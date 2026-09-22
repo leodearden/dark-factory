@@ -98,6 +98,7 @@ def file_folded_escalation(
     dedupe: bool = True,
     context: str = '',
     on_fold: Callable[[Any], None] | None = None,
+    no_escalation_level: int = logging.DEBUG,
 ) -> str | None:
     """File one escalation under *anchor_task_id* into *project_root*'s queue.
 
@@ -163,11 +164,45 @@ def file_folded_escalation(
             hook that raises is caught and logged — it is caller-supplied
             logging on a never-raise path, and must not become a new way to
             break the write path.
+        no_escalation_level: The level the package-unavailable arm is emitted
+            at. Defaults to ``logging.DEBUG``.
+
+            A CALLER CONCERN because the callers measurably disagree. Six of
+            the seven filers folded in here logged a missing optional
+            ``escalation`` package at DEBUG, as a detail;
+            ``referent_repair_storm_escalator`` deliberately treated it as a
+            LOST ALARM and logged it at WARNING (merge-base 6f9cddb0bb,
+            ``middleware/referent_repair_storm_escalator.py``:131). A repair
+            storm is a sustained scanner/resolver regression against a
+            measured ~0.22% base rate, so in an env without the optional
+            package the DEBUG default emits nothing at all at the default
+            threshold — the silence this module's own docstring argues against.
+
+            THE DEFAULT IS DELIBERATELY NOT RAISED FOR EVERYONE. Whether DEBUG
+            is the right HOUSE level for a lost alarm is a fleet-wide design
+            question with its own blast radius (``orchestrator/mcp/markup_sink``
+            logs the same condition at WARNING), and it is filed as its own
+            follow-up rather than settled here. It is not a regression this
+            consolidation introduced, and bumping the default would silently
+            change six callers inside a refactor contracted to be
+            behaviour-preserving — so raise it at the CALLERS that want it, not
+            here.
+
+            NO EQUIVALENT KNOB EXISTS FOR THE ``project_root is None`` ARM, by
+            choice: all seven callers agreed on DEBUG for it at the merge base,
+            and it means "this caller has no queue to file into", not "an alarm
+            was lost". Nor is there a ``fold_level`` — ``on_fold`` above already
+            owns fold-arm customisation, and a second knob for the same arm
+            would be exactly the duplicate-mechanism shape this module exists
+            to pay down.
 
     Returns the escalation id — freshly filed, or the id of the already-open
     escalation under this anchor when one exists — or ``None`` when filing was
     not possible. NEVER raises.
     """
+    # DEBUG with no knob, unlike the package-unavailable arm below: this means
+    # "this caller has no queue to file into", not "an alarm was lost", and all
+    # seven callers agreed on DEBUG for it at the merge base.
     if project_root is None:
         logger.debug(
             '%s: no project_root, so there is no project queue to file into; '
@@ -176,7 +211,8 @@ def file_folded_escalation(
         return None
 
     if not HAS_ESCALATION:
-        logger.debug(
+        logger.log(
+            no_escalation_level,
             '%s: escalation package unavailable; nothing will be escalated%s',
             log_label, _suffix(context),
         )
