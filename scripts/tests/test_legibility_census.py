@@ -1147,7 +1147,7 @@ def test_render_report_contains_dated_header_and_all_sections():
         matrix_md="| origin \\ manifested | merge |\n| --- | --- |\n| implement | 2 |\n",
         mining_result=_sample_mining_result(),
         synthesis_md="Fable synthesis prose goes here.",
-        filed_ticket_ids=["1234", "1235"],
+        filed_ticket_ids=["tkt_1234", "tkt_1235"],
         cost_note="~$3.42 across 20 Sonnet calls + 1 Fable call.",
     )
 
@@ -1160,9 +1160,9 @@ def test_render_report_contains_dated_header_and_all_sections():
     assert "2" in report  # batch count
     assert "0.5" in report
     assert "0.9" in report
-    # filed task ids
-    assert "1234" in report
-    assert "1235" in report
+    # filed ticket ids
+    assert "tkt_1234" in report
+    assert "tkt_1235" in report
     # cost note
     assert "~$3.42 across 20 Sonnet calls + 1 Fable call." in report
     # synthesis prose
@@ -1194,7 +1194,7 @@ def test_render_report_is_deterministic_no_clock():
         matrix_md="matrix",
         mining_result=_sample_mining_result(),
         synthesis_md="prose",
-        filed_ticket_ids=["1"],
+        filed_ticket_ids=["tkt_1"],
         cost_note="cost",
     )
     assert mod.render_report(**kwargs) == mod.render_report(**kwargs)
@@ -1311,7 +1311,7 @@ def _render(**overrides):
         matrix_md="matrix",
         mining_result=_sample_mining_result(),
         synthesis_md="prose",
-        filed_ticket_ids=["1"],
+        filed_ticket_ids=["tkt_1"],
         cost_note="cost",
     )
     kwargs.update(overrides)
