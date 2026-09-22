@@ -575,6 +575,18 @@ class TestTaskWordIsAsciiOnly:
     cover this: the number here was already ASCII: only the WORD was
     spelled with a lookalike.
 
+    ONE thing the narrowing changes BEYOND refusing the lookalike, declared
+    because the module calls this direction dangerous elsewhere: removing a
+    bare mention also removes a CONTEST. ``_LOCAL_MENTION_PATTERN``'s
+    whitespace branch is deliberately left Unicode-broad precisely because
+    narrowing it would mean 'fewer bare mentions ... which means MORE
+    confident splits on prose that pre-3667 refused'. The same is true here —
+    and it is acceptable here only because the mention removed was never the
+    word 'task', so the contest it created was SPURIOUS, not a genuine
+    competing reading. ``test_a_lookalike_mention_no_longer_contests_a_``
+    ``foreign_ref`` pins the measured shape so a revert cannot silently
+    restore the phantom contest.
+
     The standing ASCII regression guards are deliberately NOT copied into
     this class, following the convention TestUnicodeDigitsAreNotTaskNumbers
     documents for the same reason: TestParseNodeNameMatchesLocalForms and
@@ -618,6 +630,29 @@ class TestTaskWordIsAsciiOnly:
         """Both lookalikes at once, replacing 's' and 'k' in the same word."""
         name = 'ta' + LATIN_SMALL_LETTER_LONG_S + KELVIN_SIGN + ' 5'
         assert parse_node_name(name) is None
+
+    def test_a_lookalike_mention_no_longer_contests_a_foreign_ref(self):
+        """The PARTITION axis, not just the refusal: a phantom bare mention
+        used to push a genuine foreign ref into ``.ambiguous``, and no longer
+        does.
+
+        MEASURED before the narrowing, with the pre-change pattern restored
+        in-memory: this content yielded ``refs == ()`` with
+        ``ambiguous == ['reify:5', 'Task 5']`` — a contested scan every
+        downstream consumer no-ops on. After it, the phantom 'Task 5' is gone
+        and the genuine foreign ref stands alone in ``.refs``, where a
+        consumer doing destructive edge surgery WILL act on it.
+
+        So this is not a pure precision win: it hands over a referent the
+        permissive scan withheld. Acceptable because the withholding rested on
+        a word that was never 'task' — see the class docstring. Pinned so a
+        revert of the narrowing fails HERE rather than silently reopening the
+        phantom contest, which no other test in the suite would notice.
+        """
+        content = 'reify:5 blocks ta' + LATIN_SMALL_LETTER_LONG_S + 'k 5'
+        scan = scan_content(content, group_id='dark_factory')
+        assert [r.node_name for r in scan.refs] == ['reify:5']
+        assert scan.ambiguous == ()
 
 
 class TestQualifiedRefNeverSpansALineBreak:

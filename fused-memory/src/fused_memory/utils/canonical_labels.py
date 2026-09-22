@@ -277,10 +277,26 @@ _TASK_VOCABULARY_QUALIFIER = re.compile(r'(sub_?)?tasks?')
 #   consumer refuses; a false negative lets destructive surgery proceed.
 # - The word 'tasks?' is interpolated from the SAME _TASK_WORD constant this
 #   pattern shares with _TASK_NODE_NAME_PATTERN — explicit ASCII case classes,
-#   NOT 'tasks?' plus re.IGNORECASE, for the reason recorded there: re.IGNORECASE performs FULL
-#   Unicode case folding on str patterns, so 'ta\u017fk 5' and
-#   'tas\u212a 5' matched and minted a referent from a word that was
-#   never actually 'task'. Dropping the flag changes nothing else here either.
+#   NOT 'tasks?' plus re.IGNORECASE, for the reason recorded there:
+#   re.IGNORECASE performs FULL Unicode case folding on str patterns, so
+#   'ta\u017fk 5' and 'tas\u212a 5' matched and minted a referent from a word
+#   that was never actually 'task'. Every other class in this pattern is
+#   untouched by dropping the flag — 'tasks?' was its only cased literal.
+#   BUT the EMITTED PARTITION is not untouched, and unlike the '\s+' branch two
+#   bullets above this narrowing DOES remove bare mentions, and so removes
+#   CONTESTS — declared here rather than left for a reader to discover, because
+#   the bullet above calls that the dangerous direction. MEASURED, group_id
+#   'dark_factory': 'reify:5 blocks ta\u017fk 5' yielded refs=() and
+#   ambiguous=('reify:5', 'Task 5') before this change and yields
+#   refs=('reify:5',), ambiguous=() after, so a foreign referent the permissive
+#   scan refused to hand to destructive edge surgery is now handed over. That is
+#   acceptable HERE and not there because the removed mention was never the word
+#   'task': the contest it created was SPURIOUS, and a contest is protection
+#   only when it reflects a genuine competing reading. The '\s+' branch's
+#   mentions, by contrast, are real mentions of the real word, merely wrapped —
+#   so narrowing THERE would suppress genuine contests. Pinned by
+#   TestTaskWordIsAsciiOnly so a future revert cannot silently restore the
+#   phantom contest.
 _LOCAL_MENTION_PATTERN = re.compile(
     r'(?<![\w:-])' + _TASK_WORD + r'(?:[ \t]*[#:][ \t]*|\s+)([0-9]+)(?!\d)'
 )
