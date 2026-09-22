@@ -326,7 +326,8 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
        `coalesce-*` carve-outs, so do not restate or improvise any ladder text here. If it yields
        a **stampable sha**, that is success: proceed with sub-steps a–d above. On the `coalesce-*`
        arm remember both carve-outs: **neither rc=1 nor rc=128-with-an-empty-marker is
-       not-landed**, and a non-`done` scheduler status is a **veto** — never self-stamp over one.
+       not-landed**, and **neither arm carries a self-stamp** — the scheduler status decides only
+       which exit applies, never whether a write is permitted.
      - **If it has not resolved yet, both available exits are non-failures.** Either keep polling
        the **branch** handle (`mcp__escalation__merge_status(branch="task/<task_id>")`, same
        clamped cadence) for whatever remains of step 8's 20-minute deadline, re-running the
@@ -429,12 +430,11 @@ eyeballed listing.
   marker of its own nor an ancestor relationship to prove. Follow the ladder's pointer into
   `merge-queue/SKILL.md`: rules 2–3 govern rc=1 (take its **landed-but-not-credited** exit),
   rule 2a governs rc=128-with-empty-marker (check the tip's merge marker and this task's
-  scheduler status; on either landing signal it is landed — but rule 2a's **veto** applies here
-  too, so a non-`done` scheduler status means never self-stamp, and the exit is the same
-  **landed-but-not-credited** report). In **neither** case `merge_cancel`, and in neither case
-  report not-landed. This is the one carve-out that most
-  matters here: this skill is fully autonomous, so a wrong not-landed reading cancels and
-  abandons work that actually landed.
+  scheduler status; on either landing signal it is landed — but rule 2a licenses **no write on
+  this arm at all**, so never self-stamp, and the exit is the same **landed-but-not-credited**
+  report). In **neither** case `merge_cancel`, and in neither case report not-landed. This is
+  the one carve-out that most matters here: this skill is fully autonomous, so a wrong
+  not-landed reading cancels and abandons work that actually landed.
 - **No verdict** (containment rc=128) — re-derive per the ladder. Do not stamp, and do not read
   it as either outcome.
 
