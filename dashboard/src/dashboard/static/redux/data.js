@@ -326,7 +326,16 @@ function applyKey(key, value, spec, receipt) {
   if (typeof key === 'string' && key.startsWith('__')) return;
   let applied = value;
   if ((spec || PLAIN).kind === 'datum') {
-    if (!isDatumPayload(value)) return;
+    if (!isDatumPayload(value)) {
+      // SAYS SO, rather than refusing in silence. The only externally visible
+      // consequence of a refusal is that this key's tiles keep ageing — which
+      // is pixel-identical to the endpoint being wedged, so an operator would
+      // diagnose a network outage for what is a schema break. refreshOne's
+      // catch arm already warns on a fetch failure; this is the same
+      // loud-over-silent rule applied to the one failure the UI cannot show.
+      console.warn('DF_DATA: refused a non-Datum payload for datum-kinded key', key, value);
+      return;
+    }
     applied = stampWithReceipt(value, receipt);
   }
   if (STABLE_ARRAY_KEYS.has(key) && Array.isArray(window.DF_DATA[key]) && Array.isArray(applied)) {
@@ -478,14 +487,40 @@ function publishReceipt(stateKey, receipt) {
   window.DF_DATA.__receipt[stateKey] = receipt;
 }
 
+// What one attempt DID. A closed vocabulary rather than four hand-typed
+// strings at the call sites that compare against them, for the reason PLAIN
+// and DATUM are named constants: a caller that misspells `REFRESH_OUTCOMES.x`
+// gets `undefined` at the comparison rather than a branch that silently never
+// runs.
+//
+// THE POLL LOOP IGNORES THIS, and that is correct — the next tick retries, so
+// there is nothing for it to decide. It exists for a USER ACTION: the gamma3
+// UI that opens a terminal has to tell "here are the rows" from "the server
+// said no" from "we did not even ask", and datumFor(key) reports the same
+// pre-request unknown Datum in all three cases.
+const REFRESH_OUTCOMES = Object.freeze({
+  applied: 'applied',
+  failed: 'failed',
+  skippedInFlight: 'skipped-inflight',
+  skippedBackoff: 'skipped-backoff',
+});
+
 // `stateKey` names the flow-control, staleness and receipt entry this request
 // owns, and defaults to pollKey(url) — so every poll-loop call is unchanged
 // and every existing direct caller keeps working. An on-demand request passes
 // its own key instead; see requestOnDemand for why it must.
+//
+// RETURNS A REFRESH_OUTCOMES VALUE on every path, including the two skips.
+// `applied` means the response landed and its keys were offered to applyKey —
+// a datum-kinded key applyKey then REFUSED is reported by its own console.warn
+// above, because that is a server schema break rather than an outcome this
+// request can act on.
 async function refreshOne(url, keySpecs, state, deps, stateKey = pollKey(url)) {
   const st = stateFor(state, stateKey);
-  if (st.inFlight) return; // already in flight for this endpoint — skip this tick, do not queue
-  if (deps.now() < st.nextAllowedAt && !deps.ignoreBackoff) return; // still backed off
+  // already in flight for this endpoint — skip this tick, do not queue
+  if (st.inFlight) return REFRESH_OUTCOMES.skippedInFlight;
+  // still backed off
+  if (deps.now() < st.nextAllowedAt && !deps.ignoreBackoff) return REFRESH_OUTCOMES.skippedBackoff;
   st.inFlight = true;
   // Fall back inline (not via DEFAULT_POLL_DEPS) so a caller that hand-builds
   // a partial deps object — e.g. refreshOne invoked directly with just
@@ -523,7 +558,7 @@ async function refreshOne(url, keySpecs, state, deps, stateKey = pollKey(url)) {
     ]);
     if (!resp.ok) {
       recordFailure(st, deps);
-      return;
+      return REFRESH_OUTCOMES.failed;
     }
     const body = await resp.json();
     // ONE clock reading for the whole response, so every key it carries shares
@@ -535,11 +570,13 @@ async function refreshOne(url, keySpecs, state, deps, stateKey = pollKey(url)) {
     st.nextAllowedAt = 0;
     st.lastSuccessAt = receipt.receivedAt;
     publishReceipt(stateKey, receipt);
+    return REFRESH_OUTCOMES.applied;
   } catch (err) {
     recordFailure(st, deps);
     // Network blip, or a timed-out/aborted request — keep the prior values
     // so the UI does not blank out.
     console.warn('DF_DATA fetch failed', url, err);
+    return REFRESH_OUTCOMES.failed;
   } finally {
     clearTimeoutFn(timeoutId);
     st.inFlight = false;
@@ -633,6 +670,12 @@ async function refreshDFData(win, opts) {
 // NO JITTER. It exists to spread the 14 poll fetches across the interval; a
 // single user-triggered request has nothing to spread against, and delaying it
 // would only be latency the user sees.
+//
+// RETURNS refreshOne's outcome verbatim. A user action is the one caller that
+// cannot just wait for the next tick: without it, an awaited request resolves
+// identically whether the Datum landed, the server 503'd, or the key was still
+// inside its backoff window and nothing was even asked — so the UI could only
+// spin.
 async function requestOnDemand(name, param, opts) {
   const row = ON_DEMAND_KEYS[name];
   if (!row) {
@@ -641,7 +684,7 @@ async function requestOnDemand(name, param, opts) {
   const o = opts || {};
   const url = row.url(param);
   const deps = { ...DEFAULT_POLL_DEPS, ...o.deps, jitterMaxMs: 0 };
-  await refreshOne(
+  return refreshOne(
     url,
     { [row.key(param)]: row.spec },
     o.state || DF_POLL_STATE,
@@ -702,6 +745,7 @@ const DF_DATA_LOADER_API = {
   datumFor,
   ON_DEMAND_KEYS,
   requestOnDemand,
+  REFRESH_OUTCOMES,
 };
 
 if (typeof module !== 'undefined' && module.exports) {

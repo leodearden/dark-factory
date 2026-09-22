@@ -1605,6 +1605,21 @@ test('applyKey: a datum-kinded payload is stored as a COPY carrying its receipt'
   assert.equal(win.DF_DATA.__loaded.DONE_COUNTS, true);
 });
 
+// Runs *fn* with console.warn captured, and hands back what it said. Every
+// refusal below is EXPECTED to warn, so the capture keeps the suite's output
+// readable — and makes the warning itself assertable rather than mere noise.
+function warningsFrom(fn) {
+  const original = console.warn;
+  const calls = [];
+  console.warn = (...args) => calls.push(args);
+  try {
+    fn();
+  } finally {
+    console.warn = original;
+  }
+  return calls;
+}
+
 test('applyKey: a datum-kinded payload that is NOT a Datum is refused, prior value kept', () => {
   // The half that matters. A server regression that starts sending a bare
   // number where a Datum was declared must leave the last good envelope on
@@ -1616,14 +1631,44 @@ test('applyKey: a datum-kinded payload that is NOT a Datum is refused, prior val
   const good = win.DF_DATA.DONE_COUNTS;
 
   for (const bad of [42, 'nine', [SERVED_DATUM], { value: 1, as_of: null, state: 'fresh', reason: null }]) {
-    api.applyKey('DONE_COUNTS', bad, DATUM_SPEC, { servedAt: null, receivedAt: 2 });
+    warningsFrom(() => api.applyKey('DONE_COUNTS', bad, DATUM_SPEC, { servedAt: null, receivedAt: 2 }));
     assert.equal(win.DF_DATA.DONE_COUNTS, good, `a non-Datum (${JSON.stringify(bad)}) was applied`);
   }
 });
 
+test('applyKey: a refusal SAYS SO, naming the key', () => {
+  // Refusing in silence would make a schema break pixel-identical to a wedged
+  // endpoint: in both cases the key's tiles simply keep ageing, and an operator
+  // would diagnose a network outage for a server that is answering perfectly.
+  // The value must still not be applied — only the diagnosis was missing.
+  const { api, window: win } = loadDataJs();
+  const seed = win.DF_DATA.DONE_COUNTS;
+
+  const calls = warningsFrom(() =>
+    api.applyKey('DONE_COUNTS', 42, DATUM_SPEC, { servedAt: null, receivedAt: 1 }),
+  );
+
+  assert.equal(calls.length, 1, 'a refused datum payload must warn exactly once');
+  assert.ok(/DF_DATA/.test(String(calls[0][0])), `the warning must name the source: ${calls[0][0]}`);
+  assert.ok(
+    calls[0].includes('DONE_COUNTS'),
+    `the warning must name the refused key, got ${JSON.stringify(calls[0])}`,
+  );
+  assert.equal(win.DF_DATA.DONE_COUNTS, seed, 'the refused value must still not be applied');
+});
+
+test('applyKey: a plain-kinded key is never second-guessed, and never warns', () => {
+  // The warning is scoped to a DECLARED datum row receiving a non-Datum. Every
+  // polled key is plain today, so a warn on the plain path would fire on every
+  // healthy poll and train an operator to ignore it.
+  const { api } = loadDataJs();
+  const calls = warningsFrom(() => api.applyKey('COSTS', 42, PLAIN_SPEC, { servedAt: null, receivedAt: 1 }));
+  assert.deepEqual(calls, []);
+});
+
 test('applyKey: a refused datum payload does not flip the __loaded marker', () => {
   const { api, window: win } = loadDataJs();
-  api.applyKey('DONE_COUNTS', 42, DATUM_SPEC, { servedAt: null, receivedAt: 1 });
+  warningsFrom(() => api.applyKey('DONE_COUNTS', 42, DATUM_SPEC, { servedAt: null, receivedAt: 1 }));
   assert.equal(win.DF_DATA.__loaded.DONE_COUNTS, undefined, '__loaded must mean a real value LANDED');
 });
 
@@ -2003,4 +2048,122 @@ test('on-demand: an undeclared name is refused loudly rather than fetched', asyn
     /termnial/,
   );
   assert.deepEqual(fetchUrls, [], 'an undeclared name must not reach the network');
+});
+
+// ---------------------------------------------------------------------------
+// REFRESH_OUTCOMES — what one attempt DID
+//
+// The poll loop ignores this: the next tick retries, so there is nothing for
+// it to decide. It exists for a USER ACTION. Without it `await
+// requestOnDemand(...)` resolves identically whether the Datum landed, the
+// server 503'd, or the key was still inside its backoff window and nothing was
+// even asked — and datumFor reports the same pre-request unknown Datum in all
+// three cases, so the gamma3 terminal UI could only spin.
+// ---------------------------------------------------------------------------
+
+test('outcomes: the vocabulary is a closed, frozen set', () => {
+  // Named constants rather than four hand-typed strings at the call sites that
+  // compare against them — a misspelled `REFRESH_OUTCOMES.x` is `undefined` at
+  // the comparison, not a branch that silently never runs.
+  const { api } = loadDataJs();
+
+  assert.deepEqual(api.REFRESH_OUTCOMES, {
+    applied: 'applied',
+    failed: 'failed',
+    skippedInFlight: 'skipped-inflight',
+    skippedBackoff: 'skipped-backoff',
+  });
+  assert.ok(Object.isFrozen(api.REFRESH_OUTCOMES));
+});
+
+test('outcomes: a landed response reports `applied`', async () => {
+  const { api } = loadDataJs();
+  const outcome = await api.refreshOne(CURATOR_PATH, {}, api.createPollState(), {
+    fetchImpl: okResponse({ CURATOR_STATE: {} }),
+    now: () => 1,
+  });
+  assert.equal(outcome, api.REFRESH_OUTCOMES.applied);
+});
+
+test('outcomes: a non-ok status and a thrown fetch both report `failed`', async () => {
+  // Distinct code paths — the `!resp.ok` early return and the catch arm — and
+  // one outcome, because a caller can act on neither differently: the rows did
+  // not arrive.
+  for (const fetchImpl of [
+    () => Promise.resolve({ ok: false, status: 503, json: async () => ({}) }),
+    () => Promise.reject(new Error('boom')),
+  ]) {
+    const { api } = loadDataJs();
+    let outcome;
+    const original = console.warn;
+    console.warn = () => {};
+    try {
+      outcome = await api.refreshOne(CURATOR_PATH, {}, api.createPollState(), { fetchImpl, now: () => 1 });
+    } finally {
+      console.warn = original;
+    }
+    assert.equal(outcome, api.REFRESH_OUTCOMES.failed);
+  }
+});
+
+test('outcomes: the two skips are told apart from each other and from a failure', async () => {
+  // The distinction the gamma3 UI needs most: "we did not even ask" is neither
+  // an error to report nor rows to draw, and both skips return before any
+  // fetch is issued, so nothing else in the response tells them apart.
+  const { api } = loadDataJs();
+  const state = api.createPollState();
+  const fetchUrls = [];
+  const deps = {
+    fetchImpl: url => { fetchUrls.push(url); return new Promise(() => {}); },
+    now: () => 1,
+  };
+
+  const pending = api.refreshOne(CURATOR_PATH, {}, state, deps);
+  assert.equal(await api.refreshOne(CURATOR_PATH, {}, state, deps), api.REFRESH_OUTCOMES.skippedInFlight);
+  assert.equal(fetchUrls.length, 1, 'the in-flight skip must not issue a second request');
+
+  const backedOff = api.createPollState();
+  backedOff.set(CURATOR_PATH, { inFlight: false, failures: 3, nextAllowedAt: 9_000, lastSuccessAt: 0 });
+  assert.equal(
+    await api.refreshOne(CURATOR_PATH, {}, backedOff, deps),
+    api.REFRESH_OUTCOMES.skippedBackoff,
+  );
+  assert.equal(fetchUrls.length, 1, 'the backoff skip must not issue a request either');
+
+  void pending;
+});
+
+test('outcomes: requestOnDemand propagates refreshOne\'s answer verbatim', async () => {
+  const { api } = loadDataJs();
+
+  const applied = await api.requestOnDemand('terminal', TERMINAL_PROJECT, {
+    state: api.createPollState(),
+    deps: { fetchImpl: terminalResponse(), now: () => 1 },
+  });
+  assert.equal(applied, api.REFRESH_OUTCOMES.applied);
+
+  const original = console.warn;
+  console.warn = () => {};
+  let failed;
+  try {
+    failed = await api.requestOnDemand('terminal', TERMINAL_PROJECT, {
+      state: api.createPollState(),
+      deps: { fetchImpl: () => Promise.reject(new Error('boom')), now: () => 1 },
+    });
+  } finally {
+    console.warn = original;
+  }
+  assert.equal(failed, api.REFRESH_OUTCOMES.failed);
+});
+
+test('outcomes: the poll loop ignores them — refreshDFData still resolves to undefined', async () => {
+  // Nothing about the loop changes. Stated as a test because "poll-loop callers
+  // ignore the return" is the premise that makes this addition safe.
+  const { api } = loadDataJs();
+  const result = await api.refreshDFData(undefined, {
+    state: api.createPollState(),
+    jitterMaxMs: 0,
+    deps: { fetchImpl: okResponse({}), now: () => 1 },
+  });
+  assert.equal(result, undefined);
 });

@@ -214,13 +214,17 @@ function agentCellState(task, opts) {
 // exists to remove, so "we don't know" has to win over "here is what we last
 // saw". task_row_cells.test.mjs pins that absence of a branch directly.
 //
-// THE TOOLTIP RULE IS NOT RE-DERIVED HERE. datumView already decides when a
-// reason is worth surfacing (a fresh value has nothing to explain, so a stray
-// reason on one is not shown), and asking it is what keeps this cell following
-// that rule if it ever changes. Its `text` is discarded and `format` returns
+// NEITHER THE HOLE RULE NOR THE TOOLTIP RULE IS RE-DERIVED HERE. datumView
+// decides both — when a reason is worth surfacing (a fresh value has nothing to
+// explain, so a stray reason on one is not shown), and whether there is a
+// measurement at all — and asking it for both is what keeps this cell following
+// those rules if either ever changes. A `datum.state === 'unknown'` test here
+// would make the Locks column a second authority on the question 43 tiles and
+// 17 pips already ask datumView, and its own node suite would stay green while
+// the two answers diverged. Its `text` is discarded and `format` returns
 // nothing on purpose: this cell has no text of its own — its value is a chip
-// LIST, which the caller renders — so the view is consulted for the tooltip
-// decision alone.
+// LIST, which the caller renders — so what is read back is the hole flag and
+// the tooltip.
 //
 // `placeholder` is present-and-null on the known arms rather than an absent
 // key, for the reason agentCellState's `color` is: the call site BRANCHES on
@@ -235,7 +239,7 @@ function locksCellState(datum, lockInfo) {
   requireDatum(datum, 'locksCellState');
   const view = viewOfDatum(datum, { format: () => '' });
   return {
-    placeholder: datum.state === 'unknown' ? DATUM_PLACEHOLDER : null,
+    placeholder: view.isHole ? DATUM_PLACEHOLDER : null,
     title: view.title,
   };
 }

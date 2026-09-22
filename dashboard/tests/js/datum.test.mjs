@@ -397,6 +397,21 @@ test('datumView: an unknown datum renders an em-dash carrying its reason', () =>
   assert.equal(view.text, EM_DASH);
   assert.equal(view.title, 'scheduler offline');
   assert.equal(view.age, null);
+  assert.equal(view.isHole, true);
+});
+
+test('datumView: isHole is the ONE answer to "is there a measurement here"', () => {
+  // Surfaced on the descriptor because a caller whose value is not text has to
+  // know too: task_row_cells.js::locksCellState renders a chip LIST and draws
+  // the placeholder from this flag. Re-deriving `state === 'unknown'` there
+  // would make the Locks column a second authority on the question every tile
+  // and pip asks here — and its own node suite would stay green while the two
+  // answers diverged.
+  assert.equal(datumView(withReceipt(unknownDatum('r'), RECEIPT), { now: NOW }).isHole, true);
+  for (const state of ['fresh', 'stale', 'lower_bound']) {
+    const view = datumView(stampedWire({ state }), { now: NOW, format: String });
+    assert.equal(view.isHole, false, `state ${state} is a measurement, not a hole`);
+  }
 });
 
 test('datumView: NEVER invokes format on a hole', () => {
@@ -420,6 +435,28 @@ test('datumView: a stale datum renders its value, its reason, and an age badge',
   assert.equal(view.text, '$7.00');
   assert.equal(view.title, 'ReadTimeout');
   assert.ok(view.age, 'a stale datum must carry an age badge');
+});
+
+test('datumView: a NEGATIVE displayed age is unbadgeable, on both clocks', () => {
+  // formatAge answers any n < 0 with the literal 'an unknown time', which is
+  // exactly the phrase displayedAgeMs returns null rather than NaN to avoid —
+  // it says nothing, and says it in a 10px chip beside a real value. The age
+  // is still computed and still honest; only the BADGE is withheld.
+  //
+  // Both clocks, because each can go backwards for its own reason: an NTP step
+  // between the poll and the render makes the CLIENT gap negative, and once
+  // PRD leaf beta serves Datums, a producer whose as_of is later than the
+  // response's served_at makes the SERVER gap negative.
+  const clientSkewed = stampedWire({ as_of: SERVED_AT });
+  const clientNow = RECEIVED_AT - 60_000;
+  assert.equal(displayedAgeMs(clientSkewed, clientNow), -60_000, 'the arithmetic must still report it');
+  const clientView = datumView(clientSkewed, { now: clientNow, format: money });
+  assert.equal(clientView.age, null, 'a backwards client clock must draw no badge');
+  assert.equal(clientView.text, '$7.00', 'the value itself still renders');
+
+  const serverSkewed = stampedWire({ as_of: '2026-09-20T13:00:00+00:00' });
+  assert.ok(displayedAgeMs(serverSkewed, NOW) < 0, 'as_of after served_at is a negative server gap');
+  assert.equal(datumView(serverSkewed, { now: NOW, format: money }).age, null);
 });
 
 test('datumView: a lower_bound datum prefixes the FORMATTED value', () => {

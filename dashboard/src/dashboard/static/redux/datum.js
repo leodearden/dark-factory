@@ -204,13 +204,19 @@ const EM_DASH = '—';
 const LOWER_BOUND_PREFIX = '≥';
 
 // ── How should this datum be drawn? ──
-// Returns `{text, title, age, prefix}`:
+// Returns `{text, title, age, prefix, isHole}`:
 //   text   — what the value cell says, formatter and prefix already applied;
 //   title  — the producer's reason, as a tooltip, or null when there is none;
 //   age    — the humanised displayed age to badge, or null for no badge;
 //   prefix — '≥' or '', the same decision surfaced separately for a call site
 //            that wants to style the marker; `text` already carries it, so a
-//            caller rendering only `text` is complete.
+//            caller rendering only `text` is complete;
+//   isHole — is there a measurement here at all? Surfaced BECAUSE a caller
+//            whose value is not text (task_row_cells.js::locksCellState renders
+//            a chip LIST) still has to know, and re-deriving it from
+//            `datum.state` there would make that cell a second authority on the
+//            hole rule — free to keep answering the old way if this arm ever
+//            widens. Reading it here is what keeps the answer in one place.
 //
 // ONE DECISION, NO PER-CALLER BRANCHING. This is the entire point of the leaf:
 // a component asks what to draw and draws it. A tile that grew its own arm for
@@ -226,6 +232,16 @@ const LOWER_BOUND_PREFIX = '≥';
 // each site's `x == null ? '—' : f(x)` sentinel instead of keeping two hole
 // decisions per tile.
 //
+// A NEGATIVE DISPLAYED AGE IS UNBADGEABLE, for the reason displayedAgeMs gives
+// for returning null rather than NaN: formatAgeMs answers any n < 0 with the
+// literal 'an unknown time', which says far less clearly than no badge at all
+// what a 10px chip beside a value is for. It is reachable — an NTP step
+// backwards between the poll and the render makes the client gap negative, and
+// once PRD leaf beta puts served Datums on the wire, a producer whose `as_of`
+// is later than the response's `served_at` makes the server gap negative. The
+// age is still computed and still honest; it is only the BADGE that is
+// withheld, because there is nothing legible to draw.
+//
 // THE AGE BADGE WINS OVER THE SERVER'S STATE. A datum served `fresh` was fresh
 // when it was served; if it has since aged past its producer's bound sitting in
 // this browser, the badge appears anyway. The value still renders and no reason
@@ -239,18 +255,20 @@ function datumView(datum, opts) {
   const now = o.now === undefined ? Date.now() : o.now;
 
   if (datum.state === 'unknown') {
-    return { text: EM_DASH, title: datum.reason, age: null, prefix: '' };
+    return { text: EM_DASH, title: datum.reason, age: null, prefix: '', isHole: true };
   }
 
   const ageMs = displayedAgeMs(datum, now);
-  const overBound = ageMs !== null && ageMs > datum.freshness_bound_seconds * 1000;
+  const badgeable = ageMs !== null && ageMs >= 0;
+  const overBound = badgeable && ageMs > datum.freshness_bound_seconds * 1000;
   const prefix = datum.state === 'lower_bound' ? LOWER_BOUND_PREFIX : '';
 
   return {
     text: prefix + format(datum.value),
     title: datum.state === 'fresh' ? null : datum.reason,
-    age: ageMs !== null && (datum.state !== 'fresh' || overBound) ? formatAgeMs(ageMs) : null,
+    age: badgeable && (datum.state !== 'fresh' || overBound) ? formatAgeMs(ageMs) : null,
     prefix,
+    isHole: false,
   };
 }
 
