@@ -6,6 +6,9 @@ Covers:
     zero-valued before any work, and additive beside the pre-existing keys.
   * The call-site wiring, driven end-to-end: a real merge that lands moves
     ``landings_total``, and a real merge conflict records a drift sample.
+  * Per-request drift-base isolation, driven end-to-end: a conflict counts
+    only the landings since ITS OWN merge-start, so a landing that consumed
+    another in-flight request's drift base is caught.
 
 Task 5030 (PRD ``plans/merge-lane-quality-prd.md`` task γ7) replaced this
 file's former drive mechanism. The wiring used to be exercised by calling the
@@ -26,12 +29,17 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from _merge_lane_fakes import FakeVerifier
-from _orch_helpers import wait_responsive
+from _merge_lane_fakes import FakeVerifier, hangs_until, passes
+from _orch_helpers import (
+    MERGE_GATE_BARRIER_TIMEOUT,
+    MERGE_RESULT_TIMEOUT,
+    wait_responsive,
+)
 
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_lane import MergeLane
+from orchestrator.merge_lane.ports import VerifyPort
 from orchestrator.merge_queue import MergeMetrics, MergeRequest
 from orchestrator.merge_types import QueuedBranch
 
@@ -127,20 +135,76 @@ async def _prepare(
     return request
 
 
-@contextlib.asynccontextmanager
-async def _running_lane(git_ops: GitOps):
-    """A running single-host lane whose scoped verify always passes.
+class _MergeGatedGitOps(GitOps):
+    """A ``GitOps`` whose ``merge_to_main`` parks on an event for ONE branch.
 
-    Teardown goes through ``stop()`` -- the lane's own shutdown protocol, which
+    A SUBCLASS rather than a ``patch``/``setattr``: ``git_ops`` is a
+    constructor parameter of ``MergeLane``, so scripting a PUBLIC method of an
+    injected collaborator is the same category of seam as the injected
+    ``FakeVerifier`` -- it needs no patching and no private access, and keeps
+    this file at its ratchet baseline of 0 patch targets and 0 private reads.
+
+    Parking inside ``merge_to_main`` is what makes a drift drive
+    deterministic: the lane stashes a request's drift base immediately before
+    merging it, and that window is otherwise only a handful of awaits wide.
+    ``at_gate`` being set is proof the base has already been stashed, so a
+    test can hold the gated request there for as long as it needs while it
+    drives another request all the way to a landing.
+
+    The override mirrors the parent signature EXACTLY rather than absorbing
+    a ``**kwargs``: a true substitution keeps a future positional
+    ``base_sha`` caller binding here as it does in production, and the
+    declared ``MergeResult`` return lets pyright catch a fake that stops
+    handing back a merge result at this seam instead of downstream.
+    """
+
+    def __init__(self, config: GitConfig, root: Path, *, branch: str) -> None:
+        super().__init__(config, root)
+        self._gated_branch = branch
+        self.at_gate = asyncio.Event()
+        self.release_merge = asyncio.Event()
+
+    async def merge_to_main(
+        self, worktree: Path, branch: str, base_sha: str | None = None,
+    ) -> MergeResult:
+        if branch == self._gated_branch:
+            self.at_gate.set()
+            await self.release_merge.wait()
+        return await super().merge_to_main(worktree, branch, base_sha=base_sha)
+
+
+@contextlib.asynccontextmanager
+async def _running_lane(
+    git_ops: GitOps,
+    *,
+    verifier: VerifyPort | None = None,
+    speculation_depth: int = 1,
+    gates: tuple[asyncio.Event, ...] = (),
+):
+    """A running single-host lane; its scoped verify passes unless scripted.
+
+    Every keyword defaults to today's behaviour, so the plain
+    ``_running_lane(git_ops)`` call sites are unchanged: an always-passing
+    ``FakeVerifier``, one merge ahead, and no gates.
+
+    Teardown releases every gate in *gates* BEFORE stopping, so a failing
+    assertion can never leave a verify or a merge parked and hang the stop.
+    It then goes through ``stop()`` -- the lane's own shutdown protocol, which
     resolves in-flight request futures, drains its queues, cleans merge
     worktrees and releases leases, and is internally bounded so it cannot hang.
     """
     queue: asyncio.Queue = asyncio.Queue()
-    lane = MergeLane(git_ops, queue, verifier=FakeVerifier())
+    lane = MergeLane(
+        git_ops, queue,
+        speculation_depth=speculation_depth,
+        verifier=FakeVerifier() if verifier is None else verifier,
+    )
     lane_task = asyncio.ensure_future(lane.run())
     try:
         yield lane, queue
     finally:
+        for gate in gates:
+            gate.set()
         # Exception, not BaseException: this must not swallow a CancelledError
         # aimed at the enclosing test task (or a KeyboardInterrupt).
         with contextlib.suppress(Exception):
@@ -370,3 +434,117 @@ class TestMetricsFromRealMerges:
                 f'no drift sample ({drift!r})'
             )
             assert drift['last'] == 0
+
+
+# ---------------------------------------------------------------------------
+# Per-request drift-base isolation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDriftBaseIsolation:
+    """A landing must not consume another in-flight request's drift base."""
+
+    async def test_drift_counts_only_the_landings_since_its_own_merge_start(
+        self, git_config: GitConfig, git_repo: Path, config: OrchestratorConfig,
+    ) -> None:
+        """A conflict after ONE intervening landing records a drift of 1.
+
+        The sibling ``test_conflicting_merge_records_a_drift_sample`` records a
+        drift of 0 by construction -- it lands A before B is dequeued, so no
+        landing falls between B's merge-start and its conflict. At 0, "pop MY
+        entry" and "clear EVERY entry" are indistinguishable. Only an
+        intervening landing separates them: here B's base is stashed while
+        main_position is still 0, A lands (main_position -> 1), and only then
+        does B conflict. A landing that consumed B's base instead of its own
+        would drop the sample back to 0.
+
+        The window between B's ``_note_merge_started`` and its merge is a
+        handful of awaits wide, so it is not stably observable on the public
+        snapshot. Parking B INSIDE ``merge_to_main`` holds it open for as long
+        as the test needs: ``at_gate`` being set is proof the base was already
+        stashed, and A's landing is then driven to completion and confirmed on
+        the public counter before B's merge is released.
+        """
+        verify_gate = asyncio.Event()
+        git_ops = _MergeGatedGitOps(git_config, git_repo, branch='task/drift-blocked')
+        verifier = FakeVerifier(
+            default=passes(), scripts={'drift-lander': hangs_until(verify_gate)},
+        )
+
+        async with _running_lane(
+            git_ops,
+            verifier=verifier,
+            speculation_depth=2,
+            gates=(verify_gate, git_ops.release_merge),
+        ) as (lane, queue):
+            # Both branches are cut from the same base, before either lands, so
+            # they each ADD clash.py -- an add/add conflict.
+            lander = await _prepare(
+                git_ops, config, 'drift-lander', 'clash.py', 'x = 1\n',
+            )
+            blocked = await _prepare(
+                git_ops, config, 'drift-blocked', 'clash.py', 'x = 2\n',
+            )
+
+            await queue.put(lander)
+            await wait_responsive(
+                verifier.await_entry(1),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='lander: verify entered',
+            )
+
+            await queue.put(blocked)
+            await wait_responsive(
+                git_ops.at_gate.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='blocked request parked inside merge_to_main',
+            )
+            # Load-bearing precondition: the blocked request is parked INSIDE
+            # merge_to_main, so its drift base was stashed while main_position
+            # was still 0. Without this, the whole drive proves nothing.
+            assert lane.snapshot()['metrics']['landings_total'] == 0, (
+                'the lander landed before the blocked request reached its '
+                'merge -- the blocked base was stashed too late to be at 0'
+            )
+
+            verify_gate.set()
+            outcome_lander = await wait_responsive(
+                lander.result,
+                timeout=MERGE_RESULT_TIMEOUT,
+                label='lander lands',
+            )
+            assert outcome_lander.status == 'done', (
+                f'expected the lander to land, got {outcome_lander!r}'
+            )
+            async def _lander_counted() -> None:
+                while lane.snapshot()['metrics']['landings_total'] < 1:
+                    await asyncio.sleep(0.01)
+
+            await wait_responsive(
+                _lander_counted(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='lander counted on the public landings_total',
+            )
+
+            git_ops.release_merge.set()
+            outcome_blocked = await wait_responsive(
+                blocked.result,
+                timeout=MERGE_RESULT_TIMEOUT,
+                label='blocked request conflicts',
+            )
+            assert outcome_blocked.status == 'conflict', (
+                f'expected the blocked request to conflict, got {outcome_blocked!r}'
+            )
+
+            metrics = lane.snapshot()['metrics']
+            assert metrics['landings_total'] == 1
+            drift = metrics['drift_at_detection']
+            assert drift['count'] == 1, (
+                f'the conflict recorded no drift sample ({drift!r})'
+            )
+            assert drift['last'] == 1, (
+                'a landing consumed another request\'s drift base: the blocked '
+                'request started merging at main_position 0 and conflicted at 1, '
+                f'so its drift is 1, not {drift["last"]!r}'
+            )

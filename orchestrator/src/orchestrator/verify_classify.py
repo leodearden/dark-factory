@@ -76,6 +76,45 @@ def is_external_kill_rc(rc: int) -> bool:
 # ---------------------------------------------------------------------------
 
 _PYTEST_INTERNALERROR_RE = re.compile(r'^INTERNALERROR>.+$', re.MULTILINE)
+
+# pytest's argparse REJECTING the argv we built — the tool never ran a test,
+# so nothing in the output is a verdict about the code. Captured verbatim from
+# the real binary in this worktree (rc=4)::
+#
+#     ERROR: usage: pytest [options] [file_or_dir] [file_or_dir] [...]
+#     pytest: error: argument --timeout: expected one argument
+#
+# The PROG NAME IS NOT PINNED: argparse renders `basename(sys.argv[0])`, a
+# property of how pytest was LAUNCHED rather than of the error. Measured here
+# today, both rc=4: `pytest ...` -> `ERROR: usage: pytest [options] ...`,
+# `python -m pytest ...` -> `ERROR: usage: __main__.py [options] ...`. Pinning
+# `pytest` would leave any target project whose test_command is
+# `python -m pytest` still recording a rejected argv as a real red — this
+# task's defect, silently un-closed for that project. What is matched is the
+# SHAPE: `ERROR: ` at column 0, argparse's `[options]` usage line, and its
+# `<prog>: error: ` continuation on the very next line.
+#
+# Those three parts, plus this arm's POSITION after the FAILED arms in
+# _PYTEST_PATTERNS, are the whole false-positive margin, and each one earns
+# its place. pytest writes the marker at column 0 before any test output,
+# whereas a failing test that merely QUOTES the text has it rendered indented
+# behind assertion-diff framing ('E   ...') — but pytest's own
+# `--- Captured stdout call ---` sections are unindented, so a test that
+# PRINTS the marker clears the anchor. Adjacency then costs it the
+# single-line print, and the ordering costs it every output in which a test
+# actually ran and failed: a genuine rejection carries no FAILED line,
+# because nothing ran.
+#
+# Deliberately does NOT cover pytest's other rc=4 shape,
+# 'ERROR: file or directory not found: <x>': that one is branch-reachable in
+# the ordinary way (a diff deleting or renaming a test file produces it
+# legitimately), so reading it as "we could not re-run" would suppress a real
+# red — the one failure direction the flake discriminator's doctrine forbids.
+# If it ever shows up in the ledger it deserves its own adjudication with its
+# own evidence (task 5580).
+_PYTEST_USAGE_ERROR_RE = re.compile(
+    r'^ERROR: usage: \S+ \[options\].*\n\S+: error: ', re.MULTILINE,
+)
 _COMPILE_ERROR_RUSTC_CODE_RE = re.compile(r'error\[E\d+\]:', re.MULTILINE)
 _COMPILE_ERROR_STRING_RE = re.compile(r'compile error', re.MULTILINE | re.IGNORECASE)
 
@@ -1015,7 +1054,7 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
     human log is unchanged by construction.
 
     CLOSED DOMAIN: the return value is always a ``FailureCategory`` member —
-    see that enum's docstring for the closed 15-value output domain its
+    see that enum's docstring for the closed output domain its
     ``CATEGORY_POLICY`` table enforces exhaustively at import time.
     """
     if rc == 0:
@@ -1051,7 +1090,8 @@ def classify_failure(tool: ToolKind, rc: int, output: str, timed_out: bool) -> F
 # ---------------------------------------------------------------------------
 # ToolKind.PYTEST — env_transient (shared-venv-mutation signatures, task
 # 2048) is consulted FIRST and ONLY here (Invariant C1's structural win: no
-# other tool's table even references these patterns), then INTERNALERROR,
+# other tool's table even references these patterns), then the argv rejection
+# (pytest refused to start — task 5580), then INTERNALERROR,
 # then FAILED lines, then flock (the test leg is flock-admission-wrapped),
 # falling through to UNKNOWN_TEST_FAILURE — which also covers pytest rc=5
 # ("no tests ran", kept RED per task 1852 — see _classify_opaque's docstring
@@ -1152,13 +1192,20 @@ _ENV_TRANSIENT_PATTERNS: list[re.Pattern[str]] = [
     ),
 ]
 
-# Order matters: INTERNALERROR before FAILED so a worker-death run (which has
-# both INTERNALERROR> lines and collateral FAILED lines from the dead worker)
-# classifies as pytest_internalerror, not test_failure.
+# Order matters, twice over. The usage error comes FIRST: pytest rejected the
+# command, so any FAILED line elsewhere in the same captured output belongs to
+# an earlier leg or is quoted text, and must not shadow the fact that this run
+# never started. Then INTERNALERROR before FAILED, so a worker-death run
+# (which has both INTERNALERROR> lines and collateral FAILED lines from the
+# dead worker) classifies as pytest_internalerror, not test_failure.
 _PYTEST_PATTERNS: list[tuple[re.Pattern[str], FailureCategory]] = [
     (_PYTEST_INTERNALERROR_RE, FailureCategory.PYTEST_INTERNALERROR),
     (_TEST_FAILURE_TRAILING_RE, FailureCategory.TEST_FAILURE),
     (_TEST_FAILURE_LEADING_RE, FailureCategory.TEST_FAILURE),
+    # The argv rejection is consulted only once no test is known to have run:
+    # a genuine rejection carries no FAILED line, so an output that has one is
+    # a real red which happens to quote the rejection text (task 5580).
+    (_PYTEST_USAGE_ERROR_RE, FailureCategory.PYTEST_USAGE_ERROR),
     # flock lock failures — the test leg is flock-admission-wrapped.
     (_FLOCK_ERROR_RE, FailureCategory.FLOCK_ERROR),
 ]
@@ -1166,7 +1213,18 @@ _PYTEST_PATTERNS: list[tuple[re.Pattern[str], FailureCategory]] = [
 
 def _classify_pytest(output: str) -> FailureCategory:
     """The PYTEST table: env_transient FIRST (Invariant C1: ONLY here), then
-    INTERNALERROR/FAILED/flock, falling through to UNKNOWN_TEST_FAILURE.
+    INTERNALERROR/FAILED, then the argv rejection, then flock, falling through
+    to UNKNOWN_TEST_FAILURE.
+
+    env_transient stays ahead of the rejection arm deliberately: a usage error
+    caused by the xdist plugin vanishing mid-run is a HOST condition that
+    retries, and must keep that verdict rather than being relabelled as a
+    command we built wrong.
+
+    The FAILED arms stay ahead of it for the mirror-image reason: a genuine
+    rejection never ran a test and so never carries a FAILED line, while a red
+    test that prints the rejection text into a captured-output section does.
+    Ordering this way means that forgery costs a real red nothing.
     """
     for env_pattern in _ENV_TRANSIENT_PATTERNS:
         if env_pattern.search(output):

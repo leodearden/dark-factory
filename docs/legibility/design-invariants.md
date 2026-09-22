@@ -14,7 +14,9 @@ INV-10 was added 2026-08-30 from the doc-guard reconciliation
 which this codebase had minted independently across 55 tracked files
 (measured on base eba215060c — a pinned measurement, not a live count:
 it grows as citations accrue) and cited as if canonical while no
-heading defined it (task 3803; rehearsal walked 2026-08-20). They gate `/prd`
+heading defined it (task 3803; rehearsal walked 2026-08-20); INV-12
+was added 2026-09-18 from the exception-register PRD's own incident
+evidence (`plans/inv12-exceptions-owned-or-ratified-prd.md`). They gate `/prd`
 decompose (G7, `skills/prd/references/gates.md`) and `/review` phase 2's
 cross-module audit — both consumers Read this doc at run time;
 it is the single normative copy (no restatement, per INV-5). Stable slug
@@ -214,6 +216,23 @@ loop enforcing it *was* the blocked thread. 726 of the sampled
 subprocesses were a byte-identical, render-invariant
 `git worktree list --porcelain`. (task 3778)
 
+That fix was correct; the CENSUS accompanying it was not, and it took three
+further batches to notice. Two methodology defects, both since confirmed
+against the live tree. (1) It enumerated the sites where the blocking
+PRIMITIVE is written and then made a per-MODULE offload claim —
+`services/recon_claim_verification_guard.py` was recorded as "already
+offloaded at its call sites", which was true of the callers it looked at and
+false of the others, so one offloaded caller made the whole module read as
+clean and every other caller was invisible. The census question is "which
+CALLERS reach this primitive without a hop", not "is this module offloaded".
+(2) It enumerated `subprocess.run` only, while the Rule above names
+filesystem and lock too; `read_text` and `yaml.safe_load` misses accounted
+for tasks 4091 and 4201 independently of (1). Tasks 4091 and 4201 each found
+live sites in that blind spot, and task 4484's caller-side re-run found 60 —
+including four same-shape `async def _maybe_*` registry loaders in
+`fused-memory/src/fused_memory/middleware/task_curator.py`, two of which had
+no task filed at all. (tasks 3778, 4091, 4201, 4484)
+
 **House pattern**: `asyncio.to_thread` at the boundary
 (`fused-memory/src/fused_memory/middleware/task_interceptor.py::_apply_status_transition`;
 `middleware/task_curator.py::curate_batch_prepared`); the async
@@ -221,6 +240,15 @@ subprocess runner `orchestrator/src/orchestrator/git_ops.py::_run`;
 hoist the loop-invariant probe out of the body and bound the fan-out with
 an explicit cap that logs what it dropped (no silent truncation); loop-lag
 heartbeat firing above a threshold (INV-4 applied to scheduling).
+Mechanical enforcement now stands behind this slug:
+`shared/tests/test_loop_blocking_gate.py` scans `fused-memory/src` caller-side
+(`shared/tests/loop_blocking_scan.py::find_loop_blocking_sites`) and ratchets
+every coroutine call site reaching a blocking primitive against a
+dispositioned ledger, `shared/tests/loop_blocking_allowlist.py`. A new site
+must be fixed or blessed with a stated reason in the same change, and a landed
+fix must delete its blessing. This is what the Census seam section below asks
+for when a slug is violated across repeated census batches — INV-8 was missed
+across three (3778, 4091, 4201) before the guard was filed as task 4484.
 
 ## INV-9 `one-fact-one-home`
 
@@ -362,6 +390,64 @@ constrains the AGGREGATE audibility of a fail-soft path deliberately
 RETAINED, and presupposes that path is legitimate. One occurrence is
 already an INV-11 defect, where INV-4 only asks about the hundredth.
 
+## INV-12 `exceptions-owned-or-ratified`
+
+**Rule**: For an allow-list that tracks exceptions to a rule intended to be
+uniform, every entry is either `Debt(owner)` — owner a live task or ticket:
+not `done`, `cancelled` or `deferred` — or `Policy(ratified)`, the id of a
+row in the ratification table
+(`docs/legibility/exception-ratifications.yaml`), for an exemption that is a
+deliberate permanent ruling rather than debt. No entry may be neither.
+Inline suppressions are in scope, under their own register and ratchet.
+Entries predating the register's seeding may carry no disposition, but their
+count may only fall, never rise; every entry added or touched after it
+carries one. The ratification table lands with the mechanism (House pattern,
+step γ2) and is not in the tree yet, so `Debt(owner)` is today's only
+available disposition.
+
+**Checkable design question(s)**: Does this feature add or touch an
+allow-list, registry, or inline suppression whose entries silence a
+detector — a lint, a guard test, a census warning, an alarm, a sweep, a
+failure classifier, a finding pipeline? Suppressors are in scope; a list
+whose entries grant a capability (who may promote, what auto-heals, which
+fields hot-reload) is design, reviewed as design, and out of scope here. If
+it is a suppressor: where does each entry's disposition live — a cited live
+task, a cited ticket, or a ratification-table row id — and what notices
+when its owner dies?
+
+**Evidence**: `verify.py::_KNOWN_LOAD_FLAKE_NODEID_RES` (since retired, in
+b5bf73106e; the incident predates the retirement) carried an entry that
+outlived the task that owned it (2733, done 2026-07-18) with no owner
+recorded on the entry itself, and the same test recurred at task 4545's gate
+on 2026-09-06 (esc-4545-6); a missing-id check would not have caught this —
+only a **liveness** check would have. Two registers still in the tree make
+that point checkable today:
+`orchestrator/tests/test_timeout_marker_inversion_guard.py::_GRANDFATHERED`
+(owner task 5149) and
+`orchestrator/tests/test_serial_merge_worker_import_guard.py::ALLOWLIST`
+(owner task 5034) each assert every entry still names a live REFERENT — a
+real in-band site, a file that really imports the fixture — while neither
+records an owner on an entry at all: a dead referent fails, a dead owner
+does not. A census of the repo's named allow-lists found the same gap under
+tasks 4354, 4920 and 5215, each owning a burn-down that nothing connects to
+the entries it retires, so nothing notices when one of those tasks completes
+and entries remain.
+
+**House pattern**: `plans/inv12-exceptions-owned-or-ratified-prd.md` — the
+disposition vocabulary, the ratification table, the inline-marker grammar,
+the multiset ratchet kernel, the exception register and the owner-liveness
+sweep. Re-point this at the landed paths once the mechanism lands.
+
+**Family boundary**: INV-7 `holds-owned-and-bounded` and INV-12 are
+adjacent — both ask who owns a thing and what notices when the owner is
+gone — but govern different objects. INV-7 governs held RUNTIME STATES: a
+parked status, an open escalation, a wait loop, legal only while a live
+claimant exists. INV-12 governs TREE-RESIDENT EXCEPTION LISTS: an allow-list
+entry or an inline suppression, legal only while its cited task or ticket is
+live, or it is explicitly ratified. A walker facing a park/wait/hold state
+checks INV-7; a walker facing an exception list or inline suppression checks
+INV-12.
+
 ## Census seam
 
 Incident records MAY carry an optional `invariant_violated: <slug>` field.
@@ -378,4 +464,6 @@ verdict table exercising the as-landed G7 and `/review` phase-2 text — live
 at `docs/legibility/design-invariants-fixtures.md` (landed 2026-07-14;
 INV-6/INV-7 fixtures added 2026-08-02; INV-8 fixtures added 2026-08-06;
 INV-9 fixtures added 2026-08-24; INV-10 fixtures added 2026-08-30;
-INV-11 fixtures added with the `no-silent-fail-soft` promotion).
+INV-11 fixtures added with the `no-silent-fail-soft` promotion; INV-12
+fixtures added 2026-09-18 with the `exceptions-owned-or-ratified`
+invariant).

@@ -2720,11 +2720,11 @@ class TestCollectSnapshotPerRootBudget:
         ``snapshots`` is APPEND-ONLY and no later cycle backfills, that is a
         permanent unexplained hole in the chart.
         """
-        import dashboard.app as app_module
+        import dashboard.loops as loops_module
         from dashboard.data.tasks import DEFAULT_WHOLE_OPERATION_BUDGET
 
         budget = burndown_module._SNAPSHOT_PER_ROOT_BUDGET
-        one_cycle_half = app_module._SAMPLE_INTERVAL_SECONDS / 2
+        one_cycle_half = loops_module._SAMPLE_INTERVAL_SECONDS / 2
 
         # BOTH bounds are the ones the derivation actually names. An earlier
         # form of this test asserted `>= DEFAULT_WHOLE_OPERATION_BUDGET` (7.0)
@@ -2746,7 +2746,7 @@ class TestCollectSnapshotPerRootBudget:
         assert budget <= one_cycle_half, (
             f'_SNAPSHOT_PER_ROOT_BUDGET ({budget}) is above HALF one collector '
             f'cycle ({one_cycle_half} s = _SAMPLE_INTERVAL_SECONDS / 2 = '
-            f'{app_module._SAMPLE_INTERVAL_SECONDS} / 2). A root that cannot '
+            f'{loops_module._SAMPLE_INTERVAL_SECONDS} / 2). A root that cannot '
             'finish inside one cycle can never finish at all, and the halving '
             'is what guarantees cycle N is done before cycle N+1 starts even '
             'when a root spends its whole budget.'

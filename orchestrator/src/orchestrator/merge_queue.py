@@ -221,6 +221,7 @@ from orchestrator.verify import (
     seed_main_baseline,
     verify_failure_is_preexisting_on_main,
 )
+from orchestrator.verify_cancel import elide_middle
 from orchestrator.verify_categories import (
     INDETERMINATE_VERDICT_CATEGORIES,
     INFRA_TRANSIENT_CATEGORIES,
@@ -18253,7 +18254,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 )
                 _progress_probe_secs = self.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS / 2
             while True:
-                done, _ = await asyncio.wait(
+                done = await self._clock.wait_for_any(
                     {verify_task},
                     timeout=self.VERIFY_ABANDON_POLL_SECS,
                 )
@@ -18499,10 +18500,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # quarantine_and_release, which _finalize_inflight runs first to
             # bench the dead remote before the re-dispatch.
             logger.warning(
-                'Task %s: remote runner unavailable (merge=%s) — '
-                'will re-dispatch on another host',
-                req.task_id, merge_commit[:8],
-            )
+                'Task %s: remote runner unavailable (merge=%s) on host %s — '
+                'will re-dispatch on another host: %s',
+                req.task_id, merge_commit[:8], lease.name, elide_middle(str(exc)))
             # task 3003 amend (robustness): a dead remote transport is not lane
             # contention — this item is re-dispatched on another host, so close
             # any open contended-lane streak rather than let its start stamp

@@ -8,66 +8,36 @@ without sys.path pollution — mirrors the pattern in test_cleanup_count_snapsho
 
 from __future__ import annotations
 
-import importlib.util
 import logging
 import re
-import sys
-import types
 from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from _fm_helpers import load_script_module
+from _store_mutation_preflight_contract import (
+    SENTINEL,
+    deny,
+    fail_closed_records,
+    neutralise_fixture,
+)
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'clear_false_dependency_invalidations.py'
 )
 
 
-def _load_module() -> types.ModuleType:
-    """Load clear_false_dependency_invalidations.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    @dataclass and other reflection-based decorators work correctly
-    (they call sys.modules.get(cls.__module__)).
-    """
-    mod_name = 'clear_false_dependency_invalidations'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
+_mod = load_script_module(SCRIPT_PATH, mod_name='clear_false_dependency_invalidations')
 
 
-_mod = _load_module()
-
-
-@pytest.fixture(autouse=True)
-def _neutralise_store_mutation_preflight(monkeypatch):
-    """Keep this MOCK-unit suite independent of the REAL ``~/.mem0``.
-
-    ``repair(..., apply=True)`` runs a fail-closed capability preflight before
-    it touches a single edge (task 4293). That probe touches the real
-    filesystem, so without this fixture every ``--apply`` test would pass or
-    fail according to whether the machine running pytest happens to be able to
-    write mem0's history directory -- and it genuinely cannot inside an agent
-    sandbox, which is the whole reason the guard exists. This suite is
-    deliberately MOCK-unit (an AsyncMock memory service, no live store), so the
-    environment must not be an input to it.
-
-    ``TestRunApplyStoreMutationPreflight`` re-rigs this per test -- to refuse,
-    to record, or to pass -- so the guard's own behaviour is still pinned
-    explicitly rather than assumed away.
-
-    Deliberately NOT ``raising=False``: if the guard is ever removed from the
-    script this fixture must break loudly rather than silently no-op.
-    """
-    monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+_neutralise = neutralise_fixture(
+    _mod,
+    note="""``repair(..., apply=True)`` runs the preflight before it touches a
+    single edge (task 4293). This suite is deliberately MOCK-unit (an AsyncMock
+    memory service, no live store). ``TestRunApplyStoreMutationPreflight``
+    re-rigs this per test -- to refuse, to record, or to pass -- so the guard's
+    own behaviour is still pinned explicitly rather than assumed away.""",
+)
 
 
 # The 6 falsely-invalidated dependency edge UUIDs to be cleared.
@@ -173,45 +143,6 @@ class TestRunApplyStoreMutationPreflight:
         )
         return memory
 
-    @staticmethod
-    def _deny(monkeypatch):
-        """Rig the preflight to refuse, as it would inside an agent sandbox."""
-        def _raise(*_args, **_kwargs):
-            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
-
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
-
-    @staticmethod
-    def _fail_closed_records(caplog) -> list:
-        """The guard site's OWN diagnosis.
-
-        ``main`` has no handler at all here -- ``_run`` re-raises through its
-        ``finally`` and ``asyncio.run`` lets it out, so the refusal exits the
-        interpreter as an uncaught traceback -- which means this ERROR record
-        is the ONLY place the operator is told what was refused and what to do
-        instead. Pinned on the fail-closed marker and the remedy noun ONLY, so
-        every other word of the message stays free to reword.
-
-        Asserting on message CONTENT is deliberate, and is the narrow exception
-        to the repo's don't-pin-guard-message-prose norm (task 3799): the record
-        this test is about is defined BY its content -- mere record-existence
-        would still pass if the whole diagnosis were replaced by "boom",
-        precisely the regression this exists to catch. Verified non-vacuous:
-        mutating the marker in the script turns this assertion red (task 4127
-        amendment).
-
-        NOTE the logger name is ``clear_false_dep_invalidations``, which is NOT
-        the module name -- filtering on the module name would silently match
-        nothing and make every assertion below vacuous.
-        """
-        return [
-            rec for rec in caplog.records
-            if rec.name == 'clear_false_dep_invalidations'
-            and rec.levelname == 'ERROR'
-            and 'NOT started (fail-closed)' in rec.getMessage()
-            and 'MCP server' in rec.getMessage()
-        ]
-
     @pytest.mark.asyncio
     async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
         self, monkeypatch
@@ -224,11 +155,11 @@ class TestRunApplyStoreMutationPreflight:
         ``{'status': 'error'}`` rows, and the caller could not tell an
         environment-level denial from six ordinary edge failures.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory = self._memory()
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+            _mod.StoreMutationUnavailable, match=SENTINEL
         ):
             await _mod.repair(memory, project_id='know_live', apply=True)
 
@@ -239,7 +170,7 @@ class TestRunApplyStoreMutationPreflight:
         """A read-only run mutates nothing, so it must not require the ability
         to mutate -- the repair report stays obtainable from anywhere, with the
         deny still installed."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory = self._memory()
 
         report = await _mod.repair(memory, project_id='know_live', apply=False)
@@ -287,7 +218,7 @@ class TestRunApplyStoreMutationPreflight:
         so without this record the operator sees a bare traceback naming an
         exception class and no remedy.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory = self._memory()
 
         with (
@@ -296,7 +227,9 @@ class TestRunApplyStoreMutationPreflight:
         ):
             await _mod.repair(memory, project_id='know_live', apply=True)
 
-        assert self._fail_closed_records(caplog), (
+        # The logger is ``clear_false_dep_invalidations``, NOT the module name --
+        # filtering on the module name would match nothing and be vacuous.
+        assert fail_closed_records(caplog, 'clear_false_dep_invalidations'), (
             'nothing else explains this traceback -- the guard site must log '
             'the fail-closed diagnosis before raising; got: '
             f'{[rec.getMessage() for rec in caplog.records]}'

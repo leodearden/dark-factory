@@ -10,9 +10,9 @@ are syntactically valid — independently of the *resolution* half
 (``test_warm_lane_script_resolution.py``), which pins how ``GitOps`` chooses
 between a project override and these copies.
 
-The sibling-wiring class is the load-bearing one.  Three of the seven source a
+The sibling-wiring class is the load-bearing one.  Four of the seven source a
 lib that is not itself one of the seven, so a seven-file-only relocation would
-ship three scripts that cannot execute:
+ship four scripts that cannot execute:
 
 * ``warm-lane-gc.sh`` and ``warm-lane-gc-sweep.sh`` source
   ``$SCRIPT_DIR/lib_live_refs.sh`` and deliberately ``exit 2`` when it is
@@ -33,9 +33,15 @@ ship three scripts that cannot execute:
   it holds the facts only dark-factory owns (the ``.lane-state`` record format
   and ``PROTECTED_PREFIXES``), which is why the audit's ``assigned`` column can
   no longer be produced without it.
+* ``warm-lane-degenerate-ref-check.sh`` sources ``$SCRIPT_DIR/lib_task_citation.sh``
+  since dark-factory task 5566, behind the same ``exit 2`` guard.  That lib is
+  the single copy of the "cites task N" grammar the classifier consults; a
+  silently-absent one cannot degrade gracefully, because a ref whose citation
+  cannot be read is reported ``degenerate`` — which dark-factory reads as "zero
+  task work" and acts on by reverting and re-dispatching.
 
 Running each with ``--help`` from the new directory is the executable proof
-that all three libs actually travelled along.
+that all four libs actually travelled along.
 """
 from __future__ import annotations
 
@@ -79,6 +85,13 @@ SOURCED_LIBS = (
     # In SOURCED_LIBS rather than a parallel test class so it inherits the
     # exists / owner-execute-bit / `bash -n` coverage already written here.
     'lib_lane_state.sh',
+    # A reify relocation (UNLIKE lib_lane_state.sh), vendored verbatim by
+    # dark-factory task 5566.  It is the single copy of the "cites task N"
+    # grammar warm-lane-degenerate-ref-check.sh consults, and it is normative
+    # across the reify/dark-factory seam — which is why it is vendored rather
+    # than re-inlined into its one consumer.  Here for the same reason as the
+    # entry above: exists / owner-execute-bit / `bash -n` coverage for free.
+    'lib_task_citation.sh',
 )
 
 ALL_SHIPPED = RELOCATED_SCRIPTS + SOURCED_LIBS
@@ -121,13 +134,13 @@ class TestRelocatedScriptsAreShipped:
 
 
 class TestSiblingLibsTravelledWithTheScripts:
-    """The three lib-sourcing scripts actually run from the new directory.
+    """The four lib-sourcing scripts actually run from the new directory.
 
     Each is invoked with ``--help`` (read-only, no mount, no subprocess side
     effects) from ``orchestrator/scripts/warm-lane/``.  Since task 3370 closed
     the last gap there is ONE shape for a missing sibling, and it is what these
     cases assert against: the script's own fail-loud wiring message + ``exit
-    2``, for all three libs.
+    2``, for all four libs.
     """
 
     #: Exit 2 is the wiring/usage sentinel both gc scripts use for
@@ -151,11 +164,23 @@ class TestSiblingLibsTravelledWithTheScripts:
         # tuple needed no amendment).  Both scripts are already in the
         # parametrize list below, so both are covered by this one entry.
         'lib_lane_state.sh not found next to',
+        # The guard for the vendored citation grammar, added by task 5566 and
+        # reusing the same template verbatim — which is why this entry is one
+        # line and not a new spelling, and why the per-line scan below covers
+        # it too.  reify's own copy of the sourcing script does a BARE
+        # ``source``; dark-factory diverges (README "Delta 11") for the reason
+        # task 3370 gave for ``lib_portable.sh``.
+        'lib_task_citation.sh not found next to',
     )
 
     @pytest.mark.parametrize(
         'name',
-        ['warm-lane-gc.sh', 'warm-lane-gc-sweep.sh', 'warm-lane-audit.sh'],
+        [
+            'warm-lane-gc.sh',
+            'warm-lane-gc-sweep.sh',
+            'warm-lane-audit.sh',
+            'warm-lane-degenerate-ref-check.sh',
+        ],
     )
     def test_help_does_not_hit_a_sibling_wiring_error(self, name: str) -> None:
         script = WARM_LANE_SCRIPT_DIR / name
@@ -322,6 +347,77 @@ class TestAuditFailsLoudOnAMissingLibPortable:
         assert 'lib_portable.sh not found next to' not in proc.stderr, (
             'the lib_portable.sh guard fired even though the lib is present — '
             f'its `[ ! -f ]` test is inverted or mis-pathed.\nstderr:\n{proc.stderr}'
+        )
+
+
+class TestDegenerateRefCheckFailsLoudOnAMissingLibTaskCitation:
+    """``warm-lane-degenerate-ref-check.sh``'s citation-grammar guard.
+
+    Task 5566 moved the "cites task N" grammar out of this script and into
+    ``lib_task_citation.sh``, so the classifier now has a sibling it cannot run
+    without.  An absent one is a WIRING failure — exit 2, not the 1 bash's own
+    bare ``source`` produces under ``set -e``.  reify's copy of this script does
+    a BARE ``source``; dark-factory diverges for the reason task 3370 recorded
+    for ``lib_portable.sh``, and ``orchestrator/scripts/warm-lane/README.md``
+    "Delta 11" is the single home for that rationale.
+
+    The positive direction is already covered: the script joined
+    ``TestSiblingLibsTravelledWithTheScripts``'s parametrize list, which runs
+    its ``--help`` from the shipped directory and proves the lib travelled.
+    This class is the negative control that keeps that case from passing for
+    the wrong reason — a guard that had been deleted, or softened to bash's own
+    exit 1, would still leave the positive case green.
+    """
+
+    def test_a_copy_without_the_citation_lib_exits_2_naming_it(
+        self, tmp_path: Path,
+    ) -> None:
+        staged_dir = tmp_path / 'incomplete-deploy'
+        staged_dir.mkdir()
+        staged = staged_dir / 'warm-lane-degenerate-ref-check.sh'
+        staged.write_bytes(
+            (WARM_LANE_SCRIPT_DIR / 'warm-lane-degenerate-ref-check.sh').read_bytes(),
+        )
+        staged.chmod(0o755)
+
+        # Assert the fixture before asserting on it: a quietly-present sibling
+        # would keep the guard from firing and every assertion below would pass
+        # for the wrong reason.
+        assert not (staged_dir / 'lib_task_citation.sh').exists(), (
+            f'fixture is not an incomplete deployment: lib_task_citation.sh is '
+            f'present in {staged_dir}, so this case would pass vacuously'
+        )
+
+        proc = subprocess.run(
+            [_BASH, str(staged), '--help'],
+            cwd=str(staged_dir),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=_sanitized_env(),
+        )
+        combined = proc.stdout + proc.stderr
+
+        # --help normally exits 0, so a 2 additionally proves the guard fires
+        # BEFORE argv is parsed.
+        assert proc.returncode == TestSiblingLibsTravelledWithTheScripts.WIRING_EXIT, (
+            'an absent lib_task_citation.sh must be the wiring sentinel exit '
+            f'{TestSiblingLibsTravelledWithTheScripts.WIRING_EXIT}, not a runtime '
+            f'failure; rc={proc.returncode} stderr={proc.stderr!r}'
+        )
+        # Split around the message's U+2014 em dash so the pin does not depend
+        # on that codepoint surviving an editor.
+        assert 'warm-lane-degenerate-ref-check.sh: ERROR' in proc.stderr, (
+            'the failure must be attributed to the SCRIPT, not to bash; '
+            f'stderr={proc.stderr!r}'
+        )
+        assert (
+            'lib_task_citation.sh not found next to warm-lane-degenerate-ref-check.sh'
+            in proc.stderr
+        ), f'the fail-loud message must name the missing sibling; {proc.stderr!r}'
+        assert 'lib_task_citation.sh: No such file' not in combined, (
+            "bash's own bare-`source` failure shape is still reachable — the "
+            f'guard is missing or sits AFTER the source.\noutput:\n{combined}'
         )
 
 

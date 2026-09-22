@@ -89,6 +89,9 @@ Five phases, strictly ordered by dependency. Every task is behaviour-preserving
 (§ Contract) and must leave `test_merge_lane_ratchet.py` green — a task that
 moves code lowers the baseline it moved away from in the same commit; a task can
 never raise one.
+[Scoped by Correction 8 below (2026-09-17, task 5406): the sentence's subject is
+this PRD's five behaviour-preserving phases; net-additive work outside them has
+an authorized-raise path. Left as written.]
 
 **Phase 0 — instruments (α).** A metrics script and a ratchet test with a committed
 baseline. Nothing else starts until this is on `main`.
@@ -635,3 +638,36 @@ Filed batch: tasks **5021–5049** (α=5021, ζ1=5022, β=5023, γ1–γ10=5024�
    now-callerless accessors and reading `file_cognitive_measures` once.) The
    ceiling and the INV-10/INV-11 prohibitions above are unchanged — this is a
    correction of measured facts, not a renegotiation.
+
+8. **"A task can never raise one" is scoped to this PRD's own phases; net-additive
+   work has an authorized-raise path** (2026-09-17, task 5406). The Sketch-of-approach
+   sentence is scoped by its own subject — "*Every task* is behaviour-preserving
+   (§ Contract) … a task can never raise one" — and for the five phases it governs
+   "never raise" is exactly right: a refactor that grows the cluster has failed at
+   the thing it was for. But the ratchet TEST measures the cluster regardless of a
+   task's provenance, so it fires on net-additive work too, and under a literal
+   reading of the sentence no bug fix could ever land in the merge lane — which
+   cannot be the intent of an instrument built to improve that lane's quality.
+
+   **Forcing case:** task 5342 (esc-5342-1, commit `bbfbf1059e`) repaired a
+   rename-blind post-merge equivalence gate that false-blocked correct merges —
+   one blocked reify task, two escalations and a human session. The fix was
+   net-additive, so the ratchet fired on a correct change. The alternative to
+   raising was reshaping a landed, tested design to chase a line count, which
+   `~/.claude/CLAUDE.md` forbids outright ("never steer quality work by raw line
+   count or average complexity"), and splitting one coherent unit across files to
+   dodge a derived cluster total fights heuristics 13/14 and SPOT.
+
+   **Resolution:** an unreviewed raise is still refused — now by `--write-baseline`
+   itself rather than only by prose, so a raise can no longer be absorbed by
+   regenerating the file that would have caught it. A reviewed one lands as a diff
+   in `orchestrator/tests/merge_lane_ratchet_authorized_raises.json` naming the
+   task, the reason and the exact per-measure delta, derived from the measurement
+   rather than typed. Ceiling breaches count as raises for that gate too; a ledger
+   entry authorizes nothing in future, since authorization is the act of passing
+   `--authorize-raise`, not a standing record.
+
+   **Rejected:** scoping the rule by a machine-readable "behaviour-preserving"
+   task signal. No trustworthy signal exists — task metadata is author-supplied,
+   and 5342 itself arrived as an ordinary bug-fix task carrying no such marker.
+   Hence the scoping is prose (this entry) and the enforcement is mechanical.

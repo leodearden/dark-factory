@@ -37,6 +37,7 @@ import asyncio
 import contextlib
 import dataclasses
 import json
+import os
 import shlex
 import time
 import uuid
@@ -50,7 +51,12 @@ from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 from orchestrator import flake_ledger, verify
 from orchestrator.config import ModuleConfig
 from orchestrator.verify import VerifyResult, _archive_merge_verify_logs
-from orchestrator.verify_cancel import HEARTBEAT_INTERVAL_SECS
+from orchestrator.verify_cancel import (
+    HEARTBEAT_INTERVAL_SECS,
+    SSH_SERVER_ALIVE_COUNT_MAX,
+    SSH_SERVER_ALIVE_INTERVAL,
+    start_stdin_heartbeat,
+)
 from orchestrator.verify_categories import FailureCategory, _assert_sentinels_disjoint
 
 if TYPE_CHECKING:
@@ -270,7 +276,44 @@ class MergeVerifySpec:
     verify_commands     : one VerifyCommand per module, scoped to task_files
     unscoped_typecheck  : the _run_unscoped_typechecks gate spec
     task_files          : files in the merge commit (None → full verify)
-    verify_env          : environment overrides (RUSTC_WRAPPER, CARGO_INCREMENTAL, …)
+    verify_env          : environment overrides (RUSTC_WRAPPER, CARGO_INCREMENTAL, …).
+                          APPLIED ONTO the consuming host's config in
+                          run_merge_verify_on_worktree (task 5496): the spec wins
+                          on conflict, host keys absent from the spec are
+                          preserved. Neither 'replace' nor 'ignore' — the spec is
+                          dispatcher-shaped, while a remote runner's own --config
+                          carries per-host local necessities no dispatcher-built
+                          spec can know (a narrower verify-only host widening its
+                          own per-host-measured timeout budgets is the live case).
+                          MERGE-DECIDING, not cosmetic: these keys SELECT TESTS,
+                          so a remote green reached under a different env is the
+                          task-2822 false-green class, not a performance detail.
+                          Path-valued keys ship VERBATIM and resolve against the
+                          REMOTE filesystem — no rewrite, no denylist, on purpose:
+                          the per-module path already ships them verbatim, and a
+                          name-based filter would put one project's vocabulary
+                          inside generic transport code and re-diverge the two
+                          paths task 5496 unified. Which keys a project sets, and
+                          why any of them is deliberately absolute, stays in that
+                          project's own dark-factory-orchestrator.yaml — its single
+                          home (INV-9), and the file to read before assuming what a
+                          key here means.
+                          Residual risk on a REMOTE dispatch is wasted wall-clock,
+                          not a false green. The measured case is the retry env
+                          from
+                          orchestrator/src/orchestrator/merge_queue.py::_build_retry_verify_env:
+                          its *_NEXTEST_FILTER_FILE_* values are dispatcher-absolute
+                          paths to UNTRACKED files that git push does not carry, so
+                          the remote finds them missing — and reify's consumer then
+                          refuses to narrow, loudly, and runs that profile FULL (an
+                          independent tree-OID guard refuses the same way on a
+                          drifted sidecar). The same dict's REIFY_RUN_ALL_MEMBER_SUBSET
+                          and REIFY_GUI_RETRY_SPECS DO narrow remotely, uncorroborated
+                          by that guard, and are sound here: the remote verifies the
+                          same pushed tree and consumes no dispatcher build artefacts.
+                          Making the filter files shippable needs merge_queue.py
+                          (outside task 5496's scope); follow-up ticket
+                          tkt_0RTNRCDNA8DDHVN6P8ZNV2JXXK.
     cold_timeout_secs   : merge_verify_cold cascade timeout
     is_merge_verify     : always True for merge-path specs (default)
     merge_verify_workspace : force-workspace profile of the merge gate (fix a,
@@ -592,6 +635,46 @@ async def run_merge_verify_on_worktree(
         'merge_verify_workspace': spec.merge_verify_workspace,
         'merge_verify_breadth': spec.merge_verify_breadth,
     }
+    # Task 5496 — the spec's verify_env is APPLIED ONTO the reconstructed remote
+    # config: the spec wins on conflict, host keys absent from the spec are
+    # preserved. Without this the zero-module-config path (spec.verify_commands
+    # == (), e.g. reify) reconstructs no ModuleConfig at all, so spec.verify_env
+    # has NO consumer and the remote decides the merge under its own config's
+    # test-selection env — the task-2822 false-green class, since these keys
+    # select which tests run.
+    #
+    # Neither of the two simpler rules works. 'Ignore' (the pre-fix behaviour) is
+    # the defect. 'Replace' (dict(spec.verify_env)) would drop the host's own
+    # local necessities, which are by construction absent from any
+    # dispatcher-built spec: a remote runner is dispatched against its OWN
+    # --config, and a narrower verify-only host widens its per-host-measured
+    # timeout budgets there — values the dispatching workstation never measured
+    # and cannot ship, which 'replace' would silently narrow back to the
+    # workstation's. The spec is dispatcher-shaped and the host config is
+    # host-shaped; only a merge carries both.
+    #
+    # This is not a NEW rule: orchestrator/src/orchestrator/verify.py::_resolve_verify_env
+    # already computes exactly {**config.verify_env, **module_config.verify_env}
+    # on the per-module path. The merge here is therefore byte-identical there —
+    # _resolve_verify_env re-applies the same spec env from ModuleConfig.verify_env
+    # on top of it ({**{**H, **S}, **S} == {**H, **S}) — and the change simply
+    # makes the ONE existing rule uniform across both paths.
+    #
+    # Spelling constraints:
+    #  - A FRESH dict, never config.verify_env.update(...). model_copy carries
+    #    the field's VALUE over unchanged, so the copy's mapping can be the SAME
+    #    dict object as the caller's — the same hazard the task-4536 registry
+    #    comment below spells out. An in-place write would corrupt the config
+    #    cli.py loaded from disk and may still use.
+    #  - Reads effective_verify_env, the PROPERTY, mirroring the producer
+    #    (build_merge_verify_spec above) so the wire round-trip is symmetric;
+    #    writes the verify_env FIELD, because the property is read-only and
+    #    _resolve_verify_env — the sole builder of the executed env — reads the
+    #    field.
+    #  - UNCONDITIONAL. An empty spec env means "the dispatcher has no verify
+    #    env", which under this rule already leaves every host key intact, so a
+    #    guard would buy a branch with no behavioural difference.
+    config_update['verify_env'] = {**config.effective_verify_env, **spec.verify_env}
     # INV-1, task 2883 — a zero-module-config spec ships the dispatching side's
     # global full-gate commands; apply them onto the reconstructed remote config
     # so the remote runs the SAME gate as local (the module_configs=[] Site-2
@@ -913,27 +996,17 @@ class LocalRunner:
 # ---------------------------------------------------------------------------
 
 
-# Archive timestamp format — mirrors _archive_merge_verify_logs (verify.py:827).
+# Archive timestamp format — mirrors verify.py::_archive_stamp.
 # Microsecond precision ensures uniqueness across back-to-back ENOSPC retries for
 # the same task; the format is still lexicographically sortable.
 _STDERR_ARCHIVE_TS_FMT = '%Y%m%dT%H%M%S_%fZ'
 
-# task-2362: ssh keepalive tuning. ConnectTimeout bounds only the initial TCP
-# connect, not a mid-session stall — if the TCP session goes silently dead
-# (NAT/conntrack timeout, network partition, wedged remote process producing
-# no output), an ssh child with no keepalive can block indefinitely. These
-# ServerAlive probes ride the live TCP session (independent of stdout cadence),
-# so ssh itself detects a dead peer and exits non-zero within
-# SSH_SERVER_ALIVE_INTERVAL * SSH_SERVER_ALIVE_COUNT_MAX seconds ->
-# RunnerUnavailable -> existing re-dispatch / local-fallback path (incident
-# 5111). A long-but-progressing remote verify keeps the session alive and is
-# unaffected. Values are chosen well inside the remote verify timeout budget.
-SSH_SERVER_ALIVE_INTERVAL = 15
-SSH_SERVER_ALIVE_COUNT_MAX = 4
-
 # Shared base ssh options for all four RemoteRunner ssh argv sites (health,
 # run_merge_verify dispatch, cancel_verify, probe_clean) — kept in one place
-# so the keepalive flags can't drift apart across sites.
+# so the keepalive flags can't drift apart across sites. The two keepalive
+# values themselves are imported from verify_cancel, which derives the remote
+# watchdog's deadline from them (task 4195), so the transport's dead-peer
+# verdict and the watchdog's cannot drift apart either.
 _SSH_BASE_OPTS = [
     '-o', 'BatchMode=yes',
     '-o', 'ConnectTimeout=10',
@@ -994,67 +1067,122 @@ async def _default_subprocess_run(
     )
 
 
+#: Ceiling on the teardown join of the stdin-heartbeat writer thread in
+#: :func:`_default_ssh_heartbeat_run`.  A WEDGE DETECTOR, not a cadence: the
+#: writer's only blocking operation is a ``threading.Event.wait`` that ``stop()``
+#: ends within one GIL switch, and its write end is non-blocking so ``os.write``
+#: can never park on a full pipe — so 5.0s is ~6x the ~0.85s worst single-gap
+#: additive scheduling delay measured at loadavg 113-178 (recorded in
+#: ``test_laptop_warm_verify_boundary.py``'s ``HeartbeatWriter`` comment) and is
+#: never reached in practice.
+#:
+#: WHO PAYS THE WAIT: not the event loop.  ``Thread.join`` is synchronous, and
+#: the coroutine that tears the writer down runs on the orchestrator's single
+#: shared loop — the loop whose 14.8-16.1s stalls are why the beat moved to a
+#: thread in the first place.  Joining inline would hand that loop a fresh
+#: self-inflicted stall of up to this bound, so the join is awaited through
+#: ``asyncio.to_thread``: a wedged writer costs its own dispatch's teardown and
+#: nothing else.
+#:
+#: Bounded at all, rather than a bare ``join()``, because an unbounded one would
+#: let a single pathological writer hold a merge-lane dispatch open forever —
+#: the failure class this protocol exists to remove, re-introduced at the other
+#: end.  Giving up is safe: the thread is ``daemon=True`` so it cannot block
+#: interpreter shutdown, and it still closes its own fd in its own ``finally``
+#: whenever it does finish, so that fd can never be closed out from under a
+#: reused descriptor.
+HEARTBEAT_STOP_JOIN_SECS: float = 5.0
+
+
 async def _default_ssh_heartbeat_run(
     argv: list[str],
     *,
     cwd: str | Path | None = None,
     heartbeat_interval: float = HEARTBEAT_INTERVAL_SECS,
+    start_heartbeat=start_stdin_heartbeat,
 ) -> tuple[int, str, str]:
     """Default ssh-dispatch subprocess helper — like :func:`_default_subprocess_run`,
     plus a stdin heartbeat (connection-death protocol, PRD §8.1).
 
-    Opens *argv* with ``stdin=PIPE`` (unlike :func:`_default_subprocess_run`,
-    whose stdin is unset/inherited) and runs a concurrent writer task that
-    sends a heartbeat newline down the child's stdin every
+    Opens *argv* on the read end of a pipe this coroutine owns (unlike
+    :func:`_default_subprocess_run`, whose stdin is unset/inherited) and beats
+    one ``verify_cancel.HEARTBEAT_TOKEN`` down the write end every
     *heartbeat_interval* seconds for the full duration of the call.  This is
     the dispatcher half of the connection-death protocol: the remote
-    verify-merge watchdog (``verify_cancel.run_stdin_watchdog``) fires if
-    heartbeats stop arriving, tying the remote build's lifetime to this ssh
-    child's lifetime.
+    verify-merge watchdog (``verify_cancel.run_stdin_watchdog``) fires if beats
+    stop arriving, tying the remote build's lifetime to this ssh child's
+    lifetime.
 
-    A heartbeat write failing with ``BrokenPipeError``/``ConnectionResetError``
-    means the child is already gone (EPIPE) — benign, since the existing
-    transport-failure handling (non-zero rc / unparseable stdout ->
-    RunnerUnavailable) already covers the dead-channel outcome.  Swallowed so
-    it never raises out of the writer nor alters the returned
-    ``(rc, stdout, stderr)``.  The writer task is cancelled once stdout/stderr
-    have been fully read and the child has exited.
+    The beat is written from a dedicated OS thread
+    (``verify_cancel.start_stdin_heartbeat``), NOT an asyncio task on this
+    coroutine's loop.  That loop is the orchestrator's single shared one —
+    scheduler, agent dispatch, merge worker, uvicorn escalation server — and a
+    producer scheduled behind its stalls stops beating for exactly as long as
+    the stall lasts, which the remote correctly reads as a dead channel.
+    Owning a raw pipe is what makes the thread possible: ``proc.stdin`` would
+    be a loop-bound ``StreamWriter`` whose ``write``/``drain`` must not be
+    called from another thread, and routing through ``call_soon_threadsafe``
+    would put the write back on the very loop whose stalls are the defect.
+
+    A failed beat never raises out of the writer nor alters the returned
+    ``(rc, stdout, stderr)``; ``verify_cancel.run_stdin_heartbeat`` names each
+    suppressed error and why it is benign.
+
+    The writer is stopped and joined before this returns, so it can never
+    outlive its dispatch; the join is bounded by
+    :data:`HEARTBEAT_STOP_JOIN_SECS` and is awaited OFF this loop (see that
+    constant: joining inline would re-create, in the teardown, exactly the
+    loop stall the beat was moved to a thread to survive).
+    *start_heartbeat* is injectable
+    (default ``verify_cancel.start_stdin_heartbeat``) so tests can observe the
+    writer's lifetime, mirroring this module's ``run`` / ``ssh_run`` /
+    ``id_factory`` seams.
 
     Deliberately does NOT use ``proc.communicate()`` (task 2309 boundary gate,
     SS9 Row 6): ``communicate()`` unconditionally calls its internal
     ``_feed_stdin(input)`` helper whenever ``self.stdin is not None`` — true
-    here since this coroutine opens with ``stdin=PIPE`` — and ``_feed_stdin``
-    closes ``proc.stdin`` right after (a no-op) write/drain, even when
-    ``input`` is ``None``.  That closes the connection-death channel within
-    milliseconds of spawn, racing the heartbeat writer above so real
+    whenever this coroutine opens with ``stdin=PIPE``, as it once did — and
+    ``_feed_stdin`` closes ``proc.stdin`` right after (a no-op) write/drain,
+    even when ``input`` is ``None``.  That closes the connection-death channel
+    within milliseconds of spawn, racing the heartbeat writer so real
     heartbeats never reach the child — confirmed via a real child that reports
     back exactly what it read from stdin (a plain ``readline()``-based check
     is fooled: EOF unblocks a blocking read the same as a real newline would,
     so it can't tell "closed" from "heartbeat delivered").  Reading the
     streams directly (mirroring ``communicate()``'s own
-    ``gather(...); await self.wait()`` shape, minus the stdin feed/close)
-    keeps ``proc.stdin`` open for the full duration instead.
+    ``gather(...); await self.wait()`` shape, minus the stdin feed/close) kept
+    the channel open for the full duration instead.
+
+    Task 4195 changed that paragraph's premise without changing its
+    conclusion: with ``stdin=<raw fd>`` ``proc.stdin`` is ``None``, so
+    ``_feed_stdin`` never fires and ``communicate()`` is technically safe here
+    again.  The direct read is retained anyway, and the record above kept,
+    because reverting to ``stdin=PIPE`` is the single edit that would silently
+    re-arm the defect — this paragraph is the only thing standing in its way.
     """
-    proc = await asyncio.create_subprocess_exec(
-        *argv,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=cwd,
-    )
-
-    async def _heartbeat() -> None:
-        assert proc.stdin is not None  # stdin=PIPE above guarantees this
-        while True:
-            await asyncio.sleep(heartbeat_interval)
-            try:
-                proc.stdin.write(b'\n')
-                await proc.stdin.drain()
-            except (BrokenPipeError, ConnectionResetError):
-                pass  # child already gone -- benign, transport-failure path handles it
-
-    heartbeat_task = asyncio.ensure_future(_heartbeat())
+    # Ordering is load-bearing.  The writer is started BEFORE the spawn so that
+    # exactly ONE owner exists for write_fd on every path: if
+    # create_subprocess_exec raises, the outer finally stops the thread, which
+    # closes the fd in its own finally, and nothing leaks.  start_stdin_heartbeat
+    # puts the write end in non-blocking mode itself, so a full pipe raises
+    # BlockingIOError in the writer (skipping one beat) instead of parking that
+    # thread forever and wedging the teardown join below.
+    read_fd, write_fd = os.pipe()
+    heartbeat = start_heartbeat(write_fd, interval=heartbeat_interval)
     try:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=read_fd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=cwd,
+            )
+        finally:
+            # The child holds its own dup.  A reader left open in the parent
+            # would stop a dead child's pipe from ever raising BrokenPipeError
+            # — the signal the writer's suppression is built around.
+            os.close(read_fd)
         # stdout=PIPE/stderr=PIPE above guarantees these are populated; an
         # explicit check (rather than a bare assert) keeps the guard live
         # under `python -O`, which strips asserts.
@@ -1067,11 +1195,15 @@ async def _default_ssh_heartbeat_run(
         stdout_b, stderr_b = await asyncio.gather(stdout_r.read(), stderr_r.read())
         await proc.wait()
     finally:
-        heartbeat_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await heartbeat_task
-        if proc.stdin is not None and not proc.stdin.is_closing():
-            proc.stdin.close()
+        # The writer owns write_fd and closes it as it exits; that close is what
+        # delivers EOF to the remote's watchdog.  stop() is synchronous and
+        # instant; the join that follows is not, so it is paid on a worker
+        # thread — this coroutine's loop is the shared one (see
+        # HEARTBEAT_STOP_JOIN_SECS).  A CancelledError raised at that await
+        # during shutdown is harmless: stop() has already been signalled, the
+        # thread is daemon=True, and it closes its own fd in its own finally.
+        heartbeat.stop()
+        await asyncio.to_thread(heartbeat.thread.join, HEARTBEAT_STOP_JOIN_SECS)
 
     return (
         proc.returncode or 0,
@@ -1717,8 +1849,8 @@ class RemoteRunner:
         sibling of 1768).  Timestamp format and name sanitization mirror _archive_merge_verify_logs
         (verify.py:779-856) via _STDERR_ARCHIVE_TS_FMT and _sanitize_runner_name.
 
-        The attempt number is pinned to 1, matching the local merge path's ``attempt_id or 1``
-        default (verify.py:2529).  Microsecond-precision timestamps already guarantee filename
+        The attempt number is pinned to 1, matching the local merge path's default
+        (``verify.py::_archive_attempt_id``).  Microsecond-precision timestamps already guarantee filename
         uniqueness across back-to-back ENOSPC retries, so threading attempt_id through the call
         chain is unnecessary and would complicate the interface for no triage benefit.
 

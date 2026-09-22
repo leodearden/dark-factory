@@ -37,6 +37,7 @@ from orchestrator.flake_report import (
     LEDGER_NO_TABLES,
     LEDGER_OK,
     LEDGER_UNREADABLE,
+    MERGE_GATE_SPLICE_DEFECT_END,
     DebtReportRow,
     FlakeLedgerReport,
     GateBlindCounter,
@@ -671,9 +672,15 @@ class TestBuildReport:
             _seed_occurrence(db_path, test_id=UNKNOWN_TEST_ID,
                              observed_at=f'2026-08-09T0{i}:00:00+00:00',
                              verdict=FlakeVerdict.unconfirmable)
+        # main_probe, not the default merge_gate: this fixture's stamps predate
+        # MERGE_GATE_SPLICE_DEFECT_END, and a pre-cutoff merge_gate fails_in_isolation
+        # row is exactly what the task-5580 exclusion discards.  The row's purpose here
+        # is to be a CONFIRMED RED the counters see, and main_probe is where such a red
+        # was real in that period — its engine never took the spliced path.
         _seed_occurrence(db_path, test_id='tests/test_b.py::test_two',
                          observed_at='2026-08-09T20:00:00+00:00',
-                         verdict=FlakeVerdict.fails_in_isolation)
+                         verdict=FlakeVerdict.fails_in_isolation,
+                         call_site=FlakeCallSite.main_probe)
         return db_path
 
     def test_report_sees_the_db(self, tmp_path):
@@ -740,6 +747,149 @@ class TestBuildReport:
         assert [c.test_id for c in report.chains] == ['tests/test_old.py::test_x']
         assert report.chains[0].debt is not None
         assert report.chains[0].occurrence_count == 0
+
+
+class TestSplicedMergeGateRowsAreNotEvidence:
+    """The pre-fix ``merge_gate`` reds are not observations ABOUT ANY TEST (task 5580).
+
+    Until this task, :func:`verify.confirm_isolated_rerun_verdict` built the isolated
+    re-run as a string and a second rewrite spliced ``--junitxml`` between ``--timeout``
+    and its value, so pytest rejected the argv (rc=4, ``argument --timeout: expected one
+    argument``) without ever running a test — and the discriminator recorded that
+    rejection as ``fails_in_isolation``.  Every one of those rows says something about
+    the command the gate rendered, and nothing about the test it names.
+
+    Every stamp below is derived from :data:`MERGE_GATE_SPLICE_DEFECT_END` rather than
+    written out, so the fixtures cannot drift away from the bound they are probing.
+    """
+
+    @staticmethod
+    def _cutoff() -> datetime:
+        stamp = _parse_stamp(MERGE_GATE_SPLICE_DEFECT_END)
+        assert stamp is not None, 'the cutoff constant must itself be a parseable stamp'
+        return stamp
+
+    @classmethod
+    def _now(cls) -> datetime:
+        """A wall clock just after the cutoff, so BOTH sides of it sit in the window."""
+        return cls._cutoff() + timedelta(hours=2)
+
+    @classmethod
+    def _before(cls) -> str:
+        return (cls._cutoff() - timedelta(hours=1)).isoformat()
+
+    @classmethod
+    def _after(cls) -> str:
+        return (cls._cutoff() + timedelta(hours=1)).isoformat()
+
+    @staticmethod
+    def _ledger(tmp_path: Path, rows: list[dict]) -> Path:
+        db_path = tmp_path / 'runs.db'
+        ensure_schema(db_path)
+        for row in rows:
+            _seed_occurrence(db_path, **row)
+        return db_path
+
+    def test_pre_cutoff_merge_gate_fails_in_isolation_is_excluded(self, tmp_path):
+        db_path = self._ledger(tmp_path, [
+            dict(test_id='tests/test_a.py::test_one', observed_at=self._before(),
+                 verdict=FlakeVerdict.fails_in_isolation, call_site=FlakeCallSite.merge_gate),
+        ])
+        report = build_report(db_path, now=self._now())
+        # Asserted through the aggregates rather than by reaching into the partition:
+        # the claim is that the counters never SAW the row, and these are the three
+        # places a row that reached them would show up.
+        assert report.gate_blind.total == 0, 'a spliced re-run is not an observation'
+        assert report.chains == [], 'a spliced re-run must own no recurrence chain'
+        assert report.systemic.peak_distinct_tests == 0
+        assert report.excluded_non_evidence == 1
+
+    def test_the_cutoff_bound_is_inclusive(self, tmp_path):
+        # The cutoff is the fix's AUTHORING instant, so a row stamped exactly at it
+        # still predates the fixed code by construction.
+        db_path = self._ledger(tmp_path, [
+            dict(test_id='tests/test_a.py::test_one', observed_at=MERGE_GATE_SPLICE_DEFECT_END,
+                 verdict=FlakeVerdict.fails_in_isolation, call_site=FlakeCallSite.merge_gate),
+        ])
+        report = build_report(db_path, now=self._now())
+        assert report.excluded_non_evidence == 1
+        assert report.gate_blind.total == 0
+
+    def test_the_exclusion_is_narrow(self, tmp_path):
+        """Only the one cell is discarded — every neighbouring row stays evidence.
+
+        The defect could only produce a ``fails_in_isolation`` verdict at the
+        ``merge_gate`` call site before the fix: ``main_probe``'s engine passes
+        ``role='task'``, so no junit path is computed and the second rewrite never
+        happens.  Anything wider than that one cell would start deleting real reds.
+        """
+        db_path = self._ledger(tmp_path, [
+            dict(test_id='tests/test_a.py::test_one', observed_at=self._before(),
+                 verdict=FlakeVerdict.fails_in_isolation, call_site=FlakeCallSite.merge_gate),
+            dict(test_id='tests/test_b.py::test_kept_unconfirmable', observed_at=self._before(),
+                 verdict=FlakeVerdict.unconfirmable, call_site=FlakeCallSite.merge_gate),
+            dict(test_id='tests/test_c.py::test_kept_passes', observed_at=self._before(),
+                 verdict=FlakeVerdict.passes_in_isolation, call_site=FlakeCallSite.merge_gate),
+            dict(test_id='tests/test_d.py::test_kept_probe', observed_at=self._before(),
+                 verdict=FlakeVerdict.fails_in_isolation, call_site=FlakeCallSite.main_probe),
+            dict(test_id='tests/test_e.py::test_kept_post_fix', observed_at=self._after(),
+                 verdict=FlakeVerdict.fails_in_isolation, call_site=FlakeCallSite.merge_gate),
+        ])
+        report = build_report(db_path, now=self._now())
+        assert report.excluded_non_evidence == 1
+        assert report.gate_blind.total == 4
+        assert {c.test_id for c in report.chains} == {
+            'tests/test_b.py::test_kept_unconfirmable',
+            'tests/test_c.py::test_kept_passes',
+            'tests/test_d.py::test_kept_probe',
+            'tests/test_e.py::test_kept_post_fix',
+        }
+
+    def test_an_unparseable_stamp_is_kept(self, tmp_path):
+        # `_parse_stamp` degrades to None for a stamp it cannot read, and a row whose
+        # clock cannot be read is NOT known to predate the fix.  Dropping data on a
+        # parse failure is the silent degradation this module's docstring fights.
+        db_path = self._ledger(tmp_path, [
+            dict(test_id='tests/test_a.py::test_one', observed_at='not-a-stamp',
+                 verdict=FlakeVerdict.fails_in_isolation, call_site=FlakeCallSite.merge_gate),
+        ])
+        report = build_report(db_path, now=self._now())
+        assert report.excluded_non_evidence == 0
+        assert report.gate_blind.total == 1
+        assert [c.test_id for c in report.chains] == ['tests/test_a.py::test_one']
+
+    def test_excluded_count_is_reported(self, tmp_path):
+        """An exclusion the operator cannot see is a lie by omission."""
+        db_path = self._ledger(tmp_path, [
+            dict(test_id=f'tests/test_{i}.py::test_x', observed_at=self._before(),
+                 verdict=FlakeVerdict.fails_in_isolation, call_site=FlakeCallSite.merge_gate)
+            for i in range(3)
+        ])
+        report = build_report(db_path, now=self._now())
+        assert report.excluded_non_evidence == 3
+        rendered = render_report(report)
+        named = [ln for ln in rendered.splitlines() if MERGE_GATE_SPLICE_DEFECT_END in ln]
+        assert named, rendered
+        line = named[0]
+        assert '3' in line, line
+        # The reason, not just the number: a count with no cause is unactionable.
+        assert '5580' in line, line
+
+    def test_nothing_excluded_renders_nothing(self, tmp_path):
+        # render_report is byte-deterministic and every section prints even when empty;
+        # an exclusion line for zero excluded rows would be noise in every report ever
+        # rendered after this task.
+        db_path = self._ledger(tmp_path, [
+            dict(test_id='tests/test_a.py::test_one', observed_at=self._before(),
+                 verdict=FlakeVerdict.passes_in_isolation, call_site=FlakeCallSite.merge_gate),
+        ])
+        report = build_report(db_path, now=self._now())
+        assert report.excluded_non_evidence == 0
+        assert MERGE_GATE_SPLICE_DEFECT_END not in render_report(report)
+        # And the same for a report built by hand without the field at all — the render
+        # tests below construct these directly, so the default has to mean "nothing
+        # was excluded".
+        assert MERGE_GATE_SPLICE_DEFECT_END not in render_report(_report())
 
 
 class TestThresholdPlumbing:

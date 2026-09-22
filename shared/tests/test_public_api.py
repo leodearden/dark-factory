@@ -152,7 +152,8 @@ class TestModuleLevelAll:
 
         assert hasattr(async_sqlite_base, '__all__'), 'async_sqlite_base must define __all__'
         assert set(async_sqlite_base.__all__) == {
-            'apply_wal_pragmas', 'apply_full_durability_pragmas', 'connect_daemon', 'CheckpointResult', 'AsyncSqliteBase'
+            'apply_wal_pragmas', 'apply_full_durability_pragmas', 'connect_daemon', 'CheckpointResult',
+            'AtomicConnection', 'AsyncSqliteBase',
         }
 
     def test_locking_all(self):

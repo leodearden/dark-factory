@@ -20,7 +20,22 @@
 #       (wiring error) before argv is parsed (A9, task 5572 review); the same
 #       contract for the new sibling scripts/lib_lane_state.sh, with
 #       lib_live_refs.sh PRESENT so A9's guard cannot account for it
-#       (A10, task 3075)
+#       (A10, task 3075); --max-record-age-days is validated and a
+#       misconfiguration is FATAL, because EVERY wrong bound is invisible in
+#       the summary line: missing value, non-integer and negative all exit 2
+#       (A11a-A11d), and so do the two doors the `^[0-9]+$` first cut ACCEPTED
+#       — a LEADING ZERO read as octal and an OVERFLOWING magnitude that
+#       wrapped the multiply negative (A11e-A11k, which also pin the env var as
+#       the guard's second door). A11l is the non-vacuity case. What each door
+#       measurably did lives in orchestrator/scripts/warm-lane/README.md
+#       "Delta 10"; what is pinned HERE is only that the guard rejects it
+#       (task 5504)
+#   A11-boundary — the bound is validated BEFORE any lane is touched, which no
+#       Block A case can reach because A7's fixture has no lanes. Glob order
+#       puts a reclaimable lane ahead of the assigned one, so a boundary guard
+#       and a mid-pass abort are distinguishable from the first lane alone: a
+#       misconfigured bound must reclaim NOTHING and exit 2, not reclaim half a
+#       pool and die with exit 1 and no summary line (task 5504)
 #   B — reset a divergent FREE lane (seed-script invoked with resolved gen path)
 #   C — remove an orphaned-landed clean worktree
 #   D — always-reclaim (task 5326): a DIRTY POOL LANE is now RECLAIMED (reset),
@@ -40,7 +55,11 @@
 #       the live-reference gate covers THIS branch too — Block P only ever
 #       drives the α branch, so gc.sh's "before BOTH reset branches" claim was
 #       structurally true but unasserted on the destructive one (task 5572
-#       review)
+#       review). K5 and S-pressure are the TWO HALVES OF ONE CONTRACT — K5
+#       pins that --disk-pressure still HONOURS the live-reference gate,
+#       S-pressure that it DOWNGRADES the record gate; a reader who meets
+#       either should read the other, because "downgrade" is only safe
+#       BECAUSE the gate K5 pins is still standing (task 5504)
 #   M — ephemeral verify/sweep worktrees (_mainsweep-*/_mainprobe-*) protected
 #       by the DEFAULT protect-glob, DF-faithful (--mount only, no
 #       --protect-glob) (task 5221)
@@ -89,7 +108,25 @@
 #       record is loud while the ordinary recordless case stays quiet;
 #       S-toctou pins PLACEMENT — a lane assigned MID-PASS is still preserved,
 #       so the read cannot be hoisted into an up-front classification pass
-#       without going RED (GREEN on arrival, like Block R)
+#       without going RED (GREEN on arrival, like Block R).
+#       Task 5504 BOUNDS that preserve, because an unbounded one composed with
+#       the gate's position before the --disk-pressure branch held the ENOSPC
+#       valve shut with the very failure it responds to (a release whose
+#       durable write hit ENOSPC and was swallowed leaves `assigned` on disk
+#       while the pool reads FREE). Two orthogonal downgrade reasons, OR'd:
+#       S-pressure pins the ACUTE one — --disk-pressure downgrades the gate
+#       to warn-and-fall-through, with a two-arm fixture proving the change is
+#       scoped to the emergency path, and with a live-referenced lane proving
+#       "downgrade" means FALL THROUGH to the /proc gate, never reclaim
+#       outright; S-age pins the CHRONIC one — a record whose `updated_at` is
+#       older than --max-record-age-days (default 14) is downgraded in every
+#       mode, with a fresh sibling preserved in the same pass so it is
+#       discrimination and not blanket expiry, plus `0` as the escape hatch
+#       and the REIFY_WARM_LANE_GC_MAX_RECORD_AGE_DAYS knob; S-age-degrade
+#       pins the DELIBERATE ASYMMETRY — an unreadable STATE reclaims (S15/S17)
+#       while an unreadable AGE preserves loudly, and Arm B pins that the
+#       acute valve is never subject to that fail-safe because the
+#       --disk-pressure leg is evaluated first
 #   X — the DEFAULT protect-glob is RENDERED from dark-factory's
 #       PROTECTED_PREFIXES via lib_lane_state.sh's lane_protect_glob, not
 #       hand-mirrored as a literal (task 3292). X-band pins the observable
@@ -423,6 +460,177 @@ assert "A10a: missing sibling lib_lane_state.sh exits 2 (wiring error, not runti
 # assertion data.
 assert "A10b: stderr names the missing library with the registered fragment" \
     bash -c 'printf "%s\n" "$1" | grep -qF "lib_lane_state.sh not found next to"' _ "$A10_ERR"
+
+# A11: --max-record-age-days is validated, and a misconfiguration is FATAL
+# (task 5504). A bound is a safety valve, and both silent failure directions
+# are invisible in the summary line: silently defaulting would leave an
+# operator believing they had widened it, and silently zeroing would disable
+# the valve outright while `downgraded_assigned=0` reads as "nothing was
+# stale". Neither is discoverable from the output, so the misconfiguration
+# must be loud at the boundary. Exit 2, the usage/WIRING class — nothing about
+# the invocation could have avoided it.
+run_helper reclaim \
+    --worktrees-dir "$A7_WORKTREES" \
+    --base-target "$A7_BASE/target" \
+    --max-record-age-days
+assert "A11a: --max-record-age-days with NO value exits 2 (requires-a-value guard)" \
+    test "$RC" -eq 2
+
+run_helper reclaim \
+    --worktrees-dir "$A7_WORKTREES" \
+    --base-target "$A7_BASE/target" \
+    --max-record-age-days notanumber
+assert "A11b: --max-record-age-days notanumber exits 2" test "$RC" -eq 2
+# `grep -qF --` is load-bearing: without the end-of-options marker grep parses
+# the pattern itself as an unrecognized long option and exits 2, which reads as
+# "no match" and would make this assertion silently un-assertable.
+assert "A11c: ...and stderr names the flag and the offending value" \
+    bash -c 'printf "%s\n" "$1" | grep -qF -- "--max-record-age-days" && printf "%s\n" "$1" | grep -qF -- "notanumber"' _ "$ERR_OUT"
+
+# A negative would make MAX_RECORD_AGE_SECS negative, and `age > negative` is
+# true for every record — a blanket downgrade of the whole pool from a typo.
+run_helper reclaim \
+    --worktrees-dir "$A7_WORKTREES" \
+    --base-target "$A7_BASE/target" \
+    --max-record-age-days -3
+assert "A11d: a NEGATIVE --max-record-age-days exits 2 (never a blanket downgrade)" \
+    test "$RC" -eq 2
+
+# A11e-A11k: the two doors A11b/A11d do not reach. `^[0-9]+$` rejects junk and
+# negatives, but a LEADING ZERO (`08` is the loud one — it dies in the octal
+# multiply, leaving MAX_RECORD_AGE_SECS unset mid-pass; `010` is the dangerous
+# one — it quietly means 8 days) and an OVERFLOWING MAGNITUDE both sail through
+# it and then mean something other than what the operator typed. Neither is
+# discoverable from the summary line, which is why the guard must reject rather
+# than normalize. The pinned property here is exactly that rejection.
+run_helper reclaim \
+    --worktrees-dir "$A7_WORKTREES" \
+    --base-target "$A7_BASE/target" \
+    --max-record-age-days 08
+assert "A11e: a LEADING-ZERO --max-record-age-days 08 exits 2 (never read as octal)" \
+    test "$RC" -eq 2
+# Two halves, and the second is what keeps this assert honest if the guard is
+# ever re-loosened: a raw bash arithmetic diagnostic reaching an operator is the
+# tell that the value got as far as the multiply, i.e. the guard was bypassed
+# rather than enforced. `grep -qF --` for the same reason A11c documents.
+assert "A11f: ...and stderr names the flag and the value 08, with NO raw bash arithmetic diagnostic" \
+    bash -c 'printf "%s\n" "$1" | grep -qF -- "--max-record-age-days" \
+        && printf "%s\n" "$1" | grep -qF -- "08" \
+        && ! printf "%s\n" "$1" | grep -qF -- "value too great for base"' _ "$ERR_OUT"
+
+run_helper reclaim \
+    --worktrees-dir "$A7_WORKTREES" \
+    --base-target "$A7_BASE/target" \
+    --max-record-age-days 010
+assert "A11g: --max-record-age-days 010 exits 2 (it would SILENTLY mean 8 days, not 10)" \
+    test "$RC" -eq 2
+
+# The disable escape hatch is documented as exactly `0`. `00` is the same
+# ambiguous-token class and must not become a second, undocumented spelling of
+# a switch that turns the valve off.
+run_helper reclaim \
+    --worktrees-dir "$A7_WORKTREES" \
+    --base-target "$A7_BASE/target" \
+    --max-record-age-days 00
+assert "A11h: --max-record-age-days 00 exits 2 (the disable hatch is spelled 0, and only 0)" \
+    test "$RC" -eq 2
+
+# The env var is a REAL second door into the same guard, so it must be guarded
+# identically — and the message must name the door the operator actually used,
+# not a flag they never passed. Inline command prefix, NEVER an export, per the
+# file's established REIFY_* idiom (K4's PATH prefix, O-env).
+REIFY_WARM_LANE_GC_MAX_RECORD_AGE_DAYS=09 run_helper reclaim \
+    --worktrees-dir "$A7_WORKTREES" \
+    --base-target "$A7_BASE/target"
+assert "A11i: a leading-zero value via the ENV VAR exits 2 too (the same guard, the other door)" \
+    test "$RC" -eq 2
+assert "A11j: ...and the error names the env var, not only the flag the operator never passed" \
+    bash -c 'printf "%s\n" "$1" | grep -qF -- "REIFY_WARM_LANE_GC_MAX_RECORD_AGE_DAYS"' _ "$ERR_OUT"
+
+# Overflow is the same forbidden SILENT direction as 010, reached through a
+# different door, and A11d's negative case cannot reach it because the typed
+# value is positive: `9223372036854775807 * 86400` WRAPS to -86400, which then
+# fails the `-gt 0` test and disables the bound outright while
+# `downgraded_assigned=0` reads as "nothing was stale".
+run_helper reclaim \
+    --worktrees-dir "$A7_WORKTREES" \
+    --base-target "$A7_BASE/target" \
+    --max-record-age-days 9223372036854775807
+assert "A11k: an OVERFLOWING --max-record-age-days exits 2 (a wrap would silently disable the valve)" \
+    test "$RC" -eq 2
+
+# NON-VACUITY. Without this the block would pass a guard that rejected
+# everything, and A11's reader cannot see Block S-age's accepting cases from
+# here (heuristic 13 — a block makes internal sense in isolation).
+run_helper reclaim \
+    --worktrees-dir "$A7_WORKTREES" \
+    --base-target "$A7_BASE/target" \
+    --max-record-age-days 14
+assert "A11l: NON-VACUITY — a plain --max-record-age-days 14 still exits 0 on the same fixture" \
+    test "$RC" -eq 0
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Block A11-boundary — the bound is validated BEFORE any lane is touched
+# ──────────────────────────────────────────────────────────────────────────────
+# The property that makes the finding's severity concrete, and one no A11 case
+# above can reach because A7's fixture has no lanes at all. A guard that fires
+# at the boundary makes a misconfigured bound reclaim NOTHING; a guard that
+# fires mid-pass makes it reclaim HALF A POOL and then die without a summary
+# line to say so.
+#
+# Glob order is deliberately exploited: `_lane-1` (reclaimable) sorts before
+# `_lane-2` (assigned, and so the first lane that reads MAX_RECORD_AGE_SECS),
+# so a boundary guard and a mid-pass abort are distinguishable by looking at
+# `_lane-1` alone. All <lane>.lock FREE, no live process references, no
+# --extra-protect-glob.
+echo ""
+echo "--- Block A11-boundary: a misconfigured bound reclaims NOTHING (task 5504) ---"
+
+A11B_ROOT="$(mktemp -d /tmp/test-gc-a11b-XXXXXX)"
+_TMPDIRS+=("$A11B_ROOT")
+mkdir -p "$A11B_ROOT/worktrees" "$A11B_ROOT/base"
+make_repo "$A11B_ROOT/repo"
+mkdir -p "$A11B_ROOT/base/target.gen.1"
+touch "$A11B_ROOT/base/target.gen.1.lock"
+ln -sfn "$A11B_ROOT/base/target.gen.1" "$A11B_ROOT/base/target"
+for _a11b_name in _lane-1 _lane-2; do
+    git -C "$A11B_ROOT/repo" worktree add -q "$A11B_ROOT/worktrees/$_a11b_name"
+    mkdir -p "$A11B_ROOT/worktrees/$_a11b_name/target"
+    touch "$A11B_ROOT/worktrees/$_a11b_name/target/DIVERGENT_MARKER"
+done
+make_lane_state "$A11B_ROOT/worktrees" _lane-1 released
+make_lane_state "$A11B_ROOT/worktrees" _lane-2 assigned 5504
+_seed_stub_body > "$A11B_ROOT/seed_stub.sh"
+chmod +x "$A11B_ROOT/seed_stub.sh"
+export SEED_LOG="$A11B_ROOT/seed_calls.log"
+
+run_helper reclaim \
+    --worktrees-dir "$A11B_ROOT/worktrees" \
+    --base-target "$A11B_ROOT/base/target" \
+    --seed-script "$A11B_ROOT/seed_stub.sh" \
+    --main-ref main \
+    --max-record-age-days 08
+
+# Exit 2, the usage/WIRING class — not the runtime 1 a mid-pass `set -u` abort
+# produces, and the distinction is load-bearing: an operator (or the sweep's
+# own error handling) reads the class to decide whether the invocation could
+# have avoided it.
+assert "A11-boundary1: a misconfigured bound exits 2 (usage/wiring), not 1 (runtime)" \
+    test "$RC" -eq 2
+assert "A11-boundary2: the seed stub was NEVER invoked — no lane was reclaimed" \
+    bash -c '[ ! -s "$1" ]' _ "$A11B_ROOT/seed_calls.log"
+assert "A11-boundary3: the reclaimable _lane-1 is INTACT (a mid-pass abort would have reset it first)" \
+    test -f "$A11B_ROOT/worktrees/_lane-1/target/DIVERGENT_MARKER"
+assert "A11-boundary4: the assigned _lane-2 is likewise untouched" \
+    test -f "$A11B_ROOT/worktrees/_lane-2/target/DIVERGENT_MARKER"
+# The LITERAL is load-bearing, and the obvious one is the wrong one:
+# `reclaim complete:` is `ok`'s wording and every log helper in warm-lane-gc.sh
+# writes to STDERR, so grepping $OUT for it would pass no matter what the script
+# did — including in the exact mid-pass abort this case exists to catch. The
+# stdout summary is the `reclaim: reset=…` printf, the line a consumer
+# prefix-matches; its ABSENCE is what says no pass was half-run.
+assert "A11-boundary5: NO reclaim: summary line on stdout (a misconfigured bound must not half-run a pass)" \
+    bash -c '! printf "%s\n" "$1" | grep -qF "reclaim: reset="' _ "$OUT"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Block B — reset a divergent FREE lane
@@ -2363,15 +2571,20 @@ ST_SEED_STUB="$ST_ROOT/seed_stub.sh"
 # The trigger stub: behaves like _seed_stub_body for every lane, and
 # ADDITIONALLY, when invoked for _lane-1, reassigns _lane-2 before returning.
 # The record is written in the SAME byte shape make_lane_state emits, so the
-# fixture and the mid-pass mutation cannot disagree about the record format.
+# fixture and the mid-pass mutation cannot disagree about the record format --
+# including updated_at, which the stub takes from $TOCTOU_UPDATED_AT stamped
+# from the same clock the factory uses. A frozen past literal here would read
+# as STALE to the Pass-1 record gate's age bound (task 5504) and the mid-pass
+# reassignment would be downgraded rather than honoured, which is the opposite
+# of what S21-S23 exist to pin.
 cat > "$ST_SEED_STUB" << 'STUB_EOF'
 #!/usr/bin/env bash
 echo "$*" >> "$SEED_LOG"
 LANE_DIR="$2"
 rm -rf "$LANE_DIR/target/DIVERGENT_MARKER" 2>/dev/null || true
 if [ "${LANE_DIR##*/}" = "_lane-1" ]; then
-    printf '{\n  "state": "assigned",\n  "task_id": "%s",\n  "title": "lane fixture task %s",\n  "branch": null,\n  "seeded_from_sha": null,\n  "updated_at": "2026-07-26T12:43:10.704531+00:00"\n}' \
-        "$TOCTOU_TASK_ID" "$TOCTOU_TASK_ID" \
+    printf '{\n  "state": "assigned",\n  "task_id": "%s",\n  "title": "lane fixture task %s",\n  "branch": null,\n  "seeded_from_sha": null,\n  "updated_at": "%s"\n}' \
+        "$TOCTOU_TASK_ID" "$TOCTOU_TASK_ID" "$TOCTOU_UPDATED_AT" \
         > "$TOCTOU_STATE_DIR/_lane-2.json"
 fi
 exit 0
@@ -2381,6 +2594,7 @@ chmod +x "$ST_SEED_STUB"
 export SEED_LOG="$ST_SEED_LOG"
 export TOCTOU_STATE_DIR="$ST_WORKTREES/.lane-state"
 export TOCTOU_TASK_ID="5334"
+export TOCTOU_UPDATED_AT="$(date -u +%Y-%m-%dT%H:%M:%S.000000+00:00)"
 
 run_helper reclaim \
     --worktrees-dir "$ST_WORKTREES" \
@@ -2388,7 +2602,7 @@ run_helper reclaim \
     --seed-script "$ST_SEED_STUB" \
     --main-ref main
 
-unset TOCTOU_STATE_DIR TOCTOU_TASK_ID
+unset TOCTOU_STATE_DIR TOCTOU_TASK_ID TOCTOU_UPDATED_AT
 
 # Non-vacuity: without S20 the whole sub-case could pass because the stub never
 # ran and the mutation never fired.
@@ -2402,6 +2616,398 @@ assert "S22: ...and preserved for the RIGHT reason (the record, read at gate tim
     bash -c 'printf "%s\n" "$1" | grep -qF "preserving _lane-2: assigned to task 5334"' _ "$ERR_OUT"
 assert "S23: summary reset=1 with the preserve attributed to the record gate" \
     bash -c 'printf "%s\n" "$1" | grep -qE "reset=1 .*preserved_assigned=1"' _ "$OUT"
+
+# ── S-pressure: --disk-pressure DOWNGRADES the record gate (task 5504) ────────
+# Block K5 pins one half of the "before BOTH reset branches" contract: under
+# --disk-pressure the LIVE-REFERENCE gate still fires. This is the other half,
+# and it is the half the composition in task 5504 turns on.
+#
+# THE DEFECT. The record gate `continue`d unconditionally on ASSIGNED, and it
+# sits BEFORE the --disk-pressure branch. So a lane whose durable record says
+# `assigned` was unreachable by the emergency rm — including a lane that is
+# assigned ONLY because the release that should have cleared the record hit
+# ENOSPC and WarmLanePool._note_released_durable swallowed the OSError
+# (fail-open release, invariant I3). That composition holds the ENOSPC valve
+# shut with the very failure it exists to respond to, and it does so on the
+# UNATTENDED path: warm-lane-gc-sweep.sh measures `df -B1 --output=avail` once
+# per sweep and APPENDS --disk-pressure below the critical floor.
+#
+# THE CONTRACT. --disk-pressure downgrades the record gate to
+# warn-and-fall-through. "Downgrade" means FALL THROUGH, never "reclaim
+# outright": the lane still meets the live-reference gate, so the emergency
+# trades an AUTHORITATIVE preserve for a PROBED one, not for none. Arm A is the
+# emergency; Arm B is the SAME fixture without the flag, proving the change is
+# scoped to the emergency path and Block S's ordinary contract is untouched.
+#
+# DF-faithful throughout: every <lane>.lock FREE and NO --extra-protect-glob, so
+# neither the flock nor a protect glob can account for any preservation seen.
+echo ""
+echo "--- Block S-pressure: --disk-pressure downgrades the record gate (task 5504) ---"
+
+# _make_sp_fixture <root-var-prefix-dir>
+# Builds the three-lane fixture both arms share, into the directory given.
+# A function, not a copy-paste: the two arms MUST be identical apart from the
+# flag, or the discrimination the block claims is not discrimination.
+_make_sp_fixture() {
+    local root="$1"
+    mkdir -p "$root/worktrees" "$root/base"
+    make_repo "$root/repo"
+    mkdir -p "$root/base/target.gen.1"
+    touch "$root/base/target.gen.1.lock"
+    ln -sfn "$root/base/target.gen.1" "$root/base/target"
+    local _sp_name
+    for _sp_name in _lane-1 _lane-2 _lane-3; do
+        git -C "$root/repo" worktree add -q "$root/worktrees/$_sp_name"
+        mkdir -p "$root/worktrees/$_sp_name/target"
+        touch "$root/worktrees/$_sp_name/target/DIVERGENT_MARKER"
+    done
+    # Both assigned records are FRESH (the factory stamps NOW), so nothing in
+    # this block can be explained by the staleness bound — the only variable
+    # between the two arms is --disk-pressure.
+    make_lane_state "$root/worktrees" _lane-1 assigned 5504
+    make_lane_state "$root/worktrees" _lane-2 assigned 5505
+    make_lane_state "$root/worktrees" _lane-3 released
+    _seed_stub_body > "$root/seed_stub.sh"
+    chmod +x "$root/seed_stub.sh"
+}
+
+# ── Arm A: WITH --disk-pressure ───────────────────────────────────────────────
+SPA_ROOT="$(mktemp -d /tmp/test-gc-spa-XXXXXX)"
+_TMPDIRS+=("$SPA_ROOT")
+_make_sp_fixture "$SPA_ROOT"
+
+# _lane-2 also carries a live cwd holder, established causally (technique R, no
+# wall-clock sleep) exactly as K5 does. It is the lane that proves the downgrade
+# hands the record's verdict to the /proc gate rather than discarding it.
+SPA_READY="$SPA_ROOT/lane2-holder.ready"
+( cd "$SPA_ROOT/worktrees/_lane-2/target" && touch "$SPA_READY" && exec sleep 300 ) &
+SPA_HELPER_PID=$!
+_BGPIDS+=("$SPA_HELPER_PID")
+_wait_for_reader_lock "$SPA_READY" 30
+
+export SEED_LOG="$SPA_ROOT/seed_calls.log"
+
+run_helper reclaim \
+    --worktrees-dir "$SPA_ROOT/worktrees" \
+    --base-target "$SPA_ROOT/base/target" \
+    --seed-script "$SPA_ROOT/seed_stub.sh" \
+    --main-ref main \
+    --disk-pressure
+
+assert "S-pressure1: exit 0" test "$RC" -eq 0
+assert "S-pressure2: assigned _lane-1 target/ DELETED (the record gate was downgraded and the rm branch was reached)" \
+    bash -c '[ ! -d "$1" ]' _ "$SPA_ROOT/worktrees/_lane-1/target"
+assert "S-pressure3: stderr names _lane-1's downgrade and attributes it to --disk-pressure" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "downgrading record gate for _lane-1: --disk-pressure emergency override"' _ "$ERR_OUT"
+assert "S-pressure4: ...and the downgraded lane does NOT also print the ordinary assigned-preserve line" \
+    bash -c '! printf "%s\n" "$1" | grep -qF "preserving _lane-1: assigned to task 5504"' _ "$ERR_OUT"
+# THE LOAD-BEARING HALF. Downgrade means fall through, not reclaim: _lane-2 is
+# assigned AND live-referenced, and the emergency must still stop at the /proc
+# gate. If this goes red the valve has become a wipe.
+assert "S-pressure5: live-referenced _lane-2 target/ SURVIVES (downgrade falls through to the live-reference gate, it does not reclaim outright)" \
+    test -d "$SPA_ROOT/worktrees/_lane-2/target"
+assert "S-pressure6: live-referenced _lane-2 divergent marker intact (nothing under it was deleted)" \
+    test -f "$SPA_ROOT/worktrees/_lane-2/target/DIVERGENT_MARKER"
+assert "S-pressure7: ...and _lane-2's preserve is attributed to the /proc gate, the backstop the downgrade hands it to" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "preserving _lane-2: live consumer (process reference)"' _ "$ERR_OUT"
+assert "S-pressure8: released _lane-3 target/ DELETED (non-vacuity: the pass really ran the rm branch)" \
+    bash -c '[ ! -d "$1" ]' _ "$SPA_ROOT/worktrees/_lane-3/target"
+assert "S-pressure9: the seed stub was NOT invoked for any lane (the disk-pressure branch has no α fallback)" \
+    bash -c '[ ! -s "$1" ]' _ "$SPA_ROOT/seed_calls.log"
+# Full adjacent tail, the way S11 does it: pins BOTH downgraded_assigned's value
+# AND that it was APPENDED after preserved_assigned rather than interposed.
+assert "S-pressure10: summary APPENDS downgraded_assigned=2 after preserved_assigned (never interposed)" \
+    bash -c 'printf "%s\n" "$1" | grep -qE "reset=2 removed=0 preserved=1 preserved_live_ref=1 preserved_assigned=0 downgraded_assigned=2"' _ "$OUT"
+
+kill "$SPA_HELPER_PID" 2>/dev/null || true
+wait "$SPA_HELPER_PID" 2>/dev/null || true
+_BGPIDS=()  # clear so EXIT cleanup does not re-kill a possibly-reused PID
+
+# ── Arm B: the SAME fixture, WITHOUT --disk-pressure ──────────────────────────
+# The control that proves the downgrade is scoped to the emergency path. Every
+# byte of the fixture is identical (same factory function); the flag is the only
+# difference, so any divergence in outcome is attributable to it alone.
+SPB_ROOT="$(mktemp -d /tmp/test-gc-spb-XXXXXX)"
+_TMPDIRS+=("$SPB_ROOT")
+_make_sp_fixture "$SPB_ROOT"
+
+SPB_READY="$SPB_ROOT/lane2-holder.ready"
+( cd "$SPB_ROOT/worktrees/_lane-2/target" && touch "$SPB_READY" && exec sleep 300 ) &
+SPB_HELPER_PID=$!
+_BGPIDS+=("$SPB_HELPER_PID")
+_wait_for_reader_lock "$SPB_READY" 30
+
+export SEED_LOG="$SPB_ROOT/seed_calls.log"
+
+run_helper reclaim \
+    --worktrees-dir "$SPB_ROOT/worktrees" \
+    --base-target "$SPB_ROOT/base/target" \
+    --seed-script "$SPB_ROOT/seed_stub.sh" \
+    --main-ref main
+
+assert "S-pressure11: exit 0" test "$RC" -eq 0
+assert "S-pressure12: off the emergency path _lane-1 is PRESERVED with Block S's existing wording" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "preserving _lane-1: assigned to task 5504 (state=assigned)"' _ "$ERR_OUT"
+assert "S-pressure13: ...and its target/ and divergent marker are intact" \
+    test -f "$SPB_ROOT/worktrees/_lane-2/target/DIVERGENT_MARKER" -a -f "$SPB_ROOT/worktrees/_lane-1/target/DIVERGENT_MARKER"
+assert "S-pressure14: _lane-2 preserved by the RECORD gate, not the /proc gate (record is still checked first off the emergency path)" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "preserving _lane-2: assigned to task 5505 (state=assigned)"' _ "$ERR_OUT"
+assert "S-pressure15: no downgrade was reported for any lane" \
+    bash -c '! printf "%s\n" "$1" | grep -qF "downgrading record gate"' _ "$ERR_OUT"
+assert "S-pressure16: released _lane-3 still resets via the seed stub (the α branch, not the rm branch)" \
+    bash -c 'test -f "$1" && grep -q "_lane-3" "$1" && [ ! -f "$2" ]' _ \
+    "$SPB_ROOT/seed_calls.log" "$SPB_ROOT/worktrees/_lane-3/target/DIVERGENT_MARKER"
+assert "S-pressure17: summary reports preserved_assigned=2 downgraded_assigned=0 (Block S's contract, untouched off the emergency path)" \
+    bash -c 'printf "%s\n" "$1" | grep -qE "reset=1 removed=0 preserved=2 preserved_live_ref=0 preserved_assigned=2 downgraded_assigned=0"' _ "$OUT"
+
+kill "$SPB_HELPER_PID" 2>/dev/null || true
+wait "$SPB_HELPER_PID" 2>/dev/null || true
+_BGPIDS=()  # clear so EXIT cleanup does not re-kill a possibly-reused PID
+
+# ── S-age: an ASSIGNED record too OLD to believe is downgraded (task 5504) ────
+# The chronic half of the same defect, on the ORDINARY (non-emergency) path.
+#
+# THE PRODUCER. A lane record is stranded `assigned` whenever the transition
+# that should have cleared it never landed — the ENOSPC-at-release swallow, or
+# a task that is still pending/in-progress/blocked and so is skipped BY DESIGN
+# by harness.py's terminal-status reclaim. dark-factory already knows about
+# such lanes: _stale_lane_assignment_census bounds exactly this field
+# (`updated_at`) by exactly this predicate (age > a days threshold) and prints
+# them under the digest's `## Stale lane assignments`. It is report-only by
+# explicit design, so the age bound terminated in a digest line and never in a
+# reclaim. This block pins the bound REUSED rather than re-derived: same field,
+# same predicate, same documented handling of an unreadable value — different
+# ACTION.
+#
+# Nothing here has a live process reference and every <lane>.lock is FREE, with
+# no --extra-protect-glob, so neither the /proc gate nor the flock nor a glob
+# can account for any outcome observed. The ONLY variable is record age.
+echo ""
+echo "--- Block S-age: the record's updated_at bounds an ASSIGNED preserve (task 5504) ---"
+
+# 400 days against a 14-day default leaves a ~386-day margin, so no clock skew
+# and no pass duration can flip the verdict. Computed ONCE so all three
+# sub-cases judge the same record.
+SA_STALE_TS="$(date -u -d '-400 days' +%Y-%m-%dT%H:%M:%S.000000+00:00)"
+
+# _make_sa_fixture <root>
+# The three-lane fixture all three sub-cases share, built identically each time
+# so the flag/env knob under test is the only variable between them.
+_make_sa_fixture() {
+    local root="$1"
+    mkdir -p "$root/worktrees" "$root/base"
+    make_repo "$root/repo"
+    mkdir -p "$root/base/target.gen.1"
+    touch "$root/base/target.gen.1.lock"
+    ln -sfn "$root/base/target.gen.1" "$root/base/target"
+    local _sa_name
+    for _sa_name in _lane-1 _lane-2 _lane-3; do
+        git -C "$root/repo" worktree add -q "$root/worktrees/$_sa_name"
+        mkdir -p "$root/worktrees/$_sa_name/target"
+        touch "$root/worktrees/$_sa_name/target/DIVERGENT_MARKER"
+    done
+    # _lane-1: stale, via make_lane_state's 6th argument (the branch argument is
+    # empty, the shape an unassigned-branch record carries).
+    make_lane_state "$root/worktrees" _lane-1 assigned 5504 '' "$SA_STALE_TS"
+    # _lane-2: the factory's default — stamped NOW. The discrimination control.
+    make_lane_state "$root/worktrees" _lane-2 assigned 5505
+    make_lane_state "$root/worktrees" _lane-3 released
+    _seed_stub_body > "$root/seed_stub.sh"
+    chmod +x "$root/seed_stub.sh"
+}
+
+# ── S-age-fires: the bound acts, and acts on ONE lane ─────────────────────────
+SAF_ROOT="$(mktemp -d /tmp/test-gc-saf-XXXXXX)"
+_TMPDIRS+=("$SAF_ROOT")
+_make_sa_fixture "$SAF_ROOT"
+export SEED_LOG="$SAF_ROOT/seed_calls.log"
+
+run_helper reclaim \
+    --worktrees-dir "$SAF_ROOT/worktrees" \
+    --base-target "$SAF_ROOT/base/target" \
+    --seed-script "$SAF_ROOT/seed_stub.sh" \
+    --main-ref main
+
+assert "S-age1: exit 0" test "$RC" -eq 0
+assert "S-age2: the stale assigned _lane-1 IS reset (the seed stub ran for it and its marker is gone)" \
+    bash -c 'test -f "$1" && grep -q "_lane-1" "$1" && [ ! -f "$2" ]' _ \
+    "$SAF_ROOT/seed_calls.log" "$SAF_ROOT/worktrees/_lane-1/target/DIVERGENT_MARKER"
+assert "S-age3: stderr names _lane-1's downgrade with the record's own timestamp and the effective bound" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "downgrading record gate for _lane-1: record updated_at=$2 is 400d old, past the --max-record-age-days 14 bound"' _ "$ERR_OUT" "$SA_STALE_TS"
+assert "S-age4: ...and the downgraded lane does NOT also print the ordinary assigned-preserve line" \
+    bash -c '! printf "%s\n" "$1" | grep -qF "preserving _lane-1: assigned to task 5504"' _ "$ERR_OUT"
+# DISCRIMINATION, not a blanket expiry: the two assigned lanes differ ONLY in
+# their record's timestamp, and they take opposite branches in ONE pass.
+assert "S-age5: the fresh assigned _lane-2 is PRESERVED with Block S's existing wording" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "preserving _lane-2: assigned to task 5505 (state=assigned)"' _ "$ERR_OUT"
+assert "S-age6: ...and its divergent marker is intact (the seed stub never ran for it)" \
+    bash -c '[ -f "$1" ] && ([ ! -f "$2" ] || ! grep -q "_lane-2" "$2")' _ \
+    "$SAF_ROOT/worktrees/_lane-2/target/DIVERGENT_MARKER" "$SAF_ROOT/seed_calls.log"
+assert "S-age7: released _lane-3 still resets (non-vacuity: the pass ran the reset branch)" \
+    bash -c 'grep -q "_lane-3" "$1" && [ ! -f "$2" ]' _ \
+    "$SAF_ROOT/seed_calls.log" "$SAF_ROOT/worktrees/_lane-3/target/DIVERGENT_MARKER"
+assert "S-age8: summary reports reset=2 with the two assigned lanes split 1 preserved / 1 downgraded" \
+    bash -c 'printf "%s\n" "$1" | grep -qE "reset=2 removed=0 preserved=1 preserved_live_ref=0 preserved_assigned=1 downgraded_assigned=1"' _ "$OUT"
+
+# ── S-age-disabled: 0 is the documented escape hatch ──────────────────────────
+# An operator who wants pre-5504 behaviour must have a way to get it that is
+# explicit and visible in the invocation, not a source edit.
+SAD_ROOT="$(mktemp -d /tmp/test-gc-sad-XXXXXX)"
+_TMPDIRS+=("$SAD_ROOT")
+_make_sa_fixture "$SAD_ROOT"
+export SEED_LOG="$SAD_ROOT/seed_calls.log"
+
+run_helper reclaim \
+    --worktrees-dir "$SAD_ROOT/worktrees" \
+    --base-target "$SAD_ROOT/base/target" \
+    --seed-script "$SAD_ROOT/seed_stub.sh" \
+    --main-ref main \
+    --max-record-age-days 0
+
+assert "S-age9: exit 0 under --max-record-age-days 0" test "$RC" -eq 0
+assert "S-age10: with the bound disabled the 400-day-stale _lane-1 is PRESERVED again" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "preserving _lane-1: assigned to task 5504 (state=assigned)"' _ "$ERR_OUT"
+assert "S-age11: ...and its divergent marker is intact (0 really means no bound, not a large one)" \
+    test -f "$SAD_ROOT/worktrees/_lane-1/target/DIVERGENT_MARKER"
+assert "S-age12: summary reports both assigned lanes preserved and none downgraded" \
+    bash -c 'printf "%s\n" "$1" | grep -qE "preserved_assigned=2 downgraded_assigned=0"' _ "$OUT"
+
+# ── S-age-env: the knob is wired as every sibling REIFY_WARM_LANE_GC_* is ─────
+# The flag's default comes from the env var, so a deployment can widen the bound
+# without editing the sweep's argv. Asserted with a value that CHANGES the
+# verdict (1000 > 400), so a knob that were read but ignored goes red.
+SAE_ROOT="$(mktemp -d /tmp/test-gc-sae-XXXXXX)"
+_TMPDIRS+=("$SAE_ROOT")
+_make_sa_fixture "$SAE_ROOT"
+export SEED_LOG="$SAE_ROOT/seed_calls.log"
+export REIFY_WARM_LANE_GC_MAX_RECORD_AGE_DAYS=1000
+
+run_helper reclaim \
+    --worktrees-dir "$SAE_ROOT/worktrees" \
+    --base-target "$SAE_ROOT/base/target" \
+    --seed-script "$SAE_ROOT/seed_stub.sh" \
+    --main-ref main
+
+unset REIFY_WARM_LANE_GC_MAX_RECORD_AGE_DAYS
+
+assert "S-age13: exit 0 under REIFY_WARM_LANE_GC_MAX_RECORD_AGE_DAYS=1000" test "$RC" -eq 0
+assert "S-age14: a 1000-day bound preserves the 400-day-stale _lane-1 (the env knob is the flag's default)" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "preserving _lane-1: assigned to task 5504 (state=assigned)"' _ "$ERR_OUT"
+assert "S-age15: ...and its divergent marker is intact" \
+    test -f "$SAE_ROOT/worktrees/_lane-1/target/DIVERGENT_MARKER"
+assert "S-age16: summary reports both assigned lanes preserved and none downgraded" \
+    bash -c 'printf "%s\n" "$1" | grep -qE "preserved_assigned=2 downgraded_assigned=0"' _ "$OUT"
+
+# ── S-age-degrade: the AGE fails SAFE where the STATE fails OPEN (task 5504) ──
+# The two reads answer different questions, and the gate treats them in OPPOSITE
+# directions on purpose:
+#   an unreadable STATE  -> reclaim  (S15/S17 pin it: failing closed on a corrupt
+#                                     record would freeze a lane out of reclaim
+#                                     forever)
+#   an unreadable AGE    -> preserve (this block)
+# A readable `assigned` state is a trustworthy claim about STATE, so a bad
+# timestamp leaves only the AGE unknown. Reclaiming on that would let a
+# malformed field delete a genuinely live lane's build — strictly worse than one
+# extra sweep of preservation. It is also verbatim the policy
+# harness.py::_stale_lane_assignment_census already documents for the same
+# field ("a record with an empty/unparseable `updated_at` is skipped"), which is
+# the reuse this task is about.
+#
+# Arm B is the half that keeps the fail-safe from re-creating the very defect:
+# under --disk-pressure an unreadable timestamp must NOT hold the valve shut.
+# The chronic bound may fail closed; the acute valve never can.
+echo ""
+echo "--- Block S-age-degrade: an unjudgeable record age preserves, except under --disk-pressure (task 5504) ---"
+
+# _make_sag_fixture <root>
+# Both degraded records go through make_lane_state_raw, which exists for exactly
+# the records make_lane_state cannot express. Both keep a VALID `state` and
+# task_id, so the only thing wrong with them is the timestamp.
+_make_sag_fixture() {
+    local root="$1"
+    mkdir -p "$root/worktrees" "$root/base"
+    make_repo "$root/repo"
+    mkdir -p "$root/base/target.gen.1"
+    touch "$root/base/target.gen.1.lock"
+    ln -sfn "$root/base/target.gen.1" "$root/base/target"
+    local _sag_name
+    for _sag_name in _lane-1 _lane-2 _lane-3; do
+        git -C "$root/repo" worktree add -q "$root/worktrees/$_sag_name"
+        mkdir -p "$root/worktrees/$_sag_name/target"
+        touch "$root/worktrees/$_sag_name/target/DIVERGENT_MARKER"
+    done
+    # _lane-1: valid assigned record with NO `updated_at` key at all.
+    make_lane_state_raw "$root/worktrees" _lane-1 \
+        '{"state": "assigned", "task_id": "5504", "title": null, "branch": null, "seeded_from_sha": null}'
+    # _lane-2: `updated_at` present but unparseable by `date -d`.
+    make_lane_state_raw "$root/worktrees" _lane-2 \
+        '{"state": "assigned", "task_id": "5505", "title": null, "branch": null, "seeded_from_sha": null, "updated_at": "not-a-timestamp"}'
+    make_lane_state "$root/worktrees" _lane-3 released
+    _seed_stub_body > "$root/seed_stub.sh"
+    chmod +x "$root/seed_stub.sh"
+}
+
+# ── Arm A: the ordinary path — both degraded records PRESERVE, loudly ─────────
+SAGA_ROOT="$(mktemp -d /tmp/test-gc-saga-XXXXXX)"
+_TMPDIRS+=("$SAGA_ROOT")
+_make_sag_fixture "$SAGA_ROOT"
+export SEED_LOG="$SAGA_ROOT/seed_calls.log"
+
+run_helper reclaim \
+    --worktrees-dir "$SAGA_ROOT/worktrees" \
+    --base-target "$SAGA_ROOT/base/target" \
+    --seed-script "$SAGA_ROOT/seed_stub.sh" \
+    --main-ref main
+
+assert "S-age-degrade1: exit 0" test "$RC" -eq 0
+assert "S-age-degrade2: fixture — both degraded records still read as ASSIGNED (only the timestamp is wrong)" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "preserving _lane-1: assigned to task 5504" && printf "%s\n" "$1" | grep -qF "preserving _lane-2: assigned to task 5505"' _ "$ERR_OUT"
+assert "S-age-degrade3: the record with NO updated_at key is PRESERVED, markers intact, seed stub never invoked" \
+    bash -c '[ -f "$1" ] && ([ ! -f "$2" ] || ! grep -q "_lane-1" "$2")' _ \
+    "$SAGA_ROOT/worktrees/_lane-1/target/DIVERGENT_MARKER" "$SAGA_ROOT/seed_calls.log"
+assert "S-age-degrade4: the record with a GARBAGE updated_at is PRESERVED likewise" \
+    bash -c '[ -f "$1" ] && ([ ! -f "$2" ] || ! grep -q "_lane-2" "$2")' _ \
+    "$SAGA_ROOT/worktrees/_lane-2/target/DIVERGENT_MARKER" "$SAGA_ROOT/seed_calls.log"
+# LOUD, per lane, and attributable. The channel is anomaly-only (a real producer
+# always stamps the field), so it cannot train operators to ignore it — the same
+# asymmetry argument the unparseable-record vs no-readable-record comment makes.
+assert "S-age-degrade5: stderr says the bound could not be applied to _lane-1, naming the empty value" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "_lane-1: cannot judge lane-state record age (updated_at='"''"')"' _ "$ERR_OUT"
+assert "S-age-degrade6: ...and names _lane-2's actual garbage value, not a generic message" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "_lane-2: cannot judge lane-state record age (updated_at='"'"'not-a-timestamp'"'"')"' _ "$ERR_OUT"
+assert "S-age-degrade7: released _lane-3 still resets (non-vacuity: the pass ran the reset branch)" \
+    bash -c 'grep -q "_lane-3" "$1" && [ ! -f "$2" ]' _ \
+    "$SAGA_ROOT/seed_calls.log" "$SAGA_ROOT/worktrees/_lane-3/target/DIVERGENT_MARKER"
+assert "S-age-degrade8: summary reports preserved_assigned=2 downgraded_assigned=0 (an unreadable AGE preserves)" \
+    bash -c 'printf "%s\n" "$1" | grep -qE "preserved_assigned=2 downgraded_assigned=0"' _ "$OUT"
+
+# ── Arm B: the SAME fixture under --disk-pressure — the valve is immune ───────
+SAGB_ROOT="$(mktemp -d /tmp/test-gc-sagb-XXXXXX)"
+_TMPDIRS+=("$SAGB_ROOT")
+_make_sag_fixture "$SAGB_ROOT"
+export SEED_LOG="$SAGB_ROOT/seed_calls.log"
+
+run_helper reclaim \
+    --worktrees-dir "$SAGB_ROOT/worktrees" \
+    --base-target "$SAGB_ROOT/base/target" \
+    --seed-script "$SAGB_ROOT/seed_stub.sh" \
+    --main-ref main \
+    --disk-pressure
+
+assert "S-age-degrade9: exit 0" test "$RC" -eq 0
+assert "S-age-degrade10: under --disk-pressure the no-updated_at record IS reclaimed" \
+    bash -c '[ ! -d "$1" ]' _ "$SAGB_ROOT/worktrees/_lane-1/target"
+assert "S-age-degrade11: ...and so is the garbage-updated_at record — no unreadable timestamp holds the ENOSPC valve shut" \
+    bash -c '[ ! -d "$1" ]' _ "$SAGB_ROOT/worktrees/_lane-2/target"
+assert "S-age-degrade12: both are attributed to the emergency override, not the staleness bound" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "downgrading record gate for _lane-1: --disk-pressure emergency override" && printf "%s\n" "$1" | grep -qF "downgrading record gate for _lane-2: --disk-pressure emergency override"' _ "$ERR_OUT"
+# ORDERING, asserted rather than left to be inferred from line order in the
+# source: the acute leg returns BEFORE the chronic leg runs, so the fail-safe's
+# warn is never even reached under --disk-pressure.
+assert "S-age-degrade13: the chronic leg never ran (no unjudgeable-age warn under --disk-pressure)" \
+    bash -c '! printf "%s\n" "$1" | grep -qF "cannot judge lane-state record age"' _ "$ERR_OUT"
+assert "S-age-degrade14: summary reports downgraded_assigned=2 preserved_assigned=0" \
+    bash -c 'printf "%s\n" "$1" | grep -qE "preserved_assigned=0 downgraded_assigned=2"' _ "$OUT"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Block X — the PROTECT_GLOB default is RENDERED from dark-factory's registry

@@ -2083,6 +2083,34 @@ class TestProjectIdValidation(BaseStageValidationTest):
             'curator_gate_resolution_scanned': 0,
             'curator_gate_resolution_flags_emitted': 0,
             'curator_gate_resolution_errors': 0,
+            # Always present (task 4574, mirrors stage1_fetch_degraded above): set
+            # before the remediation early-return so the key is unconditionally
+            # present. 0 here because this test's mock_deps stub out the LLM-driving
+            # super().run() call, so assemble_payload's episode/Mem0 freshness
+            # filters — the only place that increments this counter — never run,
+            # leaving it at its __init__/reset value of 0.
+            'stage1_undatable_freshness_records': 0,
+            # Always present (task 3052), zeroed in the same block as the
+            # task-3084 curator-gate trio above and for the same reason: they
+            # are set BEFORE the remediation early-return, so a caller reading
+            # report.stats never has to .get() them.  All eight stay 0 here —
+            # the orphaned-recon-escalation sweep is guarded on BOTH
+            # _escalation_queue and taskmaster being set, and this stage is
+            # built from mock_deps with no escalation queue, so it never runs.
+            'orphaned_recon_escalations_scanned': 0,
+            'orphaned_recon_escalations_terminal': 0,
+            'orphaned_recon_escalations_missing': 0,
+            'orphaned_recon_escalations_live': 0,
+            'orphaned_recon_escalations_ambiguous': 0,
+            'orphaned_recon_escalations_unresolvable': 0,
+            'orphaned_recon_escalations_errors': 0,
+            'orphaned_recon_escalations_flags_emitted': 0,
+            # Always present (task 4814), pre-initialised beside the
+            # task-2312/2229/3084 pre-inits above and before the
+            # remediation early-return.  Stays 0 here: no active task is
+            # human-gate-owned, so the deterministic gate-owned
+            # suggested_action normalizer rewrites nothing.
+            'gate_owned_suggested_actions_normalized': 0,
         }
         assert result.started_at is not None
         assert result.started_at <= result.completed_at
@@ -2218,6 +2246,34 @@ class TestProjectIdValidation(BaseStageValidationTest):
             'curator_gate_resolution_scanned': 0,
             'curator_gate_resolution_flags_emitted': 0,
             'curator_gate_resolution_errors': 0,
+            # Always present (task 4574, mirrors stage1_fetch_degraded above): set
+            # before the remediation early-return so the key is unconditionally
+            # present. 0 here because this test's mock_deps stub out the LLM-driving
+            # super().run() call, so assemble_payload's episode/Mem0 freshness
+            # filters — the only place that increments this counter — never run,
+            # leaving it at its __init__/reset value of 0.
+            'stage1_undatable_freshness_records': 0,
+            # Always present (task 3052), zeroed in the same block as the
+            # task-3084 curator-gate trio above and for the same reason: they
+            # are set BEFORE the remediation early-return, so a caller reading
+            # report.stats never has to .get() them.  All eight stay 0 here —
+            # the orphaned-recon-escalation sweep is guarded on BOTH
+            # _escalation_queue and taskmaster being set, and this stage is
+            # built from mock_deps with no escalation queue, so it never runs.
+            'orphaned_recon_escalations_scanned': 0,
+            'orphaned_recon_escalations_terminal': 0,
+            'orphaned_recon_escalations_missing': 0,
+            'orphaned_recon_escalations_live': 0,
+            'orphaned_recon_escalations_ambiguous': 0,
+            'orphaned_recon_escalations_unresolvable': 0,
+            'orphaned_recon_escalations_errors': 0,
+            'orphaned_recon_escalations_flags_emitted': 0,
+            # Always present (task 4814), pre-initialised beside the
+            # task-2312/2229/3084 pre-inits above and before the
+            # remediation early-return.  Stays 0 here: no active task is
+            # human-gate-owned, so the deterministic gate-owned
+            # suggested_action normalizer rewrites nothing.
+            'gate_owned_suggested_actions_normalized': 0,
         }
         assert result.started_at is not None
         assert result.started_at <= result.completed_at

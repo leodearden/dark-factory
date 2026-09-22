@@ -12,9 +12,11 @@ deaths were then observed at loadavg 250-423, one further inflation step past
 the 60s ``[tool.pytest.ini_options].timeout`` default THEN IN FORCE (that
 default was raised to 300 on 2026-09-12 for an unrelated reason -- CPU
 starvation on a loaded host false-redding a shifting victim; see
-shared/pyproject.toml.  The family ceiling stayed at its own
-measurement-anchored 300s rather than following, so the marks this module
-demands are now equal to, not above, the global default: they still guarantee
+shared/pyproject.toml.  That default has since moved again, to a
+MEASURED 540 (2026-09-17, task 5442), and the family ceiling followed it up --
+not because this family was re-measured, but because the never-narrow rule
+forbids the ceiling sitting below the global default.  The marks this module
+demands are therefore equal to, not above, that default: they still guarantee
 the family never drops BELOW it, which is what a floor is for).
 
 What makes the breach so expensive is the two settings around it:
@@ -42,9 +44,10 @@ truncated verify.
 NOT widening the global ``timeout`` *as the remedy for THIS hazard*: doing it
 for that reason would blunt the hang-catching ceiling for the other ~16000
 tests to buy headroom only ~13 modules need.  (The global default did later
-move 60 -> 300, but for a different hazard -- wall-clock CPU starvation
-false-redding a shifting victim -- and the per-module marks stayed, because a
-sweep's cost and a host's contention are separate things to size against.)
+move 60 -> 300 and then 300 -> 540, but for a different hazard -- wall-clock
+CPU starvation false-redding a shifting victim -- and the per-module marks
+stayed, because a sweep's cost and a host's contention are separate things to
+size against.)
 
 WHERE THE RATIONALE LIVES.  The mechanism is restated here because this is the
 module a failing run points at, but the CANONICAL home -- the derivation of the
@@ -198,8 +201,14 @@ class TestTimeoutConstants:
         * xdist worker deaths observed at loadavg 250-423 (esc-3980-1,
           esc-3787-1), i.e. past the 60s default then in force.
 
-        300s leaves ~36x headroom over the unloaded worst case and ~10x over the
-        measured-under-load worst case.  Asserted as ``>=`` rather than ``==`` so
+        The 300s floor leaves ~36x headroom over the unloaded worst case and
+        ~10x over the measured-under-load worst case above; the constant itself
+        now sits at 540, dragged up by the never-narrow rule when task 5442
+        raised the ini default there.  That task also re-measured this family
+        under load and found a marked member at 51.87s -- 1.7x the 30.75s the
+        floor is anchored to -- so 540 clears the family's own current
+        requirement (51.87 x 8 = 414.96) while the FLOOR's arithmetic below
+        still rests on the older figure.  Asserted as ``>=`` rather than ``==`` so
         raising the constant later is never blocked by this test -- the
         never-narrow polarity the neighbouring shared timeouts use.
 
@@ -234,13 +243,17 @@ class TestTimeoutConstants:
         assert WHOLE_TREE_SCAN_TEST_TIMEOUT >= _ABSOLUTE_FLOOR_SECONDS, (
             f'WHOLE_TREE_SCAN_TEST_TIMEOUT ({WHOLE_TREE_SCAN_TEST_TIMEOUT}) has '
             f'fallen below the absolute floor ({_ABSOLUTE_FLOOR_SECONDS}s). It '
-            f'is derived as 5 * PYPROJECT_DEFAULT_TIMEOUT '
-            f'({PYPROJECT_DEFAULT_TIMEOUT}), so the likeliest cause is that the '
-            "pyproject's per-test default was TIGHTENED and dragged this "
-            'ceiling down with it. The family ceiling must stay anchored to the '
-            f'measured cost ({_MEASURED_UNDER_LOAD_WORST_CASE}s per call at '
-            'loadavg 120-176, with worker deaths at loadavg 250-423), not to '
-            'the setting it exists to clear -- pin it explicitly rather than '
+            'is a LITERAL, derived from nothing: the `5 * '
+            'PYPROJECT_DEFAULT_TIMEOUT` derivation was DROPPED on 2026-09-12 '
+            "(this test's docstring says why), so do not read the two as "
+            'tracking each other. What binds the constant is never-narrow '
+            'against TWO independent bounds -- this floor, and the ini default '
+            f'({PYPROJECT_DEFAULT_TIMEOUT}s, asserted separately below) -- so '
+            'the likeliest cause of this failure is the constant being lowered '
+            'by hand. The family ceiling must stay anchored to the measured '
+            f'cost ({_MEASURED_UNDER_LOAD_WORST_CASE}s per call at loadavg '
+            '120-176, with worker deaths at loadavg 250-423), not to whichever '
+            'setting it happens to clear -- pin it explicitly rather than '
             'lowering this floor.'
         )
         assert WHOLE_TREE_SCAN_TEST_TIMEOUT >= PYPROJECT_DEFAULT_TIMEOUT, (

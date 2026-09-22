@@ -164,8 +164,12 @@ class ResumeAgeSample:
 _ILLEGITIMATE_OUTCOMES = ('cancelled', 'soft-cancelled')
 
 
-def _parsed_utc(value: str) -> datetime | None:
+def parsed_utc(value: str) -> datetime | None:
     """One ``events.timestamp`` as an aware UTC datetime, or None if unusable.
+
+    PUBLIC because ``orchestrator.storm_window_bound`` imports it (task 3733):
+    the two derived-bound samplers read the same column out of the same
+    database, so they must not be able to drift in how they parse it.
 
     Annotated ``str`` because the column is declared TEXT NOT NULL, and the
     TypeError is still caught because sqlite DECLARES types rather than
@@ -250,7 +254,7 @@ def observed_resume_age_inputs(db_path: Path | str) -> ResumeAgeSample | None:
             'SELECT timestamp FROM events WHERE timestamp >= ? ORDER BY timestamp',
             (window_start,),
         ):
-            parsed = _parsed_utc(value)
+            parsed = parsed_utc(value)
             if parsed is None or parsed < threshold:
                 continue
             if previous is None:

@@ -17,6 +17,7 @@ from escalation.models import (
     Escalation,
     EvidenceEntry,
     IndexHealthState,
+    LateResolution,
     TrainState,
     max_severity,
 )
@@ -1351,6 +1352,143 @@ class TestEscalationAmendments:
         assert b.amendments == [], (
             'default amendments list is SHARED between instances — '
             'a mutable default leaked one record\'s framing onto another'
+        )
+
+
+
+class TestEscalationLateResolutions:
+    """`late_resolutions` / `late_resolutions_truncated` — the non-lossy
+    already-terminal capture fields (task 4495, esc-3902-1).
+
+    `queue.resolve()`'s already-terminal branch is the SOLE writer: when a
+    substantive `resolve_issue` lands on a record an AUTOMATED sweep already
+    dismissed (the W9-δ steward auto-dismiss race), the incoming text used to be
+    dropped on the floor.  It is APPENDED here instead, and the record's own
+    terminal state (`status` / `resolution` / `resolved_at` / `resolved_by`) is
+    never overwritten — exactly the append-only shape `amendments` established.
+
+    Pinned by the same two properties this repo pins for amendments /
+    train_state / members / granted_files: a verbatim round-trip, and legacy
+    JSON without the keys deserialising to the defaults so no on-disk migration
+    is required.
+    """
+
+    def _seeded(self, **kwargs: Any) -> Escalation:
+        """An L0 an automated sweep already dismissed, plus whatever kwargs override."""
+        return Escalation(
+            id='esc-task-3902-1',
+            task_id='3902',
+            agent_role='implementer',
+            severity='blocking',
+            category='task_failure',
+            summary='original one-line summary',
+            detail='the ORIGINAL filing detail',
+            level=0,
+            status='dismissed',
+            resolution='Auto-dismissed: steward interrupted (attempt cap)',
+            resolved_by='auto-dismissed',
+            resolution_class='benign',
+            **kwargs,
+        )
+
+    def test_late_resolutions_field_roundtrips_and_defaults_empty(self):
+        """Late resolutions survive to_json/from_json verbatim; legacy JSON defaults to empty."""
+        # --- (a) DEFAULTS: an unpopulated record carries the empty/zero defaults.
+        fresh = self._seeded()
+        assert fresh.late_resolutions == [], (
+            f'late_resolutions must default to []: {fresh.late_resolutions!r}'
+        )
+        assert fresh.late_resolutions_truncated == 0, (
+            f'late_resolutions_truncated must default to 0: '
+            f'{fresh.late_resolutions_truncated!r}'
+        )
+        assert fresh.late_resolutions_chars_elided == 0, (
+            f'late_resolutions_chars_elided must default to 0: '
+            f'{fresh.late_resolutions_chars_elided!r}'
+        )
+
+        # --- (b) ROUND-TRIP: the entry dict and the counter survive verbatim,
+        # through BOTH the dict pair and the JSON pair (the on-disk path).
+        entry: LateResolution = {
+            'timestamp': '2026-09-06T00:00:00+00:00',
+            'resolution': "the steward's real finding",
+            'resolved_by': 'claude-task-3902-steward',
+            'dismiss': False,
+            'prior_resolution_class': 'benign',
+        }
+        esc = self._seeded(
+            late_resolutions=[entry],
+            late_resolutions_truncated=2,
+            late_resolutions_chars_elided=417,
+        )
+
+        via_dict = Escalation.from_dict(esc.to_dict())
+        assert via_dict.late_resolutions == [entry], (
+            f'entry lost or mangled through to_dict/from_dict: {via_dict.late_resolutions!r}'
+        )
+
+        restored = Escalation.from_json(esc.to_json())
+        assert restored.late_resolutions == [entry], (
+            f'entry lost or mangled through to_json/from_json: {restored.late_resolutions!r}'
+        )
+        assert restored.late_resolutions[0].keys() == entry.keys(), (
+            f'a LateResolution key was dropped in the round-trip: '
+            f'{sorted(restored.late_resolutions[0])} != {sorted(entry)}'
+        )
+        assert restored.late_resolutions_truncated == 2, (
+            f'truncation counter lost: {restored.late_resolutions_truncated!r}'
+        )
+        # The BYTE-side counter is what makes the per-entry elision's loss
+        # assertable from the record rather than log-only (INV-8), so it has to
+        # survive the round-trip too.
+        assert restored.late_resolutions_chars_elided == 417, (
+            f'elision counter lost: {restored.late_resolutions_chars_elided!r}'
+        )
+        # The record's OWN terminal state is a separate thing and is untouched by
+        # the capture — that separation is the whole point of appending.
+        assert restored.status == 'dismissed'
+        assert restored.resolution == 'Auto-dismissed: steward interrupted (attempt cap)'
+        assert restored.resolved_by == 'auto-dismissed'
+
+        # --- (c) ZERO MIGRATION: legacy on-disk JSON has neither key.
+        legacy = esc.to_dict()
+        del legacy['late_resolutions']
+        del legacy['late_resolutions_truncated']
+        del legacy['late_resolutions_chars_elided']
+
+        from_legacy = Escalation.from_dict(legacy)
+
+        assert from_legacy.late_resolutions == [], (
+            f'legacy record without the key must default to []: '
+            f'{from_legacy.late_resolutions!r}'
+        )
+        assert from_legacy.late_resolutions_truncated == 0, (
+            f'legacy record without the key must default to 0: '
+            f'{from_legacy.late_resolutions_truncated!r}'
+        )
+        assert from_legacy.late_resolutions_chars_elided == 0, (
+            f'legacy record without the key must default to 0: '
+            f'{from_legacy.late_resolutions_chars_elided!r}'
+        )
+
+    def test_default_late_resolutions_list_is_per_instance(self):
+        """field(default_factory=list), not a shared mutable default.
+
+        Without this, one record's captured late resolution would appear on
+        every other default-constructed Escalation in the process.
+        """
+        a = self._seeded()
+        b = self._seeded()
+        a.late_resolutions.append({
+            'timestamp': '2026-09-06T00:00:00+00:00',
+            'resolution': 'mine alone',
+            'resolved_by': 'claude-task-3902-steward',
+            'dismiss': False,
+            'prior_resolution_class': 'benign',
+        })
+        assert b.late_resolutions == [], (
+            'default late_resolutions list is SHARED between instances — '
+            "a mutable default leaked one record's captured resolution onto another"
         )
 
 

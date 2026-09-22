@@ -1387,7 +1387,7 @@ class TestReapProcessGroups:
     The barrier's reaping half: generalizes terminate_process_group's
     escalation from a single owned proc handle to a set of foreign pgids,
     refusing any unsafe pgid (self/parent/own-group/init) via
-    _unsafe_pgid_reason.
+    unsafe_pgid_reason.
     """
 
     @pytest.mark.asyncio

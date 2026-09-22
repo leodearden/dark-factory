@@ -40,7 +40,6 @@ from __future__ import annotations
 
 import functools
 import hashlib
-import importlib.util
 import json
 import shutil
 import subprocess
@@ -48,6 +47,7 @@ import types
 from pathlib import Path
 
 import pytest
+from _fm_helpers import load_script_module
 from shared.memory_eval_metrics import (
     parse_metric_series,
     serialize_metric_series,
@@ -77,36 +77,10 @@ REPORT_SHA256 = 'f5101c6449f48f5d04609a70e0b70c367527538c8b87c526655f37c725f5381
 REPORT_SIZE_BYTES = 13849
 
 
-def _load_module() -> types.ModuleType:
-    """Load memory_eval_retrieval_probe.py from its file path.
-
-    Same loader as ``test_memory_eval_retrieval_probe.py`` (and
-    ``test_calibrate_write_triage.py``, ``test_audit_duplicate_memories.py``):
-    ``scripts/`` has no ``__init__.py``, so the probe is not importable as a
-    package. Registered in ``sys.modules`` under its own name because
-    ``@dataclass`` and other reflection-based decorators look the module up
-    there.
-    """
-    import sys  # noqa: PLC0415
-
-    mod_name = 'memory_eval_retrieval_probe'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
 @functools.cache
 def _mod() -> types.ModuleType:
     """Lazy, so the pure file-contract tests above never load the probe."""
-    return _load_module()
+    return load_script_module(SCRIPT_PATH, mod_name='memory_eval_retrieval_probe')
 
 
 @functools.cache

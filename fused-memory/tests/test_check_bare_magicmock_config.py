@@ -9,31 +9,20 @@ See task 1372 (lint guard) and task 1339/1313/1064 (migration).
 from __future__ import annotations
 
 import ast
-import importlib.util
 import shutil
 import subprocess
 import sys
-import types
 from pathlib import Path
 
 import pytest
+from _fm_helpers import load_script_module
 
 # Load the checker script via importlib to avoid sys.path pollution.
 # fused-memory/scripts/ is not on PYTHONPATH per pyproject.toml (pythonpath=['src']).
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'check_bare_magicmock_config.py'
 
 
-def _load_checker() -> types.ModuleType:
-    """Load the checker module from its script path."""
-    spec = importlib.util.spec_from_file_location('check_bare_magicmock_config', SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)  # type: ignore[union-attr]
-    return module
-
-
-_checker = _load_checker()
+_checker = load_script_module(SCRIPT_PATH, mod_name='check_bare_magicmock_config')
 find_violations = _checker.find_violations
 
 

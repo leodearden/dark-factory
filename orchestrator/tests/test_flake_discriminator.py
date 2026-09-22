@@ -150,6 +150,12 @@ def _failing_result(
 #: pass"; today that fact dies in the log while the bool says False).
 _INFRA_CATEGORY = 'pytest_internalerror'
 
+#: pytest REJECTED the argv we synthesised for the re-run (task 5580), so no
+#: test ran and nothing in the result is a verdict about the code. Deliberately
+#: NOT a member of INFRA_TRANSIENT_CATEGORIES — that set drives bounded retry
+#: windows, and re-running a byte-identical rejected command cannot help.
+_REJECTED_CATEGORY = 'pytest_usage_error'
+
 
 class TestRunIsolatedConfirmGroupOutcome:
     """`_run_isolated_confirm_group_observation().outcome` -> `_RerunOutcome`
@@ -226,6 +232,40 @@ class TestRunIsolatedConfirmGroupOutcome:
 
         config = _make_config(tmp_path)
         rv = AsyncMock(return_value=_result(True, category=_INFRA_CATEGORY))
+        with patch.object(verify_module, 'run_verification', rv):
+            outcome = self._run(verify_module, config, tmp_path)
+
+        assert outcome is verify_module._RerunOutcome.unconfirmable, outcome
+
+    def test_all_attempts_rejected_command_yields_unconfirmable(
+        self, tmp_path: Path,
+    ) -> None:
+        """pytest refusing our argv is "we could not re-run", not a red.
+
+        The engine judges a command IT constructed. A rejection says the
+        command was malformed — which is a fact about this module, not about
+        the branch — so calling it `failed` would launder a defect here into
+        a verdict about the code under test. That is exactly what 350 merge
+        gate observations did.
+        """
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        rv = AsyncMock(return_value=_result(False, category=_REJECTED_CATEGORY))
+        with patch.object(verify_module, 'run_verification', rv):
+            outcome = self._run(verify_module, config, tmp_path)
+
+        assert outcome is verify_module._RerunOutcome.unconfirmable, outcome
+
+    def test_rejected_command_paired_with_passed_true_is_still_unconfirmable(
+        self, tmp_path: Path,
+    ) -> None:
+        """Category-FIRST, like the infra-sentinel arm beside it: a rejected
+        command is not trusted as confirmation in EITHER direction."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        rv = AsyncMock(return_value=_result(True, category=_REJECTED_CATEGORY))
         with patch.object(verify_module, 'run_verification', rv):
             outcome = self._run(verify_module, config, tmp_path)
 
@@ -1310,6 +1350,157 @@ class TestConfirmIsolatedRerunVerdictMainProbe:
         commands = [c.args[2].test_command for c in rv.await_args_list]
         assert any(FAILED_ID in cmd for cmd in commands), commands
         assert any(OTHER_ID in cmd for cmd in commands), commands
+
+
+# ---------------------------------------------------------------------------
+# Task 5580: a re-run command pytest REFUSED is not a verdict about the code.
+# ---------------------------------------------------------------------------
+
+
+class TestRerunCommandRejectedIsUnconfirmable:
+    """The discriminator must not launder a rejected command into a red.
+
+    This is INV-2 applied to the fact that cost the most: between 2026-08-30
+    and 2026-09-17 every one of 350 merge-gate isolated re-runs exited rc=4 on
+    a pytest usage error — pytest never ran a test — and every one was
+    recorded as `fails_in_isolation`, a verdict about code that was never
+    executed. Flake suppression was off fleet-wide and the ledger read as if
+    it were working.
+
+    The reason string is its own prefix rather than the existing
+    `infra_transient_rerun:` one, because a triager acts on the two
+    differently: `infra_transient_rerun` says the HOST was unusable and the
+    response is to wait or look at the box; `rerun_command_rejected` says OUR
+    OWN argv was malformed and the response is to read the rendered command —
+    the diagnosis that took a human session to reach this time. Folding them
+    together would have filed a code defect as host pressure.
+    """
+
+    def _run(self, verify_module, config, module_configs, failing, worktree,
+             *, call_site='merge_gate', **kw):
+        return asyncio.run(
+            verify_module.confirm_isolated_rerun_verdict(
+                worktree, config, module_configs, failing,
+                call_site=call_site, **kw,
+            )
+        )
+
+    def test_merge_gate_rejected_command_names_its_own_reason(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+        with patch.object(
+            verify_module,
+            'run_verification',
+            AsyncMock(return_value=_result(False, category=_REJECTED_CATEGORY)),
+        ):
+            s = self._run(
+                verify_module, config, [_module_config('orchestrator')],
+                _failing_result(), tmp_path,
+            )
+
+        assert s.verdict is FlakeVerdict.unconfirmable, s.verdict
+        assert s.unconfirmable_reason == (
+            f'rerun_command_rejected:{_REJECTED_CATEGORY}'
+        ), s.unconfirmable_reason
+        # §8 permits empty test_ids only when NOTHING was examined; these
+        # node-ids were examined, the re-run of them just never started.
+        assert s.test_ids == (FAILED_ID, CRASH_ID), s.test_ids
+
+    def test_main_probe_names_the_same_reason(self, tmp_path: Path) -> None:
+        """INV-5: both gates share the ONE discriminator, so neither may
+        drift into its own vocabulary for the same observation."""
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+        with patch.object(
+            verify_module,
+            'run_verification',
+            AsyncMock(return_value=_result(False, category=_REJECTED_CATEGORY)),
+        ):
+            s = self._run(
+                verify_module, config, [_module_config('orchestrator')],
+                _failing_result(), tmp_path, call_site='main_probe',
+            )
+
+        assert s.verdict is FlakeVerdict.unconfirmable, s.verdict
+        assert s.unconfirmable_reason == (
+            f'rerun_command_rejected:{_REJECTED_CATEGORY}'
+        ), s.unconfirmable_reason
+
+    def test_the_existing_reason_vocabulary_is_untouched(
+        self, tmp_path: Path,
+    ) -> None:
+        """θ's class-1 rate and any operator grep read the existing string, so
+        every category that produced it before must still produce it
+        byte-for-byte."""
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        config = _make_config(tmp_path)
+        with patch.object(
+            verify_module,
+            'run_verification',
+            AsyncMock(return_value=_result(False, category=_INFRA_CATEGORY)),
+        ):
+            s = self._run(
+                verify_module, config, [_module_config('orchestrator')],
+                _failing_result(), tmp_path,
+            )
+
+        assert s.verdict is FlakeVerdict.unconfirmable, s.verdict
+        assert s.unconfirmable_reason == (
+            f'infra_transient_rerun:{_INFRA_CATEGORY}'
+        ), s.unconfirmable_reason
+
+    def test_a_genuine_red_elsewhere_still_outranks_a_rejected_command(
+        self, tmp_path: Path,
+    ) -> None:
+        """CROSS-GROUP PRECEDENCE is unchanged, in BOTH orderings.
+
+        The new outcome joins the existing `unconfirmable` rung rather than
+        adding a fourth: a group that genuinely failed is still decisive, so
+        this change can only ever turn a false red into "we could not tell",
+        never a true red into a suppression.
+        """
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        _materialize(
+            tmp_path,
+            'orchestrator/tests/test_x.py',
+            'fused-memory/tests/test_q.py',
+        )
+        config = _make_config(tmp_path)
+        module_configs = [
+            _module_config('orchestrator'), _module_config('fused-memory'),
+        ]
+
+        for rejected_prefix in ('orchestrator', 'fused-memory'):
+            def _fake(_worktree, _config, module_config, _p=rejected_prefix, **_kw):
+                if module_config.prefix == _p:
+                    return _result(False, category=_REJECTED_CATEGORY)
+                return _result(False)
+
+            with patch.object(
+                verify_module, 'run_verification', AsyncMock(side_effect=_fake),
+            ):
+                s = self._run(
+                    verify_module, config, module_configs,
+                    _failing_result(TWO_GROUP_TEST_OUTPUT), tmp_path,
+                )
+
+            assert s.verdict is FlakeVerdict.fails_in_isolation, (
+                f'rejected_prefix={rejected_prefix!r} gave {s.verdict} '
+                f'(reason={s.unconfirmable_reason!r})'
+            )
 
 
 # ---------------------------------------------------------------------------

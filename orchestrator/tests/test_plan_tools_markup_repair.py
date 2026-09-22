@@ -5,6 +5,13 @@ boundary row B12). The subject under test is ``orchestrator.mcp.plan_tools``'s
 read-time repair surface; the detection/repair mechanism itself is owned by
 ``shared.toolcall_markup`` (task 3688) and is NOT re-implemented here.
 
+ONE concern lives next door rather than below: the SELF-NAME closer — the
+dialect the blanket ``detect`` cannot see at all — is
+``test_plan_tools_markup_self_name``, whole, from prefilter to accepted
+truncation. It was split out by SIZE, so nothing here depends on it and
+nothing there is a continuation of a unit that starts here. Both drive the
+same surface and share ``_plan_markup_fixtures``.
+
 ## Sentinel-literal hazard — every fixture is BUILT, never written verbatim
 
 This module describes MCP tool-call envelope markup, so it is exactly the file
@@ -15,11 +22,11 @@ INSIDE its own tool-call argument, which reproduces the very over-consumption
 defect under test — the Write/Edit argument terminates early, truncating this
 file and silently dropping that call's sibling arguments.
 
-So every specimen below is assembled at import time from :func:`_close`,
-:func:`_open_param` and :data:`_INVOKE_CLOSER`, which build their angle bracket
-from ``chr(60)``. The result is byte-identical at runtime and never appears
-verbatim in the file text. :func:`_assert_no_raw_sentinels` enforces that on the
-module's OWN BYTES at import, so a future editor cannot quietly reintroduce one
+So every specimen below is assembled at import time from ``_markup_helpers``'
+builders, which build their angle bracket from ``chr(60)``. The result is
+byte-identical at runtime and never appears verbatim in the file text. That
+module's ``assert_no_raw_sentinels`` enforces it on the bytes of whichever file
+passes its own ``__file__``, so a future editor cannot quietly reintroduce one
 (it is a check on this file's source text, not on any docstring's wording).
 """
 
@@ -39,7 +46,20 @@ from collections.abc import Iterator, Mapping
 from pathlib import Path
 
 import pytest
-from shared.toolcall_markup import ENVELOPE_LITERALS, detect
+from _markup_helpers import (
+    INVOKE_CLOSER,
+    assert_no_raw_sentinels,
+    closer,
+    param_opener,
+)
+from _plan_markup_fixtures import (
+    DECISION_PROSE,
+    corrupt_plan,
+    isolate_the_refusal_memo,  # noqa: F401 — autouse; pytest resolves it by name
+    on_disk,
+    plan_artifacts,  # noqa: F401 — a fixture, requested by test parameter name
+)
+from shared.toolcall_markup import detect
 
 from orchestrator.artifacts import (
     PLAN_SCHEMA_VERSION,
@@ -48,49 +68,11 @@ from orchestrator.artifacts import (
 )
 from orchestrator.mcp import plan_tools
 
-# ---------------------------------------------------------------------------
-# Sentinel BUILDERS — the only way markup enters this module.
-# ---------------------------------------------------------------------------
-
-#: The opening angle bracket, spelled so it never appears verbatim in the file.
-_LT = chr(60)
-
-
-def _close(name: str) -> str:
-    """Build the closing tag for *name* (the mis-close shape the harness emits)."""
-    return _LT + '/' + name + '>'
-
-
-def _open_param(name: str) -> str:
-    """Build the canonical opening tag for parameter *name*."""
-    return _LT + 'parameter name="' + name + '">'
-
-
-#: The bare invoke closer — the terminator that trails a last-parameter leak.
-_INVOKE_CLOSER = _close('invoke')
-
-
-def _assert_no_raw_sentinels() -> None:
-    """Fail at IMPORT if this file's own bytes carry a raw envelope literal.
-
-    Checked against ``shared.toolcall_markup.ENVELOPE_LITERALS`` (the single
-    owner of the literal set, INV-5) plus the two structural prefixes every
-    built specimen uses, so a builder output spelled out by hand is caught even
-    when it is not itself one of the enumerated literals.
-    """
-    source = Path(__file__).read_text(encoding='utf-8')
-    forbidden = (*ENVELOPE_LITERALS, _LT + '/', _LT + 'parameter ')
-    for sequence in forbidden:
-        if sequence in source:
-            raise AssertionError(
-                f'{Path(__file__).name} contains a RAW envelope sentinel '
-                f'({sequence!r}). Build it from _close()/_open_param() instead '
-                '— a verbatim literal here corrupts the tool call that writes '
-                'this file. See the module docstring.'
-            )
-
-
-_assert_no_raw_sentinels()
+# The sentinel builders and the import-time self-scan live in
+# ``_markup_helpers``: three suites in this package need them and none may hold
+# a second copy (INV-5). Imported under this module's own local spellings so
+# every specimen below still reads as it always did.
+assert_no_raw_sentinels(__file__)
 
 
 # ---------------------------------------------------------------------------
@@ -107,25 +89,21 @@ _HOW_PROSE = (
     'Imported directly; the helper does the grammar work and owns every '
     'accept/refuse decision, so this module adds no literal enumeration.'
 )
-_DECISION_PROSE = (
-    'Repair the plan lazily on read rather than sweeping the fleet, because a '
-    'sweep would have to quiesce every running task first.'
-)
 
 #: TRAILING RESIDUE on ``design_decisions[].rationale`` — the DOMINANT live
 #: shape (97 of 118 corrupted strings): the parameter was last in the call, so
 #: nothing was absorbed and only the mis-close plus the invoke closer trail it.
-TRAILING_RATIONALE = _RATIONALE_PROSE + _close('rationale') + '\n' + _INVOKE_CLOSER + '\n'
+TRAILING_RATIONALE = _RATIONALE_PROSE + closer('rationale') + '\n' + INVOKE_CLOSER + '\n'
 
 #: The same trailing-residue shape on ``reuse[].how`` (27 of the 97).
-TRAILING_HOW = _HOW_PROSE + _close('how') + '\n' + _INVOKE_CLOSER + '\n'
+TRAILING_HOW = _HOW_PROSE + closer('how') + '\n' + INVOKE_CLOSER + '\n'
 
 #: ABSORBED SIBLING on ``design_decisions[].decision``: the parser mis-closed
 #: ``decision`` and then swallowed the whole ``rationale`` parameter into it, so
 #: the rationale a later reader sees is another field's text (PRD section 2.4).
 #: The final opener is UNTERMINATED — its closer was consumed as the terminator.
 ABSORBED_RATIONALE = (
-    _DECISION_PROSE + _close('decision') + '\n' + _open_param('rationale') + _RATIONALE_PROSE
+    DECISION_PROSE + closer('decision') + '\n' + param_opener('rationale') + _RATIONALE_PROSE
 )
 
 #: PROSE FALSE POSITIVE, measured live in worktree 2939 — a plan ABOUT this leak,
@@ -134,85 +112,10 @@ ABSORBED_RATIONALE = (
 #: sanitize contract would mutilate it. This is the specimen that makes the
 #: repair-or-leave-byte-identical contract load-bearing rather than stylistic.
 PROSE_QUOTED = (
-    'The harness closes the argument with ' + _close('description') + ' or with '
-    + _close('parameter') + ', and then re-opens with ' + _open_param('x')
+    'The harness closes the argument with ' + closer('description') + ' or with '
+    + closer('parameter') + ', and then re-opens with ' + param_opener('x')
     + ' before the next value, which is how the sibling arguments get lost.'
 )
-
-
-# ---------------------------------------------------------------------------
-# Fixtures and plan factory.
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture()
-def plan_artifacts(tmp_path):
-    """TaskArtifacts over a temp worktree — mirrors ``test_plan_tools_server``."""
-    a = TaskArtifacts(tmp_path)
-    a.init('test-1', 'Test task', 'A test')
-    return a
-
-
-def corrupt_plan(**overrides) -> dict:
-    """Return a complete, VALID plan dict whose fields can then be poisoned.
-
-    Every call builds a fresh, independent document (no shared mutable state),
-    so a test may poison ``plan['design_decisions'][0]['rationale']`` in place.
-    Keyword *overrides* replace whole top-level keys, which is how a test swaps
-    in its own collection (e.g. four decisions instead of the default two).
-
-    The default document is entirely CLEAN: nothing here trips ``detect()``, so
-    any fact a test observes came from the field it poisoned.
-    """
-    plan: dict = {
-        'task_id': 'test-1',
-        'title': 'A test plan',
-        'analysis': 'Clean analysis prose describing the approach.',
-        'files': ['orchestrator/src/orchestrator/mcp/plan_tools.py'],
-        'prerequisites': [
-            {
-                'id': 'pre-1',
-                'description': 'Clean prerequisite prose.',
-                'status': 'pending',
-                'commit': None,
-                'tests': [],
-            },
-        ],
-        'steps': [
-            {
-                'id': 'step-1',
-                'type': 'test',
-                'description': 'Clean step prose for the first step.',
-                'status': 'pending',
-                'commit': None,
-            },
-            {
-                'id': 'step-2',
-                'type': 'impl',
-                'description': 'Clean step prose for the second step.',
-                'status': 'pending',
-                'commit': None,
-            },
-        ],
-        'design_decisions': [
-            {'decision': _DECISION_PROSE, 'rationale': 'Clean rationale prose.'},
-            {'decision': 'A second clean decision.', 'rationale': 'A second clean rationale.'},
-        ],
-        'reuse': [
-            {
-                'what': 'The shared detector',
-                'where': 'shared/src/shared/toolcall_markup.py',
-                'how': 'Clean reuse prose.',
-            },
-            {
-                'what': 'The plan artifact reader',
-                'where': 'orchestrator/src/orchestrator/artifacts.py',
-                'how': 'A second clean reuse prose.',
-            },
-        ],
-    }
-    plan.update(overrides)
-    return plan
 
 
 # ---------------------------------------------------------------------------
@@ -1244,12 +1147,12 @@ class TestRepairableFieldTable:
 #: The trailing shape on a step/prerequisite ``description``. Built here rather
 #: than in the specimen block because the same field name serves two tools.
 _TRAILING_DESCRIPTION = (
-    'Clean step prose for the first step.' + _close('description') + '\n' + _INVOKE_CLOSER + '\n'
+    'Clean step prose for the first step.' + closer('description') + '\n' + INVOKE_CLOSER + '\n'
 )
 #: The trailing shape on the top-level ``analysis`` key (collection None).
 _TRAILING_ANALYSIS = (
     'Clean analysis prose describing the approach.'
-    + _close('analysis') + '\n' + _INVOKE_CLOSER + '\n'
+    + closer('analysis') + '\n' + INVOKE_CLOSER + '\n'
 )
 
 
@@ -1291,6 +1194,16 @@ class TestRepairPlanFieldsTrailing:
     """
 
     def test_trailing_rationale_repairs_with_a_full_fact(self):
+        """MOVED BY TASK 5283: ``pattern`` ``INVOKE_CLOSER`` -> the closer.
+
+        ``TRAILING_RATIONALE`` is prose, ``rationale``'s own closer, then the
+        invoke closer that terminates the leak. The repaired arm used to
+        publish ``result.pattern`` — derived from the blanket ``detect``, which
+        spells no parameter name and therefore reported the trailing invoke
+        closer — while the UNREPAIRABLE arm published the gate's widened value
+        for the very same field. Both arms now publish the gate's value, so the
+        fact names the head of the leak whichever way the repair goes.
+        """
         plan = corrupt_plan()
         plan['design_decisions'][0]['rationale'] = TRAILING_RATIONALE
 
@@ -1300,7 +1213,7 @@ class TestRepairPlanFieldsTrailing:
         assert decision['rationale'] == _RATIONALE_PROSE
         assert detect(decision['rationale']) is None
         # The sibling the tool authored in the same call is untouched.
-        assert decision['decision'] == _DECISION_PROSE
+        assert decision['decision'] == DECISION_PROSE
         assert facts == [
             {
                 'tool': 'add_design_decision',
@@ -1309,8 +1222,8 @@ class TestRepairPlanFieldsTrailing:
                 # writer the fact says so rather than overstating its precision.
                 'also_written_by': [],
                 'param': 'rationale',
-                'pattern': _INVOKE_CLOSER,
-                'misclose': _close('rationale'),
+                'pattern': closer('rationale'),
+                'misclose': closer('rationale'),
                 'outcome': 'repaired',
                 'recovered_params': [],
                 'declined_params': [],
@@ -1348,7 +1261,7 @@ class TestRepairPlanFieldsTrailing:
         assert facts[0]['tool'] == 'add_reuse_item'
         assert facts[0]['outcome'] == 'repaired'
         assert facts[0]['recovered_params'] == []
-        assert facts[0]['misclose'] == _close('how')
+        assert facts[0]['misclose'] == closer('how')
 
     @pytest.mark.parametrize(
         ('collection', 'index', 'field', 'poisoned', 'clean', 'tool'),
@@ -1359,7 +1272,7 @@ class TestRepairPlanFieldsTrailing:
             ),
             (
                 'prerequisites', 0, 'description',
-                'Clean prerequisite prose.' + _close('description') + '\n' + _INVOKE_CLOSER + '\n',
+                'Clean prerequisite prose.' + closer('description') + '\n' + INVOKE_CLOSER + '\n',
                 'Clean prerequisite prose.', 'add_prerequisite',
             ),
         ],
@@ -1519,8 +1432,8 @@ class TestRepairPlanFieldsTrailing:
 #: mis-close, so the recovered value's own boundary would be a guess. Alpha's
 #: ``_parse_tail`` refuses this by construction (PRD boundary row B5).
 _DOUBLY_CORRUPT_HOW = (
-    'Reuse prose that was cut short.' + _close('how') + '\n'
-    + _open_param('what') + 'the absorbed value' + _close('description')
+    'Reuse prose that was cut short.' + closer('how') + '\n'
+    + param_opener('what') + 'the absorbed value' + closer('description')
     + ' and then still more leftover text.'
 )
 
@@ -1546,13 +1459,13 @@ class TestRepairPlanFieldsRefuses:
 
         assert repaired['design_decisions'][0]['decision'] == PROSE_QUOTED
         # Nothing was shaved off the end: all three quoted sentinels survive.
-        for quoted in (_close('description'), _close('parameter'), _open_param('x')):
+        for quoted in (closer('description'), closer('parameter'), param_opener('x')):
             assert quoted in repaired['design_decisions'][0]['decision']
         assert len(facts) == 1
         fact = facts[0]
         assert fact['outcome'] == 'unrepairable'
         # The residue stays VISIBLE: the detected pattern is reported.
-        assert fact['pattern'] == detect(PROSE_QUOTED) == _close('description')
+        assert fact['pattern'] == detect(PROSE_QUOTED) == closer('description')
         assert fact['recovered_params'] == []
         assert fact['misclose'] is None
         assert fact['collection'] == 'design_decisions'
@@ -1576,7 +1489,7 @@ class TestRepairPlanFieldsRefuses:
         # the earlier self-name closer is the improvement, not a changed
         # expectation. The two are asserted DISTINCT so this row keeps proving
         # the widening is what is being observed.
-        assert facts[0]['pattern'] == _close('how')
+        assert facts[0]['pattern'] == closer('how')
         assert facts[0]['pattern'] != detect(_DOUBLY_CORRUPT_HOW)
         assert facts[0]['recovered_params'] == []
         assert facts[0]['field'] == 'how'
@@ -1685,7 +1598,7 @@ class TestRepairPlanFieldsAbsorbedSibling:
         repaired, facts = plan_tools._repair_plan_fields(plan)
 
         item = repaired['design_decisions'][0]
-        assert item['decision'] == _DECISION_PROSE
+        assert item['decision'] == DECISION_PROSE
         assert detect(item['decision']) is None
         assert item['rationale'] == _RATIONALE_PROSE
         # D5: the recovered text is a VERBATIM substring of the original value,
@@ -1696,7 +1609,7 @@ class TestRepairPlanFieldsAbsorbedSibling:
         assert facts[0]['outcome'] == 'repaired'
         assert facts[0]['recovered_params'] == ['rationale']
         assert facts[0]['field'] == 'decision'
-        assert facts[0]['misclose'] == _close('decision')
+        assert facts[0]['misclose'] == closer('decision')
 
     def test_recovers_into_a_missing_sibling__key_is_created(self):
         plan = _absorbed_decision()
@@ -1705,7 +1618,7 @@ class TestRepairPlanFieldsAbsorbedSibling:
         repaired, facts = plan_tools._repair_plan_fields(plan)
 
         item = repaired['design_decisions'][0]
-        assert item['decision'] == _DECISION_PROSE
+        assert item['decision'] == DECISION_PROSE
         assert item['rationale'] == _RATIONALE_PROSE
         assert len(facts) == 1
         assert facts[0]['outcome'] == 'repaired'
@@ -1717,7 +1630,7 @@ class TestRepairPlanFieldsAbsorbedSibling:
         repaired, facts = plan_tools._repair_plan_fields(plan)
 
         item = repaired['design_decisions'][0]
-        assert item['decision'] == _DECISION_PROSE
+        assert item['decision'] == DECISION_PROSE
         assert item['rationale'] == _RATIONALE_PROSE
         assert facts[0]['outcome'] == 'repaired'
         assert facts[0]['recovered_params'] == ['rationale']
@@ -1739,8 +1652,8 @@ class TestRepairPlanFieldsAbsorbedSibling:
             design_decisions=[{
                 'decision': 'A decision.',
                 'rationale': (
-                    authored + _close('rationale') + '\n'
-                    + _open_param('rationale') + 'stub'
+                    authored + closer('rationale') + '\n'
+                    + param_opener('rationale') + 'stub'
                 ),
             }],
         )
@@ -1777,8 +1690,8 @@ class TestRepairPlanFieldsAbsorbedSibling:
             design_decisions=[{
                 'decision': 'A decision.',
                 'rationale': (
-                    _close('rationale') + '\n'
-                    + _open_param('rationale') + authored
+                    closer('rationale') + '\n'
+                    + param_opener('rationale') + authored
                 ),
             }],
         )
@@ -1811,8 +1724,8 @@ class TestRepairPlanFieldsAbsorbedSibling:
             design_decisions=[{
                 'decision': 'A decision.',
                 'rationale': (
-                    '   \n\t  ' + _close('rationale') + '\n'
-                    + _open_param('rationale') + authored
+                    '   \n\t  ' + closer('rationale') + '\n'
+                    + param_opener('rationale') + authored
                 ),
             }],
         )
@@ -1875,18 +1788,18 @@ class TestRepairPlanFieldsAbsorbedSibling:
 #: recovered ``str`` replaces the value the lock charter (``derive_modules`` /
 #: ``files_to_modules``) and the merge gate (``plan_files_not_touched``) read.
 _ABSORBED_FILES_TITLE = (
-    'A real title.' + _close('title') + '\n' + _open_param('files') + 'orchestrator/src/a.py'
+    'A real title.' + closer('title') + '\n' + param_opener('files') + 'orchestrator/src/a.py'
 )
 
 #: An absorbed ``step_type`` argument on a step ``description``. ``step_type``
 #: is the TOOL's parameter name; the plan stores it as ``type``. Keyed on the
 #: parameter name, the recovery creates a junk ``step_type`` key and leaves the
 #: real ``type`` — the field actually corrupted — untouched.
-_ABSORBED_STEP_TYPE = 'Do the thing.' + _close('description') + '\n' + _open_param('step_type') + 'test'
+_ABSORBED_STEP_TYPE = 'Do the thing.' + closer('description') + '\n' + param_opener('step_type') + 'test'
 
 #: The same shape with ``prereq_id``, which the plan stores as ``id``.
 _ABSORBED_PREREQ_ID = (
-    'A prerequisite.' + _close('description') + '\n' + _open_param('prereq_id') + 'pre-99'
+    'A prerequisite.' + closer('description') + '\n' + param_opener('prereq_id') + 'pre-99'
 )
 
 
@@ -1982,7 +1895,7 @@ class TestRecoveryTargetsAreRealPlanKeys:
         """
         observed = _observed_plan_keys(tmp_path)
         decisions = [
-            {'decision': _DECISION_PROSE, 'rationale': TRAILING_RATIONALE},
+            {'decision': DECISION_PROSE, 'rationale': TRAILING_RATIONALE},
             {'decision': 'A clean decision.', 'rationale': 'A clean rationale.'},
         ]
         plan = corrupt_plan(
@@ -2048,7 +1961,7 @@ class TestRecoveryTargetsAreRealPlanKeys:
         repaired, facts = plan_tools._repair_plan_fields(plan)
 
         item = repaired['design_decisions'][0]
-        assert item['decision'] == _DECISION_PROSE
+        assert item['decision'] == DECISION_PROSE
         assert item['rationale'] == _RATIONALE_PROSE
         assert facts[0]['outcome'] == 'repaired'
         assert facts[0]['recovered_params'] == ['rationale']
@@ -2097,7 +2010,7 @@ class TestRepairWriteBackByteFormat:
         repaired, facts = plan_tools._read_plan_repaired(plan_artifacts)
 
         assert any(f['outcome'] == 'repaired' for f in facts)
-        written = _on_disk(plan_artifacts)
+        written = on_disk(plan_artifacts)
         assert written['_schema_version'] == PLAN_SCHEMA_VERSION
         assert written['task_id'] == 'test-1'
         assert written == repaired
@@ -2167,21 +2080,6 @@ def _fact_payloads(caplog) -> list[dict]:
     return payloads
 
 
-@pytest.fixture(autouse=True)
-def _isolate_the_refusal_memo():
-    """Clear ``_REPORTED_REFUSALS`` around every test in this module.
-
-    The memo is process-local by design (one plan-tools subprocess per agent
-    invocation, so "once per process" is "once per session"), which under pytest
-    means one set shared by every test in the run. Clearing it here keeps the
-    suite order-independent instead of making a later test depend on whether an
-    earlier one happened to report the same locator.
-    """
-    plan_tools._REPORTED_REFUSALS.clear()
-    yield
-    plan_tools._REPORTED_REFUSALS.clear()
-
-
 def _seed_mixed_plan(artifacts) -> dict:
     """Write a plan carrying one REPAIRABLE and one UNREPAIRABLE field."""
     plan = corrupt_plan()
@@ -2229,7 +2127,7 @@ class TestReadPlanRepaired:
         for key in ('task_id', 'title', 'analysis', 'files', 'prerequisites',
                     'steps', 'reuse'):
             assert on_disk[key] == seeded[key]
-        assert on_disk['design_decisions'][0]['decision'] == _DECISION_PROSE
+        assert on_disk['design_decisions'][0]['decision'] == DECISION_PROSE
         assert on_disk['design_decisions'][1]['rationale'] == 'A second clean rationale.'
 
     # -- idempotence ------------------------------------------------------
@@ -2626,10 +2524,6 @@ def _seed_corrupt(artifacts) -> None:
     artifacts.write_plan(plan)
 
 
-def _on_disk(artifacts) -> dict:
-    return json.loads((artifacts.root / 'plan.json').read_text())
-
-
 def _added_step(plan: dict) -> None:
     assert [s['id'] for s in plan['steps']] == ['step-1', 'step-2', 'step-9']
 
@@ -2811,7 +2705,7 @@ class TestPlanToolsReadPathsRepair:
 
         call(plan_artifacts)
 
-        rationale = _on_disk(plan_artifacts)['design_decisions'][0]['rationale']
+        rationale = on_disk(plan_artifacts)['design_decisions'][0]['rationale']
         assert rationale == _RATIONALE_PROSE
         assert detect(rationale) is None
 
@@ -2827,7 +2721,7 @@ class TestPlanToolsReadPathsRepair:
 
         call(plan_artifacts)
 
-        plan = _on_disk(plan_artifacts)
+        plan = on_disk(plan_artifacts)
         check_mutation(plan)
         assert plan['design_decisions'][0]['rationale'] == _RATIONALE_PROSE
 
@@ -2894,256 +2788,15 @@ class TestCreatePlanIsDeliberatelyNotHooked:
 
         assert response == {'status': 'ok', 'task_id': 'test-1'}
         assert 'markup_repairs' not in response
-        assert _on_disk(plan_artifacts)['analysis'] == _TRAILING_ANALYSIS
+        assert on_disk(plan_artifacts)['analysis'] == _TRAILING_ANALYSIS
 
         followup = plan_tools._add_design_decision(plan_artifacts, 'A decision.', 'A rationale.')
 
         assert followup['status'] == 'ok'
         assert [f['field'] for f in followup['markup_repairs']] == ['analysis']
-        analysis = _on_disk(plan_artifacts)['analysis']
+        analysis = on_disk(plan_artifacts)['analysis']
         assert analysis == 'Clean analysis prose describing the approach.'
         assert detect(analysis) is None
-
-
-# ---------------------------------------------------------------------------
-# Task 4696 — the SELF-NAME closer, invisible to the read-repair prefilter.
-# ---------------------------------------------------------------------------
-
-#: A rationale mis-closed with its OWN tag and NOTHING else: no invoke closer,
-#: no parameter-open token. 296 real plan entries have exactly this shape.
-_SELF_NAME_RATIONALE_PROSE = 'Both mechanisms partition rather than race.'
-_SELF_NAME_RATIONALE = _SELF_NAME_RATIONALE_PROSE + _close('rationale')
-
-#: The same on the second-largest victim, ``add_reuse_item.how`` (129 entries).
-_SELF_NAME_HOW_PROSE = 'Reuse the declared table directly.'
-_SELF_NAME_HOW = _SELF_NAME_HOW_PROSE + _close('how')
-
-#: THE 4525 SHAPE, verbatim in structure: the field's own closer, then an
-#: invoke closer, then the SAME parameter re-declared. repair() refuses it —
-#: the invoke closer leads the tail so no candidate parses, and ``invoke`` does
-#: not qualify — so the string must be left byte-identical and merely FLAGGED.
-_UNREPAIRABLE_RATIONALE = (
-    'See plan_tools.py:65-74.'
-    + _close('rationale')
-    + '\n'
-    + _INVOKE_CLOSER
-    + '\n'
-    + _open_param('rationale')
-    + 'See decision text.'
-)
-
-
-def _seed_self_name_plan(artifacts) -> dict:
-    """Write a plan whose ONLY corruption is two self-name closers."""
-    plan = corrupt_plan()
-    plan['design_decisions'][0]['rationale'] = _SELF_NAME_RATIONALE
-    plan['reuse'][0]['how'] = _SELF_NAME_HOW
-    artifacts.write_plan(copy.deepcopy(plan))
-    return plan
-
-
-class TestSelfNameCloserIsSeenByTheReadRepair:
-    """Epsilon's lazy read-repair was gated on a predicate that could not see it.
-
-    ``_carries_markup`` is the cheap prefilter that decides whether the repair
-    pass runs at all, and it asked the param-free ``detect``. A plan whose only
-    damage is a field mis-closed with its OWN name-echoing tag therefore looked
-    CLEAN: the prefilter returned False, the deep copy never happened, and the
-    corruption sat on disk untouched read after read — which is exactly why 296
-    ``rationale`` and 129 ``how`` specimens were still there five weeks after
-    the read-repair went live.
-
-    The repairer behind that gate was correct for them the whole time. Unlike
-    the middleware boundary, this site pays NOTHING to be fully schema-aware:
-    the walk already yields the ``_PlanField`` record, so ``record.field`` and
-    ``record.schema_params`` are both in hand from the DECLARED table.
-    """
-
-    def test_the_specimen_is_invisible_to_the_blanket_predicate(self):
-        """Otherwise this class would be re-testing an already-caught dialect."""
-        for value in (_SELF_NAME_RATIONALE, _SELF_NAME_HOW):
-            assert _INVOKE_CLOSER not in value
-            assert _LT + 'parameter ' not in value
-            assert detect(value) is None
-
-    def test_carries_markup_sees_the_self_name_closers(self):
-        plan = corrupt_plan()
-        plan['design_decisions'][0]['rationale'] = _SELF_NAME_RATIONALE
-        plan['reuse'][0]['how'] = _SELF_NAME_HOW
-
-        assert plan_tools._carries_markup(plan) is True
-
-    def test_a_genuinely_clean_plan_is_still_not_copied(self):
-        """The prefilter's whole purpose survives the widening."""
-        assert plan_tools._carries_markup(corrupt_plan()) is False
-
-    def test_both_fields_come_back_repaired(self, plan_artifacts):
-        _seed_self_name_plan(plan_artifacts)
-
-        plan, _facts = plan_tools._read_plan_repaired(plan_artifacts)
-
-        assert plan['design_decisions'][0]['rationale'] == _SELF_NAME_RATIONALE_PROSE
-        assert plan['reuse'][0]['how'] == _SELF_NAME_HOW_PROSE
-
-    def test_the_repair_is_persisted_to_disk(self, plan_artifacts):
-        _seed_self_name_plan(plan_artifacts)
-
-        plan_tools._read_plan_repaired(plan_artifacts)
-
-        on_disk = json.loads((plan_artifacts.root / 'plan.json').read_text(encoding='utf-8'))
-        assert on_disk['design_decisions'][0]['rationale'] == _SELF_NAME_RATIONALE_PROSE
-        assert on_disk['reuse'][0]['how'] == _SELF_NAME_HOW_PROSE
-
-    def test_the_facts_locate_each_repair_by_collection_index_and_field(
-        self, plan_artifacts
-    ):
-        _seed_self_name_plan(plan_artifacts)
-
-        _plan, facts = plan_tools._read_plan_repaired(plan_artifacts)
-
-        located = {
-            (f['collection'], f['index'], f['field']): f
-            for f in facts
-        }
-        assert set(located) == {
-            ('design_decisions', 0, 'rationale'),
-            ('reuse', 0, 'how'),
-        }
-        for (_collection, _index, field), fact in located.items():
-            assert fact['outcome'] == 'repaired'
-            assert fact['param'] == field
-            assert fact['misclose'] == _close(field)
-            assert fact['recovered_params'] == []
-
-    def test_the_4525_shape_is_flagged_UNREPAIRABLE_and_never_guessed(
-        self, plan_artifacts
-    ):
-        """The task's own specimen: refuse, flag, and change not one byte.
-
-        Its tail leads with an invoke closer, so no candidate parses and the
-        only other candidate name — ``invoke`` — does not qualify. There is
-        nothing to delete and nothing to preserve separately: the tail's
-        re-declaration is of the SAME parameter, INSIDE the one string, so the
-        "fabricated sibling" is not a sibling key at all. Visible damage beats
-        a guessed repair.
-        """
-        plan = corrupt_plan()
-        plan['design_decisions'][0]['rationale'] = _UNREPAIRABLE_RATIONALE
-        plan_artifacts.write_plan(copy.deepcopy(plan))
-        before = (plan_artifacts.root / 'plan.json').read_bytes()
-
-        repaired, facts = plan_tools._read_plan_repaired(plan_artifacts)
-
-        flagged = [f for f in facts if f['field'] == 'rationale']
-        assert [f['outcome'] for f in flagged] == ['unrepairable']
-        assert repaired['design_decisions'][0]['rationale'] == _UNREPAIRABLE_RATIONALE
-        assert sorted(repaired['design_decisions'][0]) == ['decision', 'rationale']
-        assert (plan_artifacts.root / 'plan.json').read_bytes() == before, (
-            'an unrepairable field must leave the file BYTE-IDENTICAL — a '
-            'rewrite here would mean something was guessed'
-        )
-
-    def test_the_unrepairable_fact_names_the_tag_it_actually_saw(
-        self, plan_artifacts
-    ):
-        """Not ``None``, and not the invoke closer that merely follows it.
-
-        The diagnostic pattern on the refusal path came from the same blind
-        predicate, so before this task it named whatever fixed literal happened
-        to trail the leak — PRD section 2.2's original complaint, one layer in.
-        """
-        plan = corrupt_plan()
-        plan['design_decisions'][0]['rationale'] = _UNREPAIRABLE_RATIONALE
-        plan_artifacts.write_plan(copy.deepcopy(plan))
-
-        _repaired, facts = plan_tools._read_plan_repaired(plan_artifacts)
-
-        flagged = [f for f in facts if f['field'] == 'rationale']
-        assert flagged[0]['pattern'] == _close('rationale')
-
-
-#: A ``rationale`` whose prose legitimately ENDS by quoting a SIBLING field's
-#: tag pair. ``decision`` is a real sibling parameter of ``add_design_decision``
-#: and its closer is NOT one of the fixed ``ENVELOPE_LITERALS``, so it is a name
-#: the task-4696 widening contributed and nothing else.
-_QUOTED_SIBLING_PROSE = (
-    'The harness emits ' + _LT + 'decision>X' + _close('decision')
-)
-
-
-class TestQuotedSiblingTagIsNeverTruncated:
-    """A plan that TALKS ABOUT the markup must not be rewritten by the reader.
-
-    The widening at ``_carries_markup`` / ``_repair_one_field`` added every
-    sibling ``record.schema_params`` name to the gate, and ``repair`` accepts an
-    EMPTY tail — a candidate closer at end-of-string recovers ``{}`` and still
-    returns ``clean_value = value[:candidate.start()]``. Composed, a rationale
-    ending in ``\x3c/decision>`` was TRUNCATED, reported ``repaired``, and
-    persisted atomically by ``_read_plan_repaired``, with nothing left to
-    surface the loss. Pre-4696 the blanket ``detect`` returned None and the
-    value was left alone, so the loss surface was introduced by that change.
-
-    This is not hypothetical in a repo whose plans discuss tool-call markup —
-    the containment PRD itself quotes these tags. And the widening bought
-    nothing measured: the PRD's 2026-08-25 census puts the CROSS-FIELD
-    population at ZERO (212/212 invisible specimens are self-name).
-
-    The fix is at the shared ``repair`` chokepoint, so the sweep's own
-    sibling-key widening is closed by the same mechanism (INV-5).
-    """
-
-    def test_the_specimen_was_invisible_before_the_widening(self):
-        """Otherwise this class would be pinning pre-existing behaviour."""
-        assert detect(_QUOTED_SIBLING_PROSE) is None
-
-    def test_the_value_comes_back_byte_identical(self, plan_artifacts):
-        plan = corrupt_plan()
-        plan['design_decisions'][0]['rationale'] = _QUOTED_SIBLING_PROSE
-        plan_artifacts.write_plan(copy.deepcopy(plan))
-
-        repaired, _facts = plan_tools._read_plan_repaired(plan_artifacts)
-
-        assert repaired['design_decisions'][0]['rationale'] == _QUOTED_SIBLING_PROSE
-
-    def test_no_repaired_fact_is_emitted_for_it(self, plan_artifacts):
-        """``repaired`` would be an outright false report: nothing was
-        recovered, so the only change would have been text DESTROYED."""
-        plan = corrupt_plan()
-        plan['design_decisions'][0]['rationale'] = _QUOTED_SIBLING_PROSE
-        plan_artifacts.write_plan(copy.deepcopy(plan))
-
-        _repaired, facts = plan_tools._read_plan_repaired(plan_artifacts)
-
-        flagged = [f for f in facts if f['field'] == 'rationale']
-        assert [f['outcome'] for f in flagged] == ['unrepairable']
-        assert flagged[0]['recovered_params'] == []
-
-    def test_the_file_is_never_rewritten(self, plan_artifacts):
-        """The all-refusals branch of ``_read_plan_repaired`` must hold, or the
-        truncation would be durable and the mtime would churn under watchers."""
-        plan = corrupt_plan()
-        plan['design_decisions'][0]['rationale'] = _QUOTED_SIBLING_PROSE
-        plan_artifacts.write_plan(copy.deepcopy(plan))
-        before = (plan_artifacts.root / 'plan.json').read_bytes()
-
-        plan_tools._read_plan_repaired(plan_artifacts)
-
-        assert (plan_artifacts.root / 'plan.json').read_bytes() == before
-
-    def test_a_self_name_closer_in_the_same_plan_is_still_repaired(
-        self, plan_artifacts
-    ):
-        """The guard is scoped to ``name != param``, so the dialect this task
-        exists to fix is untouched — the fix narrows REPAIR, not DETECTION."""
-        plan = corrupt_plan()
-        plan['design_decisions'][0]['rationale'] = _QUOTED_SIBLING_PROSE
-        plan['reuse'][0]['how'] = _SELF_NAME_HOW
-        plan_artifacts.write_plan(copy.deepcopy(plan))
-
-        repaired, _facts = plan_tools._read_plan_repaired(plan_artifacts)
-
-        assert repaired['reuse'][0]['how'] == _SELF_NAME_HOW_PROSE
-        assert repaired['design_decisions'][0]['rationale'] == _QUOTED_SIBLING_PROSE
 
 
 # ---------------------------------------------------------------------------
@@ -3195,7 +2848,7 @@ class TestRepairWriteBackDelegatesToTaskArtifacts:
         )
         assert calls[0] == repaired
         # And the delegation really wrote: the bytes on disk are the repair.
-        assert _on_disk(plan_artifacts) == repaired
+        assert on_disk(plan_artifacts) == repaired
 
     def test_a_clean_plan_still_writes_nothing(self, plan_artifacts, monkeypatch):
         """Consolidating the writer must not convert a read into a write."""

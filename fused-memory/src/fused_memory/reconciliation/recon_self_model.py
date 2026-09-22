@@ -767,9 +767,16 @@ def render_task_creation_accounting_section() -> str:
     proactive/cross-project sample-review surface yet Stage 2 self-reported
     `tasks_created: 0` — exactly the gap this section closes, by stating the
     counter is path-agnostic and by giving the framework an action-record
-    ground truth (`task_created_records`) it can repair from, modeled
-    directly on `flag_deleted_records`' established convention (see
+    list (`task_created_records`) it can repair from, modeled directly on
+    `flag_deleted_records`' established convention (see
     `## Per-Cycle Counter Schema` in prompts/stage2.py).
+
+    That list is NOT taken as ground truth (task 3051): it is itself LLM
+    self-report, so the framework corroborates each record via `get_task`
+    against the record's own `project_id` before letting it raise the
+    counter. The closing paragraph says so, because a prompt that overstates
+    the framework's safety net lowers agent care on a counter nothing else
+    checks.
 
     Rendered once, as a shared renderer (INV-5) — not restated in
     `assemble_payload`'s "Your Task" block, where the Proactive Task Sample /
@@ -808,10 +815,15 @@ def render_task_creation_accounting_section() -> str:
         '"status": "created"|"combined", "project_id": <project the task '
         'was filed into>, "source_path": <short label of the surface that '
         'produced it>}`\n\n'
-        'The framework treats this list as ground truth and REPAIRS '
-        '`tasks_created` upward when the two disagree (recording the '
-        'pre-repair value under `tasks_created_reported`), so a missed '
-        'increment is recovered rather than lost.'
+        'The framework CORROBORATES every record before it counts for '
+        'anything: it looks each `task_id` up via `get_task` against the '
+        "root of that record's own `project_id`, and REPAIRS "
+        '`tasks_created` upward to the number of records whose task is '
+        'confirmed to EXIST (recording the pre-repair value under '
+        '`tasks_created_reported`), so a missed increment is recovered '
+        'rather than lost. A record naming a task that cannot be confirmed '
+        'to exist will NOT raise the counter — record only creations you '
+        'actually made, with the `project_id` you actually filed into.'
     )
 
 

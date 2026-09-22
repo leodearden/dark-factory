@@ -2646,3 +2646,97 @@ def test_verify_merge_no_watchdog_when_request_id_absent(tmp_path, monkeypatch):
     assert watchdog_calls == [], (
         f'start_stdin_watchdog must NOT be called without --request-id; got {watchdog_calls!r}'
     )
+
+
+# ---------------------------------------------------------------------------
+# Task 4194 step-1 — the fire callback forwards the WatchdogTrigger
+# ---------------------------------------------------------------------------
+
+
+def test_verify_merge_watchdog_fire_callback_forwards_trigger(tmp_path, monkeypatch):
+    """The fire callback forwards the trigger, and still sets watchdog_fired FIRST.
+
+    The callback the CLI hands start_stdin_watchdog is the last hop before
+    fire_watchdog_kill reports the branch identity on stderr, so it has to
+    carry that identity through. It must also keep setting watchdog_fired
+    strictly before anything else: that happens-before is load-bearing (see
+    the comment above the callback in cli.py) and threading a new argument
+    through must not reorder it. Both are asserted from one ordered log.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from orchestrator.verify_cancel import WatchdogTrigger
+
+    FAKE_PGID = 55556
+    known_json = '{"passed": true, "results": []}'
+
+    fake_wt = tmp_path / '_merge-verify'
+    fake_wt.mkdir()
+    mock_git_ops = MagicMock()
+    mock_git_ops.worktree_base = tmp_path / '.worktrees'
+    mock_git_ops.acquire_host_verify_worktree = AsyncMock(return_value=fake_wt)
+    mock_git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)
+    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
+
+    fake_config = OrchestratorConfig(project_root=tmp_path)
+    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
+    monkeypatch.setattr(cli_module, 'start_own_process_group', lambda: FAKE_PGID)
+
+    # One ordered log shared by both seams, so the happens-before is read off
+    # the log rather than inferred from two independent recorders.
+    ordered = []
+
+    class _LoggingEvent(threading.Event):
+        def set(self):
+            ordered.append('watchdog_fired.set')
+            super().set()
+
+    monkeypatch.setattr(threading, 'Event', _LoggingEvent)
+
+    kill_calls = []
+
+    def fake_fire_watchdog_kill(pgid, **kwargs):
+        ordered.append('fire_watchdog_kill')
+        kill_calls.append((pgid, kwargs))
+
+    monkeypatch.setattr(cli_module, 'fire_watchdog_kill', fake_fire_watchdog_kill)
+
+    captured_fire = []
+
+    def fake_start_stdin_watchdog(pgid, *args, fire=None, **kwargs):
+        captured_fire.append(fire)
+        return MagicMock()
+
+    monkeypatch.setattr(cli_module, 'start_stdin_watchdog', fake_start_stdin_watchdog)
+
+    monkeypatch.setattr('orchestrator.verify_runner.spec_from_json', lambda s: MagicMock())
+    monkeypatch.setattr(
+        'orchestrator.verify_runner.run_merge_verify_on_worktree',
+        AsyncMock(return_value=MagicMock()),
+    )
+    monkeypatch.setattr('orchestrator.verify_runner.result_to_json', lambda r: known_json)
+
+    cfg_file = tmp_path / 'config.yaml'
+    cfg_file.write_text('')
+
+    sha = 'abc1234567890abc1234567890abc1234567890ab'
+    r = CliRunner().invoke(main, [
+        'verify-merge',
+        '--sha', sha,
+        '--spec', '{}',
+        '--config', str(cfg_file),
+        '--request-id', 'test-req-4194',
+    ])
+
+    assert r.exit_code == 0, f'expected exit_code 0, got {r.exit_code}; output={r.output!r}'
+    assert len(captured_fire) == 1, f'expected one fire= callback; got {captured_fire!r}'
+    assert captured_fire[0] is not None
+
+    ordered.clear()  # scope the log to the callback's own actions
+    captured_fire[0](WatchdogTrigger.HEARTBEAT_STARVATION)
+
+    assert ordered == ['watchdog_fired.set', 'fire_watchdog_kill']
+    assert len(kill_calls) == 1
+    pgid, kwargs = kill_calls[0]
+    assert pgid == FAKE_PGID
+    assert kwargs['trigger'] is WatchdogTrigger.HEARTBEAT_STARVATION

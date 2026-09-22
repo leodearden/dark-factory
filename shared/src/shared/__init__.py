@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from shared.agent_result import AgentVerdict, extract_agent_verdict
     from shared.async_sqlite_base import (
         AsyncSqliteBase,
+        AtomicConnection,
         CheckpointResult,
         apply_full_durability_pragmas,
         apply_wal_pragmas,
@@ -93,6 +94,7 @@ _SYMBOL_MODULE: dict[str, str] = {
     'extract_agent_verdict': 'agent_result',
     # shared.async_sqlite_base
     'AsyncSqliteBase': 'async_sqlite_base',
+    'AtomicConnection': 'async_sqlite_base',
     'CheckpointResult': 'async_sqlite_base',
     'apply_full_durability_pragmas': 'async_sqlite_base',
     'apply_wal_pragmas': 'async_sqlite_base',
@@ -210,6 +212,7 @@ __all__ = [
     'AgentVerdict',
     'extract_agent_verdict',
     'AsyncSqliteBase',
+    'AtomicConnection',
     'CheckpointResult',
     'apply_wal_pragmas',
     'apply_full_durability_pragmas',

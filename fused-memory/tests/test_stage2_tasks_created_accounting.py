@@ -318,6 +318,32 @@ class TestCoerceTasksCreatedCount:
 # ── Task-3046 step-5: TaskKnowledgeSync._apply_post_flight_guards repair ────
 
 
+class _AllPresentTaskmaster:
+    """Corroborating taskmaster double (task 3051).
+
+    Every ``get_task`` returns a task record, so the corroboration pass task
+    3051 inserted ahead of the repair confirms every structurally-valid
+    record. That keeps the pins BELOW exercising the task-3046 repair itself
+    — which records count, how they dedup, how a non-int self-report coerces
+    — rather than accidentally re-testing the corroboration gate, whose own
+    contract (what happens when a record can NOT be confirmed) is owned by
+    ``tests/test_stage2_stats_audit.py``.
+    """
+
+    async def get_task(self, task_id, project_root):
+        return {'id': str(task_id), 'title': f'task {task_id}', 'status': 'pending'}
+
+
+#: project_id -> project_root for every project the records below name.
+#: Required as of task 3051: an unresolvable project_id issues no get_task
+#: call and therefore corroborates nothing, which would withhold the repair.
+_KNOWN_PROJECTS = {
+    'dark_factory': '/repo/dark-factory',
+    'reify': '/repo/reify',
+    'test_project': '/tmp/test',
+}
+
+
 def _mock_deps() -> dict:
     """Kwargs for constructing a TaskKnowledgeSync with mocked deps (task 3046).
 
@@ -326,6 +352,11 @@ def _mock_deps() -> dict:
     cross-importing that module-private fixture — the same choice
     ``test_recon_gate_closure_guidance.py::_make_consolidator`` documents and
     makes for ``MemoryConsolidator``.
+
+    Supplies a corroborating taskmaster and a populated ``known_projects``
+    (task 3051): a bare ``AsyncMock()`` taskmaster confirms nothing and an
+    empty ``known_projects`` issues no lookups at all, either of which now
+    withholds the upward repair these pins exercise.
     """
     config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
     write_journal_mock = MagicMock()
@@ -336,10 +367,11 @@ def _mock_deps() -> dict:
     journal_mock.clear_run_session = AsyncMock()
     return {
         'memory_service': AsyncMock(),
-        'taskmaster': AsyncMock(),
+        'taskmaster': _AllPresentTaskmaster(),
         'journal': journal_mock,
         'config': config,
         'scope': ProjectScope(ProjectId('test_project'), ProjectRoot('/tmp/test')),
+        'known_projects': dict(_KNOWN_PROJECTS),
     }
 
 

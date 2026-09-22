@@ -620,8 +620,65 @@ def test_task_status_counts_js_loads_before_tab_tasks(index_html_body: str) -> N
 _TASK_ROW_CELLS_PREFIX = '/static/redux/task_row_cells.js'
 _BURNDOWN_BANDS_PREFIX = '/static/redux/burndown_bands.js'
 _PINS_RECOVERY_PREFIX = '/static/redux/pins_recovery.js'
+_RECON_STATUS_PREFIX = '/static/redux/recon_status.js'
 _TAB_ESCALATIONS_PREFIX = '/static/redux/tab_escalations.jsx'
 _TAB_ESC_ANALYTICS_PREFIX = '/static/redux/tab_escalation_analytics.jsx'
+_SCHED_HEATMAP_BOUNDS_PREFIX = '/static/redux/scheduler_heatmap_bounds.js'
+_SCHEDULER_HEATMAP_PREFIX = '/static/redux/scheduler_heatmap.jsx'
+
+
+def test_scheduler_heatmap_bounds_js_is_served(client) -> None:
+    """GET /static/redux/scheduler_heatmap_bounds.js returns 200.
+
+    The load-order guard below only inspects the <script> tag's position in
+    index.html, so a file that exists in git but is not actually served (a
+    packaging or StaticFiles-mount regression) would keep CI green while the
+    browser 404s.  scheduler_heatmap.jsx destructures
+    window.DF_SCHED_HEATMAP_BOUNDS at top level with no `|| {}` fallback, so a
+    404 here throws at load and blanks the whole Scheduler tab.
+
+    The body check is what makes this more than a reachability probe: a 200
+    serving the wrong file (a stale mount, a path collision) would otherwise
+    pass.
+    """
+    resp = client.get(_SCHED_HEATMAP_BOUNDS_PREFIX)
+    assert resp.status_code == 200, (
+        f'expected 200 for {_SCHED_HEATMAP_BOUNDS_PREFIX}, got {resp.status_code} '
+        '— the module is registered in index.html but not reachable at runtime.'
+    )
+    assert 'boundHeatmapAxes' in resp.text, (
+        f'{_SCHED_HEATMAP_BOUNDS_PREFIX} was served but does not define '
+        'boundHeatmapAxes — the route resolves to the wrong file.'
+    )
+
+
+def test_scheduler_heatmap_bounds_js_loads_before_scheduler_heatmap(
+    index_html_body: str,
+) -> None:
+    """scheduler_heatmap_bounds.js must load BEFORE scheduler_heatmap.jsx.
+
+    scheduler_heatmap.jsx destructures {boundHeatmapAxes, rowTouchesModule}
+    from window.DF_SCHED_HEATMAP_BOUNDS at top-level execution time with no
+    fallback — a later (or missing) tag makes it throw at load, so the
+    Scheduler tab never renders.  The destructure is deliberate
+    (loud-over-silent degradation); this ordering guard keeps that loudness
+    out of a browser.
+
+    Satisfied structurally by the bounds module being a CLASSIC script: every
+    classic tag precedes the first type="text/babel" tag in index.html.  That
+    is the arrangement this asserts, not a coincidence to rely on.
+    """
+    assert_script_loads_before(
+        index_html_body,
+        _SCHED_HEATMAP_BOUNDS_PREFIX,
+        _SCHEDULER_HEATMAP_PREFIX,
+        before_label='scheduler_heatmap_bounds.js',
+        after_label='scheduler_heatmap.jsx',
+        consumer_note=(
+            'scheduler_heatmap.jsx destructures window.DF_SCHED_HEATMAP_BOUNDS '
+            'at top level; scheduler_heatmap_bounds.js must define it first.'
+        ),
+    )
 
 
 def test_task_row_cells_js_is_served(client) -> None:
@@ -781,6 +838,73 @@ def test_pins_recovery_js_loads_before_tab_escalation_analytics(
 
 
 # ---------------------------------------------------------------------------
+# Regression guard: recon_status.js must load BEFORE tabs.jsx and app.jsx
+# (task 5320)
+# ---------------------------------------------------------------------------
+
+
+def test_recon_status_js_is_served(client) -> None:
+    """GET /static/redux/recon_status.js returns 200.
+
+    The load-order guards below only inspect <script> tag positions in
+    index.html, so a file that exists in git but is not actually served (a
+    packaging or StaticFiles-mount regression) would keep CI green while the
+    browser 404s. Both consumers destructure window.DF_RECON_STATUS at top
+    level with no fallback, so a 404 here throws while tabs.jsx / app.jsx are
+    evaluating — taking the whole dashboard, not just the Recon tab.
+    """
+    resp = client.get(_RECON_STATUS_PREFIX)
+    assert resp.status_code == 200, (
+        f'expected 200 for {_RECON_STATUS_PREFIX}, got {resp.status_code} — '
+        'the module is registered in index.html but not reachable at runtime.'
+    )
+
+
+def test_recon_status_js_loads_before_tabs(index_html_body: str) -> None:
+    """recon_status.js must load BEFORE tabs.jsx.
+
+    tabs.jsx destructures {reconRunCounts, reconSuccessPct, reconStatusTone}
+    from window.DF_RECON_STATUS at top-level execution time with no fallback,
+    for ReconTab's tiles and its Recent Runs badges. A later (or missing) tag
+    throws while tabs.jsx is evaluating, so every tab that file defines goes
+    with it.
+    """
+    assert_script_loads_before(
+        index_html_body,
+        _RECON_STATUS_PREFIX,
+        _TABS_PREFIX,
+        before_label='recon_status.js',
+        after_label='tabs.jsx',
+        consumer_note=(
+            'tabs.jsx (ReconTab) destructures window.DF_RECON_STATUS at top '
+            'level; recon_status.js must define it first.'
+        ),
+    )
+
+
+def test_recon_status_js_loads_before_app(index_html_body: str) -> None:
+    """recon_status.js must also load BEFORE app.jsx.
+
+    A SECOND consumer in a different file, so it needs its own assertion:
+    app.jsx destructures {reconRunCounts} at top level to compute the Recon
+    rail badge. Ordering this one wrong is the quieter failure of the two —
+    the rail count is a single digit an operator has no independent way to
+    check, which is how the vocabulary mismatch this task fixes survived.
+    """
+    assert_script_loads_before(
+        index_html_body,
+        _RECON_STATUS_PREFIX,
+        _APP_JSX_PREFIX,
+        before_label='recon_status.js',
+        after_label='app.jsx',
+        consumer_note=(
+            'app.jsx destructures window.DF_RECON_STATUS at top level for the '
+            'Recon rail badge; recon_status.js must define it first.'
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Regression guard: endpoint_staleness.js is served and loads before app.jsx
 # (task 4884, #4791)
 # ---------------------------------------------------------------------------
@@ -858,6 +982,125 @@ def test_endpoint_staleness_js_has_cache_buster(index_html_body: str) -> None:
         'missing tag throws at app.jsx evaluation and blanks the whole page; '
         'a tag added without a cache-buster misses already-open browsers. Bump '
         'all /static/redux/* ?v= uniformly.'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Regression guard: task_vocab.js is served and loads before its JSX consumers
+# (task 5585, PRD leaf alpha)
+#
+# task_vocab.js is the first /static/redux/ asset that is GENERATED rather than
+# hand-written: scripts/gen_dashboard_task_vocab.py renders it from
+# shared/src/shared/task_statuses.py and dashboard/src/dashboard/data/census.py,
+# and tests/scripts/test_dashboard_task_vocab.py pins the two byte-for-byte.
+# That parity test compares generated output against generated output, so it is
+# silent about whether the artifact is WIRED IN at all. These four assertions
+# are the other half: the file is reachable over HTTP, it is versioned, and it
+# runs before the JSX that reads it.
+# ---------------------------------------------------------------------------
+
+_TASK_VOCAB_PREFIX = '/static/redux/task_vocab.js'
+
+
+def test_task_vocab_js_is_served(client) -> None:
+    """GET /static/redux/task_vocab.js returns 200.
+
+    The load-order guards below only inspect <script> tag positions in
+    index.html, so a file that exists in git but is not actually served (a
+    packaging or StaticFiles-mount regression) would keep CI green while the
+    browser 404s. The consumers destructure window.DF_TASK_VOCAB at top level
+    with no fallback, so a 404 here throws while tabs.jsx / app.jsx are
+    evaluating — taking every tab those files define, not one panel.
+    """
+    resp = client.get(_TASK_VOCAB_PREFIX)
+    assert resp.status_code == 200, (
+        f'expected 200 for {_TASK_VOCAB_PREFIX}, got {resp.status_code} — '
+        'the module is registered in index.html but not reachable at runtime.'
+    )
+
+
+def test_task_vocab_js_has_cache_buster(index_html_body: str) -> None:
+    """task_vocab.js is present among the VERSIONED redux assets.
+
+    The presence half of what `test_redux_cache_buster_bumped` asserts for its
+    top-level-destructured siblings: a tag added without a `?v=` misses every
+    already-open browser, and a tag deleted outright takes its consumers down
+    with it. The uniformity half needs no edit at all —
+    `redux_cache_buster_versions` collects EVERY `/static/redux/*?v=N` tag, so
+    a mismatched version here fails over there automatically.
+
+    A stale cached copy is the sharper risk for THIS asset than for the
+    hand-written ones. Its whole purpose is to be the single copy of the task
+    vocabulary the SPA reads; a browser holding last week's task_vocab.js while
+    running this week's JSX sees a vocabulary that disagrees with the census the
+    server computed, which is the class of mismatch the generator exists to
+    make impossible.
+
+    Deliberately its OWN test rather than a ninth assertion inside
+    `test_redux_cache_buster_bumped`, following the endpoint_staleness.js
+    precedent next door: that function is also driven with SYNTHETIC bodies
+    from `test_cache_buster_freshness.py::TestHardcodedFloorIsRetired`, whose
+    `_REQUIRED_ASSETS` roster is a separate mirror in a file outside this
+    task's scope.
+    """
+    assert re.search(r'/static/redux/task_vocab\.js\?v=\d+', index_html_body), (
+        'task_vocab.js is not present among the versioned /static/redux/* '
+        'assets in index.html — the generated task vocabulary never reaches '
+        'the browser, so every consumer destructuring window.DF_TASK_VOCAB at '
+        'top level throws; a tag added without a cache-buster leaves an '
+        'already-open browser reading a stale vocabulary against fresh census '
+        'payloads. Bump all /static/redux/* ?v= uniformly.'
+    )
+
+
+def test_task_vocab_js_loads_before_tabs(index_html_body: str) -> None:
+    """task_vocab.js must load BEFORE tabs.jsx.
+
+    PRD leaves gamma1 and gamma2 both read the vocabulary from tabs.jsx — the
+    shared `ST`/`LocksCell` renderers and OrchTab's census views — via a
+    top-level `window.DF_TASK_VOCAB` destructure with no fallback. A later (or
+    missing) tag throws while tabs.jsx is evaluating, so every tab that file
+    defines goes with it.
+
+    The tag lands in alpha, ahead of those consumers, on purpose: alpha ships
+    the seam and its guards, and an unwired artifact is the one failure the
+    byte-parity test cannot see.
+    """
+    assert_script_loads_before(
+        index_html_body,
+        _TASK_VOCAB_PREFIX,
+        _TABS_PREFIX,
+        before_label='task_vocab.js',
+        after_label='tabs.jsx',
+        consumer_note=(
+            'gamma1 (ST, LocksCell) and gamma2 (OrchTab) destructure '
+            'window.DF_TASK_VOCAB at tabs.jsx top level; task_vocab.js must '
+            'define it first.'
+        ),
+    )
+
+
+def test_task_vocab_js_loads_before_app(index_html_body: str) -> None:
+    """task_vocab.js must also load BEFORE app.jsx.
+
+    A SECOND consumer in a different file, so it needs its own assertion:
+    gamma2 reads the census views in app.jsx for the topbar and rail counts.
+    Ordering this one wrong is the quieter failure of the two — a rail badge is
+    a single number an operator has no independent way to check, which is how
+    the "0/1 vs Active 33" mismatch this PRD closes survived in the first
+    place.
+    """
+    assert_script_loads_before(
+        index_html_body,
+        _TASK_VOCAB_PREFIX,
+        _APP_JSX_PREFIX,
+        before_label='task_vocab.js',
+        after_label='app.jsx',
+        consumer_note=(
+            'gamma2 destructures window.DF_TASK_VOCAB at app.jsx top level for '
+            'the topbar and rail census counts; task_vocab.js must define it '
+            'first.'
+        ),
     )
 
 

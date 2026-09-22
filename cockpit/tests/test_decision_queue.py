@@ -202,6 +202,96 @@ class TestScoringAdapters:
         assert item.filed_at == _NOW
 
 
+class TestQuestionWidth:
+    """derive_question_width(items, now, available_width) -- how many cells
+    the question column gets once the three fixed columns have taken theirs.
+
+    Pure: the widget supplies the measured width, this decides the bound.
+    With _make_row_item()'s defaults at available_width=200, cell_padding=1
+    the three fixed columns render 7 + 5 + 14 = 26 cells ('score' the label
+    beats '1.0', 'age' the label ties '10d', 'project#task' the label beats
+    'df#2085', each plus two padding cells), leaving 200 - 26 - 2 == 172.
+    """
+
+    def test_wide_terminal_leaves_the_question_everything_the_others_do_not_take(self):
+        from cockpit.panes.decision_queue import derive_question_width
+
+        assert derive_question_width([_make_row_item()], _NOW, 200) == 172
+
+    def test_a_column_label_wider_than_every_cell_sets_that_column_s_floor(self):
+        from cockpit.panes.decision_queue import derive_question_width
+
+        item = _make_row_item(project='d', task_id=None)
+
+        assert derive_question_width([item], _NOW, 200) == 172
+
+    def test_a_cell_wider_than_its_label_takes_the_excess_from_the_question(self):
+        from cockpit.panes.decision_queue import derive_question_width
+
+        long_project = 'a-very-long-project-name-here'
+        item = _make_row_item(project=long_project, task_id=None)
+
+        excess = len(long_project) - len('project#task')
+
+        assert derive_question_width([item], _NOW, 200) == 172 - excess
+
+    def test_the_bound_grows_one_for_one_with_the_available_width(self):
+        from cockpit.panes.decision_queue import derive_question_width
+
+        items = [_make_row_item()]
+
+        wide = derive_question_width(items, _NOW, 300)
+        narrow = derive_question_width(items, _NOW, 200)
+
+        assert wide - narrow == 100
+
+    def test_zero_cell_padding_frees_two_cells_per_column(self):
+        from cockpit.panes.decision_queue import derive_question_width
+
+        items = [_make_row_item()]
+
+        padded = derive_question_width(items, _NOW, 200, cell_padding=1)
+        unpadded = derive_question_width(items, _NOW, 200, cell_padding=0)
+
+        assert unpadded - padded == 8
+
+    def test_a_narrow_terminal_floors_rather_than_going_to_zero_or_negative(self):
+        from cockpit.panes.decision_queue import derive_question_width
+
+        bound = derive_question_width([_make_row_item()], _NOW, 30)
+
+        assert bound == 20
+        assert bound >= len('(no question)')
+
+    def test_an_unmeasured_width_returns_the_pre_layout_fallback(self):
+        from cockpit.panes.decision_queue import derive_question_width
+
+        assert derive_question_width([_make_row_item()], _NOW, 0) == 60
+
+    def test_no_items_still_reserves_the_three_column_labels(self):
+        from cockpit.panes.decision_queue import derive_question_width
+
+        assert derive_question_width([], _NOW, 200) == 172
+
+    def test_a_double_width_cell_claims_two_cells_per_character(self):
+        """The budget is spent in the unit Textual lays a column out in.
+        Measured in characters, a 6-character CJK project would claim 6 of
+        the 12 'project#task' already reserves and cost the question column
+        nothing -- while rendering 12 cells wide on screen and pushing the
+        row past the terminal."""
+        from cockpit.panes.decision_queue import derive_question_width
+
+        item = _make_row_item(project='プロジェクト', task_id=None)
+
+        # 6 characters, 12 cells: exactly ties 'project#task''s own 12
+        assert derive_question_width([item], _NOW, 200) == 172
+
+        wider = _make_row_item(project='プロジェクトー', task_id=None)
+
+        # one more double-width character takes TWO cells from the question
+        assert derive_question_width([wider], _NOW, 200) == 170
+
+
 class TestFormatQueueRow:
     def test_renders_four_column_row(self):
         from cockpit.panes.decision_queue import format_queue_row
@@ -280,6 +370,142 @@ class TestFormatQueueRow:
         _, _, _, question_col = format_queue_row(item, now)
 
         assert question_col != ''
+
+
+    def test_the_question_is_cut_to_the_supplied_bound(self):
+        from cockpit.panes.decision_queue import format_queue_row
+
+        item = _make_row_item(question='x' * 200)
+        now = datetime(2026, 7, 8, tzinfo=UTC)
+
+        _, _, _, question_col = format_queue_row(item, now, question_width=25)
+
+        assert len(question_col) == 25
+        assert question_col.endswith('\u2026')
+
+    def test_the_cut_tracks_the_bound_rather_than_a_constant(self):
+        from cockpit.panes.decision_queue import format_queue_row
+
+        item = _make_row_item(question='x' * 200)
+        now = datetime(2026, 7, 8, tzinfo=UTC)
+
+        _, _, _, question_col = format_queue_row(item, now, question_width=120)
+
+        assert len(question_col) == 120
+        assert question_col.endswith('\u2026')
+
+    def test_a_question_under_the_bound_passes_through_unmarked(self):
+        from cockpit.panes.decision_queue import format_queue_row
+
+        item = _make_row_item(question='Which port?')
+        now = datetime(2026, 7, 8, tzinfo=UTC)
+
+        _, _, _, question_col = format_queue_row(item, now, question_width=40)
+
+        assert question_col == 'Which port?'
+        assert '\u2026' not in question_col
+
+    def test_a_question_exactly_at_the_bound_is_not_truncated(self):
+        from cockpit.panes.decision_queue import format_queue_row
+
+        item = _make_row_item(question='x' * 40)
+        now = datetime(2026, 7, 8, tzinfo=UTC)
+
+        _, _, _, question_col = format_queue_row(item, now, question_width=40)
+
+        assert question_col == 'x' * 40
+
+    def test_whitespace_still_collapses_before_the_bound_is_applied(self):
+        from cockpit.panes.decision_queue import format_queue_row
+
+        item = _make_row_item(question='word\n\nword   word  ' * 10)
+        now = datetime(2026, 7, 8, tzinfo=UTC)
+
+        _, _, _, question_col = format_queue_row(item, now, question_width=25)
+
+        assert len(question_col) == 25
+        assert '\n' not in question_col
+        assert '  ' not in question_col
+        assert question_col == 'word word word word word\u2026'
+
+    def test_a_blank_question_degrades_to_the_placeholder_at_any_bound(self):
+        from cockpit.panes.decision_queue import format_queue_row
+
+        now = datetime(2026, 7, 8, tzinfo=UTC)
+
+        for blank in ('', None, '   '):
+            _, _, _, question_col = format_queue_row(
+                _make_row_item(question=blank), now, question_width=25
+            )
+            assert question_col == '(no question)'
+
+    def test_omitting_the_bound_falls_back_to_the_unmeasured_width(self):
+        from cockpit.panes.decision_queue import format_queue_row
+
+        item = _make_row_item(question='x' * 200)
+        now = datetime(2026, 7, 8, tzinfo=UTC)
+
+        _, _, _, question_col = format_queue_row(item, now)
+
+        assert len(question_col) == 60
+        assert question_col.endswith('\u2026')
+
+    def test_the_bound_is_spent_in_cells_not_characters(self):
+        """The bound must buy the same number of CELLS whatever the script,
+        because that is what the column is laid out and cropped in. Cut by
+        character count, a Japanese question bounded at 172 renders 343 cells
+        wide, so Textual crops it near its middle -- taking the ellipsis with
+        it and leaving no sign the text was truncated."""
+        from rich.cells import cell_len
+
+        from cockpit.panes.decision_queue import format_queue_row
+
+        item = _make_row_item(question='\u3053\u308c\u306f\u30c6\u30b9\u30c8\u7528\u306e\u8cea\u554f\u3067\u3059\u3002' * 30)
+        now = datetime(2026, 7, 8, tzinfo=UTC)
+
+        _, _, _, question_col = format_queue_row(item, now, question_width=172)
+
+        assert cell_len(question_col) <= 172
+        assert cell_len(question_col) >= 171  # fills the column, minus a split-char cell
+        assert len(question_col) < 172  # ... in far fewer characters
+        assert question_col.endswith('\u2026')
+
+    def test_an_odd_bound_across_a_double_width_character_still_fits(self):
+        """Cutting at an odd cell count splits a double-width character.
+        The result must stay INSIDE the bound (rich pads the split with a
+        space; that padding is stripped before the ellipsis is appended)
+        rather than rounding up and overrunning the column by a cell."""
+        from rich.cells import cell_len
+
+        from cockpit.panes.decision_queue import format_queue_row
+
+        item = _make_row_item(question='\u3042' * 50)
+        now = datetime(2026, 7, 8, tzinfo=UTC)
+
+        for bound in range(20, 31):
+            _, _, _, question_col = format_queue_row(item, now, question_width=bound)
+
+            assert cell_len(question_col) <= bound
+            assert question_col.endswith('\u2026')
+
+    def test_a_non_positive_bound_degrades_instead_of_inverting_the_cut(self):
+        """format_queue_row exposes the bound as a public keyword, so the
+        function is total for every int it accepts -- not only for the ones
+        derive_question_width happens to return. A negative bound used to
+        become a negative slice and silently return almost the whole
+        question; it is clamped to the placeholder's width instead."""
+        from rich.cells import cell_len
+
+        from cockpit.panes.decision_queue import format_queue_row
+
+        item = _make_row_item(question='x' * 200)
+        now = datetime(2026, 7, 8, tzinfo=UTC)
+
+        for bound in (-5, 0, 1, 13):
+            _, _, _, question_col = format_queue_row(item, now, question_width=bound)
+
+            assert cell_len(question_col) == len('(no question)')
+            assert question_col.endswith('\u2026')
 
 
 class TestFormatCopyPayload:

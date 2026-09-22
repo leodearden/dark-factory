@@ -46,7 +46,7 @@ import hashlib
 from collections import Counter
 from collections.abc import Iterator
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, Protocol, TypeVar
 
 # ---------------------------------------------------------------------------
 # Public types
@@ -62,6 +62,39 @@ class Violation(NamedTuple):
     message: str
     qualname: str = ""  # enclosing function qualname (e.g. "Harness.run")
     content_hash: str = ""  # sha256(ast.unparse(node))[:12] — drift-resistant
+
+
+class KeyedSite(Protocol):
+    """The three fields the drift-resistant identity key is built from.
+
+    The key helpers below are deliberately reusable by any gate in this
+    directory that reports per-site findings — ``loop_blocking_scan``'s
+    ``LoopBlockingSite`` is the second such tuple, and it names its path field
+    ``filename`` precisely so the multiset ratchet is reused rather than
+    re-implemented.  Typing the helpers against this structural protocol rather
+    than against :class:`Violation` is what makes that documented reuse
+    type-check instead of needing a ``# type: ignore`` at every call site.
+
+    Read-only ``@property`` members, not bare attributes: a ``NamedTuple``'s
+    fields are read-only, so a protocol declaring mutable attributes would not
+    match one.
+    """
+
+    @property
+    def filename(self) -> str: ...
+
+    @property
+    def qualname(self) -> str: ...
+
+    @property
+    def content_hash(self) -> str: ...
+
+
+#: Bound to the protocol so ``reconcile_against_allowlist`` returns the SAME
+#: concrete tuple type it was handed — callers keep access to their own extra
+#: fields (e.g. ``LoopBlockingSite.callee`` / ``.primitive``) in the returned
+#: unblessed list.
+_SiteT = TypeVar("_SiteT", bound=KeyedSite)
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +297,7 @@ def _content_hash(node: ast.AST) -> str:
 # ---------------------------------------------------------------------------
 
 
-def violation_key(v: Violation) -> tuple[str, str, str]:
+def violation_key(v: KeyedSite) -> tuple[str, str, str]:
     """Return the drift-resistant identity key for a violation.
 
     The key is ``(filename, qualname, content_hash)`` — omitting lineno so
@@ -272,7 +305,8 @@ def violation_key(v: Violation) -> tuple[str, str, str]:
     does not invalidate a blessed allowlist entry.
 
     Args:
-        v: A :class:`Violation` instance (must have content_hash populated).
+        v: Any :class:`KeyedSite` — a :class:`Violation` or any other
+            per-site finding tuple (must have content_hash populated).
 
     Returns:
         A 3-tuple ``(relpath, qualname, content_hash)``.
@@ -281,9 +315,9 @@ def violation_key(v: Violation) -> tuple[str, str, str]:
 
 
 def reconcile_against_allowlist(
-    violations: list[Violation],
+    violations: list[_SiteT],
     allow_keys: list[tuple[str, str, str]],
-) -> tuple[list[Violation], list[tuple[str, str, str]]]:
+) -> tuple[list[_SiteT], list[tuple[str, str, str]]]:
     """Reconcile tree violations against the blessed allowlist using multiset semantics.
 
     Uses :class:`collections.Counter` subtraction so that duplicate keys (two
@@ -318,7 +352,7 @@ def reconcile_against_allowlist(
     # once a key's allowance is exhausted, subsequent violations with that key
     # are emitted as unblessed.
     remaining = Counter(allow_counts)
-    unblessed: list[Violation] = []
+    unblessed: list[_SiteT] = []
     for v in violations:
         key = violation_key(v)
         if remaining[key] > 0:

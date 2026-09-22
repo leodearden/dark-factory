@@ -566,6 +566,18 @@ def scan_content(
             canonicalization — the filter is PERMISSIVE; see
             :func:`_canonical_allowlist`.
 
+            Narrowing is STRICTLY SUBTRACTIVE: it can only ever remove a
+            referent from the result, never add one. Dropping a foreign
+            candidate removes it from both partitions but PRESERVES the
+            ambiguity contest it created, because the contest is decided
+            against the permissive candidate set. Without that, dropping the
+            junk qualifier in 'Restarted redis at localhost:6379 while
+            finishing task 6379.' would promote the bare 'task 6379' out of
+            ``ambiguous`` and into ``refs`` — turning an episode that produces
+            NO referent set today, which every consumer no-ops on, into one
+            that produces a set a repair path will act on. A narrowing that
+            mints referents is a net regression, not a precision win.
+
     Returns:
         A :class:`LabelScan`. ``refs`` is safe to act on; ``ambiguous`` must
         not be acted on silently. A number goes to ``ambiguous`` only when the
@@ -590,6 +602,13 @@ def scan_content(
     # referent came from an UNQUALIFIED mention, which is what the ambiguity
     # partition below is decided on.
     found: list[tuple[int, Referent, bool]] = []
+    # (kind, number) of every foreign candidate the allowlist DROPS. The
+    # candidate itself never reaches `found`, but the ambiguity CONTEST it
+    # created against a bare mention of the same number must survive it — see
+    # the subtractive guarantee below. Empty whenever `allowlist is None`,
+    # which is what makes the narrowing a provable no-op for permissive
+    # callers.
+    dropped_foreign_keys: set[tuple[str, str]] = set()
 
     for match in _LOCAL_MENTION_PATTERN.finditer(content):
         found.append((match.start(), Referent(kind='task', number=match.group(1)), True))
@@ -616,11 +635,13 @@ def scan_content(
             # drop that module wants.
             found.append((match.start(), Referent(kind='task', number=number), False))
             continue
+        foreign = Referent(kind='task', project_id=project_id, number=number)
         if allowlist is not None and project_id not in allowlist:
+            # Keyed off the candidate itself rather than a literal, so the key
+            # cannot drift from the kind the referent actually carries.
+            dropped_foreign_keys.add((foreign.kind, foreign.number))
             continue
-        found.append(
-            (match.start(), Referent(kind='task', project_id=project_id, number=number), False)
-        )
+        found.append((match.start(), foreign, False))
 
     # Merge the two passes by OFFSET rather than concatenating them, so the
     # result reads in the order a human reads the content. Sorting is stable,
@@ -674,8 +695,16 @@ def scan_content(
     # lose a genuine contest the content does contain. (Dedup still collapses
     # 'reify:5181 and task 5181' to one own-project referent; that pair simply
     # has no foreign side to contest.)
+    # The contest is decided against the PERMISSIVE candidate set while the
+    # emitted refs stay NARROWED, which is what makes narrowing STRICTLY
+    # SUBTRACTIVE. A dropped foreign candidate is gone from both partitions,
+    # but it was also the thing CONTESTING a bare mention of its number;
+    # letting the drop take the contest with it would PROMOTE that bare
+    # mention out of `.ambiguous` and into `.refs` — narrowing minting a
+    # referent the permissive scan refused to mint. Only the contest survives
+    # the drop, never the candidate.
     bare_keys = {(r.kind, r.number) for _offset, r, arrived_bare in found if arrived_bare}
-    foreign_keys = {(r.kind, r.number) for r in deduped if r.project_id}
+    foreign_keys = {(r.kind, r.number) for r in deduped if r.project_id} | dropped_foreign_keys
     contested = bare_keys & foreign_keys
 
     # Digits are compared as literals, never int-normalized, so '0250' and

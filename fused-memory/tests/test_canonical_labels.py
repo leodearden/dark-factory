@@ -769,6 +769,126 @@ class TestScanContentAllowlist:
         assert [r.node_name for r in scan.refs] == ['dark_factory:2500']
 
 
+class TestNarrowingIsStrictlySubtractive:
+    """Dropping a foreign candidate may REMOVE a referent, never ADD one.
+
+    The allowlist narrows by dropping foreign candidates that name an unknown
+    project — but a dropped candidate is also the thing that was CONTESTING a
+    bare mention of the same number, and losing that contest PROMOTES the bare
+    mention out of ``.ambiguous`` and into ``.refs``. Narrowing would then MINT
+    a referent the permissive scan refused to mint: an episode body that
+    produces no referent set today — so every downstream consumer no-ops on it
+    — silently becomes one that produces a set a repair path will act on. That
+    is the opposite of what an allowlist is for, and the one way narrowing can
+    be a net regression rather than a precision win.
+
+    So the contest is decided against the PERMISSIVE candidate set while the
+    emitted refs stay NARROWED: a dropped junk qualifier leaves the output
+    entirely — it appears in neither ``.refs`` nor ``.ambiguous`` — and the
+    bare number it contested stays withheld from ``.refs``.
+    """
+
+    REGISTRY = {'dark_factory': '/src/dark-factory', 'reify': '/src/reify'}
+
+    # The measured incident shape: a host:port whose digits collide with a task
+    # number, which is why 'localhost:6379' reads as a foreign task ref at all.
+    PORT_COLLISION = 'Restarted redis at localhost:6379 while finishing task 6379.'
+
+    # Junk qualifiers from the measured episode corpus, each beside a bare
+    # mention of the number it collides on. Spelled as
+    # (content, bare node name, junk node name as the PERMISSIVE scan emits it)
+    # rather than derived from the content, so no test-local parser has to
+    # restate the scanner's own canonicalization ('INFO' -> 'info').
+    JUNK_SHAPES = [
+        ('saw localhost:6379 while finishing task 6379', 'Task 6379', 'localhost:6379'),
+        ('saw INFO:1234 while finishing task 1234', 'Task 1234', 'info:1234'),
+        ('saw redis:6379 while finishing task 6379', 'Task 6379', 'redis:6379'),
+        ('saw commit:4321 while finishing task 4321', 'Task 4321', 'commit:4321'),
+        ('saw pending:77 while finishing task 77', 'Task 77', 'pending:77'),
+    ]
+
+    def test_dropping_a_junk_qualifier_never_promotes_the_number_it_contested(self):
+        """MEASURED at HEAD: permissive yields refs=(), narrowed yields
+        refs=(Task 6379,). The EMPTY referent set is the property every
+        downstream consumer no-ops on, so narrowing turning it non-empty is
+        precisely the regression this pins."""
+        scan = scan_content(
+            self.PORT_COLLISION, group_id='dark_factory', known_project_ids=self.REGISTRY
+        )
+        assert scan.refs == ()
+        assert [r.node_name for r in scan.ambiguous] == ['Task 6379']
+
+    def test_the_dropped_qualifier_is_still_gone_from_the_output(self):
+        """Subtractive, not a revert: only the CONTEST survives the drop. The
+        junk qualifier itself appears in NEITHER partition — narrowing still
+        does the job it was wired for."""
+        scan = scan_content(
+            self.PORT_COLLISION, group_id='dark_factory', known_project_ids=self.REGISTRY
+        )
+        emitted = [r.node_name for r in (*scan.refs, *scan.ambiguous)]
+        assert 'localhost:6379' not in emitted
+
+    def test_a_genuine_in_registry_foreign_ref_survives_the_subtraction(self):
+        """Preserving the contest must not cost a real cross-project ref. Here
+        'reify:2500' is in the registry and uncontested, so it stays in
+        ``.refs``, while 'task 6379' stays contested out of them by the
+        dropped 'localhost:6379' it collides with."""
+        scan = scan_content(
+            'See reify:2500 and task 6379 and localhost:6379',
+            group_id='dark_factory',
+            known_project_ids=self.REGISTRY,
+        )
+        assert [r.node_name for r in scan.refs] == ['reify:2500']
+        assert [r.node_name for r in scan.ambiguous] == ['Task 6379']
+
+    @pytest.mark.parametrize(('content', 'bare_name', 'junk_name'), JUNK_SHAPES)
+    def test_every_measured_junk_shape_drops_without_promoting_its_bare_twin(
+        self, content, bare_name, junk_name
+    ):
+        scan = scan_content(content, group_id='dark_factory', known_project_ids=self.REGISTRY)
+        assert scan.refs == ()
+        assert [r.node_name for r in scan.ambiguous] == [bare_name]
+        assert junk_name not in [r.node_name for r in scan.ambiguous]
+
+    @pytest.mark.parametrize('allowlist', [None, {}, set()])
+    @pytest.mark.parametrize(
+        ('content', 'expected_refs', 'expected_ambiguous'),
+        [
+            (PORT_COLLISION, [], ['localhost:6379', 'Task 6379']),
+            (
+                'See reify:2500 and task 6379 and localhost:6379',
+                ['reify:2500'],
+                ['Task 6379', 'localhost:6379'],
+            ),
+            *[
+                (content, [], [junk_name, bare_name])
+                for content, bare_name, junk_name in JUNK_SHAPES
+            ],
+        ],
+    )
+    def test_permissive_mode_is_byte_identical_to_head(
+        self, allowlist, content, expected_refs, expected_ambiguous
+    ):
+        """The fix must be a provable NO-OP when nothing is dropped: with no
+        usable allowlist no candidate is ever skipped, so the extra
+        bookkeeping contributes nothing and every permissive result is the one
+        measured at HEAD."""
+        scan = scan_content(content, group_id='dark_factory', known_project_ids=allowlist)
+        assert [r.node_name for r in scan.refs] == expected_refs
+        assert [r.node_name for r in scan.ambiguous] == expected_ambiguous
+
+    def test_a_contest_from_an_in_registry_foreign_ref_is_unaffected(self):
+        """The ordinary contest — the one that never involved a drop — keeps
+        emitting BOTH sides into ``.ambiguous``, so the new bookkeeping did not
+        disturb the partition it rides alongside."""
+        content = 'reify:2500 blocks task 2500 here'
+        narrowed = scan_content(content, group_id='dark_factory', known_project_ids=self.REGISTRY)
+        permissive = scan_content(content, group_id='dark_factory')
+        assert narrowed == permissive
+        assert narrowed.refs == ()
+        assert [r.node_name for r in narrowed.ambiguous] == ['reify:2500', 'Task 2500']
+
+
 class TestAllPathShapedRegistryIsLoud:
     """The permissive fallback for an all-path-shaped registry is a fail-SOFT
     path, so it must be audible — INV-4 ``storm-escape-required``

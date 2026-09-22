@@ -126,3 +126,68 @@ async def test_fault_runtime_error_returns_blocked(tmp_path: Path):
     outcome = (await wf.run()).outcome
 
     assert outcome == WorkflowOutcome.BLOCKED
+
+
+# ---------------------------------------------------------------------------
+# Task 4930: WarmLaneStealFailed / WarmLaneLockTimeout → REQUEUED
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_steal_failed_returns_requeued(tmp_path: Path):
+    """WarmLaneStealFailed → REQUEUED with its own reason_prefix and the cap
+    charged.
+
+    The REQUEUED half already passes via the shared WarmLaneRequeue base row;
+    the reason_prefix and counts_against_requeue_cap assertions are the RED
+    ones. Before task 4930 this condition surfaced as a bare RuntimeError and
+    landed the task BLOCKED + L1 with agent_invocations=0 — the 2026-08-29
+    incident shape.
+    """
+    from orchestrator.git_ops import WarmLaneStealFailed
+
+    wf = _make_workflow(tmp_path=tmp_path)
+    wf.git_ops.create_worktree = AsyncMock(
+        side_effect=WarmLaneStealFailed(
+            "warm-lane reclaim-on-exhaustion steal failed for branch '1859': "
+            'every stolen lane failed to provision, or no further eligible '
+            'victim remained (at most 3 attempts per acquire); requeue'
+        )
+    )
+    report = await wf.run()
+
+    assert report.outcome == WorkflowOutcome.REQUEUED, (
+        'a pool-pressure steal failure must requeue, never block + L1'
+    )
+    assert report.reason.startswith('warm_lane_steal_failed (pool pressure)'), (
+        f'expected the steal-failure reason_prefix; got {report.reason!r}'
+    )
+    assert report.counts_against_requeue_cap is True, (
+        'chronic pool pressure does not self-clear — the cap is the bounded '
+        'loud path that replaces the per-task BLOCKED+L1 being removed'
+    )
+
+
+@pytest.mark.asyncio
+async def test_lane_lock_timeout_returns_requeued(tmp_path: Path):
+    """WarmLaneLockTimeout → REQUEUED, and the task is NOT charged for it."""
+    from orchestrator.git_ops import WarmLaneLockTimeout
+
+    wf = _make_workflow(tmp_path=tmp_path)
+    wf.git_ops.create_worktree = AsyncMock(
+        side_effect=WarmLaneLockTimeout(
+            "warm-lane seed lost the 30s <lane>.lock wait (rc=124) for branch "
+            "'1859'; requeue (transient contention)"
+        )
+    )
+    report = await wf.run()
+
+    assert report.outcome == WorkflowOutcome.REQUEUED, (
+        'a lost lock race is transient contention — it must requeue'
+    )
+    assert report.reason.startswith('warm_lane_lock_timeout (transient infra)'), (
+        f'expected the lock-timeout reason_prefix; got {report.reason!r}'
+    )
+    assert report.counts_against_requeue_cap is False, (
+        'the requeued task did not cause the lock race and must not be '
+        'charged for it'
+    )

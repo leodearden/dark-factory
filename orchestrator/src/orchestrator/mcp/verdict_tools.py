@@ -34,6 +34,7 @@ from fastmcp import FastMCP
 from shared.mcp_markup_middleware import (
     MarkupGuardMiddleware,
     RepairPolicy,
+    accepts_markup_override,
 )
 
 from orchestrator.artifacts import TaskArtifacts, _validate_verdict_role
@@ -406,6 +407,7 @@ def create_server(artifacts: TaskArtifacts, role: str, session_id: str = '') -> 
 
     if role == 'judge':
         @mcp.tool()
+        @accepts_markup_override
         def submit_completion_verdict(
             complete: bool,
             reasoning: str,
@@ -426,6 +428,7 @@ def create_server(artifacts: TaskArtifacts, role: str, session_id: str = '') -> 
             )
     elif role == 'triage':
         @mcp.tool()
+        @accepts_markup_override
         def submit_triage(
             accepted: list[dict],
             skipped: list[dict],
@@ -444,6 +447,7 @@ def create_server(artifacts: TaskArtifacts, role: str, session_id: str = '') -> 
             )
     elif role == 'merger':
         @mcp.tool()
+        @accepts_markup_override
         def submit_merge_disposition(
             blocked: bool,
             reason: str,
@@ -463,6 +467,7 @@ def create_server(artifacts: TaskArtifacts, role: str, session_id: str = '') -> 
         assert role not in _SINGLETON_ROLE_TOOLS
 
         @mcp.tool()
+        @accepts_markup_override
         def submit_review_verdict(
             reviewer: str,
             verdict: str,

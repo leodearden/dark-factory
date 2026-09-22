@@ -61,6 +61,31 @@ if [ -n "$staged_mm" ]; then
     fi
 fi
 
+# module-local TestClient fixture check — STAGED dashboard test files only.
+# See the notes above: repo-wide enforcement lives in dashboard's verify
+# lint_command (which also runs in merge-queue verify); this gate only inspects
+# the .py files under dashboard/tests that THIS commit stages, so it never
+# blocks an unrelated commit with debt that commit did not introduce.
+#
+# Deliberately scoped to dashboard/tests: conftest.py there owns the shared
+# module-scoped _client fixture, and a second TestClient in a fixture means a
+# second app lifespan per module. Other packages' tests build TestClients for
+# other apps and are none of this rule's business.
+# Script is stdlib-only (ast/argparse/pathlib/re/sys) — invoked via plain python3 to skip uv env-resolution overhead.
+echo "pre-commit: module-local TestClient fixture check (staged)..."
+staged_tc="$(cd "$ROOT" && git diff --cached --name-only --diff-filter=ACMR -- \
+    dashboard/tests \
+    | grep -E '\.py$' || true)"
+if [ -n "$staged_tc" ]; then
+    if ! (cd "$ROOT" && printf '%s\n' "$staged_tc" | xargs python3 fused-memory/scripts/check_module_local_testclient.py); then
+        echo "pre-commit: module-local TestClient fixture check failed."
+        echo "  Request conftest.py's shared module-scoped '_client' fixture instead of building your own."
+        echo "  See task 4485 (guard), task 3571 (the dedup this makes durable)."
+        echo "  To suppress a specific site: add '# noqa: module-local-testclient — <reason>' on the preceding non-blank line."
+        exit 1
+    fi
+fi
+
 # pyright (must run from each package directory to pick up [tool.pyright] config)
 # Path-filtered: only run for packages with staged .py changes, so docs/plans-only
 # commits (and commits scoped to a single package) don't pay for an unconditional

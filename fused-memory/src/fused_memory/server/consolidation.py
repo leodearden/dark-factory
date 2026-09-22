@@ -11,6 +11,21 @@ Imports stay stdlib + :mod:`fused_memory.memory_metadata` /
 :mod:`fused_memory.topic_slug` / :mod:`fused_memory.utils.validation` for
 exactly that reason.
 
+THE ONE VALIDATOR, TWO ARMS
+---------------------------
+:func:`validate_consolidate_args` serves both callers of this shape (PRD D6 —
+one fact, one home).  ``limits=None`` selects the OP arm, taken by
+``server/tools.py::consolidate_memories``.  Passing a :class:`ProposalLimits`
+selects the PROPOSAL arm, taken by task gamma's ``propose_consolidation`` at
+the emit boundary — so the LLM that wrote a mis-shaped claim fixes it in-turn
+— and again by task delta's executor when it re-checks an aged ledger row
+whose limits have since moved (PRD B7).  The id, topic and arm rules are
+therefore checked once, in one place, rather than re-typed per caller.
+
+``reconciliation/consolidation_auto.py::evaluate_auto_predicate`` deliberately
+calls NONE of this: PRD C2 makes the benign codes the emit boundary's business,
+and the predicate re-derives none of them.
+
 WHY VALIDATION IS A SEPARATE, FIRST STEP
 ----------------------------------------
 ``consolidate_memories`` is irreversible by construction: it writes a
@@ -40,6 +55,8 @@ Two properties follow from that position and are not incidental:
 
 from __future__ import annotations
 
+import re
+from dataclasses import dataclass
 from typing import Any
 
 from fused_memory.memory_metadata import normalize_supersedes
@@ -53,7 +70,11 @@ from fused_memory.topic_slug import TOPIC_SLUG_MAX_LEN, is_valid_topic_slug
 # truncate differently from every other validator's.
 from fused_memory.utils.validation import _safe_repr, is_full_uuid
 
-__all__ = ['build_consolidation_result', 'validate_consolidate_args']
+__all__ = [
+    'ProposalLimits',
+    'build_consolidation_result',
+    'validate_consolidate_args',
+]
 
 #: Pointer to the ONE topic-slug namespace (PRD D4), quoted at the wire so a
 #: caller can find the rule rather than re-derive a regex that already has a
@@ -154,6 +175,122 @@ def _repeated_id_members(values: list[Any], field: str) -> list[str]:
     return problems
 
 
+@dataclass(frozen=True)
+class ProposalLimits:
+    """The three proposal-shape bounds, passed in rather than defaulted here.
+
+    NO defaults, deliberately. Every number has exactly one home —
+    ``ConsolidationAutoConfig`` — and callers build this from it, so a default
+    here would be a second home for the same fact (SPOT) and would be the copy
+    that goes stale when the config leaf is retuned. Passing this object is
+    also what SELECTS the proposal arm of :func:`validate_consolidate_args`.
+    """
+
+    claim_max_chars: int
+    member_min: int
+    member_max: int
+
+
+#: Stopwords stripped before asking whether a claim says anything the topic
+#: slug did not already say.
+#:
+#: Inline, and that is the DECIDED answer rather than an oversight (PRD §12
+#: Q4): :mod:`fused_memory.topic_slug` exposes only ``TOPIC_SLUG_RE``,
+#: ``TOPIC_SLUG_MAX_LEN`` and ``is_valid_topic_slug`` — it has no tokenizer, so
+#: there is nothing to reuse and importing it would not save a list.
+_CLAIM_STOPWORDS: frozenset[str] = frozenset({
+    'the', 'a', 'an', 'and', 'or', 'of', 'for', 'to', 'in', 'on', 'at',
+    'is', 'are', 'was', 'were', 'be', 'been', 'this', 'that', 'these',
+    'those', 'it', 'its', 'as', 'by', 'with', 'from', 'into', 'over',
+    'under', 'not', 'no', 'all', 'any', 'one',
+})
+
+#: A claim must not open with a LABEL. Case-sensitive and ``\b``-terminated on
+#: purpose: the rule refuses the heading ``INDEX —``, not every sentence that
+#: happens to begin ``Indexing`` or ``Canonicalisation``.
+_CLAIM_LABEL_RE = re.compile(r'^(INDEX|CANONICAL)\b')
+
+#: Fewest whitespace-separated words a claim may carry. Below this it is a
+#: fragment, and a fragment in the canonical's first paragraph is the position
+#: PRD §2 measured the retrieval property out of.
+_CLAIM_MIN_WORDS = 8
+
+_CLAIM_HINT = (
+    'A `claim` is ONE assertion on ONE line, in ordinary prose: what is true '
+    'of this cluster that the topic slug does not already say. Not a heading '
+    f'(`INDEX ...`, `CANONICAL: ...`), not a bracketed banner, at least '
+    f'{_CLAIM_MIN_WORDS} words, and short enough to lead the canonical — it '
+    'becomes the canonical\'s first paragraph verbatim.'
+)
+
+
+def _claim_problems(claim: str, topic: str, *, max_chars: int) -> list[str]:
+    """The ONE home of the five claim-shape rules. Collects, never short-circuits.
+
+    A claim becomes the auto-consolidated canonical's first paragraph verbatim
+    (``reconciliation/consolidation_auto.py::build_auto_canonical``), so every
+    rule here is about that position: one line, bounded length, not a banner,
+    not a heading, long enough to be an assertion, and saying something the
+    topic slug did not already say.
+    """
+    problems: list[str] = []
+
+    if '\n' in claim or '\r' in claim:
+        problems.append(
+            '`claim` must be a single line — it becomes the canonical\'s first '
+            f'paragraph verbatim, got {_safe_repr(claim)}'
+        )
+
+    if len(claim) > max_chars:
+        problems.append(
+            f'`claim` is {len(claim)} characters, over the {max_chars} limit'
+        )
+
+    if claim.strip().startswith('['):
+        problems.append(
+            '`claim` must not open with a bracketed stamp: a `[CORRECTION ...]` '
+            'banner lifted from a record body would carry that banner into the '
+            f'canonical, got {_safe_repr(claim)}'
+        )
+
+    if _CLAIM_LABEL_RE.match(claim):
+        problems.append(
+            '`claim` must be an assertion, not an INDEX/CANONICAL label, got '
+            f'{_safe_repr(claim)}'
+        )
+
+    words = claim.split()
+    if len(words) < _CLAIM_MIN_WORDS:
+        problems.append(
+            f'`claim` has {len(words)} words, under the {_CLAIM_MIN_WORDS}-word '
+            'minimum'
+        )
+
+    # The slug is already lowercase alphanumeric segments joined by single
+    # hyphens (TOPIC_SLUG_RE), so splitting it on '-' yields the comparable
+    # token set without a second regex.
+    slug_tokens = set(topic.split('-')) if isinstance(topic, str) else set()
+    claim_tokens = set(re.findall(r'[a-z0-9]+', claim.lower()))
+    if not (claim_tokens - slug_tokens - _CLAIM_STOPWORDS):
+        problems.append(
+            '`claim` says nothing the `topic` slug does not already say: every '
+            f'word is drawn from {_safe_repr(topic)} or is a stopword'
+        )
+
+    return problems
+
+
+def _member_count_problems(retain_ids: list[Any], limits: ProposalLimits) -> list[str]:
+    """Range-check the proposal's member arm, naming the count AND the bound."""
+    count = len(retain_ids)
+    if limits.member_min <= count <= limits.member_max:
+        return []
+    return [
+        f'a proposal names {count} members in `retain`, outside the '
+        f'[{limits.member_min}, {limits.member_max}] range'
+    ]
+
+
 def validate_consolidate_args(
     *,
     canonical_content: Any,
@@ -161,8 +298,32 @@ def validate_consolidate_args(
     supersedes: Any,
     retain: Any,
     run_id: Any,
+    claim: Any = None,
+    limits: ProposalLimits | None = None,
 ) -> tuple[dict[str, str] | None, list[Any], list[Any]]:
     """Check a ``consolidate_memories`` call and normalize its two id arms.
+
+    TWO ARMS, selected by *limits* — this is THE one validator for both (PRD
+    D6), so the id, topic and arm rules below have a single home rather than a
+    re-typed copy per caller:
+
+    * ``limits is None`` — the OP shape. Exactly today's behaviour, plus one
+      addition: a non-``None`` *claim* is itself collected as a problem, so a
+      mis-wired caller that passes a claim without limits fails CLOSED instead
+      of having its claim (and therefore every cap on it) silently dropped.
+      ``server/tools.py::consolidate_memories`` takes this arm by omission,
+      which is why it needs no edit.
+    * ``limits is not None`` — the PROPOSAL shape. ``canonical_content`` is not
+      required (a proposal has no canonical text yet, by construction), *claim*
+      is, and the retain arm's length must fall in
+      ``[member_min, member_max]``. Task gamma's ``propose_consolidation`` takes
+      this arm at the EMIT boundary so the LLM fixes its own shape in-turn, and
+      task delta's executor takes it again when re-checking an aged ledger row
+      whose limits have since moved (PRD B7).
+
+    ``evaluate_auto_predicate`` deliberately calls NONE of this. PRD C2 makes
+    the benign codes the emit boundary's business, and the predicate re-derives
+    none of them.
 
     Returns ``(error_or_None, normalized_supersedes, normalized_retain)``.
     The error is the flat ``{'error', 'error_type': 'ValidationError',
@@ -194,15 +355,36 @@ def validate_consolidate_args(
     supersedes_ids = normalize_supersedes(supersedes)
     retain_ids = normalize_supersedes(retain)
 
-    if not isinstance(canonical_content, str) or not canonical_content.strip():
+    if limits is None:
+        if not isinstance(canonical_content, str) or not canonical_content.strip():
+            problems.append(
+                '`canonical_content` must be a non-empty string, got '
+                f'{_safe_repr(canonical_content)}'
+            )
+            _add_hint(
+                'canonical_content is the consolidated record\'s TEXT — the single '
+                'claim the surviving canonical will state.'
+            )
+        if claim is not None:
+            problems.append(
+                '`claim` was passed without `limits`, so no claim rule could be '
+                'applied; pass ProposalLimits built from '
+                'ConsolidationAutoConfig to select the proposal shape'
+            )
+            _add_hint(_CLAIM_HINT)
+    elif not isinstance(claim, str) or not claim.strip():
         problems.append(
-            '`canonical_content` must be a non-empty string, got '
-            f'{_safe_repr(canonical_content)}'
+            '`claim` must be a non-empty string in a proposal, got '
+            f'{_safe_repr(claim)}'
         )
-        _add_hint(
-            'canonical_content is the consolidated record\'s TEXT — the single '
-            'claim the surviving canonical will state.'
+        _add_hint(_CLAIM_HINT)
+    else:
+        claim_problems = _claim_problems(
+            claim, topic, max_chars=limits.claim_max_chars,
         )
+        if claim_problems:
+            problems.extend(claim_problems)
+            _add_hint(_CLAIM_HINT)
 
     if not is_valid_topic_slug(topic):
         problems.append(f'`topic` is not a valid topic slug: {_safe_repr(topic)}')
@@ -295,6 +477,17 @@ def validate_consolidate_args(
             'claimed twice by the canonical, and counted twice against a '
             'ledger that stores it once.'
         )
+
+    if limits is not None:
+        count_problems = _member_count_problems(retain_ids, limits)
+        if count_problems:
+            problems.extend(count_problems)
+            _add_hint(
+                'A proposal names the cluster it wants consolidated in `retain`. '
+                'Below the minimum there is no duplication to fold; above the '
+                'maximum a human sitting reads the cluster better than an '
+                'automatic write does.'
+            )
 
     # See the module docstring: refused HERE so an unattributable delete
     # costs zero writes rather than stranding a canonical over unfolded

@@ -12,7 +12,7 @@ import pytest
 from fastmcp import FastMCP
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.mcp import plan_tools
+from orchestrator.mcp import plan_markup_stamp, plan_tools
 from orchestrator.mcp.plan_tools import (
     _add_design_decision,
     _add_plan_step,
@@ -32,6 +32,21 @@ from orchestrator.mcp.plan_tools import (
     _report_unactionable_task,
     _update_plan_metadata,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clear_pending_refusals():
+    """Clear the markup stamp's pending buffer around every test in this module.
+
+    THE SAME shape and the same reason as
+    ``test_plan_tools_markup_guard._clear_pending_refusals``: process-global
+    state on a per-agent stdio server, which one test would otherwise leak into
+    the next. ``_confirm_plan`` READS that buffer (task 4597), so without this
+    a buffered refusal would inflate an unrelated test's reported count.
+    """
+    plan_markup_stamp.clear_pending()
+    yield
+    plan_markup_stamp.clear_pending()
 
 
 @pytest.fixture()
@@ -188,6 +203,85 @@ class TestCreatePlan:
         )
 
         assert artifacts.read_plan() == {}
+
+
+class TestCreatePlanCarriesTheRejectionCounterThroughTheAlgebra:
+    """``_create_plan`` overwrites plan.json WHOLESALE (task 4597).
+
+    It is therefore the one consumer that takes a stored ``_markup_rejections``
+    block and puts it straight into a document it is about to author. Every
+    other consumer (``merge_block``, ``summary``) already treats plan.json as
+    agent-adjacent and degrades what it finds; copying the on-disk value
+    verbatim would be the single path that launders a mangled block into a
+    brand-new plan — and from there into the four architect-facing prompts that
+    embed the document.
+    """
+
+    KEY = plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY
+
+    def _seed_with_block(self, artifacts, block):
+        _create_plan(artifacts, 'test-1', 'T', 'A', ['m.py'])
+        plan = artifacts.read_plan()
+        plan[self.KEY] = block
+        artifacts.write_plan(plan)
+
+    def test_a_usable_block_survives_the_overwrite(self, artifacts):
+        """Without this, a re-plan erases a counter earned earlier."""
+        self._seed_with_block(artifacts, plan_markup_stamp.block_of({
+            'ts': '2026-09-07T00:00:00+00:00',
+            'tool': 'add_design_decision',
+            'param': 'decision',
+            'outcome': 'rejected',
+        }))
+
+        _create_plan(artifacts, 'test-1', 'T2', 'A2', ['m.py'])
+
+        block = artifacts.read_plan()[self.KEY]
+        assert block['count'] == 1
+        assert block['by_tool'] == {'add_design_decision': 1}
+        assert block['note'] == plan_markup_stamp.STAMP_NOTE
+
+    def test_a_mangled_block_is_normalised_rather_than_copied(self, artifacts):
+        """The junk is re-projected, not laundered into the new document."""
+        self._seed_with_block(artifacts, {
+            'count': 2,
+            'by_tool': {'add_design_decision': 'lots', 'add_reuse_item': 2},
+            'events': [{'tool': 'add_design_decision', 'unreviewed_key': 'x' * 900}],
+            'note': 'a hand-edited note that is not the constant',
+        })
+
+        _create_plan(artifacts, 'test-1', 'T2', 'A2', ['m.py'])
+
+        block = artifacts.read_plan()[self.KEY]
+        assert block['count'] == 2
+        assert block['by_tool'] == {'add_design_decision': 0, 'add_reuse_item': 2}
+        assert block['note'] == plan_markup_stamp.STAMP_NOTE
+        assert set(block['events'][0]) <= set(plan_markup_stamp.STAMP_EVENT_KEYS), (
+            'an unreviewed key must not ride a carry-forward into a new plan'
+        )
+
+    def test_an_unrecoverable_block_is_dropped_rather_than_zeroed(self, artifacts):
+        """``None`` from the algebra means NO KEY, not a present-and-zero one.
+
+        The key's PRESENCE is the whole signal, so laundering junk into an
+        empty block would put a key meaning nothing onto a brand-new plan.
+        """
+        for junk in ('a string', 42, ['a', 'list'], {}, {'count': 'seven'}):
+            self._seed_with_block(artifacts, junk)
+
+            _create_plan(artifacts, 'test-1', 'T2', 'A2', ['m.py'])
+
+            assert self.KEY not in artifacts.read_plan(), (
+                f'{junk!r} holds no recorded refusal and must not become a key'
+            )
+
+    def test_the_clean_path_still_writes_no_key_at_all(self, artifacts):
+        """THE OVERWHELMINGLY COMMON PATH stays byte-identical to today."""
+        _create_plan(artifacts, 'test-1', 'T', 'A', ['m.py'])
+
+        _create_plan(artifacts, 'test-1', 'T2', 'A2', ['m.py'])
+
+        assert self.KEY not in artifacts.read_plan()
 
 
 class TestAddPlanStep:
@@ -547,6 +641,206 @@ class TestConfirmPlan:
         assert result['status'] == 'error'
         assert 'files' in result['message'].lower()
         assert '_finalized_at' not in artifacts.read_plan()
+
+
+class TestConfirmPlanSurfacesTheRejectionCounter:
+    """The architect's LAST tool result is where a loss reaches the transcript.
+
+    Task 4597. The block is already on disk by the time confirm_plan runs, but
+    a plan-tools tool result lands in the durable agent transcript — and that
+    is the one surface where the architect itself, mid-session, can still see
+    that calls it believed it made were refused. Hence a compact summary here
+    despite the block sitting two keys away in the document.
+
+    EVERY BRANCH, not just the success one. An architect that has been leaking
+    reaches an ERROR branch — refused add_plan_step calls are what leaves a
+    plan stepless, and a refused create_plan is what leaves it absent — so the
+    three error exits are where the explanation is most needed and were the
+    three that first went without it.
+    """
+
+    def _stamp(self, artifacts, **overrides):
+        """Put a rejection block on the plan, through the real algebra."""
+        plan = artifacts.read_plan()
+        block = plan_markup_stamp.merge_block(
+            plan_markup_stamp.block_of({
+                'ts': '2026-09-07T00:00:00+00:00',
+                'tool': 'add_design_decision',
+                'param': 'decision',
+                'outcome': 'rejected',
+            }),
+            plan_markup_stamp.block_of({
+                'ts': '2026-09-07T00:00:05+00:00',
+                'tool': 'add_reuse_item',
+                'param': 'how',
+                'outcome': 'unrepairable',
+            }),
+        )
+        block.update(overrides)
+        plan[plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY] = block
+        artifacts.write_plan(plan)
+
+    def test_a_stamped_plan_reports_count_and_by_tool(self, artifacts):
+        _setup_full_plan(artifacts)
+        self._stamp(artifacts)
+
+        result = _confirm_plan(artifacts)
+
+        assert result['status'] == 'ok'
+        assert result['markup_rejections'] == {
+            'count': 2,
+            'by_tool': {'add_design_decision': 1, 'add_reuse_item': 1},
+        }
+
+    def test_the_summary_carries_no_events_and_no_note(self, artifacts):
+        """A SIGNAL to the architect, not a second copy of the block.
+
+        Echoing the events back would put the block's bulk into the response
+        that is already the largest thing the architect reads at the end of a
+        session, to say something the two numbers already say.
+        """
+        _setup_full_plan(artifacts)
+        self._stamp(artifacts)
+
+        result = _confirm_plan(artifacts)
+
+        assert set(result['markup_rejections']) == {'count', 'by_tool'}
+
+    def test_it_composes_with_the_existing_response_keys(self, artifacts):
+        """Purely ADDITIVE — the documented envelope keeps its keys."""
+        _setup_full_plan(artifacts)
+        self._stamp(artifacts)
+
+        result = _confirm_plan(artifacts)
+
+        assert result['finalized'] is True
+        assert result['steps'] == 3
+        assert result['files'] == 2
+
+    def test_an_unstamped_plan_response_is_byte_identical_to_today(self, artifacts):
+        """The omit-when-absent convention ``_with_markup_repairs`` keeps.
+
+        Absent, not present-and-zero. The overwhelming majority of plans refuse
+        nothing, and those responses must stay exactly what every existing
+        caller and every existing assertion already sees.
+        """
+        _setup_full_plan(artifacts)
+
+        result = _confirm_plan(artifacts)
+
+        assert 'markup_rejections' not in result
+        assert set(result) == {'status', 'finalized', 'steps', 'files'}
+
+
+    def _buffer(self, *, tool: str = 'create_plan', param: str = 'analysis') -> None:
+        """Hold one refusal in the pending buffer — the pre-plan leak shape.
+
+        A refused ``create_plan`` has no document to stamp, so its event waits
+        in process-global state until a plan exists to adopt it. That is the
+        case a plan-only view cannot describe, and the case an architect is
+        most likely to be sitting in when it calls confirm_plan.
+        """
+        plan_markup_stamp.note_pending({
+            'ts': '2026-09-07T00:00:00+00:00',
+            'tool': tool,
+            'param': param,
+            'outcome': 'rejected',
+        })
+
+    def test_a_stamped_plan_with_no_steps_still_reports_the_counter(self, artifacts):
+        """THE LIKELIEST ROW OF ALL, and the one the counter most has to serve.
+
+        Refused ``add_plan_step`` calls are precisely what leaves a plan with
+        no steps, so the branch that rejects a stepless plan is the branch an
+        architect that has been leaking reaches. Reporting the counter only on
+        the success branch would withhold the explanation from exactly the
+        response that needs it.
+        """
+        _create_plan(artifacts, 'test-1', 'T', 'A', ['m.py'])
+        self._stamp(artifacts)
+
+        result = _confirm_plan(artifacts)
+
+        assert result['status'] == 'error'
+        assert 'no steps' in result['message'].lower()
+        assert result['markup_rejections'] == {
+            'count': 2,
+            'by_tool': {'add_design_decision': 1, 'add_reuse_item': 1},
+        }
+
+    def test_a_stamped_plan_with_no_files_still_reports_the_counter(self, artifacts):
+        _create_plan(artifacts, 'test-1', 'T', 'A', [])
+        _add_plan_step(artifacts, 'step-1', 'test', 'Write a test')
+        self._stamp(artifacts)
+
+        result = _confirm_plan(artifacts)
+
+        assert result['status'] == 'error'
+        assert 'files' in result['message'].lower()
+        assert result['markup_rejections'] == {
+            'count': 2,
+            'by_tool': {'add_design_decision': 1, 'add_reuse_item': 1},
+        }
+
+    def test_a_buffered_refusal_is_reported_when_no_plan_exists(self, artifacts):
+        """The row that proves the fix reads the SESSION, not just the plan.
+
+        There is no document here to hold a block, so ``summary(plan)`` alone
+        returns None and this branch would stay silent — while the architect
+        that reached it did so *because* its create_plan was refused.
+        """
+        self._buffer(tool='create_plan')
+
+        result = _confirm_plan(artifacts)
+
+        assert result['status'] == 'error'
+        assert result['message'] == 'No plan exists.'
+        assert result['markup_rejections'] == {
+            'count': 1, 'by_tool': {'create_plan': 1},
+        }
+
+    def test_the_success_branch_reports_it_and_adds_no_other_key(self, artifacts):
+        """Routing all four exits through one responder must not widen any of them."""
+        _setup_full_plan(artifacts)
+        self._stamp(artifacts)
+
+        result = _confirm_plan(artifacts)
+
+        assert set(result) == {
+            'status', 'finalized', 'steps', 'files', 'markup_rejections',
+        }
+        assert result['markup_rejections'] == {
+            'count': 2,
+            'by_tool': {'add_design_decision': 1, 'add_reuse_item': 1},
+        }
+
+    def test_a_clean_session_leaves_the_three_error_responses_as_they_are(
+        self, artifacts
+    ):
+        """The omit-when-absent contract, on every branch that just grew a key.
+
+        Nothing stamped and nothing buffered, so each error response must be
+        EQUAL to what it is today — not merely free of a zeroed counter. The
+        key's PRESENCE is the signal, and an always-present one would be a
+        silent contract change on three envelopes at once.
+        """
+        assert _confirm_plan(artifacts) == {
+            'status': 'error', 'message': 'No plan exists.',
+        }
+
+        _create_plan(artifacts, 'test-1', 'T', 'A', [])
+        assert _confirm_plan(artifacts) == {
+            'status': 'error', 'message': 'Plan has no steps — cannot confirm.',
+        }
+
+        _add_plan_step(artifacts, 'step-1', 'test', 'Write a test')
+        assert _confirm_plan(artifacts) == {
+            'status': 'error',
+            'message': (
+                'Plan has no files — cannot confirm. Call create_plan (or '
+                'update_plan_metadata) with a non-empty files list first.'
+            ),
+        }
 
 
 class TestReportBlockingDependency:

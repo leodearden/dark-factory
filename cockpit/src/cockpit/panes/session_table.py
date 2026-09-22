@@ -10,6 +10,7 @@ no-coerce policy for spawn_mode/display).
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from orchestrator.session_registry import TERMINAL_STATUSES, SessionRecord, Status
@@ -40,6 +41,38 @@ def state_glyph(status: Status | str) -> str:
     except ValueError:
         return _FALLBACK_GLYPH
     return _GLYPHS.get(resolved, _FALLBACK_GLYPH)
+
+
+# The focusability cue's vocabulary, deliberately disjoint from _GLYPHS
+# above: status ("is it working?") and focusability ("can I get to it?")
+# are orthogonal, so a collision would make one column read as the other.
+# Both are single-width, so the leading column shifts nothing beside it.
+_FOCUSABLE_MARKER = '▸'
+_HEADLESS_MARKER = '·'
+
+
+def is_focusable(record: SessionRecord) -> bool:
+    """Can Enter raise a terminal for *record*? True iff it has a display.
+
+    Restates decision_queue.resolve_target's SessionRecord branch, the code
+    app.py::_focus_slug actually runs. Importing it would be a cycle
+    (decision_queue imports this module), so test_session_table.py::
+    TestFocusMarker::test_agrees_with_resolve_target is what holds the two
+    statements together.
+    """
+    return record.display is not None
+
+
+def focus_marker(record: SessionRecord) -> str:
+    """Render *record*'s focusability as its row marker.
+
+    Both states get a present, distinct glyph rather than one marked and
+    the other blank, since a mostly-empty column reads as "not populated
+    yet" rather than "nothing to raise". Total over any record shape: any
+    display at all reads focusable, unrecognized kinds included (fail-soft,
+    PRD §2 -- an unknown kind is still a real terminal).
+    """
+    return _FOCUSABLE_MARKER if is_focusable(record) else _HEADLESS_MARKER
 
 
 def format_title(record: SessionRecord) -> str:
@@ -124,6 +157,10 @@ def _state_rank(status: Status | str) -> int:
     return _STATE_RANK.get(resolved, _UNKNOWN_STATE_RANK)
 
 
+def _focus_rank(record: SessionRecord) -> int:
+    return 0 if is_focusable(record) else 1
+
+
 def _start_ts_sort_key(start_ts: str) -> tuple[int, str]:
     """Sort ascending by *start_ts* (oldest first); empty/unparseable sorts last.
 
@@ -141,8 +178,23 @@ def _start_ts_sort_key(start_ts: str) -> tuple[int, str]:
     return (1, '')
 
 
-def order_sessions(records: list[SessionRecord]) -> list[SessionRecord]:
-    """Order *records* blocked-first, then by state rank, then oldest start_ts first.
+def order_sessions(
+    records: list[SessionRecord], *, focus_first: bool = False
+) -> list[SessionRecord]:
+    """Order *records* by state rank, then focusability if asked, then oldest first.
+
+    State rank is always PRIMARY: blocked-on-you is the top signal, so a
+    headless awaiting-input session outranks a focusable running one.
+
+    focus_first sorts focusable-before-headless between that rank and the
+    start_ts tiebreak. Opt-in because the two consumers want different
+    things: the session table orders BEFORE capping (filter_live_sessions
+    slices an already-ordered list), so it wants the rows an operator can
+    actually act on to be the ones that survive the cap, while
+    spawn_tree.py orders sibling groups, where oldest-first IS the signal
+    (the spawn sequence) and must not be reshuffled by whether a child
+    happens to own a terminal. Ordering only reorders; which rows are
+    dropped is the cap's business, not this function's.
 
     A deterministic, dependency-free stand-in for the C5b priority score
     (this task's dependency surface is C1 only -- see design_decisions).
@@ -151,7 +203,11 @@ def order_sessions(records: list[SessionRecord]) -> list[SessionRecord]:
     """
     return sorted(
         records,
-        key=lambda record: (_state_rank(record.status), _start_ts_sort_key(record.start_ts)),
+        key=lambda record: (
+            _state_rank(record.status),
+            _focus_rank(record) if focus_first else 0,
+            _start_ts_sort_key(record.start_ts),
+        ),
     )
 
 
@@ -176,17 +232,57 @@ def _is_terminal(status: Status | str) -> bool:
 _DEFAULT_VISIBLE_CAP = 200
 
 
+@dataclass(frozen=True)
+class LiveSessions:
+    """The records a view should render, plus how many there were before the cap.
+
+    visible is a prefix of the ordered input and len(visible) <= total, so
+    total - len(visible) is what the view is hiding. The two travel
+    together from producer to renderer; see filter_live_sessions.
+    """
+
+    visible: list[SessionRecord]
+    total: int
+
+
 def filter_live_sessions(
     records: list[SessionRecord], *, cap: int = _DEFAULT_VISIBLE_CAP
-) -> list[SessionRecord]:
+) -> LiveSessions:
     """Drop terminal-status (exited/failed-to-start) records, preserving order.
 
     Then slices to the first `cap` of what remains -- pass an
     already-ordered list (see order_sessions) so the cap keeps the top-N
-    of that order. Pure and total: an empty input returns [] and a
-    foreign status is kept (see _is_terminal), never raising.
+    of that order. The cap is reportable rather than silent: the returned
+    view carries the pre-cap live count alongside the slice, so a truncated
+    table can say so (see format_visible_count) instead of looking
+    identical to a complete one.
+
+    Terminal records are excluded from the count as well as from the slice
+    -- total is the size of the live band, not of the scanned set, so the
+    notice never claims the cap hid history the view never meant to show.
+
+    Pure and total: an empty input returns an empty view with total 0, and
+    a foreign status is kept (see _is_terminal), never raising.
     """
-    return [record for record in records if not _is_terminal(record.status)][:cap]
+    live = [record for record in records if not _is_terminal(record.status)]
+    return LiveSessions(visible=live[:cap], total=len(live))
+
+
+def format_visible_count(shown: int, total: int) -> str:
+    """Render the cap notice: 'showing N of M', or '' when nothing is hidden.
+
+    '' means "nothing to say", not "unknown" -- the caller assigns this
+    result straight to border_subtitle, where an empty label renders
+    nothing (measured on textual 8.2.8), so the notice appears only when
+    the cap actually hid something and a complete table stays quiet.
+
+    Total over any pair: shown > total is not a state filter_live_sessions
+    can produce, but it degrades to '' rather than rendering a backwards
+    count (fail-soft, PRD §2).
+    """
+    if total > shown:
+        return f'showing {shown} of {total}'
+    return ''
 
 
 def _count_children_by_parent(all_records: list[SessionRecord]) -> dict[str, int]:
@@ -213,16 +309,24 @@ def _count_children_by_parent(all_records: list[SessionRecord]) -> dict[str, int
 class SessionTable(DataTable):
     """The session-registry table: one row per session, keyed by session_slug.
 
-    Columns: state glyph / title / age / project / outstanding children.
+    Columns: focus marker / state glyph / title / age / project /
+    outstanding children. The focus marker answers a different question
+    from the state glyph -- a headless agent session has no terminal
+    anywhere, so Enter can never raise anything for it, however busy it is.
     Selection-preserving: replace_rows re-locates the previously highlighted
     session_slug after a rebuild, so a poll tick never yanks the cursor away
     from the row an operator is looking at.
     """
 
+    # The border is not decoration: textual paints border labels as part
+    # of the border EDGE, so without one the "showing N of M" notice
+    # replace_rows writes to border_subtitle is set, readable, and
+    # invisible. TestSessionTableCapNotice asserts it is still here.
     DEFAULT_CSS = """
     SessionTable {
         width: 1fr;
         height: 1fr;
+        border: round $panel;
     }
     """
 
@@ -231,7 +335,7 @@ class SessionTable(DataTable):
         super().__init__(*args, **kwargs)
 
     def on_mount(self) -> None:
-        self.add_columns('', 'title', 'age', 'project', 'children')
+        self.add_columns('', '', 'title', 'age', 'project', 'children')
 
     def highlighted_slug(self) -> str | None:
         """Return the session_slug of the currently-highlighted row, or None if empty."""
@@ -242,27 +346,35 @@ class SessionTable(DataTable):
 
     def replace_rows(
         self,
-        records: list[SessionRecord],
+        view: LiveSessions,
         now: datetime,
         *,
         all_records: list[SessionRecord] | None = None,
     ) -> None:
-        """Rebuild VISIBLE rows from *records* (already ordered), preserving the cursor by slug.
+        """Rebuild VISIBLE rows from *view* (already ordered), preserving the cursor by slug.
+
+        Takes the whole view rather than its slice: the rows and the count
+        they were cut from cannot be separated at this boundary, so no
+        caller can render a truncated table that looks complete. The notice
+        is written unconditionally, so a rebuild that is no longer
+        truncated clears a stale one rather than leaving it on screen.
 
         Outstanding-children counts are computed against *all_records* when
-        given (the full scanned set), falling back to *records* otherwise --
-        so a filtered/capped visible subset never undercounts a visible
-        parent's non-terminal children just because those children
+        given (the full scanned set), falling back to the visible rows
+        otherwise -- so a filtered/capped visible subset never undercounts a
+        visible parent's non-terminal children just because those children
         themselves are hidden from view. Counted via a single O(all_records)
         pass (_count_children_by_parent) rather than one full rescan of
         all_records per visible row.
         """
+        records = view.visible
         counting_set = all_records if all_records is not None else records
         children_by_parent = _count_children_by_parent(counting_set)
         previous_slug = self.highlighted_slug()
         self.clear()
         for record in records:
             self.add_row(
+                focus_marker(record),
                 state_glyph(record.status),
                 format_title(record),
                 format_age(record.start_ts, now),
@@ -270,6 +382,7 @@ class SessionTable(DataTable):
                 str(children_by_parent.get(record.session_slug, 0)),
                 key=record.session_slug,
             )
+        self.border_subtitle = format_visible_count(len(records), view.total)
         if not self.row_count:
             return
         if previous_slug is not None:

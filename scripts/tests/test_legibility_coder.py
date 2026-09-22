@@ -1707,6 +1707,306 @@ def test_invoke_cli_explicit_claude_bin_beats_the_env_var(tmp_path, monkeypatch)
 
 
 # ---------------------------------------------------------------------------
+# task 5488 / step-13(d): END TO END — an exhausted POOL still lands on task
+# 4736's exit-0 DEFERRED path.
+#
+# The pool-backed invoker is just another (prompt, model) -> str callable
+# through the existing seam, so code_digests' control flow is inherited
+# unchanged. What this pins is that the NEW input it can now produce -- a
+# CoderCapExhausted meaning "every account in the pool is out", rather than
+# "the one login I happened to ride is out" -- still produces exactly the
+# RunResult shape nightly's DEFERRED branch keys on.
+# ---------------------------------------------------------------------------
+
+def test_an_exhausted_pool_reads_as_a_cap_deferral_end_to_end(monkeypatch):
+    import account_pool
+
+    # THE PAIRING IS THE POINT, and it is why this one test does not drive
+    # `mod`. scripts/legibility/ is on sys.path alongside scripts/, so this
+    # file's `import coder as mod` and account_pool's (and nightly's)
+    # `from legibility import coder` are two DISTINCT module objects carrying
+    # two distinct CoderCapExhausted classes. code_digest catches that
+    # exception BY NAME under two arms with no generic `except Exception`
+    # beneath them, so an unpaired module here would not merely mislabel the
+    # deferral -- in production it would let the exception escape run_nightly
+    # and crash the night task 4736 exists to make exit 0. Drive the pairing
+    # production uses, and assert it rather than assume it.
+    from legibility import coder as paired_coder
+
+    assert paired_coder is account_pool.coder, (
+        'account_pool must raise through the same coder module this test '
+        'drives, or the deferral contract goes untested'
+    )
+
+    class _AllCappedGate:
+        """Minimal stand-in for an exhausted pool: nothing to lease, ever."""
+
+        accounts = ()
+
+        def try_lease(self, *, scope=None, reverse=False, exclude=None):
+            return None
+
+        def release_probe_slot(self, oauth_token):
+            pass
+
+        @property
+        def account_count(self):
+            return 7
+
+        @property
+        def active_account_name(self):
+            # The gate's public "is any account still usable" predicate.
+            # None here says every one of the seven is genuinely capped,
+            # which is what makes this an exhausted POOL rather than a
+            # digest the pool merely refused.
+            return None
+
+    def must_not_run(*args, **kwargs):  # pragma: no cover - guard
+        raise AssertionError(
+            "the CLI must never be invoked once the pool is exhausted"
+        )
+
+    invoke = account_pool.pool_invoke(_AllCappedGate(), invoke=must_not_run)
+
+    result = paired_coder.code_digests(
+        _batch_digests(3), _tiny_codebook(), project="dark_factory",
+        model="haiku", invoke=invoke,
+    )
+
+    assert result.total == 3
+    assert result.capped == 3, (
+        f"every digest the exhausted pool could not code must be labelled "
+        f"capped, never coded and never fabricated; got {result.capped}"
+    )
+    assert result.succeeded == 0
+    assert result.records == [], (
+        "the never-fabricate contract: a digest the CLI never looked at "
+        "yields NO record, not an empty one"
+    )
+    assert result.status == "failure"
+    assert paired_coder.is_cap_deferral(result) is True, (
+        "this is the exact input nightly's exit-0 DEFERRED branch keys on -- "
+        "an all-capped night is expected weather, not an infra page"
+    )
+
+
+# ---------------------------------------------------------------------------
+# task 5488 / step-3: RED — the two streams are carried as STRUCTURED DATA,
+# not only inside the formatted message.
+#
+# The gate's strict detector wants them SEPARATELY --
+# `detect_cap_hit(stderr, result_text)` -- so the account-failover path in
+# account_pool.py must be able to read each stream as itself. Recovering them
+# by re-parsing `stdout={!r} stderr={!r}` out of the message would be an
+# ad-hoc parser over a meaningful string (docs/code-quality.md heuristic 12),
+# and would couple failover to wording that exists for humans reading
+# journals. `marker` on CoderCapExhausted is the precedent for a typed
+# attribute on this hierarchy.
+#
+# The message text is deliberately NOT changed: it is pinned by
+# test_invoke_cli_nonzero_exit_carries_both_streams_labelled above and lands
+# verbatim in journal lines, run.failures entries and escalation bodies.
+# ---------------------------------------------------------------------------
+
+def test_invocation_error_carries_both_streams_as_structured_attributes(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude_failing_on_both_streams(
+        bin_dir,
+        stdout_text="STDOUT_STRUCT_SS5488 the CLI's own diagnostic",
+        stderr_text="STDERR_STRUCT_SE5488 the backend's complaint",
+    )
+
+    with pytest.raises(mod.CoderInvocationError) as excinfo:
+        mod._invoke_cli(
+            "prompt text", "haiku",
+            claude_bin=str(bin_dir / "claude"), timeout=10, cwd=str(tmp_path),
+        )
+    exc = excinfo.value
+
+    assert exc.stdout == "STDOUT_STRUCT_SS5488 the CLI's own diagnostic", (
+        f"the captured stdout must be readable as ITSELF, not scraped back "
+        f"out of the formatted message; got {exc.stdout!r}"
+    )
+    assert exc.stderr == "STDERR_STRUCT_SE5488 the backend's complaint", (
+        f"likewise stderr, and SEPARATELY -- detect_cap_hit takes the two "
+        f"streams as distinct arguments; got {exc.stderr!r}"
+    )
+
+    # The human-facing message is UNCHANGED. This change adds a data channel
+    # beside the prose; it does not restate or replace it.
+    message = str(exc)
+    assert "STDOUT_STRUCT_SS5488" in message, message
+    assert "STDERR_STRUCT_SE5488" in message, message
+    assert "stdout=" in message and "stderr=" in message, message
+    assert "exited 1" in message, message
+
+
+def test_cap_exhausted_carries_the_streams_alongside_its_marker(tmp_path):
+    """The subclass the failover path actually catches. It already carries a
+    typed `marker`; the streams ride beside it, so account_pool can hand the
+    gate's strict detector exactly what the CLI said on each stream."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    banner = REAL_CLI_CAP_MESSAGES[0]
+    _write_fake_claude_failing_on_both_streams(
+        bin_dir, stdout_text=banner, stderr_text="STDERR_CAP_SE5488",
+    )
+
+    with pytest.raises(mod.CoderCapExhausted) as excinfo:
+        mod._invoke_cli(
+            "prompt text", "haiku",
+            claude_bin=str(bin_dir / "claude"), timeout=10,
+        )
+    exc = excinfo.value
+
+    assert exc.marker, "the existing typed attribute must survive"
+    assert exc.stdout == banner, (
+        f"the banner the CLI wrote to STDOUT is what the gate's strict "
+        f"detector scans as the result text; got {exc.stdout!r}"
+    )
+    assert exc.stderr == "STDERR_CAP_SE5488", exc.stderr
+
+
+def test_invocation_error_streams_default_to_empty_for_the_streamless_arms(
+    tmp_path, monkeypatch,
+):
+    """The timeout and OSError arms have NO streams to carry -- the process
+    either never finished or never started. They must still expose the
+    attributes, defaulted to '', so every consumer can read `exc.stdout`
+    unconditionally instead of guarding with hasattr (which would quietly
+    treat a future regression as "no cap banner" and never rotate)."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude_sleeping(bin_dir, sleep_secs=2)
+
+    with pytest.raises(mod.CoderInvocationError) as excinfo:
+        mod._invoke_cli(
+            "prompt text", "haiku",
+            claude_bin=str(bin_dir / "claude"), timeout=0.2,
+        )
+    assert excinfo.value.stdout == ""
+    assert excinfo.value.stderr == ""
+    assert "timed out" in str(excinfo.value)
+
+    # The never-started arm: a binary that does not exist at all.
+    _scrub_path_of_claude(tmp_path, monkeypatch)
+    with pytest.raises(mod.CoderInvocationError) as excinfo:
+        mod._invoke_cli(
+            "prompt text", "haiku",
+            claude_bin=str(tmp_path / "no-such-claude"), timeout=10,
+        )
+    assert excinfo.value.stdout == ""
+    assert excinfo.value.stderr == ""
+    assert "could not be started" in str(excinfo.value)
+
+
+def test_invocation_error_is_constructible_with_no_streams_at_all():
+    """Positional-message construction must keep working: three sites raise
+    or catch this type today (code_digest, census._build_default_verify_fn,
+    census.preflight_headroom) and none of them is in this task's scope."""
+    exc = mod.CoderInvocationError("plain message")
+    assert str(exc) == "plain message"
+    assert exc.stdout == ""
+    assert exc.stderr == ""
+
+
+# ---------------------------------------------------------------------------
+# task 5488 / step-1: RED — _invoke_cli(oauth_token=) picks the ACCOUNT the
+# shared UsageGate chose, by handing the child an explicit env.
+#
+# Two facts, and the second is as load-bearing as the first:
+#   * with a token, the child gets CLAUDE_CODE_OAUTH_TOKEN=<token> and
+#     ANTHROPIC_API_KEY REMOVED — the CLI prefers the API key over the OAuth
+#     token, so leaving it set would silently bill the wrong identity and
+#     defeat the account choice entirely (the failover would look like it
+#     worked while every invocation rode the same login);
+#   * with NO token the parent env is inherited UNCHANGED, because that is
+#     census/preflight_headroom's path and this parameter must be strictly
+#     additive.
+# ---------------------------------------------------------------------------
+
+def _write_fake_claude_echoing_env(bin_dir):
+    """Fake `claude` binary: echoes the two env vars that decide WHICH
+    account the real CLI authenticates as, then exits 0.
+
+    ``:-<unset>`` rather than a bare expansion, deliberately: an absent var
+    and a var set to the empty string both echo as an empty line otherwise,
+    and "ANTHROPIC_API_KEY was REMOVED from the child env" is exactly the
+    distinction these tests exist to pin."""
+    p = bin_dir / "claude"
+    p.write_text(
+        "#!/usr/bin/env bash\n"
+        "cat > /dev/null\n"
+        'echo "OAUTH=${CLAUDE_CODE_OAUTH_TOKEN:-<unset>}"\n'
+        'echo "ANTHROPIC=${ANTHROPIC_API_KEY:-<unset>}"\n'
+    )
+    p.chmod(0o755)
+
+
+def test_invoke_cli_oauth_token_reaches_the_child_with_anthropic_key_stripped(
+    tmp_path, monkeypatch,
+):
+    """The account the gate leased must be the account the CLI actually
+    uses. Pins both halves of the fleet's OAuth-env idiom (identical to
+    agents/invoke.py, cli_invoke.py and usage_gate.py): set the OAuth token,
+    and REMOVE ANTHROPIC_API_KEY so it cannot take precedence."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude_echoing_env(bin_dir)
+    _scrub_path_of_claude(tmp_path, monkeypatch)
+
+    # Set in the PARENT env, so the strip is observable rather than vacuous:
+    # without this the child would report <unset> no matter what the code does.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-parent-key-MUST-NOT-LEAK")
+
+    raw = mod._invoke_cli(
+        "prompt text", "haiku",
+        claude_bin=str(bin_dir / "claude"), timeout=10,
+        oauth_token="oauth-tok-ACCOUNT-F",
+    )
+
+    assert "OAUTH=oauth-tok-ACCOUNT-F" in raw, (
+        f"the leased account's token must reach the child as "
+        f"CLAUDE_CODE_OAUTH_TOKEN; got {raw!r}"
+    )
+    assert "ANTHROPIC=<unset>" in raw, (
+        f"ANTHROPIC_API_KEY must be REMOVED from the child env — the CLI "
+        f"prefers it over the OAuth token, so leaving it set silently "
+        f"defeats the account choice; got {raw!r}"
+    )
+
+
+def test_invoke_cli_without_oauth_token_inherits_the_parent_env_unchanged(
+    tmp_path, monkeypatch,
+):
+    """The no-token call is census's path (`preflight_headroom` and the
+    mining/verify/synthesis primitive), and it must not move: `env=None` is
+    subprocess's own "inherit the parent", so BOTH vars pass through exactly
+    as the parent set them — including ANTHROPIC_API_KEY, which this
+    function has no business stripping when no account was chosen."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude_echoing_env(bin_dir)
+    _scrub_path_of_claude(tmp_path, monkeypatch)
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-parent-key-INHERITED")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "parent-oauth-INHERITED")
+
+    raw = mod._invoke_cli(
+        "prompt text", "haiku",
+        claude_bin=str(bin_dir / "claude"), timeout=10,
+    )
+
+    assert "OAUTH=parent-oauth-INHERITED" in raw, raw
+    assert "ANTHROPIC=sk-ant-parent-key-INHERITED" in raw, (
+        f"with no oauth_token the parent env must be inherited UNCHANGED — "
+        f"stripping here would silently change census's own invocations; "
+        f"got {raw!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # step-17: RED — main(argv) end-to-end, LLM mocked via monkeypatch of
 # mod._invoke_cli (never a real subprocess)
 # ---------------------------------------------------------------------------

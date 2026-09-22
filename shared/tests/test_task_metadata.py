@@ -2069,6 +2069,36 @@ class TestParseMetadataFailurePolicy:
         unknown_key_fields = {w.field for w in warnings if w.code == 'unknown_key'}
         assert 'recurrence' not in unknown_key_fields
 
+    def test_merge_lane_metadata_key_is_blessed(self):
+        """The merge-queue priority-lane selector must not census-warn (task 4888).
+
+        ``merge_lane`` is the sole selector for a merge-queue priority lane
+        anywhere in the system: it is machine-written by the orchestrator on
+        the hotfix/main-health task classes and read by
+        ``orchestrator/src/orchestrator/merge_queue.py::lane_for_task_metadata``,
+        which is what decides whether a request is picked ahead of the normal
+        lane. Unblessed, every carrier emits a ``code=unknown_key`` census
+        line. RED until ``'merge_lane'`` is added to
+        ``_BLESSED_METADATA_KEYS``.
+
+        The blessing ground and the carrier census live in the frozenset
+        entry's own comment, which is their single in-repo copy; this
+        docstring cites it rather than restating the figures.
+
+        The parametrized
+        test_every_blessed_metadata_key_individually_suppresses_unknown_key_warning
+        above picks the key up for free once blessed — this test pins the
+        specific key with a real in-vocabulary value, matching the two named
+        precedents above, and carries the rationale rather than the coverage.
+        """
+        _, warnings = parse_metadata({'merge_lane': 'high'}, direction='read')
+        offending = [
+            w for w in warnings if w.code == 'unknown_key' and w.field == 'merge_lane'
+        ]
+        assert offending == [], (
+            f'Expected no unknown_key warning for merge_lane; got: {offending}'
+        )
+
     def test_cross_repo_metadata_keys_are_blessed(self):
         """The cross-repo deliverable marker must not census-warn (task 3004).
 
@@ -2148,6 +2178,46 @@ class TestParseMetadataFailurePolicy:
         ]
         assert offending == [], (
             f'Expected no unknown_key warning for last_blocked_at; got: {offending}'
+        )
+
+    def test_pending_since_metadata_keys_are_blessed(self):
+        """The scheduler's pending-wait anchor must not census-warn (task 3816).
+
+        PRD plans/scheduler-dispatch-scoring-and-lock-layer-prd.md §C1. Both
+        keys are MACHINE-written Tier-A conventions, the same profile as the
+        already-blessed `last_blocked_at` / `files_tagged_at` stamps above.
+
+        `pending_since` is the durable wall-clock anchor written by the
+        fused-memory status chokepoint on every `* -> pending` landing
+        (`fused-memory/src/fused_memory/backends/sqlite_task_backend.py::
+        stamp_pending_since`, called from `add_task`, `set_task_status` and
+        `set_status_and_stamp_audit`), and READ back by the orchestrator
+        scheduler's age term (task beta) and the watchdog idle clock (task
+        delta) — so it is load-bearing on both sides.
+
+        `pending_since_backfilled` marks the population anchored by the
+        one-shot v4 -> v5 migration from `updated_at` rather than observed
+        live, so the deliberate under-aging that back-fill introduces stays
+        COUNTABLE instead of invisible (PRD design decision 4).
+
+        Unblessed, every stamped status write in the factory — i.e. all of
+        them — would manufacture a `code=unknown_key` census line. RED until
+        both keys are added to `_BLESSED_METADATA_KEYS`.
+        """
+        _, warnings = parse_metadata(
+            {
+                'pending_since': '2026-08-06T10:00:00.000Z',
+                'pending_since_backfilled': True,
+            },
+            direction='read',
+        )
+        unknown_key_fields = {w.field for w in warnings if w.code == 'unknown_key'}
+        assert 'pending_since' not in unknown_key_fields, (
+            f'Expected no unknown_key warning for pending_since; got: {sorted(unknown_key_fields)}'
+        )
+        assert 'pending_since_backfilled' not in unknown_key_fields, (
+            'Expected no unknown_key warning for pending_since_backfilled; '
+            f'got: {sorted(unknown_key_fields)}'
         )
 
     def test_finding_provenance_metadata_keys_are_blessed(self):

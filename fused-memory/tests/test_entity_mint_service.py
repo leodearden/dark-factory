@@ -79,6 +79,26 @@ class TestMintAndResolve:
         assert result['name'] == _NAME
 
     @pytest.mark.asyncio
+    async def test_the_mint_forbids_the_collapse_at_the_backend(self, service):
+        """The mint branch forwards merge_duplicates=False (task 4985).
+
+        Redundant-by-construction with this wrapper's own pre-read — the call
+        is reached only on the 0-match branch, so the backend's >=2 arm cannot
+        fire — and that is exactly why it is pinned. Today the collapse is
+        unreachable through an ORDERING property of this method's body, which a
+        later refactor dropping the redundant pre-read would silently undo.
+        The keyword makes it structurally unreachable instead of contingently
+        unreachable, which is Ratified Decision 1 stated as an invariant rather
+        than as a coincidence.
+        """
+        await service.ensure_entity_node(
+            name=_NAME, project_id=_PROJECT, agent_id='curator-x',
+        )
+
+        _, kwargs = service.graphiti.ensure_entity_node.await_args
+        assert kwargs['merge_duplicates'] is False
+
+    @pytest.mark.asyncio
     async def test_one_match_resolves_without_any_backend_write(self, service):
         """A pure resolve does no writes at all — not even a backend call."""
         service.graphiti.get_nodes_by_exact_name = AsyncMock(
@@ -156,7 +176,7 @@ class TestIdentityLock:
         lock = service.graphiti._identity_lock_for(_PROJECT)
         observed = {}
 
-        async def _probe(name, *, group_id, summary=''):
+        async def _probe(name, *, group_id, summary='', merge_duplicates=True):
             observed['locked'] = lock.locked()
             return 'uuid-new'
 

@@ -1,4 +1,10 @@
-"""Tests for usage cap detection, gate lifecycle, and reset time parsing."""
+"""Tests for usage cap detection and gate lifecycle.
+
+Reset-time parsing is NOT here: task 4357 retired usage_gate.py's
+`_parse_resets_at` fork and the orchestrator re-export that kept it importable,
+so that coverage lives with the single surviving copy, in
+shared/tests/test_invocation_outcome.py::TestParseResetsAt.
+"""
 
 from __future__ import annotations
 
@@ -9,12 +15,7 @@ from unittest.mock import AsyncMock
 import pytest
 from _orch_helpers import build_usage_gate
 from shared.config_models import AccountConfig, UsageCapConfig
-from shared.usage_gate import (
-    SessionBudgetExhausted,
-    UsageGate,
-    _extract_cap_message,
-    _parse_resets_at,
-)
+from shared.usage_gate import SessionBudgetExhausted, UsageGate
 
 # --- Helpers ---
 
@@ -83,65 +84,6 @@ class TestDetectCapHit:
     def test_case_insensitive(self):
         gate = _make_gate(num_accounts=1)
         assert gate.detect_cap_hit("YOU'VE HIT YOUR usage limit resets in 3h", '', oauth_token='token-a') is True
-
-
-# --- Reset time parsing ---
-
-
-class TestParseResetsAt:
-    def test_relative_hours(self):
-        dt = _parse_resets_at('resets in 3h')
-        assert dt is not None
-        expected = datetime.now(UTC) + timedelta(hours=3)
-        assert abs((dt - expected).total_seconds()) < 2
-
-    def test_relative_minutes(self):
-        dt = _parse_resets_at('resets in 45m')
-        assert dt is not None
-        expected = datetime.now(UTC) + timedelta(minutes=45)
-        assert abs((dt - expected).total_seconds()) < 2
-
-    def test_relative_days(self):
-        dt = _parse_resets_at('resets in 2d')
-        assert dt is not None
-        expected = datetime.now(UTC) + timedelta(days=2)
-        assert abs((dt - expected).total_seconds()) < 2
-
-    def test_absolute_time_with_timezone(self):
-        dt = _parse_resets_at('resets 9pm (UTC)')
-        assert dt is not None
-        # Should be in the future (today or tomorrow at 9pm UTC)
-        assert dt > datetime.now(UTC) - timedelta(hours=1)
-
-    def test_absolute_time_with_minutes(self):
-        dt = _parse_resets_at('resets 3:00 AM (UTC)')
-        assert dt is not None
-
-    def test_fallback_to_1_hour(self):
-        dt = _parse_resets_at('no reset info here')
-        assert dt is not None
-        expected = datetime.now(UTC) + timedelta(hours=1)
-        assert abs((dt - expected).total_seconds()) < 2
-
-    def test_embedded_in_longer_text(self):
-        text = "You've hit your limit. Your usage resets in 5h. Please wait."
-        dt = _parse_resets_at(text)
-        assert dt is not None
-        expected = datetime.now(UTC) + timedelta(hours=5)
-        assert abs((dt - expected).total_seconds()) < 2
-
-
-# --- Extract cap message ---
-
-
-class TestExtractCapMessage:
-    def test_extracts_full_line(self):
-        text = "Some preamble\nYou've hit your usage limit for Claude.\nMore text"
-        msg = _extract_cap_message(text, "You've hit your")
-        assert msg == "You've hit your usage limit for Claude."
-
-    def test_returns_empty_on_no_match(self):
-        assert _extract_cap_message('no match here', "You've hit your") == ''
 
 
 # --- Session budget ---
@@ -977,42 +919,6 @@ class TestProbeInterval:
 
         assert acct.capped is False
         assert acct.probe_count == 0  # past reset → count reset
-
-
-# --- Parse resets_at with date ---
-
-
-class TestParseResetsAtWithDate:
-    def test_date_time_timezone(self):
-        """Parse 'resets Mar 30, 6pm (Europe/London)'."""
-        dt = _parse_resets_at('resets Mar 30, 6pm (Europe/London)')
-        assert dt is not None
-        # Should be a real datetime, not the 1h fallback
-        fallback = datetime.now(UTC) + timedelta(hours=1)
-        assert abs((dt - fallback).total_seconds()) > 60
-
-    def test_date_time_with_comma(self):
-        dt = _parse_resets_at('resets Mar 30, 6pm (UTC)')
-        assert dt is not None
-        assert dt.month == 3 or dt.month == 3  # March (possibly next year)
-        assert dt.hour == 18
-        assert dt.minute == 0
-
-    def test_date_time_no_comma(self):
-        dt = _parse_resets_at('resets Mar 30 6pm (UTC)')
-        assert dt is not None
-        assert dt.hour == 18
-
-    def test_date_time_with_minutes(self):
-        dt = _parse_resets_at('resets Mar 31, 2:30pm (Europe/London)')
-        assert dt is not None
-
-    def test_embedded_in_cap_message(self):
-        text = "You've hit your limit · resets Mar 30, 6pm (Europe/London)"
-        dt = _parse_resets_at(text)
-        assert dt is not None
-        fallback = datetime.now(UTC) + timedelta(hours=1)
-        assert abs((dt - fallback).total_seconds()) > 60
 
 
 # --- CostStore init / properties ---

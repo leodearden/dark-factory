@@ -7,7 +7,7 @@ import logging
 import shutil
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import TYPE_CHECKING, Any
 
 from shared.cli_invoke import AgentResult, AllAccountsCappedException, invoke_with_cap_retry
@@ -447,8 +447,106 @@ def recon_config_base_dir(data_dir: Path) -> Path:
     (``BaseStage.run``) and the GC (``harness``) derive the same path from
     ``(journal.data_dir, run_id)`` without passing a ``TaskConfigDir`` across
     scopes.
+
+    The returned root is always ABSOLUTE, and that is load-bearing (task 4592).
+    It becomes ``TaskConfigDir.path``, which is BOTH the ``CLAUDE_CONFIG_DIR``
+    handed to the CLI child (``shared/src/shared/cli_invoke.py::invoke_claude_agent``
+    sets ``env['CLAUDE_CONFIG_DIR'] = str(config_dir)``) and the path the parent
+    verifies for sandbox containment
+    (``fused-memory/src/fused_memory/reconciliation/sandbox_guard.py::_assert_config_dir_writable``).
+    A RELATIVE string is resolved against two DIFFERENT cwds: the child's — the
+    wrapped argv is spawned with ``cwd=`` ``config.explore_codebase_root``, see
+    ``run_stage_via_cli`` below — and the parent's, where every
+    ``os.path.realpath`` in the guard runs. Verified path A, written path B: the
+    fail-closed containment check reports PASS while the kernel denies every
+    transcript write, which is exactly the 2026-07-18 -> 2026-08-11 silent
+    transcript loss that task 4003's check exists to make impossible.
+    ``data_dir`` really can be relative: ``fused-memory/config/config.yaml``
+    supplies ``${RECONCILIATION_DATA_DIR:./data/reconciliation}``, the
+    ``${VAR:default}`` expander
+    (``fused-memory/src/fused_memory/config/schema.py::YamlSettingsSource._expand_env_vars``)
+    is plain string substitution with no abspath, and
+    ``scripts/fused-memory.service.template`` sets ``WorkingDirectory`` and
+    ``PROJECT_ROOT`` but NOT ``RECONCILIATION_DATA_DIR`` — so the relative default
+    is what a standalone/systemd launch actually uses. Only a MANAGED spawn
+    escapes it, because ``orchestrator/src/orchestrator/mcp_lifecycle.py`` injects
+    an absolute XDG path. The two cwds agree today only because that unit sets
+    ``WorkingDirectory`` == ``PROJECT_ROOT``; nothing enforces it.
+
+    THIS DOCSTRING IS THE CANONICAL STATEMENT of that deployment story. The other
+    sites that depend on it — ``journal.py::ReconciliationJournal.__init__``,
+    ``config/schema.py``'s ``data_dir`` and ``sandbox_recon_writable_extras``
+    comments, ``sandbox_guard.py``'s module docstring, and the two test modules —
+    state only their LOCAL invariant and cite back here, so a change to the
+    deployment story (the unit starts setting ``RECONCILIATION_DATA_DIR``, or the
+    expander gains an abspath) has exactly one place to be corrected.
+
+    The anchor is ``Path.cwd()`` and deliberately NOT
+    ``config.explore_codebase_root``. This function's job is only to make the
+    parent and the child NAME THE SAME DIRECTORY, which either anchor achieves
+    once the path is absolute — so the tie-break is "relocate no byte". The
+    process cwd is the anchor every existing ``data_dir`` consumer already uses
+    implicitly: ``fused-memory/src/fused_memory/reconciliation/journal.py::ReconciliationJournal.initialize``
+    mkdirs ``data_dir`` and opens ``reconciliation.db`` under it, and
+    ``fused-memory/src/fused_memory/server/main.py`` builds ten sibling paths
+    (``WriteJournal``, ``EventBuffer``, ``TicketStore``, curator/report state,
+    the dead-letter JSONL) the same way. Anchoring here therefore renames nothing
+    on disk; anchoring at ``explore_codebase_root`` would silently relocate the
+    per-run config dirs into a different tree from the journal DB they are keyed
+    to whenever the two diverge — trading a silent write-denial for a silent
+    relocation. Capturing ``Path.cwd()`` per call is safe because ``os.chdir``
+    appears nowhere in ``shared/src``, ``orchestrator/src`` or
+    ``fused-memory/src``, so the process cwd is stable for the life of a run.
+
+    ``Path.cwd() / base`` rather than ``.resolve()`` / ``.absolute()`` is also
+    deliberate: it leaves an already-absolute input BYTE-IDENTICAL. ``.resolve()``
+    would additionally collapse symlink components, rewriting the string handed to
+    the child and to ``landlock-exec`` for every existing absolute deployment
+    (including the XDG ``RECONCILIATION_DATA_DIR`` that
+    ``orchestrator/src/orchestrator/mcp_lifecycle.py`` injects under a managed
+    spawn). Symlink resolution is not needed here anyway — ``sandbox_guard``
+    realpaths both sides of the containment comparison, which is the semantics
+    Landlock itself uses (it resolves rules by O_PATH fd).
+
+    ``data_dir`` is used AS GIVEN rather than re-wrapped in ``Path(...)``, which
+    honours the annotation instead of widening it to "anything os.PathLike".
+    Both production construction sites already pass a real ``Path``
+    (``fused-memory/src/fused_memory/server/main.py`` and
+    ``fused-memory/scripts/repair_recon_citation.py`` each build
+    ``Path(config.reconciliation.data_dir)`` before handing it to
+    ``ReconciliationJournal``), so the wrap would buy nothing there — while
+    costing something real elsewhere: ``MagicMock``/``AsyncMock`` implement
+    ``__fspath__``, so ``Path(mock)`` silently coerces a mock journal's
+    ``data_dir`` into the RELATIVE path ``AsyncMock/mock.data_dir/<id>``, which
+    this function would then anchor at the cwd and ``TaskConfigDir.__init__``
+    would really ``mkdir(parents=True)`` — littering the repo with directories on
+    every suite run. Used as given, a mock's ``__truediv__`` returns another mock
+    and nothing reaches the filesystem, exactly as before this function
+    absolutized anything.
+
+    The ``isinstance(base, PurePath)`` guard extends that "leave a duck type
+    strictly alone" contract from the coercion to the CALL. Without it,
+    ``is_absolute()`` is invoked on the mock, and for the ``AsyncMock`` journal
+    the stage suite actually uses (``fused-memory/tests/reconciliation/test_base_stage_cutover.py``)
+    that returns a COROUTINE, not a bool: truthy, so the branch is skipped and no
+    directory is created, but the coroutine is never awaited and CPython emits
+    ``RuntimeWarning: coroutine 'AsyncMockMixin._execute_mock_call' was never
+    awaited``. ``orchestrator/pyproject.toml`` already promotes that exact
+    warning to an error in its ``filterwarnings``, so leaking one here would
+    plant an anti-pattern the repo has decided to fail on — and would break
+    fused-memory's suite the day it adopts the same filters. Testing the type
+    first also states the real precondition: absolutization is a ``PurePath``
+    operation, and anything else is none of this function's business.
+
+    Shape precedent:
+    ``fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._start_escalation_server``.
+    ``gc_run_config_dir`` inherits the fix for free — it derives its rmtree target
+    from this function.
     """
-    return data_dir / 'recon-config'
+    base = data_dir
+    if isinstance(base, PurePath) and not base.is_absolute():
+        base = Path.cwd() / base
+    return base / 'recon-config'
 
 
 def gc_run_config_dir(data_dir: Path, run_id: str) -> None:

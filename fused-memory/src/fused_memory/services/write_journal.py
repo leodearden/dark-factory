@@ -8,6 +8,7 @@ import json
 import logging
 import time
 import uuid as uuid_mod
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -228,6 +229,46 @@ CREATE TABLE IF NOT EXISTS idempotent_ops (
     result TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+-- referent_findings: the durable half of leaf zeta's diagnosis (task 4984).
+-- `_verify_episode_referents` returns its findings in-process and they are then
+-- gone, so an episode whose edges were fully diagnosed with no path to repair
+-- left nothing a later pass could act on.
+--
+-- A DIAGNOSIS LOG, NOT A WORK QUEUE. There is deliberately no status/claimed
+-- column: a row records what was TRUE of the graph at one moment, not an
+-- instruction, so the phase-5 replay pass must re-verify a row against the live
+-- graph before acting on it. That is the fail-closed direction, and the same one
+-- `ReferentFinding.resolvable` takes by defaulting to False. A status column now
+-- would pre-empt phase 5's own read-path choice with speculative generality.
+--
+-- HOW A READER DRAINS IT, given no status column: WriteJournal.get_referent_findings
+-- returns the OLDEST page and takes an `after_seq` cursor over the sqlite rowid,
+-- which is the only total insertion order here — one episode's findings are
+-- written in ONE batched commit and deliberately share a single `created_at`.
+-- RETENTION is NOT yet wired: the startup sweep that runs prune_mem0_intents /
+-- prune_idempotent_ops / prune_write_ops lives in server/main.py, outside task
+-- 4984's locks, so growth is watched rather than bounded for now (the write path
+-- is the ~0.2%-of-edges finding path, so the rate is low, not zero).
+--
+-- No ALTER migration: initialize() runs executescript(SCHEMA_SQL) unconditionally
+-- and this DDL is IF NOT EXISTS, so a fresh AND an existing database both pick
+-- the table up on the next start (same reasoning as the idx_wo_created block
+-- above). _migrate() is for ALTER TABLE column additions.
+CREATE TABLE IF NOT EXISTS referent_findings (
+    id TEXT PRIMARY KEY,
+    group_id TEXT,
+    episode_uuid TEXT,
+    payload TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+-- ONE index, serving the ONLY planned read's filter (`WHERE group_id = ?`); the
+-- rowid ordering that read applies on top of it is free, since an index entry
+-- already carries the rowid. The idx_wo_created note above measures what a new
+-- index costs on a populated table — 47 s of startup DDL against a ~120 s
+-- watchdog grace; this table starts EMPTY so that build is free today, and must
+-- not be multiplied later without taking that measurement again.
+CREATE INDEX IF NOT EXISTS idx_rf_group_time ON referent_findings(group_id, created_at);
 """
 
 
@@ -446,6 +487,123 @@ class WriteJournal:
         except Exception as e:
             self._dropped[operation] += 1
             logger.warning(f'Failed to log backend_op: {e}')
+
+    async def log_referent_finding(
+        self, *, payload: dict, group_id: str, episode_uuid: str
+    ) -> None:
+        """Persist ONE referent finding. Fire-and-forget — never raises.
+
+        The singular convenience over :meth:`log_referent_findings`, which owns
+        the only INSERT. One commit either way, so a caller already holding an
+        episode's findings should hand them over together rather than call this
+        in a loop — see that method's BATCHED note for what the loop costs.
+        """
+        await self.log_referent_findings(
+            [payload], group_id=group_id, episode_uuid=episode_uuid,
+        )
+
+    async def log_referent_findings(
+        self, payloads: Sequence[dict], *, group_id: str, episode_uuid: str
+    ) -> None:
+        """Persist ONE EPISODE's referent findings, in ONE commit. Never raises.
+
+        Modelled on :meth:`log_backend_op` and counting its losses on the SAME
+        ``_dropped`` counter (INV-5) rather than growing a second, divergent
+        one. The contract matters to the caller: it runs inside the per-group
+        identity lock AFTER the episode write has already committed, so a
+        journal fault must cost a diagnosis and never the write — and because
+        the guard is here, no call site needs a try/except of its own.
+
+        BATCHED, not per finding, because every commit here is a
+        ``synchronous=FULL`` fsync (~1-5 ms, and up to the 5000 ms
+        ``busy_timeout`` under contention) taken while that identity lock
+        serializes same-group writes. An episode's finding count has NO
+        ceiling — the verify pass's warn cap is documented as capping the log
+        and nothing else — so a storm episode of 50-100 misattached ends would
+        hold the lock for 50-500 ms of fsyncs one row at a time. One
+        transaction makes that cost per EPISODE instead of per finding.
+
+        A dropped batch counts EVERY row it lost, because
+        :meth:`journal_drop_stats` reports rows LOST rather than calls failed.
+        """
+        if not payloads:
+            return
+        try:
+            # ONE timestamp for the batch: these rows are one episode's
+            # diagnosis, taken under one lock at one moment, and stamping them
+            # microseconds apart would invent a precision the observation does
+            # not have. `get_referent_findings` orders on the rowid precisely
+            # so a shared `created_at` cannot scramble their order.
+            created_at = datetime.now(UTC).isoformat()
+            async with self._txn() as db:
+                await db.executemany(
+                    """INSERT INTO referent_findings
+                       (id, group_id, episode_uuid, payload, created_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    [
+                        (
+                            str(uuid_mod.uuid4()),
+                            group_id,
+                            episode_uuid,
+                            json.dumps(payload),
+                            created_at,
+                        )
+                        for payload in payloads
+                    ],
+                )
+        except Exception as e:
+            self._dropped['referent_finding'] += len(payloads)
+            logger.warning(
+                f'Failed to log {len(payloads)} referent_finding row(s): {e}'
+            )
+
+    async def get_referent_findings(
+        self,
+        *,
+        group_id: str | None = None,
+        after_seq: int | None = None,
+        limit: int = 1000,
+    ) -> list[dict]:
+        """The OLDEST *limit* findings, in insertion order, ``payload`` decoded.
+
+        OLDEST-FIRST AND TRUNCATED AT *limit* — say it plainly, because the
+        table has no prune path and no status column to mark a row handled (it
+        is a diagnosis log, not a work queue). A consumer of a table longer
+        than one page that does not carry *after_seq* forward therefore re-reads
+        the same oldest page forever and never reaches a newer diagnosis. Pass
+        the ``seq`` of the last row handled to get the next page.
+
+        ``seq`` is the row's sqlite ``rowid``: assigned at INSERT, so it is the
+        ONE key that totally orders these rows the way they were written —
+        including inside a batched commit, where every row deliberately shares
+        one ``created_at``. It is also gap-tolerant as a cursor: a future
+        retention sweep deleting the oldest rows cannot renumber the newer ones
+        under a reader mid-page.
+
+        Unlike :meth:`log_referent_findings` this one MAY raise: it is an
+        operator/replay read, not a hot write path, and an unreadable journal is
+        an answer the caller has to see rather than an empty list to act on.
+        """
+        db = self._require_db()
+        clauses: list[str] = []
+        params: list = []
+        if group_id is not None:
+            clauses.append('group_id = ?')
+            params.append(group_id)
+        if after_seq is not None:
+            clauses.append('rowid > ?')
+            params.append(after_seq)
+        where = f'WHERE {" AND ".join(clauses)} ' if clauses else ''
+        params.append(limit)
+        async with db.execute(
+            f'SELECT rowid AS seq, * FROM referent_findings {where}'
+            'ORDER BY rowid LIMIT ?',
+            params,
+        ) as cursor:
+            return [
+                {**dict(row), 'payload': json.loads(row['payload'])}
+                for row in await cursor.fetchall()
+            ]
 
     def journal_drop_stats(self) -> dict:
         """Return ``{'dropped_total': int, 'by_operation': dict}`` — rows LOST.

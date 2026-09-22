@@ -1310,6 +1310,21 @@ BASELINE_MEASURED_AT = _datetime.datetime(
     2026, 8, 6, 9, 30, tzinfo=_datetime.UTC,
 )
 
+#: When the fixture's PROBE reading was taken: one minute after
+#: BASELINE_MEASURED_AT, because a healthcheck reads the card AFTER the arm
+#: started.  DERIVED from the baseline's moment rather than hand-copied from
+#: it, so editing that one cannot silently falsify this sentence.  Pinned for
+#: the same reason the baseline's stamp is -- and for one more, specific to
+#: this one: `render_table` prints it in the header line, so a stamp read off
+#: the live clock puts six microsecond digits into every rendering this module
+#: asserts over.
+FIXTURE_MEASURED_AT = BASELINE_MEASURED_AT + _datetime.timedelta(minutes=1)
+
+#: The same moment as the ARTIFACT carries it.  `run_healthcheck` takes a
+#: `datetime` and renders it, so the constant above is what a test injects and
+#: this one is what a test asserts against.
+FIXTURE_MEASURED_AT_ISO = FIXTURE_MEASURED_AT.isoformat()
+
 
 def _baseline(
     used_mib=BASELINE_USED_MIB, free_mib=BASELINE_FREE_MIB, consumers=None,
@@ -1360,6 +1375,10 @@ def _failing_probe(arm, *, warmup: bool = False):
 
 
 def _report(arms=None, probe=_passing_probe, snapshot=None, baseline=None, **kwargs):
+    # `setdefault`, so the pin is a DEFAULT and not a wall: a caller wanting a
+    # different or live stamp can pass `now=` exactly as callers already pass
+    # `repeat=`.
+    kwargs.setdefault('now', lambda: FIXTURE_MEASURED_AT)
     return lms_healthcheck.run_healthcheck(
         arms if arms is not None else [_arm()],
         gpu_probe=lambda: snapshot if snapshot is not None else _snapshot(),
@@ -1582,16 +1601,94 @@ def test_the_report_carries_a_schema_version():
     assert isinstance(report.schema_version, int)
 
 
-def test_the_report_is_stamped_with_an_aware_utc_timestamp():
-    """A naive timestamp would make a stale artifact indistinguishable from a
-    fresh one across a timezone change -- and this artifact's whole job is to
-    prove a live run happened."""
-    report = _report()
+def test_the_measurement_stamp_is_injectable_and_otherwise_read_from_the_live_clock():
+    """Both halves of the clock seam, on the function that owns it.
 
-    stamped = _datetime.datetime.fromisoformat(report.measured_at)
+    A test may pin the stamp, and a real run may not: a naive or stale
+    timestamp would make a dead artifact indistinguishable from a live one,
+    and proving a live run happened is this artifact's whole job.  Called
+    directly rather than through `_report()`, which exists to hide the very
+    argument under test.
+    """
+    injected = lms_healthcheck.run_healthcheck(
+        [_arm()],
+        gpu_probe=lambda: _snapshot(),
+        probe=_passing_probe,
+        baseline=_baseline(),
+        now=lambda: FIXTURE_MEASURED_AT,
+    )
 
+    # The ROW too, not just the report: `run_healthcheck` stamps every ArmRow
+    # from the same local, so the seam has to reach that far to be worth
+    # anything to a test asserting over a rendering.  Asserted in ISO because
+    # the seam hands over a `datetime` and the rendering is the function's.
+    assert injected.measured_at == FIXTURE_MEASURED_AT_ISO
+    assert injected.arms[0].measured_at == FIXTURE_MEASURED_AT_ISO
+
+    default = lms_healthcheck.run_healthcheck(
+        [_arm()],
+        gpu_probe=lambda: _snapshot(),
+        probe=_passing_probe,
+        baseline=_baseline(),
+    )
+
+    stamped = _datetime.datetime.fromisoformat(default.measured_at)
+
+    assert default.measured_at != FIXTURE_MEASURED_AT_ISO
     assert stamped.tzinfo is not None
     assert stamped.utcoffset() == _datetime.timedelta(0)
+    # DELIBERATELY loose.  This only has to tell a live reading from a stamp
+    # pinned ~40 days in the past, and a tight bound would re-introduce the
+    # very wall-clock coupling this seam exists to remove -- a slow runner or
+    # a container clock step would then fail a test about injection.
+    freshness = _datetime.datetime.now(_datetime.UTC) - stamped
+    assert abs(freshness) < _datetime.timedelta(seconds=300)
+
+
+@pytest.mark.parametrize(
+    'unanchorable',
+    [
+        _datetime.datetime(2026, 8, 6, 9, 31),
+        _datetime.datetime(
+            2026, 8, 6, 10, 31,
+            tzinfo=_datetime.timezone(_datetime.timedelta(hours=1)),
+        ),
+    ],
+    ids=['naive', 'aware-but-not-utc'],
+)
+def test_a_clock_that_cannot_be_anchored_is_refused_rather_than_stamped(unanchorable):
+    """Injection must not be able to weaken the stamp's invariant.
+
+    `measured_at` is a plain `str` in the artifact with no validator behind
+    it, so nothing downstream would notice a naive or local-time stamp -- and
+    `merge_reports` picks a slate's stamp with `max()` over those strings,
+    which orders by instant only while every stamp shares one offset.  Both
+    unanchorable shapes are refused as CALLER errors, never recorded as an arm
+    failure.
+    """
+    with pytest.raises(lms_healthcheck.HealthcheckError, match='UTC'):
+        lms_healthcheck.run_healthcheck(
+            [_arm()],
+            gpu_probe=lambda: _snapshot(),
+            probe=_passing_probe,
+            baseline=_baseline(),
+            now=lambda: unanchorable,
+        )
+
+
+def test_a_fixture_report_describes_one_fixed_moment():
+    """A fixture is a fixed moment, so its rendering is a fixed string.
+
+    Under the live clock two renderings of "the same" fixture differ in their
+    microsecond digits, which is what made `table.count(...)` a coin flip:
+    `render_table` prints `measured_at` in the header line, and the counts run
+    over the whole rendering.
+    """
+    assert _report().measured_at == FIXTURE_MEASURED_AT_ISO
+    assert (
+        lms_healthcheck.render_table(_report())
+        == lms_healthcheck.render_table(_report())
+    )
 
 
 def test_the_report_carries_a_gpu_identity_block():
@@ -1911,6 +2008,17 @@ def test_the_table_lists_who_else_held_the_card_at_each_reading():
         baseline=_baseline(consumers=[WHISPER_CONSUMER]),
         snapshot=_snapshot(consumers=[WHISPER_CONSUMER, ARM_CONSUMER]),
     ))
+    # The counts below read the WHOLE rendering, so they say "appears in the
+    # inventory" only while no OTHER rendered element carries the same digit
+    # run.  The header's `measured_at` is the one that actually bit -- off the
+    # live clock its microsecond digits made this a coin flip -- but every MiB
+    # figure, the headroom and the latencies are equally capable of it.  The
+    # SAME report with the inventories empty settles that from the renderer
+    # itself, so no future fixture number can quietly re-create the collision
+    # and nothing here has to parse rendered prose to rule it out.
+    without_consumers = lms_healthcheck.render_table(_report(
+        baseline=_baseline(consumers=[]), snapshot=_snapshot(consumers=[]),
+    ))
 
     # Two SECTIONS, not one merged list: whisper-writer held the card at both
     # readings and so appears twice, the arm only at the probe.  A structural
@@ -1920,6 +2028,7 @@ def test_the_table_lists_who_else_held_the_card_at_each_reading():
     assert table.count(str(WHISPER_CONSUMER.pid)) == 2
     assert table.count(str(ARM_CONSUMER.pid)) == 1
     for consumer in (WHISPER_CONSUMER, ARM_CONSUMER):
+        assert str(consumer.pid) not in without_consumers
         assert consumer.process_name in table
         assert str(consumer.pid) in table
         assert str(consumer.used_mib) in table
@@ -2479,7 +2588,13 @@ def test_every_row_carries_its_own_measurement_time_and_footprint():
     other seven arms' measurements would leave the artifact entirely."""
     row = _report().arms[0]
 
-    assert _datetime.datetime.fromisoformat(row.measured_at).tzinfo is not None
+    # The RUN's stamp, not merely a well-formed one.  This asserted tz-
+    # awareness until the fixture pinned `now=`, at which point it only
+    # re-checked that a constant three hundred lines above was written aware --
+    # a tautology.  Awareness is production's invariant and is pinned where it
+    # is load-bearing, on the un-injected clock, by
+    # `test_the_measurement_stamp_is_injectable_and_otherwise_read_from_the_live_clock`.
+    assert row.measured_at == FIXTURE_MEASURED_AT_ISO
     assert row.arm_footprint_mib == MEASURED_FOOTPRINT_MIB
 
 

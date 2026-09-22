@@ -11,66 +11,37 @@ is a plain unit test; the single I/O boundary (an injected
 """
 from __future__ import annotations
 
-import importlib.util
 import json
 import logging
-import sys
-import types
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from _fm_helpers import load_script_module
+from _store_mutation_preflight_contract import (
+    SENTINEL,
+    deny,
+    fail_closed_records,
+    neutralise_fixture,
+)
 
 from fused_memory import topic_slug as topic_slug_module
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'retro_stamp_topics.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load retro_stamp_topics.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    reflection-based decorators work correctly.
-    """
-    mod_name = 'retro_stamp_topics'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
+_mod = load_script_module(SCRIPT_PATH, mod_name='retro_stamp_topics')
 
 
-_mod = _load_module()
-
-
-@pytest.fixture(autouse=True)
-def _neutralise_store_mutation_preflight(monkeypatch):
-    """Keep this MOCK-unit suite independent of the REAL ``~/.mem0``.
-
-    ``run(..., apply=True)`` runs a fail-closed capability preflight before it
-    scrolls (task 4293). That probe touches the real filesystem, so without
-    this fixture every ``--apply`` test would pass or fail according to whether
-    the machine running pytest happens to be able to write mem0's history
-    directory -- and it genuinely cannot inside an agent sandbox, which is the
-    whole reason the guard exists. This suite is deliberately MOCK-unit (an
-    AsyncMock service, no live store), so the environment must not be an input
-    to it.
-
-    ``TestRunApplyStoreMutationPreflight`` re-rigs this per test -- to refuse,
-    to record, or to pass -- so the guard's own behaviour is still pinned
-    explicitly rather than assumed away.
-
-    Deliberately NOT ``raising=False``: if the guard is ever removed from the
-    script this fixture must break loudly rather than silently no-op.
-    """
-    monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+_neutralise = neutralise_fixture(
+    _mod,
+    note="""``run(..., apply=True)`` runs the preflight before it scrolls (task
+    4293). This suite is deliberately MOCK-unit (an AsyncMock service, no live
+    store). ``TestRunApplyStoreMutationPreflight`` re-rigs this per test -- to
+    refuse, to record, or to pass -- so the guard's own behaviour is still
+    pinned explicitly rather than assumed away.""",
+)
 
 
 # ===========================================================================
@@ -2772,40 +2743,6 @@ class TestRunApplyStoreMutationPreflight:
             gate_manifest=self._gates(),
         )
 
-    @staticmethod
-    def _deny(monkeypatch):
-        """Rig the preflight to refuse, as it would inside an agent sandbox."""
-        def _raise(*_args, **_kwargs):
-            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
-
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
-
-    @staticmethod
-    def _fail_closed_records(caplog) -> list:
-        """The guard site's OWN diagnosis.
-
-        ``main`` has NO blanket handler here -- it hands ``run`` straight to
-        ``asyncio.run`` -- so the refusal exits as an uncaught traceback and
-        this ERROR record is the ONLY place the operator is told what was
-        refused and what to do instead. Pinned on the fail-closed marker and
-        the remedy noun ONLY, so every other word stays free to reword.
-
-        Asserting on message CONTENT is deliberate, and is the narrow exception
-        to the repo's don't-pin-guard-message-prose norm (task 3799): the record
-        this test is about is defined BY its content -- mere record-existence
-        would still pass if the whole diagnosis were replaced by "boom",
-        precisely the regression this exists to catch. Verified non-vacuous:
-        mutating the marker in the script turns this assertion red (task 4127
-        amendment).
-        """
-        return [
-            rec for rec in caplog.records
-            if rec.name == 'retro_stamp_topics'
-            and rec.levelname == 'ERROR'
-            and 'NOT started (fail-closed)' in rec.getMessage()
-            and 'MCP server' in rec.getMessage()
-        ]
-
     @pytest.mark.asyncio
     async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
         self, monkeypatch
@@ -2816,11 +2753,11 @@ class TestRunApplyStoreMutationPreflight:
         become N ``outcome: 'error'`` rows inside a report that otherwise looks
         like a completed sweep.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         service = self._service()
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+            _mod.StoreMutationUnavailable, match=SENTINEL
         ):
             await self._run(service, apply=True)
 
@@ -2830,7 +2767,7 @@ class TestRunApplyStoreMutationPreflight:
     async def test_the_guard_sits_before_every_backend_read(self, monkeypatch):
         """It aborts without a single round-trip: source (1)'s canonical scroll
         is not paid for by a run that was never going to be allowed to stamp."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         service = self._service()
 
         with pytest.raises(_mod.StoreMutationUnavailable):
@@ -2843,7 +2780,7 @@ class TestRunApplyStoreMutationPreflight:
         """A rehearsal withholds only the writes, so it must not require the
         ability to write -- the report stays obtainable from anywhere, with the
         deny still installed."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         service = self._service()
 
         report = await self._run(service, apply=False)
@@ -2893,7 +2830,7 @@ class TestRunApplyStoreMutationPreflight:
         logger rather than ``print`` precisely so it stays off stdout, which
         this script reserves for its machine-read markdown/JSON report.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         service = self._service()
 
         with (
@@ -2902,7 +2839,7 @@ class TestRunApplyStoreMutationPreflight:
         ):
             await self._run(service, apply=True)
 
-        assert self._fail_closed_records(caplog), (
+        assert fail_closed_records(caplog, 'retro_stamp_topics'), (
             'nothing else explains this traceback -- the guard site must log '
             'the fail-closed diagnosis before raising; got: '
             f'{[rec.getMessage() for rec in caplog.records]}'

@@ -756,8 +756,10 @@ class TestMaybeEscalateStalledGateBacklog:
         # WARNING — silently flipping every shape test below to result == [] with no
         # visible error.
         q.get_pending.return_value = []
-        # Pins observed_submit_response to its documented fail-open 'queued' branch
-        # instead of leaning on MagicMock attribute truthiness.
+        # Pins observed_submit_response to its documented 'accepted_unpersisted'
+        # branch instead of leaning on MagicMock attribute truthiness.  The
+        # assertions below read only the returned id list, which that branch
+        # carries exactly as the 'queued' one does.
         q.get.return_value = None
         return q
 

@@ -1421,6 +1421,75 @@ def test_forked_inheritor_does_not_claim_the_spawners_window(
     assert forked.display is None
 
 
+def test_forked_inheritor_does_not_inherit_the_spawners_role_task_or_title(
+    tmp_path: Path,
+) -> None:
+    # Task 4663 (task-4193-review residual): parent_session_id/display/
+    # launcher_pid were already guarded above, but resolve_hook_identity
+    # still read CLAUDE_SPAWN_ROLE/TASK_ID/ESCALATION_ID/TITLE straight out
+    # of the inherited env, so a forked record got the SPAWNER's role,
+    # task_id, escalation_id and display title -- two cockpit rows
+    # identical except for slug. These must resolve to this session's own
+    # non-spawn defaults instead.
+    slug = 'session-cockpit-3215093'
+    _write_bound_parent(slug, tmp_path, 3215093)
+    hook_input = {'session_id': 'uuid-nested', 'cwd': '/home/leo/src/dark-factory'}
+    env = {
+        'CLAUDE_SPAWN_SESSION_ID': slug,
+        'CLAUDE_SPAWN_ROLE': 'unblock',
+        'CLAUDE_SPAWN_PROJECT': 'df',
+        'CLAUDE_SPAWN_TASK_ID': '9999',
+        'CLAUDE_SPAWN_ESCALATION_ID': 'esc-9999-1',
+        'CLAUDE_SPAWN_TITLE': 'unblock:dark-factory#9999 spawner-title',
+    }
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    forked = sr.read_record(sh.hook_session_slug(hook_input, env, root=tmp_path), root=tmp_path)
+    assert forked.role == 'session'
+    # 'dark-factory' is the cwd basename, NOT the inherited 'df': every
+    # load-bearing key of _SPAWNER_IDENTITY_ENV_KEYS is set here with a value
+    # that differs from the fall-through default, so dropping any one of them
+    # from the frozenset reddens this test rather than silently putting the
+    # spawner's identity back on the forked row.
+    assert forked.project == 'dark-factory'
+    assert forked.task_id is None
+    assert forked.escalation_id is None
+    assert forked.title == 'session:dark-factory'
+    # And the spawning session's own record is untouched -- role/title
+    # never carried spawn env in the first place (see _write_bound_parent).
+    spawner = sr.read_record(slug, root=tmp_path)
+    assert spawner.role == ''
+    assert spawner.title == ''
+
+
+def test_forked_inheritor_strip_is_record_scoped_not_terminal_scoped(
+    tmp_path: Path,
+) -> None:
+    # The SCOPE of the task-4663 strip, made executable: it covers the
+    # identity PERSISTED in a record, not the OSC escape painted on a
+    # terminal. The tab a nested claude retitles is the one it runs INSIDE --
+    # its spawner's -- so its Stop deliberately keeps carrying the SPAWNER's
+    # title text (with this session's own status glyph), while the forked ROW
+    # it writes keeps its own non-spawn title. Stripping the retitle too
+    # would have the nested session rename its spawner's tab, flapping the
+    # text between the two titles as each one's hooks fire. Revisit this
+    # assertion deliberately; do not flip it as a consistency tidy-up.
+    slug = 'session-cockpit-3215094'
+    _write_bound_parent(slug, tmp_path, 3215094)
+    hook_input = {'session_id': 'uuid-nested', 'cwd': '/home/leo/src/dark-factory'}
+    spawner_title = 'unblock:dark-factory#9999 spawner-title'
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug, 'CLAUDE_SPAWN_TITLE': spawner_title}
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+    retitle = sh.run_stop(hook_input, env, root=tmp_path)
+
+    assert retitle == sh.osc_retitle_sequence(sr.Status.IDLE, spawner_title)
+    forked = sr.read_record(sh.hook_session_slug(hook_input, env, root=tmp_path), root=tmp_path)
+    assert forked.title == 'session:dark-factory'
+    assert forked.status == sr.Status.IDLE
+
+
 def test_adopted_session_still_resolves_the_spawn_window_marker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -1,0 +1,5 @@
+{
+  "_README": "This is the APPEND-ONLY provenance of every raise ever authorized against the merge-lane ratchet baseline (orchestrator/tests/merge_lane_ratchet_baseline.json). It is NOT a permission list: nothing in this file grants a future raise, and no entry here will ever let --write-baseline absorb one. Authorization is an act, not a standing entry -- rerun --authorize-raise for each raise, and it appends one more record. Each entry's \"measures\" block is DERIVED from the measured raises the write gate computed, never hand-written, so it is mechanically incapable of disagreeing with the baseline diff it accompanies. There is no timestamp: git already carries the date, and a clock would churn this file on every rewrite. Written by scripts/merge_lane_metrics.py --write-baseline orchestrator/tests/merge_lane_ratchet_baseline.json --authorize-raise <task-id> --reason \"<why>\".",
+  "schema_version": 1,
+  "raises": []
+}

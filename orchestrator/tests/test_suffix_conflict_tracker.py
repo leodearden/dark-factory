@@ -9,7 +9,10 @@ Covers:
   step-3 RED  — SuffixConflictTracker.recompute() without a worker.
   step-5 RED  — SuffixConflictTracker.bounce_conflicting_suffix_items() without
                 a worker.
-  step-7 RED  — SpeculativeMergeWorker delegates to self._suffix_tracker.
+  step-7 RED  — SpeculativeMergeWorker's PUBLIC suffix-conflict surface:
+                recompute_suffix_conflict_graph() drives the tracker over the
+                worker's live state and snapshot()['suffix_conflict_graph']
+                publishes the result.
 """
 
 from __future__ import annotations
@@ -606,7 +609,7 @@ class TestTrackerBounceWithoutWorker:
         )
 
 
-# ── step-7: SpeculativeMergeWorker delegates to SuffixConflictTracker ──────────
+# ── step-7: the worker's PUBLIC suffix-conflict surface ───────────────────────
 
 
 def _make_worker(git_ops: GitOps) -> SpeculativeMergeWorker:
@@ -614,129 +617,73 @@ def _make_worker(git_ops: GitOps) -> SpeculativeMergeWorker:
     return SpeculativeMergeWorker(git_ops, asyncio.Queue())
 
 
-class TestWorkerDelegatesToTracker:
-    """SpeculativeMergeWorker delegates its suffix-conflict state to a
-    SuffixConflictTracker instance (self._suffix_tracker) via thin property
-    wrappers that preserve the worker's original attribute names.
+class TestWorkerPublishesTheSuffixConflictGraph:
+    """A worker publishes its suffix-conflict state through snapshot()'s
+    ``suffix_conflict_graph`` key — the only surface a reader outside the
+    worker is entitled to.
 
-    RED until step-8 GREEN rewires SpeculativeMergeWorker.__init__ to
-    construct self._suffix_tracker and replaces the 4 inline attrs with
-    delegating properties. (Sync-only class — see TestWorkerMethodDelegation
-    for the async method-delegation + recompute-visibility cases; mixing
-    sync defs into an @pytest.mark.asyncio class is a hard error here, see
-    the "Sync def collected inside an @pytest.mark.asyncio class" filterwarnings entry.)
+    (Sync-only class — see TestWorkerRecomputeIsPubliclyObservable for the
+    async cases; mixing sync defs into an @pytest.mark.asyncio class is a
+    hard error here, see the "Sync def collected inside an
+    @pytest.mark.asyncio class" filterwarnings entry.)
     """
 
-    def test_worker_has_suffix_tracker(self, git_ops):
-        worker = _make_worker(git_ops)
-        assert isinstance(worker._suffix_tracker, SuffixConflictTracker)
-
-    def test_read_delegation_graph(self, git_ops):
-        worker = _make_worker(git_ops)
-        assert worker._suffix_conflict_graph is worker._suffix_tracker.graph
-
-    def test_write_delegation_graph(self, git_ops):
-        worker = _make_worker(git_ops)
-        g = SuffixConflictGraph(
-            nodes=('rid-x',),
-            textual_edges=frozenset(),
-            footprint_edges=frozenset(),
-            conflicts_with_main=frozenset(),
-        )
-        worker._suffix_conflict_graph = g
-        assert worker._suffix_tracker.graph is g, (
-            'Writing worker._suffix_conflict_graph must round-trip through '
-            'self._suffix_tracker.graph.'
-        )
-
-    def test_write_delegation_signature(self, git_ops):
-        worker = _make_worker(git_ops)
-        sig = (('rid-x',), 'deadbeef')
-        worker._suffix_conflict_signature = sig
-        assert worker._suffix_tracker.signature == sig
-        assert worker._suffix_conflict_signature == sig
-
-    def test_write_delegation_last_known_main_sha(self, git_ops):
-        worker = _make_worker(git_ops)
-        worker._last_known_main_sha = 'cafef00d'
-        assert worker._suffix_tracker.last_known_main_sha == 'cafef00d'
-        assert worker._last_known_main_sha == 'cafef00d'
-
-    def test_write_delegation_bounce_registry(self, git_ops):
-        worker = _make_worker(git_ops)
-        reg = MergeBounceRegistry()
-        reg.record_bounce('591')
-        worker._bounce_registry = reg
-        assert worker._suffix_tracker.bounce_registry is reg
-        assert worker._bounce_registry is reg
-
-    def test_snapshot_integrity(self, git_ops):
+    def test_fresh_worker_publishes_the_empty_sentinel_graph(self, git_ops):
         worker = _make_worker(git_ops)
         assert (
             worker.snapshot()['suffix_conflict_graph']
-            == worker._suffix_tracker.graph.to_snapshot_dict()
+            == EMPTY_SUFFIX_CONFLICT_GRAPH.to_snapshot_dict()
         )
-
-    def test_git_ops_reassignment_observed(self, git_ops):
-        """amend (reviewer robustness_stale_reference): reassigning
-        worker._git_ops after construction must be observed by the tracker
-        on its next call — not the GitOps snapshotted at construction time.
-        Mirrors the worker._git_ops reassignment pattern already used
-        elsewhere (e.g. test_merge_queue.py, test_merge_queue_train_attribution.py).
-        """
-        worker = _make_worker(git_ops)
-        new_git_ops = object()
-        worker._git_ops = new_git_ops  # type: ignore[assignment]
-        assert worker._suffix_tracker._git_ops() is new_git_ops
-
-    def test_frozen_prefix_reassignment_observed(self, git_ops):
-        """amend (reviewer consistency): reassigning worker.frozen_prefix /
-        frozen_prefix_tip after construction must be observed by the
-        tracker, removing the asymmetry with lane_buffers' existing
-        re-reading-lambda semantics."""
-        worker = _make_worker(git_ops)
-        sentinel_prefix = ('sentinel-rid',)
-        worker.frozen_prefix = lambda: sentinel_prefix
-        worker.frozen_prefix_tip = lambda main_sha: 'SENTINEL-TIP'
-        assert worker._suffix_tracker._frozen_prefix() == sentinel_prefix
-        assert worker._suffix_tracker._frozen_prefix_tip('irrelevant') == 'SENTINEL-TIP'
 
 
 @pytest.mark.asyncio
-class TestWorkerMethodDelegation:
-    """Async half of TestWorkerDelegatesToTracker: method delegation +
-    recompute-visibility (split out because mixing sync defs into an
-    @pytest.mark.asyncio class is a hard error in this repo).
-
-    RED until step-8 GREEN rewires recompute_suffix_conflict_graph() /
-    _bounce_conflicting_suffix_items() to thin `await self._suffix_tracker...`
-    delegators.
+class TestWorkerRecomputeIsPubliclyObservable:
+    """Driving the worker's PUBLIC recompute_suffix_conflict_graph() reaches
+    the tracker over the worker's LIVE attributes and lands in the worker's
+    PUBLIC snapshot.
     """
 
-    async def test_method_delegation_bounce(self, git_ops):
-        """worker._bounce_conflicting_suffix_items() must delegate (await)
-        to self._suffix_tracker.bounce_conflicting_suffix_items()."""
-        worker = _make_worker(git_ops)
-        sentinel_mock = AsyncMock()
-        worker._suffix_tracker.bounce_conflicting_suffix_items = sentinel_mock
-
-        await worker._bounce_conflicting_suffix_items()
-
-        sentinel_mock.assert_awaited_once()
-
-    async def test_method_delegation_recompute_visible_both_paths(
-        self, git_ops, config, git_repo,
+    async def test_recompute_drives_the_tracker_over_live_state_and_publishes_it(
+        self, git_ops,
     ):
-        """Driving worker.recompute_suffix_conflict_graph() must make the
-        resulting graph visible through BOTH the worker's legacy attribute
-        name and the tracker's own field (same object)."""
-        req = _make_req('591', 'branch-591', config, git_repo)
+        """Two guarantees in one drive, because each is the other's discriminator.
+
+        LIVE STATE: the worker injects ``frozen_prefix`` into its tracker as a
+        callable that RE-READS the attribute on every call (merge_queue.py::
+        SpeculativeMergeWorker.__init__), not as a bound-method snapshot taken
+        at construction.  So a ``frozen_prefix`` reassigned AFTER the worker
+        exists is the one the recompute consults — which is what the spy
+        below observes, and what proves the drive really reached the tracker
+        rather than returning early.  ``git_ops`` / ``lane_buffers`` /
+        ``frozen_prefix_tip`` are injected by the same expression in the same
+        shape; this witnesses that shape.
+
+        PUBLICATION: over an empty suffix the recompute yields the empty
+        sentinel (covered semantically by
+        TestTrackerRecomputeWithoutWorker::test_recompute_empty_suffix_yields_sentinel),
+        and snapshot() must publish exactly that.  Driving over EMPTY lane
+        buffers is deliberate: the populated-suffix case is covered at tracker
+        level by test_recompute_builds_edges_and_conflicts_with_main, which
+        injects buffers through _make_tracker's public ``lane_buffers=``
+        keyword, so nothing here needs to reach into the worker's buffers.
+        """
         worker = _make_worker(git_ops)
-        worker._lane_buffers['normal'].append(req)
+        consulted: list[str] = []
+
+        def _spy_frozen_prefix() -> tuple[str, ...]:
+            consulted.append('frozen_prefix')
+            return ()
+
+        worker.frozen_prefix = _spy_frozen_prefix
 
         await worker.recompute_suffix_conflict_graph()
 
-        assert worker._suffix_conflict_graph is worker._suffix_tracker.graph, (
-            'worker._suffix_conflict_graph and worker._suffix_tracker.graph '
-            'diverged after recompute_suffix_conflict_graph().'
+        assert consulted == ['frozen_prefix'], (
+            'Expected recompute_suffix_conflict_graph() to consult the '
+            'frozen_prefix reassigned after construction (a re-reading '
+            f'callable, not a construction-time snapshot); consulted={consulted!r}.'
         )
+        assert (
+            worker.snapshot()['suffix_conflict_graph']
+            == EMPTY_SUFFIX_CONFLICT_GRAPH.to_snapshot_dict()
+        ), 'Expected snapshot() to publish the graph the recompute just built.'

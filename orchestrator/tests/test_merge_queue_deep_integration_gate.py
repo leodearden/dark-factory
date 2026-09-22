@@ -341,9 +341,11 @@ from _merge_lane_census import lanes_by_task, queued_in_lane
 # their spawn counts has been measured, and widening an unmeasured marker is the
 # guessing this task replaced. The asymmetry is a decision, not an oversight.
 from _orch_helpers import (
+    DEEP_GATE_SCENE_BUDGET,
     DEEP_GATE_SCENE_TEST_TIMEOUT,
     VERIFY_CLI_PER_TEST_TIMEOUT,
-    deep_gate_spawn_budget_violation,
+    count_git_spawns,
+    spawn_budget_violation,
 )
 from shared.task_metadata import RetryLedger
 
@@ -4376,34 +4378,22 @@ class TestRow7KillSwitchByteIdentity:
         prose copies of a derivation are what drift.  This docstring covers
         only what is local to the fixture and stated nowhere else.
 
-        Counts BOTH asyncio spawn entry points, which is what the measurement
-        behind the constants counted.  ``create_subprocess_exec`` is the one
-        ``git_ops._run`` reaches and carries the bulk (231 / 110 / 110), but
-        each of these tests also makes exactly 3 ``create_subprocess_shell``
-        calls; watching ``_exec`` alone undercounts every test by those 3 and
-        would have quietly shipped a budget measured against a different
-        number than the timeout was derived from.
-
-        Per-test and IN-PROCESS by construction, never module state, so it
-        stays correct under ``--dist loadgroup`` where these three tests can
-        land on three different workers.  Patched through ``monkeypatch`` so it
-        is restored at teardown, per the instance-level rule in HARNESS NOTES.
+        A WIRE between two shared parts and nothing else:
+        ``count_git_spawns`` is the instrument and ``spawn_budget_violation``
+        the verdict, both in _orch_helpers.py, both also used by this file's
+        counterpart in test_merge_queue_deep_landing.py.  Which seams are
+        counted, and why both of them, is stated once at ``count_git_spawns``;
+        a copy of that instrument here is what would let the two budgets drift
+        apart.  What is local to THIS scene is the size of the seam that a
+        single-seam instrument would have missed: ``create_subprocess_exec``
+        carries the bulk (231 / 110 / 110), and each of these three tests
+        makes exactly 3 ``create_subprocess_shell`` calls on top.
         """
-        seams = ('create_subprocess_exec', 'create_subprocess_shell')
-        spawns = 0
-
-        def counting(real):
-            async def counting_spawn(*args, **kwargs):
-                nonlocal spawns
-                spawns += 1
-                return await real(*args, **kwargs)
-
-            return counting_spawn
-
-        for seam in seams:
-            monkeypatch.setattr(asyncio, seam, counting(getattr(asyncio, seam)))
+        spawns = count_git_spawns(monkeypatch)
         yield
-        violation = deep_gate_spawn_budget_violation(spawns, request.node.nodeid)
+        violation = spawn_budget_violation(
+            spawns(), request.node.nodeid, budget=DEEP_GATE_SCENE_BUDGET,
+        )
         assert violation is None, violation
 
     async def _sequence(

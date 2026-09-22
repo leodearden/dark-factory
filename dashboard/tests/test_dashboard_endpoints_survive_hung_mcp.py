@@ -36,7 +36,7 @@ import pytest
 _TINY_BUDGET = 0.05
 
 _TARGET_MODULES = {
-    'dashboard.app',
+    'dashboard.api.escalations',
     'dashboard.data.orchestrator',
     'dashboard.data.merge_queue',
 }
@@ -79,7 +79,8 @@ def hung_mcp(monkeypatch, tmp_path):
     Returns the ``reached`` list of ``(module_name, project_root)`` pairs the
     stub recorded, so a caller can assert the hang was genuinely exercised.
     """
-    from dashboard.app import _analytics_cache_clear, _task_cards_cache_clear
+    from dashboard.api.escalations import _task_cards_cache_clear
+    from dashboard.app import _analytics_cache_clear
     from dashboard.data import active_tasks, merge_queue, orchestrator, tasks
 
     reached: list[tuple[str, str]] = []
@@ -92,9 +93,13 @@ def hung_mcp(monkeypatch, tmp_path):
         return _hang
 
     # Patch the binding in EVERY module that imported the name by value —
-    # patching dashboard.data.tasks.fetch_tasks alone would miss all four.
+    # patching dashboard.data.tasks.fetch_tasks alone would miss all five.
+    # ``dashboard.app`` still binds it for the /healthz probe, which this
+    # sweep does not reach; the escalations tab's binding travelled to
+    # ``dashboard.api.escalations`` with ``_load_task_cards``.
     for module_name in (
         'dashboard.app',
+        'dashboard.api.escalations',
         'dashboard.data.orchestrator',
         'dashboard.data.merge_queue',
         'dashboard.data.active_tasks',
@@ -103,9 +108,9 @@ def hung_mcp(monkeypatch, tmp_path):
             f'{module_name}.fetch_tasks', _make_stub(module_name),
         )
 
-    import dashboard.app as _app
+    import dashboard.api.escalations as _esc
 
-    monkeypatch.setattr(_app, '_TASK_CARDS_BUDGET', _TINY_BUDGET)
+    monkeypatch.setattr(_esc, '_TASK_CARDS_BUDGET', _TINY_BUDGET)
     monkeypatch.setattr(merge_queue, '_TASK_TITLES_BUDGET', _TINY_BUDGET)
     monkeypatch.setattr(
         orchestrator, '_ORCHESTRATORS_PER_ROOT_BUDGET', _TINY_BUDGET,
@@ -142,7 +147,7 @@ def hung_mcp(monkeypatch, tmp_path):
         }],
     )
     monkeypatch.setattr(
-        _app,
+        _esc,
         'build_escalation_queues',
         lambda config: {
             'subsections': [

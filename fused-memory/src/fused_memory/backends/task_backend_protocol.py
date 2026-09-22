@@ -227,6 +227,26 @@ class TaskBackendProtocol(Protocol):
           True)`` and ``('additive', False)`` are unaffected, and as with the
           task-2180 guard a details-only write (NO metadata) is not rejected.
 
+        **Implementations MUST reject ``append=True`` combined with a non-None
+        ``title``, ``description`` or ``priority`` by raising**, naming the
+        offending field(s) in the message (e.g.
+        ``AppendUnsupportedFieldError``, which keeps the
+        ``TASKMASTER_TOOL_ERROR`` code).  Those three columns are
+        REPLACE-ONLY: ``append`` governs ONLY the ``details``/``prompt``
+        concatenation and the metadata mode above, and has never applied to
+        them.  Accepting the pair silently OVERWROTE the column — a caller
+        who believed they were extending a description destroyed the whole
+        original instead, with no error and no warning, in four recorded live
+        repros (the worst wiping ~17KB of authored prose that existed nowhere
+        else; the task-4039 defect).  Loud over silent, exactly like the two
+        metadata guards above: reject unconditionally on the flag combination,
+        without consulting the stored row, so the outcome cannot depend on
+        invisible state and the rejection can precede the row lookup.  The way
+        to EXTEND one of these fields is a read-modify-write — read the
+        current value, concatenate locally, then write the COMPLETE new value
+        with ``append`` omitted.  ``dependencies`` is also replace-only but is
+        deliberately NOT covered.
+
         **Implementations MUST reject a non-None ``status`` by raising** (e.g.
         ``TaskmasterError('TASKMASTER_TOOL_ERROR', …)``).  ``set_task_status``
         is the only sanctioned status writer — it enforces the terminal-exit,

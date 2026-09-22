@@ -55,6 +55,7 @@ import contextlib
 import logging
 import math
 import time
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
@@ -77,6 +78,7 @@ from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane import MergeLane
 from orchestrator.merge_queue import (
+    PRODUCTION_CLOCK,
     MergeRequest,
     PersistentWorktreeConfigError,
     check_merge_liveness_margin,
@@ -1349,6 +1351,14 @@ class _ShortSleepClock:
 
     async def sleep(self, secs: float) -> None:
         await asyncio.sleep(min(secs, self._CAP_SECS))
+
+    async def wait_for_any(self, aws: Collection[Any], timeout: float) -> set[Any]:
+        # UNCAPPED, unlike the sleep above: capping it would re-check the
+        # lane's halt and abandonment branches ~500x more often and reorder
+        # the halt-vs-verify interleaving this file's capstone measures. So
+        # this one method wants production semantics exactly, and delegates
+        # rather than restating them.
+        return await PRODUCTION_CLOCK.wait_for_any(aws, timeout)
 
 
 class _HostEscalationQueue:

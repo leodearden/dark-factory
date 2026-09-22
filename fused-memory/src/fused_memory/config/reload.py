@@ -62,6 +62,13 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # LOAD-BEARING, not cosmetic: anything absent from this frozenset silently
     # degrades to restart-only.
     'reconciliation.topic_anchored_recall_enabled',
+    # PRD C5's caller bar for `deterministic-*` done provenance (task 5237,
+    # consumed by task epsilon). Green tier because the value an operator
+    # reaches for during an incident is the EMPTY list -- deny every caller --
+    # and a deny-all that needs a restart arrives after the writes it was meant
+    # to stop. _iter_leaves yields the list WHOLE, so it reloads atomically: a
+    # half-applied prefix list would admit a caller no operator ever wrote.
+    'reconciliation.deterministic_provenance_allowed_agent_prefixes',
     # Write-triage band thresholds (task 3130). Written by
     # scripts/calibrate_write_triage.py --write-config, which derives them from
     # measured similarity distributions -- so hot-reload is what lets a
@@ -184,6 +191,57 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # deliberately does NOT capture threshold/window in __init__.
     'entity_mint.storm_threshold',
     'entity_mint.storm_window_seconds',
+    # ---- Deterministic auto-consolidation (task 5237, PRD Section 7/11) ----
+    # HONEST STATUS, because a comment that overclaims is worse than none: NO
+    # consumer of consolidation_auto.* exists on this branch. The executor is
+    # task delta, the proposal tool task gamma, the provenance bar task
+    # epsilon. These leaves are registered NOW so the section ships green-tier
+    # from its first commit; the live-read half of this module's reload-safety
+    # rule -- read off the shared config object per call, never captured at
+    # construction -- is discharged by those tasks' own resolvers and their own
+    # tests, which is where a captured-at-construction regression would be
+    # caught. Registration is load-bearing either way: anything absent from
+    # this frozenset silently degrades to restart-only.
+    #
+    # Two of these MUST be green tier for the PRD Section 11 rollout to work at
+    # all. `enabled` is the kill switch -- what an operator flips to stop a
+    # mis-consolidating cycle -- and a restart-only kill switch is no kill
+    # switch (the mem0_update.enabled lesson above). `enabled_projects` is the
+    # per-project staging lever, which is a rollout tool only if it moves on a
+    # running server.
+    'consolidation_auto.enabled',
+    'consolidation_auto.enabled_projects',
+    # Stamped onto every verdict and onto auto-execution provenance, read live
+    # per verdict so a reload retags subsequent verdicts rather than needing a
+    # restart to change what the corpus audit trail says.
+    'consolidation_auto.predicate_version',
+    # Proposal-shape bounds, enforced at the emit boundary by
+    # server/consolidation.py::validate_consolidate_args. Green tier so the
+    # supervised cycle can tighten or loosen what counts as a cluster from the
+    # evidence it is producing, without a redeploy between observations.
+    'consolidation_auto.member_min',
+    'consolidation_auto.member_max',
+    'consolidation_auto.claim_max_chars',
+    # Blast-radius caps. Both admit 0 as a narrow off switch, which is the
+    # value an operator sets mid-incident to stop execution (or gate filing)
+    # while leaving the rest of the pipeline observing -- useless if it needed
+    # a restart.
+    'consolidation_auto.max_auto_per_cycle',
+    'consolidation_auto.max_gate_filings_per_cycle',
+    # Ranking + re-proposal tuning, calibrated against what the supervised
+    # cycle actually produces (PRD Section 12 Q2), so they must move on a
+    # running server or the calibration loop is a redeploy loop.
+    'consolidation_auto.backlog_multiplier',
+    'consolidation_auto.refusal_streak_threshold',
+    'consolidation_auto.slug_collision_jaccard',
+    'consolidation_auto.proposal_ttl_hours',
+    # ATOMICITY NOTE for the two containers above and below: _iter_leaves
+    # yields `enabled_projects` (list) and `category_weights` (dict) WHOLE,
+    # never descending into them -- the same treatment as
+    # reconciliation.procedural_knowledge_topic_guard_clusters and
+    # write_triage.t_high_by_category. Each therefore reloads all-or-nothing,
+    # which is why a partially-applied ranking map can never gate a cycle.
+    'consolidation_auto.category_weights',
 })
 
 

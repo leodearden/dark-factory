@@ -29,7 +29,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from dashboard import app
+from dashboard.api import escalations
 from dashboard.data import merge_queue, orchestrator, tasks
 
 _DATA_JS = Path(tasks.__file__).parent.parent / 'static' / 'redux' / 'data.js'
@@ -108,7 +108,7 @@ def test_fetch_tasks_whole_operation_budget_is_structurally_deliverable():
         ('orchestrator._ORCHESTRATORS_PER_ROOT_BUDGET',
          orchestrator._ORCHESTRATORS_PER_ROOT_BUDGET),
         ('merge_queue._TASK_TITLES_BUDGET', merge_queue._TASK_TITLES_BUDGET),
-        ('app._TASK_CARDS_BUDGET', app._TASK_CARDS_BUDGET),
+        ('escalations._TASK_CARDS_BUDGET', escalations._TASK_CARDS_BUDGET),
     ):
         assert site_budget <= whole, (
             f'{label} ({site_budget}s) exceeds the shared '

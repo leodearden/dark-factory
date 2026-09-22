@@ -22,7 +22,6 @@ import asyncio
 import dataclasses
 import errno
 import hashlib
-import importlib.util
 import json
 import os
 import random
@@ -34,7 +33,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _fm_helpers import falkor_skipif
+from _fm_helpers import falkor_skipif, load_script_module
 from shared.testing_streams import (
     StdoutWithAFailingFlush,
     StdoutWithAFailingWrite,
@@ -46,30 +45,7 @@ SCRIPT_PATH = (
 )
 
 
-def _load_module() -> types.ModuleType:
-    """Load build_corpus.py from its file path.
-
-    The module is registered in sys.modules under its name BEFORE
-    ``exec_module`` so that ``@dataclass`` and other reflection-based
-    decorators work correctly (they call ``sys.modules.get(cls.__module__)``),
-    and build_corpus.py defines frozen dataclasses. See the note at
-    test_memory_eval_retrieval_probe.py's copy of this helper.
-    """
-    mod_name = 'lme_build_corpus'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='lme_build_corpus')
 
 
 # ===========================================================================
