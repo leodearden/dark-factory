@@ -42,6 +42,8 @@ cd /home/leo/src/dark-factory && uv run --project shared python scripts/legibili
 
 The run mines, verifies, synthesizes, updates the codebook, and files remediation tasks unattended — it can take a while (saturation mining runs until novelty drops below the configured duplicate-rate threshold for several consecutive batches). Watch the terminal for the final `census: done -- report=... filed_tasks=N stop_reason=...` line, or `census: deferred -- <reason>` if the headroom preflight declined to start.
 
+The done line gains a trailing **`unresolved_verdicts=N`** when — and only when — N is non-zero. It means N verify verdicts this run *paid for* found no `pending` candidate to apply to, because a prior adjudication of the same title is standing and the merger correctly declined to fabricate a pending twin over it. Nothing is lost and the run is not a failure, but nothing changes on its own either: re-open those titles by hand (the run's log names them, one warning per title) or the same verify spend repeats every census.
+
 ### Operator cost-control flags
 
 Three composable flags bound what one run may spend. Each is optional and defaults to today's unbounded behavior, so omitting them all is exactly the command above.

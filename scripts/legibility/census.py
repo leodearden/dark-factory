@@ -1772,6 +1772,22 @@ class CensusOutcome:
     preflight defer spent nothing, a verify defer sank the mining cost.
     Neither persisted anything, so both recover by re-running."""
 
+    verified_clusters: int = 0
+    """How many novel clusters a ``"verify"`` deferral had already seen come
+    back VERIFIED when the gate hit -- adjudication paid for, not an absence.
+
+    This count, ``rejected_clusters`` and ``unverified_clusters`` always sum
+    to the clusters the run offered (the invariant
+    ``CensusHeadroomExhausted`` carries and ``_defer`` renders as a total).
+    All three are FIELDS for the reason ``unresolved_verdicts`` below is one:
+    so a caller can assert what the operator is being asked to trust
+    structurally, instead of grepping digits out of the escalation prose."""
+
+    rejected_clusters: int = 0
+    """How many novel clusters a ``"verify"`` deferral had already seen come
+    back REJECTED when the gate hit. See ``verified_clusters`` for the
+    invariant the three counts satisfy together."""
+
     unverified_clusters: int = 0
     """How many novel clusters were left unadjudicated by a ``"verify"``
     deferral -- the hitting cluster plus every one never attempted.
@@ -1882,6 +1898,8 @@ def _defer(
         status="deferred",
         reason=reason,
         deferred_stage=stage,
+        verified_clusters=verified,
+        rejected_clusters=rejected,
         unverified_clusters=unverified,
     )
 

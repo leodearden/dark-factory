@@ -5943,6 +5943,16 @@ def test_run_census_defer_message_accounts_for_the_whole_run(tmp_path):
     outcome = mod.run_census(**kwargs)
 
     assert outcome.status == "deferred"
+
+    # Structurally first: all three counts are FIELDS, so what the operator is
+    # asked to trust is assertable without grepping digits out of prose.
+    counts = (
+        outcome.verified_clusters,
+        outcome.rejected_clusters,
+        outcome.unverified_clusters,
+    )
+    assert counts == (1, 1, 3)
+
     blob = _defer_blob(fake_escalate_fn)
 
     # The legacy pin, kept intact rather than re-spelled — see the design
@@ -5950,15 +5960,18 @@ def test_run_census_defer_message_accounts_for_the_whole_run(tmp_path):
     # asserts this exact substring and must not silently rot.
     assert "1 cluster(s) verified" in blob
 
-    assert "1" in blob and "rejected" in blob.lower(), (
+    # The rendered CLAUSE, not incidental digits: a bare `"3" in blob` passes
+    # on any stray digit anywhere in the reason, summary or recovery prose.
+    assert "1 were verified before the cap" in blob
+    assert "1 were rejected before it" in blob, (
         f"the REJECTED count must be named — it is work already spent; got {blob!r}"
     )
-    assert "3" in blob, "the unverified count"
-    assert "5" in blob, "and the TOTAL offered, so the three counts account for the run"
+    assert "3 were NOT verified" in blob
 
-    # The three counts must actually sum to the stated total, not merely
-    # co-occur: pin the arithmetic the operator is being asked to trust.
-    assert (1 + 1 + 3) == 5
+    # And the stated total is the SUM of those three, not an independent
+    # fourth number: this is the arithmetic the operator is asked to trust.
+    assert f"Of {sum(counts)} novel cluster(s) offered" in blob
+    assert "of 5 offered" in blob, "the summary line carries the total too"
 
     # The sunk-work phrasing an operator needs to size what completed.
     assert "sunk" in blob.lower(), f"the message must say the spend is sunk; got {blob!r}"
