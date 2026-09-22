@@ -164,9 +164,34 @@ def emit_referent_repair_storm_escalation(
     # because a filer that dedupes against an anchor somebody else keeps open
     # goes permanently silent and that silence reads exactly like health.
     #
+    def _announce_fold(existing: Any) -> None:
+        """Re-emit the merge-base fold line: WARNING, on THIS module's logger.
+
+        The fold is a SUPPRESSION, and while a project is storming it is the
+        only ongoing evidence the regression is still firing — at the helper's
+        INFO default that evidence vanishes from a default-threshold log, and
+        an operator sees one old escalation and no sign of the storm behind it.
+        """
+        logger.warning(
+            'referent_repair_storm: %s already open for project_id=%r '
+            '(streak now %d, %d repair(s) this episode); folding into it '
+            'rather than filing a duplicate',
+            existing.id, project_id, streak, repairs,
+        )
+
     # The fold itself is why the anchor is per-project rather than per-episode:
     # once a project is storming, EVERY subsequent episode breaches the
     # threshold again, and filing per breach would bury the operator queue.
+    #
+    # THIS FILER IS DELIBERATELY LOUDER THAN ITS SIX SIBLINGS, on both quiet
+    # arms: `no_escalation_level` raises the missing-optional-package arm, and
+    # `_announce_fold` raises the fold arm. A repair storm is a sustained
+    # scanner/resolver regression against a measured ~0.22% base rate, not a
+    # routine event, so neither "the alarm could not be filed" nor "the alarm
+    # is still firing" may sit below an operator's default threshold. Do NOT
+    # "simplify" these two arguments away to match the siblings — that is
+    # exactly the flattening this restores (merge-base 6f9cddb0bb, :131 and
+    # :172), and its only symptom is absence of output.
     return file_folded_escalation(
         project_root,
         anchor_task_id=_ANCHOR_TASK_ID,
@@ -194,4 +219,6 @@ def emit_referent_repair_storm_escalation(
             f'{repairs} repair(s) this episode; repairs continue'
         ),
         level=1,
+        no_escalation_level=logging.WARNING,
+        on_fold=_announce_fold,
     )
