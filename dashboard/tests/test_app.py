@@ -283,6 +283,27 @@ def test_tasks_default_render_issues_no_terminal_fetch(client):
         )
 
 
+def _render_through_the_real_collector(client, canned):
+    """GET /api/v2/dashboard/tasks with only ``mcp_tool_call`` canned, on a cold unit.
+
+    Everything above the substrate is real: the handler, the collector,
+    ``acquire_snapshot`` and its cache. The unit cache starts EMPTY because a
+    cache miss is the render that measures during the request, which is the
+    render production serves every 15 s.
+    """
+    import dashboard.data.task_snapshot as snapshot_mod
+    import dashboard.data.tasks as tasks_mod
+
+    snapshot_mod._snapshot_cache_clear()
+    tasks_mod._fetch_tasks_cache_clear()
+    try:
+        with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+            return client.get('/api/v2/dashboard/tasks')
+    finally:
+        snapshot_mod._snapshot_cache_clear()
+        tasks_mod._fetch_tasks_cache_clear()
+
+
 def test_a_healthy_root_is_fresh_when_the_real_collector_measures_it(client, caplog):
     """``served_at`` must be the instant the COLLECTOR stamps, not merely the one it is checked against.
 
@@ -311,9 +332,6 @@ def test_a_healthy_root_is_fresh_when_the_real_collector_measures_it(client, cap
 
     from test_task_snapshot import CannedMCP, _raw_row
 
-    import dashboard.data.task_snapshot as snapshot_mod
-    import dashboard.data.tasks as tasks_mod
-
     label = client.app.state.config.project_root.name
     pairs = ((1, 'in-progress'), (2, 'pending'), (3, 'done'))
     canned = CannedMCP(
@@ -321,18 +339,8 @@ def test_a_healthy_root_is_fresh_when_the_real_collector_measures_it(client, cap
         status_map=dict(pairs),
         status_page_size=2000,
     )
-    # A cache MISS is the render that stamps as_of during the request, and the
-    # only one on which the ordering can go wrong.
-    snapshot_mod._snapshot_cache_clear()
-    tasks_mod._fetch_tasks_cache_clear()
-    try:
-        with caplog.at_level(logging.WARNING), patch(
-            'dashboard.data.tasks.mcp_tool_call', new=canned,
-        ):
-            resp = client.get('/api/v2/dashboard/tasks')
-    finally:
-        snapshot_mod._snapshot_cache_clear()
-        tasks_mod._fetch_tasks_cache_clear()
+    with caplog.at_level(logging.WARNING):
+        resp = _render_through_the_real_collector(client, canned)
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -358,6 +366,57 @@ def test_a_healthy_root_is_fresh_when_the_real_collector_measures_it(client, cap
         if 'this is a BUG, not an outage' in record.getMessage()
     ]
     assert broken == []
+
+
+_TASK_ROW_KEYS = frozenset({
+    'id', 'project', 'title', 'description', 'details', 'status', 'agent',
+    'loops', 'attempts', 'lane', 'phase', 'lane_state', 'runtime_offline',
+    'runtime_status', 'claimant_run_id', 'heartbeat_at', 'stranded',
+    'meta_files', 'train', 'external_deps', 'prd', 'started', 'deps',
+})
+"""One active ``TaskRow``'s keys: ``_build_task_row``'s plus ``started`` and ``deps``.
+
+A literal rather than a derivation, so that adding a field to the wire is a
+deliberate edit here.
+"""
+
+_RAW_ONLY_KEYS = frozenset({'priority', 'dependencies', 'metadata', 'updated_at'})
+"""The raw ``_shape_task`` fields the shaper narrows away, ``metadata`` the heaviest."""
+
+
+def test_the_snapshot_rows_on_the_wire_are_the_shaped_task_rows(client):
+    """``TASKS_SNAPSHOT[p].rows`` carries the rows ``ACTIVE_TASKS`` carries, not raw MCP rows.
+
+    ``Datum.to_wire()`` renders ``value`` verbatim. So the unit's RAW rows used
+    to ship beside the shaped ones: every active row twice per render, the
+    second copy with the whole ``metadata`` blob, on the endpoint this leaf
+    exists to shrink. That also broke the PRD's declared
+    ``Datum[list[TaskRow]]``. With one configured root, ``ACTIVE_TASKS`` is
+    exactly that root's rows, so the two exposures must be equal.
+    """
+    from test_task_snapshot import CannedMCP, _raw_row
+
+    label = client.app.state.config.project_root.name
+    pairs = ((1, 'in-progress'), (2, 'pending'), (3, 'blocked'))
+    canned = CannedMCP(
+        rows=[
+            _raw_row(task_id, status, metadata={'files': ['a.py'], 'prd': 'plans/x.md'})
+            for task_id, status in pairs
+        ],
+        status_map=dict(pairs),
+        status_page_size=2000,
+    )
+
+    resp = _render_through_the_real_collector(client, canned)
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    wire_rows = body['TASKS_SNAPSHOT'][label]['rows']['value']
+    assert len(wire_rows) == len(pairs)
+    for row in wire_rows:
+        assert set(row) == _TASK_ROW_KEYS, sorted(set(row) ^ _TASK_ROW_KEYS)
+        assert not set(row) & _RAW_ONLY_KEYS
+    assert body['ACTIVE_TASKS'] == wire_rows
 
 
 def test_tasks_surfaces_offline_marker_when_mcp_unreachable(client):

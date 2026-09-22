@@ -8,6 +8,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import httpx
 import pytest
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 from shared.task_statuses import ACTIVE, TaskStatus
@@ -2084,6 +2085,168 @@ class TestDepsOutsideTheFetchedRows:
 
         assert deps[7]['done'] is False, 'a blocked dep must never render as done'
         assert deps[7]['title'] == ''
+
+
+# ---------------------------------------------------------------------------
+# The unit's wire rows are the shaped rows (task 5587 step-19)
+# ---------------------------------------------------------------------------
+
+
+class TestTheReturnedUnitsCarryTheShapedRows:
+    """``snapshots[label].rows.value`` is the row list ``ACTIVE_TASKS`` is joined from.
+
+    The CACHED unit holds the raw MCP rows, because the next render shapes
+    from them. The unit the collector RETURNS must carry the shaped rows, in
+    the same ``TaskRow`` shape as ``ACTIVE_TASKS``, because that is what goes
+    on the wire. These tests pin that the two exposures cannot disagree, and
+    that putting shaped rows on the wire does not use up the raw rows in the
+    cache.
+
+    Every read goes through ``dashboard.data.tasks.mcp_tool_call``, so the real
+    ``acquire_snapshot`` and its cache run underneath.
+    """
+
+    @staticmethod
+    def _roots(tmp_path, *names):
+        roots = [tmp_path / name for name in names]
+        for root in roots:
+            root.mkdir()
+        return roots
+
+    @staticmethod
+    def _tree():
+        rows = [_raw_row(1, 'in-progress'), _raw_row(2, 'pending'), _raw_row(3, 'blocked')]
+        return rows, {int(row['id']): row['status'] for row in rows}
+
+    async def test_active_tasks_is_the_units_rows_joined_in_root_order(
+        self, tmp_path, monkeypatch, dummy_client,
+    ):
+        """ACTIVE_TASKS is every root's ``rows.value``, concatenated in canonical root order.
+
+        Then the two exposures cannot disagree, and γ3 can retire
+        ``ACTIVE_TASKS`` by deleting it.
+        """
+        df, reify = self._roots(tmp_path, 'df', 'reify')
+        mcp, _calls = _canned_mcp(*self._tree())
+        monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', mcp)
+        config = DashboardConfig(project_root=df, known_project_roots=[reify])
+
+        active, snapshots = await collect_tasks_with_counts(dummy_client, config)
+
+        joined = [row for label in ('df', 'reify') for row in snapshots[label].rows.value]
+        assert active == joined
+        assert [row['project'] for row in active] == ['df'] * 3 + ['reify'] * 3
+
+    async def test_the_external_dep_overwrite_shows_through_both_exposures(
+        self, tmp_path, monkeypatch, dummy_client,
+    ):
+        """The unit carries the SAME row objects, not a copy that would drift.
+
+        The batched external-dep tail overwrites ``entry['status']`` in place,
+        after the per-root walk. It reaches the wire through
+        ``TASKS_SNAPSHOT`` only if both exposures hold one set of dicts.
+        """
+        (root,) = self._roots(tmp_path, 'xdeps')
+        mcp, _calls = _canned_mcp(
+            [_raw_row(5, 'pending') | {'metadata': {'external_deps': ['dark_factory:13']}}],
+            {5: 'pending'},
+        )
+        monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', mcp)
+
+        async def _resolved(client, config, deps):
+            return {'dark_factory:13': 'done'}
+
+        monkeypatch.setattr('dashboard.data.active_tasks.fetch_external_statuses', _resolved)
+
+        active, snapshots = await collect_tasks_with_counts(
+            dummy_client, DashboardConfig(project_root=root), resolve_external=True,
+        )
+
+        (wire_row,) = snapshots['xdeps'].rows.value
+        assert wire_row is active[0]
+        assert wire_row['external_deps'] == [{'id': 'dark_factory:13', 'status': 'done'}]
+
+    async def test_an_unmeasured_root_keeps_no_value_rather_than_an_empty_list(
+        self, tmp_path, monkeypatch, dummy_client,
+    ):
+        """``value is None`` is how the envelope says "never measured".
+
+        ``[]`` would claim a measured zero and break the
+        ``unknown <=> value is None <=> as_of is None`` triad.
+        """
+        live, dead = self._roots(tmp_path, 'live', 'dead')
+        healthy, _calls = _canned_mcp(*self._tree())
+
+        async def _mcp(client, url, tool, args, **kwargs):
+            if args.get('project_root') == str(dead.resolve()):
+                raise httpx.ReadTimeout('canned read timeout')
+            return await healthy(client, url, tool, args, **kwargs)
+
+        monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', _mcp)
+        config = DashboardConfig(project_root=live, known_project_roots=[dead])
+
+        active, snapshots = await collect_tasks_with_counts(dummy_client, config)
+
+        assert snapshots['dead'].rows.state is DatumState.UNKNOWN
+        assert snapshots['dead'].rows.value is None
+        assert snapshots['live'].rows.value == active
+
+    async def test_the_cached_unit_keeps_the_raw_rows_the_next_render_shapes(
+        self, tmp_path, monkeypatch, dummy_client,
+    ):
+        """Putting shaped rows on the wire must not use up what the cache holds.
+
+        A second render inside the 15 s TTL is served from the cached unit and
+        shapes from its rows. Had the first render replaced them with shaped
+        rows, the second would find no integer ids and render an empty table.
+        """
+        from dashboard.data.task_snapshot import acquire_snapshot
+
+        (root,) = self._roots(tmp_path, 'df')
+        mcp, calls = _canned_mcp(*self._tree())
+        monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', mcp)
+        config = DashboardConfig(project_root=root)
+
+        first, _ = await collect_tasks_with_counts(dummy_client, config, now=_STUB_AS_OF)
+        reads = len(calls)
+        second, snapshots = await collect_tasks_with_counts(dummy_client, config, now=_STUB_AS_OF)
+        cached = await acquire_snapshot(dummy_client, config, config.project_root, now=_STUB_AS_OF)
+
+        assert len(calls) == reads, 'both later reads must be served from the cached unit'
+        assert second == first
+        assert snapshots['df'].rows.value == second
+        assert cached.rows.value is not None
+        assert all('metadata' in row for row in cached.rows.value), (
+            'the cached unit must still hold the RAW rows'
+        )
+
+    async def test_a_stale_rows_half_is_shaped_and_keeps_its_provenance(
+        self, tmp_path, monkeypatch, dummy_client,
+    ):
+        """Last-good raw rows served as STALE reach the wire shaped, still aged and explained."""
+        import dashboard.data.task_snapshot as snapshot_mod
+
+        (root,) = self._roots(tmp_path, 'df')
+        healthy, _calls = _canned_mcp(*self._tree())
+        monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', healthy)
+        config = DashboardConfig(project_root=root)
+        fresh, _ = await collect_tasks_with_counts(dummy_client, config, now=_STUB_AS_OF)
+
+        async def _rows_read_fails(client, url, tool, args, **kwargs):
+            if tool == 'get_tasks':
+                raise httpx.ReadTimeout('canned read timeout')
+            return await healthy(client, url, tool, args, **kwargs)
+
+        monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', _rows_read_fails)
+        monkeypatch.setattr(snapshot_mod, 'SNAPSHOT_TTL_SECONDS', 0.0)
+        later = _STUB_AS_OF + timedelta(seconds=20)
+        active, snapshots = await collect_tasks_with_counts(dummy_client, config, now=later)
+
+        rows = snapshots['df'].rows
+        assert rows.state is DatumState.STALE
+        assert rows.as_of == _STUB_AS_OF, 'a stale half keeps the instant it was measured'
+        assert 'ReadTimeout' in (rows.reason or ''), rows.reason
+        assert rows.value == active == fresh
 
 
 # ---------------------------------------------------------------------------

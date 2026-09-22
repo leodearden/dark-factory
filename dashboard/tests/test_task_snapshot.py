@@ -448,6 +448,27 @@ class TestAcquireSnapshotHappyPath:
         assert isinstance(rows_wire, dict)
         assert isinstance(rows_wire['value'], list)
 
+    async def test_the_unit_holds_the_raw_rows_the_shaper_reads(
+        self, project_root, dashboard_config, dummy_client
+    ):
+        """(f2) The unit's ``rows.value`` is raw material, not the wire's ``TaskRow`` list.
+
+        The unit is what the 15 s cache holds, and each render shapes its rows
+        again, so it keeps the raw integer ids, ``dependencies`` and
+        ``metadata`` that shaping reads. The wire gets the shaped rows because
+        ``collect_tasks_with_counts`` swaps them into the copy it returns. It
+        never shapes the cached unit itself.
+        """
+        rows, status_map = _tree()
+        canned = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
+        snapshot = await self._acquire(canned, dummy_client, dashboard_config, project_root,
+                                       now=NOW)
+
+        assert snapshot.rows.value is not None
+        for row in snapshot.rows.value:
+            assert isinstance(row['id'], int), row
+            assert {'dependencies', 'metadata'} <= set(row), sorted(row)
+
     async def test_one_unit_one_ttl_and_an_uncached_row_read(
         self, project_root, dashboard_config, dummy_client, monkeypatch
     ):
