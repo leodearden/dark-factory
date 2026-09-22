@@ -51,17 +51,19 @@ from __future__ import annotations
 
 import ast
 import textwrap
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 
 import pytest
 from silent_fallthrough_scan import ParsedFile
 from wildcard_mcp_scoping_scan import (
+    EXEMPT_NEUTRAL_CWD,
     EXEMPT_STRICT_MCP,
     NOT_EXEMPT,
     WildcardMcpScopingSite,
     find_wildcard_mcp_scoping_sites,
     is_violation,
+    records_worth_scanning,
 )
 
 _SYNTHETIC = 'synthetic/module.py'
@@ -285,6 +287,150 @@ class TestNonMatchingCallsAreNotSites:
         ''') == []
 
 
+
+class TestNeutralCwdExemption:
+    """The cwd exemption checks WHAT was assigned, not that an assignment exists.
+
+    Without these, step-5's one-hop resolution could decay into a blanket pass
+    — any local name, any attribute — and the whole-tree gate would stay green
+    the whole way down, because its tree is green either way.
+    """
+
+    def test_a_direct_neutral_cwd_call_is_compliant(self) -> None:
+        sites = _scan('''
+            def call_the_model():
+                return invoke_with_cap_retry(
+                    disallowed_tools=['*'],
+                    output_schema=SCHEMA,
+                    cwd=neutral_cli_cwd(),
+                )
+        ''')
+        assert len(sites) == 1, f'got {sites!r}'
+        assert sites[0].exemption == EXEMPT_NEUTRAL_CWD, f'got {sites[0]!r}'
+
+    def test_the_attribute_spelling_of_the_call_is_compliant(self) -> None:
+        """``neutral_cwd.neutral_cli_cwd()`` is the same call, module-qualified."""
+        sites = _scan('''
+            def call_the_model():
+                return invoke_with_cap_retry(
+                    disallowed_tools=['*'],
+                    output_schema=SCHEMA,
+                    cwd=neutral_cwd.neutral_cli_cwd(),
+                )
+        ''')
+        assert len(sites) == 1, f'got {sites!r}'
+        assert sites[0].exemption == EXEMPT_NEUTRAL_CWD, f'got {sites[0]!r}'
+
+    def test_a_local_name_assigned_from_the_call_is_compliant(self) -> None:
+        """The synthetic twin of all three real neutral-cwd sites.
+
+        Without this fixture, a refactor that dropped the local-name resolution
+        would red the whole-tree gate with no synthetic test explaining why.
+        """
+        sites = _scan('''
+            class Curator:
+                async def _call_llm(self, prompt):
+                    cwd = neutral_cli_cwd()
+                    return await invoke_with_cap_retry(
+                        prompt=prompt,
+                        disallowed_tools=['*'],
+                        output_schema=SCHEMA,
+                        cwd=cwd,
+                    )
+        ''')
+        assert len(sites) == 1, f'got {sites!r}'
+        assert sites[0].exemption == EXEMPT_NEUTRAL_CWD, f'got {sites[0]!r}'
+
+    def test_a_local_name_assigned_from_something_else_is_a_violation(self) -> None:
+        """The single most important negative case: it proves the resolution
+        checks WHAT was assigned, not merely that a local assignment exists.
+        """
+        sites = _scan('''
+            def call_the_model(self):
+                cwd = some_other_root()
+                return invoke_with_cap_retry(
+                    disallowed_tools=['*'],
+                    output_schema=SCHEMA,
+                    cwd=cwd,
+                )
+        ''')
+        assert len(sites) == 1, f'got {sites!r}'
+        assert is_violation(sites[0]), f'got {sites[0]!r}'
+
+    def test_an_attribute_cwd_is_a_violation(self) -> None:
+        """Function-local ONLY, pinned together with the attribute exclusion:
+        the enclosing function DOES bind a neutral cwd, to a different name and
+        never to this argument. A guard that accepted ``cwd=self._cwd`` would
+        accept any instance attribute whatsoever — the exact silent-exposure
+        shape this gate exists to catch.
+        """
+        sites = _scan('''
+            class Runner:
+                async def go(self):
+                    neutral = neutral_cli_cwd()
+                    return await invoke_with_cap_retry(
+                        disallowed_tools=['*'],
+                        output_schema=SCHEMA,
+                        cwd=self._cwd,
+                    )
+        ''')
+        assert len(sites) == 1, f'got {sites!r}'
+        assert is_violation(sites[0]), f'got {sites[0]!r}'
+
+    def test_a_neutral_binding_of_a_different_name_is_a_violation(self) -> None:
+        """The bound name must actually be the one passed."""
+        sites = _scan('''
+            def call_the_model(cwd_param):
+                other = neutral_cli_cwd()
+                return invoke_with_cap_retry(
+                    disallowed_tools=['*'],
+                    output_schema=SCHEMA,
+                    cwd=cwd_param,
+                )
+        ''')
+        assert len(sites) == 1, f'got {sites!r}'
+        assert is_violation(sites[0]), f'got {sites[0]!r}'
+
+    def test_a_binding_in_an_enclosing_function_is_a_violation(self) -> None:
+        """No transitive chains and no enclosing-scope reads — deliberate, not
+        accidental. Resolution searches the NEAREST enclosing function's own
+        body; a closure over an outer binding does not carry the exemption in.
+        """
+        sites = _scan('''
+            def outer():
+                cwd = neutral_cli_cwd()
+
+                def inner():
+                    return invoke_with_cap_retry(
+                        disallowed_tools=['*'],
+                        output_schema=SCHEMA,
+                        cwd=cwd,
+                    )
+                return inner
+        ''')
+        assert len(sites) == 1, f'got {sites!r}'
+        assert is_violation(sites[0]), f'got {sites[0]!r}'
+
+    def test_both_protections_report_the_explicit_one(self) -> None:
+        """A doubly-protected call is compliant, and the precedence is PINNED
+        rather than incidental: the exemption named is the one the call STATES,
+        not the one it inherits from where it happens to run.
+        """
+        sites = _scan('''
+            def call_the_model():
+                cwd = neutral_cli_cwd()
+                return invoke_with_cap_retry(
+                    disallowed_tools=['*'],
+                    output_schema=SCHEMA,
+                    mcp_config=no_mcp_servers_config(),
+                    strict_mcp_config=True,
+                    cwd=cwd,
+                )
+        ''')
+        assert len(sites) == 1, f'got {sites!r}'
+        assert not is_violation(sites[0]), f'got {sites[0]!r}'
+        assert sites[0].exemption == EXEMPT_STRICT_MCP, f'got {sites[0]!r}'
+
 # --------------------------------------------------------------------------- #
 # The whole-tree gate
 # --------------------------------------------------------------------------- #
@@ -309,6 +455,21 @@ _KNOWN_SITES: frozenset[tuple[str, str]] = frozenset({
 })
 
 
+def _sites_in(records: Iterable[ParsedFile]) -> list[WildcardMcpScopingSite]:
+    """Scan *records*, skipping any whose parse failed.
+
+    A file that failed to parse carries ``tree is None`` and contributes
+    nothing; ``test_silent_fallthrough_gate.test_no_unparseable_files`` is what
+    reports those, so this gate does not duplicate the complaint.
+    """
+    sites: list[WildcardMcpScopingSite] = []
+    for record in records:
+        if record.tree is None:
+            continue
+        sites.extend(find_wildcard_mcp_scoping_sites(record.tree, record.relpath))
+    return sites
+
+
 @pytest.fixture(scope='session')
 def tree_sites(first_party_tree: Sequence[ParsedFile]) -> list[WildcardMcpScopingSite]:
     """Every matching call site in the first-party tree.
@@ -320,16 +481,9 @@ def tree_sites(first_party_tree: Sequence[ParsedFile]) -> list[WildcardMcpScopin
     while ``_scan`` above is still free to parse synthetic fixtures.
 
     The ASTs are shared with every other gate in this directory and are walked
-    READ-ONLY. A file that failed to parse carries ``tree is None`` and
-    contributes nothing; ``test_silent_fallthrough_gate.test_no_unparseable_files``
-    is what reports those, so this gate does not duplicate the complaint.
+    READ-ONLY.
     """
-    sites: list[WildcardMcpScopingSite] = []
-    for record in first_party_tree:
-        if record.tree is None:
-            continue
-        sites.extend(find_wildcard_mcp_scoping_sites(record.tree, record.relpath))
-    return sites
+    return _sites_in(first_party_tree)
 
 
 class TestWholeTreeGate:
@@ -421,6 +575,44 @@ class TestWholeTreeGate:
             f'  GONE (a load-bearing caller vanished, or the detector broke): '
             f'{sorted(_KNOWN_SITES - found) or "none"}\n'
             f'Repo root resolved to: {_REPO_ROOT}'
+        )
+
+
+class TestPrefilterParity:
+    """The source-substring prefilter drops files, and drops nothing that matters.
+
+    Walking all 524 parsed ASTs for Call nodes costs ~10x what walking only the
+    files whose source spells a target name costs, and ``shared/tests`` is the
+    FIRST segment of the repo test_command — so its runtime is charged to every
+    subsequent task. The filter is sound by construction (a call cannot appear
+    in a file whose source never spells the name), and these two tests are what
+    keep that claim honest rather than merely asserted.
+    """
+
+    def test_prefiltered_scan_equals_unfiltered_scan(
+        self, first_party_tree: Sequence[ParsedFile]
+    ) -> None:
+        assert sorted(_sites_in(records_worth_scanning(first_party_tree))) == sorted(
+            _sites_in(first_party_tree)
+        ), 'the prefilter changed the result; it is an optimisation, not a policy'
+
+    def test_the_prefilter_actually_drops_something(
+        self, first_party_tree: Sequence[ParsedFile]
+    ) -> None:
+        """A parity test alone passes vacuously if the filter keeps everything,
+        silently costing the ~10x it exists to buy. The floor below it is the
+        other direction: it cannot drop so much that the known sites vanish.
+        """
+        survivors = records_worth_scanning(first_party_tree)
+        assert len(survivors) < len(first_party_tree), (
+            f'the prefilter kept all {len(first_party_tree)} records — it is '
+            f'filtering on nothing, and the scan is paying full price'
+        )
+        assert len(survivors) >= len(_KNOWN_SITES), (
+            f'only {len(survivors)} record(s) survived the prefilter; the '
+            f'{len(_KNOWN_SITES)} known sites live in '
+            f'{len({relpath for relpath, _ in _KNOWN_SITES})} files, so every '
+            f'one of those must survive'
         )
 
 
