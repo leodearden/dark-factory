@@ -388,6 +388,51 @@ def _tag_spans(source: str, pattern: re.Pattern[str], site: str) -> list[str]:
     ]
 
 
+_SPAN_TOKEN_RE = re.compile(r'</span\s*>|<span(?=[\s/>])')
+
+
+def _hand_built_pip_spans(source: str, site: str) -> list[str]:
+    """Each hand-built ``className="pip"`` element, CHILDREN INCLUDED.
+
+    ``_tag_spans`` above stops at the opening tag's ``>``, which is the right
+    span for a prop assertion and the wrong one for a word: a pip renders its
+    word as a TEXT CHILD (``…></span>offline</span>``), so an opening tag never
+    contains it.  Searching the whole file for the word instead is what made the
+    assertion below vacuous — 'running' occurs four times in tabs.jsx and
+    'offline' nine, almost all of them outside any pip.
+
+    Nesting-aware because every pip wraps a ``<span>`` dot, and self-closing
+    aware because ``<span … />`` opens no depth.  RAISES on an unclosed element,
+    for ``_tag_end``'s reason: a probe over a runaway span means nothing.
+    """
+    spans = []
+    for match in _HAND_BUILT_PIP_RE.finditer(source):
+        start = source.rfind('<span', 0, match.start())
+        assert start != -1, (
+            f'{site}: a `className="pip"` with no opening <span> before it — the '
+            'walker cannot bound the element, so no assertion over it would mean '
+            'anything.'
+        )
+        depth = 0
+        index = start
+        while True:
+            token = _SPAN_TOKEN_RE.search(source, index)
+            assert token is not None, (
+                f'{site}: a hand-built pip element is never closed.'
+            )
+            if token.group().startswith('</'):
+                depth -= 1
+                index = token.end()
+                if depth == 0:
+                    spans.append(source[start:index])
+                    break
+            else:
+                index = _tag_end(source, token.end(), site)
+                if source[index - 2:index] != '/>':
+                    depth += 1
+    return spans
+
+
 @pytest.fixture(scope='module')
 def census_bodies(_client):
     """Comment-stripped served bodies for every file the census names.
@@ -495,17 +540,26 @@ def test_measured_pips_render_through_the_shared_component(census_bodies):
                 f'{name}: a <Pip> site hands over no `datum=`:\n{span}'
             )
 
-        remaining = _HAND_BUILT_PIP_RE.findall(body)
+        remaining = _hand_built_pip_spans(body, name)
         allowed = _HAND_BUILT_PIPS[name]
         assert len(remaining) == len(allowed), (
             f'{name} still hand-builds {len(remaining)} `className="pip"` span(s); '
             f'only {len(allowed)} may remain {allowed}. Every other pip renders a '
             'measured number and belongs in <Pip>.'
         )
+        # Inside the pip's OWN element, never anywhere in the file. The count
+        # above already catches a deletion; what this catches is a SWAP — one
+        # allowed flag replaced by a different hand-built pip, which leaves the
+        # count untouched. Searched file-wide it caught neither: 'running'
+        # occurs four times in tabs.jsx and 'offline' nine, almost all outside
+        # any pip, so both assertions passed whatever the markup said.
         for word in allowed:
-            assert word in body, (
-                f'{name} no longer renders the `{word}` status pip. It is a derived '
-                'FLAG, not a measurement — it must stay hand-built, not be deleted.'
+            holders = [span for span in remaining if word in span]
+            assert len(holders) == 1, (
+                f'{name} renders the `{word}` status pip in {len(holders)} of its '
+                f'{len(remaining)} hand-built pips, expected exactly 1. It is a '
+                'derived FLAG, not a measurement — it must stay hand-built, and '
+                f'it must stay:\n{remaining}'
             )
 
 
