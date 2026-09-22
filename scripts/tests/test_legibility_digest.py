@@ -2301,6 +2301,98 @@ class TestHarnessInjectedTurnFilter:
 
 
 # ---------------------------------------------------------------------------
+# is_coder_judgment_payload -- the re-ingestion content classifier's
+# machine-answer half (task 5685). A prior trickle-coder answer re-enters a
+# transcript as ONE carrier holding the coder's whole {"matches",
+# "candidates"} object (scripts/legibility/coder.py::build_prompt), and its
+# notes quote the digest being coded, so every signal literal they carry
+# used to fire as this session's own. The classifier PARSES the whole
+# carrier, bare or inside one outer ```json fence; it never substring-matches
+# or brace-slices, so prose that merely quotes the schema stays dialogue.
+# ---------------------------------------------------------------------------
+
+def _coder_judgment(note="that's wrong: the watcher re-armed on a stale lease"):
+    """A trickle-coder answer as it lands in a transcript: the whole
+    judgment on ONE line, shaped after session b203a05c record 22. *note*
+    rides inside a match, where a real coder quotes the digest it codes."""
+    return json.dumps({
+        'matches': [{
+            'entry_id': 'watcher-loop-harness-mismatch',
+            'origin_phase': 'unknown',
+            'manifested_phase': 'recon',
+            'invariant_violated': None,
+            'note': note,
+        }],
+        'candidates': [{
+            'title': 'Recon reaper closes a filed task with its escalation',
+            'cause': 'closure keys off escalation linkage, not task merit',
+            'area': 'recon',
+            'origin_phase': 'unknown',
+            'manifested_phase': 'recon',
+            'evidence_quote': 'Re-filing without an escalation_id.',
+        }],
+    })
+
+
+def _json_fenced(payload):
+    """*payload* inside one outer ```json fence, trailing newline included."""
+    return f'```json\n{payload}\n```\n'
+
+
+class TestCoderJudgmentPayloadClassifier:
+    @pytest.mark.parametrize(
+        'text',
+        [
+            _coder_judgment(),
+            '{"matches": [], "candidates": []}',
+            _json_fenced(_coder_judgment()),
+            f'\n\n  {_coder_judgment()}  \n\n',
+            json.dumps({'matches': [], 'candidates': [], 'rationale': 'nothing fits'}),
+        ],
+        ids=['bare', 'empty_judgment', 'json_fenced', 'surrounding_whitespace', 'extra_key'],
+    )
+    def test_whole_carrier_judgment_is_recognised(self, text):
+        assert mod.is_coder_judgment_payload(text) is True
+
+    def test_prose_quoting_the_schema_inline_is_not_a_payload(self):
+        # A genuine self-correction that merely MENTIONS the schema is this
+        # session's own dialogue and must never be suppressed.
+        text = (
+            'The coder answers with {"matches": [], "candidates": []} '
+            "— that's wrong, it should be a single object per session."
+        )
+
+        assert mod.is_coder_judgment_payload(text) is False
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            '{"matches": []}',
+            '{"candidates": []}',
+            '[{"matches": [], "candidates": []}]',
+            '{"results": [{"id": "ccf73ca4", "content": "Task 1470 wired /audit."}]}',
+            'not json at all',
+            '',
+        ],
+        ids=[
+            'matches_only', 'candidates_only', 'top_level_array',
+            'unrelated_object', 'non_json', 'empty',
+        ],
+    )
+    def test_anything_but_a_judgment_object_is_not_a_payload(self, text):
+        assert mod.is_coder_judgment_payload(text) is False
+
+    def test_pathologically_nested_object_answers_false_without_raising(self):
+        # json.loads raises RecursionError, which is not a ValueError, on
+        # this input under CPython 3.13. The predicate runs on every carrier
+        # of arbitrary transcripts, tool_results included, so it must
+        # answer rather than abort the whole digest.
+        text = '{"a":' * 200_000 + '1' + '}' * 200_000
+
+        assert mod.is_coder_judgment_payload(text) is False
+
+
+# ---------------------------------------------------------------------------
 # Run-review-prompt exclusion via is_harness_injected_turn -- R1 (confusion
 # census 2026-07-31 §1.1 facet (b), :81/:85): 5 sightings across 5 sessions
 # where the flagged "User Correction" is a full Reconciliation Run Review.
