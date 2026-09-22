@@ -49,6 +49,12 @@ port's method list suggests and a reader should not have to re-derive it:
 Imported by bare module name (``from _merge_lane_verifier_doubles import
 ...``), like ``_merge_lane_fakes`` -- ``orchestrator/tests/`` has no
 ``__init__.py``.
+
+This module imports no cluster module, so ``scripts/merge_lane_metrics.py``
+does not measure it and it holds no ratchet key -- which is exactly why lane
+internals must not be reached from here.  Moving a private read into an
+unmeasured shared helper does not reduce it, it hides it; keep every such read
+in the test file whose baseline key accounts for it.
 """
 from __future__ import annotations
 
