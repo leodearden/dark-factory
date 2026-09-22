@@ -50,11 +50,15 @@ from __future__ import annotations
 
 from _role_splice_contract import (
     MARKDOWN_HEADING,
+    SpliceContract,
     assert_brace_free,
     assert_nonempty,
 )
 
-from orchestrator.agents.roles import COMPOUND_COMMAND_REWRITE_GUIDANCE
+from orchestrator.agents.roles import (
+    COMPOUND_COMMAND_REWRITE_GUIDANCE,
+    GREP_LOOKAROUND_GUIDANCE,
+)
 
 
 def test_guidance_is_nonempty():
@@ -116,5 +120,165 @@ def test_guidance_has_no_literal_braces():
             'A literal brace raises at format time or mangles the rendered '
             'prompt at an interpolating splice site. Spell the example command '
             'without one.'
+        ),
+    )
+
+
+#: Roles holding UNQUALIFIED `Bash`, so a multi-line `python3 -c` script and
+#: the heredoc escape are both things they can actually run.
+#: Capability: `role.prompt_spec is None and 'Bash' in role.allowed_tools`.
+_BASH_CAPABLE_UNPINNED_ROLES = frozenset({
+    'architect',
+    'debugger',
+    'deep_reviewer',
+    'implementer',
+    'merger',
+    'simple_task',
+    'steward',
+})
+
+#: `judge` is deliberately absent: its grant is `Bash(git:*)`, so it can run
+#: neither `python3 -c` nor the heredoc escape, and the whole block is
+#: inapplicable there rather than merely needing a narrower recourse — which is
+#: why this constant has ONE variant where `GREP_LOOKAROUND_GUIDANCE` has two.
+#: `reviewer_comprehensive` is absent for a different reason: it is the sole
+#: `PromptSpec`-built role, whose pinned artifact can override the literal
+#: template at runtime, so a splice there could be silently dropped in exactly
+#: the sessions it protects. That is a DEFERRED COVERAGE GAP, not an exemption
+#: on the merits — the same reading
+#: `orchestrator/tests/test_roles_grep_lookaround.py::test_no_role_outside_the_set_carries_that_variant`
+#: already documents, and closing it means splicing into the frozen reviewer
+#: template and bumping `_REVIEWER_PROMPT_HARNESS_VERSION`.
+_CONTRACT = SpliceContract(
+    constant_name='COMPOUND_COMMAND_REWRITE_GUIDANCE',
+    constant=COMPOUND_COMMAND_REWRITE_GUIDANCE,
+    roles=_BASH_CAPABLE_UNPINNED_ROLES,
+    role_set_name='_BASH_CAPABLE_UNPINNED_ROLES',
+    capability=lambda role: role.prompt_spec is None and 'Bash' in role.allowed_tools,
+    capability_description='a literal system_prompt and unqualified `Bash`',
+)
+
+
+def test_role_set_matches_its_bash_capability():
+    """Drift tripwire: the hand-listed set still equals the derived one.
+
+    This is what makes the carrier set self-maintaining rather than a snapshot.
+    A role gaining or losing unqualified `Bash`, converting to a `PromptSpec`,
+    or a new role arriving, diverges the derived set from the hand-maintained
+    one and the failure names the set to edit.
+
+    Pinned against the CAPABILITY rather than against a sibling constant's
+    carriers. Coupling to a sibling would make this test report a defect
+    whenever that sibling's own set legitimately changed, and would go silently
+    vacuous if the sibling were ever removed; the capability is the thing that
+    actually decides who needs this block.
+
+    Pins the PREMISE (which roles can run the script forms this block talks
+    about), not the splice, so it passes regardless of whether the guidance has
+    been spliced anywhere yet.
+    """
+    _CONTRACT.assert_role_set_matches_capability(
+        remedy=(
+            "A role's `Bash` grant changed, a role was added, or a role became "
+            'PromptSpec-backed. Add or remove it in _BASH_CAPABLE_UNPINNED_ROLES '
+            'to match — a role that cannot run an unqualified `Bash` command '
+            'cannot use either the offending form or the escape, so the block is '
+            'dead weight there.'
+        ),
+    )
+
+
+def test_every_role_in_the_set_carries_the_guidance():
+    """Every role in the set embeds the guidance in its system_prompt."""
+    _CONTRACT.assert_every_role_carries(
+        remedy=(
+            'These roles compose compound `Bash` commands routinely and would '
+            'otherwise meet the rewrite by failure — reading an IndentationError '
+            'that accuses their own script, with nothing reporting that the '
+            'command was altered before it reached the shell.'
+        ),
+    )
+
+
+def test_no_role_outside_the_set_carries_the_guidance():
+    """The negative half: a role outside the set must NOT carry the guidance.
+
+    The two tests above catch a role gaining the capability and a covered role
+    losing the block. Neither catches a splice landing where the block does not
+    belong, which ships silently and is paid on every invocation of that role.
+    """
+    _CONTRACT.assert_no_other_role_carries(
+        remedy=(
+            '`judge` takes NO variant of this block: its grant is `Bash(git:*)`, '
+            'so it can run neither the multi-line `python3 -c` form the block '
+            'warns about nor the heredoc escape it prescribes — a splice there is '
+            'dead weight, not a fix, and the right response is to remove it '
+            'rather than to add `judge` to the set. `reviewer_comprehensive` is '
+            'out for the separate PromptSpec reason recorded above '
+            '_BASH_CAPABLE_UNPINNED_ROLES; closing that gap needs a '
+            '_REVIEWER_PROMPT_HARNESS_VERSION bump, not a splice.'
+        ),
+    )
+
+
+def test_guidance_appears_exactly_once_per_role():
+    """No duplicate splice — the guidance is carried once, and only once.
+
+    Scoped to catching a stale duplicate left beside a new one, NOT to
+    enforcing presence: that is
+    `test_every_role_in_the_set_carries_the_guidance`'s job.
+    """
+    # `absent_ok=True`: a role that has not yet received the splice then fails
+    # exactly ONE test for that one root cause — the containment one, whose job
+    # presence is — instead of two.
+    _CONTRACT.assert_spliced_exactly_once(
+        absent_ok=True,
+        remedy=(
+            'A stale duplicate splice was probably left beside a new one — '
+            'delete the extra copy.'
+        ),
+    )
+
+
+def test_placement_is_structural():
+    """The guidance lands immediately after `GREP_LOOKAROUND_GUIDANCE`.
+
+    An index comparison against a named constant — no literal text, no magic
+    number. The TAIL of the chain is the ONLY position available, not a
+    preference, because three upstream invariants pin everything ahead of it:
+
+    - `orchestrator/tests/test_roles_wait_pattern.py::test_combined_guidance_is_stated_up_front`
+      requires `BACKGROUND_WAIT_GUIDANCE`'s heading to remain the prompt's
+      FIRST `##` heading, within its char budget.
+    - `orchestrator/tests/test_roles_tool_call_rejection.py::test_guidance_placement_is_structural`
+      requires `TOOL_CALL_REJECTION_GUIDANCE`'s heading to be `judge`'s first
+      `##`.
+    - `orchestrator/tests/test_roles_grep_lookaround.py::test_variant_placement_is_structural`
+      requires the grep block to abut `ERROR_REMEDY_HINT_GUIDANCE`.
+
+    And one reason that is not a test at all: `_GREP_ENGINE_LIMITS`'s prose
+    draws its own discrimination by pointing at "the section just above", which
+    holds only while it abuts `ERROR_REMEDY_HINT_GUIDANCE`. Splicing this block
+    between them would leave every test above green while silently redirecting
+    that pointer at this block. Appending behind the grep block satisfies all
+    four with no per-role branching.
+
+    No `char_budget` is passed: that secondary bound belongs to the wait
+    block's own up-front invariant, not to a block spliced behind it.
+
+    The FOLLOWS arm is non-vacuous here because every role in the set carries
+    the predecessor, and a role where this block is absent entirely is recorded
+    as an offender rather than skipped — so this can never pass by default.
+    """
+    _CONTRACT.assert_placement(
+        follows=GREP_LOOKAROUND_GUIDANCE,
+        follows_name='GREP_LOOKAROUND_GUIDANCE',
+        remedy=(
+            'It cannot be moved ahead of the wait block, of '
+            'TOOL_CALL_REJECTION_GUIDANCE, or between ERROR_REMEDY_HINT_GUIDANCE '
+            'and the grep block to fix this — the first two are pinned as their '
+            "prompts' FIRST `##` heading, and the third abutment is both pinned "
+            'and depended on by _GREP_ENGINE_LIMITS\'s "the section just above". '
+            'Re-append it behind GREP_LOOKAROUND_GUIDANCE instead.'
         ),
     )
