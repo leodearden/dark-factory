@@ -1083,11 +1083,12 @@ def shape_scheduler(
     pin_queue: list,
     events_by_task: dict,
     offline_projects: list,
+    degraded_projects: list,
     paused_projects: list,
     recovery_events: dict,
     snapshot_at: str | None,
 ) -> dict:
-    """Return ``{SCHEDULER: {rows, modules, pin_queue, events_by_task, snapshot_at, offline, offline_projects, paused, paused_projects, recovery_events, recovery_event_counts}}``.
+    """Return ``{SCHEDULER: {rows, modules, pin_queue, events_by_task, snapshot_at, offline, offline_projects, degraded, degraded_projects, paused, paused_projects, recovery_events, recovery_event_counts}}``.
 
     Pure, I/O-free — mirrors ``shape_curator`` style.  Shallow-copies top-level
     containers only (``list(rows)``, ``dict(events_by_task)``); inner dicts and
@@ -1108,9 +1109,19 @@ def shape_scheduler(
       the point: zero and unknown must not collapse, or a dead orchestrator
       renders as a quiet one.
 
-    ``recovery_events`` is a required keyword: a new collector element must be
-    threaded through here deliberately, and until it is the mismatch is a loud
-    ``TypeError`` rather than a field that silently never reaches the UI.
+    ``degraded_projects`` is projected as its OWN pair —
+    ``degraded``/``degraded_projects``, spelled exactly like
+    ``offline``/``offline_projects`` and ``paused``/``paused_projects`` so the
+    UI reads one idiom — and is deliberately NOT an addition to
+    ``offline_projects``.  The two facts send an operator to different places:
+    offline means the read demonstrably FAILED (fused-memory is unreachable),
+    degraded means the whole-handler budget expired and the project's state is
+    simply UNKNOWN.  Merging them reads a healthy fused-memory as a dead one.
+
+    ``recovery_events`` and ``degraded_projects`` are required keywords: a new
+    collector element must be threaded through here deliberately, and until it
+    is the mismatch is a loud ``TypeError`` rather than a field that silently
+    never reaches the UI.
     """
     return {
         'SCHEDULER': {
@@ -1121,6 +1132,8 @@ def shape_scheduler(
             'snapshot_at': snapshot_at,
             'offline': bool(offline_projects),
             'offline_projects': list(offline_projects),
+            'degraded': bool(degraded_projects),
+            'degraded_projects': list(degraded_projects),
             'paused': bool(paused_projects),
             'paused_projects': list(paused_projects),
             'recovery_events': [

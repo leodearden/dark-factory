@@ -863,6 +863,7 @@ def test_shape_scheduler_envelope():
         pin_queue=pin_queue,
         events_by_task=events_by_task,
         offline_projects=['proj-a'],
+        degraded_projects=[],
         paused_projects=[paused_entry],
         recovery_events={},
         snapshot_at=snapshot_at,
@@ -872,6 +873,7 @@ def test_shape_scheduler_envelope():
     assert set(inner.keys()) == {
         'rows', 'modules', 'pin_queue', 'events_by_task',
         'snapshot_at', 'offline', 'offline_projects',
+        'degraded', 'degraded_projects',
         'paused', 'paused_projects',
         'recovery_events', 'recovery_event_counts',
     }
@@ -892,6 +894,7 @@ def test_shape_scheduler_envelope():
         pin_queue=pin_queue,
         events_by_task=events_by_task,
         offline_projects=[],
+        degraded_projects=[],
         paused_projects=[],
         recovery_events={},
         snapshot_at=snapshot_at,
@@ -973,6 +976,7 @@ def test_shape_scheduler_top_level_lists_are_shallow_copies():
         pin_queue=pin_queue,
         events_by_task=events_by_task,
         offline_projects=[],
+        degraded_projects=[],
         paused_projects=paused_projects,
         recovery_events={},
         snapshot_at=None,
@@ -3362,6 +3366,7 @@ def test_shape_scheduler_surfaces_recovery_events_and_counts():
         pin_queue=[],
         events_by_task={},
         offline_projects=['proj-down'],
+        degraded_projects=[],
         paused_projects=[],
         recovery_events=recovery_events,
         snapshot_at=None,
@@ -3381,7 +3386,8 @@ def test_shape_scheduler_surfaces_recovery_events_and_counts():
     # Empty input degrades cleanly — no error, no keys.
     empty = shape_scheduler(
         rows=[], modules=[], pin_queue=[], events_by_task={},
-        offline_projects=[], paused_projects=[], recovery_events={},
+        offline_projects=[], degraded_projects=[], paused_projects=[],
+        recovery_events={},
         snapshot_at=None,
     )['SCHEDULER']
     assert empty['recovery_events'] == []
