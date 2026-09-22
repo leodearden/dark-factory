@@ -693,6 +693,51 @@ class TestEveryMutatingScriptCallsTheGuard:
 
 
 # ---------------------------------------------------------------------------
+# GUARDED-column tripwire (task 4848)
+# ---------------------------------------------------------------------------
+#
+# The conformance test above enforces the RULE -- every mutating script calls
+# the guard -- and says nothing at all about the production module's GUARDED
+# column, which is a second, hand-written copy of the same ground truth. That
+# column has now drifted in two consecutive task cycles, the second time inside
+# the very commit that re-dated it and re-asserted "This column IS exhaustive".
+# A hand-checked list that advertises its own one-line re-derivation and that
+# nothing ever runs it against is a SPOT violation (heuristic 11); the pin
+# below is what makes its drift detectable rather than merely regrettable.
+#
+# This is a TRIPWIRE, not a generator. It cannot edit either home, and an
+# author who updates the constant below without touching the column still
+# ships a stale column -- it only makes forgetting loud.
+# ---------------------------------------------------------------------------
+
+
+class TestGuardedScriptCensus:
+    """The live set of guard-calling scripts must match the reviewed column.
+
+    Deliberately set-equality rather than a subset or a floor: a script that
+    STOPS calling the guard is as much a drift as one that starts, and the
+    column claims to be exhaustive in both directions.
+    """
+
+    def test_guarded_script_census_matches_the_reviewed_column(self):
+        actual = {path.name for path in GUARDED_SCRIPTS}
+        assert actual == EXPECTED_GUARDED_SCRIPTS, (
+            'The set of guard-calling scripts has drifted from the reviewed '
+            'GUARDED column.\n'
+            f'  unexpected additions: {sorted(actual - EXPECTED_GUARDED_SCRIPTS)}\n'
+            f'  missing entries:      {sorted(EXPECTED_GUARDED_SCRIPTS - actual)}\n'
+            'Update EXPECTED_GUARDED_SCRIPTS here AND the GUARDED column in '
+            'fused_memory/utils/store_mutation_preflight.py, re-deriving BOTH by '
+            "running `grep -rln 'assert_store_mutation_allowed(' "
+            "fused-memory/scripts/ --include='*.py' | sort` rather than adjusting "
+            'a count by inspection -- that is how this column drifted under tasks '
+            '4293 and 4848. Unlike EXPECTED_EXEMPT_SCRIPTS this list is expected '
+            'to GROW: a newly-guarded script is the good outcome, and growth is '
+            'fine as long as BOTH homes move together in the same edit.'
+        )
+
+
+# ---------------------------------------------------------------------------
 # PREFLIGHT_EXEMPT_SCRIPTS anti-rot suite (task 4280 / 4848)
 # ---------------------------------------------------------------------------
 #
