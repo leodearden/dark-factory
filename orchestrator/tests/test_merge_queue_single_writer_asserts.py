@@ -43,6 +43,12 @@ lane-buffer mutation call sites.
                 forced on, proving the steps 04/06 wiring never raises a
                 false-positive ``AssertionError`` against the production
                 coroutines.
+
+These real-git cases observe the lane through an injected ``VerifyPort``
+rather than a patch of ``run_scoped_verification``.  What that does and
+does NOT stub of the post-merge gate chain is stated once, with the
+measurement behind it, in ``_merge_lane_verifier_doubles.py``'s module
+docstring.
 """
 
 from __future__ import annotations

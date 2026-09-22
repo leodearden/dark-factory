@@ -13,6 +13,12 @@ mtimes advanced.  Never a throughput floor.
 Fakes/fixtures are reused from the sibling γ harness
 (test_merge_queue_concurrent_verify) via import — single source of truth, zero
 churn to the landed γ test file.
+
+These are real-git cases that observe the lane through an injected
+``VerifyPort`` (``FakeVerifier``/``ScriptedVerifier``) rather than a patch of
+``run_scoped_verification``.  What that does and does NOT stub of the
+post-merge gate chain is stated once, with the measurement behind it, in
+``_merge_lane_verifier_doubles.py``'s module docstring.
 """
 
 from __future__ import annotations
@@ -28,6 +34,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _merge_lane_fakes import FakeVerifier
+from _merge_lane_verifier_doubles import ScriptedVerifier
 from _orch_helpers import MERGE_RESULT_TIMEOUT, wait_responsive
 
 # Reuse the γ harness fakes/fixtures (established cross-test-module import pattern).
@@ -52,34 +59,6 @@ from orchestrator.verify_runner import RunnerUnavailable
 # ---------------------------------------------------------------------------
 # Local helpers
 # ---------------------------------------------------------------------------
-
-
-class _ScriptedVerifier(FakeVerifier):
-    """A ``VerifyPort`` whose scoped verify runs *impl*.
-
-    These tests script the local verify per CALL -- a gate that blocks the
-    first call and lets the rest through, a span recorder, a failure followed
-    by a pass -- which is what ``FakeVerifier``'s docstring sanctions a
-    ``run_scoped`` override for. ``_note_entry`` is called so ``verified`` and
-    ``entered_count`` stay truthful for the subclass too.
-    """
-
-    def __init__(self, impl: Any) -> None:
-        super().__init__()
-        self._impl = impl
-
-    async def run_scoped(  # type: ignore[override]
-        self,
-        worktree: Path,
-        config: Any,
-        module_configs: list[Any],
-        task_files: list[str] | None = None,
-        **options: Any,
-    ) -> Any:
-        self._note_entry(options.get('task_id'))
-        return await self._impl(
-            worktree, config, module_configs, task_files, **options,
-        )
 
 
 class _Span(NamedTuple):
@@ -120,7 +99,11 @@ def _make_spanning_local_verify(
     name: str = 'local',
     passed: bool = True,
 ) -> Any:
-    """Return an async coroutine to patch run_scoped_verification with span recording."""
+    """Return the per-call impl for ``ScriptedVerifier``.
+
+    Records a verify span and gates on *gate_release*; the lane reaches it
+    through the injected ``VerifyPort``, not through a patch.
+    """
 
     async def _impl(*args: Any, **kwargs: Any) -> MagicMock:
         t0 = time.monotonic()
@@ -264,7 +247,7 @@ class TestB1OverlapOrderedAdvance:
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(
             git_ops, q, on_merge_landed=_on_landed,
-            verifier=_ScriptedVerifier(local_verify),
+            verifier=ScriptedVerifier(local_verify),
         )
         _inject_two_host_allocator(worker, spanning_remote)
 
@@ -376,7 +359,7 @@ class TestB2ChainInvalidationUnderOverlap:
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(
-            git_ops, q, verifier=_ScriptedVerifier(_gated_local),
+            git_ops, q, verifier=ScriptedVerifier(_gated_local),
         )
         _inject_two_host_allocator(worker, gated_remote)
 
@@ -432,7 +415,7 @@ class TestB2ChainInvalidationUnderOverlap:
             f'got {gated_remote.cancel_verify.call_count}'
         )
 
-        # (4) N+1 resolved done
+        # (3) N+1 resolved done
         assert outcome_b is not None and outcome_b.status == 'done', (
             f'Expected N+1 to resolve "done" after re-merge, got {outcome_b!r}'
         )
@@ -443,7 +426,7 @@ class TestB2ChainInvalidationUnderOverlap:
             ['git', 'ls-tree', '-r', '--name-only', 'main'],
             cwd=git_ops.project_root,
         )
-        # (3) N+1 was re-merged onto ACTUAL main. This pair of git-state
+        # (4) N+1 was re-merged onto ACTUAL main. This pair of git-state
         # assertions is the observable form of that claim and replaces a spy on
         # _remerge: b2-b was speculatively merged on top of b2-a's merge commit,
         # so b2_b.py can only be on main WITHOUT b2_a.py if the chain was
@@ -499,7 +482,7 @@ class TestB3HostDownMidOverlap:
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(
-            git_ops, q, verifier=_ScriptedVerifier(_gated_local),
+            git_ops, q, verifier=ScriptedVerifier(_gated_local),
         )
         _inject_two_host_allocator(worker, dead_remote)
 
@@ -611,7 +594,7 @@ class TestB4CancelBehavior:
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(
-            git_ops, q, verifier=_ScriptedVerifier(_gated_local),
+            git_ops, q, verifier=ScriptedVerifier(_gated_local),
         )
         allocator = _inject_two_host_allocator(worker, gated_remote)
         remote_name = gated_remote.name
@@ -715,7 +698,7 @@ class TestB4CancelBehavior:
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(
-            git_ops, q, verifier=_ScriptedVerifier(_gated_local),
+            git_ops, q, verifier=ScriptedVerifier(_gated_local),
         )
         allocator = _inject_two_host_allocator(worker, gated_remote)
         remote_name = gated_remote.name
@@ -838,7 +821,7 @@ class TestB5OperatorHalt:
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(
-            git_ops, q, verifier=_ScriptedVerifier(_gated_local),
+            git_ops, q, verifier=ScriptedVerifier(_gated_local),
         )
         _inject_two_host_allocator(worker, gated_remote)
         worker.VERIFY_ABANDON_POLL_SECS = 0.01  # fast abort-polls for determinism

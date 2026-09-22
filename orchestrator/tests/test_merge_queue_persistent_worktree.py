@@ -1,17 +1,21 @@
 """Tests for the persistent warm merge-verify worktree feature (task 1692).
 
 All tests in this file relate to PRD κ Phase 1 of reify warmer-builds-merge-verify.
+
+The routing tests are real-git and observe the lane through an injected
+``VerifyPort`` (``ScriptedVerifier``).  What that does and does NOT stub of
+the post-merge gate chain is stated once, with the measurement behind it, in
+``_merge_lane_verifier_doubles.py``'s module docstring.
 """
 
 from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _merge_lane_fakes import FakeVerifier
+from _merge_lane_verifier_doubles import ScriptedVerifier
 from _orch_helpers import make_placeholder_future
 
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -341,34 +345,6 @@ class TestAcquireWarmVerifyWorktree:
 # ---------------------------------------------------------------------------
 
 
-class _WorktreeRecordingVerifier(FakeVerifier):
-    """A passing ``VerifyPort`` that records which worktree each verify ran in.
-
-    Post-merge verify reaches the port through
-    ``verify_runner.py::LocalRunner``, which passes the merge worktree it was
-    built on as ``run_scoped``'s first positional argument -- so ``worktrees``
-    is the injected reading of the routing decision these tests are about.
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.worktrees: list[Path] = []
-
-    async def run_scoped(
-        self,
-        worktree: Path,
-        config: Any,
-        module_configs: list[Any],
-        task_files: list[str] | None = None,
-        **options: Any,
-    ):
-        self.worktrees.append(worktree)
-        return await super().run_scoped(
-            worktree, config, module_configs, task_files, **options,
-        )
-
-
-
 class TestPersistentWorktreeVerifyRouting:
     """Integration tests driving SpeculativeMergeWorker with real-git fixtures.
 
@@ -385,7 +361,7 @@ class TestPersistentWorktreeVerifyRouting:
         wt = await _make_branch_with_file(git_ops, 'warm-test', 'warm.py', 'x = 1\n')
         req = _make_merge_request('warm-test', 'warm-test', wt, cfg)
 
-        verifier = _WorktreeRecordingVerifier()
+        verifier = ScriptedVerifier()
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue, verifier=verifier)
@@ -425,7 +401,7 @@ class TestPersistentWorktreeVerifyRouting:
         wt = await _make_branch_with_file(git_ops, 'cold-test', 'cold.py', 'y = 2\n')
         req = _make_merge_request('cold-test', 'cold-test', wt, cfg)
 
-        verifier = _WorktreeRecordingVerifier()
+        verifier = ScriptedVerifier()
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue, verifier=verifier)
@@ -549,7 +525,7 @@ class TestSafetyValveIntegration:
         wt = await _make_branch_with_file(git_ops, 'valve-test', 'valve.py', 'z = 3\n')
         req = _make_merge_request('valve-test', 'valve-test', wt, cfg)
 
-        verifier = _WorktreeRecordingVerifier()
+        verifier = ScriptedVerifier()
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue, verifier=verifier)

@@ -15,6 +15,12 @@ Steps covered:
   step-8  GREEN — route finalize-head handler through the chokepoint
   step-9  RED  — CASCADE path fault injection + release idempotency
   step-10 GREEN — route cascade handler through the chokepoint
+
+These real-git cases observe the lane through an injected ``VerifyPort``
+rather than a patch of ``run_scoped_verification``.  What that does and
+does NOT stub of the post-merge gate chain is stated once, with the
+measurement behind it, in ``_merge_lane_verifier_doubles.py``'s module
+docstring.
 """
 
 from __future__ import annotations
@@ -26,7 +32,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _merge_lane_fakes import FakeVerifier
+from _merge_lane_verifier_doubles import ScriptedVerifier
 from _orch_helpers import MERGE_RESULT_TIMEOUT
 
 # Reuse the γ harness two-host fakes (established cross-test-module import
@@ -107,33 +113,6 @@ async def _make_branch_with_file(
     (worktree / filename).write_text(content)
     await git_ops.commit(worktree, f'Add {filename}')
     return worktree
-
-
-class _ScriptedVerifier(FakeVerifier):
-    """A ``VerifyPort`` whose scoped verify runs *impl*.
-
-    The cascade tests below script the local verify per CALL -- a gate that
-    blocks and then fails, later calls passing -- which is what
-    ``FakeVerifier``'s docstring sanctions a ``run_scoped`` override for.
-    ``_note_entry`` is called so ``verified``/``entered_count`` stay truthful.
-    """
-
-    def __init__(self, impl: Any) -> None:
-        super().__init__()
-        self._impl = impl
-
-    async def run_scoped(  # type: ignore[override]
-        self,
-        worktree: Path,
-        config: Any,
-        module_configs: list[Any],
-        task_files: list[str] | None = None,
-        **options: Any,
-    ) -> Any:
-        self._note_entry(options.get('task_id'))
-        return await self._impl(
-            worktree, config, module_configs, task_files, **options,
-        )
 
 
 def _make_request(
@@ -944,7 +923,7 @@ class TestCascadeErrorChokepoint:
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(
-            git_ops, q, verifier=_ScriptedVerifier(_gated_local),
+            git_ops, q, verifier=ScriptedVerifier(_gated_local),
         )
         _inject_two_host_allocator(worker, gated_remote)
         calls = _spy_on_resolve_and_release(worker)
@@ -1160,7 +1139,7 @@ class TestCascadeErrorChokepoint:
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(
-            git_ops, q, verifier=_ScriptedVerifier(_gated_local),
+            git_ops, q, verifier=ScriptedVerifier(_gated_local),
         )
         _inject_two_host_allocator(worker, gated_remote)
         calls = _spy_on_resolve_and_release(worker)
@@ -1334,7 +1313,7 @@ class TestCascadeErrorChokepoint:
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(
-            git_ops, q, verifier=_ScriptedVerifier(_gated_local),
+            git_ops, q, verifier=ScriptedVerifier(_gated_local),
         )
         allocator = _inject_two_host_allocator(worker, gated_remote)
         calls = _spy_on_resolve_and_release(worker)
@@ -1501,7 +1480,7 @@ class TestCascadeErrorChokepoint:
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(
-            git_ops, q, verifier=_ScriptedVerifier(_gated_local),
+            git_ops, q, verifier=ScriptedVerifier(_gated_local),
         )
         _inject_two_host_allocator(worker, gated_remote)
         worker.VERIFY_ABANDON_POLL_SECS = 0.01  # fast abort-poll for determinism

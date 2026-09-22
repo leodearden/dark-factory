@@ -8,6 +8,12 @@ born-at-L2 terminal escalation and halts the worker via _loops_finished.
 Fixture mirrors: test_merge_queue_restart_hook.py (git_repo/git_config/git_ops/config).
 MagicMock escalation_queue: mirrors TestRunDriftCheck._make_fake_escalation_queue in
 test_merge_queue_multihost_wiring.py.
+
+These real-git cases observe the lane through an injected ``VerifyPort``
+rather than a patch of ``run_scoped_verification``.  What that does and
+does NOT stub of the post-merge gate chain is stated once, with the
+measurement behind it, in ``_merge_lane_verifier_doubles.py``'s module
+docstring.
 """
 
 from __future__ import annotations
