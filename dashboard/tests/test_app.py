@@ -283,6 +283,83 @@ def test_tasks_default_render_issues_no_terminal_fetch(client):
         )
 
 
+def test_a_healthy_root_is_fresh_when_the_real_collector_measures_it(client, caplog):
+    """``served_at`` must be the instant the COLLECTOR stamps, not merely the one it is checked against.
+
+    Drives the REAL ``collect_tasks_with_counts``: only
+    ``dashboard.data.tasks.mcp_tool_call`` is replaced, by the paging-aware
+    ``CannedMCP``, so every ``Datum`` on this payload is measured DURING the
+    request, the way production measures it. The root list is the app's own
+    configured one, which is what the collector fans out over. Patching only
+    the handler's root enumerator would give the handler and the collector two
+    different populations.
+
+    WHY THE REST OF THIS FILE CANNOT CATCH THIS. ``_snapshot`` stamps ``as_of``
+    at ``datetime.now(UTC)`` BEFORE the request, so every fixture datum is a
+    little OLDER than the handler's ``served_at``. That inverts production's
+    ordering. In production the handler resolved ``served_at``, and the
+    collector then read the clock again and stamped every fresh half
+    microseconds AFTER it. ``validate_datum`` refuses a negative age, so
+    ``_validated`` routed every project to ``unknown`` on every cache-miss
+    render, and 350 green dashboard tests sat over that handler.
+    ``dashboard/src/dashboard/data/scheduler.py::collect_scheduler_state`` and
+    ``collect_active_tasks`` already forward ``now``; ``api_tasks`` was the only
+    call site that did not.
+    """
+    import logging
+    from datetime import datetime
+
+    from test_task_snapshot import CannedMCP, _raw_row
+
+    import dashboard.data.task_snapshot as snapshot_mod
+    import dashboard.data.tasks as tasks_mod
+
+    label = client.app.state.config.project_root.name
+    pairs = ((1, 'in-progress'), (2, 'pending'), (3, 'done'))
+    canned = CannedMCP(
+        rows=[_raw_row(task_id, status) for task_id, status in pairs],
+        status_map=dict(pairs),
+        status_page_size=2000,
+    )
+    # A cache MISS is the render that stamps as_of during the request, and the
+    # only one on which the ordering can go wrong.
+    snapshot_mod._snapshot_cache_clear()
+    tasks_mod._fetch_tasks_cache_clear()
+    try:
+        with caplog.at_level(logging.WARNING), patch(
+            'dashboard.data.tasks.mcp_tool_call', new=canned,
+        ):
+            resp = client.get('/api/v2/dashboard/tasks')
+    finally:
+        snapshot_mod._snapshot_cache_clear()
+        tasks_mod._fetch_tasks_cache_clear()
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    entry = body['TASKS_SNAPSHOT'][label]
+    # (a) Both halves were measured, and the payload says so.
+    assert entry['census']['state'] == 'fresh', entry['census']
+    assert entry['rows']['state'] == 'fresh', entry['rows']
+    # (b) A healthy tree is named in no banner.
+    assert body['TASKS_COUNT_UNKNOWN_PROJECTS'] == []
+    assert body['TASKS_OFFLINE_PROJECTS'] == []
+    # (c) Nothing on the payload claims to have been measured after it was served.
+    served_at = datetime.fromisoformat(body['served_at'])
+    for project, wire in body['TASKS_SNAPSHOT'].items():
+        for half in ('census', 'rows'):
+            as_of = wire[half]['as_of']
+            assert as_of is not None, f'{project}.{half} was never measured: {wire[half]}'
+            assert datetime.fromisoformat(as_of) <= served_at, (
+                f'{project}.{half} claims as_of={as_of}, after served_at={body["served_at"]}'
+            )
+    # (d) The fallback that reports a contract break never fired.
+    broken = [
+        record.getMessage() for record in caplog.records
+        if 'this is a BUG, not an outage' in record.getMessage()
+    ]
+    assert broken == []
+
+
 def test_tasks_surfaces_offline_marker_when_mcp_unreachable(client):
     """When every root's read demonstrably failed, the payload sets ``offline=True``."""
     with patch(

@@ -497,6 +497,53 @@ async def test_collect_tasks_with_counts_started_uses_provided_now_across_projec
 
 
 @pytest.mark.asyncio
+async def test_collect_tasks_with_counts_stamps_every_snapshot_at_the_provided_now(
+    tmp_path, monkeypatch, dummy_client,
+):
+    """Every returned unit's two halves are stamped at exactly the caller's *now*.
+
+    The collector-side half of the ``served_at`` contract. ``api_tasks``
+    validates every datum against its own ``served_at``, and ``validate_datum``
+    refuses a negative age. So the handler's instant has to BE the instant the
+    producer stamps. This pins the threading here as well as through the
+    endpoint (``test_app.py``), because a fix confined to one call site would
+    leave the other free to regress.
+
+    Driven through the real ``acquire_snapshot`` over a canned
+    ``mcp_tool_call``, so the stamp is the one the unit really applies.
+    ``test_app.py::_snapshot`` cannot catch this: it stamps ``as_of`` at the
+    live clock BEFORE the request, which inverts production's ordering. That
+    inversion is how 350 green dashboard tests sat over a handler that routed
+    every project to ``unknown`` on every cache-miss render.
+    ``dashboard/src/dashboard/data/scheduler.py::collect_scheduler_state`` and
+    ``collect_active_tasks`` already forwarded ``now``; ``api_tasks`` was the
+    only call site that did not.
+    """
+    fixed = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+    df_root = tmp_path / 'df'
+    reify_root = tmp_path / 'reify'
+    for root in (df_root, reify_root):
+        root.mkdir()
+    pairs = ((1, 'in-progress'), (2, 'pending'), (3, 'done'))
+    mcp, _calls = _canned_mcp(
+        [_raw_row(task_id, status) for task_id, status in pairs], dict(pairs),
+    )
+    monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', mcp)
+    cfg = DashboardConfig(project_root=df_root, known_project_roots=[reify_root])
+
+    _active, snapshots = await collect_tasks_with_counts(
+        client=dummy_client, config=cfg, now=fixed,
+    )
+
+    assert set(snapshots) == {'df', 'reify'}
+    for label, snapshot in snapshots.items():
+        assert snapshot.census.state is DatumState.FRESH, (label, snapshot.census)
+        assert snapshot.rows.state is DatumState.FRESH, (label, snapshot.rows)
+        assert snapshot.census.as_of == fixed, (label, snapshot.census.as_of)
+        assert snapshot.rows.as_of == fixed, (label, snapshot.rows.as_of)
+
+
+@pytest.mark.asyncio
 async def test_collect_active_tasks_handles_missing_worktree_metadata(tmp_path, monkeypatch, dummy_client):
     """A pending task absent from an ONLINE runtime map still appears, with honest zeros."""
     root, shaped = _make_project(
