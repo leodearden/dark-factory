@@ -28,6 +28,7 @@ import logging
 import subprocess
 import sys
 import types
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
@@ -57,6 +58,7 @@ from fused_memory.server.write_triage_judge import (
     _DEFAULT_JUDGE_TIMEOUT_SECONDS,
     _DEFAULT_MODEL_BY_PROVIDER,
     _ELIDED_MARKER,
+    _FIELD_CHARS,
     _JUDGE_MAX_TOKENS,
     _KNOWN_PROVIDERS,
     JUDGE_SYSTEM_PROMPT,
@@ -124,6 +126,275 @@ class TestJudgeVerdictVocabulary:
     def test_each_word_maps_to_its_outcome(self, word: str, outcome: str) -> None:
         """Each judge word lands on the outcome the ack contract publishes."""
         assert JUDGE_VERDICTS[word] == outcome
+
+
+# ---------------------------------------------------------------------------
+# the worked examples that teach the vocabulary
+# ---------------------------------------------------------------------------
+
+#: The committed curator corpus the judge is MEASURED against. Named here so
+#: the leakage guard below can ask whether an exemplar was drawn from it.
+CALIBRATION_FIXTURE_PATH = (
+    Path(__file__).parent.parent / 'fixtures' / 'write_triage_calibration.jsonl'
+)
+
+
+@pytest.fixture(scope='module')
+def records() -> list[dict]:
+    """The committed curator corpus, parsed with the stdlib.
+
+    Parsed here rather than through the eval script's loader, so a loader bug
+    cannot mask a data defect (and vice versa) — the discipline the sibling
+    suite's own ``records`` fixture states.
+    """
+    assert CALIBRATION_FIXTURE_PATH.exists(), (
+        f'fixture missing: {CALIBRATION_FIXTURE_PATH}'
+    )
+    return [
+        json.loads(line)
+        for line in CALIBRATION_FIXTURE_PATH.read_text().splitlines()
+        if line.strip()
+    ]
+
+
+class TestJudgeExemplars:
+    """The vocabulary's worked examples, held as DATA rather than as prose.
+
+    Four words with no worked example is what the 2026-08-27 measurement
+    indicts: 31 of 75 duplicates were answered ``stored`` with the correct
+    canonical sitting in the slate, i.e. ``restates``/``amends`` were
+    under-produced. A vocabulary word the model has never seen USED is the one
+    it under-produces, so full verdict coverage is the invariant that targets
+    the defect rather than a tidiness rule.
+
+    Structured records, not a pre-formatted blob (heuristic 12): declaring
+    ``entry``/``candidate``/``verdict`` as separate fields is what lets
+    vocabulary closure, verdict coverage and corpus disjointness be CHECKED
+    here instead of grepped for in a string. The renderer owns the formatting.
+    """
+
+    def test_the_exemplars_are_structured_records(self) -> None:
+        """Three separate fields per record — the data carries no formatting.
+
+        A pre-formatted blob would reduce every assertion below to substring
+        grepping, and would move the prompt's layout out of the renderer and
+        into the data, where two exemplars can disagree about it.
+        """
+        exemplars = judge_module.JUDGE_EXEMPLARS
+        assert isinstance(exemplars, tuple), 'exemplars are an ordered, frozen tuple'
+        assert exemplars, 'an empty exemplar tuple teaches nothing'
+        for exemplar in exemplars:
+            fields = (exemplar.entry, exemplar.candidate, exemplar.verdict)
+            for field in fields:
+                assert isinstance(field, str) and field.strip(), (
+                    f'every field is a non-empty string: {exemplar!r}'
+                )
+                assert '\n' not in field, (
+                    f'line breaks are the renderer\'s business, not the data\'s: '
+                    f'{exemplar!r}'
+                )
+            assert len(set(fields)) == len(fields), (
+                f'the three fields are distinct values, not one blob repeated: '
+                f'{exemplar!r}'
+            )
+
+    def test_every_exemplar_verdict_is_in_the_closed_vocabulary(self) -> None:
+        """An out-of-vocabulary exemplar teaches a word the parser REJECTS.
+
+        ``parse_judge_verdict`` raises on anything outside ``JUDGE_VERDICTS``
+        and ``write_triage`` counts that raise as a fail-open — so the damage
+        surfaces as a storm escalation describing an outage, not as a bad
+        verdict anyone would trace back to a typo in a prompt example.
+        """
+        for exemplar in judge_module.JUDGE_EXEMPLARS:
+            assert exemplar.verdict in JUDGE_VERDICTS, (
+                f'{exemplar.verdict!r} is not one of {sorted(JUDGE_VERDICTS)}'
+            )
+
+    def test_every_verdict_has_at_least_one_worked_example(self) -> None:
+        """Coverage is the invariant aimed at the measured defect.
+
+        Derived from ``JUDGE_VERDICTS`` rather than spelled as four literals,
+        so a fifth word added to the vocabulary arrives here already demanding
+        its example instead of shipping unexemplified.
+        """
+        covered = {exemplar.verdict for exemplar in judge_module.JUDGE_EXEMPLARS}
+        assert covered == set(JUDGE_VERDICTS), (
+            f'verdicts with no worked example: {sorted(set(JUDGE_VERDICTS) - covered)}'
+        )
+
+    def test_no_exemplar_text_is_drawn_from_the_eval_corpus(
+        self, records: list[dict],
+    ) -> None:
+        """Exemplars are prompt content; fixture records are a MEASUREMENT.
+
+        Hand-writing an exemplar is ordinary prompt engineering — nothing is
+        scored against it. Drawing one from the corpus the judge is scored on
+        is training on the test set, and would make the accuracy report
+        unreadable as evidence. This is the one way an exemplar can corrupt a
+        measurement, so it is asserted rather than remembered.
+        """
+        corpus = '\n'.join(str(record.get('content', '')) for record in records)
+        assert corpus.strip(), 'the corpus parsed empty — the guard would be vacuous'
+        for exemplar in judge_module.JUDGE_EXEMPLARS:
+            for field_name in ('entry', 'candidate'):
+                text = getattr(exemplar, field_name)
+                assert text not in corpus, (
+                    f'exemplar {field_name} is drawn from the eval corpus — '
+                    f'that is training on the test set: {text!r}'
+                )
+
+    def test_each_exemplar_renders_as_an_answered_pair(self) -> None:
+        """The PAIRING is the property. The three fields separately are not.
+
+        A pair rendered without its verdict is a riddle, and a verdict
+        rendered without its pair is an assertion — so what has to hold is
+        that each exemplar's three fields reach the model AS ONE BLOCK.
+        Checking the fields individually cannot see that: all four verdict
+        words already appear in the vocabulary bullets above the examples, so
+        ``exemplar.verdict in prompt`` is true whatever the renderer emits.
+        Measured by simulation — a ``_render_exemplars`` that dropped its
+        ``answer:`` line entirely, shipping four unanswered riddles, left the
+        per-field version of this test green.
+
+        Asserted as the contiguous triple, which is executable structure and
+        not a wording pin. It restates ``_render_exemplars``' block layout on
+        purpose — that layout IS the contract between the tuple and the model
+        — while leaving the prompt's prose around the examples free to be
+        reworded. It subsumes the per-field presence check, so there is no
+        longer a separate one.
+        """
+        for exemplar in judge_module.JUDGE_EXEMPLARS:
+            block = (
+                f'new entry: {exemplar.entry}\n'
+                f'candidate: {exemplar.candidate}\n'
+                f'answer: {exemplar.verdict}'
+            )
+            assert block in JUDGE_SYSTEM_PROMPT, (
+                f'exemplar does not reach the model as an ANSWERED pair — its '
+                f'fields may all be present but not together: {block!r}'
+            )
+
+    def test_the_exemplars_render_once_each_in_declaration_order(self) -> None:
+        """A REPRODUCIBLE measurement needs a prompt that does not move.
+
+        This suite has been bitten once already by an iteration order moving
+        between two processes — the committed `.json`/`.md` confusion-row
+        disagreement that
+        ``test_the_committed_markdown_is_the_render_of_the_committed_json``
+        now pins. A tuple cannot reorder itself, so what is left to check is
+        that the RENDERER walks it in order and does not double-render.
+
+        Asserted on ``entry``, which uniquely identifies an exemplar and
+        occurs nowhere else in the prompt. ``candidate`` and ``verdict``
+        deliberately recur — one candidate is shared by all four exemplars, so
+        the only variable is the relationship, and each verdict word already
+        appears three to five times in the vocabulary section above the
+        examples. Counting occurrences of either would measure the prompt's
+        prose, not the renderer's determinism.
+        """
+        prompt = JUDGE_SYSTEM_PROMPT
+        positions = []
+        for exemplar in judge_module.JUDGE_EXEMPLARS:
+            assert prompt.count(exemplar.entry) == 1, (
+                f'exemplar rendered {prompt.count(exemplar.entry)} times, not '
+                f'once: {exemplar.entry!r}'
+            )
+            positions.append(prompt.index(exemplar.entry))
+        assert positions == sorted(positions), (
+            f'the render walks JUDGE_EXEMPLARS out of declaration order: '
+            f'{positions}'
+        )
+
+    def test_the_user_prompt_carries_no_exemplar_text(self) -> None:
+        """Exemplars are constant, so they are paid for ONCE, system-side.
+
+        Two reasons beyond the token bill. ``scripts/check_write_triage_attach_target.py``
+        is the behavioural gate probe for flip-predicate item 1; its
+        ``_echoes_argument`` / ``_swap_verdict`` controls attribute a
+        rendering difference to a SPECIFIC candidate in the user turn, and
+        constant example lines there would be extra material those controls
+        would have to reason around. And the system half is the half a
+        provider can cache — rendered per call, the exemplars would be paid
+        for on all 102 cases of an eval run instead of once.
+
+        Verdict WORDS are excluded: ``build_judge_prompt`` names the closed
+        vocabulary by design, which is a different thing from carrying an
+        example.
+        """
+        candidates = [
+            _result('mem-aaa', 0.9, content='first candidate body'),
+            _result('mem-bbb', 0.8, content='second candidate body'),
+        ]
+        prompt = build_judge_prompt('the new entry text', candidates)
+        for exemplar in judge_module.JUDGE_EXEMPLARS:
+            for field_name in ('entry', 'candidate'):
+                text = getattr(exemplar, field_name)
+                assert text not in prompt, (
+                    f'exemplar {field_name} leaked into the per-call user turn: '
+                    f'{text!r}'
+                )
+
+    def test_the_worst_case_prompt_stays_within_the_char_budget(self) -> None:
+        """PRD C1 bounds the whole call, and the exemplars spend against it.
+
+        The worst case is not hypothetical: the calibration fixture holds a
+        ~9k-char canonical, so a full slate of over-long candidates plus an
+        over-long entry is what a real call looks like when the corpus is at
+        its largest. Built rather than arithmetic, so the scaffolding between
+        the fields is counted too.
+
+        BUILT THE WAY ``judge_write`` CALLS IT, which is the whole point —
+        a construction the production path never makes bounds nothing. Two
+        details were missing when this test used 5-char stand-in ids and no
+        attach target, and together they cost 209 chars, enough to put the
+        real call over a budget this test reported as met. Both are now
+        asserted rather than assumed, because either could be quietly undone
+        by an edit that still left the test green: candidate ids are the
+        36-char uuids every record actually carries (all 104 in
+        ``tests/fixtures/write_triage_calibration.jsonl`` are, and
+        ``build_judge_prompt`` renders ``- id:`` UN-elided), and
+        ``attach_target_id`` is passed, because ``judge_write`` forwards it on
+        EVERY call — so its line is part of the worst case, not an extra.
+
+        THE FIELDS ARE OVER ``_FIELD_CHARS``, NOT AT IT. ``_elide`` returns a
+        field of exactly ``_FIELD_CHARS`` untouched and cuts a longer one to
+        ``_FIELD_CHARS`` PLUS ``_ELIDED_MARKER`` — so the input that elides
+        renders 9 chars wider per field, 54 across a full slate, than the
+        input that merely fills. A worst case built at the cap is therefore
+        not the worst case; it is the widest input that never trips the
+        behaviour this budget exists to bound.
+
+        The ceiling is a module constant, not a literal here, so the budget
+        has one home — raising it is an edit to the thing being budgeted,
+        made next to the C1 rationale, rather than a number quietly relaxed in
+        a test.
+        """
+        maximal = 'x' * (_FIELD_CHARS + 1)
+        candidates = [
+            _result(str(uuid.uuid4()), 0.9, content=maximal)
+            for _ in range(_DEFAULT_JUDGE_CANDIDATE_COUNT)
+        ]
+        assert {len(c.id) for c in candidates} == {36}, (
+            'the slate must carry the 36-char uuids production carries — a '
+            'shorter stand-in id under-measures every candidate line'
+        )
+        rendered = build_judge_prompt(
+            maximal, candidates, attach_target_id=candidates[0].id,
+        )
+        assert _ELIDED_MARKER in rendered, (
+            'the worst case must be an ELIDED render — otherwise it misses '
+            'the marker _elide appends, and under-measures the real ceiling'
+        )
+        assert f'  attach_target: {candidates[0].id}' in rendered, (
+            'the attach_target line is rendered on every production call, so '
+            'a worst case measured without it is not the worst case'
+        )
+        worst_case = len(JUDGE_SYSTEM_PROMPT) + len(rendered)
+        assert worst_case <= judge_module._PROMPT_CHAR_BUDGET, (
+            f'worst-case prompt is {worst_case} chars against a budget of '
+            f'{judge_module._PROMPT_CHAR_BUDGET}'
+        )
 
 
 class TestParseJudgeVerdict:

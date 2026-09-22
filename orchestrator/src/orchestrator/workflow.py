@@ -491,12 +491,12 @@ class _BriefingLike(Protocol):
         worktree: Path | None = ...,
     ) -> str: ...
     async def build_implementer_prompt(
-        self, plan: dict, iteration_log: list, context: str | None = ...,
+        self, plan: dict, context: str | None = ...,
         rebase_notice: dict | None = ..., task_id: str | None = ...,
         wip_notice: list[dict] | None = ...,
     ) -> str: ...
     async def build_amender_prompt(
-        self, plan: dict, iteration_log: list[dict],
+        self, plan: dict,
         suggestions: list[dict], locked_modules: list[str],
         context: str | None = ..., task_id: str | None = ...,
     ) -> str: ...
@@ -8340,7 +8340,7 @@ class TaskWorkflow:
             }
 
             prompt = await self.briefing.build_implementer_prompt(
-                self.plan, iteration_log, rebase_notice=rebase_notice,
+                self.plan, rebase_notice=rebase_notice,
                 task_id=self.task_id, wip_notice=wip_notice,
             )
             pre_head = await self._get_head_commit()
@@ -10537,13 +10537,15 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         assert self.worktree is not None and self.artifacts is not None
 
         self.plan = self.artifacts.read_plan()
-        iteration_log, corrupted = self.artifacts.read_iteration_log()
+        # Read for the corruption signal alone — the amender prompt no longer
+        # renders iteration history (task 5744), and this is the only place
+        # that would notice a corrupt log before the pass runs.
+        _entries, corrupted = self.artifacts.read_iteration_log()
         if corrupted:
             self._escalate_corruption(corrupted)
 
         prompt = await self.briefing.build_amender_prompt(
             plan=self.plan,
-            iteration_log=iteration_log,
             suggestions=in_scope,
             locked_modules=list(self.modules),
             task_id=self.task_id,

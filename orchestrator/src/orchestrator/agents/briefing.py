@@ -1041,35 +1041,26 @@ suggestions-only on this exact tree — call
     async def build_implementer_prompt(
         self,
         plan: dict,
-        iteration_log: list[dict],
         context: str | None = None,
         rebase_notice: dict | None = None,
         task_id: str | None = None,
         wip_notice: list[dict] | None = None,
     ) -> str:
-        """Build prompt for the implementer agent."""
+        """Build prompt for the implementer agent.
+
+        Renders NO plan progress and NO iteration history (tasks 5728, 5744):
+        plan.json and iterations.jsonl are their single homes, and the Session
+        Startup Protocol below mandates reading both. A copy frozen into this
+        string is the one that can lie, because the retry ladder replays an
+        assembled prompt verbatim into a fresh session
+        (shared/src/shared/cli_invoke.py::_reset_for_fresh_retry). Pinned by
+        orchestrator/tests/test_briefing_progress_spot.py.
+        """
         effective_tid = task_id or plan.get('task_id')
         if context is None:
             context = await self._get_memory_context(effective_tid)
 
         identity = self._agent_identity(effective_tid, 'implementer')
-
-        completed = [s for s in plan.get('steps', []) if isinstance(s, dict) and s.get('status') == 'done']
-        pending = [s for s in plan.get('steps', []) if isinstance(s, dict) and s.get('status') == 'pending']
-        pre_completed = [s for s in plan.get('prerequisites', []) if isinstance(s, dict) and s.get('status') == 'done']
-        pre_pending = [s for s in plan.get('prerequisites', []) if isinstance(s, dict) and s.get('status') == 'pending']
-
-        log_summary = ''
-        if iteration_log:
-            recent = iteration_log[-3:]
-            log_lines = []
-            for entry in recent:
-                log_lines.append(
-                    f"- Iteration {entry.get('iteration', '?')}: "
-                    f"completed {entry.get('steps_completed', [])}, "
-                    f"summary: {entry.get('summary', 'N/A')}"
-                )
-            log_summary = "## Recent Iterations\n\n" + '\n'.join(log_lines)
 
         rebase_section = ''
         if rebase_notice:
@@ -1124,12 +1115,6 @@ Before writing any new code:
 **Task:** {plan.get('title', 'Unknown')}
 **Analysis:** {plan.get('analysis', 'N/A')}
 
-## Progress
-
-- Prerequisites: {len(pre_completed)} done, {len(pre_pending)} pending
-- Steps: {len(completed)} done, {len(pending)} pending
-
-{log_summary}
 {rebase_section}
 {wip_section}
 # Session Startup Protocol
@@ -1164,7 +1149,6 @@ Execute the next pending steps in TDD order. Commit after each step. Call `mark_
     async def build_amender_prompt(
         self,
         plan: dict,
-        iteration_log: list[dict],
         suggestions: list[dict],
         locked_modules: list[str],
         context: str | None = None,
@@ -1187,24 +1171,16 @@ Execute the next pending steps in TDD order. Commit after each step. Call `mark_
         and is not a scope violation (esc-3147-7, ruled 2026-08-24: act, then
         auto-widen). Phrase the rules around the EDIT/CREATE distinction, which
         holds at any depth, never around containment in a "module".
+
+        Renders NO iteration history (task 5744), for the same reason as
+        :meth:`build_implementer_prompt`: iterations.jsonl is its single home
+        and the Action section below mandates reading it.
         """
         effective_tid = task_id or plan.get('task_id')
         if context is None:
             context = await self._get_memory_context(effective_tid)
 
         identity = self._agent_identity(effective_tid, 'implementer')
-
-        log_summary = ''
-        if iteration_log:
-            recent = iteration_log[-3:]
-            log_lines = []
-            for entry in recent:
-                log_lines.append(
-                    f"- Iteration {entry.get('iteration', '?')} "
-                    f"[{entry.get('agent', '?')}]: "
-                    f"{entry.get('summary', 'N/A')}"
-                )
-            log_summary = "## Recent Iterations\n\n" + '\n'.join(log_lines)
 
         modules_list = '\n'.join(f'- `{m}`' for m in sorted(locked_modules))
 
@@ -1243,8 +1219,6 @@ expanding the task's concurrency footprint.
 
 **Task:** {plan.get('title', 'Unknown')}
 **Analysis:** {plan.get('analysis', 'N/A')}
-
-{log_summary}
 
 ## Scope Discipline
 

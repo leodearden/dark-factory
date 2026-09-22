@@ -428,7 +428,7 @@ class FakeBriefing:
         return f'Complete partial plan: {task.get("title", "")}'
 
     async def build_implementer_prompt(
-        self, plan: dict, iteration_log: list, context: str | None = None,
+        self, plan: dict, context: str | None = None,
         rebase_notice: dict | None = None, task_id: str | None = None,
         wip_notice: list[dict] | None = None,
     ) -> str:
@@ -472,7 +472,7 @@ class FakeBriefing:
         return f'Resume: {resolution[:100]}'
 
     async def build_amender_prompt(
-        self, plan: dict, iteration_log: list, suggestions: list, locked_modules: list,
+        self, plan: dict, suggestions: list, locked_modules: list,
         context: str | None = None, task_id: str | None = None,
     ) -> str:
         return 'Amend the plan'

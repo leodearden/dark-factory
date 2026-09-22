@@ -1260,6 +1260,12 @@ class TestCalibrationScriptArmTableLockstep:
         column the store never had. This drives the script's own reader over a
         DB the real store created and wrote, so it fails on exactly the drift
         that matters and on nothing else.
+
+        The same corpus reconciles the script's TICK CLOCK. ``read_series``
+        counts ``runqueue_read_ok`` rows with its own SQL instead of fetching
+        the series, and that count is the denominator of every coverage row --
+        so this is the only place it can be checked against the number of ticks
+        ``write_tick`` actually wrote.
         """
         from sampler.store import LoadSampleStore
 
@@ -1273,12 +1279,16 @@ class TestCalibrationScriptArmTableLockstep:
                 windowed={'runqueue_ratio': 1.0 + i, 'runqueue_read_ok': 1.0},
             )
 
-        series, readability, degradations = module.read_series(db_path, None)
+        read = module.read_series(db_path, None)
 
-        assert degradations == [], degradations
-        assert [v for _, v in series['runqueue_ratio']] == [1.0, 2.0, 3.0]
-        assert [v for _, v in series['psi_cpu_some_avg10']] == [10.0, 11.0, 12.0]
-        assert [v for _, v in readability['runqueue_read_ok']] == [1.0, 1.0, 1.0]
+        assert read.degradations == [], read.degradations
+        assert [v for _, v in read.series['runqueue_ratio']] == [1.0, 2.0, 3.0]
+        assert [v for _, v in read.series['psi_cpu_some_avg10']] == [10.0, 11.0, 12.0]
+        assert [v for _, v in read.readability['runqueue_read_ok']] == [1.0, 1.0, 1.0]
+        assert read.ticks_in_corpus == 3, (
+            'the script counted a different number of ticks than write_tick '
+            f'wrote: {read.ticks_in_corpus} against 3'
+        )
 
     def test_every_declared_readability_metric_is_one_the_collectors_emit(
         self, tmp_path

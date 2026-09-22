@@ -3,6 +3,9 @@
 from fused_memory.reconciliation.consolidation_gate import (
     render_consolidation_gate_section,
 )
+from fused_memory.reconciliation.gate_owned_finding_phrasing import (
+    render_gate_owned_action_norm,
+)
 from fused_memory.reconciliation.internal_writers import (
     INTERNAL_WRITER_POPULATION_NOTE,
 )
@@ -10,6 +13,7 @@ from fused_memory.reconciliation.prompts import (
     _STAGE1_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE1_PROJECT_ID_GUIDELINE,
     AMEND_AND_EPISODE_TOOLS_BLOCK,
+    CITATION_REPAIR_TOOL_BLOCK,
     DUPLICATE_FINDING_SALVAGE_GUIDANCE,
     STALE_KNOWLEDGE_ANNOTATION_NORM,
     get_recon_report_tool_guidance,
@@ -209,6 +213,8 @@ weaken the guidance above — still prefer `update_edge`/`refresh_entity_summary
 - **Report channel — recon_report MCP tools (PRD γ §9)**: For each inconsistency or finding \
 (including cross-project scope mismatches flagged to Stage 2): \
 {get_recon_report_tool_guidance()}
+
+{CITATION_REPAIR_TOOL_BLOCK}
 
 {STALE_KNOWLEDGE_ANNOTATION_NORM}
 
@@ -877,6 +883,8 @@ causing the same finding to be re-flagged every cycle.
 This directive mirrors the code-side enforcement: see the completion-marker \
 same-cycle self-delete branch in `flag_dedup.dedup_flags` (task 2312), gated on \
 the same present-and-false `flag_for_stage2` signal.
+
+{render_gate_owned_action_norm()}
 
 ## Stage 2 Flag Relay (FIX B)
 When you write a flag to Mem0 with `metadata.flag_for_stage2=true`, you MUST ALSO include \

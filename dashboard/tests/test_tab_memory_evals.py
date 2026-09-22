@@ -401,7 +401,7 @@ _MEMORY_EVALS_CONTRACT_KEYS = (
 
 
 def test_data_js_registers_memory_evals_endpoint(data_js_body: str) -> None:
-    """data.js must register /api/v2/dashboard/memory-evals -> ['MEMORY_EVALS']
+    """data.js must register /api/v2/dashboard/memory-evals -> {'MEMORY_EVALS': SPEC}
     and seed DF_DATA.MEMORY_EVALS with the server's own default body.
 
     The seed is asserted key-by-key against the ``shape_memory_evals`` contract
@@ -415,17 +415,22 @@ def test_data_js_registers_memory_evals_endpoint(data_js_body: str) -> None:
     assert '/api/v2/dashboard/memory-evals' in data_js_body, (
         "data.js does not register '/api/v2/dashboard/memory-evals'. Add a "
         'static (non-windowed) row to endpointsFor() mapping it to '
-        "['MEMORY_EVALS']."
+        "{'MEMORY_EVALS': <spec>}."
     )
 
     # (b) key and value must be checked as a PAIR — two independent substring
     # hits would pass even if the endpoint mapped to some other DF_DATA key.
+    # The mapped value is a key->spec OBJECT, and the spec is matched as a bare
+    # identifier (`PLAIN`/`DATUM`) rather than pinned to one of them: which spec
+    # a row carries is data.js's to flip, and this test is about WHICH KEY the
+    # endpoint feeds.  The closing brace has to follow immediately, so
+    # 'MEMORY_EVALS' must be the row's only entry.
     assert re.search(
-        r"""['"]/api/v2/dashboard/memory-evals['"]\s*:\s*\[\s*['"]MEMORY_EVALS['"]\s*,?\s*\]""",
+        r"""['"]/api/v2/dashboard/memory-evals['"]\s*:\s*\{\s*['"]MEMORY_EVALS['"]\s*:\s*\w+\s*,?\s*\}""",
         data_js_body,
     ), (
         "data.js's endpointsFor() must map '/api/v2/dashboard/memory-evals' to "
-        "exactly ['MEMORY_EVALS']."
+        "exactly one key spec, {'MEMORY_EVALS': <spec>}."
     )
 
     # (c) the DF_DATA seed block exists

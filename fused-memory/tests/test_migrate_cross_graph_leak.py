@@ -20,6 +20,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _fm_helpers import extract_cypher, extract_params, load_script_module
+from _store_mutation_preflight_contract import (
+    SENTINEL,
+    deny,
+    fail_closed_records,
+    neutralise_fixture,
+)
 
 from fused_memory.maintenance.cross_graph_move import (
     CreateResult,
@@ -32,27 +38,15 @@ SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'migrate_cross_graph_le
 _mod = load_script_module(SCRIPT_PATH, mod_name='migrate_cross_graph_leak')
 
 
-@pytest.fixture(autouse=True)
-def _neutralise_store_mutation_preflight(monkeypatch):
-    """Keep this MOCK-unit suite independent of the REAL ``~/.mem0``.
-
-    ``run(..., apply=True)`` runs a fail-closed capability preflight before it
-    loads the reviewed manifest (task 4293). That probe touches the real
-    filesystem, so without this fixture every ``--apply`` test in this file
-    would pass or fail according to whether the machine running pytest happens
-    to be able to write mem0's history directory -- and it genuinely cannot
-    inside an agent sandbox, which is the whole reason the guard exists. This
-    suite is deliberately MOCK-unit (MagicMock graphs, AsyncMock service, no
-    live FalkorDB), so the environment must not be an input to it.
-
+_neutralise = neutralise_fixture(
+    _mod,
+    note="""``run(..., apply=True)`` runs the preflight before it loads the
+    reviewed manifest (task 4293). This suite is deliberately MOCK-unit
+    (MagicMock graphs, AsyncMock service, no live FalkorDB).
     ``TestRunApplyStoreMutationPreflight`` re-rigs this per test -- to refuse,
     to record, or to pass -- so the guard's own behaviour is still pinned
-    explicitly rather than assumed away.
-
-    Deliberately NOT ``raising=False``: if the guard is ever removed from the
-    script this fixture must break loudly rather than silently no-op.
-    """
-    monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+    explicitly rather than assumed away.""",
+)
 
 
 # ===========================================================================
@@ -2234,40 +2228,6 @@ class TestRunApplyStoreMutationPreflight:
         memory_service = _make_memory_service({'reify': graph})
         return mocks, memory_service, graph
 
-    @staticmethod
-    def _deny(monkeypatch):
-        """Rig the preflight to refuse, as it would inside an agent sandbox."""
-        def _raise(*_args, **_kwargs):
-            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
-
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
-
-    @staticmethod
-    def _fail_closed_records(caplog) -> list:
-        """The guard site's OWN diagnosis.
-
-        ``main`` has no handler at all here -- it hands ``_run_live`` straight
-        to ``asyncio.run`` -- so the refusal exits as an uncaught traceback and
-        this ERROR record is the ONLY place the operator is told what was
-        refused and what to do instead. Pinned on the fail-closed marker and
-        the remedy noun ONLY, so every other word stays free to reword.
-
-        Asserting on message CONTENT is deliberate, and is the narrow exception
-        to the repo's don't-pin-guard-message-prose norm (task 3799): the record
-        this test is about is defined BY its content -- mere record-existence
-        would still pass if the whole diagnosis were replaced by "boom",
-        precisely the regression this exists to catch. Verified non-vacuous:
-        mutating the marker in the script turns this assertion red (task 4127
-        amendment).
-        """
-        return [
-            rec for rec in caplog.records
-            if rec.name == 'migrate_cross_graph_leak'
-            and rec.levelname == 'ERROR'
-            and 'NOT started (fail-closed)' in rec.getMessage()
-            and 'MCP server' in rec.getMessage()
-        ]
-
     @pytest.mark.asyncio
     async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
         self, tmp_path, monkeypatch,
@@ -2281,12 +2241,12 @@ class TestRunApplyStoreMutationPreflight:
         a half-applied three-phase move is the worst outcome available (a home
         copy with no edges, or a deleted source whose edges never landed).
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         mocks, memory_service, _ = self._scenario(monkeypatch)
         manifest_path = self._manifest_path(tmp_path)
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+            _mod.StoreMutationUnavailable, match=SENTINEL
         ):
             await _mod.run(
                 _args(apply=True, manifest=str(manifest_path)), memory_service,
@@ -2304,7 +2264,7 @@ class TestRunApplyStoreMutationPreflight:
         """It aborts without reading the reviewed manifest off disk, so a run
         that was never going to be allowed to mutate pays for nothing -- and
         no graph is resolved for the REKEY dispatch either."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         _, memory_service, _ = self._scenario(monkeypatch)
         manifest_path = self._manifest_path(tmp_path)
 
@@ -2421,7 +2381,7 @@ class TestRunApplyStoreMutationPreflight:
         so without this record the operator sees a bare traceback naming an
         exception class and no remedy.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         _, memory_service, _ = self._scenario(monkeypatch)
         manifest_path = self._manifest_path(tmp_path)
 
@@ -2433,7 +2393,7 @@ class TestRunApplyStoreMutationPreflight:
                 _args(apply=True, manifest=str(manifest_path)), memory_service,
             )
 
-        assert self._fail_closed_records(caplog), (
+        assert fail_closed_records(caplog, 'migrate_cross_graph_leak'), (
             'nothing else explains this traceback -- the guard site must log '
             'the fail-closed diagnosis before raising; got: '
             f'{[rec.getMessage() for rec in caplog.records]}'

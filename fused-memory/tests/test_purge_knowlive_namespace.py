@@ -14,6 +14,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _fm_helpers import load_script_module
+from _store_mutation_preflight_contract import (
+    SENTINEL,
+    deny,
+    fail_closed_records,
+    neutralise_fixture,
+)
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'purge_knowlive_namespace.py'
 
@@ -46,27 +52,14 @@ def _make_graph_mock(rows: list[list] | None = None) -> MagicMock:
     return graph
 
 
-@pytest.fixture(autouse=True)
-def _neutralise_store_mutation_preflight(monkeypatch):
-    """Keep this MOCK-unit suite independent of the REAL ``~/.mem0``.
-
-    ``run(..., apply=True)`` runs a fail-closed capability preflight before it
-    enumerates (task 4127). That probe touches the real filesystem, so without
-    this fixture every ``--apply`` test would pass or fail according to whether
-    the machine running pytest happens to be able to write mem0's history
-    directory -- and it genuinely cannot inside an agent sandbox, which is the
-    whole reason the guard exists. This suite is deliberately MOCK-unit (an
-    AsyncMock service, no live FalkorDB and no live Qdrant), so the
-    environment must not be an input to it.
-
-    ``TestRunApplyStoreMutationPreflight`` re-rigs this per test -- to refuse,
-    to record, or to pass -- so the guard's own behaviour is still pinned
-    explicitly rather than assumed away.
-
-    Deliberately NOT ``raising=False``: if the guard is ever removed from the
-    script this fixture must break loudly rather than silently no-op.
-    """
-    monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+_neutralise = neutralise_fixture(
+    _mod,
+    note="""``run(..., apply=True)`` runs the preflight before it enumerates (task
+    4127). This suite is deliberately MOCK-unit (an AsyncMock service, no live
+    FalkorDB and no live Qdrant). ``TestRunApplyStoreMutationPreflight``
+    re-rigs this per test -- to refuse, to record, or to pass -- so the guard's
+    own behaviour is still pinned explicitly rather than assumed away.""",
+)
 
 
 # ===========================================================================
@@ -905,40 +898,6 @@ class TestRunApplyStoreMutationPreflight:
         memory_service.update_edge = AsyncMock(return_value=None)
         return memory_service, graph
 
-    @staticmethod
-    def _deny(monkeypatch):
-        """Rig the preflight to refuse, as it would inside an agent sandbox."""
-        def _raise(*_args, **_kwargs):
-            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
-
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
-
-    @staticmethod
-    def _fail_closed_records(caplog) -> list:
-        """The guard site's OWN diagnosis.
-
-        ``main`` has no handler at all here -- the refusal exits the
-        interpreter as an uncaught traceback -- so this ERROR record is the
-        ONLY place the operator is told what was refused and what to do
-        instead. Pinned on the fail-closed marker and the remedy noun ONLY, so
-        every other word of the message stays free to reword.
-
-        Asserting on message CONTENT is deliberate, and is the narrow exception
-        to the repo's don't-pin-guard-message-prose norm (task 3799): the record
-        this test is about is defined BY its content -- mere record-existence
-        would still pass if the whole diagnosis were replaced by "boom",
-        precisely the regression this exists to catch. Verified non-vacuous:
-        mutating the marker in the script turns this assertion red (task 4127
-        amendment).
-        """
-        return [
-            rec for rec in caplog.records
-            if rec.name == 'purge_knowlive_namespace'
-            and rec.levelname == 'ERROR'
-            and 'NOT started (fail-closed)' in rec.getMessage()
-            and 'MCP server' in rec.getMessage()
-        ]
-
     @pytest.mark.asyncio
     async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
         self, monkeypatch
@@ -949,7 +908,7 @@ class TestRunApplyStoreMutationPreflight:
         -- a zero-mutation claim that covered only one of the three would be
         vacuous, and the Graphiti DETACH DELETE is the largest of them.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory_service, graph = self._make_memory_service(
             graphiti_rows=[['uuid-1', ['Entity'], 'Node A']],
             mem0_members=[_mem0_member('m1')],
@@ -957,7 +916,7 @@ class TestRunApplyStoreMutationPreflight:
         invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+            _mod.StoreMutationUnavailable, match=SENTINEL
         ):
             await _mod.run(
                 self._args(apply=True), memory_service,
@@ -974,7 +933,7 @@ class TestRunApplyStoreMutationPreflight:
         (a FalkorDB ro_query plus a mem0 count+get_all, --limit 1000 each) are
         not paid for in an environment that was never going to be allowed to
         purge."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory_service, graph = self._make_memory_service(
             graphiti_rows=[['uuid-1', ['Entity'], 'Node A']],
             mem0_members=[_mem0_member('m1')],
@@ -1000,7 +959,7 @@ class TestRunApplyStoreMutationPreflight:
         docstring calls the dry-run manifest "the only recovery record of what
         is about to be deleted", and it stays obtainable from anywhere.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory_service, graph = self._make_memory_service(
             graphiti_rows=[['uuid-1', ['Entity'], 'Node A']],
             mem0_members=[_mem0_member('m1')],
@@ -1082,7 +1041,7 @@ class TestRunApplyStoreMutationPreflight:
         handler in ``main``, that record is the only thing standing between an
         operator and an unexplained traceback.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory_service, _ = self._make_memory_service(
             mem0_members=[_mem0_member('m1')],
         )
@@ -1104,11 +1063,11 @@ class TestRunApplyStoreMutationPreflight:
         monkeypatch.setattr(_mod.asyncio, 'run', _drive)
 
         with caplog.at_level('ERROR'), pytest.raises(
-            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+            _mod.StoreMutationUnavailable, match=SENTINEL
         ):
             _mod.main()
 
-        assert self._fail_closed_records(caplog), (
+        assert fail_closed_records(caplog, 'purge_knowlive_namespace'), (
             'nothing else explains this traceback -- the guard site must log '
             'the fail-closed diagnosis before raising; got: '
             f'{[rec.getMessage() for rec in caplog.records]}'

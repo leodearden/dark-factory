@@ -15,6 +15,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _fm_helpers import load_script_module
+from _store_mutation_preflight_contract import (
+    SENTINEL,
+    deny,
+    fail_closed_records,
+    neutralise_fixture,
+)
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'cleanup_count_snapshots.py'
 
@@ -24,27 +30,15 @@ EdgeMatch = _mod.EdgeMatch
 EntityScanResult = _mod.EntityScanResult
 
 
-@pytest.fixture(autouse=True)
-def _neutralise_store_mutation_preflight(monkeypatch):
-    """Keep this MOCK-unit suite independent of the REAL ``~/.mem0``.
-
-    ``run(..., apply=True)`` runs a fail-closed capability preflight before it
-    enumerates or scans (task 4293). That probe touches the real filesystem, so
-    without this fixture every ``--apply`` test would pass or fail according to
-    whether the machine running pytest happens to be able to write mem0's
-    history directory -- and it genuinely cannot inside an agent sandbox, which
-    is the whole reason the guard exists. This suite is deliberately MOCK-unit
-    (a MagicMock/AsyncMock memory, no live Graphiti), so the environment must
-    not be an input to it.
-
+_neutralise = neutralise_fixture(
+    _mod,
+    note="""``run(..., apply=True)`` runs the preflight before it enumerates or
+    scans (task 4293). This suite is deliberately MOCK-unit (a
+    MagicMock/AsyncMock memory, no live Graphiti).
     ``TestRunApplyStoreMutationPreflight`` re-rigs this per test -- to refuse,
     to record, or to pass -- so the guard's own behaviour is still pinned
-    explicitly rather than assumed away.
-
-    Deliberately NOT ``raising=False``: if the guard is ever removed from the
-    script this fixture must break loudly rather than silently no-op.
-    """
-    monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+    explicitly rather than assumed away.""",
+)
 
 
 # ===========================================================================
@@ -778,40 +772,6 @@ class TestRunApplyStoreMutationPreflight:
     def _known_map(self, pid='dark_factory'):
         return {pid: '/some/path'}
 
-    @staticmethod
-    def _deny(monkeypatch):
-        """Rig the preflight to refuse, as it would inside an agent sandbox."""
-        def _raise(*_args, **_kwargs):
-            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
-
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
-
-    @staticmethod
-    def _fail_closed_records(caplog) -> list:
-        """The guard site's OWN diagnosis.
-
-        ``main`` has no handler at all here -- ``_run_live`` re-raises through
-        its ``finally`` and ``asyncio.run`` lets it out -- so this ERROR record
-        is the ONLY place the operator is told what was refused and what to do
-        instead. Pinned on the fail-closed marker and the remedy noun ONLY, so
-        every other word of the message stays free to reword.
-
-        Asserting on message CONTENT is deliberate, and is the narrow exception
-        to the repo's don't-pin-guard-message-prose norm (task 3799): the record
-        this test is about is defined BY its content -- mere record-existence
-        would still pass if the whole diagnosis were replaced by "boom",
-        precisely the regression this exists to catch. Verified non-vacuous:
-        mutating the marker in the script turns this assertion red (task 4127
-        amendment).
-        """
-        return [
-            rec for rec in caplog.records
-            if rec.name == 'cleanup_count_snapshots'
-            and rec.levelname == 'ERROR'
-            and 'NOT started (fail-closed)' in rec.getMessage()
-            and 'MCP server' in rec.getMessage()
-        ]
-
     @pytest.mark.asyncio
     async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
         self, monkeypatch
@@ -822,11 +782,11 @@ class TestRunApplyStoreMutationPreflight:
         each sits behind its own swallowing ``except Exception``, so a
         zero-mutation claim covering only one of them would be vacuous.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory = self._make_memory()
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+            _mod.StoreMutationUnavailable, match=SENTINEL
         ):
             await _mod.run(
                 self._args(apply=True),
@@ -843,7 +803,7 @@ class TestRunApplyStoreMutationPreflight:
         """It aborts without a single round-trip: neither the first-pass entity
         enumeration nor the second-pass edge scan is paid for by a run that was
         never going to be allowed to mutate."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory = self._make_memory()
 
         with pytest.raises(_mod.StoreMutationUnavailable):
@@ -861,7 +821,7 @@ class TestRunApplyStoreMutationPreflight:
         """A read-only run mutates nothing, so it must not require the ability
         to mutate -- the audit report stays obtainable from anywhere, with the
         deny still installed."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory = self._make_memory()
 
         report = await _mod.run(
@@ -924,7 +884,7 @@ class TestRunApplyStoreMutationPreflight:
         than being converted into a 0 exit code, AND the journal an operator
         reads carries the diagnosis.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory = self._make_memory()
         monkeypatch.setattr(sys, 'argv', ['cleanup_count_snapshots.py', '--apply'])
         real_asyncio_run = asyncio.run
@@ -947,7 +907,7 @@ class TestRunApplyStoreMutationPreflight:
         ):
             _mod.main()
 
-        assert self._fail_closed_records(caplog), (
+        assert fail_closed_records(caplog, 'cleanup_count_snapshots'), (
             "main has no handler, so the traceback is all an operator gets "
             'unless the guard site logs the fail-closed diagnosis itself; '
             f'got: {[rec.getMessage() for rec in caplog.records]}'

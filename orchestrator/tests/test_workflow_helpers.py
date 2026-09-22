@@ -57,7 +57,7 @@ async def test_fake_briefing_smoke() -> None:
 
     # build_implementer_prompt returns a fixed string ('Implement the plan')
     # without interpolating its arguments, so only a shape check applies here.
-    impl_prompt = await briefing.build_implementer_prompt({'title': 't'}, [])
+    impl_prompt = await briefing.build_implementer_prompt({'title': 't'})
     assert isinstance(impl_prompt, str) and impl_prompt, 'implementer prompt must be non-empty'
 
     arch_prompt = await briefing.build_architect_prompt({'title': 'my task'})

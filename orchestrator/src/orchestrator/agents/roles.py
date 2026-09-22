@@ -402,9 +402,11 @@ half-done tree that is falsely recorded as a completed, successful run.
   below, past which you must background it and poll instead. A foreground
   command that legitimately runs that long is fine; an abandoned background one
   never is.
-- If you genuinely must use `run_in_background=true`, you MUST poll it to
-  completion with `BashOutput` (or terminate it with `KillShell`) BEFORE ending
-  your turn. Never end the turn with a background command still pending.
+- If you genuinely must use `run_in_background=true`, you MUST see it through
+  BEFORE ending your turn. The launch hands you an output FILE PATH; `Read` on
+  that path is how you collect the result, so read it until the command has
+  actually finished — or terminate the task outright. Never end the turn with a
+  background command still pending.
 """
 
 
@@ -430,19 +432,46 @@ half-done tree that is falsely recorded as a completed, successful run.
 #       prohibition without the pattern breeds busy-loops, the pattern without
 #       the prohibition breeds abandoned background work.
 #
-# TOOL AVAILABILITY -- measured 2026-08-05, do NOT re-derive.  The tools named
-# below (`BashOutput`, `Monitor`, `ToolSearch`, `ScheduleWakeup`) are absent
-# from every role's `allowed_tools`, and that is CORRECT, not a bug: the
-# `--allowed-tools` flag cli_invoke passes (cli_invoke.py:1830) is a PERMISSION
-# allowlist -- what may run without a prompt -- not a tool-registry filter.
-# Built-in harness tools remain present and callable regardless.  Verified from
-# inside a dispatched implementer session whose cmdline was exactly
-# `--allowed-tools Read Edit Write Bash Glob Grep mcp__...`: `ToolSearch` and
-# `ScheduleWakeup` were live in that session's tool list, and
-# `ToolSearch("select:Monitor,TaskOutput")` returned both schemas.  The same
-# holds for the `BashOutput`/`KillShell` that BACKGROUND_TASK_WARNING has named
-# since task 2761.  So do NOT "fix" this block by trimming those tools out of
-# it on the theory that the roles cannot reach them -- they can.
+# TOOL AVAILABILITY -- read what this block does and does not establish.  It
+# records that built-ins are REACHABLE.  It is NOT, and cannot be, an inventory
+# of WHICH built-ins exist -- see the retraction below, which this block has
+# now earned twice.  For that, re-derive with `ToolSearch`.
+#
+# REACHABILITY -- measured 2026-08-05, do NOT re-derive.  The tools named below
+# (`Monitor`, `ToolSearch`, `ScheduleWakeup`) are absent from every role's
+# `allowed_tools`, and that is CORRECT, not a bug: the `--allowed-tools` flag
+# cli_invoke passes (cli_invoke.py:1830) is a PERMISSION allowlist -- what may
+# run without a prompt -- not a tool-registry filter.  Built-in harness tools
+# remain present and callable regardless.  Verified from inside a dispatched
+# implementer session whose cmdline was exactly `--allowed-tools Read Edit
+# Write Bash Glob Grep mcp__...`: `ToolSearch` and `ScheduleWakeup` were live
+# in that session's tool list, and a `ToolSearch` select query for deferred
+# tools returned their schemas.  So do NOT "fix" this block by trimming those
+# tools out of it on the theory that the roles cannot reach them -- they can.
+#
+# RETRACTED 2026-09-20 (task 5332), in place rather than deleted, so the next
+# editor can tell which of this block's claims rest on what.  The block used to
+# continue: "The same holds for the `BashOutput`/`KillShell` that
+# BACKGROUND_TASK_WARNING has named since task 2761."  That sentence was never
+# measured -- it inherited the authority of the genuine measurement above it
+# through the words "The same holds for", and later edits then cited the whole
+# block as settled.  It is false: neither name has ever resolved from the
+# registry, and no transcript in the fleet census ever shows one being called.
+# THE MEASUREMENT AND ITS DATES ARE NOT RESTATED HERE -- they live once, at
+# tests/test_roles_harness_tool_inventory.py::MEASURED_ABSENT_TOOLS, for the
+# same reason the size figures below live at exactly one site.
+#
+# The retraction GENERALISES, and that is the part worth carrying forward: this
+# block has now aged wrong TWICE in the same way.  Its own worked example above
+# used to cite a `ToolSearch` select query returning a `TaskOutput` schema --
+# and ten days later that name no longer resolved at all (both measurements at
+# the citation above).  Reachability is durable; the roster is not.  So the
+# guidance below is deliberately built on the things that do not churn --
+# `Bash`'s own `run_in_background` parameter, `Read` on the output file path it
+# returns, and `ToolSearch` as the way to DISCOVER the current termination tool
+# -- and names a concrete tool only where unavoidable, stamped with its
+# measurement date.  tests/test_roles_harness_tool_inventory.py now holds the
+# "a named built-in must be a real built-in" invariant mechanically.
 #
 # THE ~25-MINUTE BACKGROUND THRESHOLD is deliberate and is NOT the harness Bash
 # cap; do not "simplify" it back to 3900000.  But the watchdog mechanism differs
@@ -456,7 +485,8 @@ half-done tree that is falsely recorded as a completed, successful run.
 #     so extension_engaged latches True and the watchdog measures IDLE time: it
 #     kills only after no NEW transcript turn for
 #     max(working_idle_secs, timeout_seconds).  Polling a backgrounded command
-#     genuinely resets that clock, since each `BashOutput` poll is a new turn.
+#     genuinely resets that clock, since each read of the background task's
+#     output file is a new turn.
 #     Covers architect (2400s), implementer/debugger (1800s), merger (1800s),
 #     simple_task (7200s) -- each being max(working_idle_secs=1800, role).
 #   * steward.py:806 passes `timeout_seconds=timeouts.steward` and NEITHER
@@ -505,20 +535,40 @@ SANCTIONED
   - architect, implementer, debugger, merger, simple_task are watched on IDLE
     time — the kill fires only after no new transcript turn for
     max(working_idle_secs, your role timeout), stock 1800s = 30 minutes. Here
-    polling genuinely helps: every `BashOutput` poll IS a new turn and resets
-    that clock, which is what makes a long backgrounded run survivable.
+    polling genuinely helps: any tool call that engages the background task —
+    a `Read` of its output file — IS a new turn and resets that clock, which is
+    what makes a long backgrounded run survivable.
   - As STEWARD your ceiling is FLAT wall clock — 1800s = 30 minutes from
     session start — and NOTHING resets it. Polling does not extend it. Work
     that cannot finish inside that window must be sized down or handed off; no
     wait strategy rescues it, so do not start a 40-minute job and plan to poll.
   - As deep_reviewer no watchdog ceiling fires at all; only the harness Bash
     cap binds you. The don't-end-your-turn rule above still applies in full.
-  So: `Bash` with `run_in_background=true`, then poll it to completion with
-  `BashOutput` and READ the result BEFORE ending your turn. Launching it
-  detached with `setsid` and polling its log file is the same sanctioned shape;
-  so is backgrounding a wait command that EXITS on its own when the condition
-  holds. Polling something you launched is NOT the ad-hoc wait prohibited
-  below: you have a real completion signal, and you stay until you have it.
+  So: `Bash` with `run_in_background=true`. The launch returns a task ID AND
+  an output FILE PATH, and says it will notify you. `Read` that path — it is
+  the entire collection mechanism, and there is NO poll tool in this build to
+  go hunting for. While the command runs the file holds the output so far;
+  once it finishes the file holds the full output plus an "[exited with code
+  N]" trailer carrying the real exit status, so a single Read gives you both
+  the result and whether it passed (measured 2026-09-20 on a probe that exited
+  7). Keep reading until you have that trailer, BEFORE ending your turn. To
+  terminate instead, find the build's termination tool with `ToolSearch`
+  first — it is DEFERRED, so calling it cold is the `InputValidationError`
+  described below; today that tool is `TaskStop` (measured 2026-09-20), and if
+  `ToolSearch` stops returning that name it has been renamed, so discover the
+  current one rather than improvising. If a tool you reach for is absent, do
+  NOT fall back to a `ps`/`pgrep` liveness loop — that improvisation is the
+  failure this guidance exists to prevent; read the output file instead.
+  Launching it detached with `setsid` and reading its log file is the same
+  sanctioned shape; so is backgrounding a wait command that EXITS on its own
+  when the condition holds. A pid-based foreground wait
+  (`timeout N tail --pid=<pid> -f /dev/null`) is a LAST resort, and only if you
+  captured the pid AT LAUNCH: `run_in_background` hands you a task ID and a
+  path, never a pid, and a pid guessed with `pgrep -f` matched a wrapper
+  process in measurement, so the wait blocked its full timeout and exited 124
+  though the job had finished long before. Reading something you launched is
+  NOT the ad-hoc wait prohibited below: you have a real completion signal, and
+  you stay until you have it.
 - `Monitor` streams ONE notification per matching output line, so it fits a
   recurring event feed, not a single "tell me when this finishes" — for that,
   background a command that exits when done. If you do reach for it, load its
@@ -557,11 +607,11 @@ BACKGROUND_WAIT_GUIDANCE = BACKGROUND_TASK_WARNING + WAIT_PATTERN_GUIDANCE
 # system prompt, just spread across the system/turn pair where that test cannot
 # see it.  The point of the at-the-failure-site injection was always ADJACENCY
 # (put the rule next to the action item that trips it), and the pointer buys
-# that for ~15% of the block's bytes.
+# that for ~11% of the block's bytes.
 #
 # THE ONLY SIZE FIGURES IN THIS FEATURE LIVE HERE.  Measured on this revision:
-# BACKGROUND_WAIT_GUIDANCE 4480 B (= BACKGROUND_TASK_WARNING 1071 +
-# WAIT_PATTERN_GUIDANCE 3409), WAIT_PATTERN_REMINDER 662 B -> 662/4480 = 14.8%.
+# BACKGROUND_WAIT_GUIDANCE 6710 B (= BACKGROUND_TASK_WARNING 1193 +
+# WAIT_PATTERN_GUIDANCE 5517), WAIT_PATTERN_REMINDER 766 B -> 766/6710 = 11.4%.
 # Re-derive rather than trust these after any edit to the strings:
 #   python -c "from orchestrator.agents.roles import *; \
 #              print(len(BACKGROUND_WAIT_GUIDANCE), len(WAIT_PATTERN_REMINDER))"
@@ -569,9 +619,11 @@ BACKGROUND_WAIT_GUIDANCE = BACKGROUND_TASK_WARNING + WAIT_PATTERN_GUIDANCE
 # test_roles_wait_pattern.py is deliberately QUALITATIVE ("the full block").
 # An earlier revision hand-copied the figure to 8 sites (2 here, 6 in the test
 # file) and every one was wrong: 5 said "~3.2 kB" and 2 said "~2.6 kB" against
-# a real 4.4 kB, and 1 said the pointer costs "~2% of the tokens" against a
-# real ~15% -- a 7x error (task 3607 review).  Prose copies do not move when
-# the string they describe does.  Do not reintroduce a number anywhere else --
+# a real 4.4 kB, and 1 said the pointer costs "~2% of the tokens" against the
+# then-real ~15% -- a 7x error (task 3607 review).  Those are the figures as
+# that review found them; both constants have grown since, which is exactly
+# why the live numbers above are re-derived rather than carried forward.
+# Prose copies do not move when the string they describe does.  Do not reintroduce a number anywhere else --
 # cite this comment instead.
 #
 # Use this ONLY where the receiving role is statically known to carry
@@ -590,7 +642,7 @@ BACKGROUND_WAIT_GUIDANCE = BACKGROUND_TASK_WARNING + WAIT_PATTERN_GUIDANCE
 #
 # Keep it SUBSTANTIVE when editing: a pointer still has to STATE the operative
 # rules at the failure site -- foreground with an explicit `timeout`, or else
-# background it and poll `BashOutput` to completion before ending the turn --
+# background it and read its output file to completion before ending the turn --
 # because that adjacency is the whole reason for the injection.  Do not let it
 # decay into a bare "see the rule above" cross-reference; a reader who follows
 # no cross-reference gets nothing.  This is an editorial expectation, so it
@@ -600,12 +652,13 @@ WAIT_PATTERN_REMINDER = """
 Reminder — verification is exactly where the wait rules above bite. If it will
 finish inside ~25 minutes, run it in the FOREGROUND with an explicit Bash
 `timeout` (milliseconds; 120000 default). If it will run longer than that
-WITHOUT emitting a new assistant turn, background it and poll `BashOutput` to
-completion before you end your turn — the deciding limit is the working-regime
-watchdog, which kills this SESSION after ~30 minutes with no new turn, well
-short of the 3900000 harness ceiling, and each poll resets that clock. Never
-end this turn with verification still pending: this session is one-shot, and
-abandoned work is recorded as a successful run."""
+WITHOUT emitting a new assistant turn, background it and collect the result by
+reading the output file path the launch returns, until that file shows the
+command has exited, before you end your turn — the deciding limit is the
+working-regime watchdog, which kills this SESSION after ~30 minutes with no new
+turn, well short of the 3900000 harness ceiling, and each read is a new turn
+that resets that clock. Never end this turn with verification still pending:
+this session is one-shot, and abandoned work is recorded as a successful run."""
 
 
 # Census-2026-08-16 §1.1 companion to WAIT_PATTERN_GUIDANCE's `Monitor` bullet
@@ -1325,8 +1378,14 @@ unnamed appeal to "quality" is neither reviewable nor actionable.
 - **Comments.** Aim for code that is clear with no or low comments. Needing
   abundant and escalating amounts of commenting is a symptom of poor clarity,
   and comments drift away from the code they describe. Rationale that must
-  persist belongs in memory or in the incident record, with a pointer from the
-  code. This does not license deleting existing rationale during unrelated work.
+  persist belongs in a tracked file the next agent can read — the PRD, docs/,
+  or a test — with a pointer from the code. A pointer into memory or an
+  escalation record does not count: no dispatched role but the steward can read
+  an escalation, and a memory record is reached by search, not by a path the
+  code can name. Prose written to answer a reviewer — a measurement, a rejected
+  alternative, a defence of a decision — belongs in the commit message, or in
+  the task record where the agent holds a task write, not in the file. This
+  does not license deleting existing rationale during unrelated work.
 - **Tests.** Test access to a module's internals is an interface design smell:
   such a test pins implementation rather than behaviour, and the seam it reaches
   through is usually the real defect. Five symptoms, each reportable as an
@@ -1339,7 +1398,10 @@ unnamed appeal to "quality" is neither reviewable nor actionable.
 ## Do not steer by
 
 - **Raw line count.** Comments and docstrings can be most of a file; one large
-  module in this factory's own code measured 55% prose.
+  module in this factory's own code measured 55% prose. That is a caution about
+  the metric, not a tolerance for prose: heuristic 14's thresholds are alarms
+  that trigger a measurement, never a number to get under by deleting prose or
+  by a cheating split.
 - **Average complexity.** A file can average a good grade while eight of its
   functions score the worst one.
 - **Line coverage under autouse stubs.** A suite that stubs the thing under test
@@ -1360,7 +1422,15 @@ ARCHITECT_CODE_QUALITY_ADDENDUM = """
 When a plan splits or extracts a module, heuristics 13 and 14 bind hardest. A
 split is legitimate only when every resulting file makes internal sense in
 isolation: size is necessary, not sufficient. Small satellites that are
-function-bags over a parent's private state fail 13 while passing 14.
+function-bags over a parent's private state fail 13 while passing 14. Layering
+is a downward import of names a lower file defines and never takes back; a
+satellite that imports from the file that imports it is stitching, regardless
+of what the import brings across. When a plan leaves a large file whole rather
+than splitting it, record as a design decision the partition it tried and the
+heuristic-13 symptom each candidate hit — an upward import, a cycle, a
+reach-back — or none. Naming a symptom means naming the two modules and the
+specific import that would close the cycle or reach back; a sentence that
+merely asserts one exists is not a measurement.
 """
 
 

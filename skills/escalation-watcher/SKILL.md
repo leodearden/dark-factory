@@ -1471,6 +1471,126 @@ Infrastructure problems — database connectivity, MCP failures, service outages
 
 Reconciliation is infrastructure that affects memory quality across the entire system. **Tell the human** with full details. Track as a todo. These may indicate systematic issues that need root-cause investigation rather than point fixes. Also file a DecisionRecord via `write-decision` (see "Filing Parked Decisions to the Cockpit Registry" above).
 
+## Shadow-mode standing-policy rulings (measurement only)
+
+`docs/escalation-standing-policy.md` proposes classes of L2 that an adjudicating session could one
+day rule without waiting for the human. **None of them is adopted.** This section adds one thing to
+your loop and it is not an action: for an L2 you *would* rule under that policy, record what you
+would have ruled, then **handle the record exactly as its category section above says** — which for
+`risk_identified` and `design_concern` still means escalating to the human and filing the cockpit
+DecisionRecord. The stamp changes nothing about what you do.
+
+### Never stamp a record you are going to rule yourself
+
+This rule comes before the mechanics because skimming past it is how the measurement goes bad.
+
+A `design_concern` you close under "Standing rule: accept verified info-level design deviations
+(Leo, 2026-09-17)" above gets **no shadow stamp**. You are the adjudicator there, so there is no
+independent decision to compare your proposal against.
+
+The reason, in one line you can check: the weekly count reads `resolved_by` back through
+`escalation/src/escalation/classify.py::classify_resolver_tier`, where `escalation-watcher`
+classifies as `human` — exactly like a Leo ruling. A stamp plus a self-close is therefore the
+session agreeing with itself, and it would push a class toward its own adoption threshold on the
+strength of your own actions.
+
+The count does catch it: such a record is bucketed `self_resolved` and dropped from every rate. So a
+violation costs the sample, not the truth — but it still costs the sample.
+
+### Stamping
+
+Write the proposal as one `x_shadow_ruling:` line inside `triage_note`:
+
+```text
+x_shadow_ruling: {"class": "risk_identified_branch_behind_main", "proposed_action": "close_only", "evidence": "git merge-base --is-ancestor main task/4821 -> rc=0; branch is not behind", "confidence": 0.9}
+```
+
+Call it as `stamp_triage(escalation_id=..., triaged_by=..., triage_note=...)`. The `class` must be
+one of the first-tranche slugs and `proposed_action` one of the reversible-action slugs, both
+enumerated in `docs/escalation-standing-policy.md`. `evidence` quotes the deciding probe output
+verbatim — not a conclusion about it. `confidence` is in `[0.0, 1.0]`.
+
+A payload outside those vocabularies is discarded by the reader, so it is a lost sample rather than
+a loud error. This one is thrown away:
+
+```text <!-- shadow-guard: negative -->
+x_shadow_ruling: {"class": "risk_identified_branch_behind_main", "proposed_action": "restart", "evidence": "looks fine", "confidence": 0.9}
+```
+
+`restart` is a C1 action but it is not *reversible*, so it is not in the reversible-action list and
+the whole payload is dropped.
+
+### CAUTION: `stamp_triage` REPLACES `triage_note`, it never appends
+
+Verified in `escalation/src/escalation/queue.py::stamp_triage`: passing a non-empty `triage_note`
+overwrites the existing one wholesale.
+
+So on an **already-triaged** record you must re-send the previous note's content with the
+`x_shadow_ruling:` line appended on its own line. Send the marker alone and you destroy the earlier
+predicate and probe. (Omitting `triage_note` entirely is the safe freshness-bump form — it leaves
+the existing note untouched.)
+
+Re-stamping therefore leaves the note carrying **two** marker lines, which is expected and safe:
+the weekly count reads the **last** one as the record's ruling and treats the earlier lines as
+superseded. Append the new marker below the old one rather than editing the old one in place — and
+if the newest line is malformed the record is counted in `rejected_stamps`, never scored against
+the stale proposal above it.
+
+The marker goes on its **own line** of a note that still satisfies the freshness contract in
+"Reading a triage-ack annotation" above: a named world-facing predicate plus the probe used to check
+it. A shadow stamp is not a substitute for that predicate — and per that same subsection, a
+predicate about the record's own status is vacuous. A well-formed stamped note looks like:
+
+```text
+task-4821 branch tip not behind main | probe: git merge-base --is-ancestor main task/4821 -> rc=0
+x_shadow_ruling: {"class": "risk_identified_branch_behind_main", "proposed_action": "close_only", "evidence": "git merge-base --is-ancestor main task/4821 -> rc=0; branch is not behind", "confidence": 0.9}
+```
+
+### Never stamp a human-forever gate
+
+`docs/escalation-standing-policy.md` lists all seven. Two are detectable from the record itself and
+`escalation/src/escalation/shadow_ruling.py::mechanically_gated` finds them: a `milestone_gate`
+category and the `orchestrator-deterministic` role. The other five — model admission, physical
+operator actions, irreversible deletions, spend or eval launches, and a post-breaker
+`resume_scheduler` — have no signal on the record, so they are your judgement. A stamp on any of
+them is reported as `gated_stamps` and excluded from every rate.
+
+### Two facts about attribution and timing
+
+**Attribution here is a convention, not a guarantee.**
+`escalation/src/escalation/server.py::stamp_triage` overrides `triaged_by` from the
+`X-Escalation-Identity` header **only when that header is present**. The auto-watcher sends one, so
+for it the attribution is server-enforced; this session does not, so `triaged_by` is whatever you
+pass. This NARROWS the general statement in "Reading a triage-ack annotation" above for your own
+stamps. Therefore: **pass the same identity string you resolve with**, or `triaged_by` and
+`resolved_by` never compare and the `self_resolved` check silently never fires.
+
+**Stamp before the record is resolved.** `stamp_triage` refuses anything that is not `pending`, so a
+stamp written after the close is simply not written.
+
+### The weekly count
+
+```
+uv run --directory escalation python -m escalation.shadow_ruling \
+    --queue-dir <project_root>/data/escalations
+```
+
+Read it as: `agreed` / `diverged` over the **comparable** denominator printed beside the rate;
+`not_comparable` for proposals whose action is task-side and leaves no `resolution_action` to check
+against; `non_human_resolver` for a record no human resolved at all — a cascade, a sweep, the
+steward — counted per class, because the aggregate `resolver_tiers` line says only which tier took
+the sample; `gated_stamps`, `self_resolved` and `rejected_stamps` for stamps excluded from every rate
+— those three are counted over the same window as the rate. A class whose records are mostly
+`self_resolved` is not a class with a small sample — it is not measurable yet, and a non-zero
+`rejected_stamps` means the count could not read that many markers at all.
+
+`unresolved_lifetime` is the exception and says so in its name: a pending record has no
+`resolved_at` to window on, so that number is the standing backlog at sweep time, not a count from
+the window in the header.
+
+A class adopts only when task 3346 has landed **and** it has met the threshold in
+`docs/escalation-standing-policy.md`. Until both hold, keep stamping and keep escalating.
+
 ## Context Conservation
 
 You're in a long-running session — conserve your context window aggressively. Over a multi-day AFK

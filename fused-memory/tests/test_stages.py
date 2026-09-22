@@ -2105,6 +2105,12 @@ class TestProjectIdValidation(BaseStageValidationTest):
             'orphaned_recon_escalations_unresolvable': 0,
             'orphaned_recon_escalations_errors': 0,
             'orphaned_recon_escalations_flags_emitted': 0,
+            # Always present (task 4814), pre-initialised beside the
+            # task-2312/2229/3084 pre-inits above and before the
+            # remediation early-return.  Stays 0 here: no active task is
+            # human-gate-owned, so the deterministic gate-owned
+            # suggested_action normalizer rewrites nothing.
+            'gate_owned_suggested_actions_normalized': 0,
         }
         assert result.started_at is not None
         assert result.started_at <= result.completed_at
@@ -2262,6 +2268,12 @@ class TestProjectIdValidation(BaseStageValidationTest):
             'orphaned_recon_escalations_unresolvable': 0,
             'orphaned_recon_escalations_errors': 0,
             'orphaned_recon_escalations_flags_emitted': 0,
+            # Always present (task 4814), pre-initialised beside the
+            # task-2312/2229/3084 pre-inits above and before the
+            # remediation early-return.  Stays 0 here: no active task is
+            # human-gate-owned, so the deterministic gate-owned
+            # suggested_action normalizer rewrites nothing.
+            'gate_owned_suggested_actions_normalized': 0,
         }
         assert result.started_at is not None
         assert result.started_at <= result.completed_at
