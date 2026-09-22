@@ -166,16 +166,58 @@ longer exists.** All three leaves are `done`. `find_markup_pattern` and
 `find_markup_violation` were **deleted by γ3 / task 4458**, together with the
 write-time gate they served — `markup_tripwire.py` records the deletion in place
 and now re-exports `MCP_MARKUP_PATTERNS` only to feed a same-file drift guard. The
-live path is `shared.toolcall_markup.detect` / `detect_for` over
+live path as of that date is `shared.toolcall_markup.detect` over
 `ENVELOPE_LITERALS`, which `shared/src/shared/mcp_markup_middleware.py` imports and
 calls at the boundary — that is, precisely the generalisation this paragraph names
-as the fix.
+as the fix. The parameter-aware `detect_for` that same boundary also calls *today*
+is **not** part of this 2026-08-20 reading: it did not exist until 2026-08-25 (task
+**4696**). The next paragraph dates that difference, because it changes what a
+`matched_pattern` is allowed to mean.
 
-**How to read a write-time `matched_pattern`, by date.** On or after 2026-08-20 it
-may be read as the tag that was mis-closed, within `ENVELOPE_LITERALS`. Before that
-date — which is every specimen catalogued in this document — the narrower reading
-still holds: "an envelope literal was seen here", not "this is the tag that was
-mis-closed".
+**How to read a write-time `matched_pattern`, by date.** THREE windows, not two,
+because the scan widened twice and only the second widening makes the pattern name
+the mis-closed tag in general.
+
+- **On or after 2026-08-25** — task **4696**: `cb68bc3369` added `detect_for`, the
+  parameter-aware predicate, and `ac6f9e538e` made the live write boundary call it.
+  The scan is widened with the scanned argument's OWN name-echoing closer, so
+  `matched_pattern` **may be read as the tag that was mis-closed**.
+- **Between 2026-08-20 and 2026-08-25** the guard was live but scanned the FIXED
+  `ENVELOPE_LITERALS` only — six members, not one of them derived from the argument
+  being scanned. In that window it names the mis-closed tag **only when that tag is
+  one of `description`, `parameter`, `details` or `content`**; for every other
+  parameter name it still names whatever FOLLOWS the mis-closed tag. Worked example:
+  `esc-plan-tools-markup-residue-1` (`reify`), fired 2026-08-21T21:17:56Z, from
+  `/home/leo/src/reify/data/escalations/archive/2026-08-22/` — the record whose
+  `add_design_decision.decision` argument absorbed the following `rationale`
+  parameter, tabled in the containment PRD
+  (`plans/toolcall-markup-containment-prd.md` §2.5). The mis-closed tag there was
+  `decision`, which is not one of the four; the reported `matched_pattern` is the
+  canonical parameter-opener prefix, i.e. the opening of the `rationale` argument
+  that followed it. A reader applying the post-2026-08-25 rule to that record would
+  conclude the mis-closed tag was `parameter`. (Measured 2026-09-22: retention has
+  since pruned that archive directory — its oldest surviving day is 2026-08-23 — so
+  the PRD transcription is now the only copy, which is the reason it was transcribed.)
+- **Before 2026-08-20** — which is every specimen catalogued in this document — the
+  narrower reading still holds: "an envelope literal was seen here", not "this is
+  the tag that was mis-closed".
+
+**One accepted residual survives the 2026-08-25 widening, at the GENERIC boundary
+only.** `shared/src/shared/mcp_markup_middleware.py::MarkupGuardMiddleware._first_markup_argument`
+documents it in place: a CROSS-FIELD misclose — a closer naming a *different*
+parameter of the *same* tool — still passes, because that scan calls
+`detect_for(value, param)` with the argument's own name and **no schema**, so
+`matched_pattern` blames the follower exactly as in the middle window above. Two
+qualifiers travel with it, or it reads worse than it is. The schema is withheld
+**deliberately**: widening would put an awaited `get_tool` round-trip on every clean
+call, which is what the boundary's ordering exists to avoid. And the same 2026-08-25
+corpus measurement that sized the widening — 444 corrupted entries over the fleet's
+`plan.json` files — puts the cross-field population at **zero**. The residual is also
+narrower than "the write boundary": the sites that hold their schema for free DO pass
+it — `orchestrator/src/orchestrator/mcp/plan_tools.py` calls
+`detect_for(value, record.field, record.schema_params)` at two sites, and
+`scripts/sweep_toolcall_markup.py` passes its own key set — so it does not apply at
+plan-tools, which is where most catalogued specimens were caught.
 
 ---
 
