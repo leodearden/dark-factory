@@ -316,8 +316,8 @@ class CockpitApp(App):
         self._queue_items_by_key: dict[str, QueueItem] = {}
         # In-memory "already acted on" marker, set by action_focus_selected.
         # Expires with the ASK it was set against, under the same shared
-        # predicate as the overlays below (_prune_overlays), plus a cheap
-        # redundant queue-membership prune at the tail of _rebuild_queue.
+        # predicate as the overlays below (_prune_overlays). The
+        # queue-membership line at the tail of _rebuild_queue is only a guard.
         self._handling: set[str] = set()
         # Ephemeral in-memory overlays, keyed the same way (a session key is
         # stable for the session's whole lifetime). Pruned on every rebuild
@@ -790,9 +790,9 @@ class CockpitApp(App):
         identity stored in self._overlay_asks still equals the CURRENT
         _ask_identity(key). This is the single statement of that rule --
         the collections' own declarations and their action handlers point
-        here rather than restating it. self._handling alone additionally
-        carries a redundant queue-membership prune at the tail of
-        _rebuild_queue; see there for the one case that still divides them.
+        here rather than restating it. self._handling alone also meets a
+        queue-membership guard at the tail of _rebuild_queue, which is not
+        a second rule; see there.
 
         Then garbage-collects self._overlay_asks down to the keys still
         referenced by SOME overlay, so the bookkeeping side-table cannot
@@ -874,13 +874,16 @@ class CockpitApp(App):
         built from already-pruned state.
 
         The tail `self._handling &= self._queue_items_by_key.keys()` line
-        is a cheap, redundant second line of defence on top of it, not the
-        rule. The one case where the two predicates still diverge is a
-        still-live ask that self._dropped keeps out of the queue: only the
-        tail line clears that mark. It cannot move up into _prune_overlays,
-        because self._queue_items_by_key is not rebuilt until order_queue
-        returns -- evaluated at the head it would read the PREVIOUS
-        rebuild's queue and so clear the mark for a row about to reappear.
+        has no visible effect today. It is kept only as a guard, so that a
+        row restored by an un-drop action, should one ever be added, comes
+        back unmarked. The one mark it clears that _prune_overlays keeps
+        sits on a still-live ask self._dropped holds out of the queue:
+        order_queue builds no item for a dropped key, and the drop ends
+        only when its ask does, in the same _prune_overlays pass that
+        clears the mark. The line cannot move up into _prune_overlays:
+        self._queue_items_by_key is not rebuilt until order_queue returns,
+        so at the head it would read the PREVIOUS rebuild's queue and clear
+        the mark for a row about to reappear.
         """
         self._prune_overlays()
         now = self._now_fn()
