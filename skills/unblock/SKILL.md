@@ -551,6 +551,7 @@ The merge procedure is iterative — don't assume one pass will be enough:
    - Pass `{"kind": "merged", "commit": "<sha>"}` when this branch supplied the merge — thread the SHA from `result["commit"]` for an immediate terminal response, or re-derive from `git log main` for a polled terminal response (see polled-done note above).
    - Pass `{"kind": "found_on_main", "commit": "<sha>", "note": "<one-sentence explanation>"}` when the work was already on main — including the fast-forward and covered-by-sibling cases, where the sha is the commit on main that cites this task (the same sha for both: the citation gate cannot tell them apart, and does not need to). A `found_on_main` `merge_sha` returned by the tool is safe to stamp only **as returned** — do not substitute the branch tip or `git merge-base` output for it.
    - If you have no sha in hand, do not guess: run [`skills/_shared/deriving-landed-sha.md`](../_shared/deriving-landed-sha.md#the-ladder) in full — entered from the [canonical ancestry check](#branch-on-main) above — which yields the correct sha on every landed arm.
+   - **One arm skips this step entirely**, and it is a success path rather than an abort: a `coalesce-*` member that resolves **landed AND credited** — the [resumed poll](#resumed-poll)'s landed-and-credited break, where this task's scheduler status already reads `done` because `mark_member_done` flipped it. The credit is already recorded, so there is nothing to write and writing anyway is the self-stamp that arm forbids. Go straight to step 9. This is the **only** exemption: every other landed arm reaches this step and stamps.
 9. Clean up: `git worktree remove .worktrees/<TASK_ID>` and `git branch -d task/<TASK_ID>`
 
 **Merge-step failure and abandonment edges:**
@@ -684,7 +685,8 @@ The merge procedure is iterative — don't assume one pass will be enough:
   — under **either** rc=1 **or** rc=128-with-empty-marker — the landing signals below may also end
   the loop, but **only when they resolve to landed AND credited**: signal (a) shows the tip landed
   *and* signal (b), re-read fresh, says `done`. That is a **cleanup** exit, not a stamping one —
-  the automatic flip already happened, so there is nothing for step 8 to write.
+  the automatic flip already happened, so there is nothing for step 8 to write: **skip step 8
+  entirely** and go straight to **step 9** (cleanup). This is a **success** path, not an abort.
 
   **Signal (a) alone must never break the loop.** Signal (a)-landed next to a non-`done` signal (b)
   is exactly rule 2b's veto: keep polling to `terminal_resumed`'s 20-minute ceiling, and only then
@@ -754,32 +756,13 @@ The merge procedure is iterative — don't assume one pass will be enough:
     (`orchestrator/src/orchestrator/harness.py::mark_member_done`).
   - **Under rc=128-with-empty-marker** → [`skills/merge-queue/SKILL.md`](../merge-queue/SKILL.md)'s
     **rule 2a** governs; follow it there rather than from here.
-  - **Under rc=1 on the `coalesce-*` arm** → merge-queue's **rule 2b** governs, and signal (b) is a
-    **veto, not a corroborator**. There is no self-stamp on this arm. Once signal (a) shows the tip
-    landed, re-read signal (b) fresh:
-    - `done` → the automatic flip already happened. Nothing to write; conclude landed and proceed to
-      cleanup.
-    - **Any other status — `pending`, `merge-deferred`, or anything else — means do not write,
-      ever.** `pending` is what
-      `orchestrator/src/orchestrator/harness.py::_revert_withheld_member` leaves behind once
-      `mark_member_done`'s `_delivered_checks_withhold` blocks the flip because the member's declared
-      capability is not verifiably on main — the member's **only** recovery edge. Stamping `done`
-      over it destroys that recovery edge, marks done a task whose declared capability is not
-      verifiably on main (which unblocks its dependents through the delivered-check dep-gate), and
-      races a scheduler re-dispatch of the same task.
-    Confirm by content anyway — it is what makes the eventual report accurate, not a licence to
-    write: `git cherry main task/<TASK_ID>` — the same patch-id test
-    `orchestrator/src/orchestrator/git_ops.py::GitOps.rebase_preserving_task_commits` uses to tell a
-    legitimate post-rebase dedup from a genuine commit wipe — prints `-` for each of this branch's
-    commits already patch-equivalent on main and `+` for one genuinely absent. Treat this member as
-    landed-by-content only when the output is **non-empty and every line starts with `-`**. **An
-    empty output is NOT landed** — a branch that never advanced past its creation point also prints
-    nothing, so `git cherry main task/<TASK_ID> | grep -q '^+' || echo landed` belongs to the same
-    unsound-idiom family this file bans elsewhere. **This content proof cannot discharge the veto:**
-    it proves this branch's commits are patch-equivalent on main, while the withhold gates on the
-    member's declared capability against the committed main tree — a different predicate an all-`-`
-    `git cherry` is fully compatible with, so a passing content check next to a non-`done` status is
-    exactly the split-brain, not a reason to stamp over it.
+  - **Under rc=1 on the `coalesce-*` arm** → [`skills/merge-queue/SKILL.md`](../merge-queue/SKILL.md)'s
+    **rule 2b** governs; follow it there rather than from here. The verdict, so you know which way
+    the arm points before you go: rc=1 is **not** a not-landed outcome here, signal (b) is a **veto,
+    not a corroborator**, and **there is no self-stamp on this arm**. Read rule 2b there for the
+    argument — which exit each scheduler status yields, its **landed-but-not-credited** report, and
+    the `git cherry main task/<TASK_ID>` content proof including why that proof cannot discharge the
+    veto — rather than restating it.
   - **`get_merge_queue()` no longer showing the train is NOT a landing signal.** It means only
     "stop waiting on the train," and is equally consistent with a **derail**: on any non-`done`
     train outcome the orchestrator re-pends the still-unlanded members for solo re-merge
