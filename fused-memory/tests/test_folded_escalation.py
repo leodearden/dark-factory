@@ -314,9 +314,15 @@ class TestNeverRaises:
 
         monkeypatch.setattr(_folded_escalation, 'EscalationQueue', _BrokenQueue)
 
-        with caplog.at_level('ERROR'):
+        with caplog.at_level(logging.DEBUG):
             assert _emit(tmp_path) is None
-        assert caplog.records, 'a swallowed failure must still be visible'
+        assert any(r.levelno == logging.ERROR for r in caplog.records), (
+            'a swallowed failure must still be visible, and this arm is '
+            '`logger.exception`, i.e. ERROR. Captured at DEBUG and pinned on '
+            'levelno so a downgrade FAILS here rather than being hidden by the '
+            'capture filter, which a bare `assert caplog.records` under '
+            "`at_level('ERROR')` could not distinguish from silence."
+        )
 
     def test_a_get_by_task_failure_falls_through_to_filing(self, tmp_path, monkeypatch):
         """A read failure must not BLOCK the alarm — better a possible
@@ -368,7 +374,11 @@ class TestNeverRaises:
 
         assert result is None
         assert not (tmp_path / 'data' / 'escalations').exists()
-        assert caplog.records, 'a no-op alarm must still say so'
+        assert any(r.levelno == logging.DEBUG for r in caplog.records), (
+            'a no-op alarm must still say so, at the helper DEFAULT level — '
+            'see TestTheEmittedLevelIsACallerConcern for why that default is '
+            'DEBUG and how a caller opts out of it'
+        )
 
     def test_a_none_project_root_returns_none_quietly(self, tmp_path, caplog):
         """`write_triage` takes `project_root: str | None`; None means there is
@@ -475,6 +485,75 @@ class TestFoldHookAndLogging:
             'the subject that went unescalated' in r.getMessage()
             for r in caplog.records
         )
+
+
+class TestTheEmittedLevelIsACallerConcern:
+    """A never-raise alarm path is exactly where a silent level downgrade is
+    most costly, because the ONLY symptom is absence of output.
+
+    Every other arm of this helper announces a downgrade somehow — a wrong
+    `severity` shows up in the filed record, a wrong anchor shows up in the
+    pairwise sweep. A level that drops below the operator's threshold produces
+    no record, no file and no exception; the alarm simply stops being seen,
+    and "no output" is indistinguishable from "nothing to report". That is the
+    same silence this module's own docstring argues against, one layer down.
+
+    So the levels are PINNED rather than left to whatever `logger.<method>`
+    the body happens to call. The package-unavailable arm defaults to DEBUG
+    and a caller may raise it; the fold arm defaults to INFO and a caller
+    replaces it wholesale via `on_fold`.
+
+    Asserted on `levelno` against the `logging.*` constants, never on
+    `levelname` strings: a level is an ordered numeric fact, and comparing its
+    rendered name would be a meaningful string standing in for structured data
+    (heuristic 12).
+    """
+
+    def test_the_package_unavailable_arm_defaults_to_debug(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        """Six of the seven migrated filers treat an absent optional
+        `escalation` package as a DEBUG detail, so that is the default — NOT a
+        judgement that DEBUG is the right house level for a lost alarm."""
+        monkeypatch.setattr(_folded_escalation, 'HAS_ESCALATION', False)
+
+        with caplog.at_level(logging.DEBUG):
+            assert _emit(tmp_path) is None
+
+        assert [r.levelno for r in caplog.records] == [logging.DEBUG]
+
+    def test_a_caller_can_raise_the_package_unavailable_arm(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        """`referent_repair_storm_escalator` treats a missing package as a LOST
+        ALARM rather than a detail: a repair storm is a sustained scanner or
+        resolver regression, so in an env without the optional package the
+        DEBUG default emits nothing at all at the default threshold."""
+        monkeypatch.setattr(_folded_escalation, 'HAS_ESCALATION', False)
+
+        with caplog.at_level(logging.DEBUG):
+            result = _emit(tmp_path, no_escalation_level=logging.WARNING)
+
+        assert [r.levelno for r in caplog.records] == [logging.WARNING]
+        assert result is None, 'raising the level must not change the verdict'
+        assert not (tmp_path / 'data' / 'escalations').exists(), (
+            'raising the level must not start filing where the package is gone'
+        )
+
+    @_needs_escalation
+    def test_the_default_fold_arm_is_info(self, tmp_path, caplog):
+        """A fold is a SUPPRESSION, so it stays visible — but a storming
+        project folds on every subsequent event, which is why the default sits
+        at INFO rather than WARNING. A caller wanting otherwise supplies
+        `on_fold` and logs on its own logger at its own level."""
+        first = _emit(tmp_path)
+        assert first is not None
+
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            assert _emit(tmp_path) == first
+
+        assert [r.levelno for r in caplog.records] == [logging.INFO]
 
 
 # ---------------------------------------------------------------------------
