@@ -72,12 +72,19 @@ def make_escalation(
     level: int = 1,
     detail: str | None = None,
     project_id: str = 'dark_factory',
+    field_project_id: str | None = None,
 ) -> Escalation:
     """Build a real ``Escalation`` (never a mock) in the shape Stage 1 files.
 
     Real dataclass instances are used throughout this file so that a field
     rename or default change in ``escalation.models.Escalation`` breaks these
     tests instead of silently passing against a mock's ``__getattr__``.
+
+    ``project_id`` feeds the DETAIL PROSE; ``field_project_id`` sets the
+    structured ``Escalation.project_id``.  They are separate kwargs precisely
+    so a test can set them to DISAGREEING values — a helper with one kwarg
+    driving both could not express the case that proves the field wins.
+    ``field_project_id=None`` is the legacy record: prose only, no stamp.
     """
     if detail is None:
         detail = '\n'.join([
@@ -98,6 +105,7 @@ def make_escalation(
         detail=detail,
         status=status,
         level=level,
+        project_id=field_project_id,
     )
 
 
@@ -137,11 +145,15 @@ class TestSingleOwnerConstants:
 
 
 class TestEscalationProjectId:
-    """``escalation_project_id`` owns the ``project_id:`` detail-line parse.
+    """``escalation_project_id`` owns the project-id derivation, field-first.
 
-    ``Escalation`` carries NO ``project_id`` field, so there is no structured
-    fact to read — the value must be recovered from the detail block both
-    producers write.  This is the one place in the tree that does it.
+    ``Escalation`` carries a structured ``project_id`` (task 4951) and this
+    function prefers it.  The ``project_id:`` detail-line parse is retained as
+    the fallback for records that carry no usable stamp, which is not a
+    shrinking-by-itself population: a gate-backlog refiling normally FOLDS
+    into an existing pending parent, and folding writes no child record and
+    backfills no parent field.  This is the one place in the tree that resolves
+    either source.
     """
 
     def test_parses_the_current_gate_backlog_filing_format(self):
@@ -222,9 +234,66 @@ class TestEscalationProjectId:
         assert escalation_project_id(esc) is None
 
     def test_object_without_a_detail_attribute_returns_none(self):
-        """A non-``Escalation`` element never raises AttributeError."""
+        """A non-``Escalation`` element never raises AttributeError.
+
+        This is also what forces the field read to be ``getattr(esc,
+        'project_id', None)`` rather than attribute access: ``object()`` has
+        neither attribute, and an AttributeError here would abort the sweep
+        for every other record in the batch.
+        """
         assert escalation_project_id(object()) is None
         assert escalation_project_id(None) is None
+
+    # --- field-first (task 4951) ---
+
+    def test_prefers_the_structured_field_over_the_detail_prose(self):
+        """The emitter's structured fact wins over its own rendered prose.
+
+        The two sources DISAGREE here deliberately: a fallback-only
+        implementation returns the prose value and fails.  This is the
+        assertion that actually closes the INV-2 gap.
+        """
+        esc = make_escalation(field_project_id='reify', project_id='dark_factory')
+
+        assert escalation_project_id(esc) == 'reify'
+
+    def test_falls_back_to_the_detail_parse_when_the_field_is_absent(self):
+        """An unstamped legacy record still resolves through the prose."""
+        esc = make_escalation(field_project_id=None, project_id='solar_challenge')
+
+        assert escalation_project_id(esc) == 'solar_challenge'
+
+    def test_an_empty_field_falls_back_to_the_detail_parse(self):
+        """A blank stamp is UNSTAMPED, not a parse failure.
+
+        ``None`` on the field means "no producer set this", and ``''`` is no
+        more usable an identity than ``None`` — both must degrade to the prose
+        rather than resolve to an empty project name.
+        """
+        esc = make_escalation(field_project_id='', project_id='know_live')
+
+        assert escalation_project_id(esc) == 'know_live'
+
+    def test_a_non_str_field_falls_back_to_the_detail_parse(self):
+        """A non-str field degrades to the prose and never raises.
+
+        Same reasoning as the non-str ``detail`` case above: the record is
+        deserialised from JSON on disk, so a malformed value must not abort
+        the sweep for every other record.
+        """
+        esc = make_escalation(project_id='pump_web_ui')
+        esc.project_id = 12345  # type: ignore[assignment]
+
+        assert escalation_project_id(esc) == 'pump_web_ui'
+
+    def test_field_is_returned_when_detail_carries_no_project_id_line(self):
+        """A stamped record needs no prose at all — that is the point."""
+        esc = make_escalation(
+            field_project_id='pump_web_ui',
+            detail='run_id: abc\ntask_id: 7\ntitle: t',
+        )
+
+        assert escalation_project_id(esc) == 'pump_web_ui'
 
 
 class TestSelectReapableEscalations:
