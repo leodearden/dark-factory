@@ -34,6 +34,7 @@ as a migrated one.
 
 from __future__ import annotations
 
+import pathlib
 import re
 
 import pytest
@@ -527,3 +528,105 @@ def test_the_locks_cell_site_hands_over_a_datum(census_bodies):
         'inside the render rather than drawing the unknown arm:\n'
         f'{spans[0]}'
     )
+
+
+# ---------------------------------------------------------------------------
+# The endpoint paths that key DF_DATA.__receipt
+#
+# plainDatum's provenance is endpoint-granular until PRD leaf beta puts a served
+# Datum on the wire, so each tile hands it the path its number arrived on — and
+# that path is a LOOKUP KEY into a map data.js wrote.  Four JSX files now declare
+# those paths as hand-typed copies (tabs.jsx::EP, tab_overview.jsx::EP_OVERVIEW,
+# tab_escalations.jsx::EP_ESCALATIONS, tab_escalation_analytics.jsx::EP_ANALYTICS)
+# of paths already written once in data.js::endpointsFor.
+#
+# WHAT A MISTYPED COPY DOES, and why it needs a test rather than care.  It is the
+# one failure the wrapper cannot report: the lookup finds no receipt, plainDatum
+# takes its "not yet fetched" arm, and every tile on that endpoint reads as a
+# permanent em-dash with a never-fetched tooltip while the endpoint is in fact
+# healthy.  That is the confident lie this PRD exists to remove, inverted — and
+# the four copies are all correct today, which is exactly when a drift guard is
+# worth installing.
+#
+# THE SAME GUARD ALREADY EXISTS ONE LAYER DOWN.  endpoint_staleness.js carries
+# its own copy of this path list and endpoint_staleness.test.mjs:222 ("every
+# mapped endpoint is a real endpointsFor() path") pins it against the registry.
+# This is that test's JSX analogue; the registry stays the one place a path is
+# declared (heuristic 11, SPOT).
+# ---------------------------------------------------------------------------
+
+# Every asset index.html serves, discovered rather than listed: a fifth copy
+# added by a later leaf is caught only if nothing has to remember to enrol it.
+_REDUX_DIR = pathlib.Path(__file__).resolve().parent.parent / 'src' / 'dashboard' / 'static' / 'redux'
+
+# `/api/load` and the other non-dashboard routes are deliberately out of range —
+# the claim is about the receipt map's keys, which are dashboard endpoints.
+_DASHBOARD_PATH_RE = re.compile(r'/api/v2/dashboard/[A-Za-z0-9-]+')
+
+
+@pytest.fixture(scope='module')
+def registry_paths(_client) -> set[str]:
+    """Every endpoint path data.js::endpointsFor declares, query already stripped.
+
+    Read out of the registry FUNCTION rather than the whole file, so a path
+    mentioned anywhere else in data.js (ON_DEMAND_KEYS builds one by
+    interpolation) cannot make an undeclared copy look declared.
+    """
+    resp = _client.get('/static/redux/data.js')
+    assert resp.status_code == 200, f'data.js is not served (HTTP {resp.status_code})'
+    body = extract_function_body(strip_js_comments(resp.text), 'endpointsFor')
+    paths = set(_DASHBOARD_PATH_RE.findall(body))
+    assert paths, 'no endpoint paths found in endpointsFor — the extractor lost the registry'
+    return paths
+
+
+def test_every_endpoint_path_a_redux_asset_names_is_one_the_registry_polls(_client, registry_paths):
+    """No served asset may name a dashboard endpoint endpointsFor does not declare.
+
+    Counted over every ``.js``/``.jsx`` under ``static/redux`` except data.js
+    itself, so the guard covers a file this leaf never touched and a file a later
+    leaf adds.  Comment-stripped, so a path quoted in prose — and the four EP
+    blocks each quote one — cannot satisfy or break the probe.
+    """
+    offenders = {}
+    for source in sorted(_REDUX_DIR.glob('*.js*')):
+        if source.name == 'data.js':
+            continue
+        resp = _client.get(f'/static/redux/{source.name}')
+        assert resp.status_code == 200, (
+            f'{source.name} is on disk but not served (HTTP {resp.status_code}).'
+        )
+        undeclared = set(_DASHBOARD_PATH_RE.findall(strip_js_comments(resp.text))) - registry_paths
+        if undeclared:
+            offenders[source.name] = sorted(undeclared)
+
+    assert not offenders, (
+        f'these assets name dashboard endpoints data.js::endpointsFor does not '
+        f'declare: {offenders}. A path that is not a registry key is not a key of '
+        'DF_DATA.__receipt either, so plainDatum finds no receipt and every tile '
+        'on it reads as a permanent em-dash while the endpoint is healthy. Fix '
+        'the spelling, or add the row to endpointsFor.'
+    )
+
+
+def test_the_four_datum_files_key_their_receipts_off_real_paths(census_bodies, registry_paths):
+    """Each file that calls plainDatum/derivedDatum names at least one real path.
+
+    The sibling above is an ABSENCE assertion, which passes just as happily over
+    a file that names no path at all — including one whose EP block was deleted
+    and whose tiles now key their receipts off `undefined`.  This is the presence
+    half, and it is stated per file so a deletion cannot hide behind the other
+    three.
+    """
+    for name in _STAT_TILE_SITES:
+        body = census_bodies[name]
+        named = set(_DASHBOARD_PATH_RE.findall(body))
+        assert named, (
+            f'{name} calls plainDatum but names no /api/v2/dashboard path, so every '
+            'receipt lookup in it resolves to undefined and every tile reads as '
+            'never-fetched.'
+        )
+        assert named <= registry_paths, (
+            f'{name} names {sorted(named - registry_paths)}, which endpointsFor '
+            'does not declare.'
+        )
