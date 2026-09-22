@@ -588,32 +588,17 @@ def build_task_payloads(clusters, *, project_root: str, project_id: str) -> list
 
 
 def _ticket_id_from_submit_result(result) -> str | None:
-    """Extract the ticket id from one curator-path ``submit_task`` result,
-    or ``None`` when the call produced nothing filable.
+    """The ticket id one curator-path ``submit_task`` call answered with, or
+    ``None`` if it filed nothing usable.
 
-    SPOT for what that seam actually returns. ``submit_task`` answers the
-    curator path with ``{"ticket": "tkt_<id>"}`` -- a TICKET id, NOT a task
-    id (``fused_memory/server/tools.py::submit_task``,
-    ``fused_memory/middleware/task_interceptor.py::TaskInterceptor``). The
-    curator decides create/combine/drop asynchronously, so at this point in
-    a census run no task id exists yet; ``resolve_ticket`` obtains it later.
-    Callers must not label a value from here a task id -- fused-memory hard
-    rejects a ticket-shaped id passed where a task id is expected
-    (``tools.py::_reject_if_ticket_id``).
-
-    Two shapes yield ``None`` so the caller can log and exclude rather than
-    abort or inflate the filed count: a rejected or failed call answers
-    ``{"error": ..., "error_type": ...}`` (no ticket key), and a transport
-    fault can answer a non-dict. A non-string or empty ``ticket`` value is
-    refused for the same reason -- an unusable value must never render as a
-    report bullet.
-
-    The synchronous planning-mode shape ``{"task_id": ..., "status":
-    "deferred", "planning_mode": True}`` is deliberately OUT OF SCOPE:
-    ``build_task_payloads`` omits ``planning_mode`` on purpose (PRD decision
-    9) so filing goes through the curator, and ``planning_mode=True`` is the
-    only switch to that shape. Accepting it here would be unreachable code
-    that quietly widens the contract this docstring states.
+    SPOT for that seam's contract (``fused_memory/server/tools.py::submit_task``,
+    ``fused_memory/middleware/task_interceptor.py::TaskInterceptor``): success
+    is ``{"ticket": "tkt_<id>"}`` -- a TICKET id, not a task id. The curator
+    decides create/combine/drop later, and ``resolve_ticket`` then yields the
+    task id. A rejection (``{"error": ..., "error_type": ...}``), a non-dict,
+    or a missing, empty or non-string ticket gives ``None``. The planning-mode
+    ``task_id`` shape is out of scope: ``build_task_payloads`` never sets
+    ``planning_mode``.
     """
     if not isinstance(result, dict):
         return None
@@ -974,12 +959,6 @@ def render_report(
             "-- NOTHING filed; review before filing._"
         )
     elif filed_ticket_ids:
-        # These are TICKET ids, not task ids: submit_task answers the curator
-        # path with {"ticket": ...} and the create/combine/drop decision lands
-        # asynchronously, so no task id exists when this report is written.
-        # The preamble supplies that semantics; the bullets stay because a
-        # ticket id is directly actionable (resolve_ticket takes one) and is
-        # the operator's only handle on what this run filed.
         lines.append(
             f"_{len(filed_ticket_ids)} ticket(s) filed -- the curator's "
             "create/combine/drop decision is still pending, so no task id "
@@ -1638,15 +1617,13 @@ def run_census(
             f"census: codebook merge produced an invalid codebook: {validation_errors}"
         )
 
-    # Best-effort per payload -- a raised exception, or a result carrying no
-    # ticket id (the {"error", "error_type"} shape a rejected submit_task
-    # returns, or a non-dict from a transport fault), is logged and EXCLUDED
+    # Best-effort per payload -- a raised exception, or a result in which
+    # _ticket_id_from_submit_result finds no ticket, is logged and EXCLUDED
     # from filed_ticket_ids rather than aborting the run or silently
     # inflating the filed count (reviewer_comprehensive finding #1: an
     # unfilable result must never render as a "- None" report bullet, nor
-    # count as genuinely filed). What submit_task actually returns is
-    # recorded once, in _ticket_id_from_submit_result.
-    # Mirrors the best-effort handling used for commit() below.
+    # count as genuinely filed). Mirrors the best-effort handling used for
+    # commit() below.
     # Positioned BEFORE codebook.dump()/advance_census_state() below
     # (reviewer_comprehensive finding #4): a bug in payload construction can
     # then only abort the run before anything is persisted, never strand an

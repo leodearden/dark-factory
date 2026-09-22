@@ -147,11 +147,9 @@ def _make_fake_invoke(response_fn=None, *, default="{}"):
 
 def _make_fake_submit_fn():
     """Fake curator-path `submit_fn(**kwargs) -> dict` seam. Records every
-    call's kwargs in `.calls` and mimics the curator path's real return --
-    `{"ticket": "tkt_<n>"}`, an incrementing TICKET id, never a task id
-    (fused_memory/server/tools.py::submit_task). Task 4965: this double
-    previously returned `{"id": ...}`, a shape the live seam never
-    produces, which is why the whole suite agreed with the defect."""
+    call's kwargs in `.calls` and answers in the real curator-path shape
+    (census.py::_ticket_id_from_submit_result) with an incrementing ticket
+    id, `{"ticket": "tkt_<n>"}`."""
     calls = []
 
     def fake_submit_fn(**kwargs):
@@ -1231,25 +1229,18 @@ _1 ticket(s) filed -- the curator's create/combine/drop decision is still pendin
 
 cost
 """
-"""Byte-for-byte `render_report` output for a FLAGLESS run, captured
-verbatim from the module BEFORE task 3280 added the operator cost-control
-flags (`--max-batches`, `--max-verify-clusters`, `--dry-run-filing`).
+"""Byte-for-byte `render_report` output for a FLAGLESS run, first captured
+from the module before task 3280 added the operator cost-control flags
+(`--max-batches`, `--max-verify-clusters`, `--dry-run-filing`).
 
 This is a LOCK, not a spec under development: every new report line those
 flags introduce must be gated on a non-None flag value, so a run that
 passes none of them renders exactly this. Do NOT regenerate this constant
 to make a failing run pass -- a diff here means a cost-control rendering
 leaked into the unflagged path (and therefore into the nightly trickle,
-which launches census.py with no extra argv).
-
-REVISED 2026-09-08 (task 4965), deliberately and for a reason unrelated to
-the leak above: the Filed Tasks body used to present the filed ids as TASK
-ids, which they never were. submit_task answers the curator path with a
-TICKET id and the create/combine/drop decision lands later, so the body now
-says so and the lock's input moved from `filed_task_ids=["1"]` (a bare "1"
-that reads as a task id) to `filed_ticket_ids=["tkt_1"]`. A future diff here
-is still the cost-control leak this lock exists to catch -- this one entry is
-the only sanctioned edit, and it is recorded so the two are distinguishable."""
+which launches census.py with no extra argv). A deliberate change to the
+flagless report may move this lock, in a commit whose message says why;
+that record is what distinguishes it from a leak."""
 
 
 def _capped_mining_result(*, stop_reason, max_batches, batches=2):
@@ -3354,10 +3345,9 @@ def test_main_dry_run_summary_line_names_payload_file(tmp_path, monkeypatch, cap
 
 
 def test_main_done_summary_line_counts_filed_tickets_not_tasks(tmp_path, monkeypatch, capsys):
-    # The operator reads this line to learn what the run produced. It counts
-    # TICKETS -- submit_task's curator path returns a ticket id and the
-    # create/combine/drop decision lands later, so "filed_tasks=N" would
-    # overclaim N tasks that may not exist (task 4965).
+    # The operator reads this line to learn what the run produced. Filing
+    # yields tickets, not tasks (census.py::_ticket_id_from_submit_result),
+    # so "filed_tasks=N" would overclaim N tasks that may not exist.
     _write_legibility_yaml(_default_config_path(tmp_path))
     fake_run_census = _make_fake_main_run_census(
         outcome=mod.CensusOutcome(
