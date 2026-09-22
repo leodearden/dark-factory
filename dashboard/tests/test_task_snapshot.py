@@ -788,3 +788,40 @@ class TestSnapshotDegradation:
             f'a failed unit must be held for the TTL, got '
             f'{canned.calls[attempts:]}'
         )
+
+    async def test_an_unmeasured_unit_ages_its_census_but_holds_no_rows(
+        self, project_root, dashboard_config, dummy_client
+    ):
+        """(i) A root the caller never reached keeps its last census, aged, and no rows.
+
+        The census is a count, so the last good one is still evidence about
+        this root. The rows are different. The caller pairs every unit with the
+        rows IT shaped this render, and it shaped none for a root it never
+        reached. So a last-good row list here can only reach the wire unshaped,
+        or be swapped for an empty list that claims a measured zero at the last
+        good's instant.
+        """
+        from dashboard.data.datum import DatumState
+        from dashboard.data.task_snapshot import SnapshotFailure, unmeasured_snapshot
+
+        rows, status_map = _tree()
+        canned = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
+        good = await self._acquire(canned, dummy_client, dashboard_config,
+                                   project_root, now=NOW)
+        assert good.rows.value, 'the root must have a last good row list to refuse'
+
+        reason = 'exceeded its share of the Tasks budget'
+        unit = unmeasured_snapshot(
+            project_root, now=NOW + timedelta(seconds=20), reason=reason,
+            failure=SnapshotFailure.BUDGET,
+        )
+
+        assert unit.census.state is DatumState.STALE
+        assert unit.census.value == good.census.value
+        assert unit.census.as_of == NOW
+        assert unit.rows.state is DatumState.UNKNOWN
+        assert unit.rows.value is None and unit.rows.as_of is None
+        assert unit.rows.reason == reason
+        assert (unit.in_progress_live, unit.in_progress_stranded) == (None, None)
+        assert unit.skew_seconds is None
+        assert unit.failure is SnapshotFailure.BUDGET

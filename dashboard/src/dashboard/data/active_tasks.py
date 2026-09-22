@@ -71,6 +71,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
@@ -780,6 +781,18 @@ async def collect_tasks_with_counts(
     address a project by, and the ROW assembly below is still keyed by root,
     so no root's rows are lost to the collision.
 
+    **The units it returns carry the SHAPED rows**, not the raw rows
+    ``acquire_snapshot`` cached. Each measured unit comes back with
+    ``rows.value`` replaced by the very list of row dicts this function adds
+    to ``active_rows``. So ``active_rows`` IS the concatenation, in canonical
+    root order, of every unit's ``rows.value``, by construction rather than
+    by a rule a caller must remember. The external-dep tail's in-place status
+    overwrite therefore shows through both. ``dataclasses.replace`` on the
+    frozen records gives the wire its own unit and leaves the cached one's
+    raw rows for the next render to shape; ``TaskSnapshot.rows`` records why
+    the two cannot be one list. A unit whose rows were never measured keeps
+    ``value is None``, because ``[]`` would claim a measured zero.
+
     **Bounded as a whole, not merely per call.**  A ``loop.time()`` deadline
     (``_TASKS_TOTAL_BUDGET``) is taken up front and each project is run under
     ``asyncio.wait_for`` at ``min(remaining, _TASKS_PER_PROJECT_BUDGET)``,
@@ -1006,6 +1019,8 @@ async def collect_tasks_with_counts(
     # This is the only place the shared accumulators are written.
     for root in roots:
         rows, snapshot = by_root[root]
+        if snapshot.rows.value is not None:
+            snapshot = replace(snapshot, rows=replace(snapshot.rows, value=rows))
         snapshots[_project_label(root)] = snapshot
         all_active.extend(rows)
 

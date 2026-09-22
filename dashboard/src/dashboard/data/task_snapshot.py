@@ -210,7 +210,20 @@ class TaskSnapshot:
 
     Attributes:
         census: Every status's population, as a ``Datum``.
-        rows: The project's ACTIVE rows, as a ``Datum``.
+        rows: The project's ACTIVE rows, as a ``Datum``, in one of two shapes
+            depending on which unit holds it. The unit :func:`acquire_snapshot`
+            returns and caches holds the RAW MCP rows. The unit
+            ``active_tasks.collect_tasks_with_counts`` returns holds the shaped
+            ``TaskRow`` list, the same row dicts as ``ACTIVE_TASKS``, and that
+            one crosses the wire. The two cannot be one list. Shaping reads the
+            integer ids, ``dependencies`` and ``metadata`` that only a raw row
+            carries, so the cache must keep raw rows for the next render to
+            shape. And a render's shaped rows belong to that render: they are
+            joined to its runtime probe and its clock, and its external-dep
+            tail overwrites them in place, so a cache shared across renders
+            must never hold them. Raw rows on the wire would ship the whole
+            ``metadata`` blob a second time beside ``ACTIVE_TASKS`` and break
+            the PRD's ``Datum[list[TaskRow]]`` contract.
         in_progress_live: In-progress rows with a live claimant, or ``None``
             when the rows were never measured — never a fabricated zero.
         in_progress_stranded: The complement of the above, by the same
@@ -324,7 +337,7 @@ async def _bounded(coro: Awaitable[Any], *, label: str) -> _HalfRead[Any]:
 def _datum(
     half: _HalfRead[T], *, now: datetime, project_root: str, name: str
 ) -> Datum[T]:
-    """Build the ``Datum`` for one half — THE one place a state is chosen.
+    """Build the ``Datum`` for one half-outcome — THE one place its state is chosen.
 
     Three outcomes, in one place so the envelope's
     ``unknown <=> value is None <=> as_of is None`` triad holds by construction
@@ -430,23 +443,27 @@ def _strand_split(rows: Datum[list[dict]]) -> tuple[int | None, int | None]:
 
 
 def _assemble(
-    rows_half: _HalfRead[list[dict]],
+    rows: Datum[list[dict]],
     map_half: _HalfRead[Mapping[int, str]],
     *,
+    failure: SnapshotFailure,
     now: datetime,
     project_root: str,
 ) -> TaskSnapshot:
-    """Turn two half-outcomes into one stamped, contract-checked unit.
+    """Turn a rows ``Datum`` and a map outcome into one stamped, contract-checked unit.
 
     THE one place a ``TaskSnapshot`` is built, so a unit standing in for a
     root this render never reached is assembled by exactly the code that
-    assembles a measured one — including the last-good fallback, which is
-    what lets a budget expiry still show the previous census, aged, rather
-    than a bare unknown.
+    assembles a measured one — including the census's last-good fallback,
+    which is what lets a budget expiry still show the previous census, aged,
+    rather than a bare unknown.
+
+    The rows arrive as a finished ``Datum``, not as a half-outcome, because
+    the two callers choose them differently: a read's rows go through
+    :func:`_datum` like the census does, and :func:`unmeasured_snapshot`'s
+    are unknown outright. *failure* is the rows half's kind, for the reason
+    :class:`SnapshotFailure` gives.
     """
-    rows: Datum[list[dict]] = _datum(
-        rows_half, now=now, project_root=project_root, name='rows',
-    )
     census: Datum[TaskCensus] = _datum(
         _census_half(map_half), now=now, project_root=project_root, name='census',
     )
@@ -460,7 +477,7 @@ def _assemble(
         status_map=MappingProxyType(
             dict(map_half.value) if isinstance(map_half.value, Mapping) else {}
         ),
-        failure=rows_half.failure,
+        failure=failure,
     )
     # Check the contract HERE, where the producer still has the context to
     # name what it built, rather than letting a break surface as a shaping
@@ -504,8 +521,10 @@ async def _read_unit(
             label='status map',
         ),
     )
+    root = str(project_root)
     return _assemble(
-        rows_half, map_half, now=now, project_root=str(project_root),
+        _datum(rows_half, now=now, project_root=root, name='rows'),
+        map_half, failure=rows_half.failure, now=now, project_root=root,
     )
 
 
@@ -521,16 +540,30 @@ def unmeasured_snapshot(
     A caller that bounds the WHOLE per-root share — ``collect_tasks_with_counts``
     does, on top of the per-operation bound applied here — can run out of
     budget before, or instead of, either read. Every configured root still owes
-    the wire an entry, and this is it: the failure the caller can name, routed
-    through the same state machine a failed read takes, so a root whose budget
-    expired still shows its last good census aged rather than a bare unknown.
+    the wire an entry, and this is it: the failure the caller can name, with
+    the census routed through the same state machine a failed read takes, so a
+    root whose budget expired still shows its last good census aged rather
+    than a bare unknown.
 
     *failure* is the caller's own structured verdict — ``BUDGET`` for a
     deadline, ``UNREACHABLE`` for a share that raised — and never inferred
     from *reason*, which stays free to be prose.
+
+    ITS ROWS DO NOT FALL BACK, unlike its census, and are ``unknown`` with
+    *reason*. The unit a caller returns carries the rows that caller SHAPED
+    (see :attr:`TaskSnapshot.rows`), and for a root it never measured it
+    shaped none. So a last-good row list here could only reach the wire raw,
+    or be swapped for an empty shaped list that claims a measured zero at the
+    last good's instant. Shaping the last good instead would run outside the
+    per-root guard, where a row that already broke shaping would take the
+    whole render down with it. The census is a count and needs no shaping,
+    so its last good is still honest evidence.
     """
-    half: _HalfRead[Any] = _HalfRead(None, failure, reason)
-    return _assemble(half, half, now=now, project_root=str(project_root))
+    return _assemble(
+        Datum(None, None, DatumState.UNKNOWN, reason, FRESHNESS_BOUND_SECONDS),
+        _HalfRead(None, failure, reason),
+        failure=failure, now=now, project_root=str(project_root),
+    )
 
 
 class SnapshotHealth(enum.StrEnum):

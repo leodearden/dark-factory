@@ -2191,6 +2191,48 @@ class TestTheReturnedUnitsCarryTheShapedRows:
         assert snapshots['dead'].rows.value is None
         assert snapshots['live'].rows.value == active
 
+    async def test_a_root_the_budget_cut_off_holds_no_rows_even_with_a_last_good(
+        self, tmp_path, monkeypatch, dummy_client,
+    ):
+        """A cut-off root's unit keeps ``value is None``, even when it was measured before.
+
+        The render shaped no rows for it, so ``ACTIVE_TASKS`` gets none, and
+        its unit must agree. The unit could otherwise only carry the last
+        good RAW list, which is unshaped and heavy on the wire, or the empty
+        shaped list, which claims a measured zero at the last good's instant.
+        Its census still ages, because a count needs no shaping.
+
+        The budget is squeezed through the module constant, the same idiom
+        ``TestCollectTasksBudget._tighten`` uses. That is the only way to cut
+        off a real acquisition without waiting out the shipped 14 s budget.
+        """
+        import dashboard.data.task_snapshot as snapshot_mod
+
+        (root,) = self._roots(tmp_path, 'df')
+        healthy, _calls = _canned_mcp(*self._tree())
+        monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', healthy)
+        config = DashboardConfig(project_root=root)
+        measured, _ = await collect_tasks_with_counts(dummy_client, config, now=_STUB_AS_OF)
+        assert measured, 'the root must have been measured once, leaving a last good'
+
+        async def _hangs(client, url, tool, args, **kwargs):
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', _hangs)
+        monkeypatch.setattr(snapshot_mod, 'SNAPSHOT_TTL_SECONDS', 0.0)
+        monkeypatch.setattr('dashboard.data.active_tasks._TASKS_PER_PROJECT_BUDGET', 0.05)
+        active, snapshots = await collect_tasks_with_counts(
+            dummy_client, config, now=_STUB_AS_OF + timedelta(seconds=20),
+        )
+
+        unit = snapshots['df']
+        assert classify(unit) is SnapshotHealth.DEGRADED
+        assert active == []
+        assert unit.rows.state is DatumState.UNKNOWN
+        assert unit.rows.value is None, unit.rows.value
+        assert unit.census.state is DatumState.STALE
+        assert unit.census.as_of == _STUB_AS_OF
+
     async def test_the_cached_unit_keeps_the_raw_rows_the_next_render_shapes(
         self, tmp_path, monkeypatch, dummy_client,
     ):
