@@ -397,7 +397,7 @@ The merge procedure is iterative — don't assume one pass will be enough:
 
    - `status: "done"` or `status: "already_merged"` → **terminal success.** Thread the merge commit SHA:
      - Normal `done`: SHA is in `result["commit"]`.
-     - `already_merged`: SHA is in `result["commit"]` for the fast-path case. The worker-path `already_merged` may carry `commit=None`; when `result["commit"]` is falsy, re-derive with the same marker search the canonical check uses — `git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H`, **subject check included**: `git log -1 --format=%s "<hit sha>"` must equal `Merge task/<TASK_ID> into main` exactly, and a body-only match counts as an empty search ([`skills/_shared/deriving-landed-sha.md`](../_shared/deriving-landed-sha.md#step-1-subject-check) states why) — or, if that comes back empty, **do not record a note asserting the merge is present**: an empty search means nothing on main cites this task, which is exactly the signal a branch that never advanced past its creation point produces (it satisfies the worker's ancestry test while carrying none of the work). Run the [canonical ancestry check](#branch-on-main) — including [`skills/_shared/deriving-landed-sha.md`](../_shared/deriving-landed-sha.md#step-1)'s marker search on the rc=128 arm — and treat "nothing on main cites the task" as **not done**, rather than stamping a `done_provenance` note. **The canonical check's rc=0 arm agrees with this and does not override it:** its citation gate — step 4's rc=0 sub-ladder in [`skills/_shared/deriving-landed-sha.md`](../_shared/deriving-landed-sha.md) — will not stamp *anything* until a positive task citation on main proves real work landed (the shell form of `GitOps.find_task_citation_commit`), and what it stamps then is that citing commit; so a branch that never advanced fails there too and is likewise reported not-landed/phantom-branch. Neither rule licenses stamping the other's way out. **Do not eyeball `git log main --oneline | head -5` and pick a SHA**: it is not scoped to this task and you would record an unrelated task's merge as this one's provenance.
+     - `already_merged`: SHA is in `result["commit"]` for the fast-path case. The worker-path `already_merged` may carry `commit=None`; when `result["commit"]` is falsy, re-derive with the same selecting marker search the canonical check uses — [step 1](../_shared/deriving-landed-sha.md#step-1)'s `git log main --fixed-strings --grep="$S" --format='%H%x09%s' | awk -F'\t' -v s="$S" '$2==s {print $1; exit}'` with `S="Merge task/<TASK_ID> into main"`, which yields only a commit whose **subject** is exactly the marker. **Not** the bare `--grep ... --max-count=1`: it stops at the newest *message* match, so a body match can shadow the real merge ([`skills/_shared/deriving-landed-sha.md`](../_shared/deriving-landed-sha.md#step-1-subject-check) states why, with the measured population) — or, if that comes back empty, **do not record a note asserting the merge is present**: an empty search means nothing on main cites this task, which is exactly the signal a branch that never advanced past its creation point produces (it satisfies the worker's ancestry test while carrying none of the work). Run the [canonical ancestry check](#branch-on-main) — including [`skills/_shared/deriving-landed-sha.md`](../_shared/deriving-landed-sha.md#step-1)'s marker search on the rc=128 arm — and treat "nothing on main cites the task" as **not done**, rather than stamping a `done_provenance` note. **The canonical check's rc=0 arm agrees with this and does not override it:** its citation gate — step 4's rc=0 sub-ladder in [`skills/_shared/deriving-landed-sha.md`](../_shared/deriving-landed-sha.md) — will not stamp *anything* until a positive task citation on main proves real work landed (the shell form of `GitOps.find_task_citation_commit`), and what it stamps then is that citing commit; so a branch that never advanced fails there too and is likewise reported not-landed/phantom-branch. Neither rule licenses stamping the other's way out. **Do not eyeball `git log main --oneline | head -5` and pick a SHA**: it is not scoped to this task and you would record an unrelated task's merge as this one's provenance.
      - Whatever the source, stamp the SHA **exactly as the tool returned it**. This applies with full force to a `found_on_main` `merge_sha` from the poll loop below: it is already a verified commit on main, so never substitute the branch tip or a `git merge-base` result for it. (There are two exceptions: a project that sets `git.commit_citation_pattern: ""`, where the tier runs un-gated and `merge_sha` *is* the branch tip; and a task whose `metadata.delivered_checks` rescued a landing whose effect is absent at main HEAD, where `merge_sha` is on main but may name a reverted landing — see the polled-done note below.)
 
      Go directly to step 8.
@@ -732,16 +732,22 @@ The merge procedure is iterative — don't assume one pass will be enough:
     loop's 20-minute ceiling. Signal (a) is not even derivable there: there is no
     `coalesce-<TIP_ID>-<hex>` id to parse a TIP_ID from.)
   - There are exactly **two** affirmative landing signals, and only these two:
-    **(a)** the **tip's** merge marker on main — `git log main --fixed-strings
-    --grep="Merge task/<TIP_ID> into main" --max-count=1 --format=%H`, where `<TIP_ID>` is parsed
-    off the `coalesce-<TIP_ID>-<hex>` id by stripping the `coalesce-` prefix and the trailing `-`
-    plus 8 hex chars (`uuid.uuid4().hex[:8]`) — **not** a naive split on `-`, which breaks for any
-    hyphen-bearing tip id.
-    A hit counts as the tip's marker **only if its SUBJECT matches** — `git log -1 --format=%s
-    "<hit sha>"` must equal `Merge task/<TIP_ID> into main` exactly, per
-    [`skills/_shared/deriving-landed-sha.md`](../_shared/deriving-landed-sha.md#step-1-subject-check).
-    `--grep` matches commit **bodies** too, and on this arm a body match would be stamped as the
-    tip merge sha; treat a body-only match as an empty search. And
+    **(a)** the **tip's** merge marker on main — [step 1](../_shared/deriving-landed-sha.md#step-1)'s
+    selecting search, run against the **tip's** subject:
+    ```bash
+    S="Merge task/<TIP_ID> into main"
+    git log main --fixed-strings --grep="$S" --format='%H%x09%s' \
+      | awk -F'\t' -v s="$S" '$2==s {print $1; exit}'
+    ```
+    `<TIP_ID>` is parsed off the `coalesce-<TIP_ID>-<hex>` id by stripping the `coalesce-` prefix
+    and the trailing `-` plus 8 hex chars (`uuid.uuid4().hex[:8]`) — **not** a naive split on `-`,
+    which breaks for any hyphen-bearing tip id. The `awk` half is the subject selection and is
+    **not optional**: `--grep` matches commit **bodies** too, and on this arm a body match would be
+    stamped as the tip merge sha. **Do not add `--max-count=1`** — it stops at the newest *message*
+    match, so a body match shadowing the real tip merge would make this signal read not-landed on a
+    train that landed, and this arm has no step-3 ladder to fall through to
+    ([`skills/_shared/deriving-landed-sha.md`](../_shared/deriving-landed-sha.md#step-1-subject-check),
+    with the measured population). And
     **(b)** **this task's own scheduler status**, read fresh with
     `get_task(id="<TASK_ID>", project_root="<PROJECT_ROOT>")`. The orchestrator flips it to `done`
     for every absorbed member once the train lands

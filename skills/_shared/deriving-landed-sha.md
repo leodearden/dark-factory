@@ -67,8 +67,15 @@ contract](#doneprovenance-contract) for what a stamp must carry.
 ### Step 1 — exact-subject merge-marker search
 
 ```bash
-git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H
+S="Merge task/<TASK_ID> into main"
+git log main --fixed-strings --grep="$S" --format='%H%x09%s' \
+  | awk -F'\t' -v s="$S" '$2==s {print $1; exit}'
 ```
+
+It prints the newest commit on main whose **subject** is exactly the marker, or nothing. The
+`--grep` half is an indexed prefilter over the whole message; the `awk` half is the subject
+selection, and **[it is not optional](#step-1-subject-check)** — the two paragraphs below are
+why, and why there is no `--max-count=1` here.
 
 This mirrors the in-repo authority, `orchestrator/src/orchestrator/git_ops.py::GitOps.find_merge_marker`
 — the same function `merge_status`'s git-authority tier calls on the deleted-branch path.
@@ -88,37 +95,55 @@ commit describing this very mechanism, a revert, a commit message citing another
 That is a live hazard in this repo, not a hypothetical: measured 2026-09-22,
 `git log main --fixed-strings --grep="Merge task/4181 into main" --max-count=1 --format=%H`
 returns `d0d67f0c53`, a **non-merge** docs commit from task 4612 whose body quotes the subject,
-rather than the true train merge `d25b24468c`. The substring-safety argument above covers only
-the `task/1`-inside-`task/10` collision; it says nothing about a body match.
+rather than the true train merge `d25b24468c` — which the command above does return. The
+substring-safety argument covers only the `task/1`-inside-`task/10` collision; it says nothing
+about a body match.
 
 <a id="step-1-subject-check"></a>
-**So a hit is not a marker until its SUBJECT matches.** On **any** sha this search returns, before
-it may be treated as a marker on either of [step 2](#step-2)'s arms:
+**So a hit is not a marker until its SUBJECT matches.** A message match whose subject is something
+else is **not** a marker and may never be treated as one on either of [step 2](#step-2)'s arms —
+[step 2](#step-2)'s *branch GONE* arm otherwise treats the marker as authoritative on its own with
+no further check, so this selection is the only thing standing between a body match and a stamped
+`done_provenance`. Equality is against the `_merge_subject` string you searched for; nothing weaker
+(prefix, substring, case-folded) counts.
 
-```bash
-git log -1 --format=%s "<marker sha>"
-```
+**Select the newest subject-matching hit — do not take the newest hit and then test it.** These
+differ, and the difference is a false negative on work that genuinely landed. `git log --grep
+--max-count=1` stops at the newest *message* match; if that one is a body match, testing it and
+rejecting it discards the search, and the genuine marker sitting deeper in history is never
+examined. The `awk` selection above keeps newest-first-wins while scanning past body matches, so it
+finds that marker instead. **Never reintroduce `--max-count=1`** — it is precisely what makes the
+guard lossy.
 
-Accept it only on **exact equality** with the `_merge_subject` string you searched for. A hit that
-matches only in the body is **not** a marker: treat the search as empty and continue to
-[step 3](#step-3). This costs nothing when the hit is genuine and is the only thing standing
-between a body match and a stamped `done_provenance` — see [step 2](#step-2)'s *branch GONE* arm,
-which otherwise treats the marker as authoritative on its own with no further check.
+The shadowing is common and it is *growing*, because this repo's own commits about this mechanism
+quote the subject they document. Measured 2026-09-22 over all 68,279 commits on main: 12 branches
+whose newest `--grep` hit is not a subject match, **8 of them shadowing a genuine marker** —
+`task/77`, `task/321`, `task/777`, `task/2637`, `task/3446`, `task/3698`, `task/4181`, `task/5668`.
+For `task/4181` the shadowed marker is `d25b24468c`; for `task/5668` the shadowing commit is a
+`Revert "Merge task/5668 into main"`, a reminder that locating a marker is not on its own proof the
+work is still present — that is what [step 2](#step-2)'s containment check and the server's
+effect-present check are for.
+
+Reading a subject back with `git log -1 --format=%s "<sha>"` is still the right spot check when you
+are holding a sha from somewhere else and want to know whether it is a marker. It is not a
+substitute for selecting correctly in the first place.
 
 Do **not** instead add `--merges` to the search. It would diverge from the in-repo authority this
 command explicitly mirrors (`GitOps.find_merge_marker` and `GitOps._scan_merge_marker` use the same
 bare `--grep`), whose whole value is that writer and reader share one derivation and so cannot
 silently drift apart; and it is lossy — measured in this repo, `ba1bba2611 Merge task/176 into main`
-is a genuine subject-shaped marker with a **single parent**, which `--merges` drops. Subject
-equality loses nothing and needs no divergence.
+is a genuine subject-shaped marker with a **single parent**, which `--merges` drops — and which
+the command above does return. Subject equality as selected above loses nothing and needs no
+divergence. (That claim is only true of the selecting form: paired with `--max-count=1` subject
+equality *was* lossy, in the 8 measured cases above.)
 
 The root cause is in that production search, which this doc faithfully mirrors; the shell-side
 subject check is the guard available to an agent. It is the same relationship [step 2](#step-2)'s
 containment check already has to `find_merge_marker`'s branch-existence gate: the agent re-supplies
 in the shell a guard the bare search does not carry. The production half is tracked separately.
 
-- **Returned a sha whose subject matches** → go to [step 2](#step-2); whether it is authoritative depends on the branch ref.
-- **Returned nothing, or only a body match** → go to [step 3](#step-3). An empty search is **not** a not-landed verdict.
+- **Printed a sha** → its subject already matched, by construction. Go to [step 2](#step-2); whether it is authoritative depends on the branch ref.
+- **Printed nothing** (no hits at all, or every hit was a body match) → go to [step 3](#step-3). An empty result is **not** a not-landed verdict.
 
 <a id="step-2"></a>
 ### Step 2 — is the marker authoritative? Ref existence, then containment
