@@ -31,6 +31,7 @@ scripts/orchestrator-watchdog.timer).
 
 import contextlib
 import json
+import math
 import os
 import shlex
 import subprocess
@@ -1306,6 +1307,29 @@ def _read_fleet_lease() -> dict | None:
     return _read_json_state(FLEET_LEASE_PATH)
 
 
+def _fleet_lease_age_secs(lease: dict) -> float | None:
+    """Wall-clock age of *lease* in seconds, or None when its started_ts is unusable.
+
+    THE single place a lease's age is derived, for _live_fleet_lease,
+    _describe_lease and _format_fleet_lease alike. Two independent parses of
+    one field are how the gate and --report came to disagree about the same
+    lease in the first place (heuristic 11).
+
+    Unusable means missing, non-numeric, OR non-finite. json.loads accepts
+    bare NaN / Infinity / -Infinity and hands back a float, so float() lets
+    them straight through and they then DEFEAT the bound rather than failing
+    it: every comparison against NaN is False, and an Infinity started_ts
+    gives an age of -inf, which is under any bound. A lease whose age cannot
+    be computed has no age, and saying so once here is what keeps every reader
+    of it in agreement.
+    """
+    try:
+        age = time.time() - float(lease["started_ts"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return age if math.isfinite(age) else None
+
+
 def _live_fleet_lease() -> dict | None:
     """Return the lease body iff a fleet sweep is genuinely in flight, else None.
 
@@ -1318,11 +1342,17 @@ def _live_fleet_lease() -> dict | None:
     Requiring both means a crashed sweep costs at most ONE delayed window.
 
     Any unusable pid or started_ts yields None: a lease that cannot be
-    evaluated must fail toward RELEASING, never toward holding the fleet. Note
-    the deliberate divergence from the repo's OTHER lease
-    (session_registry.LEASE_HEARTBEAT_TTL), which fails toward KEEPING the
-    lease — that one protects a holder against eviction, this one suppresses
-    fleet redeploys.
+    evaluated must fail toward RELEASING, never toward holding the fleet. A
+    FUTURE-dated lease (negative age) is released for that same reason, and the
+    asymmetry is the one the bound itself rests on — honouring a negative age
+    makes the lease immortal, since no bound can expire it, while releasing it
+    costs at most one collision. Note the deliberate divergence from the repo's
+    OTHER lease (session_registry.LEASE_HEARTBEAT_TTL), which fails toward
+    KEEPING the lease — that one protects a holder against eviction, this one
+    suppresses fleet redeploys.
+
+    The AGE is tested before the pid deliberately: it is the cheaper test, and
+    it means a nonsense lease never reaches os.kill at all.
 
     Both module globals are read INSIDE the body (not defaulted at def time)
     so tests that monkeypatch them still work.
@@ -1330,23 +1360,12 @@ def _live_fleet_lease() -> dict | None:
     lease = _read_fleet_lease()
     if lease is None:
         return None
+    age = _fleet_lease_age_secs(lease)
+    if age is None or age < 0.0 or age >= FLEET_LEASE_MAX_AGE_SECS:
+        return None
     if not _pid_alive(lease.get("pid")):
         return None
-    try:
-        started_ts = float(lease["started_ts"])
-    except (KeyError, TypeError, ValueError):
-        return None
-    if time.time() - started_ts >= FLEET_LEASE_MAX_AGE_SECS:
-        return None
     return lease
-
-
-def _fleet_lease_age_secs(lease: dict) -> float | None:
-    """Wall-clock age of *lease* in seconds, or None when its started_ts is unusable."""
-    try:
-        return time.time() - float(lease["started_ts"])
-    except (KeyError, TypeError, ValueError):
-        return None
 
 
 def _describe_lease(lease: dict) -> str:
@@ -2376,12 +2395,18 @@ def _format_fleet_lease() -> str:
     """Render the in-flight fleet-redeploy lease for ``--report``, in one line.
 
     Reads via _read_fleet_lease, NOT _live_fleet_lease, deliberately: the
-    latter collapses every not-live reason into None, and the two not-live
-    reasons call for DIFFERENT operator actions. A dead holder means a sweep
-    crashed with its work unfinished; an overrun one means the sweep is
-    probably still running and merely past the bound. An operator must be able
-    to tell which without opening the file — that is the whole reason the
-    lease is surfaced at all.
+    latter collapses every not-live reason into None, and the not-live reasons
+    call for DIFFERENT operator actions. A dead holder means a sweep crashed
+    with its work unfinished; an overrun one means the sweep is probably still
+    running and merely past the bound; a future-dated one means a clock
+    stepped, and no sweep is implicated at all. An operator must be able to
+    tell which without opening the file — that is the whole reason the lease
+    is surfaced at all.
+
+    Distinguishing WHY is this function's purpose, but agreeing with
+    _live_fleet_lease about WHETHER is its contract: both derive the age from
+    _fleet_lease_age_secs and test it in the same order, so a lease the gate
+    treats as expired can never be rendered here as live.
 
     Strictly read-only, like every other --report field (I7/I8): this never
     creates, rewrites or removes the lease. The producer's lease_release is an
@@ -2396,6 +2421,10 @@ def _format_fleet_lease() -> str:
     if age is None:
         return "unreadable"
     pid = lease.get("pid")
+    # Arm order mirrors _live_fleet_lease's test order, which is what keeps
+    # the two from ever disagreeing about whether a lease is live.
+    if age < 0.0:
+        return f"future-dated (pid {pid}, stamped {-age / 60:.0f}m ahead of this clock)"
     if not _pid_alive(pid):
         return f"stale (pid {pid} not running, age {age / 60:.0f}m)"
     if age >= FLEET_LEASE_MAX_AGE_SECS:
@@ -2491,12 +2520,12 @@ def report() -> int:
     FLEET-LEASE is a single fleet-wide LINE printed above the table (task
     4755), not an eighth column: the lease is one fact about the whole fleet,
     so a column would repeat it on every row for no gain — DEPLOY-AGE already
-    pays that cost and is the reason not to add a second. It renders four
+    pays that cost and is the reason not to add a second. It renders six
     distinguishable states — none / live / stale (holder not running) /
-    expired (past FLEET_LEASE_MAX_AGE_SECS) / unreadable — because the two
-    not-live reasons call for different operator actions. It is the only way
-    to see, without hand-reading JSON, why the backstop and the coordinator
-    are both declining to redeploy.
+    expired (past FLEET_LEASE_MAX_AGE_SECS) / future-dated (stamped ahead of
+    this clock) / unreadable — because the not-live reasons call for different
+    operator actions. It is the only way to see, without hand-reading JSON,
+    why the backstop and the coordinator are both declining to redeploy.
 
     Read-only: report() never writes the fleet-deploy clock file, never
     creates, rewrites or removes the in-flight lease, and issues zero mutating

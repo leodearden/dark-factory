@@ -56,6 +56,7 @@ from __future__ import annotations
 import asyncio  # noqa: F401
 import json
 import logging
+import math
 import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -174,6 +175,12 @@ def lease_is_live(path: Path | None, *, now: float, max_age_secs: float) -> bool
     unusable one logs, because it means something is wrong with a file that
     should not be there in that state.
 
+    A FUTURE-dated lease is released for the same reason, and the asymmetry is
+    the one the max-age bound itself rests on: honouring a negative age makes
+    the lease immortal, because no bound can ever expire it, while releasing it
+    costs at most one collision — exactly pre-4755 behaviour. A backwards clock
+    step is the cheap failure; a wedged fleet is not.
+
     The pid predicate is ``session_registry._pid_alive``, IMPORTED rather than
     re-implemented (heuristic 11): it already encodes the required contract,
     including rejecting ``pid <= 0`` BEFORE ``os.kill`` — ``os.kill(0, 0)``
@@ -208,6 +215,12 @@ def lease_is_live(path: Path | None, *, now: float, max_age_secs: float) -> bool
         or isinstance(pid, bool)
         or not isinstance(started_ts, (int, float))
         or isinstance(started_ts, bool)
+        # json.loads accepts bare NaN/Infinity/-Infinity and hands back a
+        # float, so a non-finite timestamp passes every check above and then
+        # DEFEATS the bound rather than failing it: every comparison against
+        # NaN is False. Same guard block, same WARNING, so the one invariant
+        # ("this lease's age is usable") is enforced at one site.
+        or not math.isfinite(started_ts)
     ):
         logger.warning(
             'ignoring fleet-redeploy lease at %s: unusable pid/started_ts in %r',
@@ -215,7 +228,15 @@ def lease_is_live(path: Path | None, *, now: float, max_age_secs: float) -> bool
             raw,
         )
         return False
-    if now - started_ts >= max_age_secs:
+    age = now - started_ts
+    if age < 0.0:
+        logger.warning(
+            'ignoring fleet-redeploy lease at %s: stamped %.0fs in the future',
+            path,
+            -age,
+        )
+        return False
+    if age >= max_age_secs:
         return False
     return _pid_alive(pid)
 
