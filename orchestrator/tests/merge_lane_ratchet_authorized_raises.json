@@ -103,6 +103,48 @@
           "current": 6782
         }
       ]
+    },
+    {
+      "task_id": "5352",
+      "reason": "Net-additive: the offline lane's three red-path guard sidecars were found able to diverge (no joint atomicity across three files keyed by one fingerprint), so _handle_red_run and _maybe_promote_blocker now read the counts with a default instead of indexing, and offline_lane.py records why restarting the count from zero is the intended degrade rather than a KeyError that run() would retry for the whole TTL; the private_reads total rises because the two new wiring pins (the lane surviving divergent guard files, and the steward's four guards being scoped per task) assert against guard attributes that have no public accessor and are the subject under test.",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/offline_lane.py",
+          "baseline": 1190,
+          "current": 1213
+        },
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_restart_durable_guards.py",
+          "baseline": 58,
+          "current": 71
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/offline_lane.py",
+          "baseline": 637,
+          "current": 659
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 55912,
+          "current": 55935
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6782,
+          "current": 6795
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31340,
+          "current": 31362
+        }
+      ]
     }
   ]
 }
