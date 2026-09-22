@@ -190,8 +190,10 @@ def emit_referent_repair_storm_escalation(
     # routine event, so neither "the alarm could not be filed" nor "the alarm
     # is still firing" may sit below an operator's default threshold. Do NOT
     # "simplify" these two arguments away to match the siblings — that is
-    # exactly the flattening this restores (merge-base 6f9cddb0bb, :131 and
-    # :172), and its only symptom is absence of output.
+    # exactly the flattening this restores: at merge-base 6f9cddb0bb BOTH arms
+    # of this function were `logger.warning`, and the only symptom of their
+    # downgrade was absence of output. Whether DEBUG is the right HOUSE level
+    # for the six siblings is task 5775, not this module's call to make.
     return file_folded_escalation(
         project_root,
         anchor_task_id=_ANCHOR_TASK_ID,

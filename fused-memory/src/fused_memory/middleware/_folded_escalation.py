@@ -170,23 +170,22 @@ def file_folded_escalation(
             A CALLER CONCERN because the callers measurably disagree. Six of
             the seven filers folded in here logged a missing optional
             ``escalation`` package at DEBUG, as a detail;
-            ``referent_repair_storm_escalator`` deliberately treated it as a
-            LOST ALARM and logged it at WARNING (merge-base 6f9cddb0bb,
-            ``middleware/referent_repair_storm_escalator.py``:131). A repair
-            storm is a sustained scanner/resolver regression against a
-            measured ~0.22% base rate, so in an env without the optional
-            package the DEBUG default emits nothing at all at the default
-            threshold — the silence this module's own docstring argues against.
+            :mod:`fused_memory.middleware.referent_repair_storm_escalator`
+            deliberately treated it as a LOST ALARM and logged it at WARNING
+            (that module at merge-base 6f9cddb0bb). A repair storm is a
+            sustained scanner/resolver regression against a measured ~0.22%
+            base rate, so in an env without the optional package the DEBUG
+            default emits nothing at all at the default threshold — the
+            silence this module's own docstring argues against.
 
             THE DEFAULT IS DELIBERATELY NOT RAISED FOR EVERYONE. Whether DEBUG
             is the right HOUSE level for a lost alarm is a fleet-wide design
             question with its own blast radius (``orchestrator/mcp/markup_sink``
-            logs the same condition at WARNING), and it is filed as its own
-            follow-up rather than settled here. It is not a regression this
-            consolidation introduced, and bumping the default would silently
-            change six callers inside a refactor contracted to be
-            behaviour-preserving — so raise it at the CALLERS that want it, not
-            here.
+            logs the same condition at WARNING), and it is filed as TASK 5775
+            rather than settled here. It is not a regression this consolidation
+            introduced, and bumping the default would silently change six
+            callers inside a refactor contracted to be behaviour-preserving —
+            so raise it at the CALLERS that want it, not here.
 
             NO EQUIVALENT KNOB EXISTS FOR THE ``project_root is None`` ARM, by
             choice: all seven callers agreed on DEBUG for it at the merge base,
