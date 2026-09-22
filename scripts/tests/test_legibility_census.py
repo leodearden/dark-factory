@@ -5735,6 +5735,53 @@ def test_mine_to_saturation_bound_is_removed_when_the_batch_loop_unwinds(caplog)
     )
 
 
+def test_mine_to_saturation_bound_is_spent_only_on_warnings_not_on_chatter(caplog):
+    """(f) The bound is a WARNING bound — its names say so and the filter must
+    enforce it. A future `logger.info`/`logger.debug` in coder.py (simulated
+    here by logging on that logger from inside the invoke seam, which runs
+    inside census's own `code_digests` call) must pass through unbounded AND
+    must not consume the per-digest WARNING allowance."""
+    live_codebook = _minimal_v2_codebook()
+    source, fake_invoke, saturation, _, _ = (
+        _two_batch_source_with_a_failing_second_batch()
+    )
+    coder_logger = logging.getLogger("legibility.coder")
+    chatter = 0
+
+    def chatty_invoke(prompt, model):
+        nonlocal chatter
+        chatter += 1
+        coder_logger.info("coder: hypothetical future per-digest progress line")
+        coder_logger.debug("coder: hypothetical future debug line")
+        return fake_invoke(prompt, model)
+
+    with caplog.at_level(logging.DEBUG):
+        mod.mine_to_saturation(
+            source, live_codebook, project="dark_factory", model="sonnet",
+            config=saturation, invoke=chatty_invoke,
+        )
+
+    assert chatter == 20, "fixture sanity: two batches of ten digests each"
+    sub_warning = [
+        r for r in caplog.records
+        if r.name == "legibility.coder" and r.levelno < logging.WARNING
+    ]
+    assert len(sub_warning) == 2 * chatter, (
+        f"every sub-WARNING record must pass through unbounded; got {len(sub_warning)}"
+    )
+
+    # And the real per-digest WARNINGs still get their full allowance: the
+    # chatter did not eat the budget out from under them.
+    limit = mod._MAX_PER_DIGEST_CODER_WARNINGS_PER_BATCH
+    assert len(_coder_warnings(caplog)) == limit
+    batch1 = [r for r in _census_warnings(caplog) if "batch 1" in r.getMessage()]
+    assert len(batch1) == 1
+    assert f"{6 - limit} " in batch1[0].getMessage(), (
+        "and the reported suppressed count still counts only WARNINGs; got "
+        f"{batch1[0].getMessage()!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # task 4879 step-5: RED — W-B. `CensusHeadroomExhausted` carries `verified`
 # and `unverified` but NOT `rejected`, so on any run where a cluster was

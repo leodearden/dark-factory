@@ -169,9 +169,10 @@ def _bounded_coder_warnings(limit: int):
     the coder logger's LEVEL would suppress any FUTURE non-digest coder
     warning too, and matching on the message template would couple census
     to a string in ``coder.py`` -- a file this task holds no lock on and
-    which is free to reword. Filtering by count is surgical here because
-    the per-digest funnel is the only ``logger.*`` call in the whole coder
-    module, so there is no other record kind to collaterally swallow."""
+    which is free to reword. Counting is surgical enough because the bound
+    applies a WARNING FLOOR of its own: sub-WARNING records pass through
+    untouched and unconsumed, so this is a bound on the per-digest warning
+    funnel and not on whatever else ``coder.py`` may one day log."""
 
     class _CountingFilter(logging.Filter):
         def __init__(self):
@@ -180,6 +181,15 @@ def _bounded_coder_warnings(limit: int):
             self.suppressed = 0
 
         def filter(self, record):
+            if record.levelno < logging.WARNING:
+                # The contract in the names around this filter is
+                # per-digest WARNINGs, so the filter ENFORCES that floor
+                # rather than leaning on "coder.py currently logs nothing
+                # else" (true today, unenforceable tomorrow). Without it a
+                # future logger.info/debug in coder.py would eat the budget,
+                # push real per-digest WARNINGs out of a census run, and
+                # falsify the `suppressed` count reported in the aggregate.
+                return True
             self.seen += 1
             if self.seen > limit:
                 self.suppressed += 1
