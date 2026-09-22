@@ -8347,6 +8347,25 @@ async def run_main_tip_sweep(
                         'first_pass_category': result.category,
                         'first_pass_cause_hint': result.cause_hint,
                     })
+                else:
+                    # DETERMINISTIC DRIFT — the exit that used to be silent.
+                    # Before this line the failing-retry return logged NOTHING,
+                    # so from outside the process a confirmed red main and the
+                    # outer `except Exception` swallow below (which also
+                    # returns "nothing") were indistinguishable: the last thing
+                    # the journal held was the first-pass WARNING above, and
+                    # the retry itself can run for hours (5h16m on 2026-09-22).
+                    # An operator watching a red main could not tell "detected,
+                    # handed to the harness" from "dropped on the floor".
+                    logger.warning(
+                        'run_main_tip_sweep: first-pass failure at %s '
+                        'REPRODUCED on retry (category=%r, cause_hint=%r) — '
+                        'deterministic drift confirmed; returning the failing '
+                        'result to the harness, which adjudicates it through '
+                        'confirm_main_tip_failure_is_real and files the '
+                        'red-main L1 unless that gate suppresses it',
+                        _sha_prefix, retry.category, retry.cause_hint,
+                    )
 
                 # Return the retry result: passing (flake suppressed) or failing
                 # (deterministic drift — harness files L1 escalation as usual).
@@ -8360,7 +8379,25 @@ async def run_main_tip_sweep(
         )
         return None
     except Exception:
-        logger.debug('run_main_tip_sweep: unexpected error', exc_info=True)
+        # THE SWALLOW.  Anything reaching here collapses a possibly-REAL
+        # red-main signal into the None "no signal" sentinel: the harness does
+        # not mark the SHA as swept and files nothing, so a genuine drift is
+        # dropped on the floor until the tip moves.  At DEBUG — below the
+        # journal's effective level — that drop was completely invisible, and
+        # indistinguishable from the (correct) deterministic-drift return
+        # above.  ERROR, with the sha and the phase, so it can never again be
+        # silent.  Control flow is deliberately UNCHANGED (still the sentinel):
+        # raising here would turn a swallowed sweep into a background-service
+        # pass failure, a behaviour change well outside this fix.
+        logger.error(
+            'run_main_tip_sweep: unexpected error during the main-tip sweep '
+            'at %s (phase=sweep-body) — returning the "no signal" sentinel, '
+            'so any red-main drift at this SHA is NOT reported and will be '
+            're-attempted only when the tip advances or the next tick '
+            'resolves a different SHA',
+            (main_sha[:12] if main_sha else '<unresolved>'),
+            exc_info=True,
+        )
         return None
 
 
