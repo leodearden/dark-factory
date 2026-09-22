@@ -322,7 +322,11 @@ archived escalation records — `esc-plan-tools-markup-storm-1` … `-8` (altern
 per burst) plus `esc-plan-tools-markup-residue-1` — under
 `/home/leo/src/reify/data/escalations/archive/2026-08-22/`. It is recorded here for the same reason as the block
 above: the escalation store lives under `data/`, which is gitignored, so this material otherwise survives only in
-machine-local files, and this document is version-controlled. Ownership is **γ2 / task 4457** (§9) — the leaf that
+machine-local files, and this document is version-controlled. **That reason has since become the ONLY reason: measured
+2026-09-22, retention has pruned that archive directory — its oldest surviving day is now 2026-08-23 — so this
+transcription is the last copy of the eight records.** A reader auditing the table below against the cited path will
+therefore find it ABSENT, which is expiry, not a wrong citation; `docs/mcp-toolcall-xml-leak.md` records the same
+measurement where it cites `-residue-1`. Ownership is **γ2 / task 4457** (§9) — the leaf that
 registered this guard.
 
 **⚠️ ID COLLISION — escalation ids are per-project and these two are different records.** The table in §2.5 above
