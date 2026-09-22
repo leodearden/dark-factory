@@ -336,13 +336,15 @@ to prevent, and the one call sites act on hardest, since a not-landed reading he
 On that arm, follow [`merge-queue/SKILL.md`](../merge-queue/SKILL.md)'s "Follow the superseded
 successor" **rule 2a**, which governs precisely rc=128-with-empty-marker: check the **TIP's**
 merge marker on main and this task's own scheduler status, and on either landing signal take
-rule 2a's self-stamp (`found_on_main` with the tip merge sha) rather than reporting not-landed.
-[`unblock/SKILL.md`](../unblock/SKILL.md) states the same for its own resumed loop: *"Here an
-empty rc=128 marker search does NOT mean 'not landed.'"* Note that rule 2a carries **no** veto
-on a non-`done` scheduler status — unlike rule 2b on the rc=1 arm — and merge-queue flags whether
-it should as an open question it deliberately leaves unaddressed; do not import 2b's veto here,
-and do not resolve that question from this doc. **rc=128-with-empty-marker is NOT not-landed on
-the `coalesce-*` arm.**
+rule 2a's self-stamp (`found_on_main` with the tip merge sha) rather than reporting not-landed —
+**subject to the veto rule 2a carries on a non-`done` scheduler status**, which is the same veto
+rule 2b carries on the rc=1 arm. The two arms agree: on neither does a landing signal license a
+self-stamp over a status the orchestrator deliberately left non-`done`. Rule 2a is the authority
+for both halves — read the veto's conditions, its **landed-but-not-credited** exit, and why the
+`git cherry` content proof is unavailable on this arm from there, not from here.
+[`unblock/SKILL.md`](../unblock/SKILL.md) states the same for its own resumed loop: *"Neither an
+empty rc=128 marker search nor rc=1 means 'not landed' here."* **rc=128-with-empty-marker is NOT
+not-landed on the `coalesce-*` arm.**
 
 Only outside that arm — no train absorption anywhere in this task's history — is this a genuine
 not-landed outcome. There the branch ref is gone and nothing on main cites the task, so no ref
