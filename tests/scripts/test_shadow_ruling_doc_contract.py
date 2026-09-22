@@ -19,16 +19,18 @@ THE ``scope-not-delivered`` HALF guards a different failure. That standing
 policy (Leo, 2026-09-21, resolving esc-4811-3) is a policy statement with NO
 code side by ruling, so ``docs/escalation-standing-policy.md`` is the SINGLE
 normative home of its closure-form vocabulary. This file states no closure form
-of its own: it reads them back out of that document, and asserts only that the
-document still carries some. The one hand-written token left is
-``_POLICY_CLASS``, which serves as the marker slug — a structural ANCHOR of
-exactly the kind ``tests/scripts/test_line_pin_policy.py::_MARKER_BEGIN`` is,
-not a copy of a vocabulary. What is held is ABLATION: the ruling has two homes —
-the policy document a human is pointed at, and the skill the watcher actually
-loads — and silent deletion from either leaves a ruling half the readership
-never sees. ``tests/scripts/test_line_pin_policy.py`` holds a two-home
-documentation policy exactly this way, with the same begin/end marker pair and
-the same refusal to assert on wording.
+of its own: it reads them back out of that document, asserts only that the
+document still carries some, and FAILS rather than dropping one it cannot parse.
+The hand-written tokens left are ``_POLICY_CLASS``, serving as the marker slug,
+and the two headings the spans must sit under — structural ANCHORS of exactly
+the kind ``tests/scripts/test_line_pin_policy.py::_MARKER_BEGIN`` is, not copies
+of a vocabulary. What is held is ABLATION: the ruling has two homes — the policy
+document a human is pointed at, and the skill the watcher actually loads — and
+silent deletion from either, or quiet detachment from the section that home
+sends a reader to, leaves a ruling half the readership never sees.
+``tests/scripts/test_line_pin_policy.py`` holds a two-home documentation policy
+exactly this way, with the same begin/end marker pair and the same refusal to
+assert on wording.
 
 COUNTER-EXAMPLES. The skill shows a REJECTED payload next to a good one, so a
 reader can recognise the shape that will be thrown away. Put
@@ -103,6 +105,13 @@ _SHADOW_SECTION = "## Shadow-mode standing-policy rulings (measurement only)"
 #: the fourth character being `#` rather than a space.
 _DESIGN_CONCERN_SECTION = "### `design_concern` (info or blocking)"
 
+#: The heading of the policy document's standing-policy section, pinned the same
+#: way. Its span is read from INSIDE this section, for the reason the skill's is
+#: read from inside `design_concern` handling: a span moved down to
+#: `## Pointers` still parses, and is still detached from the section `## Status`
+#: sends a reader to.
+_POLICY_SECTION = "## The `scope-not-delivered` closure policy, also in force"
+
 #: The standing-policy class ruled IN FORCE on 2026-09-21 — one token serving as
 #: both the class name and the marker slug, so the two cannot drift apart.
 _POLICY_CLASS = "scope-not-delivered"
@@ -115,9 +124,12 @@ _POLICY_CLASS = "scope-not-delivered"
 _POLICY_BEGIN = f"<!-- {_POLICY_CLASS}:begin"
 _POLICY_END = f"<!-- {_POLICY_CLASS}:end -->"
 
-#: A closure-form bullet. HYPHENATED, and deliberately not `_SLUG_BULLET`: the
-#: policy vocabulary is spelled in hyphens and the codec vocabularies in
-#: underscores, so neither extractor can ever sweep up the other's tokens.
+#: A closure-form bullet. HYPHENATED, matching the spelling the policy
+#: vocabulary uses. That spelling is NOT what keeps this extractor and
+#: `_SLUG_BULLET` apart — a separator-free slug matches both, and `- `resume``
+#: (a live `REVERSIBLE_ACTIONS` member) is one, measured. The separation is
+#: REGIONAL: `_SLUG_BULLET` reads only the three `## ` vocabulary sections and
+#: this one only the marked span, and no line lies in both.
 _POLICY_BULLET = re.compile(r"^- `([a-z0-9-]+)`")
 
 
@@ -444,7 +456,50 @@ def test_the_shadow_section_quotes_a_runnable_weekly_count_command():
 # ---------------------------------------------------------------------------
 
 
-def test_the_policy_document_carries_the_closure_form_ruling():
+@pytest.fixture
+def documented_closure_forms() -> frozenset[str]:
+    """The closure forms `docs/escalation-standing-policy.md` currently names.
+
+    ONE DERIVATION for the two guards below, each of which used to open with a
+    verbatim copy of it (heuristic 11, SPOT). Setup rather than assertion, so
+    the two still fail independently and each keeps its own message for the
+    claim it holds; `conftest.py::root_config` records that argument at length
+    for this same directory.
+
+    THE SPAN IS READ OUT OF ITS OWN SECTION, not out of the whole file, for the
+    reason the skill-side guard reads its span out of `design_concern` handling:
+    a span moved under `## Pointers` or below `## Provenance` still parses, and
+    is still detached from the section `## Status` sends a reader to. The
+    normative home gets the same anchoring as the other one.
+
+    EVERY BACKTICKED BULLET IN THE SPAN MUST BE EXTRACTED, and one this pattern
+    cannot match fails here instead of being dropped. `_POLICY_BULLET` is
+    hyphenated, so a form respelled with an underscore would otherwise vanish
+    from this set — leaving the un-stampability loop below quietly running over
+    one form fewer while both guards stayed green off the survivor, which is the
+    vacuity `_marked_span` exists to refuse one layer up.
+    """
+    section = _section(_read(POLICY), _POLICY_SECTION)
+    span = _marked_span(section, f"{POLICY.relative_to(REPO_ROOT)}, under {_POLICY_SECTION}")
+
+    bullets = [line for line in span.splitlines() if line.startswith("- `")]
+    unextracted = [line for line in bullets if not _POLICY_BULLET.match(line)]
+    assert not unextracted, (
+        f"{POLICY.relative_to(REPO_ROOT)}: every bullet opening with a backticked "
+        f"token inside the `{_POLICY_CLASS}` span is a closure form this file "
+        f"drives through the live codec, and `{_POLICY_BULLET.pattern}` did not "
+        f"match these (task 5723):\n"
+        + "\n".join(f"  {line}" for line in unextracted)
+        + "\nThe policy vocabulary is hyphenated — that span's own marker comment "
+        "says why — so respelling a form means changing the document and this "
+        "extractor together, not dropping the form from the checks silently."
+    )
+    return frozenset(m.group(1) for line in bullets if (m := _POLICY_BULLET.match(line)))
+
+
+def test_the_policy_document_carries_the_closure_form_ruling(
+    documented_closure_forms: frozenset[str],
+):
     """The policy document is the AUTHORITY for how such a record may be closed.
 
     Structure only, and deliberately not a vocabulary check: which closure forms
@@ -456,15 +511,12 @@ def test_the_policy_document_carries_the_closure_form_ruling():
     holds its half.
 
     Kept separate from `test_the_policy_class_cannot_be_stamped_as_a_shadow_ruling`,
-    which repeats these assertions as its own preamble, because the two answer
-    different questions: is the ruling still in its human-facing home, versus
-    does the codec still refuse to stamp it. Folding this one in would make the
-    ablation guard vanish silently the next time that test is narrowed.
+    which takes the same fixture, because the two answer different questions: is
+    the ruling still in its human-facing home, versus does the codec still
+    refuse to stamp it. Folding this one in would make the ablation guard vanish
+    silently the next time that test is narrowed.
     """
-    span = _marked_span(_read(POLICY), str(POLICY.relative_to(REPO_ROOT)))
-    documented = {m.group(1) for line in span.splitlines() if (m := _POLICY_BULLET.match(line))}
-
-    assert documented, (
+    assert documented_closure_forms, (
         f"the `{_POLICY_CLASS}` span in {POLICY.relative_to(REPO_ROOT)} no longer "
         f"wraps any closure-form bullet (task 5723). That span is one of the "
         f"ruling's two homes and the normative one; the other is "
@@ -473,7 +525,9 @@ def test_the_policy_document_carries_the_closure_form_ruling():
     )
 
 
-def test_the_policy_class_cannot_be_stamped_as_a_shadow_ruling():
+def test_the_policy_class_cannot_be_stamped_as_a_shadow_ruling(
+    documented_closure_forms: frozenset[str],
+):
     """Leo's ruling enforced against the LIVE codec, not merely restated.
 
     `scope-not-delivered` is "a policy statement, not a shadow-measured autonomy
@@ -483,13 +537,12 @@ def test_the_policy_class_cannot_be_stamped_as_a_shadow_ruling():
     stampable — so the un-stampability is checked BEHAVIOURALLY, by driving the
     documented tokens through `parse_shadow_ruling`.
 
-    The tokens are read back OUT of the document: `_marked_span` succeeding is
-    what proves the class token is in it, and the closure forms come from its
-    bullets. So the guard binds the document rather than its own constants.
+    The tokens are read back OUT of the document by `documented_closure_forms`:
+    the marker slug succeeding is what proves the class token is in it, and the
+    closure forms come from its bullets. So the guard binds the document rather
+    than its own constants.
     """
-    span = _marked_span(_read(POLICY), str(POLICY.relative_to(REPO_ROOT)))
-    documented = {m.group(1) for line in span.splitlines() if (m := _POLICY_BULLET.match(line))}
-    assert documented, (
+    assert documented_closure_forms, (
         f"non-vacuity: the `{_POLICY_CLASS}` span carries no closure-form bullet, "
         f"so the rejections below would be asserted about nothing."
     )
@@ -507,14 +560,14 @@ def test_the_policy_class_cannot_be_stamped_as_a_shadow_ruling():
         f"a constraint on how a record may be closed into a candidate for closing "
         f"one autonomously — the inversion Leo's 2026-09-21 ruling forbids."
     )
-    for form in sorted(documented):
+    for form in sorted(documented_closure_forms):
         assert parse_shadow_ruling(_note_line(valid_class, form)) is None, (
             f"the live codec ACCEPTS the closure form `{form}` in the "
             f"`proposed_action` slot. A closure form is a policy vocabulary, not a "
             f"reversible action the shadow measurement proposes and scores."
         )
 
-    for token in sorted({_POLICY_CLASS} | documented):
+    for token in sorted({_POLICY_CLASS} | documented_closure_forms):
         for name, vocabulary in (
             ("FIRST_TRANCHE_CLASSES", FIRST_TRANCHE_CLASSES),
             ("REVERSIBLE_ACTIONS", REVERSIBLE_ACTIONS),
@@ -528,7 +581,7 @@ def test_the_policy_class_cannot_be_stamped_as_a_shadow_ruling():
             )
 
 
-def test_the_watcher_skills_design_concern_handling_cites_the_policy_class():
+def test_the_watcher_skill_points_at_the_policy_document_from_design_concern_handling():
     """The skill is the OTHER home of the ruling — the one the watcher loads.
 
     A ruling surviving in the policy document but deleted from the skill is a
