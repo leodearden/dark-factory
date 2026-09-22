@@ -597,9 +597,9 @@ The merge procedure is iterative — don't assume one pass will be enough:
   written under its own branch/task keys at absorption time
   (`orchestrator/src/orchestrator/merge_queue.py:4353-4354, 4373-4377`), the train instead lands
   under a brand-new `GroupMergeRequest` that bypasses `enqueue_merge_request` via direct queue
-  surgery (`orchestrator/src/orchestrator/merge_queue.py:12685-12696`), and `mark_member_done`
-  (`orchestrator/src/orchestrator/harness.py:1011`) flips scheduler status without writing a
-  merge record. Because the durable tiers keep serving that stale hit, Tier 3.5's git-authority
+  surgery (`orchestrator/src/orchestrator/merge_queue.py:12685-12696`), and
+  `orchestrator/src/orchestrator/harness.py::mark_member_done` flips scheduler status without
+  writing a merge record. Because the durable tiers keep serving that stale hit, Tier 3.5's git-authority
   probe — gated behind a durable-tier *miss* (`escalation/server.py:2407-2420`) — never runs to
   correct it. So for a coalesce absorption, treat the canonical ancestry check plus the two
   landing signals below as the **primary** confirmation, not a post-timeout fallback; reserve
