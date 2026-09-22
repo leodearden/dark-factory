@@ -1616,7 +1616,7 @@ _REPORT_FLAG_CASES: dict[str, dict[str, Any]] = {
     "flagless": {},
     "forced": {"force": True},
     "capped": {"mining_result": _capped_mining_result(stop_reason="capped", max_batches=2)},
-    "verify_capped": {"verify_coverage": mod.VerifyCoverage(novel=5, verified=2, cap=2)},
+    "verify_capped": {"verify_coverage": mod.VerifyCoverage(novel=5, offered=2, cap=2)},
     "dry_run_filing": {
         "filed_task_ids": [],
         "dry_run": mod.DryRunFiling(path=_PAYLOADS_PATH, payload_count=12),
@@ -1679,7 +1679,7 @@ def test_census_report_sections_verification_is_gated_and_positioned():
     -- strictly after SATURATION and strictly before MATRIX."""
     assert mod.SECTION_VERIFICATION not in _section_keys()
 
-    keys = _section_keys(verify_coverage=mod.VerifyCoverage(novel=5, verified=2, cap=2))
+    keys = _section_keys(verify_coverage=mod.VerifyCoverage(novel=5, offered=2, cap=2))
     assert keys.index(mod.SECTION_SATURATION) < keys.index(mod.SECTION_VERIFICATION)
     assert keys.index(mod.SECTION_VERIFICATION) < keys.index(mod.SECTION_MATRIX)
 
@@ -1702,7 +1702,7 @@ def test_census_report_sections_unresolved_verdicts_is_gated_and_positioned():
 
     keys = _section_keys(
         dropped_verdicts=_sample_dropped_verdicts(),
-        verify_coverage=mod.VerifyCoverage(novel=5, verified=2, cap=2),
+        verify_coverage=mod.VerifyCoverage(novel=5, offered=2, cap=2),
     )
     assert keys.index(mod.SECTION_VERIFICATION) < keys.index(mod.SECTION_UNRESOLVED_VERDICTS)
 

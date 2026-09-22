@@ -1681,24 +1681,38 @@ def _dropped_verdict_message(record: DroppedVerdict) -> str:
     )
 
 
-def _report_dropped_verdicts(records: list[DroppedVerdict]) -> None:
+def _report_dropped_verdicts(
+    records: list[DroppedVerdict], *, disposition_conflicts: int = 0,
+) -> None:
     """Announce the run's dropped verdicts: one WARNING per record, then ONE
     run-summary line sizing the total.
 
     Emitted only when there is something to say -- silence on a clean run
     keeps the summary informative rather than skimmable. The per-record lines
-    say WHICH titles; the summary says how much of the run went nowhere."""
+    say WHICH titles; the summary says how much of the run went nowhere.
+
+    *disposition_conflicts* is the run's accumulated
+    ``candidate_disposition_conflicts`` from ``codebook.apply_coding_record``
+    -- the MERGER's view of the same underlying situation the dropped verdicts
+    are this loop's view of. It rides the same line rather than a second one
+    because an operator reading a journal wants the two numbers side by side:
+    they are computed by different code over the same run, and a disagreement
+    between them is itself the signal. The line is emitted when EITHER tally is
+    non-zero, so a conflict the adjudication loops never reached is not
+    silently dropped in turn."""
     for record in records:
         logger.warning("census: %s", _dropped_verdict_message(record))
-    if records:
-        logger.warning(
-            "census: %d unresolved verdict(s) -- verdicts that found no pending "
-            "candidate and were dropped. These were PAID FOR and went nowhere: a "
-            "prior adjudication of the same title is standing and only a hand "
-            "re-open will change it. See the per-cluster warnings above for which "
-            "titles.",
-            len(records),
-        )
+    if not records and not disposition_conflicts:
+        return
+    logger.warning(
+        "census: %d unresolved verdict(s), %d candidate disposition conflict(s) "
+        "across the merge -- verdicts that found no pending candidate and were "
+        "dropped. These were PAID FOR and went nowhere: a prior adjudication of "
+        "the same title is standing and only a hand re-open will change it. See "
+        "the per-cluster warnings above for which titles.",
+        len(records),
+        disposition_conflicts,
+    )
 
 
 def _free_payloads_path(path: Path, *, limit: int = 1000) -> Path:
@@ -2288,8 +2302,14 @@ def run_census(
     matrix_md = render_matrix(compute_matrix(verified_sightings))
 
     updated_codebook = codebook_dict
+    # The merger's own count of the same situation the dropped-verdict loops
+    # below detect from the other side -- previously discarded with the rest of
+    # `_stats`, which made a conflict the adjudication loops never reached
+    # invisible everywhere.
+    disposition_conflicts = 0
     for record in mining_result.records:
         updated_codebook, _stats = codebook.apply_coding_record(updated_codebook, record)
+        disposition_conflicts += _stats.get("candidate_disposition_conflicts", 0)
 
     # ONE list for every verdict this run paid for and dropped, shared by both
     # adjudication loops below -- a per-loop name would fork the tally
@@ -2359,7 +2379,9 @@ def run_census(
     for entry_id in fixed_entry_ids:
         updated_codebook = retire_entry(updated_codebook, entry_id)
 
-    _report_dropped_verdicts(dropped_verdicts)
+    _report_dropped_verdicts(
+        dropped_verdicts, disposition_conflicts=disposition_conflicts,
+    )
 
     validation_errors = codebook.validate(updated_codebook)
     if validation_errors:
