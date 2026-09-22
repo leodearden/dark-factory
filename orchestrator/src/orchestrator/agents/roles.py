@@ -1198,18 +1198,6 @@ GREP_LOOKAROUND_GUIDANCE_READ_ONLY = _GREP_ENGINE_LIMITS + _GREP_PCRE_READ_ONLY_
 # diagnosing it. None of the four blocks may be deleted as redundant with
 # another.
 #
-# PLACEMENT: spliced at the TAIL of the chain, behind GREP_LOOKAROUND_GUIDANCE,
-# which is the only position that disturbs nothing. Three upstream invariants
-# pin the FRONT of these prompts --
-# orchestrator/tests/test_roles_wait_pattern.py::test_combined_guidance_is_stated_up_front,
-# orchestrator/tests/test_roles_tool_call_rejection.py::test_guidance_placement_is_structural
-# and
-# orchestrator/tests/test_roles_grep_lookaround.py::test_variant_placement_is_structural
-# -- and _GREP_ENGINE_LIMITS's prose points at "the section just above", so
-# inserting anything between it and ERROR_REMEDY_HINT_GUIDANCE would silently
-# redirect that pointer at this block. Appending behind the grep block
-# satisfies all four with no per-role branching.
-#
 # ONE VARIANT, not two, unlike GREP_LOOKAROUND_GUIDANCE directly above. There
 # the LIMITATION applied to every role and only the RECOURSE had to be varied
 # for JUDGE. Here the whole block is inapplicable to JUDGE: its grant is
@@ -1272,6 +1260,29 @@ Scope that escape narrowly. It covers a heredoc REDIRECT SUPPLYING THE SCRIPT.
 A heredoc nested inside a `$(...)` substitution to build an argument is NOT
 covered, and has been observed destroyed.
 """
+
+
+# The harness guidance every role with a literal system_prompt and unqualified
+# `Bash` carries, spliced straight after its one-line role statement. One
+# composite, so a new block is one edit here rather than one per carrier. Each
+# block's own test module still pins its carrier set against a capability, so
+# a role for which some block stops applying builds its own chain rather than
+# dropping that block from this one -- JUDGE already does: no wait block, the
+# read-only grep variant, and no compound-command block.
+#
+# APPEND-ONLY AT THE TAIL. Every adjacency here is pinned by the later block's
+# own test module (each asserts it starts exactly where its predecessor ends),
+# and BACKGROUND_WAIT_GUIDANCE's heading must stay the prompt's first `##`.
+# _GREP_ENGINE_LIMITS's prose also points at ERROR_REMEDY_HINT_GUIDANCE as "the
+# section just above". Inserting anywhere but the end breaks a pin, or
+# silently redirects that pointer.
+_BASH_CAPABLE_ROLE_PREAMBLE = (
+    BACKGROUND_WAIT_GUIDANCE
+    + TOOL_CALL_REJECTION_GUIDANCE
+    + ERROR_REMEDY_HINT_GUIDANCE
+    + GREP_LOOKAROUND_GUIDANCE
+    + COMPOUND_COMMAND_REWRITE_GUIDANCE
+)
 
 
 # Canonical rc=0/1/128 check for `git merge-base --is-ancestor`, spliced into
@@ -1592,7 +1603,7 @@ ARCHITECT = AgentRole(
     name='architect',
     system_prompt="""\
 You are a TDD architect. Your job is to analyze a task and produce a detailed, structured implementation plan.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE + COMPOUND_COMMAND_REWRITE_GUIDANCE + """
+""" + _BASH_CAPABLE_ROLE_PREAMBLE + """
 ## Your Output
 
 Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
@@ -1704,7 +1715,7 @@ IMPLEMENTER = AgentRole(
     name='implementer',
     system_prompt="""\
 You are a TDD implementer. You execute a structured plan by writing code, step by step.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE + COMPOUND_COMMAND_REWRITE_GUIDANCE + """
+""" + _BASH_CAPABLE_ROLE_PREAMBLE + """
 ## Session Startup Protocol
 
 1. Read `.task/plan.json` to understand the full plan — it is a symlink into the durable `<worktree_base>/.task-meta/<worktree-name>/plan.json` (which survives worktree resets), so reading either path resolves to the same plan.
@@ -1768,7 +1779,7 @@ DEBUGGER = AgentRole(
     name='debugger',
     system_prompt="""\
 You are a debugger. You fix test, lint, and type-check failures.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE + COMPOUND_COMMAND_REWRITE_GUIDANCE + """
+""" + _BASH_CAPABLE_ROLE_PREAMBLE + """
 ## Context
 
 You will be given:
@@ -2037,7 +2048,7 @@ MERGER = AgentRole(
     name='merger',
     system_prompt="""\
 You are a merge conflict resolver. You resolve git merge conflicts precisely and conservatively.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE + COMPOUND_COMMAND_REWRITE_GUIDANCE + """
+""" + _BASH_CAPABLE_ROLE_PREAMBLE + """
 ## Context
 
 You will be given:
@@ -2400,7 +2411,7 @@ STEWARD = AgentRole(
     name='steward',
     system_prompt="""\
 You are a task steward — an autonomous escalation handler with a persistent session.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE + COMPOUND_COMMAND_REWRITE_GUIDANCE + """
+""" + _BASH_CAPABLE_ROLE_PREAMBLE + """
 ## Context
 
 You handle escalations that arise during task execution. Your session persists across
@@ -2677,7 +2688,7 @@ DEEP_REVIEWER = AgentRole(
 You are an integration reviewer. Your job is to find issues that per-task reviews miss: \
 broken wiring between modules, stubbed pipelines, missing integration points, and \
 cross-cutting inconsistencies.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE + COMPOUND_COMMAND_REWRITE_GUIDANCE + """
+""" + _BASH_CAPABLE_ROLE_PREAMBLE + """
 ## What You Do
 
 You receive:
@@ -2797,7 +2808,7 @@ simple change. A simple task may be high-priority and may span several
 files/modules; the declaration means the *change* is simple, not that the
 task is trivial. You replace the usual architect+implementer pair with a
 single explore-then-plan-then-implement session.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE + COMPOUND_COMMAND_REWRITE_GUIDANCE + """
+""" + _BASH_CAPABLE_ROLE_PREAMBLE + """
 ## Workflow
 
 1. **Read** the listed files in the briefing. Confirm the change is
