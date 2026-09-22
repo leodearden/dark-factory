@@ -1616,7 +1616,7 @@ class TestEnterFocus:
             assert backend.focus_calls == []
 
 
-class TestHandlingPrunedOnQueueExit:
+class TestHandlingExpiresWithTheAsk:
     @pytest.mark.timeout(10)
     async def test_handling_flag_does_not_stick_past_the_ask_it_was_set_for(self, tmp_path):
         """self._handling is an in-memory 'already acted on' marker keyed by
@@ -1673,9 +1673,9 @@ class TestHandlingPrunedOnQueueExit:
 
     @pytest.mark.timeout(10)
     async def test_handling_expires_on_a_same_session_reask_without_a_status_change(self, tmp_path):
-        """The queue-exit rule above is the weaker half: self._handling is a
-        slug-stable in-memory "already acted on" marker, so it must expire
-        with the ASK, not merely when the key leaves the queue.
+        """Queue exit (above) is only one way an ask ends. self._handling is
+        a slug-stable in-memory "already acted on" marker, so it must also
+        expire when the ask is REPLACED while the key never leaves the queue.
 
         Reachability: orchestrator/src/orchestrator/session_hooks.py::run_notification
         writes status=AWAITING_INPUT plus a fresh Question on every
@@ -1731,9 +1731,10 @@ class TestHandlingPrunedOnQueueExit:
             await pilot.pause()
 
             assert key in app._handling
+            assert app._queue_items_by_key[key].handling is True
 
             # (c) The re-ask: still AWAITING_INPUT, same canned text, only a
-            # fresh asked_at. A genuinely new ask must render unmarked.
+            # fresh asked_at. A genuinely new ask must not inherit the mark.
             second_ask = _make_record(
                 session_slug='reask-1',
                 status=sr.Status.AWAITING_INPUT,
