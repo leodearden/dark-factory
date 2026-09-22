@@ -196,17 +196,25 @@ CREATE TABLE IF NOT EXISTS write_queue (
     created_at  REAL    NOT NULL,
     completed_at REAL,
     error       TEXT,
-    -- executed (task 4116): "a backend write for this item LANDED at some
-    -- point" — an ITEM-level fact, not a per-attempt one, which is what
-    -- POST_EXECUTE_DEAD_PREFIX has always claimed to report.
+    -- executed (task 4116): whether "a backend write for this item LANDED at
+    -- some point" — an ITEM-level fact, not a per-attempt one, which is what
+    -- POST_EXECUTE_DEAD_PREFIX has always claimed to report. THREE-valued:
+    --   1    it landed; replaying duplicates it
+    --   0    the queue recorded that no backend write landed; safe to replay
+    --   NULL unknown — the row predates this column
     --
     -- Declared bare NULLable, and appended LAST, deliberately: ALTER TABLE can
     -- only append, so an identical declaration in both paths is what keeps a
     -- migrated DB's column ORDER identical to a fresh one's. That matters more
     -- here than in the other tables using this idiom, because QueueItem
     -- positionally unpacks `SELECT *` — a divergence would corrupt every field
-    -- silently rather than fail loudly. bool(None) is already the right
-    -- reading of "no prior attempt executed", so no DEFAULT is needed.
+    -- silently rather than fail loudly.
+    --
+    -- No DEFAULT 0, which would otherwise be the tidier way to get the
+    -- explicit negative: SQLite's `ALTER TABLE ... ADD COLUMN ... DEFAULT 0`
+    -- BACKFILLS existing rows with the default, stamping "provably never
+    -- landed" onto exactly the legacy population whose history is unknown.
+    -- enqueue/enqueue_batch write the 0 themselves instead.
     executed    INTEGER
 );
 """
@@ -424,10 +432,14 @@ class DurableWriteQueue:
         assert self._db is not None
         now = time.time()
         cursor = await self._db.execute(
+            # `executed` is written explicitly as 0, not left to the column
+            # default: a negative has to be RECORDED, otherwise a row the
+            # queue knows never reached a backend is indistinguishable from a
+            # pre-4116 row whose history is genuinely unknown (NULL).
             'INSERT INTO write_queue '
             '(group_id, operation, payload, callback_type, status, attempts, '
-            ' max_attempts, next_retry_at, created_at) '
-            'VALUES (?, ?, ?, ?, ?, 0, ?, 0, ?)',
+            ' max_attempts, next_retry_at, created_at, executed) '
+            'VALUES (?, ?, ?, ?, ?, 0, ?, 0, ?, 0)',
             (group_id, operation, json.dumps(payload), callback_type,
              'pending', self._max_attempts, now),
         )
@@ -450,10 +462,11 @@ class DurableWriteQueue:
         try:
             for item in items:
                 cursor = await self._db.execute(
+                    # Explicit `executed = 0` for the same reason as enqueue().
                     'INSERT INTO write_queue '
                     '(group_id, operation, payload, callback_type, status, attempts, '
-                    ' max_attempts, next_retry_at, created_at) '
-                    'VALUES (?, ?, ?, ?, ?, 0, ?, 0, ?)',
+                    ' max_attempts, next_retry_at, created_at, executed) '
+                    'VALUES (?, ?, ?, ?, ?, 0, ?, 0, ?, 0)',
                     (item['group_id'], item['operation'],
                      json.dumps(item['payload']),
                      item.get('callback_type'),
@@ -550,6 +563,13 @@ class DurableWriteQueue:
         # write for this item landed" is an ITEM-level fact (see
         # POST_EXECUTE_DEAD_PREFIX), so an earlier attempt's landing must still
         # be known to the attempt that finally dead-letters.
+        #
+        # bool() deliberately collapses the column's third value, NULL, into
+        # False here — unlike get_dead_items, which reports it as None. The
+        # prefix is a POSITIVE assertion ("the backend write LANDED"), made
+        # only on positive evidence, so an unknown row simply gets no prefix:
+        # the pre-4116 status quo, not a regression. The honest statement of
+        # the negative belongs in the reported field, not in the prefix.
         executed = bool(item.executed)
         async with self._semaphore:
             try:
@@ -1010,6 +1030,21 @@ class DurableWriteQueue:
     ) -> list[dict[str, Any]]:
         """Return dead-lettered items, newest-first.
 
+        Each item carries ``executed``, the fact a replay decision turns on,
+        over a THREE-valued domain:
+
+        * ``True`` — a backend write for this item landed; replaying it
+          DUPLICATES that write.
+        * ``False`` — the queue recorded that no backend write landed, so the
+          item is safe to replay.
+        * ``None`` — unknown: the row predates the column (task 4116), so this
+          field knows nothing about it. Fall back to the terminal error's
+          POST_EXECUTE_DEAD_PREFIX and to ``backend_ops``.
+
+        ``None`` is FALSY, so ``if not row['executed']`` is the wrong test —
+        it reads "unknown" as "safe". Only an explicit ``is False`` licenses a
+        replay.
+
         Args:
             group_id: Optional filter by group_id.
             limit: Optional maximum number of items to return.  When *None*
@@ -1044,9 +1079,10 @@ class DurableWriteQueue:
                 'error': item.error,
                 'created_at': item.created_at,
                 # The same fact POST_EXECUTE_DEAD_PREFIX encodes in prose on
-                # the error string, exposed as a boolean so a replay decision
-                # does not have to string-match an error message. Purely
-                # additive — every existing key keeps its position and meaning.
-                'executed': bool(item.executed),
+                # the error string, exposed structurally so a replay decision
+                # does not have to string-match an error message. NULL is
+                # passed through as None rather than collapsed to False: see
+                # the three-valued domain in the docstring.
+                'executed': None if item.executed is None else bool(item.executed),
             })
         return results
