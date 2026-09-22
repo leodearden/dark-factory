@@ -481,9 +481,11 @@ def tree_sites(first_party_tree: Sequence[ParsedFile]) -> list[WildcardMcpScopin
     while ``_scan`` above is still free to parse synthetic fixtures.
 
     The ASTs are shared with every other gate in this directory and are walked
-    READ-ONLY.
+    READ-ONLY. ``records_worth_scanning`` drops the files whose source never
+    spells a target name; ``TestPrefilterParity`` below is what proves that is
+    an optimisation and not a policy.
     """
-    return _sites_in(first_party_tree)
+    return _sites_in(records_worth_scanning(first_party_tree))
 
 
 class TestWholeTreeGate:

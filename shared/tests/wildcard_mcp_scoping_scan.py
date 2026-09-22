@@ -59,10 +59,12 @@ Design
 from __future__ import annotations
 
 import ast
+from collections.abc import Iterable
 from typing import NamedTuple
 
 from loop_blocking_scan import _shallow_nodes
 from silent_fallthrough_scan import (
+    ParsedFile,
     _build_parent_map,
     _callee_name,
     _compute_qualname,
@@ -186,6 +188,38 @@ def _is_true_literal(node: ast.expr | None) -> bool:
 # --------------------------------------------------------------------------- #
 # Scanner
 # --------------------------------------------------------------------------- #
+
+
+def records_worth_scanning(records: Iterable[ParsedFile]) -> list[ParsedFile]:
+    """Keep only the parsed records whose source spells a target callee.
+
+    Sound by construction: a call to a name cannot appear in a file whose
+    source never contains that name, so the filter can drop files but never
+    sites. ``test_wildcard_mcp_scoping_gate.TestPrefilterParity`` is what keeps
+    that claim honest — it asserts the filtered and unfiltered scans agree over
+    the real tree, and that the filter drops something rather than passing
+    everything through.
+
+    Why it is worth having: ``shared/tests`` is the FIRST segment of the repo
+    ``test_command``, so this gate's runtime is charged to every subsequent
+    task. Measured on this worktree at HEAD 97e3a4d097 (2026-09-22), over 524
+    parsed records of which 28 survive, taking the best of three runs::
+
+        unfiltered walk   1.21s
+        prefiltered walk  0.21s   (the filter itself costs 0.019s of that)
+
+    The parse is NOT part of either number — it is already paid once by the
+    session-scoped ``first_party_tree`` fixture. Task 4891's plan recorded
+    2.92s / 0.29s for the same two walks over the same 524/28 records, so the
+    RATIO a reader should expect ranges from ~6x to ~10x depending on machine
+    and cache state. Re-measure rather than re-judge: the record counts have
+    reproduced exactly, the wall-clock has not.
+    """
+    return [
+        record for record in records
+        if record.tree is not None
+        and any(callee in record.source for callee in TARGET_CALLEES)
+    ]
 
 
 def find_wildcard_mcp_scoping_sites(
