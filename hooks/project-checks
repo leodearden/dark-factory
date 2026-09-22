@@ -29,8 +29,15 @@
 # the pyright scoping those four tests exist to pin. Defaulting to main keeps
 # a direct invocation byte-identical to its prior behaviour AND points the
 # unspecified case at the STRICTEST set: an omitted argument must never be
-# the reason a check quietly does not run (INV-11). A project-checks that
-# ignores $2 entirely also stays valid for any other repo that copied hooks/.
+# the reason a check quietly does not run (INV-11).
+#
+# FOR A REPO THAT COPIED hooks/, the honest claim is narrower than "stays
+# valid": a branch-unaware project-checks stays CORRECT, and stops being
+# CHEAP. This repo's pre-commit no longer exits early on a non-main branch,
+# so an older copy paired with it runs its whole main-only tier -- a
+# full-package ruff and up to three pyright sweeps, seconds each -- on every
+# commit on every branch, and blocks those commits on lint that previously
+# gated main alone. Take this file with that pre-commit.
 
 ROOT="${1:?}"
 BRANCH="${2:-main}"
@@ -44,18 +51,36 @@ BRANCH="${2:-main}"
 # the staged baseline against HEAD's blob, so every route to a widened
 # baseline lands in front of one comparison.
 #
-# Plain python3, matching the three staged-file checks below: no uv
-# env-resolution overhead. The auditor fails LOUDLY if it cannot import the
-# instrument; it never skips itself.
+# NO `|| true` on this filter, unlike the grep-terminated ones below: an empty
+# listing must mean "nothing staged", never "git could not answer". A corrupt
+# or locked index would otherwise disarm the audit in silence -- the very shape
+# this gate exists to close, reproduced one layer out (INV-11).
 staged_ratchet="$(cd "$ROOT" && git diff --cached --name-only --diff-filter=ACMRD -- \
     orchestrator/tests/merge_lane_ratchet_baseline.json \
-    orchestrator/tests/merge_lane_ratchet_authorized_raises.json || true)"
+    orchestrator/tests/merge_lane_ratchet_authorized_raises.json)" || {
+    echo "pre-commit: could not list staged ratchet artifacts (git rc=$?);"
+    echo "  refusing the commit rather than skipping the audit."
+    exit 1
+}
 if [ -n "$staged_ratchet" ]; then
     echo "pre-commit: merge-lane ratchet audit (staged)..."
-    if ! (cd "$ROOT" && python3 scripts/check_staged_ratchet_raise.py); then
-        echo "pre-commit: merge-lane ratchet audit failed."
-        echo "  A measure ROSE in the staged baseline and this commit does not record it."
-        echo "  Authorize it with --authorize-raise, or lower the measure. See above."
+    # Plain python3, matching the three staged-file checks below: no uv
+    # env-resolution overhead. The auditor fails LOUDLY if it cannot import
+    # the instrument; it never skips itself.
+    (cd "$ROOT" && python3 scripts/check_staged_ratchet_raise.py)
+    ratchet_rc=$?
+    # NO DIAGNOSIS IS RESTATED HERE. The auditor has five refusal paths (an
+    # unrecorded raise, a staged baseline deletion, a rewritten ledger history,
+    # an unreadable artifact, an unimportable instrument) and prints its own
+    # named cause plus the ONE copy of RAISE_REMEDY for the paths that remedy
+    # fits. A fixed "--authorize-raise it" line here was wrong for four of the
+    # five and sent the committer hunting the wrong thing. Only the exit ladder
+    # is read: 1 policy, 2 instrument.
+    if [ "$ratchet_rc" -eq 2 ]; then
+        echo "pre-commit: merge-lane ratchet audit could NOT RUN (rc=2); its named cause is above."
+        exit 1
+    elif [ "$ratchet_rc" -ne 0 ]; then
+        echo "pre-commit: merge-lane ratchet audit REFUSED this commit (rc=$ratchet_rc); see above."
         exit 1
     fi
 fi
