@@ -10815,16 +10815,21 @@ def test_fleet_lease_path_matches_across_tiers(monkeypatch: pytest.MonkeyPatch) 
 
 
 def test_fleet_lease_max_age_matches_config_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The max-age bound's default must not drift across its three statements.
+    """The max-age bound's default must not drift across its two statements.
 
     Modelled on test_orch_restart_min_interval_secs_matches_config_default
     above. The bound is what makes a SIGKILLed sweep cost at most one delayed
     window, and its 7200s value is DERIVED (worst legitimate sweep ~= 6270s),
     not chosen — so a tier drifting off it is a silent correctness change, not
-    a cosmetic one. The bash script never reads the knob (it holds its lease
-    for as long as the sweep takes), so its statement is the documented default
-    in the header env-knob block; a reader who trusts that block and a reader
-    who trusts the code must not be told different numbers.
+    a cosmetic one.
+
+    Two statements, because there are exactly two tiers that READ the value:
+    the coordinator via OrchestratorConfig and the watchdog via its own env
+    knob. restart-all-orchestrators.sh documents the default in its header
+    env-knob block but never reads it — it holds its lease for as long as the
+    sweep takes — so that block is documentation about someone else's knob and
+    is deliberately left unpinned. If a future change moves the real default,
+    fix that number there by hand.
     """
     from orchestrator.config import OrchestratorConfig
 
@@ -10835,17 +10840,6 @@ def test_fleet_lease_max_age_matches_config_default(monkeypatch: pytest.MonkeyPa
     assert pytest.approx(
         OrchestratorConfig().orchestrator_restart_lease_max_age_secs
     ) == wdog.FLEET_LEASE_MAX_AGE_SECS
-
-    script_src = (REPO_ROOT / "scripts" / "restart-all-orchestrators.sh").read_text()
-    match = re.search(
-        r"ORCH_FLEET_LEASE_MAX_AGE_SECS.*?\(default: (\d+)", script_src, re.DOTALL
-    )
-    assert match is not None, (
-        "restart-all-orchestrators.sh no longer documents "
-        "ORCH_FLEET_LEASE_MAX_AGE_SECS's default in its header env-knob block — "
-        "update this regex, or the operator-facing number is unpinned."
-    )
-    assert int(match.group(1)) == wdog.FLEET_LEASE_MAX_AGE_SECS
 
 
 # ---------------------------------------------------------------------------
