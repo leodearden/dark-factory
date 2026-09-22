@@ -397,7 +397,7 @@ The merge procedure is iterative — don't assume one pass will be enough:
 
    - `status: "done"` or `status: "already_merged"` → **terminal success.** Thread the merge commit SHA:
      - Normal `done`: SHA is in `result["commit"]`.
-     - `already_merged`: SHA is in `result["commit"]` for the fast-path case. The worker-path `already_merged` may carry `commit=None`; when `result["commit"]` is falsy, re-derive with the same exact-subject search the canonical check uses — `git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H` — or, if that comes back empty, **do not record a note asserting the merge is present**: an empty search means nothing on main cites this task, which is exactly the signal a branch that never advanced past its creation point produces (it satisfies the worker's ancestry test while carrying none of the work). Run the [canonical ancestry check](#branch-on-main) — including [`skills/_shared/deriving-landed-sha.md`](../_shared/deriving-landed-sha.md#step-1)'s marker search on the rc=128 arm — and treat "nothing on main cites the task" as **not done**, rather than stamping a `done_provenance` note. **The canonical check's rc=0 arm agrees with this and does not override it:** its citation gate — step 4's rc=0 sub-ladder in [`skills/_shared/deriving-landed-sha.md`](../_shared/deriving-landed-sha.md) — will not stamp *anything* until a positive task citation on main proves real work landed (the shell form of `GitOps.find_task_citation_commit`), and what it stamps then is that citing commit; so a branch that never advanced fails there too and is likewise reported not-landed/phantom-branch. Neither rule licenses stamping the other's way out. **Do not eyeball `git log main --oneline | head -5` and pick a SHA**: it is not scoped to this task and you would record an unrelated task's merge as this one's provenance.
+     - `already_merged`: SHA is in `result["commit"]` for the fast-path case. The worker-path `already_merged` may carry `commit=None`; when `result["commit"]` is falsy, re-derive with the same marker search the canonical check uses — `git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H`, **subject check included**: `git log -1 --format=%s "<hit sha>"` must equal `Merge task/<TASK_ID> into main` exactly, and a body-only match counts as an empty search ([`skills/_shared/deriving-landed-sha.md`](../_shared/deriving-landed-sha.md#step-1-subject-check) states why) — or, if that comes back empty, **do not record a note asserting the merge is present**: an empty search means nothing on main cites this task, which is exactly the signal a branch that never advanced past its creation point produces (it satisfies the worker's ancestry test while carrying none of the work). Run the [canonical ancestry check](#branch-on-main) — including [`skills/_shared/deriving-landed-sha.md`](../_shared/deriving-landed-sha.md#step-1)'s marker search on the rc=128 arm — and treat "nothing on main cites the task" as **not done**, rather than stamping a `done_provenance` note. **The canonical check's rc=0 arm agrees with this and does not override it:** its citation gate — step 4's rc=0 sub-ladder in [`skills/_shared/deriving-landed-sha.md`](../_shared/deriving-landed-sha.md) — will not stamp *anything* until a positive task citation on main proves real work landed (the shell form of `GitOps.find_task_citation_commit`), and what it stamps then is that citing commit; so a branch that never advanced fails there too and is likewise reported not-landed/phantom-branch. Neither rule licenses stamping the other's way out. **Do not eyeball `git log main --oneline | head -5` and pick a SHA**: it is not scoped to this task and you would record an unrelated task's merge as this one's provenance.
      - Whatever the source, stamp the SHA **exactly as the tool returned it**. This applies with full force to a `found_on_main` `merge_sha` from the poll loop below: it is already a verified commit on main, so never substitute the branch tip or a `git merge-base` result for it. (There are two exceptions: a project that sets `git.commit_citation_pattern: ""`, where the tier runs un-gated and `merge_sha` *is* the branch tip; and a task whose `metadata.delivered_checks` rescued a landing whose effect is absent at main HEAD, where `merge_sha` is on main but may name a reverted landing — see the polled-done note below.)
 
      Go directly to step 8.
@@ -680,12 +680,21 @@ The merge procedure is iterative — don't assume one pass will be enough:
   **`merge_status` will never itself change for a coalesce-absorbed member** — nothing overwrites
   its `superseded` record (see above) — so `terminal_resumed` alone can starve forever even after
   the real merge lands. On every tick, alongside the `merge_status` check, also re-run the
-  [canonical ancestry check](#branch-on-main): break the instant it — or, on the `coalesce-*` arm
-  under **either** rc=1 **or** rc=128-with-empty-marker, either landing signal below — reports
-  landed. Only stop-and-report once ancestry (and, where reached, both signals) is still not-landed
-  when `terminal_resumed`'s 20-minute ceiling arrives; that final check is what "if it never lands"
-  means below, and under rule 2b's veto it takes the landed-but-not-credited shape stated there
-  rather than a not-landed one. This does
+  [canonical ancestry check](#branch-on-main). **Break on ancestry rc=0.** On the `coalesce-*` arm
+  — under **either** rc=1 **or** rc=128-with-empty-marker — the landing signals below may also end
+  the loop, but **only when they resolve to landed AND credited**: signal (a) shows the tip landed
+  *and* signal (b), re-read fresh, says `done`. That is a **cleanup** exit, not a stamping one —
+  the automatic flip already happened, so there is nothing for step 8 to write.
+
+  **Signal (a) alone must never break the loop.** Signal (a)-landed next to a non-`done` signal (b)
+  is exactly rule 2b's veto: keep polling to `terminal_resumed`'s 20-minute ceiling, and only then
+  take the **landed-but-not-credited** exit stated there — citing the tip merge sha, the
+  `git cherry` output and the current status; never "not landed", never resubmit, never self-stamp.
+  Breaking out on signal (a) alone would fall through to step 8's
+  `set_task_status(..., done_provenance=...)`, which is the self-stamp this arm forbids.
+
+  Stop-and-report as **not landed** only once ancestry (and, where reached, both signals) is still
+  not-landed when that ceiling arrives; that final check is what "if it never lands" means below. This does
   **not** contradict `accept_terminal`'s "do not spin here re-polling this same key": that rule
   governs the *first* loop, where exiting on `superseded` is exactly what gets you to the
   ancestry check. This governs the *resumed* loop, which is driven by that check, not by
