@@ -677,6 +677,27 @@ async def collect_scheduler_state(
                           Offline means the read demonstrably FAILED; degraded
                           means nothing was proven.  They must never be merged
                           (see module docstring).
+
+    TWO SAME-BASENAME ROOTS: what is fixed here, and what is not.  Each
+    per-project result is paired to its OWN root by POSITION, so the per-root
+    snapshot join — pin queue, park stacks, paused state, ``project_root``
+    tagging — is correct for ``/x/proj`` and ``/y/proj`` simultaneously.
+
+    The remaining joins are NOT, and the residue is disclosed rather than
+    inherited silently.  Rows arriving from ``collect_tasks_with_counts`` are
+    tagged with the basename label UPSTREAM and carry no root at all
+    (``_task_uid`` is ``f'{label}/T-{id}'``, the React tab's map key), so the
+    ``project_active`` row filter, the ``roots_to_query`` offline filter, the
+    ``{label}/{tid}`` sparkline key, the ``recovery_events`` key and module
+    contention's ``(project, path)`` key all still collapse two roots that
+    share a basename.  Making them root-unique means changing the wire label
+    vocabulary across ``redux_api`` and six JSX consumers — filed as ticket
+    ``tkt_0RTY9RTA8NJ7RDAQ5SY7PRM11T``, not attempted here.
+
+    Do NOT "fix" that residue by making the label rule set-aware: it would
+    fork ``mcp_fanout.project_label``'s single-root signature and break the
+    throttle-key identity pinned by
+    ``tests/test_mcp_fanout.py::test_all_three_project_label_definitions_agree``.
     """
     effective_now = resolve_now(now)
     since = effective_now - timedelta(hours=1)
@@ -699,7 +720,7 @@ async def collect_scheduler_state(
         if _project_label(root) not in offline_projects
     ]
 
-    async def _one_project(root) -> tuple[str, dict | None, list[dict], list[dict]]:
+    async def _one_project(root) -> tuple[dict | None, list[dict], list[dict]]:
         """Fetch snapshot + skip events + recovery events for one project root.
 
         Delegates the per-URL failover to ``mcp_fanout.first_success``: URLs
@@ -720,14 +741,19 @@ async def collect_scheduler_state(
         one row budget lets high-rate skip rows crowd out the rare recovery
         rows, which the projection would then report as a confident zero.
 
-        Returns ``(label, snapshot, skip_events, recovery_events)`` on success —
+        Returns ``(snapshot, skip_events, recovery_events)`` on success —
         ``snapshot`` may be ``{}`` for a project with no scheduler state yet
         (online but empty), and is normalised to ``{}`` if the MCP server
         returns a non-dict (defensive — older/buggy servers should never crash
-        the aggregator).  Returns ``(label, None, [], [])`` when every URL
-        fails; the ``None`` sentinel lets the caller distinguish *offline* from
+        the aggregator).  Returns ``(None, [], [])`` when every URL fails;
+        the ``None`` sentinel lets the caller distinguish *offline* from
         *online-but-empty* so a legitimately quiescent project is never
         misclassified as offline.
+
+        The label is computed here for this function's own truncation WARNING
+        and is deliberately NOT carried out: the caller already holds the
+        ROOT, which is the stronger identity (two configured roots can share
+        one basename).
         """
         label = _project_label(root)
 
@@ -798,12 +824,7 @@ async def collect_scheduler_state(
             log_label=fanout_label('get_scheduler_state', root),
             offline_result=lambda errs: (None, [], []),
         )
-        return label, snapshot, skip_events, recovery_events
-
-    # Build a label→root map for O(1) lookup after asyncio.gather.
-    # (A linear next(...) search over roots_to_query would be O(n²) in the
-    # number of projects — trivially avoidable with a single pre-pass.)
-    label_to_root = {_project_label(r): r for r in roots_to_query}
+        return snapshot, skip_events, recovery_events
 
     # Fan out to all project roots concurrently (mirrors metrics.py pattern)
     per_project_results = await asyncio.gather(
@@ -825,11 +846,23 @@ async def collect_scheduler_state(
     # present-with-[] means "read succeeded, no sweeps", absent means offline.
     all_recovery_events: dict[str, list[dict]] = {}
 
-    for result in per_project_results:
+    # Paired by POSITION, never by label. `asyncio.gather` returns results in
+    # ARGUMENT order, which is what makes this pairing total and 1:1;
+    # `strict=True` asserts it rather than trusting it. The label is the
+    # directory BASENAME, so two configured roots can share one (``/a/proj``
+    # and ``/b/proj``) and a label-keyed join collapses them — emitting one
+    # root's snapshot, pin queue and park stacks under the OTHER root's
+    # `project_root`, which the React drawer then POSTs overrides against.
+    # Same idiom, for the same reason, as
+    # ``active_tasks.collect_tasks_with_counts``'s `by_root` pairing.
+    for root, result in zip(roots_to_query, per_project_results, strict=True):
         if isinstance(result, BaseException):
-            logger.warning('_one_project raised unexpectedly: %s', result)
+            logger.warning(
+                '_one_project raised unexpectedly for %s: %s', root, result,
+            )
             continue
-        label, snapshot, skip_events, recovery_events = result
+        snapshot, skip_events, recovery_events = result
+        label = _project_label(root)
 
         # None snapshot means every URL failed (offline); {} means online-but-empty.
         if snapshot is None:
@@ -843,11 +876,6 @@ async def collect_scheduler_state(
                 'project': label,
                 'reason': snapshot.get('pause_reason'),
             })
-
-        # O(1) lookup via pre-built map (avoids O(n²) linear search per project)
-        root = label_to_root.get(label)
-        if root is None:
-            continue
 
         # Build task lookup from active_tasks for this project
         project_active = [t for t in all_active if t.get('project') == label]
