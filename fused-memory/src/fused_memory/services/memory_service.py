@@ -3224,10 +3224,12 @@ class MemoryService:
         utils/canonical_labels.py.
 
         Survivor selection is ONE rule: the family's first member under the
-        backend's survivor-first ordering (most valid edges, then oldest, then
-        uuid) survives, every other member is merged into it, and it is renamed
-        onto the canonical name last. The earlier two-branch policy — a
-        canonically-named node wins regardless of edge count — existed to avoid
+        backend's survivor-first ordering (highest provenance_rank, then oldest,
+        then uuid — where provenance_rank is valid RELATES_TO plus Episodic
+        MENTIONS, task 4986, so episode links now count toward survival too)
+        survives, every other member is merged into it, and it is renamed onto
+        the canonical name last. The earlier two-branch policy — a
+        canonically-named node wins regardless of provenance — existed to avoid
         recreating the exact-name duplicate ``_dedup_episode_nodes`` resolves.
         Where the two policies differ is the tracked motivating case: with
         'Task 605' holding 2 edges and 'task 605' holding 13, the old rule
@@ -10357,8 +10359,9 @@ class MemoryService:
         """Merge two Graphiti entity nodes by redirecting edges and deleting the deprecated.
 
         Delegates to GraphitiBackend.merge_entities(), which validates both nodes,
-        redirects all edges from the deprecated node to the surviving node, deletes
-        the deprecated node, and refreshes the surviving node's summary.
+        redirects all RELATES_TO edges AND relocates Episodic MENTIONS provenance
+        from the deprecated node onto the surviving node, deletes the deprecated
+        node, and refreshes the surviving node's summary.
         Logs the operation via write journal if available.
 
         Args:
@@ -10372,7 +10375,14 @@ class MemoryService:
 
         Returns:
             Audit dict from backend: {surviving_uuid, surviving_name, deprecated_uuid,
-            deprecated_name, edges_redirected, surviving_summary}.
+            deprecated_name, deprecated_summary, edges_redirected,
+            mentions_redirected, residual_relationships_destroyed,
+            duplicate_edges_removed, surviving_summary}.
+
+            This dict is exactly what log_write_op persists as `result_summary`
+            below, so the merge's provenance record — including the deprecated
+            node's summary text, which nothing else preserves — is durable in the
+            write journal and not only in the backend's log line.
         """
         write_op_id = str(uuid_mod.uuid4())
         success = True
