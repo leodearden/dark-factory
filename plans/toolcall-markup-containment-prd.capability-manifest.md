@@ -302,6 +302,14 @@ contracts changed; only the packaging. Two rows above do **not** survive the spl
 module locks on the two hottest files in the repo. γ2 (task **4457**) carries plan-tools; γ3
 (task **4458**) carries fused-memory. γ1 also absorbs task **4180** (cancelled into it).
 
+**Re-measured 2026-09-22 — currency (the `.yaml` twin's γ1 `note:` carries the same clause).**
+Task **3690** is `done`; registration landed in `07a967fab0`. The `OPEN` verdict in the table
+above is reproduced from the `.yaml` **as authored on 2026-08-19** and is deliberately not
+overwritten — it is the authoring-time record, kept the way Ruling 1 and the γ correction above
+are kept, with the current reading recorded alongside. Disposition today:
+`list-typed-evidence-recovery-pinned` — the row's grep `delivered_check` (`evidence` present in
+`escalation/tests/test_markup_middleware_registration.py`) is satisfied, 44 occurrences.
+
 ### γ2 — register on plan-tools, and rule on the overlap with ε's read-time path — task **4457**
 
 | Capability | Binding | Verdict |
@@ -310,6 +318,17 @@ module locks on the two hottest files in the repo. γ2 (task **4457**) carries p
 | `d1-ruling-recorded-against-3692s-read-time-path` | capability→decision — task 3692 (ε, done) landed an independent read-time repairer in the same file (`_with_markup_repairs` at `:982`, ~25 call sites) that cannot reject, memoizes refusals per-process, and deliberately leaves `_create_plan`'s inbound arguments to this middleware. Composing vs superseding must be decided and tested **here**, not left implicit (D1, INV-5). | OPEN |
 | `live-plan-tools-write-rejected-with-repaired-call` | `producer:β` — in γ2's closure (γ2←β←α); in-flight argument access proven by PRD §6 live probe | PASS |
 
+**Re-measured 2026-09-22 — currency (the `.yaml` twin's γ2 `note:` carries the same clause).**
+Task **4457** is `done`; registration landed in `37eed69c97`. The `OPEN` verdict above is
+reproduced from the `.yaml` **as authored on 2026-08-19** and is deliberately not overwritten.
+Disposition today: `d1-ruling-recorded-against-3692s-read-time-path` — the ruling it awaited was
+made, and it is **compose**, not supersede. The middleware guards INBOUND ARGUMENTS at the
+request layer; task 3692's read-time path repairs STORED STATE inside the tool body. The two
+populations are disjoint, so registering the guard does not retire 3692. The ruling is prose in
+`orchestrator/src/orchestrator/mcp/plan_tools.py::_create_plan` and is pinned by
+`orchestrator/tests/test_plan_tools_markup_guard.py::TestComposesWithTheReadTimeRepair` — the
+prose-plus-test pair the row's `manual` check calls for.
+
 ### γ3 — adapt the guard to fused-memory's **bundled** FastMCP; cover the two ungated write tools; only then retire the in-line gates — task **4458**
 
 | Capability | Binding | Verdict |
@@ -317,6 +336,25 @@ module locks on the two hottest files in the repo. γ2 (task **4457**) carries p
 | `fused-memory-boundary-adapted` | capability→producer — ⚠️ **THE ORIGINAL γ ROW FOR THIS SITE WAS A FALSE PASS.** §6 verified `add_middleware` against the STANDALONE `fastmcp` class only and then confirmed the four sites by grepping the `FastMCP` constructor — a NAME match that does not distinguish the two classes. Measured 2026-08-19: `fused-memory/server/tools.py:17` imports `mcp.server.fastmcp.FastMCP` (the MCP SDK's **BUNDLED** class), where `hasattr add_middleware` is False and `hasattr get_tool` is False. The middleware is unattachable here as written; this leaf must choose between migrating to standalone `fastmcp` or adapting through the existing `_safe_call_tool` chokepoint in `server/main.py`. | OPEN |
 | `ungated-write-tools-now-covered` | capability→producer (`measured` 2026-08-19) — `add_system_record` (`tools.py:3102`) and `update_memory` (`tools.py:4316`) have no gate of any kind; both write to Mem0 and both carry optional trailing parameters, which is the shape where a swallow is silent rather than loud | OPEN |
 | `inline-markup-gate-call-sites-retired-inv5` | capability→producer (`measured` 2026-08-19) — exactly four call sites at `tools.py:2701, 2936, 6686, 7239` (def at `:1144`); the `1828/2020/5446/5990` anchors in the original row are stale. **MUST NOT** be retired before the replacement is live and demonstrated — this is the one boundary whose containment provably works (Mem0 frozen since 2026-07-30, Graphiti since 2026-07-29). | OPEN |
+
+**Re-measured 2026-09-22 — currency (the `.yaml` twin's γ3 `note:` carries the same clause).**
+Task **4458** is `done`. All three `OPEN` verdicts above are reproduced from the `.yaml` **as
+authored on 2026-08-19** and are deliberately not overwritten; all three are discharged.
+
+- `fused-memory-boundary-adapted` — the fork the row poses was decided for **adapt**, not
+  migrate: the guard attaches through the existing `_safe_call_tool` chokepoint as
+  `fused-memory/src/fused_memory/server/markup_guard.py::install_markup_guard`, called from
+  `fused-memory/src/fused_memory/server/main.py::_install_tool_dispatch_guards`, landed
+  `60293e0d8c` on 2026-08-20. This is the same live path `docs/mcp-toolcall-xml-leak.md` names.
+  The row's `manual` `delivered_check` reason still holds under the option taken — an
+  `add_middleware` grep remains unsatisfiable at this site by design, so do not re-add one.
+- `ungated-write-tools-now-covered` — the row's grep check (`add_system_record` present in
+  `fused-memory/tests/test_markup_guard_fused_memory.py`) is satisfied, 57 occurrences.
+- `inline-markup-gate-call-sites-retired-inv5` — the **MUST NOT** no longer binds, because the
+  replacement it guarded against is live. The four gates were retired in `5d066281c1`, and the
+  row's `expect: absent` grep passes: zero definitions or call sites remain under
+  `fused-memory/src/`, every surviving mention there being past-tense prose (e.g.
+  `markup_guard.py` reads "The retired `_markup_gate`").
 
 ### δ — retro-sweep of terminal state, atomic
 
