@@ -26,7 +26,10 @@ on _TASK_NODE_NAME_PATTERN), which decides
 whether the word 'task' was written at all rather than handing a character
 onward as data, so the rule is no longer scoped to captures alone. Still not
 every class: the '\\s' padding and the '\\w' lookbehinds stay Unicode-broad
-(see the comment on _QUALIFIED_NODE_NAME_PATTERN). The vocabulary is
+(see the comment on _TASK_NODE_NAME_PATTERN, whose padding is the one that
+actually still is — _QUALIFIED_NODE_NAME_PATTERN has no '\\s' padding LEFT
+since task 4850, so it cannot illustrate the rule it used to be cited for).
+The vocabulary is
 ASCII-explicit wherever a character reaches a consumer as DATA or decides
 that the task-vocabulary word was written, and broad only where it merely
 decides whether to refuse. Before that,
@@ -185,7 +188,9 @@ _TASK_NODE_NAME_PATTERN = re.compile(
 #
 # This pattern's OWN padding is the deliberate exception to that breadth, for
 # a different reason entirely — not Unicode safety but LINE-BREAK safety
-# (task 4850). The colon is padded '[ \t]', NOT '\s', on BOTH sides: MEASURED,
+# (task 4850). Line breaks are the MOTIVE; read the next-to-last paragraph for
+# what the narrowing actually does, which is broader. The colon is padded
+# '[ \t]', NOT '\s', on BOTH sides: MEASURED,
 # before this narrowing, parse_node_name('reify:\n132') and
 # parse_node_name('reify\n:132') each parsed to Referent(project_id='reify',
 # number='132') — an entity NAME containing a hard line break is not a
@@ -211,6 +216,22 @@ _TASK_NODE_NAME_PATTERN = re.compile(
 # bare mentions, and so remove CONTESTS, the dangerous direction — the same
 # reasoning already recorded for _QUALIFIED_REF_PATTERN's colon versus
 # _LOCAL_MENTION_PATTERN's whitespace branch below.
+#
+# SECOND AXIS, declared because it is broader than the line-break motive above
+# and the tests for that motive cannot see it: '[ \t]' drops EVERY non-space,
+# non-tab whitespace character, not just '\n'. MEASURED at HEAD before the
+# narrowing, each returning Referent(project_id='reify', number='132'):
+# '\xa0reify:132', 'reify\xa0:\xa0132' and '\x0creify:132'. All return None
+# now. ACCEPTED rather than repaired, on the same direction-of-safety argument
+# as the line-break half — this pattern mints only foreign referents, so a
+# removal is recoverable and a misattribution is not — and because NBSP or
+# form-feed padding around a project-qualified node NAME is not a spelling any
+# human or extraction path writes on purpose. Note the asymmetry with the
+# '\s+' padding two paragraphs up: there the breadth costs only an exotic
+# SPELLING of an ASCII number and the character reaches a consumer as data,
+# which is why it stays. Pinned by
+# TestQualifiedNodeNamePaddingIsAsciiSpaceAndTabOnly, whose sibling case also
+# guards that _TASK_NODE_NAME_PATTERN's padding stayed broad.
 #
 # Live impact is NIL today: task_naming.canonicalize_task_node_name returns
 # None for any qualified referent and would equally return None if the name

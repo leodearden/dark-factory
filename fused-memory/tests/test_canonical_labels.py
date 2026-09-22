@@ -41,6 +41,14 @@ FULLWIDTH_THREE = '\uff13'  # FULLWIDTH DIGIT THREE — the same hazard, a secon
 LATIN_SMALL_LETTER_LONG_S = '\u017f'  # folds onto ASCII 's' under re.IGNORECASE
 KELVIN_SIGN = '\u212a'  # folds onto ASCII 'k' under re.IGNORECASE
 
+# Whitespace that '\s' matches and '[ \t]' does not, WITHOUT being a line
+# break — same escape-spelling rationale again: NO-BREAK SPACE and EM SPACE
+# render as ordinary spaces, so literal-character fixtures would be
+# indistinguishable from the ASCII-space cases they exist to contrast with.
+NO_BREAK_SPACE = '\u00a0'
+EM_SPACE = '\u2003'
+FORM_FEED = '\x0c'  # matched by '\s'; neither a space, a tab, nor a newline
+
 
 class TestReferentNodeName:
     """``Referent.node_name`` renders the graph node name the referent denotes.
@@ -758,18 +766,21 @@ class TestQualifiedNodeNameNeverSpansALineBreak:
 
     def test_same_line_spellings_are_unaffected(self):
         """Regression guard, green before AND after: the padding still
-        tolerates the spaces and tabs humans actually write around a colon,
-        which is what proves this change narrows ONLY across line breaks and
-        is not an undeclared tightening of human spacing. Asserts on
-        ``.node_name``, not just non-None, so a referent that parsed to the
-        WRONG thing would still fail this.
+        tolerates the ASCII spaces and tabs humans actually write around a
+        colon. Asserts on ``.node_name``, not just non-None, so a referent
+        that parsed to the WRONG thing would still fail this.
 
         Includes leading/trailing SPACE and TAB around the whole name
         ('  reify:132  ', '\\treify:132\\t') alongside the colon-adjacent
         spellings, so this guard also covers the ANCHORING padding that
-        :class:`TestQualifiedNodeNameAnchoringRejectsNewlines` below narrows —
-        proving that narrowing is scoped to newlines only, not to human
-        spacing in general."""
+        :class:`TestQualifiedNodeNameAnchoringRejectsNewlines` below narrows.
+
+        SCOPE OF THE CLAIM, corrected: this proves only that ASCII space and
+        tab spelling survives. It does NOT prove the narrowing is confined to
+        line breaks — '[ \\t]' drops EVERY non-space/tab whitespace character,
+        so NBSP and form-feed padding stopped parsing too. That second axis is
+        a separate, measured consequence with its own guard; see
+        :class:`TestQualifiedNodeNamePaddingIsAsciiSpaceAndTabOnly` below."""
         for name in (
             'reify:132',
             'reify: 132',
@@ -818,6 +829,54 @@ class TestQualifiedNodeNameAnchoringRejectsNewlines:
     )
     def test_leading_or_trailing_newline_is_not_a_qualified_node_name(self, name):
         assert parse_node_name(name) is None
+
+
+class TestQualifiedNodeNamePaddingIsAsciiSpaceAndTabOnly:
+    """The SECOND axis of the '\\s' -> '[ \\t]' narrowing, measured and pinned
+    rather than left implicit: '[ \\t]' drops every non-space/tab whitespace
+    character, not only the line breaks the change was motivated by.
+
+    MEASURED at HEAD before the narrowing, all three returning
+    Referent(project_id='reify', number='132'): ``'\\xa0reify:132'``,
+    ``'reify\\xa0:\\xa0132'`` and ``'\\x0creify:132'``. All return None now. So the
+    two sibling classes above understate what changed — their fixtures are all
+    ASCII space/tab plus newline, and nothing in them can see this axis.
+
+    ACCEPTED, not merely observed, and for the same direction-of-safety reason
+    the line-break narrowing rests on: this pattern mints ONLY foreign
+    referents, so a narrowing that REMOVES one is the recoverable direction,
+    while a misattribution is not. NBSP or form-feed padding around a
+    project-qualified node NAME is not a spelling any human or extraction path
+    writes on purpose, and unlike the '\\s' padding on
+    :data:`_TASK_NODE_NAME_PATTERN` — which stays Unicode-broad, and whose
+    breadth only ever costs an exotic SPELLING of an ASCII number — nothing
+    here reaches a consumer as data.
+    """
+
+    @pytest.mark.parametrize(
+        'name',
+        [
+            NO_BREAK_SPACE + 'reify:132',
+            'reify:132' + NO_BREAK_SPACE,
+            'reify' + NO_BREAK_SPACE + ':' + NO_BREAK_SPACE + '132',
+            EM_SPACE + 'reify:132',
+            FORM_FEED + 'reify:132',
+            'reify' + FORM_FEED + ':132',
+        ],
+    )
+    def test_non_ascii_whitespace_padding_is_not_a_qualified_node_name(self, name):
+        assert parse_node_name(name) is None
+
+    def test_the_task_node_pattern_keeps_its_broad_padding(self):
+        """The contrast that makes the acceptance above coherent rather than
+        arbitrary: the LOCAL pattern's '\\s' padding is deliberately NOT
+        narrowed, so the same NBSP spelling still parses there. Measured. This
+        also guards the module docstring's claim that '\\s' padding stays
+        Unicode-broad, which now points at _TASK_NODE_NAME_PATTERN because
+        _QUALIFIED_NODE_NAME_PATTERN no longer has any."""
+        referent = parse_node_name('task' + NO_BREAK_SPACE + '132')
+        assert referent is not None
+        assert referent.node_name == 'Task 132'
 
 
 class TestScanContentOrderingAndDedup:
