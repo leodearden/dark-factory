@@ -56,7 +56,7 @@ import merge_lane_metrics as metrics  # type: ignore[import-not-found]  # noqa: 
 from test_merge_lane_ratchet import _synthetic_report  # noqa: E402
 
 _REPO_ROOT = Path(__file__).parents[2]
-_GATE = _REPO_ROOT / 'scripts' / 'check_staged_ratchet_raise.py'
+_GATE = _REPO_ROOT / metrics.COMMIT_GATE_RELPATH
 
 
 def _report_with(mutate: Callable[[dict], None]) -> dict:
@@ -795,7 +795,7 @@ class TestTheWiringIsStructurallyPinned:
 
         assert metrics.BASELINE_RELPATH in source
         assert metrics.LEDGER_RELPATH in source
-        assert 'scripts/check_staged_ratchet_raise.py' in source
+        assert metrics.COMMIT_GATE_RELPATH in source
 
 
 class TestTheCarveOutIsOneStepBack:

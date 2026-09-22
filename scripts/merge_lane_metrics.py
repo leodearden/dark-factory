@@ -1085,6 +1085,14 @@ def derive_totals(report: dict) -> dict[str, int]:
 BASELINE_RELPATH = 'orchestrator/tests/merge_lane_ratchet_baseline.json'
 LEDGER_RELPATH = 'orchestrator/tests/merge_lane_ratchet_authorized_raises.json'
 
+#: The commit-time auditor the remedy tells a blocked agent about, named here
+#: rather than spelled into the prose. It is a REAL PATH a reader is sent to
+#: grep, it is frozen into the committed baseline's ``_README`` verbatim, and
+#: this instrument -- having no git dependency -- cannot notice it going stale.
+#: As a constant, ``TestTheBlockMessageNamesTheAuthorizedPath`` can assert it
+#: RESOLVES, which a bare string literal in the prose left unchecked.
+COMMIT_GATE_RELPATH = 'scripts/check_staged_ratchet_raise.py'
+
 #: THE ONE COPY of what to do when a measure rose. Composed into every site
 #: that tells an agent it may not raise -- ``BASELINE_README`` (and so the
 #: committed bytes a blocked reader opens), ``main()``'s ``--check`` trailer,
@@ -1106,7 +1114,7 @@ RAISE_REMEDY = (
     'than as a number nobody saw move. Without those flags --write-baseline '
     'REFUSES to absorb a raise over an EXISTING baseline, so regenerating in '
     'place cannot widen the ratchet. Nor can going around it: '
-    'scripts/check_staged_ratchet_raise.py runs in pre-commit on EVERY branch '
+    f'{COMMIT_GATE_RELPATH} runs in pre-commit on EVERY branch '
     'and compares the STAGED baseline against the one in git HEAD, so a '
     'baseline deleted first, written elsewhere and copied over, or hand-edited '
     'is refused on the same terms as a regeneration -- and so is a commit that '

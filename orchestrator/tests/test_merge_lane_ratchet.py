@@ -3556,9 +3556,18 @@ class TestTheBlockMessageNamesTheAuthorizedPath:
             # task 5722 this paragraph told them "what no gate can see is a
             # baseline deleted first" -- which a gate now does see, so the
             # sentence a blocked reader most needs was the one that was false.
-            'scripts/check_staged_ratchet_raise.py',
+            metrics.COMMIT_GATE_RELPATH,
         ):
             assert fragment in metrics.RAISE_REMEDY, fragment
+
+    def test_the_auditor_the_remedy_names_actually_resolves(self) -> None:
+        # THE SUBSTRING PIN ABOVE CANNOT CATCH A RENAME. Every other fragment
+        # there is a real constant, so it moves with what it names; this one
+        # points at a FILE, is frozen verbatim into the committed baseline's
+        # _README, and the instrument has no git dependency with which to
+        # notice it going stale. Renaming or moving the auditor would leave a
+        # blocked agent grepping for nothing, with the pin still green.
+        assert (metrics.repo_root() / metrics.COMMIT_GATE_RELPATH).is_file()
 
     def test_the_committed_baseline_bytes_state_the_mechanism(self) -> None:
         # THE SITE THAT MATTERED. Not the docstring, not the CLI -- the file a
