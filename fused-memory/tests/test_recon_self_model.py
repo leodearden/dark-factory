@@ -713,12 +713,21 @@ class TestNegativeProbeSetPremise:
         fired."""
         assert self.INVARIANT not in self._invariants(report)
 
-    def test_negated_sighting_later_in_the_clause_is_still_flagged(self):
-        """Only an UN-negated verb makes the clause mixed-outcome."""
-        assert self.INVARIANT in self._invariants(
+    @pytest.mark.parametrize(
+        'claim',
+        [
             'The degradation did not reproduce at limit=3 and did not '
-            'reproduce at limit=8 this cycle.'
-        )
+            'reproduce at limit=8 this cycle.',
+            'The Graphiti degradation did not reproduce this cycle and is no '
+            'longer reproducing.',
+            'The Graphiti degradation no longer reproduces at limit=3 and no '
+            'longer fires at limit=8.',
+        ],
+    )
+    def test_negated_sighting_later_in_the_clause_is_still_flagged(self, claim):
+        """Only an UN-negated verb makes the clause mixed-outcome, and "no
+        longer" negates it as surely as "not" does."""
+        assert self.INVARIANT in self._invariants(claim)
 
     @pytest.mark.parametrize(
         'claim',
