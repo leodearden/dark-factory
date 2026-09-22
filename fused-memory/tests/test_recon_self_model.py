@@ -720,6 +720,34 @@ class TestNegativeProbeSetPremise:
             'reproduce at limit=8 this cycle.'
         )
 
+    @pytest.mark.parametrize(
+        'claim',
+        [
+            'The Graphiti degradation did not reproduce this cycle: '
+            + NEGATIVE_SET_VERDICT_TEMPLATE.format(n=len(PROBE_LIMIT_LADDER)),
+            'The Graphiti degradation did not reproduce this cycle (0 of 3 '
+            'probes reproduced).',
+            'The Graphiti degradation did not reproduce this cycle, and none of '
+            'the 3 probes reproduced it.',
+            'The Graphiti degradation did not reproduce this cycle, as no probe '
+            'fired.',
+            '0 of 3 probes reproduced, so the Graphiti degradation did not '
+            'reproduce this cycle.',
+        ],
+    )
+    def test_zero_count_beside_a_clearance_claim_is_still_flagged(self, claim):
+        """A zero count names the sighting verb but reports no sighting, so it
+        cannot make the clause mixed-outcome. The prompts hand every stage the
+        "0 of N probes reproduced" wording, which makes appending it to the
+        barred claim the likeliest relapse."""
+        assert self.INVARIANT in self._invariants(claim)
+
+    def test_zero_count_does_not_hide_a_positive_sighting(self):
+        assert self.INVARIANT not in self._invariants(
+            'The degradation did not reproduce at limit=3 this cycle, and 0 of '
+            '2 probes reproduced there, but the limit=8 probe fired.'
+        )
+
     def test_permitted_verdict_wording_is_not_flagged(self):
         """LOAD-BEARING: a rule that also rejected the sanctioned wording would
         make requirement 4 unsatisfiable -- there would be nothing a stage
