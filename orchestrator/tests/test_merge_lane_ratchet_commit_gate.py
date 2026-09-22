@@ -39,6 +39,11 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
+# The seed report is IMPORTED, never re-declared: a second synthetic baseline
+# would drift from the one the instrument's own unit tests pin, and the two
+# would then disagree about what a raise looks like. It sits in a fixtures
+# module of its own rather than in either suite -- see that module's docstring.
+from _merge_lane_ratchet_fixtures import synthetic_report
 from _orch_helpers import assert_isolated_git_repo, git_env_with_ceiling
 
 # Same bootstrap as test_merge_lane_ratchet.py, and for the same reason:
@@ -50,18 +55,13 @@ if str(_SCRIPTS) not in sys.path:
 
 import merge_lane_metrics as metrics  # type: ignore[import-not-found]  # noqa: E402
 
-# The seed report is IMPORTED, never re-declared: a second synthetic baseline
-# would drift from the one the instrument's own unit tests pin, and the two
-# would then disagree about what a raise looks like.
-from test_merge_lane_ratchet import _synthetic_report  # noqa: E402
-
 _REPO_ROOT = Path(__file__).parents[2]
 _GATE = _REPO_ROOT / metrics.COMMIT_GATE_RELPATH
 
 
 def _report_with(mutate: Callable[[dict], None]) -> dict:
     """The seed report with one measure perturbed. Never the live measurement."""
-    report = copy.deepcopy(_synthetic_report())
+    report = copy.deepcopy(synthetic_report())
     mutate(report)
     return report
 
@@ -112,7 +112,7 @@ class _Repo:
         # Pinned explicitly so an operator's GLOBAL core.hooksPath cannot reach
         # into a throwaway repo and run real hooks over it.
         repo.git('config', 'core.hooksPath', str(root / '.git' / 'hooks'))
-        repo.write_baseline(report if report is not None else _synthetic_report())
+        repo.write_baseline(report if report is not None else synthetic_report())
         repo.write_ledger(metrics.empty_ledger())
         repo.commit_all('seed the ratchet artifacts')
         return repo
@@ -276,8 +276,8 @@ class TestTheStagedDiffIsAudited:
         repo.write_ledger(
             _ledger_with(
                 _record([
-                    metrics._violation('lines', 'a.py', 1000, 1005),
-                    metrics._violation(
+                    metrics.Violation.rose('lines', 'a.py', 1000, 1005),
+                    metrics.Violation.rose(
                         'total:lines', metrics.CLUSTER_TOTAL_KEY, 1200, 1205
                     ),
                 ])
@@ -298,7 +298,7 @@ class TestTheStagedDiffIsAudited:
         # Right measure, right key, WRONG landing value -- the shape a
         # hand-written or copied-forward entry actually has.
         repo.write_ledger(
-            _ledger_with(_record([metrics._violation('lines', 'a.py', 1000, 1003)]))
+            _ledger_with(_record([metrics.Violation.rose('lines', 'a.py', 1000, 1003)]))
         )
         repo.stage(metrics.BASELINE_RELPATH, metrics.LEDGER_RELPATH)
 
@@ -323,8 +323,8 @@ class TestTheStagedDiffIsAudited:
         repo.write_ledger(
             _ledger_with(
                 _record([
-                    metrics._violation('lines', 'a.py', 1000, 1005),
-                    metrics._violation(
+                    metrics.Violation.rose('lines', 'a.py', 1000, 1005),
+                    metrics.Violation.rose(
                         'total:lines', metrics.CLUSTER_TOTAL_KEY, 1200, 1205
                     ),
                 ])
@@ -385,7 +385,7 @@ _PORTS = 'orchestrator/src/orchestrator/merge_lane/ports.py'
 
 def _incident_report() -> dict:
     """The seed report plus the two paths the incidents moved, at their OLD numbers."""
-    report = copy.deepcopy(_synthetic_report())
+    report = copy.deepcopy(synthetic_report())
     report['files'][_CONFTEST] = {
         'lines': 1172,
         'prose_lines': 752,
@@ -559,7 +559,7 @@ class TestLedgerIsAppendOnlyAtTheGate:
     @staticmethod
     def _with_history(tmp_path: Path) -> tuple[_Repo, dict]:
         repo = _Repo.seeded(tmp_path)
-        history = _record([metrics._violation('lines', 'a.py', 990, 1000)], '5485')
+        history = _record([metrics.Violation.rose('lines', 'a.py', 990, 1000)], '5485')
         repo.write_ledger(_ledger_with(history))
         repo.commit_all('record a historical raise')
         return repo, history
@@ -591,7 +591,7 @@ class TestLedgerIsAppendOnlyAtTheGate:
         # this, and a rewritten `reason` is exactly how a raise stops reading as
         # what it was.
         repo, _history = self._with_history(tmp_path)
-        forged = _record([metrics._violation('lines', 'a.py', 990, 1000)], '5485')
+        forged = _record([metrics.Violation.rose('lines', 'a.py', 990, 1000)], '5485')
         forged['reason'] = 'actually it was a refactor'
         repo.write_ledger(_ledger_with(forged))
         repo.stage(metrics.LEDGER_RELPATH)
@@ -616,8 +616,8 @@ class TestLedgerIsAppendOnlyAtTheGate:
         repo.write_ledger(
             _ledger_with(
                 _record([
-                    metrics._violation('lines', 'a.py', 1000, 1005),
-                    metrics._violation(
+                    metrics.Violation.rose('lines', 'a.py', 1000, 1005),
+                    metrics.Violation.rose(
                         'total:lines', metrics.CLUSTER_TOTAL_KEY, 1200, 1205
                     ),
                 ])
@@ -733,8 +733,8 @@ class TestTheHookActuallyRunsTheGate:
         repo.write_ledger(
             _ledger_with(
                 _record([
-                    metrics._violation('lines', 'a.py', 1000, 1005),
-                    metrics._violation(
+                    metrics.Violation.rose('lines', 'a.py', 1000, 1005),
+                    metrics.Violation.rose(
                         'total:lines', metrics.CLUSTER_TOTAL_KEY, 1200, 1205
                     ),
                 ])

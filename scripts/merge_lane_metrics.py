@@ -1721,18 +1721,37 @@ class Violation:
     current: int
     message: str
 
+    @classmethod
+    def rose(
+        cls, measure: str, key: str, baseline: int, current: int
+    ) -> Violation:
+        """THE canonical constructor for a measured raise -- public, and on the type.
 
-def _violation(measure: str, key: str, baseline: int, current: int) -> Violation:
-    return Violation(
-        measure=measure,
-        key=key,
-        baseline=baseline,
-        current=current,
-        message=(
-            f'{measure} rose {baseline} -> {current} for {key} -- the merge-lane '
-            'ratchet permits a measure to fall or hold, never to rise'
-        ),
-    )
+        ``message`` is composed HERE and nowhere else (SPOT), which is what
+        makes it the only honest way to build one: the ledger's ``measures``
+        vocabulary, ``unrecorded_raises``' coverage triple and the gate's
+        refusal lines all describe a raise in these terms, so a caller that
+        could not reach this would re-derive the wording and drift from it.
+        It was ``_violation`` until task 5722 -- a leading underscore on the
+        only constructor of a type this module hands out, which made every
+        test of the auditor reach past the module's public face.
+
+        A CLASSMETHOD rather than a module-level ``violation()``: ``main`` and
+        several siblings bind ``violation`` as a loop variable over a list of
+        them, so a module-level factory of that name would be shadowed inside
+        exactly the scopes most likely to want it.
+        """
+        return cls(
+            measure=measure,
+            key=key,
+            baseline=baseline,
+            current=current,
+            message=(
+                f'{measure} rose {baseline} -> {current} for {key} -- the '
+                'merge-lane ratchet permits a measure to fall or hold, never '
+                'to rise'
+            ),
+        )
 
 
 def _total_violation(measure: str, baseline: int, current: int) -> Violation:
@@ -1831,14 +1850,14 @@ def _check_files(current: dict, baseline: dict) -> list[Violation]:
         for measure in _SUMMED_FILE_MEASURES:
             was, now = int(base_entry.get(measure, 0)), int(entry.get(measure, 0))
             if now > was:
-                violations.append(_violation(measure, path, was, now))
+                violations.append(Violation.rose(measure, path, was, now))
     return violations
 
 
 def _check_functions(current: dict, baseline: dict) -> list[Violation]:
     current_functions = _section(current, 'functions')
     return [
-        _violation('cognitive', key, int(was), int(current_functions[key]))
+        Violation.rose('cognitive', key, int(was), int(current_functions[key]))
         for key, was in _section(baseline, 'functions').items()
         if key in current_functions and int(current_functions[key]) > int(was)
     ]
@@ -1854,14 +1873,14 @@ def _check_tests(current: dict, baseline: dict) -> list[Violation]:
         was = int(base_entry.get('private_reads', 0))
         now = int(entry.get('private_reads', 0))
         if now > was:
-            violations.append(_violation('private_reads', path, was, now))
+            violations.append(Violation.rose('private_reads', path, was, now))
         # DISTINCT names, matching the PRD's measure: re-patching the same leaf
         # twice more in one file is not a new reach into lane internals.
         was_targets = len(set(base_entry.get('patch_targets', ())))
         now_targets = len(set(entry.get('patch_targets', ())))
         if now_targets > was_targets:
             violations.append(
-                _violation('patch_targets', path, was_targets, now_targets)
+                Violation.rose('patch_targets', path, was_targets, now_targets)
             )
     return violations
 

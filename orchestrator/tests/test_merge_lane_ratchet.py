@@ -26,8 +26,9 @@ per-measure delta in ``merge_lane_ratchet_authorized_raises.json``; without
 those flags ``--write-baseline`` refuses to absorb a raise over an EXISTING
 baseline, so regenerating cannot make this test pass by widening the ratchet.
 Deleting the baseline first would -- there is then nothing to compare against --
-but that is a wholesale reset of every frozen measure, read in the diff by the
-reviewer rather than by any gate, and it is not a path past this one.
+but a staged deletion is refused outright by ``scripts/check_staged_ratchet_raise.py``
+in pre-commit on every branch, and the wholesale reset it would otherwise be is
+read in the diff by a reviewer besides.
 ``metrics.RAISE_REMEDY`` is the one copy of that rule, and every failure message
 here composes it.
 
@@ -54,6 +55,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from _merge_lane_ratchet_fixtures import synthetic_report
 from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # This module AST-parses the Appendix A cluster (23 CLUSTER_PATHS entries, two
@@ -1240,51 +1242,9 @@ class TestTestFileMeasures:
 # Report assembly, and DERIVED totals.
 
 
-def _synthetic_report() -> dict:
-    return {
-        'schema_version': 1,
-        'params': {
-            'complexipy_version': '6.2.0',
-            'cluster_paths': ['a.py', 'b.py'],
-            'file_line_ceiling': 1500,
-            'new_function_cognitive_ceiling': 15,
-        },
-        'enumeration': {
-            'requested': ['a.py', 'b.py'],
-            'resolved': ['a.py', 'b.py'],
-            # The LIVE shape: the test-tree half is two counts, and it is the one
-            # key render_baseline drops on the way to the committed file.
-            'test_tree': {'requested': 9, 'resolved': 2},
-            'unreadable': [],
-            'complete': True,
-        },
-        'files': {
-            'a.py': {
-                'lines': 1000,
-                'prose_lines': 400,
-                'cognitive': 120,
-                'function_local_imports': 3,
-                'reexport_names': 5,
-            },
-            'b.py': {
-                'lines': 200,
-                'prose_lines': 50,
-                'cognitive': 30,
-                'function_local_imports': 1,
-                'reexport_names': 0,
-            },
-        },
-        'functions': {'a.py::f': 40, 'a.py::C::m': 12, 'b.py::g': 7},
-        'tests': {
-            't1.py': {'patch_targets': ['foo', 'bar'], 'private_reads': 20},
-            't2.py': {'patch_targets': ['bar', 'baz'], 'private_reads': 5},
-        },
-    }
-
-
 class TestDeriveTotals:
     def test_sums_every_file_measure(self) -> None:
-        totals = metrics.derive_totals(_synthetic_report())
+        totals = metrics.derive_totals(synthetic_report())
         assert totals['lines'] == 1200
         assert totals['prose_lines'] == 450
         assert totals['cognitive'] == 150
@@ -1292,20 +1252,20 @@ class TestDeriveTotals:
         assert totals['reexport_names'] == 5
 
     def test_private_reads_are_summed_over_tests(self) -> None:
-        assert metrics.derive_totals(_synthetic_report())['private_reads'] == 25
+        assert metrics.derive_totals(synthetic_report())['private_reads'] == 25
 
     def test_patch_targets_total_is_the_union_size_not_the_sum(self) -> None:
         # The PRD's measure is DISTINCT names: foo/bar/baz across two files that
         # both patch `bar` is 3, not 4.
-        assert metrics.derive_totals(_synthetic_report())['patch_targets'] == 3
+        assert metrics.derive_totals(synthetic_report())['patch_targets'] == 3
 
     def test_moving_code_to_a_new_path_leaves_every_total_identical(self) -> None:
         # THE ANTI-RENAME-GAMING PROPERTY. Totals are DERIVED by summing the
         # stored per-path map rather than stored as their own key, so moving 500
         # lines and 40 cognitive from a.py to a brand-new path cannot lower the
         # cluster figure -- the ratchet still catches the move.
-        before = _synthetic_report()
-        after = _synthetic_report()
+        before = synthetic_report()
+        after = synthetic_report()
         after['files']['a.py']['lines'] -= 500
         after['files']['a.py']['cognitive'] -= 40
         after['files']['new_module.py'] = {
@@ -1318,7 +1278,7 @@ class TestDeriveTotals:
         assert metrics.derive_totals(after) == metrics.derive_totals(before)
 
     def test_is_a_pure_function_of_the_report(self) -> None:
-        report = _synthetic_report()
+        report = synthetic_report()
         snapshot = json.dumps(report, sort_keys=True)
         metrics.derive_totals(report)
         assert json.dumps(report, sort_keys=True) == snapshot
@@ -1625,7 +1585,7 @@ class TestStoredEnumerationIsChurnFree:
 
     @staticmethod
     def _report(**enumeration: object) -> dict:
-        report = _synthetic_report()
+        report = synthetic_report()
         report['enumeration'].update(enumeration)
         return report
 
@@ -1636,7 +1596,7 @@ class TestStoredEnumerationIsChurnFree:
     def test_the_stored_key_set_omits_the_test_tree_counts(self) -> None:
         # No test-tree NUMBER reaches the file, only the cluster half plus
         # INV-11's two completeness keys.
-        assert set(self._stored(_synthetic_report())) == {
+        assert set(self._stored(synthetic_report())) == {
             'requested',
             'resolved',
             'unreadable',
@@ -1681,7 +1641,7 @@ class TestStoredEnumerationIsChurnFree:
     def test_the_transform_is_idempotent(self) -> None:
         # render_baseline's round-trip contract: regenerating a baseline FROM a
         # baseline must be a no-op, not a second round of deletions.
-        once = self._stored(_synthetic_report())
+        once = self._stored(synthetic_report())
         assert metrics._stored_enumeration(once) == once
 
     def test_the_rendered_baseline_is_stable_across_an_unrelated_new_test(
@@ -1693,7 +1653,7 @@ class TestStoredEnumerationIsChurnFree:
         # reintroduce it -- `requested` moves on ANY .py arriving anywhere under
         # orchestrator/tests, and `resolved` moves whenever a lane-importing one
         # is added or deleted, which is a shared line every gamma branch rewrites.
-        report = _synthetic_report()
+        report = synthetic_report()
         before = metrics.render_baseline(report)
         report['enumeration']['test_tree']['requested'] += 1
         assert metrics.render_baseline(report) == before
@@ -1705,7 +1665,7 @@ class TestRenderBaseline:
     def test_round_trips_without_dropping_a_measure(self) -> None:
         # A hand-rolled writer's failure mode is a silently omitted measure, so
         # the round-trip is asserted structurally rather than eyeballed.
-        report = _synthetic_report()
+        report = synthetic_report()
         loaded = json.loads(metrics.render_baseline(report))
         assert loaded.pop('_README') == metrics.BASELINE_README
         # The ONE measure deliberately not stored, popped here the same way
@@ -1721,7 +1681,7 @@ class TestRenderBaseline:
         # One path per LINE makes those ten edits disjoint hunks; json.dumps(
         # indent=2) would spread merge_queue.py's five measures over six lines
         # and put two branches' unrelated edits inside one conflicting hunk.
-        report = _synthetic_report()
+        report = synthetic_report()
         rendered = metrics.render_baseline(report)
         lines = rendered.splitlines()
         for section in ('files', 'functions', 'tests'):
@@ -1735,7 +1695,7 @@ class TestRenderBaseline:
                 assert json.loads(tail) == value, f'{section}.{key} value spans lines'
 
     def test_per_path_keys_are_emitted_in_sorted_order(self) -> None:
-        report = _synthetic_report()
+        report = synthetic_report()
         rendered = metrics.render_baseline(report)
         for section in ('files', 'functions', 'tests'):
             positions = [
@@ -1744,14 +1704,14 @@ class TestRenderBaseline:
             assert positions == sorted(positions), section
 
     def test_ends_with_exactly_one_trailing_newline(self) -> None:
-        rendered = metrics.render_baseline(_synthetic_report())
+        rendered = metrics.render_baseline(synthetic_report())
         assert rendered.endswith('\n')
         assert not rendered.endswith('\n\n')
 
     def test_rendering_is_idempotent(self) -> None:
         # Regenerating a baseline from a baseline must be a no-op, or every
         # regeneration would churn the file and manufacture conflicts.
-        once = metrics.render_baseline(_synthetic_report())
+        once = metrics.render_baseline(synthetic_report())
         twice = metrics.render_baseline(json.loads(once))
         assert twice == once
 
@@ -1764,7 +1724,7 @@ class TestRenderBaseline:
         # TestRenderBaseline::test_round_trips_without_dropping_a_measure
         # already proves BASELINE_README is exactly what gets emitted. If the
         # README's guidance matters, fix the constant; do not lock its phrasing.
-        rendered = metrics.render_baseline(_synthetic_report())
+        rendered = metrics.render_baseline(synthetic_report())
         first_key_line = rendered.splitlines()[1]
         assert first_key_line.lstrip().startswith('"_README":')
         # Non-vacuity only, in this module's floor idiom: the key must not be
@@ -1774,7 +1734,7 @@ class TestRenderBaseline:
 
 class TestBaselineIO:
     def test_write_then_load_round_trips(self, tmp_path: Path) -> None:
-        report = _synthetic_report()
+        report = synthetic_report()
         target = tmp_path / 'baseline.json'
         metrics.write_baseline(target, report)
         assert target.read_text(encoding='utf-8') == metrics.render_baseline(report)
@@ -1784,7 +1744,7 @@ class TestBaselineIO:
 
     def test_write_is_atomic_leaving_no_debris(self, tmp_path: Path) -> None:
         target = tmp_path / 'baseline.json'
-        metrics.write_baseline(target, _synthetic_report())
+        metrics.write_baseline(target, synthetic_report())
         assert [p.name for p in tmp_path.iterdir()] == ['baseline.json']
 
     def test_missing_baseline_is_a_named_hard_failure(self, tmp_path: Path) -> None:
@@ -2131,7 +2091,7 @@ class TestCompareBaselineFiles:
         """The four fields a ledger record is projected from, message excluded.
 
         Asserting on the tuple rather than on ``message`` is what keeps these
-        tests about the COMPARISON: the wording lives in ``_violation`` and is
+        tests about the COMPARISON: the wording lives in ``Violation.rose`` and is
         pinned by ``TestViolationShape``, so re-deriving it here would be a
         second copy that drifts.
         """
@@ -2145,10 +2105,10 @@ class TestCompareBaselineFiles:
     @classmethod
     def _pair(cls, tmp_path: Path, mutate) -> tuple[Path, Path]:
         """Two images: the seed, and the seed with one measure perturbed."""
-        moved = copy.deepcopy(_synthetic_report())
+        moved = copy.deepcopy(synthetic_report())
         mutate(moved)
         return (
-            cls._image(tmp_path, 'previous.json', _synthetic_report()),
+            cls._image(tmp_path, 'previous.json', synthetic_report()),
             cls._image(tmp_path, 'current.json', moved),
         )
 
@@ -2166,7 +2126,7 @@ class TestCompareBaselineFiles:
         # the same raise. The total comes along because it is DERIVED -- moving
         # the mass to a new path is the shape that check exists for.
         assert [self._fields(v) for v in raises] == [
-            self._fields(metrics._violation('lines', 'a.py', 1000, 1005)),
+            self._fields(metrics.Violation.rose('lines', 'a.py', 1000, 1005)),
             ('total:lines', metrics.CLUSTER_TOTAL_KEY, 1200, 1205),
         ]
 
@@ -2222,7 +2182,7 @@ class TestCompareBaselineFiles:
     def test_a_missing_image_is_a_named_hard_failure(self, tmp_path: Path) -> None:
         # Inherited from load_baseline, never re-implemented: an unreadable
         # image must never read as an empty-baseline pass (INV-11).
-        previous = self._image(tmp_path, 'previous.json', _synthetic_report())
+        previous = self._image(tmp_path, 'previous.json', synthetic_report())
         absent = tmp_path / 'gone.json'
 
         with pytest.raises(metrics.MetricsError) as excinfo:
@@ -2231,7 +2191,7 @@ class TestCompareBaselineFiles:
         assert str(absent) in str(excinfo.value)
 
     def test_a_malformed_image_is_a_named_hard_failure(self, tmp_path: Path) -> None:
-        previous = self._image(tmp_path, 'previous.json', _synthetic_report())
+        previous = self._image(tmp_path, 'previous.json', synthetic_report())
         broken = tmp_path / 'broken.json'
         broken.write_text('{"files": {', encoding='utf-8')
 
@@ -2423,7 +2383,7 @@ class TestAuthorizedRaiseLedger:
     def _record(task_id: str) -> dict:
         return metrics.authorization_record(
             metrics.RaiseAuthorization(task_id=task_id, reason=f'reason {task_id}'),
-            [metrics._violation('lines', _MQ, 21550, 21653)],
+            [metrics.Violation.rose('lines', _MQ, 21550, 21653)],
         )
 
     def test_absence_is_empty_here_and_fatal_for_the_baseline(
@@ -2536,7 +2496,7 @@ class TestLedgerAppendedEntries:
     def _record(task_id: str, reason: str = 'net-additive work') -> dict:
         return metrics.authorization_record(
             metrics.RaiseAuthorization(task_id=task_id, reason=reason),
-            [metrics._violation('lines', _MQ, 21550, 21653)],
+            [metrics.Violation.rose('lines', _MQ, 21550, 21653)],
         )
 
     @classmethod
@@ -2622,11 +2582,11 @@ class TestUnrecordedRaises:
 
     @staticmethod
     def _lines_raise() -> metrics.Violation:
-        return metrics._violation('lines', _MQ, 21550, 21653)
+        return metrics.Violation.rose('lines', _MQ, 21550, 21653)
 
     @staticmethod
     def _cognitive_raise() -> metrics.Violation:
-        return metrics._violation('cognitive', _MQ, 2133, 2140)
+        return metrics.Violation.rose('cognitive', _MQ, 2133, 2140)
 
     def test_a_record_derived_from_the_raises_covers_them_all(self) -> None:
         raises = [self._lines_raise(), self._cognitive_raise()]
@@ -2648,7 +2608,7 @@ class TestUnrecordedRaises:
         # the right measure and the right key, so any (measure, key) check would
         # wave it through -- while the baseline it accompanies landed somewhere
         # else entirely. `current` is the discriminator.
-        stale = self._record([metrics._violation('lines', _MQ, 21550, 21600)])
+        stale = self._record([metrics.Violation.rose('lines', _MQ, 21550, 21600)])
         raises = [self._lines_raise()]
 
         assert metrics.unrecorded_raises(raises, [stale]) == raises
@@ -2675,7 +2635,7 @@ class TestUnrecordedRaises:
         # in one commit records b->m and m->f, while the HEAD-to-staged delta
         # reads b->f. Requiring `baseline` to match would refuse that correctly
         # authorized commit.
-        midpoint = self._record([metrics._violation('lines', _MQ, 21600, 21653)])
+        midpoint = self._record([metrics.Violation.rose('lines', _MQ, 21600, 21653)])
 
         assert metrics.unrecorded_raises([self._lines_raise()], [midpoint]) == []
 
