@@ -6,6 +6,7 @@ import ast
 import json
 import logging
 import sqlite3
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -2108,9 +2109,9 @@ class TestAggregatePerformanceHistoryWindowBoundary:
         )
 
 
-def _iter_non_docstring_string_literals(tree: ast.AST):
-    """Yield every string-literal ``ast.Constant`` node in *tree*, excluding
-    module/class/function docstrings.
+def _iter_non_docstring_string_literals(tree: ast.AST) -> Iterator[tuple[int, str]]:
+    """Yield ``(lineno, value)`` for every string-literal ``ast.Constant`` node
+    in *tree*, excluding module/class/function docstrings.
 
     Used to restrict a source-scanning guard to string content that could
     actually reach SQLite as a query, rather than every physical source
@@ -2119,6 +2120,12 @@ def _iter_non_docstring_string_literals(tree: ast.AST):
     the other gap -- a naive whole-file substring scan flags both, which is
     why prose in performance.py previously had to avoid spelling out the
     forbidden pattern literally.
+
+    Yielding the already-narrowed ``str`` value rather than the node carries
+    the "value is a `str`" invariant across the yield boundary in the type.
+    pyright infers `ast.Constant.value` as a union and this generator's
+    internal `isinstance` check does not survive yielding the node itself,
+    so every call site would otherwise have to re-narrow it defensively.
     """
     docstring_ids: set[int] = set()
     for node in ast.walk(tree):
@@ -2137,8 +2144,37 @@ def _iter_non_docstring_string_literals(tree: ast.AST):
             and isinstance(node.value, str)
             and id(node) not in docstring_ids
         ):
-            yield node
+            yield node.lineno, node.value
 
+
+# Both spellings of the forbidden SQL-side clock read, in one place: the
+# detection below and the remediation message both derive from this tuple.
+_SQL_CLOCK_READ_PATTERNS = ("datetime('now'", 'datetime("now"')
+
+
+def _sql_clock_read_violations(source: str, label: str) -> list[str]:
+    """Return one ``'<label>:<lineno>: <excerpt>'`` entry per non-docstring
+    string literal in *source* whose value contains a
+    `_SQL_CLOCK_READ_PATTERNS` spelling.
+
+    A match is reported straight off the AST literal -- its start line and
+    its folded value -- and never off a physical source line. Python folds
+    implicitly-concatenated adjacent literals into ONE `ast.Constant` whose
+    value can contain the pattern while no single line does, so re-deriving
+    the violation by re-scanning lines silently misses exactly the
+    multi-line SQL style the module under guard is written in (task 4624
+    review finding).
+
+    Interior whitespace in the excerpt is collapsed so that a triple-quoted
+    multi-line SQL literal cannot emit embedded newlines, which would garble
+    the joined failure message into unattributable fragments.
+    """
+    violations: list[str] = []
+    for lineno, value in _iter_non_docstring_string_literals(ast.parse(source, filename=label)):
+        if any(pattern in value for pattern in _SQL_CLOCK_READ_PATTERNS):
+            excerpt = ' '.join(value.split())[:120]
+            violations.append(f'{label}:{lineno}: {excerpt}')
+    return violations
 
 # ---------------------------------------------------------------------------
 # Detection-helper unit tests for the data-layer SQL clock-read guard
@@ -2271,6 +2307,14 @@ def test_no_sql_side_clock_reads_in_data_layer():
     uses `datetime(MAX(completed_at), ...)` and is deliberately out of
     scope for this task (see design decision).
 
+    Detection lives in `_sql_clock_read_violations`, which reports a match
+    directly off the AST literal -- file, the literal's start line, and the
+    folded value. Reporting off a physical source line instead silently
+    misses implicitly-concatenated SQL, which is the style already used in
+    the module under guard; `TestSqlClockReadGuard` above pins both that
+    regression and the prose exclusions, so `assert not violations` below
+    cannot pass vacuously on broken detection.
+
     Placement note: this guard belongs conceptually next to
     `test_clock_discipline.py::test_no_bare_clock_reads_in_data_modules`,
     which already owns the `_DATA_DIR` scan root this test re-derives. It
@@ -2283,24 +2327,13 @@ def test_no_sql_side_clock_reads_in_data_layer():
     violations: list[str] = []
     for path in sorted(data_dir.glob('*.py')):
         rel = path.relative_to(data_dir.parent.parent)
-        source = path.read_text()
-        source_lines = source.splitlines()
-        tree = ast.parse(source, filename=str(path))
-        for node in _iter_non_docstring_string_literals(tree):
-            value = node.value
-            if not isinstance(value, str):
-                continue
-            if "datetime('now'" not in value and 'datetime("now"' not in value:
-                continue
-            start, end = node.lineno, getattr(node, 'end_lineno', node.lineno)
-            for lineno in range(start, end + 1):
-                text = source_lines[lineno - 1] if 0 < lineno <= len(source_lines) else ''
-                if "datetime('now'" in text or 'datetime("now"' in text:
-                    violations.append(f'{rel}:{lineno}: {text.strip()}')
+        violations.extend(_sql_clock_read_violations(path.read_text(), str(rel)))
 
     assert not violations, (
-        "SQL-side datetime('now', ...) clock read(s) found -- compute the "
-        'cutoff in Python instead via a module-local `_cutoff(days, *, '
-        'now=None)` helper routed through dashboard.data.utils.resolve_now '
+        'SQL-side clock read(s) found ('
+        + ' / '.join(f'{pattern}, ...)' for pattern in _SQL_CLOCK_READ_PATTERNS)
+        + ') -- compute the cutoff in Python instead via a module-local '
+        '`_cutoff(days, *, now=None)` helper routed through '
+        'dashboard.data.utils.resolve_now '
         '(see dashboard.data.performance._cutoff):\n' + '\n'.join(violations)
     )
