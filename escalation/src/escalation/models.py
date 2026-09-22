@@ -679,6 +679,37 @@ class Escalation:
     # change (they are field-agnostic passthroughs or RMW-on-hydrated-record).
     pin_declared_by: list[str] = field(default_factory=list)
     pin_declared_reason: str = ''
+    # SUBJECT PROJECT (task 4951) — which project this record is ABOUT.  The
+    # queue is shared across every project the factory operates, so that is a
+    # fact consumers need and could not previously read: the emitters held it
+    # in a local variable and spent it on `detail` prose, leaving readers to
+    # parse it back out of a rendered string (the INV-2 gap this closes).
+    #
+    # WRITERS today are exactly the two reconciliation filing sites —
+    # `fused_memory/reconciliation/stage1_stall_detector.py::maybe_escalate_stalled_tasks`
+    # and `::maybe_escalate_stalled_gate_backlog` — which pass the same
+    # `project_id` they already render into `detail`.  `None` means UNSTAMPED
+    # (a legacy record, or any producer that does not set it); it never means
+    # "no project", so a reader must fall back rather than conclude anything
+    # from it.  The field-first reader is
+    # `fused_memory/reconciliation/orphaned_recon_escalation_sweep.py::escalation_project_id`.
+    #
+    # Zero migration, same pattern as members / evidence / train_state / the
+    # triage quad / granted_files / filing_claimant_run_id / amendments /
+    # root_cause_variants / the declared-pin marker above: legacy JSON without
+    # this key deserialises to None via the from_dict __dataclass_fields__
+    # filter below, to_dict's asdict() serialises it for free, and
+    # queue.submit / submit_resolved / _atomic_write / resolve / park /
+    # stamp_triage need NO change (they are field-agnostic passthroughs or
+    # RMW-on-hydrated-record).  Existing records keep their current bytes only
+    # until the next rewrite, which emits `"project_id": null` — as every
+    # field above did when it landed.
+    # Deliberately NOT added to `_COMPACT_ESCALATION_FIELDS` (server.py),
+    # mirroring `citation_sha`: no consumer of this task reads compact rows
+    # (both read FULL records), and widening that tuple puts a mostly-null key
+    # on every compact row including the dashboard poll — a separately
+    # reviewable act, not an oversight here.
+    project_id: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
