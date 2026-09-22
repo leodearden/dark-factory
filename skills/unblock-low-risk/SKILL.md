@@ -323,9 +323,20 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
          Nothing was absorbed, and that id *is* pollable by `request_id`.
      - **Resolve it by ancestry, not by re-polling the id you already hold.** Run the ancestry
        disposition in [Deriving the landed sha](#deriving-the-landed-sha) — it already carries the
-       `coalesce-*` carve-outs, so do not restate or improvise any ladder text here. If it yields
-       a **stampable sha**, that is success: proceed with sub-steps a–d above. On the `coalesce-*`
-       arm remember both carve-outs: **neither rc=1 nor rc=128-with-an-empty-marker is
+       `coalesce-*` carve-outs, so do not restate or improvise any ladder text here. It has three
+       dispositions here, and **two of them are success**:
+       - **A stampable sha** — proceed with sub-steps **a–d** above.
+       - **Resolved, landed and already credited** — the `coalesce-*` arm's `done`-status
+         outcome: signal (a) shows the tip landed, and this task's scheduler status, re-read
+         fresh, already reads `done`. There is **nothing to stamp**, and that is **success, not
+         an abort**: skip sub-step (a), then run sub-steps **(c)** cleanup and **(d)**
+         `resolve_issue`, recording the tip merge sha in the resolution text. Without this
+         disposition a landed, correctly-credited task falls through to the polling exit below
+         and gets abandoned as in-flight — see [Deriving the landed
+         sha](#deriving-the-landed-sha)'s `coalesce-*` bullet for the full two-outcome split.
+       - **Not resolved yet** — the two exits in the next bullet.
+
+       On the `coalesce-*` arm remember both carve-outs: **neither rc=1 nor rc=128-with-an-empty-marker is
        not-landed**, and **neither arm carries a self-stamp** — the scheduler status decides only
        which exit applies, never whether a write is permitted.
      - **If it has not resolved yet, both available exits are non-failures.** Either keep polling
@@ -428,11 +439,22 @@ eyeballed listing.
 - **On the `coalesce-*` arm, neither rc=1 nor rc=128-with-an-empty-marker is a not-landed
   outcome** — a train merges only the tip branch, so an absorbed non-tip member has neither a
   marker of its own nor an ancestor relationship to prove. Follow the ladder's pointer into
-  `merge-queue/SKILL.md`: rules 2–3 govern rc=1 (take its **landed-but-not-credited** exit),
-  rule 2a governs rc=128-with-empty-marker (check the tip's merge marker and this task's
-  scheduler status; on either landing signal it is landed — but rule 2a licenses **no write on
-  this arm at all**, so never self-stamp, and the exit is the same **landed-but-not-credited**
-  report). In **neither** case `merge_cancel`, and in neither case report not-landed. This is
+  `merge-queue/SKILL.md`: rules 2–3 govern rc=1, rule 2a governs rc=128-with-empty-marker, and
+  **neither arm licenses a write** — never self-stamp on either. Read rule 2 there for the
+  argument rather than restating it; the disposition here is the **same on both arms**, and it
+  turns on re-reading this task's scheduler status **fresh**:
+  - **`done`** — `mark_member_done`'s automatic flip already happened, so the work is landed
+    **and already credited**. There is nothing to write: **skip sub-step (a) entirely** and
+    proceed to sub-steps **(c)** and **(d)**. This is a **success** path — not an abort, and not
+    a landed-but-not-credited report. (Sub-step (c)'s `git branch -d` will refuse on this arm:
+    the member ref is stale-by-rebase and not an ancestor of main. `git branch -D
+    task/<task_id>` is safe once `git cherry main task/<task_id>` is non-empty and every line
+    starts with `-`; leaving the ref in place is also fine.)
+  - **Any other status** — `pending`, `merge-deferred`, anything else, including a status you
+    cannot read — **never write**. Keep polling to step 8's 20-minute ceiling, then take the
+    **landed-but-not-credited** report, citing the tip merge sha and the current status.
+
+  In **neither** case `merge_cancel`, and in neither case report not-landed. This is
   the one carve-out that most matters here: this skill is fully autonomous, so a wrong
   not-landed reading cancels and abandons work that actually landed.
 - **No verdict** (containment rc=128) — re-derive per the ladder. Do not stamp, and do not read
