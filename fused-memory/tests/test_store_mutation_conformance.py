@@ -554,11 +554,14 @@ class TestReadOnlyModuleIsNotACandidate:
 SCRIPTS_ROOT = pathlib.Path(__file__).parents[1] / 'scripts'
 
 #: Measured at plan time (task 4848) by running this same two-tier detector
-#: over the repo's 43 scripts. A FLOOR, not a pin: discovery is free to find
-#: MORE as new mutating scripts are added (and does -- the live count already
-#: exceeds it, since two scripts landed guarded after the measurement was
-#: taken). It must never find FEWER, which is what would mean the detection
-#: criteria regressed.
+#: over the scripts tree. A FLOOR, not a pin: discovery is free to find MORE
+#: as new mutating scripts are added, and does -- re-measured in the task
+#: 4848 debug pass, the tree holds 48 .py files and discovery finds 17
+#: candidates. It must never find FEWER, which is what would mean the
+#: detection criteria regressed. Every number here was taken by RUNNING
+#: _discover_candidate_scripts(); the plan-time figures it replaces ("43
+#: scripts", "two scripts landed guarded since") had silently drifted, so
+#: re-run it rather than adjusting a count by inspection.
 CANDIDATE_FLOOR = 14
 
 
