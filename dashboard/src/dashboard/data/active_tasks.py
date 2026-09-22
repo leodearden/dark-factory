@@ -72,6 +72,7 @@ from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 from shared.timestamps import parse_timestamp_or_warn
 
 from dashboard.config import DashboardConfig
+from dashboard.data.mcp_fanout import project_label
 from dashboard.data.task_runtime import fetch_task_runtime
 from dashboard.data.tasks import (
     fetch_external_statuses,
@@ -323,9 +324,11 @@ _TASKS_ROOT_CONCURRENCY = 4
 _LIVE_PRD_EXEMPTION_WARN_THRESHOLD = 200
 
 
-def _project_label(root: Path) -> str:
-    """Display label for a project root path: the directory's basename."""
-    return root.name or str(root)
+# An alias, not a wrapper: a wrapper re-declares the signature and the
+# docstring, which is exactly how this copy drifted from its definition site
+# (it was annotated ``root: Path`` and raised AttributeError on the ``str``
+# its two peers accepted). See ``mcp_fanout.project_label``.
+_project_label = project_label
 
 
 def _all_project_roots(config: DashboardConfig) -> list[Path]:

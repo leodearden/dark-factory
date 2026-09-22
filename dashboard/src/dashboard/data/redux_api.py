@@ -17,6 +17,7 @@ from typing import Any
 from shared.timestamps import parse_timestamp_or_warn
 
 from dashboard.data.escalations import resolve_owning_project
+from dashboard.data.mcp_fanout import project_label
 from dashboard.data.outcome_colors import assign_outcome_colors
 from dashboard.data.stats_utils import percentile
 from dashboard.data.utils import resolve_now
@@ -26,11 +27,11 @@ from dashboard.data.utils import resolve_now
 # ---------------------------------------------------------------------------
 
 
-def _project_label(value: str | Path) -> str:
-    """Display label for a project root: directory basename, fallback to str."""
-    s = str(value)
-    name = s.rstrip('/').rsplit('/', 1)[-1]
-    return name or s
+# An alias, not a wrapper: a wrapper re-declares the signature and the
+# docstring, which is exactly how this copy drifted from its definition site
+# (its string-splitting rule returned '.' for 'a/b/.' where the pathlib rule
+# returns 'b'). See ``mcp_fanout.project_label``.
+_project_label = project_label
 
 
 def shape_orchestrators(
