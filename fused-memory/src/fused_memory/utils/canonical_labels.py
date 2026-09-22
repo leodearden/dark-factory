@@ -20,8 +20,9 @@ drift is invisible until a destructive consumer acts on the stale half.
 The same rule governs the vocabulary's CAPTURE classes, which is why the digit
 captures are ASCII-explicit ('[0-9]', never '\\d') at this one normative site
 rather than re-narrowed per caller. Task 4850 extended the same rule to the
-literal task-vocabulary WORD ('[Tt][Aa][Ss][Kk][Ss]?', never 'tasks?' plus
-re.IGNORECASE — see the comment on _TASK_NODE_NAME_PATTERN), which decides
+literal task-vocabulary WORD (the _TASK_WORD constant,
+'[Tt][Aa][Ss][Kk][Ss]?', never 'tasks?' plus re.IGNORECASE — see the comment
+on _TASK_NODE_NAME_PATTERN), which decides
 whether the word 'task' was written at all rather than handing a character
 onward as data, so the rule is no longer scoped to captures alone. Still not
 every class: the '\\s' padding and the '\\w' lookbehinds stay Unicode-broad
@@ -94,6 +95,19 @@ _all_path_shaped_warned: bool = False
 #: this registry is where the LABEL lives, not a one-line extension point.
 _KIND_LABELS: dict[str, str] = {'task': 'Task'}
 
+#: The literal task-vocabulary WORD, as explicit ASCII case classes rather than
+#: 'tasks?' plus re.IGNORECASE. ONE spelling, interpolated into both patterns
+#: that need it (_TASK_NODE_NAME_PATTERN and _LOCAL_MENTION_PATTERN), because a
+#: case-class form does NOT read as the word at a glance: a transposed or
+#: dropped letter in one of two hand-written copies would be near-invisible in
+#: review while silently changing what parses, and the standing ASCII
+#: regression guards could not catch it — TestParseNodeNameMatchesLocalForms
+#: and TestScanContentFindsOwnProjectReferents reach the two patterns through
+#: DIFFERENT entry points, so a typo confined to one copy would leave the other
+#: suite green. Hoisted for exactly that reason (INV-5 / SPOT); WHY the spelling
+#: is case classes and not a flag is recorded on _TASK_NODE_NAME_PATTERN below.
+_TASK_WORD = r'[Tt][Aa][Ss][Kk][Ss]?'
+
 # ANCHORED (whole-string) task-node name: a bare 'task(s) N', optionally padded
 # with whitespace, case-insensitive. Anchoring means names that merely mention a
 # task ('Task 42 orchestrator', 'reify task 12') or resemble but aren't a
@@ -127,8 +141,8 @@ _KIND_LABELS: dict[str, str] = {'task': 'Task'}
 # it per caller. An explicit class rather than re.ASCII, which would silently
 # re-scope this pattern's '\s' too.
 #
-# The word 'tasks?' is spelled with explicit ASCII case classes
-# ('[Tt][Aa][Ss][Kk][Ss]?'), NOT 'tasks?' plus re.IGNORECASE. MEASURED, not
+# The word 'tasks?' is interpolated from _TASK_WORD above — explicit ASCII case
+# classes, NOT 'tasks?' plus re.IGNORECASE. MEASURED, not
 # stylistic: Python's re performs FULL Unicode case folding under
 # re.IGNORECASE on str patterns, so U+017F LATIN SMALL LETTER LONG S folds
 # onto 's' and U+212A KELVIN SIGN folds onto 'k' — 'Ta\u017fk 5' and
@@ -147,7 +161,7 @@ _KIND_LABELS: dict[str, str] = {'task': 'Task'}
 # convention. Not re.ASCII: it would silently re-scope this pattern's '\s'
 # padding too, an axis this task never measured.
 _TASK_NODE_NAME_PATTERN = re.compile(
-    r'^\s*[Tt][Aa][Ss][Kk][Ss]?(?:[ \t]*[#:][ \t]*|\s+)([0-9]+)\s*$'
+    r'^\s*' + _TASK_WORD + r'(?:[ \t]*[#:][ \t]*|\s+)([0-9]+)\s*$'
 )
 
 # The ANCHORED twin of _QUALIFIED_REF_PATTERN: a whole-string cross-project node
@@ -261,14 +275,14 @@ _TASK_VOCABULARY_QUALIFIER = re.compile(r'(sub_?)?tasks?')
 #   means fewer contests, which means MORE confident splits on prose that
 #   pre-3667 refused. A false positive here only ever adds ambiguity, which the
 #   consumer refuses; a false negative lets destructive surgery proceed.
-# - The word 'tasks?' is spelled with explicit ASCII case classes
-#   ('[Tt][Aa][Ss][Kk][Ss]?'), NOT 'tasks?' plus re.IGNORECASE, for the reason
-#   recorded on _TASK_NODE_NAME_PATTERN above: re.IGNORECASE performs FULL
+# - The word 'tasks?' is interpolated from the SAME _TASK_WORD constant this
+#   pattern shares with _TASK_NODE_NAME_PATTERN — explicit ASCII case classes,
+#   NOT 'tasks?' plus re.IGNORECASE, for the reason recorded there: re.IGNORECASE performs FULL
 #   Unicode case folding on str patterns, so 'ta\u017fk 5' and
 #   'tas\u212a 5' matched and minted a referent from a word that was
 #   never actually 'task'. Dropping the flag changes nothing else here either.
 _LOCAL_MENTION_PATTERN = re.compile(
-    r'(?<![\w:-])[Tt][Aa][Ss][Kk][Ss]?(?:[ \t]*[#:][ \t]*|\s+)([0-9]+)(?!\d)'
+    r'(?<![\w:-])' + _TASK_WORD + r'(?:[ \t]*[#:][ \t]*|\s+)([0-9]+)(?!\d)'
 )
 
 # A project-qualified task reference: '<qualifier>:<digits>'. Moved VERBATIM
