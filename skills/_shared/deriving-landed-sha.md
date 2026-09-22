@@ -69,13 +69,25 @@ contract](#doneprovenance-contract) for what a stamp must carry.
 ```bash
 S="Merge task/<TASK_ID> into main"
 git log main --fixed-strings --grep="$S" --format='%H%x09%s' \
-  | awk -F'\t' -v s="$S" '$2==s {print $1; exit}'
+  | awk -F'\t' -v s="$S" '$2==s && !seen {print $1; seen=1}'
 ```
 
 It prints the newest commit on main whose **subject** is exactly the marker, or nothing. The
-`--grep` half is an indexed prefilter over the whole message; the `awk` half is the subject
+`--grep` half is a whole-message prefilter that git evaluates *during* the revision walk — there is
+no commit-message index, so it reads commit objects as it goes; the `awk` half is the subject
 selection, and **[it is not optional](#step-1-subject-check)** — the two paragraphs below are
 why, and why there is no `--max-count=1` here.
+
+**The `awk` has no `exit`, and putting one back breaks the pipeline.** A `{print $1; exit}` closes
+the pipe while `git log` is still walking, so git dies of `SIGPIPE` and the pipeline reports **141
+on its success path** — intermittently, because it is a race between git finishing the walk and
+`awk` exiting. Measured 2026-09-22 in this repo, on a query that printed the correct sha every
+time: 4 of 10 runs of the `exit` form returned 141, against 0 of 15 for the sticky-flag form above.
+Under `set -o pipefail` that aborts the surrounding block, or leaves the captured `sha` empty — and
+an empty `sha` reads everywhere here as *no marker on main*, a false **not-landed** verdict, which
+is the exact harm this section exists to prevent. An `|| true` would silence the 141, but it also
+silences genuine git failures such as `main` not resolving; the sticky flag keeps newest-first-wins
+without ever closing the pipe early.
 
 This mirrors the in-repo authority, `orchestrator/src/orchestrator/git_ops.py::GitOps.find_merge_marker`
 — the same function `merge_status`'s git-authority tier calls on the deleted-branch path.
@@ -114,6 +126,18 @@ rejecting it discards the search, and the genuine marker sitting deeper in histo
 examined. The `awk` selection above keeps newest-first-wins while scanning past body matches, so it
 finds that marker instead. **Never reintroduce `--max-count=1`** — it is precisely what makes the
 guard lossy.
+
+**Re-adding it will look like a free optimization. It is a real one, and you take the cost anyway.**
+Selecting correctly means walking the whole history on every call, and when the marker is recent —
+the common case, a task you just landed — that is the difference between a short-circuit and a full
+walk. Measured 2026-09-22 over main's ~68k commits, against a marker a few hundred commits back:
+`--max-count=1` returned in a median ~0.08s (range 0.00–0.69s), the selecting form in a median
+~2.1s (range 1.3–3.0s). On a query with **no** match the two are indistinguishable — both walk
+everything — so benchmarking a missing marker will wrongly suggest the flag is free to restore.
+Roughly two seconds, once, at the moment a task is stamped, is the price of not recording a
+documentation commit as a merge. Note that **nothing enforces this mechanically** — no test greps
+these snippets for the flag, so this paragraph is the only thing standing between a plausible-looking
+optimization and a wrong `done_provenance`.
 
 The shadowing is common and it is *growing*, because this repo's own commits about this mechanism
 quote the subject they document. Measured 2026-09-22 over all 68,279 commits on main: 12 branches

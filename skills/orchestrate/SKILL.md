@@ -532,7 +532,7 @@ All paths below operate on the **target** project (`$TARGET_PROJECT`), not dark-
    ```bash
    S="Merge branch 'task/<task-id>'"
    sha=$(git log main --fixed-strings --grep="$S" --format='%H%x09%s' \
-           | awk -F'\t' -v s="$S" '$2==s {print $1; exit}')
+           | awk -F'\t' -v s="$S" '$2==s && !seen {print $1; seen=1}')
    echo "hand-merge sha=$sha"
    [ -n "$sha" ] && { git merge-base --is-ancestor task/<task-id> "$sha"; echo "containment rc=$?"; }
    ```
