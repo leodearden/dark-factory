@@ -1480,6 +1480,106 @@ class TestPairGateBlocks:
             groups[0].new_topic = 'other'  # type: ignore[misc]
 
 
+class TestAmbiguousGate:
+    """A legacy slug carrying MORE THAN ONE consolidation gate is refused.
+
+    A ``GateGroup`` moves exactly one gate.  Moving one of several would strand
+    the rest on the vacated slug — the uncloseable-gate trap again — so the
+    slug's renames are withheld and both stores stay on the legacy value, the
+    posture ``slug_collision`` already takes.
+    """
+
+    @staticmethod
+    def _gates_on(slug: str, *task_ids: str) -> list[dict]:
+        return [_gate_task(task_id, slug) for task_id in task_ids]
+
+    def test_a_doubly_gated_slug_forms_no_group_and_is_refused_once(self):
+        renames = [
+            _mod.Rename('dark_factory', 'm2', 'shared_gate', 'shared-gate'),
+            _mod.Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate'),
+        ]
+
+        groups, skips = _mod.pair_gate_blocks(
+            renames, self._gates_on('shared_gate', '7718', '7011'))
+
+        assert groups == []
+        (entry,) = _by_reason(skips, 'gate_ambiguous')
+        assert entry['project_id'] == 'dark_factory'
+        assert entry['old_topic'] == 'shared_gate'
+        assert entry['new_topic'] == 'shared-gate'
+        assert entry['gate_task_ids'] == ['7011', '7718']
+        assert entry['memory_ids'] == ['m1', 'm2']
+
+    def test_neither_gate_is_reported_as_an_orphan(self):
+        """They are matched to live records; "matched to no record" would be false."""
+        _groups, skips = _mod.pair_gate_blocks(
+            [_mod.Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate')],
+            self._gates_on('shared_gate', '7011', '7718'))
+
+        assert _by_reason(skips, 'orphan_gate_topic') == []
+
+    def test_the_refusal_is_per_slug(self):
+        renames = [
+            _mod.Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate'),
+            _mod.Rename('dark_factory', 'm2', 'plain_topic', 'plain-topic'),
+            _mod.Rename('dark_factory', 'm3', 'single_gate', 'single-gate'),
+        ]
+        single = _gate_task('4220', 'single_gate')
+
+        groups, _skips = _mod.pair_gate_blocks(
+            renames, [*self._gates_on('shared_gate', '7011', '7718'), single])
+
+        assert [(g.old_topic, g.gate_task_id) for g in groups] == [
+            ('plain_topic', None),
+            ('single_gate', '4220'),
+        ]
+        unaffected, _ = _mod.pair_gate_blocks(
+            [r for r in renames if r.old_topic != 'shared_gate'], [single])
+        assert groups == unaffected
+
+    def test_the_verdict_does_not_depend_on_gate_order(self):
+        renames = [_mod.Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate')]
+        gates = self._gates_on('shared_gate', '7011', '7718')
+
+        for ordered in (gates, list(reversed(gates))):
+            groups, skips = _mod.pair_gate_blocks(renames, ordered)
+
+            assert groups == []
+            (entry,) = _by_reason(skips, 'gate_ambiguous')
+            assert entry['gate_task_ids'] == ['7011', '7718']
+
+    def test_gates_in_different_projects_are_not_ambiguous(self):
+        """Gates are keyed per project, as the closure scroll that reads them is."""
+        renames = [_mod.Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate')]
+        gates = [
+            _gate_task('4220', 'shared_gate', project_id='dark_factory'),
+            _gate_task('6852', 'shared_gate', project_id='reify'),
+        ]
+
+        groups, skips = _mod.pair_gate_blocks(renames, gates)
+
+        assert [g.gate_task_id for g in groups] == ['4220']
+        assert _by_reason(skips, 'gate_ambiguous') == []
+
+    def test_the_markdown_artifact_names_every_gate(self):
+        _groups, skips = _mod.pair_gate_blocks(
+            [_mod.Rename('dark_factory', 'm1', 'shared_gate', 'shared-gate')],
+            self._gates_on('shared_gate', '7011', '7718'))
+
+        rendered = _mod.render_markdown({
+            'apply': False,
+            'skips': {'gate_ambiguous': _by_reason(skips, 'gate_ambiguous')},
+        })
+
+        assert '### gate_ambiguous: 1' in rendered
+        assert '7011' in rendered
+        assert '7718' in rendered
+
+    def test_gate_ambiguous_is_a_pre_seeded_error_bucket(self):
+        assert 'gate_ambiguous' in _mod.ERROR_OUTCOMES
+        assert 'gate_ambiguous' in _mod.SKIP_BUCKETS
+
+
 def _one_group(renames, gate_tasks=()) -> object:
     """The single :class:`GateGroup` a writer test drives, unpacked."""
     groups, _skips = _mod.pair_gate_blocks(renames, list(gate_tasks))
