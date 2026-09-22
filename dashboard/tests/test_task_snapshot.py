@@ -44,11 +44,13 @@ class CannedMCP:
       envelope, so emitting one would fake a contract nothing here reads.
     * ``get_statuses`` slices a deterministic total order and answers with the
       five-key ``pagination`` envelope
-      (``total``/``offset``/``page_size``/``returned``/``has_more``) that
-      ``fused_memory/server/tools.py::get_statuses`` documents — including
-      serving a page SMALLER than requested, which is the case that
-      distinguishes a loop advancing by the SERVED ``pagination['page_size']``
-      from one advancing by the size it asked for.
+      (``total``/``offset``/``page_size``/``returned``/``has_more``) exactly
+      as ``fused_memory/server/tools.py::_pagination_meta`` builds it:
+      ``page_size`` echoes the REQUESTED size verbatim, ``returned`` is the
+      count actually SERVED, and ``has_more`` is ``offset + returned <
+      total``. That includes serving a page SMALLER than requested, which is
+      the case that tells a loop advancing by ``returned`` apart from one
+      advancing by the size it asked for.
 
     Args:
         rows: Raw MCP ``get_tasks`` rows (string ids), as
@@ -59,8 +61,9 @@ class CannedMCP:
             backward-compatible mode: the whole map in one response with NO
             ``pagination`` key, which the contract defines as COMPLETE.
         short_page_by: Serve this many FEWER statuses per page than the
-            smaller of the requested and the server cap, reporting the served
-            size in ``pagination['page_size']``. Zero disables it.
+            smaller of the requested and the server cap. The served count is
+            reported in ``pagination['returned']``, like any other page. Zero
+            disables it.
 
     Mutable after construction so one instance can change behaviour between a
     test's two acquisitions. :attr:`fail_when` is a predicate over the
@@ -119,10 +122,7 @@ class CannedMCP:
             'pagination': {
                 'total': len(ordered),
                 'offset': offset,
-                # What was ACTUALLY served, which is what the caller must
-                # advance by — see get_statuses' "Why page_size is not
-                # clamped" note.
-                'page_size': served,
+                'page_size': requested,
                 'returned': len(window),
                 'has_more': offset + len(window) < len(ordered),
             },
@@ -170,16 +170,24 @@ class TestCannedMCP:
         }
         assert page['statuses'] == {'1': 'done', '2': 'done'}
 
-    async def test_a_short_page_reports_the_size_it_served(self):
-        """The case that separates advancing by SERVED from advancing by requested."""
+    async def test_returned_reports_what_was_served_and_page_size_what_was_asked(self):
+        """The case that separates advancing by SERVED from advancing by requested.
+
+        ``returned`` carries the served count and ``page_size`` echoes the
+        request, because that is what ``_pagination_meta`` emits. A fake that
+        put the served count in ``page_size`` would model the load-bearing
+        field backwards, and a walker keyed on it would pass here and skip
+        entries against the real server.
+        """
         canned = CannedMCP(status_map={i: 'done' for i in range(1, 6)},
                            status_page_size=4, short_page_by=1)
         page = await canned(None, 'u', 'get_statuses',
                             {'project_root': '/p', 'page_size': 4, 'offset': 0})
 
-        assert page['pagination']['page_size'] == 3, 'served, not requested'
-        assert page['pagination']['returned'] == 3
+        assert page['pagination']['returned'] == 3, 'served'
+        assert page['pagination']['page_size'] == 4, 'requested, echoed verbatim'
         assert len(page['statuses']) == 3
+        assert page['pagination']['has_more'] is True
 
     async def test_no_page_size_configured_means_no_pagination_key(self):
         """The absence of the key is the substrate's spelling of COMPLETE."""
