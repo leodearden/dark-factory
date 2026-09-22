@@ -16,15 +16,31 @@ This probe closes that gap by EXECUTING ``triage_write`` with an injected fake
 judge and asking whether the attach id is determined by the candidate the judge
 reasoned about.
 
-TWO BRANCHES, BECAUSE TWO REMEDIES ARE OPEN. Under option (a) the JUDGE names
-its candidate back and the write honours it; under option (b) the CALLER picks
-the attach target and tells the judge which candidate it is reasoning about, so
-the judge names nothing back and no judge-side designation exists to track.
-Both satisfy the invariant, and the probe PASSes on either — what is asserted
-is the invariant, not which remedy landed. Requiring the judge-side branch
-alone would fail a correct option (b) and re-block task 3169, which is the
-false-FAIL class this gate family was rewritten to remove. Item 1 is structured
-the same way and for the same reason.
+THREE BRANCHES, AND WHAT EACH DOES AND DOES NOT MEASURE. What is asserted is
+the INVARIANT, not which remedy landed: requiring any single branch would fail
+a correct fix that took another route and re-block task 3169, which is the
+false-FAIL class this gate family was rewritten to remove.
+
+    judge-side designation swap (option a). The JUDGE names its candidate back
+    and the attach tracks it across two DIFFERENT designations. A measured
+    consumption result: the write runs twice and the attach id follows.
+
+    judge-module attach target (option b, as it actually exists here). The
+    CALLER picks the target, so ``judge_write`` reads ``decision.canonical_id``
+    — which it already holds — and hands it to ``build_judge_prompt``, leaving
+    ``triage_write`` unchanged. The judge names nothing back, so no swap is
+    possible however correct the module is; consumption holds BY CONSTRUCTION,
+    because the announced target and the attach target are one expression. Read
+    from the ref's JUDGE module, which is the only place this remedy appears.
+
+    triage-side announced target. A HYPOTHETICAL channel: nothing in this
+    codebase announces a target to the judge through a kwarg of its own. It is
+    kept because the invariant it asserts is sound and it costs nothing, not
+    because it models a remedy.
+
+The PASS report names the branch that held. "A swap was measured" and "option
+(b) held by construction" authorise the production flag flip on different
+evidence, and an operator may not be left unable to tell which they have.
 
 WHY THE JUDGE SEAM. ``triage_write(..., judge=...)`` is a real injection point
 the module's own contract tests already use, and ``memory_service`` is

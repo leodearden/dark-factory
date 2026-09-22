@@ -572,12 +572,14 @@ async def triage_write(memory_service, *, content, project_id, counter,
 '''
 
 
-#: An option-(b)-shaped remedy, and the reason item 5 may not require the
-#: judge-side swap. Here the CALLER picks the attach target and announces it to
-#: the judge through a kwarg beyond main's five; the judge never names a
-#: candidate back, so a probe that only looked for a judge-side designation
-#: would fail this -- re-blocking task 3169 against a correct fix, which is the
-#: false-FAIL class this gate family was rewritten to remove.
+#: The triage-side announcement channel, which nothing in this codebase uses:
+#: here the CALLER picks the attach target and announces it to the judge
+#: through a kwarg beyond main's five. Real option (b) announces it in the
+#: JUDGE module instead (see the judge stand-ins below), so this models a
+#: HYPOTHETICAL remedy rather than the one that landed. It is kept because the
+#: invariant it asserts -- an announced target the write must honour -- is
+#: sound and costs nothing, and because a branch with no fixture is a branch
+#: nobody has run.
 _ANNOUNCES_TARGET = r"""
 
 triage_write = _make_announcing_triage_write()

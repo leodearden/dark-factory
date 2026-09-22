@@ -54,10 +54,22 @@
 #           describes, still live.
 #
 #           Checked by EXECUTING the ref's triage_write with an injected fake
-#           judge, via scripts/check_write_triage_attach_consumption.py. Like
-#           item 1 it accepts EITHER remedy: a judge that names its own
-#           candidate and a write that tracks it, or a caller that picks the
-#           attach target and announces it to the judge.
+#           judge AND by reading the ref's judge module, via
+#           scripts/check_write_triage_attach_consumption.py. THREE branches
+#           satisfy it, and the verdict below names the one that did -- they
+#           rest on different evidence:
+#             - judge-side designation swap (option a): the judge names its
+#               candidate back and the attach tracks it across two different
+#               designations. MEASURED, by running the write twice.
+#             - judge-module attach target (option b, task 4762): judge_write
+#               feeds build_judge_prompt the decision.canonical_id it already
+#               holds, and triage_write is unchanged. Consumption holds BY
+#               CONSTRUCTION -- announced target and attach target are the same
+#               expression -- not by a measured swap.
+#             - triage-side announced target: a HYPOTHETICAL channel. No remedy
+#               in this codebase announces a target to the judge through a
+#               kwarg of its own. Kept because the invariant it asserts is
+#               sound and it costs nothing, not because it models a remedy.
 #
 #           WHAT IT DOES NOT ASSERT. The probe stops at
 #           BandDecision.canonical_id -- the value tools.py::add_memory consumes
@@ -144,13 +156,22 @@ fi
 # containing a space must not tear the resolved interpreter path apart.
 PROBE5="$REPO/scripts/check_write_triage_attach_consumption.py"
 
-# Item 5's PASS line, matched literally (grep -F). BOTH of its PASS branches --
-# a judge-side designation the write tracks, and a caller-announced target the
-# write honours -- emit this prefix, and no FAIL or UNVERIFIABLE path does.
-# Pinned by the hermetic tests in
+# Item 5's PASS line, matched literally (grep -F). ALL THREE of its PASS
+# branches emit this prefix (see the item 5 block above), and no FAIL or
+# UNVERIFIABLE path does. Pinned by the hermetic tests in
 # scripts/tests/test_check_write_triage_flip_preconditions.py so the two cannot
 # drift apart silently.
 PROBE5_PASS_MARKER='PASS  the judge-bound candidate is CONSUMED by the attach'
+
+# The probe's one machine-readable line naming WHICH of those three branches
+# held, quoted into the verdict below. `PASS item 5` alone cannot tell an
+# operator whether a swap was MEASURED or whether option (b) held BY
+# CONSTRUCTION, and those authorise the production flag flip on different
+# evidence. Pinned from both ends by the hermetic tests, like the marker above.
+PROBE5_BRANCH_MARKER='ITEM5-BRANCH  '
+# How much of the branch name is quoted back. The probe keeps that line ASCII
+# for this bound: a cut inside a multi-byte character would emit a broken one.
+PROBE5_BRANCH_CHARS=120
 
 if [ -n "${CHECK_WRITE_TRIAGE_ATTACH_CONSUMPTION_PY:-}" ]; then
   read -r -a PROBE5_PY_CMD <<< "$CHECK_WRITE_TRIAGE_ATTACH_CONSUMPTION_PY"
@@ -490,6 +511,17 @@ elif [ "$EXTRACTED" -eq 1 ]; then
     # reported ~0.5% spurious failures per call. Do not "tidy" this into a pipe.
     if [ "$probe5_rc" -eq 0 ] && grep -qF "$PROBE5_PASS_MARKER" <<<"$probe5_out"; then
       note "PASS  item 5  the judge-bound candidate is consumed by the attach"
+      # HERE-STRING and `grep -m1`, never a pipe and never `| head -1`: the
+      # measured SIGPIPE race under `set -o pipefail` documented on item 1,
+      # and a second process in the pipeline is a second thing to lose it to.
+      # An absent or reformatted line leaves this empty and the verdict above
+      # stands exactly as it reads -- a drift in the probe's report format may
+      # not turn a PASS into a failure.
+      probe5_branch="$(grep -m1 -F "$PROBE5_BRANCH_MARKER" <<<"$probe5_out")"
+      probe5_branch="${probe5_branch#*"$PROBE5_BRANCH_MARKER"}"
+      if [ -n "$probe5_branch" ]; then
+        note "              via ${probe5_branch:0:$PROBE5_BRANCH_CHARS}"
+      fi
     elif [ "$probe5_rc" -eq 0 ]; then
       note "FAIL  item 5  UNVERIFIABLE: the probe exited 0 without reporting a PASS."
       note "              Its report claims no verdict, so nothing was asserted about"
@@ -501,8 +533,8 @@ elif [ "$EXTRACTED" -eq 1 ]; then
       # measured slate are all in the probe's own report printed directly below.
       note "FAIL  item 5  the judge-bound candidate is NOT consumed by the attach"
       note "              Subject: $TRIAGE at ref '$REF'."
-      note "              What was measured, and both accepted remedies, are in the"
-      note "              probe's own report below."
+      note "              What was measured, and every branch the probe evaluated, are"
+      note "              in its own report below."
       record_fail 5
     else
       note "FAIL  item 5  UNVERIFIABLE: the probe could not be run (exit $probe5_rc)."
@@ -580,7 +612,8 @@ else
   if item_failed 5; then
     note "        Item 5 is item 1's CONSUMPTION half: a verdict can be bound to a"
     note "        determinate candidate and still not be the id the write attaches to,"
-    note "        so closing item 1 does not close this. Either remedy satisfies it."
+    note "        so closing item 1 does not close this. Any of the three branches"
+    note "        listed in this script's item 5 block satisfies it."
     clause_printed=1
   fi
   # Fallback so this block can never go guidance-free: unreachable today
