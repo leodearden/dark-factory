@@ -15,16 +15,20 @@ accepts, and that a slug the policy document enumerates is one the code knows.
 Nothing about the SHADOW vocabularies is hand-copied here — they are read off the
 same frozensets the codec validates against.
 
-ONE EXCEPTION, and it guards a different failure. The ``scope-not-delivered``
-standing policy (Leo, 2026-09-21, resolving esc-4811-3) is a policy statement
-with NO code side by ruling, so there is no frozenset to read its vocabulary off
-and this file's ``_CLOSURE_FORMS`` IS the specification rather than a copy of
-one. What that half holds is therefore ABLATION, not code/doc drift: the ruling
-has two homes — the policy document a human is pointed at, and the skill the
-watcher actually loads — and silent deletion from either leaves a ruling half
-the readership never sees. ``tests/scripts/test_line_pin_policy.py`` holds a
-two-home documentation policy exactly this way, with the same begin/end marker
-pair and the same refusal to assert on wording; the scope above is unchanged.
+THE ``scope-not-delivered`` HALF guards a different failure. That standing
+policy (Leo, 2026-09-21, resolving esc-4811-3) is a policy statement with NO
+code side by ruling, so ``docs/escalation-standing-policy.md`` is the SINGLE
+normative home of its closure-form vocabulary. This file states no closure form
+of its own: it reads them back out of that document, and asserts only that the
+document still carries some. The one hand-written token left is
+``_POLICY_CLASS``, which serves as the marker slug — a structural ANCHOR of
+exactly the kind ``tests/scripts/test_line_pin_policy.py::_MARKER_BEGIN`` is,
+not a copy of a vocabulary. What is held is ABLATION: the ruling has two homes —
+the policy document a human is pointed at, and the skill the watcher actually
+loads — and silent deletion from either leaves a ruling half the readership
+never sees. ``tests/scripts/test_line_pin_policy.py`` holds a two-home
+documentation policy exactly this way, with the same begin/end marker pair and
+the same refusal to assert on wording.
 
 COUNTER-EXAMPLES. The skill shows a REJECTED payload next to a good one, so a
 reader can recognise the shape that will be thrown away. Put
@@ -102,11 +106,6 @@ _DESIGN_CONCERN_SECTION = "### `design_concern` (info or blocking)"
 #: The standing-policy class ruled IN FORCE on 2026-09-21 — one token serving as
 #: both the class name and the marker slug, so the two cannot drift apart.
 _POLICY_CLASS = "scope-not-delivered"
-
-#: The two forms by which a `scope-not-delivered` record may be closed. Hand-
-#: written because the ruling gives this class no code side; see the module
-#: docstring for why that makes this a specification rather than a copy.
-_CLOSURE_FORMS: frozenset[str] = frozenset({"owned-successor", "explicit-wont-fix"})
 
 #: The marked span carrying the ruling, in each of its two homes. The opener is
 #: matched as a PREFIX, not as a whole comment, exactly as
@@ -445,21 +444,32 @@ def test_the_shadow_section_quotes_a_runnable_weekly_count_command():
 # ---------------------------------------------------------------------------
 
 
-def test_the_policy_document_enumerates_both_closure_forms():
+def test_the_policy_document_carries_the_closure_form_ruling():
     """The policy document is the AUTHORITY for how such a record may be closed.
 
-    Structure only: the marker pair must be there and its bullets must open with
-    the two closure-form slugs. Every word of the guidance around them stays
-    free to be rewritten, exactly as the module docstring's scope says.
+    Structure only, and deliberately not a vocabulary check: which closure forms
+    the ruling permits is that document's to name, rename or extend, so this
+    guard states none of them. What it holds is the human-facing half of the
+    two-home ablation failure — the marker pair is well-formed and still wraps a
+    closure-form bullet — exactly as
+    `tests/scripts/test_line_pin_policy.py::test_policy_is_documented_in_contributing`
+    holds its half.
+
+    Kept separate from `test_the_policy_class_cannot_be_stamped_as_a_shadow_ruling`,
+    which repeats these assertions as its own preamble, because the two answer
+    different questions: is the ruling still in its human-facing home, versus
+    does the codec still refuse to stamp it. Folding this one in would make the
+    ablation guard vanish silently the next time that test is narrowed.
     """
     span = _marked_span(_read(POLICY), str(POLICY.relative_to(REPO_ROOT)))
     documented = {m.group(1) for line in span.splitlines() if (m := _POLICY_BULLET.match(line))}
 
-    assert documented == _CLOSURE_FORMS, (
-        f"the `{_POLICY_CLASS}` span in {POLICY.relative_to(REPO_ROOT)} and the "
-        f"closure forms this guard specifies have drifted.\n"
-        f"  documented but not a closure form: {sorted(documented - _CLOSURE_FORMS)}\n"
-        f"  a closure form but undocumented: {sorted(_CLOSURE_FORMS - documented)}"
+    assert documented, (
+        f"the `{_POLICY_CLASS}` span in {POLICY.relative_to(REPO_ROOT)} no longer "
+        f"wraps any closure-form bullet (task 5723). That span is one of the "
+        f"ruling's two homes and the normative one; the other is "
+        f"{SKILL.relative_to(REPO_ROOT)}. If you are reversing the policy, update "
+        f"both homes and this test together."
     )
 
 
