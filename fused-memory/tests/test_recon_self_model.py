@@ -740,6 +740,8 @@ class TestNegativeProbeSetPremise:
             'the 3 probes reproduced it.',
             'The Graphiti degradation did not reproduce this cycle, as no probe '
             'fired.',
+            'The Graphiti degradation did not reproduce this cycle, and not a '
+            'single probe reproduced it.',
             '0 of 3 probes reproduced, so the Graphiti degradation did not '
             'reproduce this cycle.',
         ],

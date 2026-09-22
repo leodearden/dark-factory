@@ -958,14 +958,33 @@ _CLEARANCE_IN_CLAUSE = rf'(?=[^.;]*\b{_CLEARANCE_QUALIFIER}\b)'
 # qualifier there scopes the sighting, not a clearance. Only an un-negated
 # verb counts: "did not reproduce at limit=3 and did not reproduce at limit=8
 # this cycle" is still a clearance claim.
+_SIGHTING_VERB = r'\b(?:reproduc(?:e|es|ed|ing)|fired|fires|recurred|recurs)\b'
 _POSITIVE_SIGHTING = (
+    rf'(?={_SIGHTING_VERB})'
     r"(?<!\bnot\s)(?<!n't\s)(?<!n\u2019t\s)(?<!\bbe\s)(?<!\bnever\s)"
-    r'\b(?:reproduc(?:e|es|ed|ing)|fired|fires|recurred|recurs)\b'
+    r'(?<!\blonger\s)'
 )
+# A zero count negates its verb through its subject instead ("0 of 3 probes
+# reproduced", "none of them fired", "no probe reproduced"), so both scans
+# step over it whole. It is the protocol's own permitted wording: read as a
+# sighting, it would wave through any claim it is appended to.
+_ZERO_COUNT_REPORT = (
+    r'\b(?:0|zero|none|no|neither|not\s+(?:a\s+single|one))\b(?:/\d+)?(?:\s+of)?'
+    r'(?:\s+(?:the|these|those|them))?(?:\s+\d+)?'
+    r'(?:\s+(?:[\w-]+\s+)?probes?)?(?:\s+(?:has|have|had))?\s+'
+    + _SIGHTING_VERB
+)
+# Steps one character at a time, so a claim may start anywhere in the clause.
 _NO_POSITIVE_BEFORE_IN_CLAUSE = (
-    rf'(?:^|(?<=[.;]))(?:(?!{_POSITIVE_SIGHTING})[^.;])*?'
+    rf'(?:^|(?<=[.;]))(?:{_ZERO_COUNT_REPORT}|(?!{_POSITIVE_SIGHTING})[^.;])*?'
 )
-_NO_POSITIVE_AFTER_IN_CLAUSE = rf'(?![^.;]*{_POSITIVE_SIGHTING})'
+# Runs once per candidate claim, so it steps over whole words, the widest step
+# that cannot skip a sighting or a zero count (both start at a word boundary),
+# and never backtracks.
+_NO_POSITIVE_AFTER_IN_CLAUSE = (
+    rf'(?=(?:[^\w.;]|{_ZERO_COUNT_REPORT}|(?!{_POSITIVE_SIGHTING})\w++)*+'
+    r'(?![^.;]))'
+)
 
 # At most a couple of determiners may sit between a negated `reproduce` and
 # the fault it is about. Anything wordier is a DIFFERENT subject wearing the
