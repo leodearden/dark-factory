@@ -599,7 +599,40 @@ def _discover_candidate_scripts() -> list[pathlib.Path]:
     return found
 
 
+def _discover_guarded_scripts() -> list[pathlib.Path]:
+    """Every script under SCRIPTS_ROOT, recursively, that calls the guard.
+
+    Same walk and same ``__pycache__`` exclusion as
+    :func:`_discover_candidate_scripts` above, so the two passes cannot
+    disagree about which files exist.
+
+    Deliberately NOT filtered to CANDIDATE_SCRIPTS. "Guarded" means calling
+    the function, full stop -- independent of whether this module's detector
+    classifies the script as a candidate. That is exactly the semantics the
+    production docstring's ``grep -rln 'assert_store_mutation_allowed('``
+    claims for its GUARDED column, and matching it is the point: a census
+    taken under different semantics could not be compared against that
+    column at all. It is why ``migrate_cross_graph_leak.py`` appears here
+    despite being a non-candidate (its mutation is a raw Cypher
+    ``DETACH DELETE`` in a string literal) -- it calls the guard, so it is
+    guarded.
+
+    Strictly MORE precise than the grep, never less: :func:`is_guarded`
+    requires a real call AND an import from the real module, so it cannot be
+    fooled by the three prose mentions the production docstring warns the
+    bare-name spelling over-reports on, nor by a locally-defined no-op decoy.
+    """
+    found: list[pathlib.Path] = []
+    for path in sorted(SCRIPTS_ROOT.rglob('*.py')):
+        if '__pycache__' in path.parts:
+            continue
+        if is_guarded(parse_python_module(path)):
+            found.append(path)
+    return found
+
+
 CANDIDATE_SCRIPTS = _discover_candidate_scripts()
+GUARDED_SCRIPTS = _discover_guarded_scripts()
 
 #: The two currently-known candidates whose ONLY mutating hits are Tier B --
 #: `qdrant_client.delete` and `memory.mem0.update`, the exact two spellings
@@ -709,6 +742,39 @@ class TestEveryMutatingScriptCallsTheGuard:
 # author who updates the constant below without touching the column still
 # ships a stale column -- it only makes forgetting loud.
 # ---------------------------------------------------------------------------
+
+
+#: The reviewed GUARDED column, as a set of bare filenames. Produced by
+#: RUNNING the derivation the production docstring advertises --
+#: `grep -rln 'assert_store_mutation_allowed(' fused-memory/scripts/
+#: --include='*.py' | sort` -- in the same pass that wrote the column itself,
+#: so a divergence between the two is a transcription error to fix, never
+#: something to reconcile by editing one side.
+#:
+#: Unlike EXPECTED_EXEMPT_SCRIPTS this list is expected to GROW: a newly
+#: guarded script is the GOOD outcome. Growth just has to be a deliberate
+#: edit that lands in BOTH homes -- here and in the GUARDED column of
+#: fused_memory/utils/store_mutation_preflight.py. This pin is the only thing
+#: that makes that column's drift detectable; nothing else in the repo ever
+#: compares it against the tree.
+EXPECTED_GUARDED_SCRIPTS: frozenset[str] = frozenset({
+    'amend_stale_resume_cwd_records.py',
+    'audit_duplicate_memories.py',
+    'backfill_entity_standing_decision.py',
+    'cleanup_count_snapshots.py',
+    'cleanup_pin_queue_edges.py',
+    'clear_false_dependency_invalidations.py',
+    'clear_malformed_empty_memory.py',
+    'consolidate_namespace_families.py',
+    'invalidate_fabricated_shipping_edges.py',
+    'migrate_cross_graph_leak.py',
+    'prune_recon_cycle_summaries.py',
+    'purge_knowlive_namespace.py',
+    'retro_stamp_topics.py',
+    'sweep_orphan_flag_markers.py',
+    'sweep_toolcall_xml_leak.py',
+    'tag_cgl_eta_rehome_scope.py',
+})
 
 
 class TestGuardedScriptCensus:

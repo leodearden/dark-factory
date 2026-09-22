@@ -157,12 +157,29 @@ measured:
     premises that would kill it, into each of those two files.
 
 ``tests/test_store_mutation_conformance.py`` is that mechanism now, for the
-RULE -- but not for these columns themselves, which remain the interim,
-hand-checked audit trail rather than generated output; keeping them accurate
-after a script changes is still on the author, same as before. Nor does it
-reach ``MemoryService.initialize()``'s pre-``run()`` writes (Graphiti startup
-maintenance) at all -- that gap is systemic, outside this check's scope
-entirely, and stays tracked by tasks 4318 and 4350.
+RULE. The three columns above are all still hand-written prose rather than
+generated output, but they no longer share one disposition:
+
+  * the GUARDED column is TRIPWIRED.
+    ``test_guarded_script_census_matches_the_reviewed_column`` re-derives the
+    set of guard-calling scripts from the tree and fails the moment it differs
+    from a pinned census, naming THIS column as the second edit to make.
+    Detected-on-change, not derived -- and emphatically not self-maintaining:
+    an author who updates that test's constant without touching this column
+    still ships a stale column. All the tripwire buys is that forgetting is
+    LOUD. (It exists because this column drifted twice, the second time inside
+    the very commit that re-dated it and re-asserted its exhaustiveness.)
+  * GUARDED BY INHERITANCE and KNOWN UNGUARDED have NO tripwire, and cannot
+    be given one, because neither is mechanically derivable: inheritance is a
+    judgement about code reached through ``importlib``, and an empty column is
+    a claim about ABSENCE, which no discovery pass can confirm. Both stay
+    purely hand-checked, and keeping them accurate after a script changes is
+    on the author, same as before. Do not generalise the tripwire above to
+    these two.
+
+Nor does the check reach ``MemoryService.initialize()``'s pre-``run()`` writes
+(Graphiti startup maintenance) at all -- that gap is systemic, outside this
+check's scope entirely, and stays tracked by tasks 4318 and 4350.
 
 Two placement rules, which are the non-obvious part:
 
