@@ -3398,3 +3398,64 @@ def test_shape_scheduler_surfaces_recovery_events_and_counts():
     inner['recovery_event_counts']['sentinel'] = 1
     assert len(recovery_events['proj-a']) == 2
     assert 'sentinel' not in recovery_events
+
+
+# ---------------------------------------------------------------------------
+# task-4889 #4271: two same-basename roots must not collapse onto one snapshot
+# ---------------------------------------------------------------------------
+
+
+async def test_two_same_basename_roots_each_keep_their_own_snapshot(
+    dummy_client, tmp_path,
+):
+    """``/x/proj`` and ``/y/proj`` each keep their OWN per-root snapshot.
+
+    THE DEFECT THIS PINS.  ``label_to_root = {_project_label(r): r for r in
+    roots_to_query}`` is a label-keyed dict, so two roots sharing a basename
+    collapse and only the LAST survives.  The gather still produces BOTH
+    results, and the re-join hands root b to both of them — so root a's pin
+    entry, park stacks and paused state are emitted carrying root b's
+    ``project_root``.  The React drawer's override POSTs then target the wrong
+    project, and root a's own state "vanishes" from the operator's view with
+    no warning.  Observed before the fix as
+    ``{('1', str(b)), ('2', str(b))}`` — root a's pin entry under root b's
+    identity.
+
+    No task rows are returned: this test is about the per-root SNAPSHOT join,
+    and empty rows keep the still-label-keyed row filter out of the picture
+    (that residue is a wire-vocabulary change, filed separately).
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from dashboard.config import DashboardConfig
+    from dashboard.data.scheduler import collect_scheduler_state
+
+    a = tmp_path / 'a' / 'proj'
+    b = tmp_path / 'b' / 'proj'
+    a.mkdir(parents=True)
+    b.mkdir(parents=True)
+    config = DashboardConfig(project_root=a, known_project_roots=[b])
+
+    pins_by_root = {
+        str(a): [{'task_id': '1', 'order': 0}],
+        str(b): [{'task_id': '2', 'order': 0}],
+    }
+
+    async def _mcp(client, url, tool, args, **kwargs):
+        if tool == 'get_scheduler_state':
+            return _scheduler_snapshot(pin_queue=pins_by_root[args['project_root']])
+        return []
+
+    with (
+        patch('dashboard.data.scheduler.mcp_tool_call', AsyncMock(side_effect=_mcp)),
+        patch(
+            'dashboard.data.scheduler.collect_tasks_with_counts',
+            AsyncMock(return_value=([], [], {}, [], [])),
+        ),
+    ):
+        _rows, _modules, pin_queue, _events, _offline, _paused, _recovery, _degraded = \
+            await collect_scheduler_state(dummy_client, config)
+
+    assert {(p['task_id'], p['project_root']) for p in pin_queue} == {
+        ('1', str(a)), ('2', str(b)),
+    }
