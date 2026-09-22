@@ -26,7 +26,7 @@ const { strandBadgeState, agentCellState, locksCellState } = window.DF_TASK_ROW_
 // tag, whose top-level bindings Babel-standalone downlevels so they never join
 // the classic-script global lexical scope that forces the renames in data.js
 // and task_row_cells.js. See classic_script_scope.test.mjs's SCOPE note.
-const { plainDatum, unknownDatum } = window.DF_DATUM;
+const { plainDatum, derivedDatum, unknownDatum } = window.DF_DATUM;
 const { burndownStacks, burndownLegend, parityBannerState } = window.DF_BURNDOWN_BANDS;
 const { reconRunCounts, reconSuccessPct, reconStatusTone } = window.DF_RECON_STATUS;
 const { useState: uS, useEffect: uE } = React;
@@ -521,14 +521,14 @@ function PerfTab({ projectFilter }) {
           return (
             <>
               <ST label="p50 time-to-completion"
-                datum={plainDatum(p50, EP.performance)} format={fmtMs}
+                datum={derivedDatum(p50, EP.performance, 'no tasks in this window')} format={fmtMs}
                 hint={`${totalTasks} tasks (window)`} history={p50Spark} sparkColor={CP.accent} />
               <ST label="p95 time-to-completion"
-                datum={plainDatum(p95, EP.performance)} format={fmtMs}
+                datum={derivedDatum(p95, EP.performance, 'no tasks in this window')} format={fmtMs}
                 hint={`${totalTasks} tasks (window)`} history={p95Spark} sparkColor={CP.warn} />
-              <ST label="One-pass success" datum={plainDatum(onePass, EP.performance)} format={fmtPct} unit={onePass == null ? '' : '%'}
+              <ST label="One-pass success" datum={derivedDatum(onePass, EP.performance, 'no tasks in this window')} format={fmtPct} unit={onePass == null ? '' : '%'}
                 hint={onePass == null ? 'no tasks' : 'across all paths'} history={onePassSpark} sparkColor={CP.ok} />
-              <ST label="Human escalation rate" datum={plainDatum(escalation, EP.performance)} format={fmtPct} unit={escalation == null ? '' : '%'}
+              <ST label="Human escalation rate" datum={derivedDatum(escalation, EP.performance, 'no tasks in this window')} format={fmtPct} unit={escalation == null ? '' : '%'}
                 hint="interactive" history={escalationSpark} sparkColor={CP.warn} />
             </>
           );
@@ -671,7 +671,7 @@ function MemoryTab({ projectFilter, onNavigate }) {
           const combined = ts.reads.map((r, i) => r + (ts.writes[i] || 0));
           const last = combined.length ? combined[combined.length - 1] : null;
           return (
-            <ST label="Ops / hr" datum={plainDatum(last, EP.memoryGraphs)} format={fmtCount}
+            <ST label="Ops / hr" datum={derivedDatum(last, EP.memoryGraphs, 'no hourly buckets in the last 24h')} format={fmtCount}
                 history={combined} sparkColor={CP.accent} hint="last 24h" />
           );
         })()}
@@ -815,11 +815,11 @@ function ReconTab({ projectFilter, search }) {
                 hint={`of ${counts.total} recent runs (all projects)`}
                 history={[]} />
             <ST label="Last full run"
-                datum={plainDatum(lastFullIso, EP.recon)} format={window.DF_SHELL.timeago}
+                datum={derivedDatum(lastFullIso, EP.recon, 'no completed run')} format={window.DF_SHELL.timeago}
                 hint={lastFullProject || 'no completed run'}
                 history={[]} />
             <ST label="Run success rate"
-                datum={plainDatum(successPct, EP.recon)}
+                datum={derivedDatum(successPct, EP.recon, 'no finished runs')}
                 unit={successPct != null ? '%' : ''}
                 hint={`${counts.terminal} finished · ${counts.inFlight} in flight`
                   + (counts.unknown ? ` · ${counts.unknown} unknown status` : '')
@@ -968,11 +968,11 @@ function MergeTab({ projectFilter }) {
               );
             })()}
             <ST label="Speculative hit rate"
-                datum={plainDatum(hitPct, EP.mergeQueue)} unit={hitPct != null ? '%' : ''}
+                datum={derivedDatum(hitPct, EP.mergeQueue, 'no speculative attempts')} unit={hitPct != null ? '%' : ''}
                 hint={`${totals.hits}/${totals.hits + totals.discards} attempts`}
                 history={[]} sparkColor={CP.ok} />
             <ST label="p95 latency · worst project"
-                datum={plainDatum(p95, EP.mergeQueue)} format={fmtMs}
+                datum={derivedDatum(p95, EP.mergeQueue, 'no merges in this window')} format={fmtMs}
                 hint={p95s.length ? `${p95s.length} projects` : 'no merges'}
                 history={[]} sparkColor={CP.warn} />
           </div>
@@ -1059,7 +1059,7 @@ function MergeTab({ projectFilter }) {
                               hint={m.landings_total != null ? `${m.landings_total} landings` : 'offline'}
                               history={[]} sparkColor={CP.warn} />
                           <ST label="Drift @ detect"
-                              datum={plainDatum(driftVal, EP.mergeQueue)}
+                              datum={derivedDatum(driftVal, EP.mergeQueue, 'no drift detections')}
                               unit=""
                               hint={dd.count ? `${dd.count} detections` : 'no conflicts'}
                               history={[]} sparkColor={CP.bad} />
@@ -1345,7 +1345,7 @@ function BurnTab({ projectFilter, displayWindow }) {
                     ? `${lastPending} / ${velocity.toFixed(1)} per day · need 7d for range`
                     : (velocity === 0 ? 'velocity is zero' : 'no data'));
               return (
-                <ST label="Forecast clear" datum={plainDatum(display, EP.burndown)} hint={hint}
+                <ST label="Forecast clear" datum={derivedDatum(display, EP.burndown, hint)} hint={hint}
                     history={b.pending} sparkColor={CP.ok} />
               );
             })()}

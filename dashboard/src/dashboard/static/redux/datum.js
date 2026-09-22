@@ -357,6 +357,38 @@ function plainDatum(value, endpointKey, receipts) {
   );
 }
 
+// ── A value the PAYLOAD delivered, that a DOMAIN condition left absent ──
+// plainDatum's absent arm says 'no value in the payload', which is true only
+// when the payload is the reason. A large share of the migrated tiles pass a
+// value derived AT THE SITE — a ratio whose denominator is zero, a forecast
+// that needs seven days of history, an ISO instant that exists only once a run
+// has completed — and there that string is an accusation against a server which
+// answered perfectly. The site is the only place that knows the real reason,
+// and in several cases it is already sitting in the tile's `hint`.
+//
+// COMPOSES THE TWO SANCTIONED CONSTRUCTORS AND DECIDES NOTHING ITSELF. It is a
+// naming device, not a third envelope: `== null` is plainDatum's own absent
+// test, on purpose and for the same reason — a measured 0 IS a measurement.
+// Exported rather than hand-written per file because three copies of one
+// two-line composition is how the 14 null guards this leaf deleted began.
+//
+// THE ENDPOINT'S OWN ABSENCE OUTRANKS THE SITE'S REASON. Before the first
+// payload resolves, a value derived from DF_DATA's seeds is null for a reason
+// that is not the domain's — an empty seed array has no last bucket — so
+// 'no ops in the last 24h' there would be a confident lie about data this
+// browser has never seen. That question is plainDatum's, and it is asked
+// rather than re-implemented: a probe value it cannot call absent comes back
+// unknown only when there is no receipt. The probe is never rendered; only its
+// state is read.
+//
+// `absentReason` is REQUIRED. A caller with nothing better to say than 'no
+// value in the payload' is describing the payload and should call plainDatum.
+function derivedDatum(value, endpointKey, absentReason, receipts) {
+  if (value !== null && value !== undefined) return plainDatum(value, endpointKey, receipts);
+  const probe = plainDatum(0, endpointKey, receipts);
+  return probe.state === 'unknown' ? probe : unknownDatum(absentReason);
+}
+
 // The browser default for plainDatum's third parameter, read lazily so a node
 // caller that passes its own map never touches a browser global — and so a
 // render that happens before data.js has published anything degrades to "no
@@ -381,6 +413,7 @@ const DATUM_API = {
   EM_DASH,
   LOWER_BOUND_PREFIX,
   plainDatum,
+  derivedDatum,
   PLAIN_DATUM_BOUND_SECONDS,
 };
 

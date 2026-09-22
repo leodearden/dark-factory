@@ -17,7 +17,7 @@ const { pinningSummary } = window.DF_PINS_RECOVERY;
 // The Datum wrapper, at module scope with no fallback — the DF_SPARK_PATH
 // convention index.html's load order backs: a missing or mis-ordered datum.js
 // throws here at load rather than inside a render.
-const { plainDatum } = window.DF_DATUM;
+const { plainDatum, derivedDatum } = window.DF_DATUM;
 
 // Every number this tab renders arrives on one endpoint, and the path is the
 // lookup key into DF_DATA.__receipt (data.js keys one receipt per polled
@@ -365,7 +365,7 @@ function EscalationStatStrip({ analytics, projectFilter }) {
     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 10, marginBottom: 10 }}>
       <C.StatTile
         label="benign rate"
-        datum={plainDatum(benignRate, EP_ESCALATIONS)}
+        datum={derivedDatum(benignRate, EP_ESCALATIONS, 'no classified filings in this window')}
         format={rate => `${Math.round(rate * 100)}%`}
         hint={stampedPct != null ? `${stampedPct}% stamped` : undefined}
         history={benignSpark}
@@ -378,14 +378,14 @@ function EscalationStatStrip({ analytics, projectFilter }) {
       />
       <C.StatTile
         label="esc / done"
-        datum={plainDatum(escPerDone, EP_ESCALATIONS)}
+        datum={derivedDatum(escPerDone, EP_ESCALATIONS, 'no tasks completed in this window')}
         format={ratio => ratio.toFixed(2)}
         history={epdSpark}
         sparkColor={C.PALETTE.accent}
       />
       <C.StatTile
         label="churn 24h"
-        datum={plainDatum(churnRate, EP_ESCALATIONS)}
+        datum={derivedDatum(churnRate, EP_ESCALATIONS, 'no filings in this window')}
         format={rate => `${Math.round(rate * 100)}%`}
         history={churnSpark}
         sparkColor={C.PALETTE.bad}

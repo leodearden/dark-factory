@@ -6,7 +6,7 @@ const D = window.DF_DATA;
 // convention index.html's load order backs: a missing or mis-ordered datum.js
 // throws here at load with a clear message rather than deferring to a TypeError
 // inside a render.
-const { plainDatum } = window.DF_DATUM;
+const { plainDatum, derivedDatum } = window.DF_DATUM;
 const { useState, useEffect } = React;
 
 // Which endpoint each tile's number arrived on — plainDatum's provenance is
@@ -229,7 +229,7 @@ function OverviewTab({ paused }) {
           history={(D.ORCHESTRATORS_SPARK?.values || []).slice(-30)} sparkColor={P.accent} hint="live" />
         <StatTile label="Active tasks" datum={plainDatum(tasksInP + tasksBlocked, EP_OVERVIEW.orchestrators)} unit={`/ ${tasksTotal}`}
           history={D.BURNDOWN.in_progress} sparkColor={P.accent} hint={`${tasksDone} done`} />
-        <StatTile label="Memory ops / min" datum={plainDatum(opsLast, EP_OVERVIEW.memoryGraphs)} format={ops => (ops / 60).toFixed(1)} unit="ops"
+        <StatTile label="Memory ops / min" datum={derivedDatum(opsLast, EP_OVERVIEW.memoryGraphs, 'no ops recorded in this window')} format={ops => (ops / 60).toFixed(1)} unit="ops"
           history={memOpsSpark} sparkColor={P.ok} hint="last 24h hourly" />
         <StatTile label="Spend (today)" datum={plainDatum(D.COSTS.summary?.today, EP_OVERVIEW.costs)} format={spend => `$${spend.toFixed(2)}`}
           delta={deltaPct != null ? `${deltaPct}%` : null}

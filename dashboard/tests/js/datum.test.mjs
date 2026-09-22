@@ -44,6 +44,7 @@ const EXPECTED_FUNCTION_NAMES = [
   'displayedAgeMs',
   'datumView',
   'plainDatum',
+  'derivedDatum',
 ];
 const EXPECTED_EXPORT_NAMES = [
   ...EXPECTED_FUNCTION_NAMES,
@@ -76,7 +77,7 @@ const { api: datum } = loadDatumJs();
 const { isDatum, unknownDatum, assertDatum, DATUM_STATES } = datum;
 const { withReceipt, displayedAgeMs } = datum;
 const { datumView, EM_DASH, LOWER_BOUND_PREFIX } = datum;
-const { plainDatum, PLAIN_DATUM_BOUND_SECONDS } = datum;
+const { plainDatum, derivedDatum, PLAIN_DATUM_BOUND_SECONDS } = datum;
 
 // The five-key wire envelope datum.py::Datum.to_wire() emits, verbatim: `as_of`
 // is an ISO-8601 instant normalised to UTC, `reason` is null only when the
@@ -708,4 +709,51 @@ test('plainDatum: the bound is four poll intervals — fine, ahead of the coarse
   // banner the later per-ENDPOINT explanation — deliberately ordered
   // fine-then-coarse, one authority each.
   assert.equal(PLAIN_DATUM_BOUND_SECONDS, 12);
+});
+
+// ---------------------------------------------------------------------------
+// derivedDatum — the absent reason travels with the site that knows it
+// ---------------------------------------------------------------------------
+
+test('derivedDatum: a present value is exactly plainDatum\'s answer', () => {
+  // A naming device, not a third envelope: nothing about a measured value is
+  // decided differently because the site derived it.
+  assert.deepEqual(
+    derivedDatum(7, TASKS_PATH, 'no completed run', receiptsFor(RECEIPT)),
+    plainDatum(7, TASKS_PATH, receiptsFor(RECEIPT)),
+  );
+});
+
+test('derivedDatum: an absent value carries the SITE\'s reason, not the payload\'s', () => {
+  // The whole point. 'no value in the payload' is an accusation against a
+  // server that answered perfectly, and the operator hovering the em-dash reads
+  // it as one.
+  const view = derivedDatum(null, TASKS_PATH, 'need 7d of history for a range', receiptsFor(RECEIPT));
+
+  assert.equal(view.state, 'unknown');
+  assert.equal(view.reason, 'need 7d of history for a range');
+  assert.equal(datumView(view, { now: NOW }).text, EM_DASH);
+});
+
+test('derivedDatum: undefined takes the absent arm too', () => {
+  // An optional-chained read (`x?.y`) is the commonest way a derived value
+  // arrives missing.
+  assert.equal(derivedDatum(undefined, TASKS_PATH, 'no runs', receiptsFor(RECEIPT)).reason, 'no runs');
+});
+
+test('derivedDatum: a measured 0 (or \'\' or false) is a MEASUREMENT, not a hole', () => {
+  // `== null` and never `!value`, for plainDatum's own reason: reading a
+  // measured zero as absent is the very conflation the envelope removes.
+  for (const falsy of [0, '', false]) {
+    const d = derivedDatum(falsy, TASKS_PATH, 'no runs', receiptsFor(RECEIPT));
+    assert.equal(d.state, 'fresh', `${JSON.stringify(falsy)} must be a measurement`);
+    assert.equal(d.value, falsy);
+  }
+});
+
+test('derivedDatum: a site with no receipt still reads as never-fetched', () => {
+  // The endpoint's own absence outranks the site's reason: nothing has arrived
+  // to derive FROM, so 'no completed run' would be a claim about data this
+  // browser has never seen.
+  assert.equal(derivedDatum(null, TASKS_PATH, 'no completed run', {}).reason, 'not yet fetched');
 });
