@@ -1992,3 +1992,123 @@ class TestDeclaredPinMarker:
 
         assert not hasattr(restored, 'not_a_real_field')
         assert restored.pin_declared_by == []
+
+
+class TestEscalationProjectId:
+    """`project_id` — the SUBJECT project of a record on a cross-project queue (task 4951).
+
+    The queue is shared across every project the factory operates, so "which
+    project is this record about" is a fact consumers need.  Before this field
+    the emitters held it in a variable and threw it away into ``detail`` prose,
+    leaving readers to parse it back out — the INV-2 gap this field closes.
+
+    These tests pin the FIELD's storage/round-trip behaviour only.  Who stamps
+    it is pinned in fused-memory/tests/reconciliation/test_stage1_stall_detector.py;
+    who prefers it is pinned in
+    fused-memory/tests/reconciliation/test_orphaned_recon_escalation_sweep.py.
+    """
+
+    def _make_base_esc(self) -> Escalation:
+        return Escalation(
+            id='esc-4951-1',
+            task_id='4951',
+            agent_role='implementer',
+            severity='blocking',
+            category='risk_identified',
+            summary='test escalation for project_id',
+        )
+
+    # --- (a) default is None ---
+
+    def test_project_id_default_is_none(self):
+        """Escalation constructed without project_id has project_id=None (unstamped)."""
+        assert self._make_base_esc().project_id is None
+
+    # --- (b) round-trip to_dict / from_dict ---
+
+    def test_project_id_round_trip_via_to_dict_from_dict(self):
+        """project_id='dark_factory' is preserved through to_dict() / from_dict()."""
+        esc = Escalation(
+            id='esc-4951-1',
+            task_id='4951',
+            agent_role='implementer',
+            severity='blocking',
+            category='risk_identified',
+            summary='test project_id round-trip',
+            project_id='dark_factory',
+        )
+        restored = Escalation.from_dict(esc.to_dict())
+        assert restored.project_id == 'dark_factory'
+
+    # --- (c) round-trip to_json / from_json ---
+
+    def test_project_id_round_trip_via_to_json_from_json(self):
+        """project_id='reify' is preserved through to_json() / from_json().
+
+        A DIFFERENT value from the to_dict case above, so an implementation
+        hardcoding one constant cannot satisfy both round-trips.
+        """
+        esc = Escalation(
+            id='esc-4951-1',
+            task_id='4951',
+            agent_role='implementer',
+            severity='blocking',
+            category='risk_identified',
+            summary='test project_id json round-trip',
+            project_id='reify',
+        )
+        restored = Escalation.from_json(esc.to_json())
+        assert restored.project_id == 'reify'
+
+    # --- (d) appears in serialised JSON ---
+
+    def test_project_id_appears_in_to_json_output(self):
+        """project_id is serialised (not silently dropped) when set."""
+        esc = Escalation(
+            id='esc-4951-1',
+            task_id='4951',
+            agent_role='implementer',
+            severity='blocking',
+            category='risk_identified',
+            summary='test project_id in json',
+            project_id='autopilot_video',
+        )
+        payload = json.loads(esc.to_json())
+        assert 'project_id' in payload
+        assert payload['project_id'] == 'autopilot_video'
+
+    # --- (e) legacy JSON backward compat (zero-migration) ---
+
+    def test_from_dict_legacy_json_omits_project_id(self):
+        """from_json() on JSON without the project_id key returns None — zero migration."""
+        old_dict = {
+            'id': 'esc-task-1-0001',
+            'task_id': 'task-1',
+            'agent_role': 'implementer',
+            'severity': 'blocking',
+            'category': 'scope_violation',
+            'summary': 'legacy escalation without project_id',
+            'detail': '',
+            'suggested_action': '',
+            'timestamp': '2026-01-01T00:00:00+00:00',
+            'status': 'pending',
+            'resolution': None,
+            'worktree': None,
+            'workflow_state': None,
+            'level': 0,
+            'resolved_at': None,
+            'resolved_by': None,
+            'resolution_turns': None,
+            'dedupe_count': 0,
+            'dedupe_children': [],
+            'dedupe_fingerprint': None,
+            'members': [],
+            'root_cause': '',
+            'options': [],
+            'train_state': None,
+            # NOTE: project_id is intentionally absent
+        }
+        restored = Escalation.from_json(json.dumps(old_dict))
+        assert restored.project_id is None, (
+            f'Expected project_id=None for legacy JSON, got {restored.project_id!r}'
+        )
