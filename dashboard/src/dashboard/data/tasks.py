@@ -606,9 +606,16 @@ class _StatusPage:
 
     ``pagination`` is None when the response carried no envelope, which the
     tool's contract defines as a COMPLETE answer rather than a missing field.
+
+    *statuses* may be SHORTER than *delivered*: an entry whose id is not an
+    integer is dropped. The walk's ``returned`` cross-check must count
+    *delivered*, what the server actually sent, for the reason
+    :class:`_Page` gives: counting the parsed entries would turn one
+    unparseable id into an offline marker for the whole project.
     """
 
     statuses: dict[int, str]
+    delivered: int
     pagination: dict | None
 
 
@@ -623,11 +630,29 @@ async def _walk_statuses(
     and a walk free to fan out mid-walk would tile pages from two different
     states of the world.
 
-    ADVANCE BY WHAT WAS SERVED.  ``get_statuses`` does not clamp an oversized
-    ``page_size``; a server may answer with fewer entries than asked and says
-    so in ``pagination['page_size']``.  Advancing by the REQUESTED size would
-    skip the difference — trading a loud transport rejection for a silently
-    incomplete census, which is the strictly worse bargain.
+    ADVANCE BY ``returned``, THE COUNT SERVED.  The envelope comes from
+    ``fused_memory/server/tools.py::_pagination_meta``.  It passes the
+    caller's REQUESTED ``page_size`` through verbatim, sets ``returned`` to
+    the number of entries it actually sliced, and derives
+    ``has_more = offset + returned < total``.  That identity is why
+    ``offset + returned`` is the only advance that tiles the population
+    without gaps: a walk that stops on the server's ``has_more`` has to step
+    exactly as the server counted.  Advancing by the requested size would skip
+    the difference whenever a server serves fewer entries than asked, which
+    produces a silently incomplete census.
+
+    ``get_statuses``' own docstring says the opposite: "Advance by
+    ``pagination['page_size']`` (what was actually served)".  Its
+    implementation does not do that.  Do not switch this walk back to
+    ``page_size`` because of that docstring.  :func:`_walk_pages` reads
+    ``returned`` off the same envelope, so both walkers key on one field.
+
+    ``returned`` is cross-checked against the entries the page actually
+    delivered, because it is the counter the walk advances on.  A page
+    clipped in flight that still claims its full count would skip the clipped
+    entries and terminate normally.  A page that under-reports would re-read
+    entries already held.  Neither is detectable afterwards, so the read is
+    refused.
 
     TRUNCATION IS LOUD, as in :func:`_walk_pages`: every failure below raises
     ``ValueError`` and discards the pages in hand.  ``fetch_statuses``'
@@ -660,30 +685,36 @@ async def _walk_statuses(
             break
 
         has_more = meta.get('has_more')
-        served = meta.get('page_size')
+        returned = meta.get('returned')
         total = meta.get('total')
-        if not isinstance(has_more, bool) or not isinstance(served, int):
+        if not isinstance(has_more, bool) or not isinstance(returned, int):
             # Without these two, completeness is UNVERIFIABLE — and an
             # unverifiable read must not be reported as a complete one.
             raise ValueError(
                 f'get_statuses pagination for {project_root} is unverifiable at '
-                f'offset {offset}: has_more={has_more!r}, page_size={served!r}'
+                f'offset {offset}: has_more={has_more!r}, returned={returned!r}'
+            )
+        if returned != page.delivered:
+            raise ValueError(
+                f'get_statuses pagination for {project_root} inconsistent at '
+                f'offset {offset}: server claims returned={returned} but sent '
+                f'{page.delivered} status(es)'
             )
         if not has_more:
             break
-        if served <= 0:
+        if returned <= 0:
             # More entries are owed, but the page that would carry them cannot
             # advance the offset, so this server cannot be paged past.
             raise ValueError(
                 f'get_statuses pagination for {project_root} cannot advance at '
-                f'offset {offset}: more entries remain but page_size={served}'
+                f'offset {offset}: more entries remain but returned={returned}'
             )
 
         if page_budget is None:
             # BOUND THE WALK.  ``has_more`` is the loop's only terminator and
             # it is server-reported, so a server that never lowers it would
             # spin here on the same httpx client the render polls share.
-            # Derived from the FIRST page's SERVED size because that is the
+            # Derived from the FIRST page's ``returned`` because that is the
             # rate the walk actually advances at; the +2 covers the final
             # partial page plus one page of slack.
             if not isinstance(total, int):
@@ -691,14 +722,14 @@ async def _walk_statuses(
                     f'get_statuses pagination for {project_root} reports no usable '
                     f'total at offset {offset}: total={total!r}'
                 )
-            page_budget = math.ceil(total / served) + 2
+            page_budget = math.ceil(total / returned) + 2
         if pages >= page_budget:
             raise ValueError(
                 f'get_statuses pagination for {project_root} exceeded its '
                 f'{page_budget}-page budget at offset {offset} '
                 f'(total={total}); refusing to keep walking'
             )
-        offset += served
+        offset += returned
     return merged
 
 
@@ -1214,7 +1245,7 @@ async def fetch_statuses(
             except (TypeError, ValueError):
                 continue
         meta = result.get('pagination')
-        return _StatusPage(out, meta if isinstance(meta, dict) else None)
+        return _StatusPage(out, len(raw), meta if isinstance(meta, dict) else None)
 
     async def _call(url: str) -> dict[int, str]:
         """Read the whole map from ONE url, pinned for the duration of the walk."""
