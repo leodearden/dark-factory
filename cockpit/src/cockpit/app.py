@@ -315,15 +315,15 @@ class CockpitApp(App):
         self._attention_targets: set[DisplayTarget] = set()
         self._queue_items_by_key: dict[str, QueueItem] = {}
         # In-memory "already acted on" marker, set by action_focus_selected.
-        # Pruned to the live QUEUE on every rebuild (_rebuild_queue) -- NOT
-        # to the live ASK, unlike the overlays below: a same-session re-ask
-        # that never leaves the queue keeps the mark. See _rebuild_queue.
+        # Expires with the ASK it was set against, under the same shared
+        # predicate as the overlays below (_prune_overlays), plus a cheap
+        # redundant queue-membership prune at the tail of _rebuild_queue.
         self._handling: set[str] = set()
         # Ephemeral in-memory overlays, keyed the same way (a session key is
-        # stable for the session's whole lifetime). These ARE pruned on every
-        # rebuild -- by ASK LIVENESS (_prune_overlays), NOT by queue
+        # stable for the session's whole lifetime). Pruned on every rebuild
+        # by that same ASK LIVENESS rule (_prune_overlays) and NOT by queue
         # membership: a dropped item is by construction absent from the
-        # rebuilt queue, so _handling's `&= queue keys` predicate would clear
+        # rebuilt queue, so _rebuild_queue's `&= queue keys` line would clear
         # every drop on the very rebuild action_drop itself triggers.
         self._boosts: dict[str, int] = {}
         self._dropped: set[str] = set()
@@ -783,21 +783,30 @@ class CockpitApp(App):
     def _prune_overlays(self) -> None:
         """Expire every overlay entry whose ask is gone or has been replaced.
 
-        Covers all three ephemeral overlays -- self._dropped, self._boosts
-        and self._deferred -- under one shared predicate
-        (_live_overlay_keys): an entry survives only while the ask it was
-        recorded against is still the same live ask, i.e. the identity
-        stored in self._overlay_asks still equals the CURRENT
-        _ask_identity(key). Then garbage-collects self._overlay_asks down
-        to the keys still referenced by SOME overlay, so the bookkeeping
-        side-table cannot become the next leak. `live` IS that set: it is
-        by construction the subset of the pre-prune union that survives, so
-        the three overlays below sum to exactly it afterwards.
+        Covers all four ephemeral collections -- self._dropped,
+        self._boosts, self._deferred and self._handling -- under one shared
+        predicate (_live_overlay_keys): an entry survives only while the ask
+        it was recorded against is still the same live ask, i.e. the
+        identity stored in self._overlay_asks still equals the CURRENT
+        _ask_identity(key). This is the single statement of that rule --
+        the collections' own declarations and their action handlers point
+        here rather than restating it. self._handling alone additionally
+        carries a redundant queue-membership prune at the tail of
+        _rebuild_queue; see there for the one case that still divides them.
+
+        Then garbage-collects self._overlay_asks down to the keys still
+        referenced by SOME overlay, so the bookkeeping side-table cannot
+        become the next leak. `live` IS that set: it is by construction the
+        subset of the pre-prune union that survives, so the four
+        collections below sum to exactly it afterwards.
         """
-        live = self._live_overlay_keys(self._dropped | self._boosts.keys() | self._deferred.keys())
+        live = self._live_overlay_keys(
+            self._dropped | self._boosts.keys() | self._deferred.keys() | self._handling
+        )
         self._dropped = {key for key in self._dropped if key in live}
         self._boosts = {key: boost for key, boost in self._boosts.items() if key in live}
         self._deferred = {key: stamp for key, stamp in self._deferred.items() if key in live}
+        self._handling = {key for key in self._handling if key in live}
         self._overlay_asks = {
             key: identity for key, identity in self._overlay_asks.items() if key in live
         }
@@ -814,8 +823,8 @@ class CockpitApp(App):
         calling _ask_identity per key per overlay. This runs at the head of
         every _rebuild_queue -- i.e. on every poll tick that diffs as
         changed -- and _ask_identity's index-less fallback scans
-        self._records linearly, so a key overlaid in all three collections
-        would cost three full scans of a registry the cockpit explicitly
+        self._records linearly, so a key overlaid in all four collections
+        would cost four full scans of a registry the cockpit explicitly
         sizes for 10k+ sessions (see _scan_registry_worker). order_queue
         builds the same slug index immediately afterwards for exactly this
         reason.
@@ -859,40 +868,19 @@ class CockpitApp(App):
         _resync_queue_detail below is what refreshes the highlighted row in
         those suppressed reposts' place.
 
-        Also prunes self._handling down to the keys still present in the
-        freshly-built queue: a key whose item LEFT the queue (resolved/
-        dropped, or a session moved off AWAITING_INPUT) stops being
-        "handling", so an ask that later reuses that key starts out
-        unmarked.
+        Every ephemeral collection -- self._handling included -- expires
+        with the ASK it was recorded against. _prune_overlays states that
+        rule and runs as the first statement below, so the queue is always
+        built from already-pruned state.
 
-        That predicate is strictly WEAKER than the overlays' below, and the
-        residual gap is known, not an oversight. AWAITING_INPUT(Q1) ->
-        AWAITING_INPUT(Q2) never removes 'session:<slug>' from the queue --
-        session_hooks.run_notification writes status=AWAITING_INPUT plus a
-        fresh Question with no required intervening Stop hook (-> IDLE) --
-        so an operator who pressed Enter on Q1 sees Q2 already rendered as
-        "handling". That is the same family as the overlay leak this method
-        prunes, with a much weaker consequence: "handling" only tints the
-        row and nudges its score, it never HIDES the row, so the new ask
-        stays visible either way. Kept as-is deliberately (this task's plan
-        pins the predicate, and TestHandlingPrunedOnQueueExit pins its
-        behaviour); tightening it to ask liveness would mean calling
-        _record_overlay from action_focus_selected and folding _handling
-        into _prune_overlays' garbage collection.
-
-        The ephemeral overlays (self._dropped, and later self._boosts/
-        self._deferred) get the same treatment for the same reason, but
-        under a deliberately DIFFERENT predicate -- _prune_overlays' ask
-        liveness, run as the first statement below so the queue is always
-        built from already-pruned state. _handling's queue-membership
-        predicate cannot be reused for them: a dropped item is by
-        construction absent from the rebuilt queue, so `&= queue keys`
-        would clear every drop on the very rebuild action_drop itself
-        triggers. Conversely _handling means "the operator has acted on the
-        item currently in the queue", which queue membership answers
-        directly and cheaply -- for every key that actually leaves, with
-        the same-key re-ask caveat noted above. The two rules stay separate
-        on purpose.
+        The tail `self._handling &= self._queue_items_by_key.keys()` line
+        is a cheap, redundant second line of defence on top of it, not the
+        rule. The one case where the two predicates still diverge is a
+        still-live ask that self._dropped keeps out of the queue: only the
+        tail line clears that mark. It cannot move up into _prune_overlays,
+        because self._queue_items_by_key is not rebuilt until order_queue
+        returns -- evaluated at the head it would read the PREVIOUS
+        rebuild's queue and so clear the mark for a row about to reappear.
         """
         self._prune_overlays()
         now = self._now_fn()
@@ -1025,22 +1013,20 @@ class CockpitApp(App):
         "handling" (an in-memory, best-effort "already acted on" marker,
         fed back into the next order_queue call) -- even when no target
         resolved, since the operator's acknowledgement is real regardless
-        of whether a live window was found. This mark is not permanent:
-        _rebuild_queue prunes self._handling down to whatever is still in
-        the queue on every rebuild, so a key whose item LEAVES the queue and
-        later resurfaces starts unmarked again. It is deliberately not keyed
-        on the ask itself, the way the _dropped/_boosts/_deferred overlays
-        are: a session going AWAITING_INPUT(Q1) -> AWAITING_INPUT(Q2) never
-        leaves the queue, so Q2 does render as already-handled. Known and
-        kept -- see _rebuild_queue's docstring for why. Fail-soft: an empty queue (no highlighted
-        key) or a key not present in the last-built queue no-ops without
-        raising -- a gone/unlinked lead is simply not focusable, never a
-        crash.
+        of whether a live window was found. This mark is not permanent: it
+        expires with the ask it was set against, under the same rule as the
+        _dropped/_boosts/_deferred overlays (see _prune_overlays), which is
+        why _record_overlay is called here -- ahead of the mark, the same
+        order every other overlay-writing handler uses. Fail-soft: an empty
+        queue (no highlighted key) or a key not present in the last-built
+        queue no-ops without raising -- a gone/unlinked lead is simply not
+        focusable, never a crash.
         """
         queue = self.query_one('#decision-queue', DecisionQueue)
         key = queue.highlighted_key()
         if key is None:
             return
+        self._record_overlay(key)
         self._handling.add(key)
         item = self._queue_items_by_key.get(key)
         if item is None or item.target is None:
