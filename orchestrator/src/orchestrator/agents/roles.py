@@ -1121,66 +1121,69 @@ GREP_LOOKAROUND_GUIDANCE_READ_ONLY = _GREP_ENGINE_LIMITS + _GREP_PCRE_READ_ONLY_
 
 
 # Census finding, task 5683 (`metadata.source: legibility_census`) -- census
-# 2026-09-20 section 1.1, codebook candidate `entry-cand-20260918-19`.
-# Reproduced first-hand in the founding session and again on execution
-# 2026-09-22. THE PROBE TABLE, with the commands that produced it; each row is
-# one Bash tool call made from a dispatched agent session in a task worktree,
-# and the script is the same two-line `import sys` / indented `print` in all
-# four:
+# 2026-09-20 section 1.1, codebook candidate `entry-cand-20260918-19`, whose
+# umbrella entry `entry-cand-20260722-6` records the mechanism.
 #
-#     A  python3 -c "<the two-line script>"
-#        -> ran; newlines preserved
-#     B  git log --oneline -1 && python3 -c "<the same script>"
-#        -> File "<string>", line 1
-#             import sys if True: print(...)
-#           IndentationError: unexpected indent
-#           ...and the git output arrived as `[log] 1 commit`, i.e. REWRITTEN
-#     G  head -1 NO_SUCH_FILE_XYZ_5683.md && python3 -c "<the same script>"
-#        -> Error: No such file or directory (os error 2); the python never ran
-#     D  git log --oneline -1 && python3 - <<'PY' <the same script> PY
-#        -> ran; newlines preserved, and the git output arrived RAW
+# MEASURED against skim 2.3.1 on 2026-09-22, and how to re-measure: pipe a
+# PreToolUse payload for each command into the host hook below and read
+# `hookSpecificOutput.updatedInput.command` from its stdout -- no output
+# means the command passes through untouched -- then confirm the key rows
+# live through the Bash tool. The script is the same two-line `import sys` /
+# indented `print` in every row:
 #
-# WHAT B AND D TOGETHER SHOW. The rewrite is not a python problem: the same
-# script runs unchanged alone (A) and over stdin (D), and only the `-c` form
-# chained to a rewrite target fails. D's git output is the sharper signal --
-# in B it came back in the rewritten shape, in D it came back raw, so the hook
-# did not merely decline to FLATTEN the heredoc command, it declined to
-# process that command at all. That is WHY the escape works, and it is also
-# why the escape is scoped in the prose to a heredoc REDIRECT supplying the
-# script: what buys the exemption is shell syntax the hook will not analyse,
-# which a heredoc nested inside `$(...)` to build an argument does not buy.
+#     git log --oneline -1 && python3 -c "<script>"
+#         -> rewritten to `skim git log ...` with the script joined onto one
+#            line; live: `SyntaxError: invalid syntax` at line 1, or
+#            `IndentationError: unexpected indent` when the script opens
+#            with a newline
+#     echo "git status" && python3 -c "<script>"
+#         -> passed through; live: ran
+#     head -1 NO_SUCH_FILE_XYZ_5683.md && python3 -c "<script>"
+#         -> rewritten although the file does not exist; live: skim's
+#            `Error: No such file or directory (os error 2)`, and python
+#            never ran
+#     head -1 /etc/hostname && python3 -c "<script>"
+#     head -1 NO_SUCH_FILE_XYZ_5683.txt && python3 -c "<script>"
+#         -> both passed through: `cat` and `head` gate on the operand's
+#            extension, never on whether it exists
+#     git log --oneline -1 && python3 - <<'PY' <script> PY
+#         -> passed through, git output raw: the hook declines the whole
+#            command, which is why the escape works
 #
-# WHAT G SHOWS, and why the prose says operand-PRESENCE and never
-# path-resolution -- this is the esc-5683-3 correction of 2026-09-20,
-# re-confirmed on execution. The path does not exist, and the command was
-# rewritten anyway. The tell is the error STRING: `Error: No such file or
-# directory (os error 2)` is Rust's io::Error rendering, emitted by the
-# rewriting binary, where GNU `head` would have said `head: cannot open '...'
-# for reading: No such file or directory`. The second consequence is stated in
-# the prose too, because it is the part that actually costs the turn: the
-# rewritten command's non-zero exit short-circuited the `&&`, so the script
-# never ran at all and the agent gets no python diagnostic of any kind.
+# Also rewritten when chained to the script: `git status`, `git diff` (not
+# `git diff --stat`), `tail` of a source file, `ls -la` (not `ls -l`),
+# `grep -rn` (not `grep -n`), `rg`, `find`, `tree`, `pytest`,
+# `python3 -m pytest`, `ruff check`, `mypy`, `cargo test`, `go test` -- far
+# wider than the four commands the codebook entry names. Passed through:
+# `uv run ... pytest`, `pyright`, `make`, `jq`, a target inside `$(...)`,
+# and a target on any line but the first. A heredoc nested in `$(...)` gets
+# no immunity of its own: beside `git status` it is flattened. Because the
+# set is broad, turns on flags, and belongs to a third-party binary that can
+# change under us, the prose describes it by category and makes the rule
+# independent of it.
+#
+# An earlier revision, following the frozen plan, called the match TEXTUAL,
+# gave `git status`, `git log`, `head` and `cat` as the whole trigger set, and
+# named only the IndentationError. The measurements above refute all three;
+# see esc-5683-4.
 #
 # THE HOST LAYER, identified so nobody searches this repo for it.
 # ~/.claude/settings.json carries a PreToolUse hook with matcher `Bash`
 # running ~/.claude/hooks/skim-rewrite.sh, whose body is
-# `exec ~/.cargo/bin/skim rewrite --hook`. It parses and re-serialises any
-# command whose TEXT contains one of its rewrite targets (`git status`,
-# `git log`, `head`, `cat`), joining every physical line into one. The match
-# being TEXTUAL rather than syntactic is measured separately: a prior session
-# saw `echo "git status"` flatten, where the token was a quoted argument that
-# never ran.
+# `exec ~/.cargo/bin/skim rewrite --hook`; a dispatched agent's config dir
+# carries the same hook. When it rewrites any part of a command it
+# re-serialises the WHOLE command with every newline turned into a space.
+#
+# RETIRE THIS BLOCK when no host running the factory wires that hook, or when
+# re-running the first row above keeps the script's newlines. The rule it
+# gives is harmless under any rewriter, so outliving the hook costs only its
+# tokens on every invocation of the seven roles that carry it.
 #
 # WHAT IS AND IS NOT ADDRESSED. The cause is a third-party binary wired in by
-# host-level operator config under ~/.claude/ -- outside this repository and
-# outside any worktree's scope. No in-repo code path produces, wraps or can
-# intercept the rewrite, so nothing here can stop it happening. Only the
-# told-upfront/recovery facet is in scope: an agent told the rule BEFORE it
-# composes the command does not walk into it, and one that recognises the
-# symptom does not spend a turn rewriting a script that was already correct.
-# Same carve-out tasks 4273, 4578, 4964 and 5331 documented for the four
-# findings above, and the reason a harness-rooted census finding lands in this
-# file rather than in a code fix.
+# host-level operator config under ~/.claude/, outside this repository and any
+# worktree's scope, so nothing here can stop the rewrite. Only the
+# told-upfront/recovery facet is in scope -- the same carve-out tasks 4273,
+# 4578, 4964 and 5331 documented for the four findings above.
 #
 # DISCRIMINATION, NOT DUPLICATION -- a FIFTH shape against three neighbours,
 # and the discriminator is WHERE the defect sits relative to the tool call.
@@ -1192,11 +1195,11 @@ GREP_LOOKAROUND_GUIDANCE_READ_ONLY = _GREP_ENGINE_LIMITS + _GREP_PCRE_READ_ONLY_
 # UNREACHABLE through the tool that printed it. This is none of the three: the
 # call was well-formed AND accepted, and what reached the shell is not what
 # was sent. The command was SILENTLY ALTERED between the tool call and the
-# shell, no error names the alteration, and the error that does surface
-# (`IndentationError`) accuses the agent's own script -- which is exactly why
-# the census records a session rewriting that script repeatedly without ever
-# diagnosing it. None of the four blocks may be deleted as redundant with
-# another.
+# shell, no error names the alteration, and the error that does surface (a
+# `SyntaxError` or `IndentationError`) accuses the agent's own script --
+# which is exactly why the census records a session rewriting that script
+# repeatedly without ever diagnosing it. None of the four blocks may be
+# deleted as redundant with another.
 #
 # ONE VARIANT, not two, unlike GREP_LOOKAROUND_GUIDANCE directly above. There
 # the LIMITATION applied to every role and only the RECOURSE had to be varied
@@ -1208,38 +1211,39 @@ GREP_LOOKAROUND_GUIDANCE_READ_ONLY = _GREP_ENGINE_LIMITS + _GREP_PCRE_READ_ONLY_
 # orchestrator/tests/test_roles_compound_command_rewrite.py::test_role_set_matches_its_bash_capability.
 #
 # HARD CONSTRAINTS: the four stated above _GREP_ENGINE_LIMITS bind this
-# constant too -- no literal `{`/`}`; no `mcp__<family>__<name>` name in the
-# prompt text; no `Test` + CamelCase class citation, so every test cited from
-# here is named `path/to/test_module.py::lowercase_function`; and no sighting
-# COUNT and no byte-size figure in the prose.
+# constant too.
 COMPOUND_COMMAND_REWRITE_GUIDANCE = """
 ## A compound Bash command can silently flatten a multi-line script
 
-THE RULE: never put a multi-line script and a `git status`, `git log`, `head`
-or `cat` token in the SAME `Bash` call. Issue the script as its own call. That
-costs one extra tool call; the alternative costs a turn and a misdiagnosis.
+THE RULE: a multi-line script — a `python3 -c` whose argument spans lines —
+goes in a `Bash` call of its own. Do not chain it to any other command: not
+with `&&`, `;` or `|`, and not on another line of the same call. That costs
+one extra tool call; the alternative costs a turn and a misdiagnosis.
 
 THE SYMPTOM, so you recognise it instead of rewriting a script that was
-already correct. The interpreter echoes your whole script back as ONE line —
+already correct. The interpreter reports your whole script as ONE line —
 `File "<string>", line 1` — with the statements space-joined, and raises
-`IndentationError: unexpected indent`. Nothing reports that the command was
+`SyntaxError: invalid syntax`, or `IndentationError: unexpected indent` if
+the script opened with a newline. Nothing reports that the command was
 altered, so the natural reading is that your script is malformed. It is not.
 Re-issuing the same script ALONE runs it unchanged, and that is the
 one-command diagnostic: passes by itself, fails when chained, means you are
 looking at this and not at your code. Do not start editing the script.
 
-THE TRIGGER: a host `PreToolUse` hook on `Bash` parses the command and
-re-serialises it onto one physical line, turning the newlines embedded in your
-`-c` argument into spaces. Two properties of it you must know, both measured:
+THE TRIGGER: a host `PreToolUse` hook on `Bash` rewrites many common
+commands into another tool's equivalents, and when it rewrites ANY part of a
+command it re-serialises the WHOLE command onto one physical line, turning
+the newlines inside your `-c` argument into spaces. What it rewrites is
+broad — `git status` and `git log`, `cat` or `head` of a source file, search
+and listing commands, test runners and linters among them — and even turns
+on which flags you pass, so do not try to predict it. Follow the rule
+instead.
 
-- The match is TEXTUAL, not syntactic. The token never has to RUN — a quoted
-  `echo "git status"` is enough, because the command TEXT is what is matched.
-- For `cat` and `head` the trigger is the PRESENCE of a path operand, NOT
-  whether that path resolves. A `head` of a file that does not exist is
-  rewritten exactly as a resolving one is, and the rewritten command's
-  non-zero exit then short-circuits an `&&` chain, so your script never runs
-  at all and you get no interpreter diagnostic. A read of a missing path is
-  not a safe thing to chain.
+Whether a file EXISTS does not protect you. A `head` of a missing `.md` file
+is rewritten exactly as a present one is; it then fails with
+`Error: No such file or directory (os error 2)` instead of `head`'s own
+message, and that non-zero exit short-circuits the `&&`, so your script never
+runs at all and you get no interpreter diagnostic.
 
 THE ESCAPE, when you genuinely need one command: pass the script on stdin via
 a heredoc redirect rather than as a `-c` argument.

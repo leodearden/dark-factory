@@ -10,11 +10,11 @@ machine-derived set of roles. `test_roles_grep_lookaround.py` is the template
 this module follows most closely.
 
 PROVENANCE, BY POINTER ONLY: census 2026-09-20 section 1.1, codebook candidate
-`entry-cand-20260918-19`, task 5683. The mechanism, the probe table with the
-commands that produced it, the host-hook identification, the out-of-repo-cause
-carve-out, the operand-presence correction and the discrimination against the
-three neighbouring blocks are recorded ONCE, next to the constant they
-constrain, in the comment block above
+`entry-cand-20260918-19`, task 5683. The mechanism, the measurements with the
+commands that produced them and how to re-run them, the host-hook
+identification, the condition that retires the block, the out-of-repo-cause
+carve-out and the discrimination against the three neighbouring blocks are
+recorded ONCE, next to the constant they constrain, in the comment block above
 `orchestrator/src/orchestrator/agents/roles.py::COMPOUND_COMMAND_REWRITE_GUIDANCE`.
 This module points there rather than carrying a second copy that would have to
 be re-corrected in step with the first (SPOT, heuristic 11).
@@ -193,9 +193,9 @@ def test_every_role_in_the_set_carries_the_guidance():
     _CONTRACT.assert_every_role_carries(
         remedy=(
             'These roles compose compound `Bash` commands routinely and would '
-            'otherwise meet the rewrite by failure — reading an IndentationError '
-            'that accuses their own script, with nothing reporting that the '
-            'command was altered before it reached the shell.'
+            'otherwise meet the rewrite by failure — reading a SyntaxError or '
+            'IndentationError that accuses their own script, with nothing '
+            'reporting that the command was altered before it reached the shell.'
         ),
     )
 
