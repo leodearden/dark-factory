@@ -86,12 +86,19 @@ Top victims: `add_design_decision.rationale` (109), `add_memory.content` (90),
 `add_design_decision.decision` (33), `add_reuse_item.how` (33),
 `submit_review_verdict.summary` (19), `escalate_info.detail` (17).
 
-The "no" rows are not permanent. Closing that coverage gap is owned by the
-containment PRD's middleware-registration task (task 3690, registering
-`MarkupGuardMiddleware` on all four servers) — once that lands, three of the
-rows above go stale. The column is dated for exactly that reason: it
-describes coverage **at measurement**, not coverage today, so this table
-cannot silently rot into a false present-tense claim.
+The "no" rows are not permanent, and **no single task closes them** — they span
+four servers, and PRD §9 split that registration work three ways on 2026-08-19
+(operator commit `965f3206eb`). Per row of the table above:
+`orchestrator/plan-tools` is **γ2 / task 4457**, `fused-memory` is **γ3 / task
+4458**, and `orchestrator/verdict-tools` and `escalation` are **γ1 / task 3690**.
+
+**Those rows went stale on 2026-08-20**, when all three leaves landed — `07a967fab0`
+(escalation), `0beb3c706a` (verdict-tools), `37eed69c97` (plan-tools), `60293e0d8c`
+(fused-memory); γ1, γ2 and γ3 are all `done`. The column is dated for exactly that
+reason: it describes coverage **at measurement**, not coverage today, so this table
+cannot silently rot into a false present-tense claim. The 2026-08-05 figures above
+are therefore left exactly as measured, and this update is recorded alongside them
+rather than written over them.
 
 ### The negative evidence that settles it
 
@@ -143,17 +150,74 @@ collapse their membership, which still differs by calibration —
 the invoke closer) while `PREFILTER_NEEDLES` carries the four parameter
 closers, and `ENVELOPE_LITERALS` is their union.
 
-So the write-time **diagnostic gap is still open today**.
-`markup_tripwire.find_markup_pattern` (`markup_tripwire.py:170`) still
-scans `MCP_MARKUP_PATTERNS` only, so a mis-closed `description` at the
-fused-memory write boundary still cannot report its own tag and still
-blames whatever happens to follow it. What closes that gap is `detect()`
-over `ENVELOPE_LITERALS` — the earliest literal by position over the full
-union — reaching the write boundary when `MarkupGuardMiddleware` is
-registered on the four servers (task 3690, the same task the coverage
-table above is dated against). Until then, read a write-time `matched_pattern`
-as "an envelope literal was seen here", not as "this is the tag that was
-mis-closed".
+So the write-time **diagnostic gap was still open when this was written**.
+`markup_tripwire.find_markup_pattern` (then at `markup_tripwire.py:170`) scanned
+`MCP_MARKUP_PATTERNS` only, so a mis-closed `description` at the fused-memory
+write boundary could not report its own tag and blamed whatever happened to
+follow it. What closes that gap is `detect()` over `ENVELOPE_LITERALS` — the
+earliest literal by position over the full union — reaching the write boundary
+when `MarkupGuardMiddleware` is registered across the servers: **γ1 / task 3690**
+(escalation, verdict-tools), **γ2 / task 4457** (plan-tools) and **γ3 / task
+4458** (fused-memory) — the same *set* the coverage table above is dated against,
+not any one task.
+
+**Re-verified 2026-08-20: that gap is CLOSED, and the mechanism described above no
+longer exists.** All three leaves are `done`. `find_markup_pattern` and
+`find_markup_violation` were **deleted by γ3 / task 4458**, together with the
+write-time gate they served — `markup_tripwire.py` records the deletion in place
+and now re-exports `MCP_MARKUP_PATTERNS` only to feed a same-file drift guard. The
+live path as of that date is `shared.toolcall_markup.detect` over
+`ENVELOPE_LITERALS`, which `shared/src/shared/mcp_markup_middleware.py` imports and
+calls at the boundary — that is, precisely the generalisation this paragraph names
+as the fix. The parameter-aware `detect_for` that same boundary also calls *today*
+is **not** part of this 2026-08-20 reading: it did not exist until 2026-08-25 (task
+**4696**). The next paragraph dates that difference, because it changes what a
+`matched_pattern` is allowed to mean.
+
+**How to read a write-time `matched_pattern`, by date.** THREE windows, not two,
+because the scan widened twice and only the second widening makes the pattern name
+the mis-closed tag in general.
+
+- **On or after 2026-08-25** — task **4696**: `cb68bc3369` added `detect_for`, the
+  parameter-aware predicate, and `ac6f9e538e` made the live write boundary call it.
+  The scan is widened with the scanned argument's OWN name-echoing closer, so
+  `matched_pattern` **may be read as the tag that was mis-closed**.
+- **Between 2026-08-20 and 2026-08-25** the guard was live but scanned the FIXED
+  `ENVELOPE_LITERALS` only — six members, not one of them derived from the argument
+  being scanned. In that window it names the mis-closed tag **only when that tag is
+  one of `description`, `parameter`, `details` or `content`**; for every other
+  parameter name it still names whatever FOLLOWS the mis-closed tag. Worked example:
+  `esc-plan-tools-markup-residue-1` (`reify`), fired 2026-08-21T21:17:56Z, from
+  `/home/leo/src/reify/data/escalations/archive/2026-08-22/` — the record whose
+  `add_design_decision.decision` argument absorbed the following `rationale`
+  parameter, tabled in the containment PRD
+  (`plans/toolcall-markup-containment-prd.md` §2.5). The mis-closed tag there was
+  `decision`, which is not one of the four; the reported `matched_pattern` is the
+  canonical parameter-opener prefix, i.e. the opening of the `rationale` argument
+  that followed it. A reader applying the post-2026-08-25 rule to that record would
+  conclude the mis-closed tag was `parameter`. (Measured 2026-09-22: retention has
+  since pruned that archive directory — its oldest surviving day is 2026-08-23 — so
+  the PRD transcription is now the only copy, which is the reason it was transcribed.)
+- **Before 2026-08-20** — which is every specimen catalogued in this document — the
+  narrower reading still holds: "an envelope literal was seen here", not "this is
+  the tag that was mis-closed".
+
+**One accepted residual survives the 2026-08-25 widening, at the GENERIC boundary
+only.** `shared/src/shared/mcp_markup_middleware.py::MarkupGuardMiddleware._first_markup_argument`
+documents it in place: a CROSS-FIELD misclose — a closer naming a *different*
+parameter of the *same* tool — still passes, because that scan calls
+`detect_for(value, param)` with the argument's own name and **no schema**, so
+`matched_pattern` blames the follower exactly as in the middle window above. Two
+qualifiers travel with it, or it reads worse than it is. The schema is withheld
+**deliberately**: widening would put an awaited `get_tool` round-trip on every clean
+call, which is what the boundary's ordering exists to avoid. And the same 2026-08-25
+corpus measurement that sized the widening — 444 corrupted entries over the fleet's
+`plan.json` files — puts the cross-field population at **zero**. The residual is also
+narrower than "the write boundary": the sites that hold their schema for free DO pass
+it — `orchestrator/src/orchestrator/mcp/plan_tools.py` calls
+`detect_for(value, record.field, record.schema_params)` at two sites, and
+`scripts/sweep_toolcall_markup.py` passes its own key set — so it does not apply at
+plan-tools, which is where most catalogued specimens were caught.
 
 ---
 
