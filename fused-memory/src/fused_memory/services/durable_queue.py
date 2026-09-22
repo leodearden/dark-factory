@@ -274,8 +274,12 @@ TerminalHookFn = Callable[[str, str, str | None], Coroutine[Any, Any, None]]
 # recomputed per attempt, so it survives a retry into a later attempt that
 # never reached the backend, and is deliberately STICKY across replay_dead
 # (see that method). It is also surfaced structurally as
-# get_dead_items()['executed'], so a replay decision can read a boolean
-# instead of string-matching this prefix against error prose.
+# get_dead_items()['executed'], so a replay decision can read a value instead
+# of string-matching this prefix against error prose — but that value is
+# THREE-valued and only as old as the column: True landed, False the queue
+# recorded that nothing landed, None unknown because the row predates task
+# 4116. For a None row this prefix and backend_ops are the only evidence
+# there is.
 POST_EXECUTE_DEAD_PREFIX = (
     'post-execute failure (the backend write LANDED; do not blind-replay): '
 )
@@ -832,6 +836,10 @@ class DurableWriteQueue:
         point" does not stop being true because an operator pressed replay —
         and it is exactly the fact that makes a SECOND blind replay dangerous.
         The asymmetry with the fields below is intentional, not an oversight.
+
+        A NULL ``executed`` is UNKNOWN, not "did not land" — the row predates
+        the column — so replaying a legacy dead row still warrants a
+        ``backend_ops`` check first.
         """
         assert self._db is not None
         if group_id:

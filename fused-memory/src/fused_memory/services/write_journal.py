@@ -58,16 +58,31 @@ CREATE TABLE IF NOT EXISTS write_ops (
     --               terminal_error with POST_EXECUTE_DEAD_PREFIX
     --               ('post-execute failure (the backend write LANDED; ...)')
     --               when the failure happened after the backend call
-    --               succeeded. Absent that prefix, terminal_error is the
-    --               queue's own f'{type(exc).__name__}: {exc}' from a failed
-    --               execute. That fact is persisted on the queue row
-    --               (write_queue.executed), so it survives a retry into a
+    --               succeeded, and persists the same fact on the queue row
+    --               (write_queue.executed), where it survives a retry into a
     --               later attempt that never reached the backend and is
-    --               sticky across replay_dead. Before replaying, read
-    --               get_dead_items()['executed'] — the same fact as a
-    --               boolean, rather than matching the prefix on this text.
-    --               When still in doubt, check backend_ops (joined on
-    --               write_op_id).
+    --               sticky across replay_dead.
+    --
+    --               Before replaying, read get_dead_items()['executed'],
+    --               which is THREE-valued — the persisted fact is only as
+    --               old as the column:
+    --                 True   it landed; do not blind-replay.
+    --                 False  the queue recorded that no backend write landed
+    --                        — safe to replay.
+    --                 None   the row predates task 4116, so this field knows
+    --                        nothing about it. terminal_error's prefix and
+    --                        backend_ops (joined on write_op_id) are then the
+    --                        ONLY evidence, not a fallback for residual doubt.
+    --
+    --               Sharp edge for those legacy rows: the ABSENCE of the
+    --               prefix is NOT proof the write never landed. Pre-4116 the
+    --               prefix was recomputed per attempt, so it evaporated
+    --               whenever a landed item retried — the very bug task 4116
+    --               fixed — which leaves backend_ops the only authority for a
+    --               legacy row carrying no prefix. Only for a row written at
+    --               or after 4116 does "absent the prefix" mean terminal_error
+    --               is the queue's own f'{type(exc).__name__}: {exc}' from a
+    --               failed execute.
     --
     -- LAST-WRITE-WINS: replay_dead resets a dead item to pending, so a
     -- dead-letter that is later replayed and lands correctly re-stamps
