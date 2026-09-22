@@ -42,6 +42,8 @@ cd /home/leo/src/dark-factory && uv run --project shared python scripts/legibili
 
 The run mines, verifies, synthesizes, updates the codebook, and files remediation tasks unattended — it can take a while (saturation mining runs until novelty drops below the configured duplicate-rate threshold for several consecutive batches). Watch the terminal for the final `census: done -- report=... filed_tasks=N stop_reason=...` line, or `census: deferred -- <reason>` if the headroom preflight declined to start.
 
+The done line gains a trailing **`unresolved_verdicts=N`** when — and only when — N is non-zero. It means N verify verdicts this run *paid for* found no `pending` candidate to apply to, because a prior adjudication of the same title is standing and the merger correctly declined to fabricate a pending twin over it. Nothing is lost and the run is not a failure, but nothing changes on its own either: re-open those titles by hand (the run's log names them, one warning per title) or the same verify spend repeats every census.
+
 ### Operator cost-control flags
 
 Three composable flags bound what one run may spend. Each is optional and defaults to today's unbounded behavior, so omitting them all is exactly the command above.
@@ -65,6 +67,8 @@ What you're trading for that: a bounded first census is a *sample*, not a sweep,
 ## Post-run checklist
 
 1. **Read the dated report.** `plans/confusion-census-<date>.md` in the *censused* project's own checkout — open it and read the origin × manifestation matrix (where confusions came from vs. how they showed up) plus the narrative sections. This is the actual deliverable; don't just trust the one-line CLI summary.
+
+   **Check for a `## Verification` section on a run you gave no `--max-verify-clusters`.** On a flagless run that section only appears when something is wrong: it means every offered cluster was rejected and none survived. Treat that as a suspected *systemic* verifier failure (model unreachable, tool access denied, unparseable verdicts) rather than a genuinely unremarkable census, and read the per-cluster verify warnings in `journalctl --user -u legibility-trickle@<project>` before accepting the run.
 2. **Sanity-check per-stratum coverage counts.** The report should show mining coverage across the strata the sampler drew from — if one stratum has near-zero sightings while others are dense, that's worth a second look (could be a genuinely clean area, could be a sampling gap).
 3. **Confirm `census-state.json` advanced.** Check `docs/legibility/census-state.json` in the censused project — `last_census_at` should now be this run's timestamp and `last_census_report` should point at the new report. This is what makes the *next* census automatic: with a real anchor in place, `census_trigger` can now compute `days_since` and the interval/tasks-landed/novelty-spike conditions become live instead of perpetually "N/A".
 

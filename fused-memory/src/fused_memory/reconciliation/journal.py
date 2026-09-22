@@ -392,14 +392,50 @@ class ReconciliationJournal:
     async def update_run_stage_reports(
         self, run_id: str, stage_reports: dict[str, StageReport | dict]
     ) -> None:
-        serialized = {}
-        for k, v in stage_reports.items():
-            serialized[k] = v.model_dump(mode='json') if isinstance(v, StageReport) else v
         async with self._require_access().write() as db:
             await db.execute(
                 'UPDATE runs SET stage_reports = ? WHERE id = ?',
-                (json.dumps(serialized), run_id),
+                (_serialize_stage_reports(stage_reports), run_id),
             )
+
+    async def compare_and_set_run_stage_reports(
+        self,
+        run_id: str,
+        stage_reports: dict[str, StageReport | dict],
+        *,
+        expected_text: str | None,
+    ) -> bool:
+        """Rewrite ``stage_reports`` only if the column still holds
+        ``expected_text``. Returns whether the write applied.
+
+        This is the serialised half of a read-modify-write of the WHOLE
+        ``stage_reports`` blob: the caller loads the blob, mutates it in Python
+        and writes it back, so a competing wholesale rewrite landing in between
+        would be silently clobbered. Pairing this with
+        ``get_run_with_stage_reports_text`` (which supplies ``expected_text``
+        from the same row read that supplied the caller's copy) makes that
+        interleaving a refusal instead.
+
+        ``False`` covers two cases — the token is stale, or the run row is gone.
+        Both mean the same thing to the caller: its loaded copy is no longer a
+        safe basis for a wholesale rewrite.
+
+        ``update_run_stage_reports`` deliberately stays unconditional. Its
+        harness call sites (``reconciliation/harness.py``) own the blob wholesale
+        at stage boundaries by design, and making a normal end-of-stage persist
+        refusable would convert routine work into a failure mode.
+        """
+        # ``IS``, not ``=``: SQLite's NULL-safe comparison, so a run whose
+        # stage_reports column is NULL is CASable with an ``expected_text=None``
+        # token instead of never matching.
+        async with self._require_access().write() as db:
+            cursor = await db.execute(
+                'UPDATE runs SET stage_reports = ? WHERE id = ? AND stage_reports IS ?',
+                (_serialize_stage_reports(stage_reports), run_id, expected_text),
+            )
+            # Read rowcount inside the write unit, before it commits.
+            applied = cursor.rowcount == 1
+        return applied
 
     async def record_run_session(
         self, run_id: str, *, session_id: str, stage_cursor: str
@@ -451,6 +487,31 @@ class ReconciliationJournal:
         if row is None:
             return None
         return _row_to_run(row)
+
+    async def get_run_with_stage_reports_text(
+        self, run_id: str
+    ) -> tuple[ReconciliationRun, str | None] | None:
+        """Read a run AND the raw ``stage_reports`` column text in ONE query.
+
+        The text is the compare-and-set token for
+        ``compare_and_set_run_stage_reports``. This method exists rather than a
+        caller doing ``get_run`` plus a second raw read because the parsed run
+        and the token must come from the SAME row: a writer landing between two
+        separate reads would make the token match what is now in the DB while
+        the caller's mutation was applied to the older parsed copy, so the CAS
+        would wrongly succeed and re-introduce the very lost update it exists to
+        prevent.
+
+        The column value is returned untouched — including ``None`` — because it
+        is a comparison token, not a value to interpret. ``get_run`` is left
+        unchanged; its many callers want only the parsed run.
+        """
+        row = await self._require_access().read_one(
+            'SELECT * FROM runs WHERE id = ?', (run_id,)
+        )
+        if row is None:
+            return None
+        return _row_to_run(row), row['stage_reports']
 
     async def get_recent_runs(
         self, project_id: str, limit: int = 10
@@ -1003,6 +1064,25 @@ def _fmt_dt(val: datetime | None) -> str | None:
     if val is None:
         return None
     return val.isoformat()
+
+
+def _serialize_stage_reports(stage_reports: dict[str, StageReport | dict]) -> str:
+    """The single definition of the ``runs.stage_reports`` column text.
+
+    Shared by ``update_run_stage_reports`` and
+    ``compare_and_set_run_stage_reports`` so the column's serialization has one
+    definition rather than two that must be kept byte-identical by hand (SPOT).
+
+    Serializer determinism is NOT a CAS invariant: the token the CAS compares
+    against is always the raw column text ``get_run_with_stage_reports_text``
+    read back, never a re-serialization, so whichever writer wrote the column
+    the next reader's token matches it by construction. Divergent writers would
+    cost readability, not correctness.
+    """
+    serialized = {}
+    for k, v in stage_reports.items():
+        serialized[k] = v.model_dump(mode='json') if isinstance(v, StageReport) else v
+    return json.dumps(serialized)
 
 
 def _row_to_run(row: aiosqlite.Row) -> ReconciliationRun:

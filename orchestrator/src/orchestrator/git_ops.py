@@ -73,6 +73,7 @@ from shared.proc_group import (
 )
 from shared.transcript_archive import archive_before_delete
 
+from orchestrator import rebase_recovery
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import TASK_META_DIRNAME, GitConfig, TranscriptArchiveConfig
 from orchestrator.lane_lifecycle import (
@@ -9606,8 +9607,8 @@ class GitOps:
         rebases the branch in *worktree* onto that ref instead.  This is used
         by ``stack_train_branches`` to chain members into a linear stack.
 
-        Returns True on success.  On failure, aborts the rebase so the
-        worktree is left in a clean state, and returns False.
+        Returns True on success.  On failure, ATTEMPTS a guarded abort and
+        returns False — which does NOT imply a clean worktree: aborts fail.
 
         Caller must NOT hold ``_merge_lock`` — this is designed to run
         outside the lock so multiple tasks can rebase concurrently in
@@ -9619,7 +9620,7 @@ class GitOps:
             cwd=worktree,
         )
         if rc != 0:
-            await _run(['git', 'rebase', '--abort'], cwd=worktree)
+            await rebase_recovery.guarded_abort('rebase', worktree, _run)
             logger.info(f'Pre-merge rebase failed in {worktree}: {err}')
             return False
         return True
@@ -9891,8 +9892,8 @@ class GitOps:
 
         On a rebase conflict the member is added to *ejected*; the last-good
         predecessor is NOT advanced, so the next member re-links onto the last
-        survivor (re-link invariant).  The conflicting branch is left clean by
-        rebase_onto_main's ``git rebase --abort``.
+        survivor (re-link invariant).  rebase_onto_main ATTEMPTS a guarded
+        abort on the conflicting branch; a clean tree is not guaranteed.
 
         A missing worktree directory is treated as an eject (defensive;
         logged at WARNING level).
@@ -10013,8 +10014,7 @@ class GitOps:
             cwd=solo_wt,
         )
         if rc != 0:
-            # Abort the rebase and clean up both the worktree and temp branch.
-            await _run(['git', 'rebase', '--abort'], cwd=solo_wt)
+            await rebase_recovery.guarded_abort('rebase', solo_wt, _run)
             logger.info(
                 'materialize_member_solo: rebase conflict for member %s '
                 '(predecessor=%s): %s — cleaning up',
@@ -13760,7 +13760,7 @@ class GitOps:
             logger.warning(
                 f'Rebase failed (attempt {attempt + 1}): {rebase_err}'
             )
-            await _run(['git', 'rebase', '--abort'], cwd=merge_worktree)
+            await rebase_recovery.guarded_abort('rebase', merge_worktree, _run)
 
             if full_branch is None:
                 # No branch to re-merge from — cannot recover
@@ -14994,7 +14994,7 @@ class GitOps:
 
     async def abort_merge(self, cwd: Path) -> None:
         """Abort an in-progress merge."""
-        await _run(['git', 'merge', '--abort'], cwd=cwd)
+        await rebase_recovery.guarded_abort('merge', cwd, _run)
         logger.info('Merge aborted')
 
     async def rename_worktree(

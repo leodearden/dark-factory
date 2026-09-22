@@ -123,7 +123,22 @@ def _discovered_modules():
 
 
 def _module_key(path):
-    """*path* as the guard names it: relative to the tests root, POSIX-spelled."""
+    """*path* as the guard names it: relative to the tests root, POSIX-spelled.
+
+    Precondition: *path* is under ``TESTS_ROOT`` — the shape
+    ``_discovered_modules()`` yields. Anything outside it is refused rather
+    than coerced to fit, for the reason the refusal itself gives.
+    """
+    path = pathlib.Path(path)
+    if not path.is_relative_to(TESTS_ROOT):
+        raise ValueError(
+            f'{str(path)!r} is not under the tests root {TESTS_ROOT}. _module_key names '
+            f'a module by its path relative to that root, so it takes the absolute path '
+            f"_discovered_modules() yields — build an ad-hoc one as TESTS_ROOT / 'sub/test_x.py'. "
+            f'A bare relative path is rejected rather than resolved because its root is '
+            f'ambiguous: the cwd, the fused-memory package root and the tests root each name '
+            f'a different file.'
+        )
     return path.relative_to(TESTS_ROOT).as_posix()
 
 
@@ -161,6 +176,11 @@ def _is_exempt(module_key, chain):
 def _unrouted_loader_lines(path):
     """The line of every non-exempt ``spec_from_file_location(...)`` call in *path*.
 
+    Naming the module comes first: ``_module_key`` is the only step that checks
+    the path's shape, and it does no I/O. Without that ordering a cwd-relative
+    path the text prefilter misses gets a clean ``[]`` — a false "forks no
+    loader" verdict about a file this guard never located under the tests root.
+
     A cheap text prefilter runs before any parse, the idiom
     ``test_falkor_index_barrier_guard.py`` established for a discovered scope:
     ``_ast_guard.parse_python_module`` memoises for the whole session, so
@@ -181,11 +201,11 @@ def _unrouted_loader_lines(path):
     hazard the barrier guard answers with a hand-verified floor set; here the
     shape of the parametrize answers it instead.
     """
+    module_key = _module_key(path)
     if LOADER_FACTORY not in path.read_text():
         return []
     tree = parse_python_module(path)
     chain_of = {id(node): chain for node, chain in _nodes_with_enclosing_scope(tree)}
-    module_key = _module_key(path)
     return sorted(
         call.lineno
         for call in calls_named(tree, LOADER_FACTORY)
@@ -240,3 +260,70 @@ def test_every_exemption_names_one_live_loader_site(module_key, qualname):
         f'is dead. Delete the entry — a leftover exemption reads as a standing licence '
         f'to fork the loader there again.'
     )
+
+
+class TestModuleKeyNamesPathsUnderTheTestsRoot:
+    """``_module_key`` takes a path under ``TESTS_ROOT``, and says so when it does not.
+
+    Sighting: ``plans/confusion-census-2026-09-20.md`` §1.4 — an ad-hoc probe
+    of this guard passed ``pathlib.Path('tests/_scratch_guard_probe.py')`` and
+    got the stdlib's ``is not in the subpath of`` refusal, which states the
+    offence and leaves the caller to rediscover the spelling that works.
+    """
+
+    @pytest.mark.parametrize(
+        'probe',
+        ['tests/_scratch_guard_probe.py', pathlib.Path('tests/_scratch_guard_probe.py')],
+        ids=['str', 'Path'],
+    )
+    def test_a_path_outside_the_tests_root_names_the_spelling_that_works(self, probe):
+        """Both spellings an ad-hoc caller types reach the same informative refusal.
+
+        A bare ``str`` used to reach ``AttributeError: 'str' object has no
+        attribute 'is_relative_to'`` — the same remedy-less stdlib refusal,
+        through the other door.
+        """
+        with pytest.raises(ValueError) as excinfo:
+            _module_key(probe)
+        message = str(excinfo.value)
+        assert str(probe) in message, (
+            'the refusal must quote the path it rejected, so a caller who passed '
+            'several knows which one was wrong'
+        )
+        assert str(TESTS_ROOT) in message, (
+            'the refusal must name the boundary the path was measured against'
+        )
+        assert 'TESTS_ROOT' in message, (
+            'the refusal must name the module constant an ad-hoc caller types to build '
+            "a path that works (TESTS_ROOT / 'sub/test_x.py')"
+        )
+
+    def test_a_path_under_the_tests_root_keys_on_its_posix_relative_spelling(self):
+        """The shape ``_discovered_modules()`` yields keeps its key, nesting included.
+
+        The regression pin on the precondition check: the guard's own callers pass
+        exactly this shape, and ``EXEMPT_CALL_SITES`` keys on the POSIX spelling.
+        The path is synthetic rather than a real sibling module: ``_module_key``
+        does pure path arithmetic, so naming one would couple this case to that
+        module's name, and ``sub/test_x.py`` is the spelling the refusal
+        advertises — the remedy and its pin stay in lockstep.
+        """
+        assert _module_key(TESTS_ROOT / 'sub' / 'test_x.py') == 'sub/test_x.py'
+
+    def test_a_cwd_relative_path_is_refused_rather_than_read_against_the_cwd(
+        self, tmp_path, monkeypatch
+    ):
+        """Naming the module comes before reading it, so a false clean is impossible.
+
+        The probe is deliberately innocuous so that it MISSES the text
+        prefilter: that is what makes the case about the ordering rather than
+        about the refusal's wording.
+        """
+        (tmp_path / 'probe.py').write_text('value = 1\n')
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(ValueError) as excinfo:
+            _unrouted_loader_lines(pathlib.Path('probe.py'))
+        assert 'TESTS_ROOT' in str(excinfo.value), (
+            'the refusal must come from _module_key — the one place this precondition '
+            'is stated — rather than from a second check that could drift from it'
+        )

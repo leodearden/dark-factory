@@ -293,6 +293,7 @@ _ALL_GROUP_ARG_SWEEP_CASES = [
     ('bulk_remove_edges', (['e1'],), {'group_id': _PATH_SHAPED}),
     ('dedup_valid_edges_for_node', ('n1',), {'group_id': _PATH_SHAPED}),
     ('redirect_node_edges', ('d1', 's1'), {'group_id': _PATH_SHAPED}),
+    ('redirect_node_mentions', ('d1', 's1'), {'group_id': _PATH_SHAPED}),
     ('merge_entities', ('d1', 's1'), {'group_id': _PATH_SHAPED}),
     ('delete_entity', ('n1',), {'group_id': _PATH_SHAPED}),
     ('delete_entity_node', ('n1',), {'group_id': _PATH_SHAPED}),
@@ -326,8 +327,8 @@ _ALL_GROUP_ARG_SWEEP_CASES = [
     ('retrieve_episodes', (), {'group_ids': [_PATH_SHAPED]}),
 ]
 
-assert len(_ALL_GROUP_ARG_SWEEP_CASES) == 41, (
-    'Sweep must cover exactly the 41 public group-arg GraphitiBackend methods '
+assert len(_ALL_GROUP_ARG_SWEEP_CASES) == 42, (
+    'Sweep must cover exactly the 42 public group-arg GraphitiBackend methods '
     'this table claims: every one not covered by the step-1/3/5 positive-path '
     'tests, plus find_entity_nodes_by_name_substring, which is in both (see the '
     'comment above) — update this table if the decorated surface ever changes.'

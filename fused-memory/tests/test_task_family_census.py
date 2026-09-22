@@ -69,15 +69,35 @@ FIXTURE_NODES = [
 #: the substring, and filtering them out is the caller's job.
 FIXTURE_PROBES = {
     '605': [
-        {'uuid': 'u-605-lower', 'name': 'task 605', 'created_at': 100, 'edge_count': 13},
-        {'uuid': 'u-foreign', 'name': 'reify:605', 'created_at': 20, 'edge_count': 7},
-        {'uuid': 'u-605-canon', 'name': 'Task 605', 'created_at': 50, 'edge_count': 2},
-        {'uuid': 'u-605-plural', 'name': 'tasks 605', 'created_at': 150, 'edge_count': 1},
-        {'uuid': 'u-6051', 'name': 'Task 6051', 'created_at': 9, 'edge_count': 1},
+        {'uuid': 'u-605-lower', 'name': 'task 605', 'created_at': 100,
+         'edge_count': 13, 'mentions_count': 1, 'provenance_rank': 14},
+        {'uuid': 'u-foreign', 'name': 'reify:605', 'created_at': 20,
+         'edge_count': 7, 'mentions_count': 0, 'provenance_rank': 7},
+        {'uuid': 'u-605-canon', 'name': 'Task 605', 'created_at': 50,
+         'edge_count': 2, 'mentions_count': 1, 'provenance_rank': 3},
+        {'uuid': 'u-605-plural', 'name': 'tasks 605', 'created_at': 150,
+         'edge_count': 1, 'mentions_count': 0, 'provenance_rank': 1},
+        {'uuid': 'u-6051', 'name': 'Task 6051', 'created_at': 9,
+         'edge_count': 1, 'mentions_count': 0, 'provenance_rank': 1},
     ],
     '900': [
-        {'uuid': 'u-900-a', 'name': 'Task 900', 'created_at': 30, 'edge_count': 4},
-        {'uuid': 'u-900-b', 'name': 'Task 900', 'created_at': 40, 'edge_count': 1},
+        {'uuid': 'u-900-a', 'name': 'Task 900', 'created_at': 30,
+         'edge_count': 4, 'mentions_count': 0, 'provenance_rank': 4},
+        {'uuid': 'u-900-b', 'name': 'Task 900', 'created_at': 40,
+         'edge_count': 1, 'mentions_count': 0, 'provenance_rank': 1},
+    ],
+}
+
+#: A family whose survivor is decided by EPISODES, not edges (task 4986): the
+#: edge-poorer 'Task 700' outranks 'task 700' on mentions and so comes back
+#: first. Without this the file would merely SURVIVE the new rule while every
+#: assertion still described the old one.
+MENTIONS_DECIDED_PROBES = {
+    '700': [
+        {'uuid': 'u-700-canon', 'name': 'Task 700', 'created_at': 80,
+         'edge_count': 2, 'mentions_count': 9, 'provenance_rank': 11},
+        {'uuid': 'u-700-lower', 'name': 'task 700', 'created_at': 70,
+         'edge_count': 8, 'mentions_count': 0, 'provenance_rank': 8},
     ],
 }
 
@@ -164,6 +184,36 @@ class TestTaskFamilyCensusRun:
         ]
 
     @pytest.mark.asyncio
+    async def test_the_would_be_survivor_can_be_decided_by_episodes_not_edges(self):
+        """variants[0] is the node a collapse would KEEP, and since task 4986
+        the backend ranks by provenance_rank (edge_count + mentions_count), not
+        edge_count alone.
+
+        The census re-sorts nothing — it inherits the backend's row order — so
+        an edge-POORER variant legitimately comes first when it carries more
+        episode provenance. Pinning that here is what keeps this file expressing
+        the CURRENT survivor rule rather than merely surviving it: every other
+        assertion in this class uses fixtures whose edge order and rank order
+        happen to agree, so none of them would notice if the census started
+        re-deriving the old rule.
+        """
+        nodes = [
+            {'uuid': 'u-700-canon', 'name': 'Task 700', 'summary': ''},
+            {'uuid': 'u-700-lower', 'name': 'task 700', 'summary': ''},
+        ]
+        census = TaskFamilyCensus(
+            backend=make_census_backend(nodes=nodes, probes=MENTIONS_DECIDED_PROBES),
+        )
+
+        result = await census.run(group_id='home')
+
+        (family_700,) = result.families
+        assert [(v.name, v.uuid, v.edge_count) for v in family_700.variants] == [
+            ('Task 700', 'u-700-canon', 2),
+            ('task 700', 'u-700-lower', 8),
+        ], 'the episode-richer variant leads even though it holds FEWER edges'
+
+    @pytest.mark.asyncio
     async def test_a_multi_spelling_family_is_distinguishable_from_an_exact_name_pair(self):
         """Two different residues, two different repairs: 605 is split across
         three SPELLINGS (workstream A's territory), while the 900 pair shares
@@ -248,7 +298,8 @@ LEAKED_FAMILY_NODES = [
 #: correctly invisible to it, leaving one spelling where the enumeration saw two.
 LEAKED_FAMILY_PROBES = {
     '605': [
-        {'uuid': 'u-605-canon', 'name': 'Task 605', 'created_at': 50, 'edge_count': 2},
+        {'uuid': 'u-605-canon', 'name': 'Task 605', 'created_at': 50,
+         'edge_count': 2, 'mentions_count': 1, 'provenance_rank': 3},
     ],
 }
 
@@ -386,13 +437,16 @@ class TestTaskFamilyCensusIsReadOnly:
 
         async def dispatch_ro(cypher, params=None):
             # CONTAINS is tested FIRST: the substring probe's own Cypher carries
-            # a `count(DISTINCT e)` edge-count aggregate, so a `count(` test
-            # would claim it and answer a four-column read with a one-column
-            # census row.
+            # a `count(DISTINCT e)` edge-count aggregate — and since task 4986 a
+            # `count(DISTINCT m)` mentions aggregate as well — so a `count(` test
+            # would claim it and answer a six-column read with a one-column
+            # census row. The second aggregate makes this ordering more
+            # load-bearing, not less.
             result = MagicMock()
             if 'CONTAINS' in cypher:
                 result.result_set = [
-                    [row['uuid'], row['name'], row['created_at'], row['edge_count']]
+                    [row['uuid'], row['name'], row['created_at'], row['edge_count'],
+                     row['mentions_count'], row['provenance_rank']]
                     for row in FIXTURE_PROBES.get((params or {})['substring'], [])
                 ]
             elif 'count(' in cypher:

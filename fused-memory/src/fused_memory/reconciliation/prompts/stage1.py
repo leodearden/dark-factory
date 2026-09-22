@@ -13,6 +13,7 @@ from fused_memory.reconciliation.prompts import (
     _STAGE1_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE1_PROJECT_ID_GUIDELINE,
     AMEND_AND_EPISODE_TOOLS_BLOCK,
+    CITATION_REPAIR_TOOL_BLOCK,
     DUPLICATE_FINDING_SALVAGE_GUIDANCE,
     STALE_KNOWLEDGE_ANNOTATION_NORM,
     get_recon_report_tool_guidance,
@@ -212,6 +213,8 @@ weaken the guidance above — still prefer `update_edge`/`refresh_entity_summary
 - **Report channel — recon_report MCP tools (PRD γ §9)**: For each inconsistency or finding \
 (including cross-project scope mismatches flagged to Stage 2): \
 {get_recon_report_tool_guidance()}
+
+{CITATION_REPAIR_TOOL_BLOCK}
 
 {STALE_KNOWLEDGE_ANNOTATION_NORM}
 

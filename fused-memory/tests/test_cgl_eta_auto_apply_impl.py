@@ -39,6 +39,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _fm_helpers import load_script_module
+from _store_mutation_preflight_contract import SENTINEL, deny
 
 from fused_memory.maintenance.cross_graph_move import (
     CreateResult,
@@ -187,17 +188,14 @@ class TestInheritedStoreMutationPreflight:
         monkeypatch.setattr(migrate, 'recreate_subgraph_relationships', recreate)
         monkeypatch.setattr(migrate, 'delete_source_node', delete)
 
-        def _raise(*_args, **_kwargs):
-            raise migrate.StoreMutationUnavailable('SENTINEL-store-unwritable')
-
-        monkeypatch.setattr(migrate, 'assert_store_mutation_allowed', _raise)
+        deny(migrate, monkeypatch)
 
         apply_args = types.SimpleNamespace(
             apply=True, manifest=str(manifest), page_size=1000, config=None,
         )
 
         with pytest.raises(
-            migrate.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+            migrate.StoreMutationUnavailable, match=SENTINEL
         ):
             await migrate.run(apply_args, shim)
 

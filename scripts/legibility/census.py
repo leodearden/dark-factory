@@ -136,6 +136,75 @@ def batch_dup_rate(records: list[dict]) -> float:
 # mine_to_saturation — stratified-random batch loop + saturation stop
 # ---------------------------------------------------------------------------
 
+_MAX_PER_DIGEST_CODER_WARNINGS_PER_BATCH = 3
+"""How many of ``coder.code_digests``' per-digest WARNINGs may survive ONE
+census mining batch before the rest are bounded away in favour of the
+batch aggregate.
+
+Small, but deliberately NOT zero. Zero would mean a census run silently
+swallows another module's log records -- the exact silent-degradation
+shape this fix exists to close. A small allowance keeps the raw,
+unaggregated line shape visible for the common one-or-two-failure batch
+(where there never was a flood), makes the suppression obviously PARTIAL
+rather than total, and still turns a 20-digest storm from 20 lines into
+4. The aggregate line states how many lines were bounded away, so the
+drop stays loud."""
+
+
+@contextlib.contextmanager
+def _bounded_coder_warnings(limit: int):
+    """Bound ``legibility.coder``'s per-digest WARNINGs to *limit* records
+    for the duration of the ``with`` block, yielding the counting filter
+    so the caller can read ``.suppressed``.
+
+    Deliberately CALLER-SCOPED, and removed in a ``finally`` so an
+    exception mid-batch cannot leave it attached. ``code_digests``'
+    per-digest WARNING is the only sink some failures ever reach for
+    ``nightly.run_nightly``'s trickle -- one or two failures a night,
+    where the per-digest shape is exactly right -- so it must never be
+    silenced globally, dropped to DEBUG, or bounded beyond the census's
+    own call.
+
+    A counting ``logging.Filter`` rather than either alternative: raising
+    the coder logger's LEVEL would suppress any FUTURE non-digest coder
+    warning too, and matching on the message template would couple census
+    to a string in ``coder.py`` -- a file this task holds no lock on and
+    which is free to reword. Counting is surgical enough because the bound
+    applies a WARNING FLOOR of its own: sub-WARNING records pass through
+    untouched and unconsumed, so this is a bound on the per-digest warning
+    funnel and not on whatever else ``coder.py`` may one day log."""
+
+    class _CountingFilter(logging.Filter):
+        def __init__(self):
+            super().__init__()
+            self.seen = 0
+            self.suppressed = 0
+
+        def filter(self, record):
+            if record.levelno < logging.WARNING:
+                # The contract in the names around this filter is
+                # per-digest WARNINGs, so the filter ENFORCES that floor
+                # rather than leaning on "coder.py currently logs nothing
+                # else" (true today, unenforceable tomorrow). Without it a
+                # future logger.info/debug in coder.py would eat the budget,
+                # push real per-digest WARNINGs out of a census run, and
+                # falsify the `suppressed` count reported in the aggregate.
+                return True
+            self.seen += 1
+            if self.seen > limit:
+                self.suppressed += 1
+                return False
+            return True
+
+    coder_logger = logging.getLogger("legibility.coder")
+    counting_filter = _CountingFilter()
+    coder_logger.addFilter(counting_filter)
+    try:
+        yield counting_filter
+    finally:
+        coder_logger.removeFilter(counting_filter)
+
+
 @dataclass
 class BatchStats:
     """Per-batch mining tally: how one ``coder.code_digests`` batch scored
@@ -210,6 +279,29 @@ def mine_to_saturation(
     ``saturated`` is forced False and the consecutive-saturated counter is
     reset, exactly as if the batch scored below threshold.
 
+    A batch with ANY coding failures emits exactly ONE aggregated WARNING
+    naming the batch index, ``failed/total``, how many DISTINCT failure
+    reasons there were, and per reason its count plus one example session
+    id. A batch that coded cleanly stays silent. This is the caller-side
+    summary ``coder.code_digests``' own docstring points at: that function
+    logs one WARNING per failed digest, which is the right shape for the
+    nightly trickle (one or two failures a night) and a flood for a census
+    batch of 20. Reasons are grouped by EXACT string equality with no
+    normalization -- the property those per-digest lines exist for is
+    telling 20 identical ENOENTs apart from 20 distinct model errors, and
+    any canonicalization is a guess that can collapse precisely that
+    distinction. Output stays bounded without a cap on distinct reasons
+    because a batch has at most ``_DEFAULT_CENSUS_BATCH_SIZE`` digests, so
+    the worst case is one long line rather than N lines.
+
+    The aggregate does not merely ADD to the flood: the
+    ``coder.code_digests`` call is wrapped in ``_bounded_coder_warnings``,
+    which caps its per-digest WARNINGs at
+    ``_MAX_PER_DIGEST_CODER_WARNINGS_PER_BATCH`` for the duration of THIS
+    call only, and the aggregate names how many lines that bound dropped.
+    The bound is caller-scoped by construction and removed in a ``finally``
+    -- ``nightly.run_nightly``'s trickle keeps full per-digest visibility.
+
     *max_batches* is the OPERATOR COST CAP (``--max-batches``): mining
     stops with ``stop_reason="capped"`` once that many batches have been
     coded. The cap is enforced here, inside the loop, rather than by
@@ -255,9 +347,14 @@ def mine_to_saturation(
     consecutive_saturated = 0
 
     for index, batch in enumerate(batch_source):
-        run_result = coder.code_digests(
-            list(batch), codebook_dict, project=project, model=model, invoke=invoke,
-        )
+        # ONLY this call is bounded -- see _bounded_coder_warnings' docstring
+        # for why the bound must never outlive it.
+        with _bounded_coder_warnings(
+            _MAX_PER_DIGEST_CODER_WARNINGS_PER_BATCH
+        ) as bounded:
+            run_result = coder.code_digests(
+                list(batch), codebook_dict, project=project, model=model, invoke=invoke,
+            )
         result.records.extend(run_result.records)
 
         dup_rate = batch_dup_rate(run_result.records)
@@ -276,6 +373,38 @@ def mine_to_saturation(
                 status=run_result.status,
             )
         )
+
+        # The CALLER-SIDE aggregate `coder.code_digests`' docstring points
+        # at: that function emits one WARNING per failed digest, which is
+        # the right shape for the nightly trickle's one-or-two failures and
+        # a flood for a 20-digest census batch. This line is the batch-level
+        # summary that a flood cannot be read as. Grouping is EXACT-STRING by
+        # design -- the property the per-digest lines exist for is telling N
+        # identical ENOENTs apart from N genuinely distinct model errors, and
+        # any normalization is a guess that can collapse the two. `coder.py`
+        # is deliberately NOT modified (its per-digest line is the only sink
+        # some failures ever reach for callers other than this one).
+        if run_result.failed:
+            by_reason: dict[str, list[str]] = {}
+            for session, reason in run_result.failures:
+                by_reason.setdefault(reason, []).append(session)
+            breakdown = "; ".join(
+                f"{len(sessions)}x {reason!r} (e.g. session={sessions[0]})"
+                for reason, sessions in by_reason.items()
+            )
+            # State the bound's own cost: a suppressed line is a dropped
+            # record, and a silent drop is the defect this whole line closes.
+            bound_note = (
+                f" [{bounded.suppressed} per-digest coder line(s) suppressed by "
+                f"this batch's bound of {_MAX_PER_DIGEST_CODER_WARNINGS_PER_BATCH}]"
+                if bounded.suppressed else ""
+            )
+            logger.warning(
+                "mining batch %d: %d/%d digest(s) failed to code, %d distinct "
+                "reason(s): %s%s",
+                index, run_result.failed, run_result.total, len(by_reason),
+                breakdown, bound_note,
+            )
 
         consecutive_saturated = consecutive_saturated + 1 if saturated else 0
         if consecutive_saturated >= config.consecutive_batches:
@@ -399,15 +528,33 @@ class CensusHeadroomExhausted(Exception):
     in the codebook as ordinary rejections.
 
     Carries the counts an operator needs to size what was interrupted:
-    *verified* clusters adjudicated before the hit, *unverified* ones left
-    (the hitting cluster plus every one never attempted).
+    *verified* clusters that came back TRUE before the hit, *rejected*
+    ones adjudicated FALSE before it, and *unverified* ones left (the
+    hitting cluster plus every one never attempted). A rejection is real
+    work already spent, not an absence -- omitting it made the counts fail
+    to account for the run on exactly the interrupted runs an operator
+    most needs to size.
+
+    INVARIANT, true at every raise site: ``verified + rejected +
+    unverified`` equals the number of clusters offered. At the two
+    pre-append sites (invocation error, unparseable banner) the hitting
+    cluster is not yet adjudicated, so ``verified + rejected == index``
+    and ``unverified == remaining``; at the backstop site it already IS
+    adjudicated, so ``verified + rejected == index + 1`` and ``unverified
+    == remaining - 1``. The total is therefore derivable by any reader and
+    is NOT threaded separately -- see ``_defer``, which sums it, so the
+    raise sites cannot disagree about what "total" means.
     """
 
-    def __init__(self, *, stage: str, reason: str, verified: int = 0, unverified: int = 0):
+    def __init__(
+        self, *, stage: str, reason: str, verified: int = 0, rejected: int = 0,
+        unverified: int = 0,
+    ):
         super().__init__(f"census headroom exhausted during {stage}: {reason}")
         self.stage = stage
         self.reason = reason
         self.verified = verified
+        self.rejected = rejected
         self.unverified = unverified
 
 
@@ -860,9 +1007,9 @@ class VerifyCoverage:
     """Coverage record for the operator verify cap (``--max-verify-clusters``).
 
     ``novel`` is how many novel clusters this run's mining actually
-    produced; ``verified`` is how many of them were handed to ``verify_fn``
+    produced; ``offered`` is how many of them were handed to ``verify_fn``
     (one Sonnet call each -- the cost being bounded); ``cap`` is the
-    operator cap that produced the split. The ``novel - verified``
+    operator cap that produced the split. The ``novel - offered``
     remainder is DEFERRED, not dropped: those clusters still merge into
     the codebook as ``pending`` candidates via the untouched
     ``codebook.apply_coding_record`` path (which consumes raw mining
@@ -879,12 +1026,45 @@ class VerifyCoverage:
     if the same confusion RECURS; a one-off deferred by the cap sits pending
     until a human adjudicates it.
 
-    ``None`` in place of this record means no verify cap was used and no
-    ``## Verification`` section is rendered."""
+    ``offered``, deliberately, and NOT ``verified``: this is a COST
+    record, counting verify_fn calls made, and a cluster handed to the
+    verifier may well come back FALSE. The rendered line says "handed" for
+    the same reason. Naming it ``verified`` is what let the capped report
+    print "verified all N novel cluster(s)" directly beneath the
+    ``MassRejection`` notice saying not one of them survived -- a report
+    contradicting itself on the one run whose report must not lie.
+
+    ``None`` in place of this record means no verify cap was used, so no
+    coverage line is rendered. The ``## Verification`` section itself may
+    still appear on the ``MassRejection`` path below -- the two signals are
+    independent and can render together."""
 
     novel: int
-    verified: int
+    offered: int
     cap: int | None = None
+
+
+@dataclass
+class MassRejection:
+    """Anomaly record: clusters were offered for verification and NOT ONE
+    survived.
+
+    ``offered`` is how many were handed to ``verify_fn`` -- the same
+    quantity ``VerifyCoverage.offered`` counts, and named identically on
+    purpose. This is the observable signature of the 2026-08-03 sandbox
+    incident, where the verify subprocess was rooted outside the censused
+    tree and every read was permission-denied -- a run with real findings
+    reported as an empty census. It is deliberately NOT folded into
+    ``VerifyCoverage``: that record is a COST record and renders on every
+    capped run, while this one is an ANOMALY record and renders only when
+    the verifier returned nothing. Two different questions, so two
+    records; they can and do render together.
+
+    ``None`` in place of this record means the run did not mass-reject.
+    An all-rejected run is legitimately possible, so this is a SUSPICION
+    to be checked, never a failure."""
+
+    offered: int
 
 
 @dataclass
@@ -966,6 +1146,7 @@ def census_report_sections(
     verify_coverage: VerifyCoverage | None = None,
     dry_run: DryRunFiling | None = None,
     dropped_verdicts: tuple[DroppedVerdict, ...] = (),
+    mass_rejection: MassRejection | None = None,
 ) -> tuple[ReportSection, ...]:
     """The dated census report, decomposed -- see :func:`render_report` for
     the markdown an operator reads.
@@ -981,6 +1162,15 @@ def census_report_sections(
     cost-control flags existed (locked by
     ``test_render_report_flagless_output_is_byte_identical_golden``). The same
     gating applies to every other cost-control rendering here.
+
+    ``## Verification`` is emitted when EITHER *verify_coverage* or
+    *mass_rejection* is present. The second path is an ANOMALY, not a cost
+    control: an uncapped run in which every offered cluster was rejected used
+    to commit a report byte-identical to a clean census, so the only trace was
+    an ephemeral log line and an info escalation. On a flagless run the mere
+    presence of the section is now itself the signal. A flagless run that did
+    NOT mass-reject still renders byte-identically, so the invariant above is
+    preserved rather than spent.
     """
     sections: list[ReportSection] = []
 
@@ -1063,15 +1253,41 @@ def census_report_sections(
         )
     emit(SECTION_SATURATION, saturation)
 
-    if verify_coverage is not None:
-        deferred = verify_coverage.novel - verify_coverage.verified
+    if verify_coverage is not None or mass_rejection is not None:
         verification = ["", "## Verification", ""]
+    else:
+        verification = []
+
+    if mass_rejection is not None:
+        # FIRST inside the section: a cap line is routine, this is not. On a
+        # flagless run the mere PRESENCE of a ## Verification section is
+        # itself the anomaly -- a stronger signal than one more always-present
+        # line an operator learns to skim past. Same voice as the `suspect`
+        # string at the detector in run_census, deliberately.
+        verification.append(
+            f"- **ALL {mass_rejection.offered} verified-candidate cluster(s) were "
+            "REJECTED and none survived.** Suspect a SYSTEMIC verifier failure "
+            "(model unreachable, tool access denied, or unparseable verdicts) "
+            "rather than genuinely unfounded claims: this is the observable "
+            "signature of the 2026-08-03 sandbox incident, in which the verify "
+            "subprocess was rooted outside the censused tree and every read was "
+            "permission-denied. Check the run's per-cluster 'verify failed' "
+            "warnings before reading this census as unremarkable -- a run with "
+            "real findings is being reported as an empty one if this is systemic."
+        )
+
+    if verify_coverage is not None:
+        deferred = verify_coverage.novel - verify_coverage.offered
+        # "handed ... to the verifier", never "verified": this is the cap's
+        # COST, and a handed cluster may come back FALSE. The old "verified N
+        # of M" spelling read as an outcome, and directly under the
+        # mass-rejection notice above it contradicted it outright.
         if deferred > 0:
             verification.append(
-                f"- verified {verify_coverage.verified} of {verify_coverage.novel} novel "
-                f"clusters (operator verify cap: {verify_coverage.cap}); {deferred} deferred "
-                "as pending candidates -- merged into the codebook by this run but NOT "
-                "verified; adjudication deferred to a later census."
+                f"- handed {verify_coverage.offered} of {verify_coverage.novel} novel "
+                f"clusters to the verifier (operator verify cap: {verify_coverage.cap}); "
+                f"{deferred} deferred as pending candidates -- merged into the codebook "
+                "by this run but NOT verified; adjudication deferred to a later census."
             )
             # Mirrors the batch-cap disclosure above: "a later census" is
             # conditional, not automatic. This window's sightings are not
@@ -1087,9 +1303,11 @@ def census_report_sections(
             # A cap that was SET BUT NOT REACHED must not emit the deferral
             # clause -- nothing was deferred and nothing went unverified.
             verification.append(
-                f"- verified all {verify_coverage.novel} novel cluster(s); operator "
-                f"verify cap: {verify_coverage.cap} (not reached)."
+                f"- handed all {verify_coverage.novel} novel cluster(s) to the "
+                f"verifier; operator verify cap: {verify_coverage.cap} (not reached)."
             )
+
+    if verification:
         emit(SECTION_VERIFICATION, verification)
 
     if dropped_verdicts:
@@ -1168,6 +1386,7 @@ def render_report(
     verify_coverage: VerifyCoverage | None = None,
     dry_run: DryRunFiling | None = None,
     dropped_verdicts: tuple[DroppedVerdict, ...] = (),
+    mass_rejection: MassRejection | None = None,
 ) -> str:
     """Assemble the dated census report as markdown, purely from the
     pieces passed in -- no clock, no model call, no I/O. *date* and every
@@ -1191,6 +1410,7 @@ def render_report(
         verify_coverage=verify_coverage,
         dry_run=dry_run,
         dropped_verdicts=dropped_verdicts,
+        mass_rejection=mass_rejection,
     ))
 
 
@@ -1461,24 +1681,38 @@ def _dropped_verdict_message(record: DroppedVerdict) -> str:
     )
 
 
-def _report_dropped_verdicts(records: list[DroppedVerdict]) -> None:
+def _report_dropped_verdicts(
+    records: list[DroppedVerdict], *, disposition_conflicts: int = 0,
+) -> None:
     """Announce the run's dropped verdicts: one WARNING per record, then ONE
     run-summary line sizing the total.
 
     Emitted only when there is something to say -- silence on a clean run
     keeps the summary informative rather than skimmable. The per-record lines
-    say WHICH titles; the summary says how much of the run went nowhere."""
+    say WHICH titles; the summary says how much of the run went nowhere.
+
+    *disposition_conflicts* is the run's accumulated
+    ``candidate_disposition_conflicts`` from ``codebook.apply_coding_record``
+    -- the MERGER's view of the same underlying situation the dropped verdicts
+    are this loop's view of. It rides the same line rather than a second one
+    because an operator reading a journal wants the two numbers side by side:
+    they are computed by different code over the same run, and a disagreement
+    between them is itself the signal. The line is emitted when EITHER tally is
+    non-zero, so a conflict the adjudication loops never reached is not
+    silently dropped in turn."""
     for record in records:
         logger.warning("census: %s", _dropped_verdict_message(record))
-    if records:
-        logger.warning(
-            "census: %d unresolved verdict(s) -- verdicts that found no pending "
-            "candidate and were dropped. These were PAID FOR and went nowhere: a "
-            "prior adjudication of the same title is standing and only a hand "
-            "re-open will change it. See the per-cluster warnings above for which "
-            "titles.",
-            len(records),
-        )
+    if not records and not disposition_conflicts:
+        return
+    logger.warning(
+        "census: %d unresolved verdict(s), %d candidate disposition conflict(s) "
+        "across the merge -- verdicts that found no pending candidate and were "
+        "dropped. These were PAID FOR and went nowhere: a prior adjudication of "
+        "the same title is standing and only a hand re-open will change it. See "
+        "the per-cluster warnings above for which titles.",
+        len(records),
+        disposition_conflicts,
+    )
 
 
 def _free_payloads_path(path: Path, *, limit: int = 1000) -> Path:
@@ -1552,6 +1786,22 @@ class CensusOutcome:
     preflight defer spent nothing, a verify defer sank the mining cost.
     Neither persisted anything, so both recover by re-running."""
 
+    verified_clusters: int = 0
+    """How many novel clusters a ``"verify"`` deferral had already seen come
+    back VERIFIED when the gate hit -- adjudication paid for, not an absence.
+
+    This count, ``rejected_clusters`` and ``unverified_clusters`` always sum
+    to the clusters the run offered (the invariant
+    ``CensusHeadroomExhausted`` carries and ``_defer`` renders as a total).
+    All three are FIELDS for the reason ``unresolved_verdicts`` below is one:
+    so a caller can assert what the operator is being asked to trust
+    structurally, instead of grepping digits out of the escalation prose."""
+
+    rejected_clusters: int = 0
+    """How many novel clusters a ``"verify"`` deferral had already seen come
+    back REJECTED when the gate hit. See ``verified_clusters`` for the
+    invariant the three counts satisfy together."""
+
     unverified_clusters: int = 0
     """How many novel clusters were left unadjudicated by a ``"verify"``
     deferral -- the hitting cluster plus every one never attempted.
@@ -1596,6 +1846,7 @@ def _defer(
     *,
     escalate_fn,
     verified: int = 0,
+    rejected: int = 0,
     unverified: int = 0,
 ) -> CensusOutcome:
     """Abort the census at *stage*: log loudly, escalate, return the outcome.
@@ -1614,16 +1865,25 @@ def _defer(
     reason = reason or f"headroom gate failed at the {stage} stage"
     logger.warning("census deferred at the %s stage: %s", stage, reason)
 
+    # Derived here, not threaded from the raise sites, so they cannot
+    # disagree about what "total" means (CensusHeadroomExhausted's INVARIANT
+    # guarantees the three terms sum to the clusters offered at every site).
+    total = verified + rejected + unverified
+
     detail = reason
     if stage != "preflight":
-        # BOTH counts. They size the interruption from either side, which is
-        # what tells "capped on cluster 2 of 5" apart from "capped before a
-        # single cluster was adjudicated" -- the stage-boundary gate always
-        # reports 0 verified, an in-verify abort reports where it got to.
+        # All THREE counts plus the derived total, so the numbers account for
+        # every offered cluster. A REJECTION is adjudication already paid for,
+        # not an absence: with only verified/unverified, "1 verified, 3
+        # unverified" of a 5-cluster run left an operator unable to tell work
+        # already spent from a bookkeeping bug. The stage-boundary gate still
+        # reports 0 verified and 0 rejected -- nothing was adjudicated there.
         detail = (
             f"{reason}\n\n"
-            f"{verified} novel cluster(s) were verified before the cap; "
-            f"{unverified} were NOT verified. Nothing was "
+            f"Of {total} novel cluster(s) offered: "
+            f"{verified} were verified before the cap and "
+            f"{rejected} were rejected before it (both are adjudication "
+            f"already paid for); {unverified} were NOT verified. Nothing was "
             "persisted: no report, no matrix, no codebook merge, no filed "
             "tasks, and last_census_at was NOT advanced -- so this window "
             "WILL be re-mined and these sightings are not lost. The mining "
@@ -1638,7 +1898,8 @@ def _defer(
             severity="info",
             summary=(
                 f"legibility census deferred at the {stage} stage "
-                f"({verified} cluster(s) verified, {unverified} unverified): {reason}"
+                f"({verified} cluster(s) verified, {rejected} rejected, "
+                f"{unverified} unverified of {total} offered): {reason}"
                 if stage != "preflight"
                 else f"legibility census deferred: {reason}"
             ),
@@ -1651,6 +1912,8 @@ def _defer(
         status="deferred",
         reason=reason,
         deferred_stage=stage,
+        verified_clusters=verified,
+        rejected_clusters=rejected,
         unverified_clusters=unverified,
     )
 
@@ -1911,7 +2174,7 @@ def run_census(
         clusters_to_verify = novel_clusters[:max_verify_clusters]
         verify_coverage = VerifyCoverage(
             novel=len(novel_clusters),
-            verified=len(clusters_to_verify),
+            offered=len(clusters_to_verify),
             cap=max_verify_clusters,
         )
         deferred_count = len(novel_clusters) - len(clusters_to_verify)
@@ -1965,6 +2228,7 @@ def run_census(
             f"headroom exhausted during verification: {exc.reason}",
             escalate_fn=escalate_fn,
             verified=exc.verified,
+            rejected=exc.rejected,
             unverified=exc.unverified,
         )
     # The default verifier probes internally (detectors (a)/(b)/(c)) and
@@ -1997,7 +2261,17 @@ def run_census(
     # defer-path escalation above (which returns immediately afterwards),
     # this one sits between the mining spend and the output writes -- a
     # raising escalate_fn must not be what discards the run's results.
+    #
+    # The signature also lands in the COMMITTED REPORT, via `mass_rejection`
+    # below. Before that it did not: the log line and the info escalation
+    # were the only trace, both ephemeral, while the dated markdown -- the
+    # artifact an operator actually reads weeks later -- rendered
+    # byte-identically to a clean census whenever no verify cap was set. The
+    # escalation stays best-effort for the reason above; the report line is
+    # the durable one.
+    mass_rejection = None
     if clusters_to_verify and not verified:
+        mass_rejection = MassRejection(offered=len(clusters_to_verify))
         suspect = (
             f"census: ALL {len(clusters_to_verify)} verified-candidate cluster(s) were "
             "REJECTED and none survived -- suspect a systemic verifier failure "
@@ -2028,8 +2302,14 @@ def run_census(
     matrix_md = render_matrix(compute_matrix(verified_sightings))
 
     updated_codebook = codebook_dict
+    # The merger's own count of the same situation the dropped-verdict loops
+    # below detect from the other side -- previously discarded with the rest of
+    # `_stats`, which made a conflict the adjudication loops never reached
+    # invisible everywhere.
+    disposition_conflicts = 0
     for record in mining_result.records:
         updated_codebook, _stats = codebook.apply_coding_record(updated_codebook, record)
+        disposition_conflicts += _stats.get("candidate_disposition_conflicts", 0)
 
     # ONE list for every verdict this run paid for and dropped, shared by both
     # adjudication loops below -- a per-loop name would fork the tally
@@ -2099,7 +2379,9 @@ def run_census(
     for entry_id in fixed_entry_ids:
         updated_codebook = retire_entry(updated_codebook, entry_id)
 
-    _report_dropped_verdicts(dropped_verdicts)
+    _report_dropped_verdicts(
+        dropped_verdicts, disposition_conflicts=disposition_conflicts,
+    )
 
     validation_errors = codebook.validate(updated_codebook)
     if validation_errors:
@@ -2219,6 +2501,7 @@ def run_census(
         verify_coverage=verify_coverage,
         dry_run=dry_run_filing,
         dropped_verdicts=tuple(dropped_verdicts),
+        mass_rejection=mass_rejection,
     )
     # Written BEFORE codebook.dump()/advance_census_state() below -- a
     # failure here (e.g. a disk-full write_text) leaves nothing but this one
@@ -2617,7 +2900,10 @@ def _build_default_verify_fn(
         for index, cluster in enumerate(clusters):
             # The hitting cluster plus everything never attempted. Computed
             # identically at every raise site so the counts cannot disagree
-            # about what "unverified" means.
+            # about what "unverified" means. The `rejected` term is passed
+            # the same way, from `len(rejected)` at every site, for the same
+            # reason -- together with `verified` the three always sum to the
+            # clusters offered (see CensusHeadroomExhausted's INVARIANT).
             remaining = len(clusters) - index
             prompt = _verify_prompt(cluster, project_root=project_root)
             try:
@@ -2634,6 +2920,7 @@ def _build_default_verify_fn(
                                 f"reports no capacity: {probe.reason or 'no headroom'}"
                             ),
                             verified=len(verified),
+                            rejected=len(rejected),
                             unverified=remaining,
                         ) from exc
                 logger.warning(
@@ -2661,6 +2948,7 @@ def _build_default_verify_fn(
                                 f"capacity: {probe.reason or 'no headroom'}"
                             ),
                             verified=len(verified),
+                            rejected=len(rejected),
                             unverified=remaining,
                         ) from exc
                     logger.warning(
@@ -2696,6 +2984,7 @@ def _build_default_verify_fn(
                             f"{probe.reason or 'no headroom'}"
                         ),
                         verified=len(verified),
+                        rejected=len(rejected),
                         unverified=remaining - 1,
                     )
         return {

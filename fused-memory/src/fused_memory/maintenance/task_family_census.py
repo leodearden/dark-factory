@@ -45,9 +45,13 @@ logger = logging.getLogger(__name__)
 class VariantSpelling:
     """One node in a fragmented family: how it is spelled, and what it holds.
 
-    ``edge_count`` is the number of still-VALID edges hanging off the node. It
-    is the field that turns a count into a decision: it says which node a
-    collapse would keep and how many edges the others would have to move.
+    ``edge_count`` is the number of still-VALID RELATES_TO edges hanging off the
+    node, and ONLY those. It says how many edges a collapse would have to move.
+    It no longer says which node a collapse would KEEP: since task 4986 the
+    backend ranks survivors by ``provenance_rank`` (``edge_count`` plus the
+    node's Episodic MENTIONS), so an edge-poorer node can legitimately outrank
+    an edge-richer one. Read ``variants[0]`` for the would-be survivor, not the
+    largest ``edge_count``.
     """
 
     name: str
@@ -65,9 +69,12 @@ class FragmentedFamily:
     of this type. :meth:`TaskFamilyCensus.run` is the only constructor, which
     is what lets that be an invariant rather than a hope.
 
-    It is ordered survivor-first — most valid edges, then oldest, then uuid —
-    which is the order the backend returns and the order a collapse would use,
-    so ``variants[0]`` reads as "the node that would survive".
+    It is ordered survivor-first — highest provenance_rank (valid RELATES_TO
+    plus Episodic MENTIONS), then oldest, then uuid — which is the order the
+    backend returns and the order a collapse would use, so ``variants[0]`` still
+    reads as "the node that would survive". The census re-sorts nothing; it
+    inherits that order, which is why the claim stays true without this module
+    knowing the ranking rule.
     """
 
     canonical_name: str

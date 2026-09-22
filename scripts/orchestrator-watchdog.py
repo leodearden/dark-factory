@@ -337,10 +337,14 @@ try:
 except (KeyError, ValueError):
     FM_RESTART_MIN_INTERVAL_SECS = 28800
 
-# Fixed transient unit name for the detached fm staleness redeploy — the natural
-# overlap guard (a second tick fails to re-register the same unit name while a
-# redeploy is still running), sibling of orch-fleet-staleness-redeploy.service.
+# Fixed transient unit names for the two detached staleness redeploys — the
+# natural overlap guard (a second tick fails to re-register the same unit name
+# while a redeploy is still running). Named constants rather than literals
+# because each is now used twice per call site: once in the ``--unit=`` flag
+# and once as the name _register_transient_unit classifies the outcome for,
+# which it takes explicitly rather than re-parsing out of the flag.
 FM_STALENESS_REDEPLOY_UNIT = "fm-staleness-redeploy.service"
+FLEET_STALENESS_REDEPLOY_UNIT = "orch-fleet-staleness-redeploy.service"
 
 
 # --- fm liveness streak + restart cap (task 3764) ---
@@ -365,9 +369,13 @@ try:
     FM_LIVENESS_STREAK_THRESHOLD = int(os.environ["FM_LIVENESS_STREAK_THRESHOLD"])
 except (KeyError, ValueError):
     FM_LIVENESS_STREAK_THRESHOLD = 3
-# CLAMPED, unlike the two knobs below, and the asymmetry is deliberate. Their
-# <=0 means "disable the cap" — a safe direction, since a disabled cap only
-# removes a restriction on an already-justified restart. Here <=0 would mean
+# CLAMPED, unlike the knobs below, and the asymmetry is deliberate. Their <=0
+# means "disable this restriction" — a safe direction, since a disabled cap
+# only removes a restriction on an already-justified restart. Concretely:
+# FM_LIVENESS_STREAK_MAX_AGE_SECS <=0 means "no age-based expiry" (a streak is
+# then invalidated only by a 'healthy' verdict or the instance boundary), and
+# FM_LIVENESS_RESTART_MIN_INTERVAL_SECS <=0 disables the revive cap without
+# even reading a clock. Here <=0 would instead mean
 # "disable the streak", and because _record_fm_liveness_failure always returns
 # >=1 the gate `streak < FM_LIVENESS_STREAK_THRESHOLD` would then never hold:
 # FM_LIVENESS_STREAK_THRESHOLD=0 silently restores the exact
@@ -385,6 +393,12 @@ FM_LIVENESS_STREAK_THRESHOLD = max(1, FM_LIVENESS_STREAK_THRESHOLD)
 # streak from hours ago masquerading as a fresh one — and it fails in the safe
 # direction: an unusually slow tick sequence expires the streak and SUPPRESSES
 # a restart rather than manufacturing one.
+# <=0 DISABLES the age expiry outright (task 4131): the count then survives any
+# gap, and continuity is enforced only by a 'healthy' verdict clearing the
+# streak and by the INSTANCE-BOUNDARY expiry — which is deliberately left in
+# force, and is what keeps <=0 in the "removes ONE restriction" family rather
+# than the "removes every defence" one, since evidence about a previous
+# fused-memory process still cannot count toward killing its successor.
 try:
     FM_LIVENESS_STREAK_MAX_AGE_SECS = int(os.environ["FM_LIVENESS_STREAK_MAX_AGE_SECS"])
 except (KeyError, ValueError):
@@ -392,10 +406,21 @@ except (KeyError, ValueError):
 
 # Minimum wall-clock seconds between successive watchdog-initiated fm LIVENESS
 # restarts — the second layer, bounding the blast radius of a verdict that is
-# wrong anyway. 3600s strictly exceeds the 3180s (53 min) worst observed
-# pathological instance lifetime, so even a wrong verdict cannot reproduce that
+# wrong anyway. 3600s strictly exceeds the 3180s (53 min) LONGEST observed
+# pathological instance LIFETIME, so even a wrong verdict cannot reproduce that
 # pathology, and it bounds watchdog-initiated fm restarts to <=24/day versus
-# today's unbounded. Deliberately 8x SHORTER than the staleness pass's
+# today's unbounded.
+#
+# READ 3180s CORRECTLY: it is an INSTANCE LIFETIME, not the duration of a wedge.
+# Task 3764's evidence records fm instance lifetime (from runs.instance_id)
+# collapsing from ~20-35h to 45-53 min while the pre-3764 detector killed fm on
+# a single non-healthy verdict, uncapped -- so 3180s is a KILL CADENCE against a
+# process that was alive and serving, and this cap's job is to guarantee a
+# minimum inter-kill interval above it. Misreading it as a wedge duration is
+# what produced the port-down fast lane that esc-4131-9 dropped; OPERATIONS.md
+# section 8 carries the same reading. Note 53 min is the LONGEST of that
+# collapsed range, used deliberately as the conservative bar -- the most
+# pathological lifetime is the shortest. Deliberately 8x SHORTER than the staleness pass's
 # FM_RESTART_MIN_INTERVAL_SECS (28800s): a brokenness revive must react faster
 # than a scheduled deploy (I5). 0 disables the cap entirely.
 try:
@@ -760,6 +785,66 @@ def is_unit_enabled(unit: str) -> bool:
         log(
             f"is-enabled probe for {unit} could not complete "
             f"({type(exc).__name__}); skipping unit"
+        )
+        return False
+
+
+# systemd's own ActiveState values meaning "this unit has not finished yet".
+UNIT_IN_FLIGHT_ACTIVE_STATES = frozenset({"active", "activating", "reloading"})
+
+
+def _unit_is_active(unit: str) -> bool:
+    """Return True iff systemd reports *unit* still in flight.
+
+    The probe that separates a benign transient-unit name COLLISION from a
+    genuine registration failure (task 4131), a distinction systemd-run's exit
+    code cannot carry: MEASURED on this host, ``systemd-run --user --collect
+    --no-block --unit=X`` exits 1 for a name collision ("Unit X was already
+    loaded or has a fragment file"), 1 for an unrecognised option, and 1 for a
+    missing executable. Asking systemd directly DOES separate them — measured
+    "active" (rc=0) during a live collision, "inactive" (rc=4) for a
+    never-registered or already-collected unit.
+
+    BRANCHES ON THE STDOUT VALUE, NOT THE RETURN CODE: ``is-active`` exits 0
+    only for "active", so an rc-only test would misread a unit still
+    "activating" as not-in-flight. These are systemd's documented ActiveState
+    enum values, so this is a structured read and not an ad-hoc parse of a
+    human-readable message — matching systemd-run's "was already loaded"
+    stderr instead would be a parser over locale- and version-sensitive prose
+    that breaks silently on an upgrade.
+
+    Shape mirrors is_unit_enabled, this file's established probe idiom, but
+    the FAIL DIRECTION IS THE OPPOSITE ONE and deliberately so: a probe error
+    here returns False, which routes the caller to its LOUD branch, so a
+    registration whose outcome cannot be classified is reported as a failure
+    rather than downgraded to "benign". False means "skip this unit" for
+    is_unit_enabled and "say something" here; each is the conservative
+    direction for its own caller.
+
+    ANY probe error takes that direction — not merely a missing binary or a
+    timeout — so the handler below is blanket, for the same reason
+    _register_transient_unit's is: fork/exec raises PermissionError and
+    OSError(EAGAIN|ENOMEM) under memory pressure, and `text=True` decoding
+    raises UnicodeDecodeError, which is not an OSError at all. An enumerated
+    handler would honour this contract for the classes it names and violate it
+    silently for the rest, letting the exception escape past the caller's own
+    guard: _delegate_fleet_restart is called from staleness_pass's TAIL,
+    outside its per-unit try/except, so an escape here aborts the whole tick
+    and takes the fused-memory staleness backstop behind it.
+    """
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "is-active", unit],
+            check=False,
+            timeout=5,
+            capture_output=True,
+            text=True,
+        )
+        return (result.stdout or "").strip() in UNIT_IN_FLIGHT_ACTIVE_STATES
+    except Exception as exc:  # noqa: BLE001
+        log(
+            f"is-active probe for {unit} could not complete "
+            f"({type(exc).__name__}); treating the registration as failed"
         )
         return False
 
@@ -1581,10 +1666,11 @@ def _stamp_fm_liveness_restart_clock() -> bool:
     the fm staleness backstop for its full 8h window every time the watchdog
     revived a wedge (I5).
 
-    Called from fused_memory_liveness_pass() immediately after restart_unit()
-    issues a revive, so the cap is armed even if the subsequent streak clear
-    fails. Thin wrapper over the shared _stamp_clock helper, which owns the
-    ``{ts, iso}`` payload schema and the atomic-write dance.
+    Called from fused_memory_liveness_pass() in the ``finally`` around
+    restart_unit(), so the cap is armed even if the restart raised or the
+    subsequent streak clear fails. Thin wrapper over the shared _stamp_clock
+    helper, which owns the payload schema and the atomic-write dance -- see
+    _stamp_clock for the field list, so this docstring cannot drift from it.
 
     THE RETURN VALUE IS LOAD-BEARING and must not be dropped. This is the one
     watchdog write whose failure points the WRONG way: _atomic_write_json is
@@ -1592,11 +1678,10 @@ def _stamp_fm_liveness_restart_clock() -> bool:
     ENOSPC, exhausted inodes) leaves the cap unarmed while streak writes keep
     succeeding — and the pass then degrades to a revive roughly every
     FM_LIVENESS_STREAK_THRESHOLD ticks (~180s at defaults) indefinitely,
-    strictly worse flapping than the one-per-hour bound this layer promises.
-    Unlike the fm deploy clock — a secondary flap-guard that self-heals from
-    ActiveEnterTimestamp on the next tick — nothing else reconstructs this
-    one, so the caller must surface the failure loudly rather than let it
-    disappear into a single routine persistence line among healthy ticks.
+    strictly worse flapping than the bound this layer promises. Unlike the fm
+    deploy clock — a secondary flap-guard that self-heals from
+    ActiveEnterTimestamp on the next tick — nothing else reconstructs this one,
+    so the caller must surface the failure loudly.
     """
     return _stamp_clock(FM_LIVENESS_RESTART_CLOCK_PATH)
 
@@ -1699,7 +1784,14 @@ def _record_fm_liveness_failure(
     incrementing it, so an hours-old streak (watchdog stopped, timer disabled,
     host suspended, unit disabled and re-enabled) can never masquerade as a
     fresh one. Ticks are ~60s apart, so a larger gap means several were missed
-    and the "consecutive" claim is no longer true.
+    and the "consecutive" claim is no longer true. The expiry is gated on the
+    knob being POSITIVE, so <=0 genuinely disables it (task 4131). Before that
+    gate, 0 compared ``(now - prior_ts) > 0`` — true for essentially every
+    entry — so EVERY streak expired, the count could never exceed 1, and at the
+    default threshold of 3 fused-memory was never revived: an operator relaxing
+    a restriction silently disabled the whole mechanism instead. The
+    INSTANCE-BOUNDARY expiry below is deliberately NOT gated on it, and is what
+    still applies when the age window is off.
 
     INSTANCE-BOUNDARY EXPIRY. *unit_elapsed_secs* is the caller's already-
     computed ``_unit_start_elapsed_secs(FUSED_MEMORY_UNIT)``. When it is known,
@@ -1736,7 +1828,10 @@ def _record_fm_liveness_failure(
     count = 1
     if prior is not None:
         prior_count, prior_ts = prior
-        if (now - prior_ts) > FM_LIVENESS_STREAK_MAX_AGE_SECS:
+        if (
+            FM_LIVENESS_STREAK_MAX_AGE_SECS > 0
+            and (now - prior_ts) > FM_LIVENESS_STREAK_MAX_AGE_SECS
+        ):
             pass  # expired: continuity is unprovable, start over at 1
         elif unit_elapsed_secs is not None and prior_ts < (now - unit_elapsed_secs):
             log(
@@ -1825,6 +1920,19 @@ def fused_memory_liveness_pass() -> None:
     liveness revive per FM_LIVENESS_RESTART_MIN_INTERVAL_SECS via its OWN clock
     (FM_LIVENESS_RESTART_CLOCK_PATH). The two layers are complementary: the
     streak makes a wrong verdict RARE, the cap makes a wrong verdict HARMLESS.
+
+    THE BOOKKEEPING RUNS ON THE RAISING PATH TOO (task 4131). The cap is armed
+    and the streak consumed in a ``finally``, so a restart_unit that RAISES —
+    it catches only subprocess.TimeoutExpired, leaving a fork/exec
+    OSError(EAGAIN|ENOMEM), a PermissionError or a mid-tick systemctl swap to
+    propagate — still bounds the next attempt. Otherwise the cap stayed unarmed
+    while the streak stayed at/above threshold, and (since the streak is
+    recorded BEFORE the cap check) the pass re-attempted the restart on every
+    60s tick, unbounded. Arming after a failed restart is consistent with the
+    already-shipped behaviour rather than a new policy: restart_unit uses
+    ``check=False``, so a non-zero systemctl exit arms the cap today. The
+    exception still propagates to the outer handler below, so the failure stays
+    LOUD instead of being made indistinguishable from a clean revive.
 
     EVIDENCE. The pass previously restarted on a SINGLE non-healthy verdict,
     uncapped. A controlled experiment (2026-08-06 07:14-09:14Z, kill path
@@ -1924,25 +2032,83 @@ def fused_memory_liveness_pass() -> None:
             f"{FUSED_MEMORY_UNIT} liveness verdict '{verdict}' "
             f"(streak {streak}/{FM_LIVENESS_STREAK_THRESHOLD}); restarting"
         )
-        restart_unit(FUSED_MEMORY_UNIT)
-        log(f"{FUSED_MEMORY_UNIT} restart issued")
-        # Arm the cap immediately after the restart is issued, so it holds even
-        # if the streak clear below fails. The stamp is fail-SOFT but not
-        # fail-safe: an unarmed cap makes the revive unbounded (a revive every
-        # ~N ticks), so its failure gets its own high-signal line rather than
-        # disappearing into _atomic_write_json's routine one.
-        if not _stamp_fm_liveness_restart_clock():
-            log(
-                f"{FUSED_MEMORY_UNIT} liveness restart cap could NOT be armed; "
-                f"further revives are unbounded until "
-                f"{FM_LIVENESS_RESTART_CLOCK_PATH} is writable"
-            )
-        # Consumed: the NEXT kill must earn a fresh N-streak, otherwise the
-        # pass would degrade back to one-verdict-per-kill immediately after
-        # the first restart.
-        _clear_fm_liveness_streak()
+        try:
+            restart_unit(FUSED_MEMORY_UNIT)
+            log(f"{FUSED_MEMORY_UNIT} restart issued")
+        finally:
+            # Arming before the streak clear, and on the raising path too —
+            # see THE BOOKKEEPING RUNS ON THE RAISING PATH TOO above.
+            if not _stamp_fm_liveness_restart_clock():
+                log(
+                    f"{FUSED_MEMORY_UNIT} liveness restart cap could NOT be armed; "
+                    f"further revives are unbounded until "
+                    f"{FM_LIVENESS_RESTART_CLOCK_PATH} is writable"
+                )
+            # Consumed: the NEXT kill must earn a fresh N-streak, otherwise the
+            # pass would degrade back to one-verdict-per-kill immediately after
+            # the first restart.
+            _clear_fm_liveness_streak()
     except Exception as exc:  # noqa: BLE001
         log(f"watchdog error for {FUSED_MEMORY_UNIT} (port {FUSED_MEMORY_PORT}): {exc}")
+
+
+def _register_transient_unit(argv: list[str], unit: str) -> None:
+    """Run *argv* to register transient *unit*, and REPORT what happened to it.
+
+    The shared run-and-classify tail of _delegate_fleet_restart and
+    _delegate_fm_restart (task 4131). Both used to discard systemd-run's
+    CompletedProcess entirely, so the benign overlap their docstrings describe
+    — a second tick while a redeploy is still running fails to re-register the
+    same unit name and no-ops — was indistinguishable in the journal from a
+    genuine registration failure, and a persistently failing registration was
+    invisible.
+
+    THE EXIT CODE ALONE CANNOT CARRY THAT DISTINCTION (measured: systemd-run
+    exits 1 for a name collision, an unrecognised option and a missing
+    executable alike), so a non-zero exit asks _unit_is_active which case it
+    was and emits ONE of two deliberately distinguishable lines. The residual
+    TOCTOU — an in-flight unit that exits between the failed registration and
+    the probe — misclassifies a collision as a failure, i.e. logs LOUDER than
+    necessary, which is the correct direction under no-silent-fail-soft.
+
+    *unit* IS PASSED EXPLICITLY rather than recovered from argv's ``--unit=``
+    element: re-parsing a flag we just built would be exactly the
+    meaningful-string parse to avoid, and every caller already holds the
+    value.
+
+    The happy path still costs exactly ONE subprocess call — the probe runs
+    only after a non-zero exit. Its banner is relayed only when systemd-run
+    actually emitted one, since an empty capture has nothing to report;
+    relaying it at all is what keeps "Running as unit / invocation ID"
+    attributable to the watchdog's own log tag now that stderr is captured
+    rather than inherited.
+
+    Fail-soft: a missing systemd-run binary, a timeout, or any other
+    registration error is logged and swallowed, never raised — a registration
+    hiccup must not crash the Type=oneshot watchdog. Nothing here changes the
+    recovery cadence: the NEXT tick simply tries again (stateless — I6), so
+    this adds signal without adding state.
+    """
+    try:
+        result = subprocess.run(
+            argv, check=False, timeout=10, capture_output=True, text=True
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"systemd-run registration of {unit} failed: {exc!r}")
+        return
+
+    banner = (result.stderr or "").strip()
+    if result.returncode == 0:
+        if banner:
+            log(f"registered {unit}: {banner}")
+        return
+    if _unit_is_active(unit):
+        log(f"{unit} is already in flight; this tick's registration is a no-op")
+        return
+    log(
+        f"systemd-run registration of {unit} failed with exit "
+        f"{result.returncode}: {banner or '<no stderr captured>'}"
+    )
 
 
 def _delegate_fleet_restart() -> None:
@@ -1954,8 +2120,8 @@ def _delegate_fleet_restart() -> None:
     the fleet restart was triggered by this backstop or by the event-driven
     coordinator / an operator.
 
-    - ``--unit=orch-fleet-staleness-redeploy.service`` is a FIXED transient
-      unit name — the natural overlap guard. A second staleness_pass tick
+    - ``--unit=orch-fleet-staleness-redeploy.service``
+      (FLEET_STALENESS_REDEPLOY_UNIT) is a FIXED transient unit name — the natural overlap guard. A second staleness_pass tick
       while a redeploy is still running fails to re-register the same unit
       name (systemd-run exits non-zero) and no-ops, so this stateless
       oneshot needs no cross-tick bookkeeping to avoid piling up concurrent
@@ -1972,27 +2138,25 @@ def _delegate_fleet_restart() -> None:
       initiated fleet restart drains + stamps identically to an operator- or
       coordinator-driven ``restart-all-orchestrators.sh --drain``.
 
-    Fail-soft: a missing systemd-run binary, a timeout, or any other
-    registration error is logged and swallowed, never raised — a
-    registration hiccup must not crash the oneshot watchdog. The NEXT tick's
-    staleness_pass will simply try again (stateless — I6).
+    Registration OUTCOME handling — including the fail-soft contract, and the
+    distinction between the overlap above and a genuine failure — belongs to
+    _register_transient_unit, shared with the fm sibling. A failed
+    registration is now reported with its exit code and systemd-run's own
+    reason instead of being discarded; the retry cadence is unchanged, since
+    the NEXT tick's staleness_pass simply tries again (stateless — I6).
     """
-    try:
-        subprocess.run(
-            [
-                "systemd-run",
-                "--user",
-                "--collect",
-                "--no-block",
-                "--unit=orch-fleet-staleness-redeploy.service",
-                os.path.join(REPO_DIR, "scripts", "restart-all-orchestrators.sh"),
-                "--drain",
-            ],
-            check=False,
-            timeout=10,
-        )
-    except Exception as exc:  # noqa: BLE001
-        log(f"_delegate_fleet_restart: systemd-run registration failed: {exc!r}")
+    _register_transient_unit(
+        [
+            "systemd-run",
+            "--user",
+            "--collect",
+            "--no-block",
+            f"--unit={FLEET_STALENESS_REDEPLOY_UNIT}",
+            os.path.join(REPO_DIR, "scripts", "restart-all-orchestrators.sh"),
+            "--drain",
+        ],
+        FLEET_STALENESS_REDEPLOY_UNIT,
+    )
 
 
 def _delegate_fm_restart() -> None:
@@ -2034,39 +2198,38 @@ def _delegate_fm_restart() -> None:
     script's verified exit-0, and the whole thing stays non-blocking (the stamp
     runs inside the detached unit, not inline in the watchdog).
 
-    Fail-soft: a missing systemd-run binary, a timeout, or any other
-    registration error is logged and swallowed, never raised — a registration
-    hiccup must not crash the oneshot watchdog. The NEXT tick's
-    fused_memory_staleness_pass will simply try again (stateless — I6).
+    Registration OUTCOME handling — including the fail-soft contract, and the
+    distinction between the overlap above and a genuine failure — belongs to
+    _register_transient_unit, shared with the fleet sibling. A failed
+    registration is now reported with its exit code and systemd-run's own
+    reason instead of being discarded; the retry cadence is unchanged, since
+    the NEXT tick's fused_memory_staleness_pass simply tries again
+    (stateless — I6).
     """
     restart_script = os.path.join(REPO_DIR, "scripts", "restart-fused-memory.sh")
     stamp_cmd = (
         f"{shlex.quote(sys.executable)} "
         f"{shlex.quote(os.path.abspath(__file__))} --stamp-fm-deploy-clock"
     )
-    try:
-        subprocess.run(
-            [
-                "systemd-run",
-                "--user",
-                "--collect",
-                "--no-block",
-                # Pin the detached stamp to the SAME clock file the reader
-                # consults — systemd-run --user does not propagate this
-                # process's env, so the chained --stamp-fm-deploy-clock would
-                # otherwise default the path (see docstring). No-op at the
-                # default path; load-bearing under a FM_DEPLOY_CLOCK override.
-                f"--setenv=FM_DEPLOY_CLOCK={FM_DEPLOY_CLOCK_PATH}",
-                f"--unit={FM_STALENESS_REDEPLOY_UNIT}",
-                "/bin/bash",
-                "-c",
-                f"{shlex.quote(restart_script)} && {stamp_cmd}",
-            ],
-            check=False,
-            timeout=10,
-        )
-    except Exception as exc:  # noqa: BLE001
-        log(f"_delegate_fm_restart: systemd-run registration failed: {exc!r}")
+    _register_transient_unit(
+        [
+            "systemd-run",
+            "--user",
+            "--collect",
+            "--no-block",
+            # Pin the detached stamp to the SAME clock file the reader
+            # consults — systemd-run --user does not propagate this
+            # process's env, so the chained --stamp-fm-deploy-clock would
+            # otherwise default the path (see docstring). No-op at the
+            # default path; load-bearing under a FM_DEPLOY_CLOCK override.
+            f"--setenv=FM_DEPLOY_CLOCK={FM_DEPLOY_CLOCK_PATH}",
+            f"--unit={FM_STALENESS_REDEPLOY_UNIT}",
+            "/bin/bash",
+            "-c",
+            f"{shlex.quote(restart_script)} && {stamp_cmd}",
+        ],
+        FM_STALENESS_REDEPLOY_UNIT,
+    )
 
 
 def staleness_pass() -> None:
@@ -2438,6 +2601,35 @@ def _format_fleet_lease() -> str:
     )
 
 
+def _render_age_hours(epoch: float | None) -> str:
+    """Render *epoch* as an age in hours to one decimal, or 'unknown' for None.
+
+    The single definition of every AGE column --report prints (the fleet
+    DEPLOY-AGE, and the fm row's DEPLOY-AGE / LIVENESS-RESTART-AGE). Spelled
+    once so unit and precision cannot drift between siblings an operator reads
+    side by side on one line.
+    """
+    if epoch is None:
+        return "unknown"
+    return f"{(time.time() - epoch) / 3600:.1f}h"
+
+
+def _safe_age(read: Callable[[], float | None], label: str) -> str:
+    """_render_age_hours over a clock read that is allowed to fail.
+
+    --report is a diagnostic (I8): one unreadable clock degrades its OWN
+    column to 'unknown' and says so, rather than aborting the row and taking
+    the healthy columns with it. The clock readers are already fail-open on a
+    missing or malformed body; this covers the residue they cannot — an
+    unreadable file, a mid-read replace — which would otherwise raise.
+    """
+    try:
+        return _render_age_hours(read())
+    except Exception as exc:  # noqa: BLE001
+        log(f"could not read {label}: {exc}")
+        return "unknown"
+
+
 def _classify_unit_heartbeat(unit: str, now: float) -> str:
     """Classify *unit*'s merge-idle heartbeat for report()'s MERGE-IDLE column.
 
@@ -2535,10 +2727,7 @@ def report() -> int:
     commit_epoch = _newest_watched_commit_epoch()
     units = _enumerate_running_units()
     now = time.time()
-    deploy_epoch = _read_last_fleet_deploy_epoch()
-    deploy_age_str = (
-        f"{(now - deploy_epoch) / 3600:.1f}h" if deploy_epoch is not None else "unknown"
-    )
+    deploy_age_str = _render_age_hours(_read_last_fleet_deploy_epoch())
 
     commit_str = _format_epoch(commit_epoch)
     print(
@@ -2679,12 +2868,7 @@ def _print_fused_memory_liveness() -> None:
     except Exception as exc:  # noqa: BLE001
         log(f"watchdog error printing {FUSED_MEMORY_UNIT} liveness row: {exc}")
         verdict = "unknown"
-    deploy_epoch = _read_last_fm_deploy_epoch()
-    deploy_age_str = (
-        f"{(time.time() - deploy_epoch) / 3600:.1f}h"
-        if deploy_epoch is not None
-        else "unknown"
-    )
+    deploy_age_str = _safe_age(_read_last_fm_deploy_epoch, f"the {FUSED_MEMORY_UNIT} deploy clock")
     recon_busy = _fused_memory_recon_busy_verdict()
     try:
         streak = _read_fm_liveness_streak()
@@ -2694,16 +2878,10 @@ def _print_fused_memory_liveness() -> None:
     except Exception as exc:  # noqa: BLE001
         log(f"could not read the {FUSED_MEMORY_UNIT} liveness streak for --report: {exc}")
         streak_str = "unknown"
-    try:
-        restart_epoch = _read_last_fm_liveness_restart_epoch()
-        restart_age_str = (
-            f"{(time.time() - restart_epoch) / 3600:.1f}h"
-            if restart_epoch is not None
-            else "unknown"
-        )
-    except Exception as exc:  # noqa: BLE001
-        log(f"could not read the {FUSED_MEMORY_UNIT} liveness restart clock: {exc}")
-        restart_age_str = "unknown"
+    restart_age_str = _safe_age(
+        _read_last_fm_liveness_restart_epoch,
+        f"the {FUSED_MEMORY_UNIT} liveness restart clock",
+    )
     print(
         f"{FUSED_MEMORY_UNIT} liveness (port {FUSED_MEMORY_PORT} + /alive): "
         f"{verdict} | DEPLOY-AGE: {deploy_age_str} | recon-busy: {recon_busy} "

@@ -5,6 +5,7 @@ import contextlib
 import functools
 import importlib.util
 import inspect
+import json
 import logging
 import re
 import time
@@ -1215,6 +1216,32 @@ _UUID_MEANS_LOAD = (
     'exists, never one to create under that id. To create a NEW episode pass '
     'uuid=None and read the minted uuid off result.episode.uuid.'
 )
+
+
+# The one copy of the survivor-ranking rule, shared by BOTH ranking methods —
+# ``find_duplicate_entity_nodes`` (exact name) and
+# ``find_entity_nodes_by_name_substring`` (substring). Module-level for the same
+# reason ``_UUID_MEANS_LOAD`` above is: it is a contract several sites inside the
+# class must express identically, and a constant is the only way to say so once.
+#
+# INVARIANT: the two methods must order IDENTICALLY. Each feeds a destructive
+# merge that keeps rows[0] and folds every other row into it, so a divergence
+# silently leaves the two paths keeping different survivors. Copying this clause
+# instead of sharing it is precisely the drift that produced task 4986's loss
+# mode 3 (``expired_at`` added to one SET list and not its twin), and that task
+# 5264 reproduced when it cloned the then-current MENTIONS-blind ranking into a
+# second method. A test importing these constants can enforce the invariant; two
+# docstrings promising each other cannot.
+_PROVENANCE_RANK_CLAUSE = (
+    'OPTIONAL MATCH (n)-[e:RELATES_TO]-() WHERE e.invalid_at IS NULL '
+    'WITH n, count(DISTINCT e) AS edge_count '
+    'OPTIONAL MATCH (:Episodic)-[m:MENTIONS]->(n) '
+    'WITH n, edge_count, count(DISTINCT m) AS mentions_count '
+)
+
+# The ordering the clause above exists to make possible. Kept adjacent to it so
+# the projection and the sort key cannot be updated apart.
+_PROVENANCE_RANK_ORDER = 'ORDER BY provenance_rank DESC, n.created_at ASC, n.uuid ASC'
 
 
 class GraphitiBackend:
@@ -2683,6 +2710,36 @@ class GraphitiBackend:
         old.uuid would silently coalesce any pre-existing dup-uuid edges
         instead of redirecting each one individually (task 2207 W6-δ).
 
+        Losslessly PRESERVED on a redirected edge (copied by direct
+        ``old.<prop>`` reference, which also preserves the vecf32
+        ``fact_embedding`` type): ``name``, ``fact``, ``fact_embedding``,
+        ``valid_at``, ``invalid_at``, ``expired_at``, ``created_at``,
+        ``group_id`` and ``episodes`` — the same set ``reassign_edge``
+        preserves, which is this method's single-edge sibling and the reason
+        that set is stated here rather than left to be diffed. The edge
+        ``uuid`` is the ONE exception, and deliberately so: it is re-minted
+        fresh per redirect for the dup-uuid reason above, with the original
+        recorded as ``superseded_edge_uuid``.
+
+        ``expired_at`` is load-bearing and its loss was silent (task 4986):
+        ``expired_at`` SET with ``invalid_at`` NULL is the restore hooks'
+        deliberately-restored signature — the hooks clear ``invalid_at`` and
+        never ``expired_at`` — so dropping it re-exposes a restored edge to
+        false supersession. It is written adjacent to ``invalid_at`` in both
+        SET lists, matching ``reassign_edge``, because that adjacency is what
+        makes the next omission visible by inspection; the omission this
+        closes was exactly ``expired_at`` reaching one list and not its twin.
+
+        ``new.reassigned_from_node_uuid`` records WHICH node the endpoint
+        left, the endpoint-relocation audit stamp alongside
+        ``superseded_edge_uuid``'s "which edge this replaced". It reuses
+        ``reassign_edge``'s property name rather than minting a merge-specific
+        one, so merge relocations are visible to the audits already written
+        against that spelling. The two operations stay distinguishable without
+        extra vocabulary: a merge relocation also mints a fresh uuid and
+        stamps ``superseded_edge_uuid``, which a uuid-preserving
+        ``reassign_edge`` never does.
+
         This trades a single bulk statement per direction for one query per
         edge (N+1 round-trips) — the deliberate cost of the ID(old) keying
         above. Entity merges are rare and touch modest-degree nodes in
@@ -2752,9 +2809,11 @@ class GraphitiBackend:
                 '    new.fact_embedding = old.fact_embedding, '
                 '    new.valid_at = old.valid_at, '
                 '    new.invalid_at = old.invalid_at, '
+                '    new.expired_at = old.expired_at, '
                 '    new.created_at = old.created_at, '
                 '    new.group_id = old.group_id, '
                 '    new.episodes = old.episodes, '
+                '    new.reassigned_from_node_uuid = $dep_uuid, '
                 '    new.source_node_uuid = $sur_uuid '
                 'DELETE old',
                 {
@@ -2792,9 +2851,11 @@ class GraphitiBackend:
                 '    new.fact_embedding = old.fact_embedding, '
                 '    new.valid_at = old.valid_at, '
                 '    new.invalid_at = old.invalid_at, '
+                '    new.expired_at = old.expired_at, '
                 '    new.created_at = old.created_at, '
                 '    new.group_id = old.group_id, '
                 '    new.episodes = old.episodes, '
+                '    new.reassigned_from_node_uuid = $dep_uuid, '
                 '    new.target_node_uuid = $sur_uuid '
                 'DELETE old',
                 {
@@ -2816,6 +2877,112 @@ class GraphitiBackend:
             'incoming_redirected': incoming_redirected,
             'inter_node_deleted': inter_node_deleted,
         }
+
+    @_canonicalize_group_args
+    async def redirect_node_mentions(
+        self, deprecated_uuid: str, surviving_uuid: str, *, group_id: str
+    ) -> dict:
+        """Relocate Episodic MENTIONS provenance from one Entity onto another.
+
+        The MENTIONS sibling of :meth:`redirect_node_edges`: same merge-time
+        endpoint move, different relationship type. That one is RELATES_TO-typed
+        in all three of its phases, and :meth:`delete_entity_node` then issues a
+        bare DETACH DELETE that destroys EVERY remaining link — so without this
+        method a merge silently destroyed the loser's episode provenance
+        (task 4986 loss mode 1).
+
+        Only INCOMING links exist to consider: MENTIONS is always
+        Episodic->Entity, so unlike ``redirect_node_edges`` there is no
+        outgoing direction and no inter-node phase.
+
+        AN ALREADY-LINKED EPISODE IS SKIPPED, NOT MOVED AND NOT DELETED. Moving
+        it would give the survivor two links for one episode; deleting it would
+        make this a destructive primitive rather than a relocation. Provenance
+        is the (episode, entity) PAIR, not the link object — when the survivor
+        already carries that episode, nothing is lost by leaving the loser's
+        redundant copy for the CALLER's delete to remove. Leaving the deletion
+        to the caller is also what makes a re-run after a partial failure
+        converge: already-moved links are on the survivor and are simply not
+        seen again, and the remaining ones move. The skip is COUNTED rather than
+        silent, so a merge log records the difference between "two links moved"
+        and "two links moved, one was redundant".
+
+        Enumerated by the stable internal ``ID(m)``, never ``m.uuid``, for the
+        same reason ``redirect_node_edges`` enumerates by ``ID(old)``: a uuid may
+        already be duplicated and so cannot target a single link. The
+        existence probe runs INSIDE the loop, which is what makes two links
+        from the SAME episode collapse to one — hoisted above the loop it
+        would read "not linked" once and move both.
+
+        Unlike the RELATES_TO redirect, the link ``uuid`` is PRESERVED rather
+        than re-minted: that one mints a fresh uuid4 to repair a graph-wide
+        per-edge uuid uniqueness invariant, and nothing folds MENTIONS links by
+        uuid, so preserving it keeps the episode-link identity stable across a
+        merge. ``uuid``, ``group_id`` and ``created_at`` are the COMPLETE
+        property set — graphiti_core's ``EPISODIC_EDGE_SAVE`` writes only those
+        three, and MENTIONS carries no embedding — the same three copied by
+        ``maintenance/cross_graph_move.py``, which documents why.
+
+        Runs in no transaction and is safe to retry from the top after a crash
+        partway through, for the convergence reason above. Counters are
+        incremented only after each write completes, so they reflect work done
+        rather than work enumerated.
+
+        Args:
+            deprecated_uuid: UUID of the entity node losing its MENTIONS links.
+            surviving_uuid: UUID of the entity node that absorbs them.
+            group_id: Project graph to target.
+
+        Returns:
+            Dict with keys: ``redirected`` (links moved onto the survivor) and
+            ``already_linked`` (links left in place because the survivor
+            already carried that episode).
+        """
+        graph = self._graph_for(group_id)
+
+        enumerated = await graph.ro_query(
+            'MATCH (ep:Episodic)-[m:MENTIONS]->(dep:Entity {uuid: $dep_uuid}) '
+            'RETURN ID(m) AS eid, ep.uuid AS episode_uuid',
+            {'dep_uuid': deprecated_uuid},
+        )
+        links = [(row[0], row[1]) for row in (enumerated.result_set or [])]
+
+        redirected = 0
+        already_linked = 0
+        for eid, episode_uuid in links:
+            existing = await graph.ro_query(
+                'MATCH (ep:Episodic {uuid: $episode_uuid})-[m:MENTIONS]->'
+                '(sur:Entity {uuid: $sur_uuid}) '
+                'RETURN m.uuid LIMIT 1',
+                {'episode_uuid': episode_uuid, 'sur_uuid': surviving_uuid},
+            )
+            if existing.result_set:
+                already_linked += 1
+                continue
+
+            await graph.query(
+                'MATCH (ep:Episodic)-[old:MENTIONS]->(dep:Entity {uuid: $dep_uuid}) '
+                'WHERE ID(old) = $eid '
+                'MATCH (sur:Entity {uuid: $sur_uuid}) '
+                'CREATE (ep)-[new:MENTIONS]->(sur) '
+                'SET new.uuid = old.uuid, '
+                '    new.group_id = old.group_id, '
+                '    new.created_at = old.created_at, '
+                '    new.reassigned_from_node_uuid = $dep_uuid '
+                'DELETE old',
+                {
+                    'dep_uuid': deprecated_uuid,
+                    'sur_uuid': surviving_uuid,
+                    'eid': eid,
+                },
+            )
+            redirected += 1
+
+        logger.info(
+            'redirect_node_mentions: dep=%s sur=%s redirected=%d already_linked=%d',
+            deprecated_uuid, surviving_uuid, redirected, already_linked,
+        )
+        return {'redirected': redirected, 'already_linked': already_linked}
 
     async def _repair_duplicate_edge_uuids(self, group_id: str) -> int:
         """One-shot idempotent repair: re-mint fresh uuids on legacy dup-uuid
@@ -2919,17 +3086,53 @@ class GraphitiBackend:
 
         Orchestrates the full merge workflow:
         1. Validate both nodes exist via get_node_text (raises NodeNotFoundError if
-           either is missing).
+           either is missing), keeping the deprecated node's SUMMARY.
         2. Redirect all RELATES_TO edges from deprecated to surviving via
            redirect_node_edges.
-        3. Delete the deprecated node via delete_entity_node.
-        4. Collapse any parallel duplicate edges left on the surviving node via
+        3. Relocate Episodic MENTIONS provenance onto the survivor via
+           redirect_node_mentions.
+        4. Census what the delete is about to destroy that step 2/3 did not
+           relocate, via count_foreign_relationships (best-effort).
+        5. Delete the deprecated node via delete_entity_node.
+        6. Collapse any parallel duplicate edges left on the surviving node via
            dedup_valid_edges_for_node (task 2118 — redirect_node_edges mints a
            fresh uuid per redirected edge, but the survivor may already hold
            an equivalent (neighbor, fact, valid_at) edge, so this
            uuid-agnostic pass is still required to collapse those parallel
            duplicates).
-        5. Rebuild the surviving node's summary via refresh_entity_summary.
+        7. Rebuild the surviving node's summary via refresh_entity_summary.
+
+        STEP 3 MUST PRECEDE STEP 5. ``delete_entity_node`` issues a bare
+        ``MATCH (n:Entity {uuid: $uuid}) DETACH DELETE n``, which destroys EVERY
+        remaining relationship — so a MENTIONS relocation ordered after it has
+        nothing left to move, and the loser's episode provenance is simply gone
+        (task 4986 loss mode 1). The same ordering is why step 4's census is
+        taken before the delete: afterwards there is nothing left to count.
+
+        STEP 4 IS AN AUDIT DATUM, NEVER A GATE. By the time it runs, steps 2 and
+        3 are already committed and irreversible, so a raise must not propagate
+        — that would abort a half-applied merge on the strength of a failed
+        OBSERVATION. A failed census records ``None``, which keeps "could not
+        measure" distinct from "measured zero", the same distinction
+        ``count_foreign_relationships`` itself refuses to blur.
+
+        THE DEPRECATED NODE'S SUMMARY IS KEPT (task 4986 loss mode 5). Step 7
+        rebuilds the survivor's summary from EDGES only, so any of the loser's
+        summary text that no edge backs is unrecoverable once the node is gone.
+        The value is already in hand from step 1's existence check; returning it
+        rather than discarding it is the whole fix.
+
+        ONE STRUCTURED RECORD PER MERGE, AND IT IS THE RETURNED OBJECT. The INFO
+        line is ``json.dumps`` of the very dict returned below — not a payload
+        assembled beside it, which would be a second copy of the same facts and
+        would drift the first time a key was added to one of them. JSON rather
+        than a ``key=value`` line because the payload carries the loser's full
+        summary: arbitrary prose with quotes, newlines and non-ASCII that a
+        reader should not need an ad-hoc parser to recover.
+        ``MemoryService.merge_entities`` already persists this same dict as the
+        write journal's ``result_summary``, so the durable record and the
+        operator-visible one carry identical fields and cannot disagree — the
+        merge's provenance is recoverable from either surface.
 
         Args:
             deprecated_uuid: UUID of the entity node to be deleted.
@@ -2937,22 +3140,59 @@ class GraphitiBackend:
 
         Returns:
             Audit dict with keys: surviving_uuid, surviving_name, deprecated_uuid,
-            deprecated_name, edges_redirected (sub-dict with redirect counts),
-            duplicate_edges_removed (count collapsed post-redirect),
-            surviving_summary (dict with old/new summary and edge_count).
+            deprecated_name, deprecated_summary (the loser's summary text, which
+            nothing else preserves), edges_redirected (sub-dict with RELATES_TO
+            redirect counts), mentions_redirected (sub-dict with the MENTIONS
+            relocated/already-linked counts), residual_relationships_destroyed
+            (what the DETACH DELETE destroyed that was not relocated, or None if
+            the census could not be taken), duplicate_edges_removed (count
+            collapsed post-redirect), surviving_summary (dict with old/new
+            summary and edge_count).
 
         Raises:
             NodeNotFoundError: if either UUID does not exist.
             RuntimeError: if the backend is not initialized.
         """
-        # Validate both nodes exist and capture their names
-        dep_name, _ = await self.get_node_text(deprecated_uuid, group_id=group_id)
+        # Validate both nodes exist and capture their names. The deprecated
+        # node's SUMMARY is kept, not discarded: refresh_entity_summary rebuilds
+        # the survivor's summary from EDGES only, so any of the loser's summary
+        # text no edge backs is unrecoverable once the node is gone.
+        dep_name, dep_summary = await self.get_node_text(deprecated_uuid, group_id=group_id)
         sur_name, _ = await self.get_node_text(surviving_uuid, group_id=group_id)
 
         # Redirect edges
         edges_redirected = await self.redirect_node_edges(
             deprecated_uuid, surviving_uuid, group_id=group_id,
         )
+
+        # Relocate Episodic MENTIONS provenance. MUST precede the delete:
+        # delete_entity_node's DETACH DELETE destroys every remaining link, so
+        # a relocation ordered after it would have nothing left to move.
+        mentions_redirected = await self.redirect_node_mentions(
+            deprecated_uuid, surviving_uuid, group_id=group_id,
+        )
+
+        # What this DETACH DELETE is about to destroy that was NOT relocated.
+        # Best-effort and never a gate: both relocations above are already
+        # committed and irreversible, so a failed OBSERVATION must not abort a
+        # half-applied merge. None keeps "could not measure" distinct from
+        # "measured zero" — the distinction count_foreign_relationships itself
+        # refuses to blur.
+        try:
+            residual = await self.count_foreign_relationships(
+                deprecated_uuid, group_id=group_id,
+            )
+        except Exception:  # noqa: BLE001
+            # Deliberately NOT prefixed 'merge_entities: ' — that prefix
+            # identifies the one structured JSON record per merge emitted
+            # below, and a diagnostic sharing it would break any auditor that
+            # greps the prefix and parses the remainder.
+            logger.warning(
+                'merge_entities residual census failed for dep=%s '
+                '(merge continues; relocations already committed)',
+                deprecated_uuid, exc_info=True,
+            )
+            residual = None
 
         # Delete the deprecated node
         await self.delete_entity_node(deprecated_uuid, group_id=group_id)
@@ -2965,17 +3205,15 @@ class GraphitiBackend:
         # Rebuild the surviving node's summary
         refresh_result = await self.refresh_entity_summary(surviving_uuid, group_id=group_id)
 
-        logger.info(
-            'merge_entities: dep=%s (%r) sur=%s (%r) redirected=%s duplicate_edges_removed=%d',
-            deprecated_uuid, dep_name, surviving_uuid, sur_name, edges_redirected,
-            duplicate_edges_removed,
-        )
-        return {
+        audit = {
             'surviving_uuid': surviving_uuid,
             'surviving_name': sur_name,
             'deprecated_uuid': deprecated_uuid,
             'deprecated_name': dep_name,
+            'deprecated_summary': dep_summary,
             'edges_redirected': edges_redirected,
+            'mentions_redirected': mentions_redirected,
+            'residual_relationships_destroyed': residual,
             'duplicate_edges_removed': duplicate_edges_removed,
             'surviving_summary': {
                 'before': refresh_result.get('old_summary', ''),
@@ -2983,6 +3221,8 @@ class GraphitiBackend:
                 'edge_count': refresh_result.get('edge_count', 0),
             },
         }
+        logger.info('merge_entities: %s', json.dumps(audit, sort_keys=True, default=str))
+        return audit
 
     @_canonicalize_group_args
     async def delete_entity(
@@ -3206,9 +3446,34 @@ class GraphitiBackend:
         but scoped to surfacing exact-name DUPLICATES for the post-write
         node-dedup sweep (MemoryService._dedup_episode_nodes) rather than
         resolving a single canonical node. Results are ordered
-        canonical-first — most valid edges, then oldest created_at, then
-        uuid — so callers can treat matches[0] as the merge survivor and
+        canonical-first — highest provenance_rank, then oldest created_at,
+        then uuid — so callers can treat matches[0] as the merge survivor and
         matches[1:] as the deprecated duplicates to fold into it.
+
+        WHY MENTIONS BELONG IN THE RANK (task 4986). matches[0] is the node
+        that SURVIVES and matches[1:] are DELETED, so a node this ordering
+        demotes loses its Episodic provenance with it. Ranking on valid
+        RELATES_TO alone therefore destroyed episode links the survivor never
+        had — measured in 12 of 50 live duplicate groups on 2026-08-31.
+        ``provenance_rank`` = ``edge_count`` + ``mentions_count`` is what the
+        ordering now keys on, and it is RETURNED rather than left for callers
+        to re-derive, so the key that ORDERED the list is the key a caller can
+        READ.
+
+        ``edge_count`` DELIBERATELY KEEPS ITS PRE-4986 MEANING — valid
+        RELATES_TO only — because two consumers read it for something other
+        than ranking. ``reconciliation/degenerate_task_node_sweep.py`` deletes
+        a placeholder node on ``int(match['edge_count']) == 0``, so folding
+        MENTIONS in would silently change WHICH nodes that sweep destroys;
+        ``maintenance/task_family_census.py`` reports it per variant in an
+        operator-facing line that would silently start counting episodes.
+        MENTIONS therefore enters ONLY through the two new keys.
+
+        The ranking clause and its ORDER BY come from the module-level
+        ``_PROVENANCE_RANK_CLAUSE`` / ``_PROVENANCE_RANK_ORDER``, shared with
+        ``find_entity_nodes_by_name_substring`` so the two survivor-ranking
+        methods cannot drift apart; see those constants for why that is an
+        invariant rather than a convenience.
 
         Scoped by an explicit `n.group_id = $group_id` property predicate (2026-07-06
         amendment), not just the graph key selected via _graph_for — task-2115's active
@@ -3223,9 +3488,11 @@ class GraphitiBackend:
             group_id: Project graph to query.
 
         Returns:
-            List of dicts with keys: uuid, created_at, edge_count — ordered
-            canonical (survivor) first. Empty list when no entity matches;
-            a single-element list when the name is unique (no duplicate).
+            List of dicts with keys: uuid, created_at, edge_count (valid
+            RELATES_TO only), mentions_count, provenance_rank (their sum, and
+            the key the ordering uses) — ordered canonical (survivor) first.
+            Empty list when no entity matches; a single-element list when the
+            name is unique (no duplicate).
 
         Raises:
             RuntimeError: if the backend is not initialized.
@@ -3234,10 +3501,10 @@ class GraphitiBackend:
         cypher = (
             'MATCH (n:Entity {name: $name}) '
             'WHERE n.group_id = $group_id '
-            'OPTIONAL MATCH (n)-[e:RELATES_TO]-() WHERE e.invalid_at IS NULL '
-            'WITH n, count(DISTINCT e) AS edge_count '
-            'RETURN n.uuid, n.created_at, edge_count '
-            'ORDER BY edge_count DESC, n.created_at ASC, n.uuid ASC'
+            + _PROVENANCE_RANK_CLAUSE
+            + 'RETURN n.uuid, n.created_at, edge_count, mentions_count, '
+              'edge_count + mentions_count AS provenance_rank '
+            + _PROVENANCE_RANK_ORDER
         )
         result = await graph.ro_query(cypher, {'name': name, 'group_id': group_id})
         return [
@@ -3245,6 +3512,8 @@ class GraphitiBackend:
                 'uuid': row[0],
                 'created_at': row[1],
                 'edge_count': row[2],
+                'mentions_count': row[3],
+                'provenance_rank': row[4],
             }
             for row in (result.result_set or [])
         ]
@@ -3259,6 +3528,27 @@ class GraphitiBackend:
         group-scoped shape, same valid-edge count, same survivor-first ordering
         — only the name predicate differs, from exact equality to CONTAINS, and
         the node's name joins the returned columns.
+
+        "Same survivor-first ordering" is TRUE BY CONSTRUCTION, not by
+        resemblance: both methods build their ranking from the module-level
+        ``_PROVENANCE_RANK_CLAUSE`` and ``_PROVENANCE_RANK_ORDER``, so the two
+        cannot drift apart. It was not always so — this method was first
+        written with a COPY of the sibling's clause, and that copy is how a
+        MENTIONS-blind survivor rank survived into a second, newer merge path
+        (task 4986). Sharing the objects is what makes the claim enforceable
+        rather than aspirational.
+
+        ``provenance_rank`` (``edge_count`` + ``mentions_count``) is what orders
+        the rows, because rows[0] SURVIVES a collapse and rows[1:] are deleted
+        — so ranking on valid edges alone destroyed the episode provenance of
+        any node that was episode-rich but edge-poor. ``edge_count`` keeps its
+        RELATES_TO-only meaning; see the sibling's docstring for the two
+        consumers that require the split.
+
+        The write-path consequence is the point: ``MemoryService.
+        _normalize_task_node_names`` reads only ``uuid`` and ``name`` and relies
+        entirely on this row ORDER to pick ``members[0]`` as the survivor, so it
+        now keeps the episode-richer node with no service-layer change at all.
 
         A deliberately TASK-AGNOSTIC candidate-NARROWING primitive. It knows
         nothing about task labels or any other vocabulary: it hands back a
@@ -3300,10 +3590,11 @@ class GraphitiBackend:
             group_id: Project graph to query.
 
         Returns:
-            List of dicts with keys: uuid, name, created_at, edge_count —
-            ordered canonical (survivor) first, exactly as
-            find_duplicate_entity_nodes orders its matches. Empty list when
-            nothing matches.
+            List of dicts with keys: uuid, name, created_at, edge_count (valid
+            RELATES_TO only), mentions_count, provenance_rank (their sum, and
+            the key the ordering uses) — ordered canonical (survivor) first,
+            exactly as find_duplicate_entity_nodes orders its matches, from the
+            shared constants above. Empty list when nothing matches.
 
         Raises:
             RuntimeError: if the backend is not initialized.
@@ -3312,10 +3603,10 @@ class GraphitiBackend:
         cypher = (
             'MATCH (n:Entity) '
             'WHERE n.group_id = $group_id AND n.name CONTAINS $substring '
-            'OPTIONAL MATCH (n)-[e:RELATES_TO]-() WHERE e.invalid_at IS NULL '
-            'WITH n, count(DISTINCT e) AS edge_count '
-            'RETURN n.uuid, n.name, n.created_at, edge_count '
-            'ORDER BY edge_count DESC, n.created_at ASC, n.uuid ASC'
+            + _PROVENANCE_RANK_CLAUSE
+            + 'RETURN n.uuid, n.name, n.created_at, edge_count, mentions_count, '
+              'edge_count + mentions_count AS provenance_rank '
+            + _PROVENANCE_RANK_ORDER
         )
         start = time.monotonic()
         result = await graph.ro_query(
@@ -3328,6 +3619,8 @@ class GraphitiBackend:
                 'name': row[1],
                 'created_at': row[2],
                 'edge_count': row[3],
+                'mentions_count': row[4],
+                'provenance_rank': row[5],
             }
             for row in (result.result_set or [])
         ]
@@ -3470,7 +3763,8 @@ class GraphitiBackend:
           nodes, it never creates one.
         - 1 match: returns that node's uuid directly (pure resolve, no writes).
         - >=2 matches: collapses duplicates via find_duplicate_entity_nodes
-          (already survivor-first: edge_count DESC, created_at ASC, uuid ASC)
+          (already survivor-first: provenance_rank DESC, created_at ASC,
+          uuid ASC, where provenance_rank is edge_count + mentions_count)
           and merge_entities, folding every non-canonical duplicate into the
           survivor. Returns the survivor's uuid.
 

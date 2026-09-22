@@ -415,6 +415,9 @@ lint_command: "uv run ruff check shared escalation fused-memory orchestrator das
 #   tests/scripts/test_unblock_skill_done_provenance_templates.py — reads
 #       skills/unblock/SKILL.md to validate its done_provenance payload
 #       literals against the live DoneProvenance model (task 4095).
+#   tests/scripts/test_shadow_ruling_doc_contract.py — reads
+#       skills/escalation-watcher/SKILL.md to validate its x_shadow_ruling
+#       payload literals against the live parser (task 5374).
 # So the union includes orchestrator/tests/ — the fleet's largest suite —
 # duplicated on every review checkpoint, main-tip sweep and merge full-verify.
 # That is far worse than the single-suite duplication 3485 assumed, and it

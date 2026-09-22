@@ -42,7 +42,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from fused_memory.routing.json_extract import extract_json
 from fused_memory.server.grouped_read import PARENT_ID_KEY
@@ -62,6 +62,8 @@ from fused_memory.server.write_triage import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from fused_memory.models.memory import MemoryResult
 
 logger = logging.getLogger(__name__)
@@ -101,6 +103,84 @@ JUDGE_VERDICTS: dict[str, str] = {
     'amends': OUTCOME_AMENDED,
     'contests': OUTCOME_CONTESTED,
 }
+
+
+class JudgeExemplar(NamedTuple):
+    """One worked example of the vocabulary: a pair, and the word for it.
+
+    Three fields rather than one pre-formatted line, because the formatting
+    belongs to the renderer: held as data, the set can be checked for
+    vocabulary closure and verdict coverage instead of grepped for.
+    """
+
+    entry: str
+    candidate: str
+    verdict: str
+
+
+#: A worked example per verdict, rendered into :data:`JUDGE_SYSTEM_PROMPT`.
+#:
+#: WHY THESE EXIST. The 2026-08-27 calibration run answered `stored` on 31 of
+#: 75 duplicates with the correct canonical sitting in the slate, while the
+#: distractor control scored 18/18 — so the judge was not attaching
+#: indiscriminately, it was systematically over-answering "distinct". A
+#: vocabulary word the model has never seen USED is the one it under-produces,
+#: which is why coverage of all four is an asserted invariant and not a
+#: stylistic goal.
+#:
+#: WHY THIS PARTICULAR SET. One candidate, four entries. Holding the candidate
+#: fixed isolates the only variable that should decide the answer — the
+#: RELATIONSHIP — and makes the two failure directions visible side by side:
+#:
+#: * `restates` and `amends` share almost no surface vocabulary with the
+#:   candidate and still attach, which is the measured defect stated as an
+#:   example (the judge was demanding lexical overlap before it would attach);
+#: * `distinct` repeats the candidate's own words verbatim and still does NOT
+#:   attach, so the lesson reads as "the claim decides" rather than as the
+#:   cruder "attach more readily" — the latter would cost the distractor
+#:   control, which is exactly what that control is there to report.
+#:
+#: The `restates`/`amends` pair differs only by a trailing novel fragment, so
+#: the discrimination between them is shown on otherwise identical material.
+#:
+#: Declaration order mirrors the decision procedure the prompt states — ask
+#: whether any candidate makes the same core claim first, reach for `distinct`
+#: only when none does — not the vocabulary's alphabet.
+#:
+#: SYNTHETIC AND OFF-CORPUS BY CONSTRUCTION. Nothing here is drawn from
+#: ``tests/fixtures/write_triage_calibration.jsonl``; drawing from it would be
+#: training on the test set, and the judge suite asserts the disjointness
+#: rather than trusting this note. Nothing here interpolates an id, a
+#: category, an agent or any repo context either: PRD C1 keeps all of that out
+#: of the judge, and a prompt that renders no metadata AT ALL is what makes
+#: that structural.
+_EXEMPLAR_CANDIDATE = 'The greenhouse thermostat is calibrated in Fahrenheit.'
+
+JUDGE_EXEMPLARS: tuple[JudgeExemplar, ...] = (
+    JudgeExemplar(
+        entry='Setpoints for the glasshouse heater are entered in degrees F.',
+        candidate=_EXEMPLAR_CANDIDATE,
+        verdict='restates',
+    ),
+    JudgeExemplar(
+        entry=(
+            'Glasshouse setpoints are entered in degrees F, and the display '
+            'rounds to the nearest whole degree.'
+        ),
+        candidate=_EXEMPLAR_CANDIDATE,
+        verdict='amends',
+    ),
+    JudgeExemplar(
+        entry='The greenhouse thermostat was replaced in March after its relay failed.',
+        candidate=_EXEMPLAR_CANDIDATE,
+        verdict='distinct',
+    ),
+    JudgeExemplar(
+        entry='The greenhouse thermostat reads only in Celsius; it has no Fahrenheit mode.',
+        candidate=_EXEMPLAR_CANDIDATE,
+        verdict='contests',
+    ),
+)
 
 #: How much of a rejected payload is quoted back in the raised message. The
 #: message reaches a log line via ``triage_write``'s ``exc_info``, and a model
@@ -186,6 +266,63 @@ _FIELD_CHARS = 1_200
 #: silent truncation hands the model a severed sentence to read as the whole
 #: record, and "this text continues" is information the verdict depends on.
 _ELIDED_MARKER = '…[elided]'
+
+#: C1's ~2.5k-token call budget, expressed in the units this module can
+#: actually count: 2_500 tokens at the conventional 4 chars/token.
+#:
+#: WHAT IT BOUNDS is the WHOLE call — :data:`JUDGE_SYSTEM_PROMPT` plus a
+#: worst-case :func:`build_judge_prompt` render, meaning
+#: :data:`_DEFAULT_JUDGE_CANDIDATE_COUNT` candidates and a new entry with
+#: every field over :data:`_FIELD_CHARS`, each candidate carrying the 36-char
+#: uuid a real record has, and the ``attach_target`` line rendered. Not the
+#: system prompt alone: the two halves are summed on every request, so
+#: budgeting either in isolation budgets nothing. And not a construction
+#: :func:`judge_write` never makes, for the same reason.
+#:
+#: WHY IT IS A CONSTANT rather than a literal in the test that checks it. The
+#: system prompt is the half that grows — a vocabulary word, a worked example,
+#: a decision rule all land there — so the ceiling needs a home next to the
+#: rationale for its value. Raising it is then an edit to the thing being
+#: budgeted, made where C1 is cited, rather than a number quietly relaxed in a
+#: test until it stops failing.
+#:
+#: THE TOLERANCE TERM IS NOT PADDING. Both inputs to the headline figure are
+#: approximations: C1 writes "~2.5k", and 4 chars/token is a convention, NOT a
+#: measurement — this package does not depend on a tokenizer, so nothing here
+#: has counted the real tokens and no claim is made about them. Multiplying
+#: two approximations and then treating the product as a hard wall is a false
+#: precision, and it bites asymmetrically: a rendering 0.5% over would read as
+#: a C1 violation when it is inside "~2.5k" on any reading.
+#:
+#: The tolerance is SIZED, not chosen for comfort — but what has to stay
+#: small is the SLACK, budget minus the measured worst case, which is what a
+#: future addition could spend without anyone having to come here. That slack
+#: is 140 chars. The four worked examples presently rendered cost 157 to 192
+#: chars apiece including the blank line between them, so even the cheapest
+#: fifth one does not fit and its author has to either make room or make the
+#: case here. A ceiling that admitted another example would have stopped
+#: bounding anything.
+#:
+#: Measured at task 4811, PRODUCTION-SHAPED and with the elision marker
+#: counted: the worst case is 10_260 chars — system 2_312, plus a 7_948-char
+#: render of six fields each OVER `_FIELD_CHARS`. The first measurement read
+#: 10_051 because it was built from 5-char stand-in ids and no attach target,
+#: neither of which production ever hands this function. The 209-char
+#: difference is not slop:
+#:
+#: * every stored record's id is a 36-char uuid — all 104 in
+#:   ``tests/fixtures/write_triage_calibration.jsonl`` are — and
+#:   :func:`build_judge_prompt` renders ``- id: {candidate.id}`` UN-elided, so
+#:   a full slate costs 155 chars more than short ids suggest;
+#: * :func:`judge_write` forwards ``attach_target_id`` on every call, so the
+#:   ``  attach_target: {id}`` line is always rendered — 54 more chars, a
+#:   fixed cost of the call rather than an optional extra.
+#:
+#: Note "over" `_FIELD_CHARS`, not "at": `_elide` returns a field of exactly
+#: `_FIELD_CHARS` unchanged and cuts a longer one to `_FIELD_CHARS` plus
+#: `_ELIDED_MARKER`, so the widest render is 9 chars per field — 54 across the
+#: six — wider than a slate built at the cap.
+_PROMPT_CHAR_BUDGET = 2_500 * 4 + 400
 
 
 def _elide(text: object) -> str:
@@ -274,6 +411,28 @@ def select_judge_candidates(
 
 # --- prompt -----------------------------------------------------------------
 
+def _render_exemplars(exemplars: Sequence[JudgeExemplar]) -> str:
+    """The EXAMPLES section of the system prompt: one block per exemplar.
+
+    A FUNCTION OF THE TUPLE ALONE — pure, total, and walking the sequence in
+    the order given. That is what makes the system prompt byte-identical on
+    every import, which is in turn the precondition for an eval run being
+    reproducible: this file has been bitten once by an iteration order moving
+    between two processes.
+
+    The formatting lives here rather than in :data:`JUDGE_EXEMPLARS` so the
+    data stays checkable — vocabulary closure and verdict coverage are
+    assertions about fields, not greps over a rendered blob — and so two
+    exemplars cannot disagree about their own layout.
+    """
+    return '\n\n'.join(
+        f'new entry: {exemplar.entry}\n'
+        f'candidate: {exemplar.candidate}\n'
+        f'answer: {exemplar.verdict}'
+        for exemplar in exemplars
+    )
+
+
 #: The judge's standing instructions. D3 lives HERE, in the model's own
 #: prompt, not only in a docstring: a model told merely to "classify" will
 #: happily decide which of two contradictory memories is true, and reify
@@ -288,9 +447,8 @@ entry is correct, and you do not merge, rewrite or rank them.
 
 Answer with exactly one of these four words:
 
-- "distinct" — the new entry is about something the candidates do not cover. \
-Overlapping vocabulary is not enough; the new entry has to be making \
-substantially the same claim as a candidate to be anything else.
+- "distinct" — no candidate makes the same core claim as the new entry. \
+Shared wording alone neither makes a match nor rules one out.
 - "restates" — the new entry asserts what a candidate already asserts, adding \
 nothing new. A paraphrase restates.
 - "amends" — the new entry asserts what a candidate asserts AND adds \
@@ -304,9 +462,15 @@ are not in conflict. You are DETECTING a contradiction so a human or a \
 downstream gate can adjudicate it; you are NOT deciding which side is true, \
 and nothing you say here deletes or edits anything.
 
-When more than one word fits, prefer the earlier one in that list: \
-"distinct" over "restates", "restates" over "amends", "amends" over \
-"contests".
+Decide in this order. First ask whether ANY candidate makes the same core \
+claim as the new entry. If one does, the answer is "restates" or "amends", \
+never "distinct"; answer "distinct" only when none does. Between "amends" \
+and "contests", prefer "amends" — a genuine incompatibility is a last \
+resort, not a default reading.
+
+Worked examples:
+
+{_render_exemplars(JUDGE_EXEMPLARS)}
 
 Reply with a bare JSON object and nothing else:
 

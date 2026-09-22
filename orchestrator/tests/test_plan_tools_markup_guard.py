@@ -61,6 +61,7 @@ from typing import Any
 import pytest
 from _markup_helpers import (
     INVOKE_CLOSER,
+    LT,
     assert_no_raw_sentinels,
     closer,
     param_opener,
@@ -70,10 +71,10 @@ from escalation.models import Escalation
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
-from shared.toolcall_markup import MARKUP_OVERRIDE_KEY, detect, repair
+from shared.toolcall_markup import ENVELOPE_LITERALS, MARKUP_OVERRIDE_KEY, detect, repair
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.mcp import markup_journal, markup_sink, plan_tools
+from orchestrator.mcp import markup_journal, markup_sink, plan_markup_stamp, plan_tools
 from orchestrator.workflow import _is_gating_escalation
 
 # The sentinel builders and the import-time self-scan live in
@@ -147,6 +148,20 @@ def _clear_reported_refusals():
     plan_tools._REPORTED_REFUSALS.clear()
 
 
+@pytest.fixture(autouse=True)
+def _clear_pending_refusals():
+    """Clear the markup stamp's pending buffer around every test.
+
+    THE SAME shape and the same reason as ``_clear_reported_refusals`` above:
+    process-global state on a per-agent stdio server, which one test would
+    otherwise leak into the next — here inflating a stamped count, which
+    several rows below assert exactly.
+    """
+    plan_markup_stamp.clear_pending()
+    yield
+    plan_markup_stamp.clear_pending()
+
+
 def journal_lines(root: Path) -> list[dict[str, Any]]:
     """Every plan-tools markup fact journalled under *root*, parsed.
 
@@ -179,6 +194,32 @@ class Harness:
 
     def plan_bytes(self) -> bytes:
         return self.plan_path.read_bytes()
+
+    def authored_plan(self) -> dict[str, Any]:
+        """The plan with the guard's own bookkeeping block removed (task 4597).
+
+        THE CONTRACT THIS SERVER PINS, at the level it is actually about.
+
+        It used to read "a refused call leaves plan.json BYTE-identical", and
+        that byte comparison was a PROXY for a property about VALUES: the
+        registration comment justifies the reject policy because "forwarding a
+        repair would write a guessed-at document that every later reader
+        inherits", and the middleware header says "no middleware-repaired value
+        can ever reach plan.json". Task 4597 wires a second fact consumer that
+        stamps a `_markup_rejections` counter, so the bytes DO change on a
+        refusal — but the property they stood for is preserved intact, and
+        comparing authored documents asserts it directly rather than by proxy.
+
+        Nothing guessed, repaired or caller-authored can reach the document
+        through the stamp: `tool` and `param` come from the invoked tool's own
+        registration and schema, `outcome` from the guard's closed vocabulary,
+        `ts` from the clock. The counter's own contents are pinned separately
+        by ``TestTheRefusalIsCountedOnThePlan``, including the control that it
+        carries no envelope markup and none of the refused payload.
+        """
+        plan = self.plan()
+        plan.pop(plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY, None)
+        return plan
 
     def plan(self) -> dict[str, Any]:
         return json.loads(self.plan_path.read_text(encoding='utf-8'))
@@ -286,7 +327,7 @@ class TestAbsorbedSiblingIsRejected:
     async def test_the_tool_body_never_ran(self, harness: Harness):
         """What makes "reject writes nothing" TRUE rather than merely intended."""
         await harness.seed_plan()
-        before = harness.plan_bytes()
+        before = harness.authored_plan()
 
         with pytest.raises(ToolError) as excinfo:
             await harness.call('add_design_decision', {'decision': ABSORBED_RATIONALE})
@@ -296,7 +337,9 @@ class TestAbsorbedSiblingIsRejected:
             'required argument" also writes nothing, so without this pin '
             'the row would pass with no middleware registered at all'
         )
-        assert harness.plan_bytes() == before, 'a rejected call must not touch plan.json'
+        assert harness.authored_plan() == before, (
+            'a rejected call must not touch a single authored field'
+        )
         assert harness.plan()['design_decisions'] == []
 
 
@@ -420,7 +463,7 @@ class TestComposesWithTheReadTimeRepair:
         """
         await harness.seed_plan()
         harness.store_damaged_rationale()
-        damaged = harness.plan_bytes()
+        damaged = harness.authored_plan()
 
         with pytest.raises(ToolError) as excinfo:
             await harness.call('add_design_decision', {'decision': ABSORBED_RATIONALE})
@@ -430,8 +473,15 @@ class TestComposesWithTheReadTimeRepair:
             'required argument" also writes nothing, so without this pin '
             'the row would pass with no middleware registered at all'
         )
-        assert harness.plan_bytes() == damaged, (
+        assert harness.authored_plan() == damaged, (
             'the tool body never ran, so the STORED damage is still there'
+        )
+        assert harness.plan()['design_decisions'][0]['rationale'] == (
+            STORED_TRAILING_RATIONALE
+        ), (
+            'WHAT THIS ROW WAS ALWAYS ABOUT: the damaged value is byte-'
+            'identical, deferred rather than lost. The counter stamped '
+            'alongside it touches no stored field.'
         )
 
         result = await harness.call(
@@ -457,7 +507,16 @@ class TestTheDeclarationIsMachineChecked:
         ]
 
         assert len(guards) == 1, 'one guard, one boundary — never two on one server'
-        assert guards[0].policy is RepairPolicy.REJECT_WITH_REPAIR
+        assert guards[0].policy is RepairPolicy.REJECT_WITH_REPAIR, (
+            'PRD section 4 C2 declares REJECT_WITH_REPAIR for this server. Task '
+            '4597 now RESTS ON THIS: the plan.json counter is named '
+            '"_markup_rejections" because under this policy the repaired '
+            'outcome cannot occur, so every fact the stamp sees is a refusal. '
+            'Flipping this to FORWARD_REPAIR would silently make that name a '
+            'lie — the per-event `outcome` would still be honest, but the '
+            "block's own name and its note would not. Change the counter's "
+            'vocabulary in the same commit, or do not change this.'
+        )
         assert guards[0].exempt_tools == frozenset(), (
             'the empty exemption set is a DECLARATION, not an omission: no '
             'plan-tools tool has searching for envelope literals as its job'
@@ -686,9 +745,15 @@ class TestTheWidenedRepairVocabularyStaysContained:
 
     @pytest.mark.asyncio
     async def test_nothing_reaches_the_plan(self, harness: Harness):
-        """The containment that matters: the document is not touched."""
+        """The containment that matters: no AUTHORED field is touched.
+
+        Compared as ``authored_plan()`` rather than bytes: since task 4597 a
+        refusal stamps the guard's own ``_markup_rejections`` block, so the
+        bytes DO move — and the property this row defends never was about
+        bytes. See ``Harness.authored_plan``.
+        """
         await harness.seed_plan()
-        before = harness.plan_bytes()
+        before = harness.authored_plan()
 
         with pytest.raises(ToolError):
             await harness.call(
@@ -696,7 +761,10 @@ class TestTheWidenedRepairVocabularyStaysContained:
                 {'decision': METADATA_TAIL_DECISION, 'rationale': 'A rationale.'},
             )
 
-        assert harness.plan_bytes() == before
+        assert harness.authored_plan() == before, (
+            'a rejected call must not touch a single authored field'
+        )
+        assert harness.plan()['design_decisions'] == []
 
     @pytest.mark.asyncio
     async def test_the_recovered_tail_is_handed_back_not_swallowed(
@@ -1326,11 +1394,11 @@ class TestUnrepairableResidueIsPreserved:
         """(e) Refusing is what makes the residue the ONLY copy — so it must hold."""
         rig = build_residue_rig(monkeypatch, artifacts)
         await rig.harness.seed_plan()
-        before = rig.harness.plan_bytes()
+        before = rig.harness.authored_plan()
 
         await rig.refuse('add_design_decision', {'decision': UNREPAIRABLE_DECISION})
 
-        assert rig.harness.plan_bytes() == before
+        assert rig.harness.authored_plan() == before
         assert rig.harness.plan()['design_decisions'] == []
 
 
@@ -2176,22 +2244,35 @@ class TestTheRejectionReachesADurableJournal:
         )
 
     @pytest.mark.asyncio
-    async def test_a_rejection_still_writes_nothing_to_the_plan(
+    async def test_a_rejection_still_writes_no_caller_content_to_the_plan(
         self, monkeypatch, artifacts: TaskArtifacts, tmp_path
     ):
-        """The journal is additive in the other direction too.
+        """The fact channels are additive in the other direction too.
 
-        "Reject writes nothing" is the contract the whole policy rests on; a new
-        write-side channel is exactly the kind of change that could quietly
-        breach it.
+        This row used to read "a rejection still writes NOTHING to the plan",
+        and warned that "a new write-side channel is exactly the kind of change
+        that could quietly breach it". Task 4597 adds exactly such a channel —
+        LOUDLY rather than quietly, in the commit that amends this row.
+
+        What the row was defending is unchanged, and is what it now says: a
+        rejection writes no CALLER CONTENT. The old byte comparison was a proxy
+        for a property about VALUES, and the property is stronger than the
+        proxy — the stamped block contains no caller-supplied bytes at all,
+        which ``TestTheRefusalIsCountedOnThePlan`` asserts against the encoded
+        block directly. What would still be a breach, and what this row still
+        catches, is any authored field moving.
+
+        The journal line is asserted alongside it because the two channels are
+        now composed: a fan-out that silently cost the journal its line would
+        move the dead end task 4744 closed rather than close it.
         """
         rig = build_residue_rig(monkeypatch, artifacts)
         await rig.harness.seed_plan()
-        before = rig.harness.plan_bytes()
+        before = rig.harness.authored_plan()
 
         await rig.refuse('add_design_decision', {'decision': ABSORBED_RATIONALE})
 
-        assert rig.harness.plan_bytes() == before
+        assert rig.harness.authored_plan() == before
         assert len(journal_lines(tmp_path)) == 1, 'the record went to the journal'
 
 
@@ -2280,3 +2361,401 @@ class TestTheStormRecordNamesTheJournal:
         assert len(lines) == 2, 'one line per rejection in the window'
         assert {line['subject_task_id'] for line in lines} == {'test-1'}
         assert {line['outcome'] for line in lines} == {'rejected'}
+
+
+# ---------------------------------------------------------------------------
+# The composed fact sink — two channels, isolated per arm (task 4597).
+# ---------------------------------------------------------------------------
+
+
+class _RecordingArm:
+    """One fake fact-sink arm: records what it saw, or raises on demand."""
+
+    def __init__(self, locator: str | None = None, error: Exception | None = None):
+        self.locator = locator
+        self.error = error
+        self.seen: list[Any] = []
+
+    async def __call__(self, record):
+        self.seen.append(record)
+        if self.error is not None:
+            raise self.error
+        return self.locator
+
+
+def _compose(monkeypatch, artifacts, journal: _RecordingArm, stamp: _RecordingArm):
+    """Build ``_markup_fact_sink`` over two fake arms.
+
+    Substitutes the module-level SEAMS rather than reaching into the built
+    sink, which is the convention ``_markup_escalation_sink`` and
+    ``_markup_fact_journal`` already keep on this module.
+    """
+    monkeypatch.setattr(plan_tools, '_markup_fact_journal', lambda _a: journal)
+    monkeypatch.setattr(plan_tools, '_markup_plan_stamp', lambda _a: stamp)
+    return plan_tools._markup_fact_sink(artifacts)
+
+
+class TestTheFactSinkFansOutToBothChannels:
+    """The middleware takes exactly ONE ``fact_sink``, so plan-tools composes.
+
+    Teaching ``MarkupGuardMiddleware`` about a list of sinks would change a
+    boundary shared with verdict-tools and the escalation server for a need
+    only this one has — neither of the others has a ``plan.json`` to stamp.
+    Composing at the registration site is where every other server-specific
+    answer on this boundary already lives.
+    """
+
+    @pytest.mark.asyncio
+    async def test_both_arms_see_the_same_record(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        journal, stamp = _RecordingArm('journal.jsonl'), _RecordingArm('plan.json')
+        sink = _compose(monkeypatch, artifacts, journal, stamp)
+        record = {'fact': 'markup_detected', 'tool': 'add_design_decision'}
+
+        await sink(record)
+
+        assert journal.seen == [record]
+        assert stamp.seen == [record]
+
+    @pytest.mark.asyncio
+    async def test_the_journals_locator_is_what_comes_back(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """The existing fact-sink return contract is unchanged.
+
+        The journal is the established durable record and the one the storm
+        escalation points an operator at, so it keeps ownership of the return
+        value; the stamp is additive.
+        """
+        journal, stamp = _RecordingArm('journal.jsonl'), _RecordingArm('plan.json')
+        sink = _compose(monkeypatch, artifacts, journal, stamp)
+
+        assert await sink({'tool': 'add_design_decision'}) == 'journal.jsonl'
+
+
+class TestTheTwoArmsAreIsolatedFromEachOther:
+    """PER-ARM isolation, and it is load-bearing rather than defensive style.
+
+    ``MarkupGuardMiddleware._call_sink`` wraps the WHOLE sink in one
+    try/except. A composed sink that let the journal's exception propagate
+    would therefore silently skip the stamp entirely — one channel's outage
+    taking the other down, which is the exact fail-soft the containment PRD
+    exists to end.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_failing_journal_still_lets_the_stamp_run(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        journal = _RecordingArm(error=OSError('the journal is unwritable'))
+        stamp = _RecordingArm('plan.json')
+        sink = _compose(monkeypatch, artifacts, journal, stamp)
+
+        result = await sink({'tool': 'add_design_decision'})
+
+        assert stamp.seen, 'the stamp was skipped by the journal outage'
+        assert result is None, 'no journal line, so no journal locator to report'
+
+    @pytest.mark.asyncio
+    async def test_a_failing_stamp_still_returns_the_journals_locator(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        journal = _RecordingArm('journal.jsonl')
+        stamp = _RecordingArm(error=ValueError('the plan is unwritable'))
+        sink = _compose(monkeypatch, artifacts, journal, stamp)
+
+        assert await sink({'tool': 'add_design_decision'}) == 'journal.jsonl'
+
+    @pytest.mark.asyncio
+    async def test_the_composed_sink_never_raises_even_when_both_arms_fail(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """The outcome is already DECIDED by the time either arm runs."""
+        journal = _RecordingArm(error=OSError('boom'))
+        stamp = _RecordingArm(error=OSError('boom'))
+        sink = _compose(monkeypatch, artifacts, journal, stamp)
+
+        assert await sink({'tool': 'add_design_decision'}) is None
+
+    @pytest.mark.asyncio
+    async def test_the_journal_runs_first(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """Order is a DECLARATION, not an accident.
+
+        The journal is the established durable record, so a stamp failure can
+        never delay it.
+        """
+        order: list[str] = []
+
+        async def journal(record):
+            order.append('journal')
+            return 'journal.jsonl'
+
+        async def stamp(record):
+            order.append('stamp')
+            return 'plan.json'
+
+        monkeypatch.setattr(plan_tools, '_markup_fact_journal', lambda _a: journal)
+        monkeypatch.setattr(plan_tools, '_markup_plan_stamp', lambda _a: stamp)
+
+        await plan_tools._markup_fact_sink(artifacts)({'tool': 'add_design_decision'})
+
+        assert order == ['journal', 'stamp']
+
+
+# ---------------------------------------------------------------------------
+# The rejected-call counter, end to end on the real server (task 4597).
+# ---------------------------------------------------------------------------
+
+
+class TestTheRefusalIsCountedOnThePlan:
+    """esc-4528-1: ``design_decisions: []`` must stop being ambiguous.
+
+    Before this, a refused call left the plan untouched, so an empty list read
+    identically whether the architect never called or called six times and was
+    refused six times. In task 4528 a reviewer could tell the two apart only
+    because the architect happened to hand-file an info note.
+
+    Driven through the REAL ``create_server`` over a ``Client``, because
+    middleware is bypassed by ``tool.fn`` / ``tool.run`` /
+    ``_tool_manager.call_tool`` — a test written any of those ways would pass
+    while running none of the guard.
+    """
+
+    @staticmethod
+    def _block(rig: ResidueRig) -> dict[str, Any]:
+        return rig.harness.plan()[plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY]
+
+    @pytest.mark.asyncio
+    async def test_a_rejected_call_is_counted_with_its_tool_and_parameter(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        rig = build_residue_rig(monkeypatch, artifacts)
+        await rig.harness.seed_plan()
+
+        payload = await rig.refuse(
+            'add_design_decision', {'decision': ABSORBED_RATIONALE}
+        )
+
+        assert payload['error_type'] == 'mcp_markup_detected'
+        block = self._block(rig)
+        assert block['count'] == 1
+        assert block['by_tool'] == {'add_design_decision': 1}
+        assert len(block['events']) == 1
+        assert block['events'][0]['param'] == 'decision'
+        assert block['events'][0]['outcome'] == 'rejected'
+        assert block['note'] == plan_markup_stamp.STAMP_NOTE
+        assert 'events_truncated' not in block, 'one event is not a cut list'
+
+    @pytest.mark.asyncio
+    async def test_the_authored_document_is_exactly_what_it_was(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """The counter records the LOSS; it does not stand in for the call.
+
+        ``design_decisions`` is still the empty list the tool body would have
+        appended to — the whole point of the reject policy is that nothing
+        guessed reaches the document.
+        """
+        rig = build_residue_rig(monkeypatch, artifacts)
+        await rig.harness.seed_plan()
+        before = rig.harness.plan()
+
+        await rig.refuse('add_design_decision', {'decision': ABSORBED_RATIONALE})
+
+        after = rig.harness.plan()
+        assert after.pop(plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY)
+        assert after == before, 'the block is the ONLY difference'
+        assert after['design_decisions'] == []
+
+    @pytest.mark.asyncio
+    async def test_the_block_carries_no_markup_and_no_refused_payload(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """The load-bearing control, on the artifact every reader opens.
+
+        ``plan.json`` is embedded verbatim into four architect-facing prompts
+        and walked recursively by ``scripts/sweep_toolcall_markup.py``, so a
+        stored literal would both reproduce the defect and inflate the census
+        the sweep exists to report. The raw payload has exactly one owner, the
+        residue escalation.
+        """
+        rig = build_residue_rig(monkeypatch, artifacts)
+        await rig.harness.seed_plan()
+
+        await rig.refuse('add_design_decision', {'decision': ABSORBED_RATIONALE})
+
+        encoded = json.dumps(self._block(rig))
+        assert detect(encoded) is None
+        for sequence in (*ENVELOPE_LITERALS, LT + '/', LT + 'parameter '):
+            assert sequence not in encoded, f'the block carries {sequence!r}'
+        assert _RATIONALE_PROSE not in encoded, 'the absorbed payload stayed out'
+        assert _DECISION_PROSE not in encoded, 'the refused payload stayed out'
+
+    @pytest.mark.asyncio
+    async def test_the_unrepairable_path_is_counted_under_its_own_outcome(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """The seventh-call shape from esc-4528 — a payload that cannot be repaired.
+
+        ``outcome`` is the fact channel's own name for what the caller-facing
+        error renders as ``error_type``, recorded verbatim rather than
+        respelled: the reject-path literal lives inline in the middleware's
+        private ``_reject`` and is not exported.
+        """
+        rig = build_residue_rig(monkeypatch, artifacts)
+        await rig.harness.seed_plan()
+
+        payload = await rig.refuse(
+            'add_design_decision', {'decision': UNREPAIRABLE_DECISION}
+        )
+
+        assert payload['error_type'] == 'mcp_markup_unrepairable'
+        block = self._block(rig)
+        assert block['count'] == 1
+        assert block['events'][0]['outcome'] == 'unrepairable'
+        assert block['by_tool'] == {'add_design_decision': 1}
+
+    @pytest.mark.asyncio
+    async def test_repeated_refusals_accumulate_across_tools(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """The question the block exists to answer: were five calls lost?"""
+        rig = build_residue_rig(monkeypatch, artifacts)
+        await rig.harness.seed_plan()
+
+        for _ in range(3):
+            await rig.refuse(
+                'add_design_decision', {'decision': ABSORBED_RATIONALE}
+            )
+        await rig.refuse('add_reuse_item', {'what': ABSORBED_RATIONALE})
+
+        block = self._block(rig)
+        assert block['count'] == 4
+        assert block['by_tool'] == {'add_design_decision': 3, 'add_reuse_item': 1}
+
+    @pytest.mark.asyncio
+    async def test_the_journal_line_is_still_written(
+        self, monkeypatch, artifacts: TaskArtifacts, tmp_path
+    ):
+        """The composition JOINED a channel; it did not displace one.
+
+        The journal is what the storm escalation points an operator at, so a
+        fan-out that silently cost it its line would move the dead end task
+        4744 closed rather than close it.
+        """
+        rig = build_residue_rig(monkeypatch, artifacts)
+        await rig.harness.seed_plan()
+
+        await rig.refuse('add_design_decision', {'decision': ABSORBED_RATIONALE})
+
+        (line,) = journal_lines(tmp_path)
+        assert line['tool'] == 'add_design_decision'
+        assert line['outcome'] == 'rejected'
+        assert self._block(rig)['count'] == 1, 'and the stamp landed too'
+
+    @pytest.mark.asyncio
+    async def test_a_clean_plan_never_grows_the_key(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """THE OVERWHELMINGLY COMMON PATH stays byte-identical to today.
+
+        Absent, not present-and-zero: the block's PRESENCE is the whole signal,
+        so a key that appeared on every plan in the fleet would mean nothing.
+        """
+        rig = build_residue_rig(monkeypatch, artifacts)
+        await rig.harness.seed_plan()
+
+        await rig.harness.call(
+            'add_design_decision',
+            {'decision': 'A clean decision.', 'rationale': 'A clean rationale.'},
+        )
+
+        assert plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY not in rig.harness.plan()
+
+
+class TestARefusalBeforeThePlanExistsIsAdoptedByIt:
+    """The one gap the eager stamp cannot close alone.
+
+    A refused ``create_plan`` has no document to stamp — the middleware's own
+    docs name the case — and ``test_no_plan_is_written`` pins that no plan file
+    appears, which the counter must not violate. Without a buffer, the loudest
+    leak shape on this server (an architect bounced repeatedly before its plan
+    even exists) would be the one case the counter could never describe.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_refused_create_plan_still_writes_no_plan_at_all(
+        self, harness: Harness
+    ):
+        """The standing invariant survives the eager stamp.
+
+        Stamping here would MANUFACTURE a plan out of a refusal — no task_id,
+        no title, no analysis — which every later reader would inherit as the
+        architect's own work.
+        """
+        with pytest.raises(ToolError):
+            await harness.call(
+                'create_plan',
+                {'task_id': 'test-1', 'title': ABSORBED_ANALYSIS, 'files': ['a.py']},
+            )
+
+        assert not harness.plan_path.exists()
+        pending = plan_markup_stamp.pending_block()
+        assert pending is not None and pending['count'] == 1, (
+            'buffered rather than lost'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_next_successful_create_plan_adopts_the_refusal(
+        self, harness: Harness
+    ):
+        with pytest.raises(ToolError):
+            await harness.call(
+                'create_plan',
+                {'task_id': 'test-1', 'title': ABSORBED_ANALYSIS, 'files': ['a.py']},
+            )
+
+        await harness.seed_plan()
+
+        plan = harness.plan()
+        block = plan[plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY]
+        assert block['count'] == 1
+        assert block['by_tool'] == {'create_plan': 1}
+        assert plan['title'] == 'A clean plan', (
+            'every authored field is exactly what the successful call supplied'
+        )
+        assert plan['analysis'] == 'Clean analysis prose describing the approach.'
+        assert plan_markup_stamp.pending_block() is None, 'the buffer was drained'
+
+    @pytest.mark.asyncio
+    async def test_a_second_create_plan_carries_the_block_forward(
+        self, monkeypatch, artifacts: TaskArtifacts
+    ):
+        """``_create_plan`` overwrites ``plan.json`` WHOLESALE.
+
+        Without the carry-forward, a re-plan would erase a counter earned
+        earlier in the same session — losing exactly the record it exists to
+        keep, at the moment a reader most wants it.
+        """
+        rig = build_residue_rig(monkeypatch, artifacts)
+        await rig.harness.seed_plan()
+        await rig.refuse('add_design_decision', {'decision': ABSORBED_RATIONALE})
+        assert rig.harness.plan()[plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY]['count'] == 1
+
+        await rig.harness.seed_plan()
+
+        block = rig.harness.plan()[plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY]
+        assert block['count'] == 1, 'the earlier refusal survived the overwrite'
+        assert block['by_tool'] == {'add_design_decision': 1}
+
+    @pytest.mark.asyncio
+    async def test_a_session_with_no_refusal_produces_no_key_at_all(
+        self, harness: Harness
+    ):
+        """The clean path stays byte-identical to what it is today."""
+        await harness.seed_plan()
+
+        assert plan_markup_stamp.PLAN_MARKUP_REJECTIONS_KEY not in harness.plan()

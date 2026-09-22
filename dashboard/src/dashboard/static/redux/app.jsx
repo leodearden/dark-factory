@@ -25,6 +25,23 @@ const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
   "showHints": true
 }/*EDITMODE-END*/;
 
+// The wall clock advances once a second; only the timestamp needs to re-render
+// for it. Owning that interval HERE rather than in App() is what keeps the
+// active tab off the 1s cadence — App re-renders on data arrival (~20/min),
+// not on the clock (~60/min). Measured 2026-09-20: with polling frozen, the
+// clock tick alone still accounted for two thirds of the main thread's blocked
+// time, because no tab is wrapped in React.memo and most memoize nothing.
+// Hoisting a timer back into App() silently restores that cost.
+function LiveClock({ live }) {
+  const [now, setNow] = uS(new Date());
+  uE(() => {
+    if (!live) return;
+    const t = setInterval(() => setNow(new Date()), 1000);
+    return () => clearInterval(t);
+  }, [live]);
+  return <>{now.toLocaleTimeString('en-GB', { hour12: false })}</>;
+}
+
 function App() {
   const [tab, setTab] = uS('overview');
   // Cross-tab handoff for the memory-eval escalation links. The SPA has no
@@ -50,14 +67,6 @@ function App() {
   uE(() => {
     document.documentElement.style.setProperty('--pad', tw.density === 'compact' ? '8px' : tw.density === 'roomy' ? '16px' : '12px');
   }, [tw.density]);
-
-  // Last-update tick
-  const [now, setNow] = uS(new Date());
-  uE(() => {
-    if (tw.pauseLive) return;
-    const t = setInterval(() => setNow(new Date()), 1000);
-    return () => clearInterval(t);
-  }, [tw.pauseLive]);
 
   // Re-render when the data loader refreshes window.DF_DATA.
   const [, setDataTick] = uS(0);
@@ -120,8 +129,6 @@ function App() {
     esc: DD.ESCALATIONS?.summary?.by_status?.pending ?? 0,
   };
 
-  const ts = now.toLocaleTimeString('en-GB', { hour12: false });
-
   // Per-endpoint staleness for the ACTIVE tab (task 4884, #4791).
   //
   // ONE render site, not thirteen: the tab -> endpoint mapping lives in
@@ -134,8 +141,9 @@ function App() {
   // source on the bare identifier — a second mention would shift its slice.)
   //
   // No new timer and no second listener: the df-data-refresh effect above
-  // already re-renders every poll cycle, and the 1s `now` tick re-renders
-  // while unpaused, so the reported age advances on its own.
+  // already re-renders every poll cycle, so the reported age advances on its
+  // own. The wall clock is deliberately NOT a second source of App renders —
+  // it lives in LiveClock, whose 1s tick re-renders the timestamp alone.
   const staleNotices = staleNoticesForTab({ tab, stale: DD.__stale || {}, now: Date.now() });
 
   function renderTab() {
@@ -192,7 +200,7 @@ function App() {
           <span style={{ color: 'var(--fg-3)' }}>/</span>
           <span className="here">{tabLabel}</span>
         </div>
-        <StatStrip live={!tw.pauseLive} lastUpdate={ts} summary={summary} />
+        <StatStrip live={!tw.pauseLive} lastUpdate={<LiveClock live={!tw.pauseLive} />} summary={summary} />
       </div>
       <div className="main">
         <Toolbar

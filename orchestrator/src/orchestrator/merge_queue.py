@@ -519,10 +519,10 @@ to retry after the offending member catches up) from a post-merge block."""
 TRAIN_REBASE_CONFLICT_REASON_PREFIX = 'Train merge rejected: tip branch rebase conflict'
 """Prefix of the ``MergeOutcome.reason`` string emitted when the tip-branch
 rebase-onto-main step of a ``GroupMergeRequest`` fails with conflicts.
-``rebase_onto_main`` already ran ``git rebase --abort``, so the worktree is
-left clean.  The downstream classifier surfaces this to the enqueuer so the
-tip task can be re-rebased in its own worktree before the train is
-re-submitted."""
+``rebase_onto_main`` ATTEMPTED a guarded ``git rebase --abort``; that can
+fail, so this is not proof of a clean tree.  The downstream classifier
+surfaces this to the enqueuer so the tip task can be re-rebased in its own
+worktree before the train is re-submitted."""
 
 TRAIN_VERIFY_FAILED_REASON_PREFIX = (
     'Train union verify failed (re-verifying members as singles)'

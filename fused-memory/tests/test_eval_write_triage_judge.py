@@ -1878,6 +1878,47 @@ class TestCommittedJudgeAccuracyReportIsTraceable:
             f'must be a positive integer'
         )
 
+    def test_the_published_slate_width_is_one_the_model_could_actually_see(
+        self,
+    ) -> None:
+        """`candidate_count` must not overstate the evidence the judge had.
+
+        Two different numbers, and the artifact publishes both:
+        `candidate_count` is the widest slate `build_judge_cases` BUILT, while
+        `judge_candidate_count` is the cap `judge_write` re-trims to before
+        the prompt is composed. When the first exceeds the second the model
+        saw the narrower slate, and a reader taking `candidate_count` as "what
+        the judge was shown" is reading an overstatement of the evidence base.
+
+        `run_judge_eval` already notices this — it logs "slate widths ran N..M
+        but judge_candidate_count caps the prompt at K". A log line is read
+        once, by whoever happened to be watching the run; the artifact is read
+        at the task-3169 flip gate, months later, by someone who was not. This
+        is the assertion that moves the property from the log to the artifact.
+
+        Silent today because the shipped cap (5) and the default
+        `--distractors 4` agree, so this is GREEN ON ARRIVAL — it exists to
+        own a property nothing owned, and to check the regeneration rather
+        than merely follow it.
+
+        DERIVED FROM THE ARTIFACT ALONE. Both numbers come from the same
+        provenance block, so this cannot go red because someone edited a
+        hot-reloadable knob in `config.yaml` after the run — the hazard the
+        sibling test above declines the config comparison to avoid, and the
+        same one that keeps `CAVEATS` uncoupled from the committed report.
+        """
+        _block, report, _resolved = self._committed()
+        assert report is not None
+        provenance = report['provenance']
+        built = provenance['candidate_count']
+        cap = provenance['judge_candidate_count']
+        assert built <= cap, (
+            f'the report publishes candidate_count={built} but the judge '
+            f'trimmed every prompt to judge_candidate_count={cap} — the model '
+            f'never saw {built} candidates, so the artifact overstates the '
+            f'evidence the task-3169 operator is reading it for'
+        )
+
     def test_provenance_names_the_model_and_the_fixture(self) -> None:
         _block, report, _resolved = self._committed()
         assert report is not None
