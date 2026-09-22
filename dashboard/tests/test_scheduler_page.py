@@ -901,6 +901,56 @@ def test_shape_scheduler_envelope():
     assert result_online['SCHEDULER']['paused_projects'] == []
 
 
+def test_shape_scheduler_projects_degraded_separately_from_offline():
+    """``degraded`` reaches the wire as its OWN pair, never folded into offline.
+
+    Mirrors the ``offline``/``offline_projects`` and ``paused``/``paused_projects``
+    spelling so the UI reads one idiom, and pins that neither list ever contains
+    the other's member: offline means the read demonstrably FAILED, degraded
+    means the budget expired and the project's state is UNKNOWN.
+
+    The missing-keyword arm pins the same required-keyword contract
+    ``shape_scheduler``'s own docstring states for ``recovery_events`` — "a new
+    collector element must be threaded through here deliberately, and until it
+    is the mismatch is a loud TypeError rather than a field that silently never
+    reaches the UI".  That silent-drop class is exactly what this workstream
+    exists to close, so it is pinned rather than assumed.
+    """
+    import pytest
+
+    from dashboard.data.redux_api import shape_scheduler
+
+    base = {
+        'rows': [],
+        'modules': [],
+        'pin_queue': [],
+        'events_by_task': {},
+        'paused_projects': [],
+        'recovery_events': {},
+        'snapshot_at': None,
+    }
+
+    both = shape_scheduler(
+        offline_projects=['down'], degraded_projects=['slow'], **base,
+    )['SCHEDULER']
+    assert both['degraded'] is True
+    assert both['degraded_projects'] == ['slow']
+    assert both['offline'] is True
+    assert both['offline_projects'] == ['down']
+    assert 'slow' not in both['offline_projects']
+    assert 'down' not in both['degraded_projects']
+
+    offline_only = shape_scheduler(
+        offline_projects=['down'], degraded_projects=[], **base,
+    )['SCHEDULER']
+    assert offline_only['degraded'] is False, (
+        'an offline project must never raise the degraded marker'
+    )
+
+    with pytest.raises(TypeError):
+        shape_scheduler(offline_projects=[], **base)
+
+
 def test_shape_scheduler_top_level_lists_are_shallow_copies():
     """shape_scheduler shallow-copies top-level containers so callers can mutate.
 
