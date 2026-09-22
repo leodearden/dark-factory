@@ -953,6 +953,20 @@ _CLEARANCE_QUALIFIER = (
 )
 _CLEARANCE_IN_CLAUSE = rf'(?=[^.;]*\b{_CLEARANCE_QUALIFIER}\b)'
 
+# A clause that also names a POSITIVE sighting is a mixed-outcome report —
+# "did not reproduce at limit=3, but fired at limit=8 this cycle" — and the
+# qualifier there scopes the sighting, not a clearance. Only an un-negated
+# verb counts: "did not reproduce at limit=3 and did not reproduce at limit=8
+# this cycle" is still a clearance claim.
+_POSITIVE_SIGHTING = (
+    r"(?<!\bnot\s)(?<!n't\s)(?<!n\u2019t\s)(?<!\bbe\s)(?<!\bnever\s)"
+    r'\b(?:reproduc(?:e|es|ed|ing)|fired|fires|recurred|recurs)\b'
+)
+_NO_POSITIVE_BEFORE_IN_CLAUSE = (
+    rf'(?:^|(?<=[.;]))(?:(?!{_POSITIVE_SIGHTING})[^.;])*?'
+)
+_NO_POSITIVE_AFTER_IN_CLAUSE = rf'(?![^.;]*{_POSITIVE_SIGHTING})'
+
 # At most a couple of determiners may sit between a negated `reproduce` and
 # the fault it is about. Anything wordier is a DIFFERENT subject wearing the
 # same words \u2014 "the stage1 stall bug did not reproduce after the Graphiti
@@ -1022,7 +1036,8 @@ _PREMISE_RULES: tuple[tuple[re.Pattern[str], str, str], ...] = (
     ),
     (
         re.compile(
-            '(?:'
+            _NO_POSITIVE_BEFORE_IN_CLAUSE
+            + '(?:'
             # <fault> did not reproduce ... this cycle
             + _PROBE_SUBJECT + r'\s+' + _NOT_REPRODUCED + _CLEARANCE_IN_CLAUSE
             + '|'
@@ -1033,7 +1048,8 @@ _PREMISE_RULES: tuple[tuple[re.Pattern[str], str, str], ...] = (
             # <fault> no longer reproduces — self-qualifying, and carries no
             # negated auxiliary for the two arms above to hang on.
             + _PROBE_SUBJECT + r'\s+no\s+longer\s+(?:be\s+)?reproduc\w*'
-            + ')',
+            + ')'
+            + _NO_POSITIVE_AFTER_IN_CLAUSE,
             re.IGNORECASE,
         ),
         'negative_probe_set_does_not_clear_intermittent_fault',

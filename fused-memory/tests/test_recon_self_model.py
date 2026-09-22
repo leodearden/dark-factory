@@ -693,6 +693,33 @@ class TestNegativeProbeSetPremise:
             'reproduce the degradation.'
         )
 
+    @pytest.mark.parametrize(
+        'report',
+        [
+            'The Graphiti degradation did not reproduce at limit=3, but '
+            'reproduced at limit=8 this cycle.',
+            'The degradation was not reproducible at limit=3 but fired at '
+            'limit=8 this cycle.',
+            'The degradation no longer reproduces at limit=3, though it fired '
+            'at limit=8.',
+            'Reproduced at limit=8, but the degradation did not reproduce at '
+            'limit=3 this cycle.',
+        ],
+    )
+    def test_positive_sighting_in_the_same_clause_is_not_flagged(self, report):
+        """A clause naming a POSITIVE sighting is a mixed-outcome report, the
+        one the protocol exists to produce. Rejecting it would also hand the
+        caller the "0 of N reproduced" wording, which is false once a probe
+        fired."""
+        assert self.INVARIANT not in self._invariants(report)
+
+    def test_negated_sighting_later_in_the_clause_is_still_flagged(self):
+        """Only an UN-negated verb makes the clause mixed-outcome."""
+        assert self.INVARIANT in self._invariants(
+            'The degradation did not reproduce at limit=3 and did not '
+            'reproduce at limit=8 this cycle.'
+        )
+
     def test_permitted_verdict_wording_is_not_flagged(self):
         """LOAD-BEARING: a rule that also rejected the sanctioned wording would
         make requirement 4 unsatisfiable -- there would be nothing a stage
