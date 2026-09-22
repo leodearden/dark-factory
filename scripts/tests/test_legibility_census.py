@@ -1539,28 +1539,17 @@ def test_render_report_dry_run_takes_precedence_over_empty_filed_ids():
     assert "create/combine/drop" not in section
 
 
-def test_render_report_filed_section_names_tickets_and_a_pending_decision():
-    # The ids in this section are TICKET ids: submit_task answers the curator
-    # path with {"ticket": ...} and the create/combine/drop decision lands
-    # asynchronously, so no task id exists when this report is written.
-    # Presenting them as task ids is the false claim task 4965 removes.
+def test_render_report_filed_section_counts_lists_and_points_at_resolve_ticket():
+    # Behaviour only; the exact wording is _GOLDEN_FLAGLESS_REPORT's to lock.
     section = _render(filed_ticket_ids=["tkt_1", "tkt_2"]).split(
         "## Filed Tasks", 1)[1].split("\n##", 1)[0]
 
     assert "2 ticket" in section, "the section must name how many tickets were filed"
-    assert "pending" in section.lower(), "the curator decision is not yet made -- say so"
-    assert "create/combine/drop" in section, "name the decision that is pending"
-    assert "no task id exists yet" in section, (
-        "a reader must not take a ticket id for a task id -- fused-memory hard "
-        "rejects a ticket-shaped id where a task id is expected"
-    )
+    bullets = [line for line in section.splitlines() if line.startswith("- ")]
+    assert bullets == ["- tkt_1", "- tkt_2"], "one bullet per ticket id, in the order filed"
     assert "resolve_ticket" in section, (
         "name the handle that turns a ticket id into the eventual task id"
     )
-    # The ids themselves stay: a ticket id is directly actionable, so the
-    # preamble supplies the semantics WITHOUT costing the operator the handle.
-    assert "- tkt_1" in section
-    assert "- tkt_2" in section
 
 
 def test_render_report_without_dry_run_filed_tasks_section_unchanged():
