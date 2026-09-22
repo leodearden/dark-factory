@@ -1007,9 +1007,9 @@ class VerifyCoverage:
     """Coverage record for the operator verify cap (``--max-verify-clusters``).
 
     ``novel`` is how many novel clusters this run's mining actually
-    produced; ``verified`` is how many of them were handed to ``verify_fn``
+    produced; ``offered`` is how many of them were handed to ``verify_fn``
     (one Sonnet call each -- the cost being bounded); ``cap`` is the
-    operator cap that produced the split. The ``novel - verified``
+    operator cap that produced the split. The ``novel - offered``
     remainder is DEFERRED, not dropped: those clusters still merge into
     the codebook as ``pending`` candidates via the untouched
     ``codebook.apply_coding_record`` path (which consumes raw mining
@@ -1026,13 +1026,21 @@ class VerifyCoverage:
     if the same confusion RECURS; a one-off deferred by the cap sits pending
     until a human adjudicates it.
 
+    ``offered``, deliberately, and NOT ``verified``: this is a COST
+    record, counting verify_fn calls made, and a cluster handed to the
+    verifier may well come back FALSE. The rendered line says "handed" for
+    the same reason. Naming it ``verified`` is what let the capped report
+    print "verified all N novel cluster(s)" directly beneath the
+    ``MassRejection`` notice saying not one of them survived -- a report
+    contradicting itself on the one run whose report must not lie.
+
     ``None`` in place of this record means no verify cap was used, so no
     coverage line is rendered. The ``## Verification`` section itself may
     still appear on the ``MassRejection`` path below -- the two signals are
     independent and can render together."""
 
     novel: int
-    verified: int
+    offered: int
     cap: int | None = None
 
 
@@ -1041,16 +1049,16 @@ class MassRejection:
     """Anomaly record: clusters were offered for verification and NOT ONE
     survived.
 
-    ``offered`` is how many were handed to ``verify_fn``. This is the
-    observable signature of the 2026-08-03 sandbox incident, where the
-    verify subprocess was rooted outside the censused tree and every read
-    was permission-denied -- a run with real findings reported as an empty
-    census. It is deliberately NOT folded into ``VerifyCoverage``: that
-    record's ``verified`` means "handed to verify_fn", not "came back
-    TRUE", so on an uncapped mass-rejection run (``novel == verified``,
-    ``cap is None``) reusing it would render "verified all N novel
-    cluster(s)" -- an actively FALSE statement on precisely the run whose
-    report must not lie.
+    ``offered`` is how many were handed to ``verify_fn`` -- the same
+    quantity ``VerifyCoverage.offered`` counts, and named identically on
+    purpose. This is the observable signature of the 2026-08-03 sandbox
+    incident, where the verify subprocess was rooted outside the censused
+    tree and every read was permission-denied -- a run with real findings
+    reported as an empty census. It is deliberately NOT folded into
+    ``VerifyCoverage``: that record is a COST record and renders on every
+    capped run, while this one is an ANOMALY record and renders only when
+    the verifier returned nothing. Two different questions, so two
+    records; they can and do render together.
 
     ``None`` in place of this record means the run did not mass-reject.
     An all-rejected run is legitimately possible, so this is a SUSPICION
@@ -1269,13 +1277,17 @@ def census_report_sections(
         )
 
     if verify_coverage is not None:
-        deferred = verify_coverage.novel - verify_coverage.verified
+        deferred = verify_coverage.novel - verify_coverage.offered
+        # "handed ... to the verifier", never "verified": this is the cap's
+        # COST, and a handed cluster may come back FALSE. The old "verified N
+        # of M" spelling read as an outcome, and directly under the
+        # mass-rejection notice above it contradicted it outright.
         if deferred > 0:
             verification.append(
-                f"- verified {verify_coverage.verified} of {verify_coverage.novel} novel "
-                f"clusters (operator verify cap: {verify_coverage.cap}); {deferred} deferred "
-                "as pending candidates -- merged into the codebook by this run but NOT "
-                "verified; adjudication deferred to a later census."
+                f"- handed {verify_coverage.offered} of {verify_coverage.novel} novel "
+                f"clusters to the verifier (operator verify cap: {verify_coverage.cap}); "
+                f"{deferred} deferred as pending candidates -- merged into the codebook "
+                "by this run but NOT verified; adjudication deferred to a later census."
             )
             # Mirrors the batch-cap disclosure above: "a later census" is
             # conditional, not automatic. This window's sightings are not
@@ -1291,8 +1303,8 @@ def census_report_sections(
             # A cap that was SET BUT NOT REACHED must not emit the deferral
             # clause -- nothing was deferred and nothing went unverified.
             verification.append(
-                f"- verified all {verify_coverage.novel} novel cluster(s); operator "
-                f"verify cap: {verify_coverage.cap} (not reached)."
+                f"- handed all {verify_coverage.novel} novel cluster(s) to the "
+                f"verifier; operator verify cap: {verify_coverage.cap} (not reached)."
             )
 
     if verification:
@@ -2130,7 +2142,7 @@ def run_census(
         clusters_to_verify = novel_clusters[:max_verify_clusters]
         verify_coverage = VerifyCoverage(
             novel=len(novel_clusters),
-            verified=len(clusters_to_verify),
+            offered=len(clusters_to_verify),
             cap=max_verify_clusters,
         )
         deferred_count = len(novel_clusters) - len(clusters_to_verify)

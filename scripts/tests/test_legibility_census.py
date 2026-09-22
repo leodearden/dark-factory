@@ -1476,7 +1476,7 @@ def _verification_bullets(sections):
 
 
 def test_render_report_verify_cap_states_verified_of_novel_and_deferred():
-    sections = _sections(verify_coverage=mod.VerifyCoverage(novel=812, verified=150, cap=150))
+    sections = _sections(verify_coverage=mod.VerifyCoverage(novel=812, offered=150, cap=150))
 
     bullets = _verification_bullets(sections)
     # TWO bullets: the deferral counts, and the conditional-pickup caveat that
@@ -1487,7 +1487,12 @@ def test_render_report_verify_cap_states_verified_of_novel_and_deferred():
     # One ordered assertion, not three independent bare-digit checks: separate
     # "150 in section" / "812 in section" checks would both still pass against
     # a transposed rendering.
-    assert "verified 150 of 812 novel clusters" in bullets[0]
+    #
+    # "handed", not "verified": the field counts verify_fn calls MADE, and a
+    # handed cluster may come back FALSE -- under the mass-rejection notice an
+    # outcome claim here would contradict it outright.
+    assert "handed 150 of 812 novel clusters" in bullets[0]
+    assert "verified 150 of 812" not in bullets[0]
     assert "operator verify cap: 150" in bullets[0]
     assert "662 deferred" in bullets[0], (
         "the deferred remainder must be STATED, not left to the reader's arithmetic"
@@ -1500,7 +1505,7 @@ def test_render_report_verify_cap_set_but_not_reached_claims_no_deferral():
     # Mirror of the batch cap's "not reached" branch. With novel == verified
     # nothing was deferred and nothing went unverified, so the deferral clause
     # would be a false statement about this run.
-    sections = _sections(verify_coverage=mod.VerifyCoverage(novel=3, verified=3, cap=5))
+    sections = _sections(verify_coverage=mod.VerifyCoverage(novel=3, offered=3, cap=5))
 
     bullets = _verification_bullets(sections)
     # ONE bullet, not two: nothing was deferred, so the deferral counts line
@@ -1508,7 +1513,8 @@ def test_render_report_verify_cap_set_but_not_reached_claims_no_deferral():
     # rather than as the absence of the word "deferred", which a reworded
     # deferral clause would slip past.
     assert len(bullets) == 1, f"a not-reached cap defers nothing; got {bullets!r}"
-    assert "verified all 3 novel cluster(s)" in bullets[0]
+    assert "handed all 3 novel cluster(s) to the verifier" in bullets[0]
+    assert "verified all" not in bullets[0]
     assert "operator verify cap: 5 (not reached)" in bullets[0], (
         "the cap is still named for the operator's record"
     )
@@ -3338,7 +3344,7 @@ def test_run_census_max_verify_clusters_defers_the_rest_as_pending_candidates(tm
     # (c) the report states the split
     report_text = kwargs["report_path"].read_text(encoding="utf-8")
     lowered = report_text.lower()
-    assert "verified 1 of 3 novel clusters" in lowered
+    assert "handed 1 of 3 novel clusters to the verifier" in lowered
     assert "2 deferred" in lowered
     assert "pending candidate" in lowered
 
@@ -3846,7 +3852,7 @@ def test_run_census_all_three_cost_control_flags_interact_end_to_end(tmp_path, c
     assert "## Verification" in report_text
     verification_section = report_text.split("## Verification", 1)[1].split("##", 1)[0]
     verification_lowered = verification_section.lower()
-    assert "verified 1 of 2 novel clusters" in verification_lowered
+    assert "handed 1 of 2 novel clusters to the verifier" in verification_lowered
     assert "1 deferred" in verification_lowered
     assert "pending candidate" in verification_lowered
 
@@ -6017,7 +6023,7 @@ def test_render_report_states_the_all_rejected_outcome_without_a_verify_cap():
 
 def test_render_report_renders_the_all_rejected_notice_before_an_existing_cap_line():
     report = _render(
-        verify_coverage=mod.VerifyCoverage(novel=3, verified=3, cap=3),
+        verify_coverage=mod.VerifyCoverage(novel=3, offered=3, cap=3),
         mass_rejection=mod.MassRejection(offered=3),
     )
 
@@ -6027,6 +6033,13 @@ def test_render_report_renders_the_all_rejected_notice_before_an_existing_cap_li
     assert section.lower().index("systemic") < section.index("verify cap: 3"), (
         "the anomaly notice comes FIRST — a cap line is routine, this is not"
     )
+    # …and the cap line must not contradict the notice directly above it. The
+    # coverage record counts verify_fn calls MADE, so on this run "verified
+    # all 3" would be a flat lie sitting one line under "not one survived".
+    assert "verified all" not in section.lower(), (
+        f"the coverage line must not claim an outcome the notice denies; got {section!r}"
+    )
+    assert "handed all 3 novel cluster(s) to the verifier" in section
 
 
 def test_render_report_flagless_golden_is_untouched_by_the_new_parameter():
