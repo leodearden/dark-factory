@@ -129,18 +129,22 @@ are holding a sha from somewhere else and want to know whether it is a marker. I
 substitute for selecting correctly in the first place.
 
 Do **not** instead add `--merges` to the search. It would diverge from the in-repo authority this
-command explicitly mirrors (`GitOps.find_merge_marker` and `GitOps._scan_merge_marker` use the same
-bare `--grep`), whose whole value is that writer and reader share one derivation and so cannot
-silently drift apart; and it is lossy — measured in this repo, `ba1bba2611 Merge task/176 into main`
-is a genuine subject-shaped marker with a **single parent**, which `--merges` drops — and which
-the command above does return. Subject equality as selected above loses nothing and needs no
-divergence. (That claim is only true of the selecting form: paired with `--max-count=1` subject
-equality *was* lossy, in the 8 measured cases above.)
+command explicitly mirrors (`GitOps.find_merge_marker` resolves through `_lookup_merge_marker`'s
+full-message `%B` index, falling back to `_scan_merge_marker`'s bare `--grep`; both derive the
+pattern from `_merge_subject`, and neither restricts to merge commits nor checks the subject —
+`_merge_marker_pattern` is deliberately unanchored to mirror `--grep`), whose whole value is that
+writer and reader share one derivation and so cannot silently drift apart; and it is lossy —
+measured in this repo, `ba1bba2611 Merge task/176 into main` is a genuine subject-shaped marker
+with a **single parent**, which `--merges` drops — and which the command above does return.
+Subject equality as selected above loses nothing and needs no divergence. (That claim is only true
+of the selecting form: paired with `--max-count=1` subject equality *was* lossy, in the 8 measured
+cases above.)
 
-The root cause is in that production search, which this doc faithfully mirrors; the shell-side
+The root cause is in that production lookup, which this doc faithfully mirrors; the shell-side
 subject check is the guard available to an agent. It is the same relationship [step 2](#step-2)'s
 containment check already has to `find_merge_marker`'s branch-existence gate: the agent re-supplies
-in the shell a guard the bare search does not carry. The production half is tracked separately.
+in the shell a guard the bare search does not carry. The production half is tracked as **task
+5765**; while that is open this shell-side guard is the only one there is.
 
 - **Printed a sha** → its subject already matched, by construction. Go to [step 2](#step-2); whether it is authoritative depends on the branch ref.
 - **Printed nothing** (no hits at all, or every hit was a body match) → go to [step 3](#step-3). An empty result is **not** a not-landed verdict.
@@ -377,11 +381,13 @@ especially damaging at call sites already holding a server-issued `done`/`alread
 verdict.
 
 Instead follow [`merge-queue/SKILL.md`](../merge-queue/SKILL.md)'s "Follow the superseded
-successor" rules 2–3: check the **TIP's** merge marker and this task's own scheduler status,
-honour rule 2b's **veto** — **there is no self-stamp on that arm**, and the status decides
-only which exit applies — confirm by content with `git cherry main task/<TASK_ID>`, and take
-rule 2b's **landed-but-not-credited** exit rather than reporting not-landed. **rc=1 is NOT
-not-landed on the `coalesce-*` arm.**
+successor" rules 2–3: check the **TIP's** merge marker and this task's own scheduler status, and
+on either landing signal the verdict is **landed** rather than not-landed. **Rule 2b licenses no
+write on this arm** — there is no self-stamp — exactly as rule 2a licenses none on the rc=128 arm
+below; the two arms agree. Rule 2b is the authority for the whole disposition — read which exit
+each scheduler status yields, its **landed-but-not-credited** report, and the `git cherry main
+task/<TASK_ID>` content proof (including why that proof cannot discharge the veto) from there, not
+from here. **rc=1 is NOT not-landed on the `coalesce-*` arm.**
 
 Only outside that arm — no train absorption anywhere in this task's history — is rc=1 a genuine
 not-landed outcome. What to do with it there is the call site's own disposition (`unblock` and
