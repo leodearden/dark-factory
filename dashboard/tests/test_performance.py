@@ -2140,6 +2140,122 @@ def _iter_non_docstring_string_literals(tree: ast.AST):
             yield node
 
 
+# ---------------------------------------------------------------------------
+# Detection-helper unit tests for the data-layer SQL clock-read guard
+# ---------------------------------------------------------------------------
+
+# Implicit concatenation folds these three adjacent fragments into ONE
+# `ast.Constant` (lineno=4, end_lineno=6) whose value contains the forbidden
+# pattern while no single physical line does. This is the SQL style already
+# used in the module under guard.
+_FOLDED_SQL_SOURCE = '''
+def q():
+    return (
+        "SELECT project_id FROM task_results "
+        "WHERE completed_at >= datetime("
+        "'now', ? || ' days')"
+    )
+'''
+
+_SINGLE_QUOTED_NOW_SOURCE = '''
+def q():
+    return "SELECT 1 FROM t WHERE completed_at >= datetime('now', ? || ' days')"
+'''
+
+_DOUBLE_QUOTED_NOW_SOURCE = """
+def q():
+    return 'SELECT 1 FROM t WHERE completed_at >= datetime("now", ? || " days")'
+"""
+
+_PROSE_DOCSTRING_SOURCE = '''
+"""Module prose explaining why datetime('now', ...) must not reach SQLite."""
+
+
+def q():
+    """Function prose naming datetime("now", ...) the same way."""
+    return 'SELECT 1'
+'''
+
+_PROSE_COMMENT_SOURCE = '''
+# Comment naming datetime('now', ? || ' days') in prose.
+def q():
+    return 'SELECT 1'  # and datetime("now", ...) named again here
+'''
+
+
+class TestSqlClockReadGuard:
+    """Unit tests for `_sql_clock_read_violations`, the detection helper behind
+    `test_no_sql_side_clock_reads_in_data_layer`.
+
+    That guard asserts `assert not violations`, which is vacuous on its own:
+    detection broken to return `[]` for everything would keep it green
+    forever. These tests pin the end-to-end detection contract directly, so
+    both halves are exercised -- SQL that must be flagged, and prose that must
+    not be.
+    """
+
+    def test_implicitly_concatenated_literal_is_flagged(self):
+        """A folded multi-line SQL literal is flagged, reported off the AST node.
+
+        Regression test for the task-4624 review finding: Python folds
+        implicitly-concatenated adjacent literals into one `ast.Constant`
+        whose value contains the pattern while no single physical line does,
+        so re-deriving the violation by re-scanning physical source lines
+        silently misses it.
+        """
+        violations = _sql_clock_read_violations(_FOLDED_SQL_SOURCE, 'fake.py')
+
+        assert len(violations) == 1, f'expected exactly one violation, got {violations!r}'
+        assert violations[0].startswith('fake.py:4: '), (
+            f'expected the violation to report the line where the implicit '
+            f'concatenation starts, got {violations[0]!r}'
+        )
+        assert "datetime('now'" in violations[0], (
+            f'expected the excerpt to carry the folded literal value, '
+            f'got {violations[0]!r}'
+        )
+        assert not any(
+            "datetime('now'" in line for line in _FOLDED_SQL_SOURCE.splitlines()
+        ), (
+            'fixture is no longer a folded literal -- some physical line now '
+            'contains the pattern, so this test would pass under the very '
+            'line re-scan it exists to forbid'
+        )
+
+    @pytest.mark.parametrize(
+        'source',
+        [
+            pytest.param(_SINGLE_QUOTED_NOW_SOURCE, id='single-quoted-now'),
+            pytest.param(_DOUBLE_QUOTED_NOW_SOURCE, id='double-quoted-now'),
+        ],
+    )
+    def test_single_line_literal_is_flagged(self, source: str):
+        """Both spellings of an ordinary one-line SQL clock read are flagged."""
+        violations = _sql_clock_read_violations(source, 'fake.py')
+
+        assert len(violations) == 1, f'expected exactly one violation, got {violations!r}'
+        assert violations[0].startswith('fake.py:3: '), (
+            f'expected the violation to report the literal\'s line, '
+            f'got {violations[0]!r}'
+        )
+
+    def test_docstring_mention_is_not_flagged(self):
+        """Module and function docstrings naming the pattern in prose are not queries.
+
+        performance.py's own docstring depends on this exclusion, so the
+        detection must not over-correct into flagging prose.
+        """
+        assert _sql_clock_read_violations(_PROSE_DOCSTRING_SOURCE, 'fake.py') == []
+
+    def test_comment_mention_is_not_flagged(self):
+        """A `#` comment naming the pattern is not a query.
+
+        Comments are absent from the AST entirely, so this documents an
+        invariant the implementation gets for free and must not lose.
+        """
+        assert _sql_clock_read_violations(_PROSE_COMMENT_SOURCE, 'fake.py') == []
+
+
 def test_no_sql_side_clock_reads_in_data_layer():
     """No `dashboard/src/dashboard/data/*.py` module computes a cutoff via a
     SQL-side `datetime('now', ...)` call (task 4624 -- its 4th recorded
