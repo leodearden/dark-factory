@@ -604,9 +604,9 @@ def _ticket_id_from_submit_result(result) -> str | None:
     Two shapes yield ``None`` so the caller can log and exclude rather than
     abort or inflate the filed count: a rejected or failed call answers
     ``{"error": ..., "error_type": ...}`` (no ticket key), and a transport
-    fault can answer a non-dict. A non-string ``ticket`` value is refused
-    for the same reason -- an unusable value must never render as a report
-    bullet.
+    fault can answer a non-dict. A non-string or empty ``ticket`` value is
+    refused for the same reason -- an unusable value must never render as a
+    report bullet.
 
     The synchronous planning-mode shape ``{"task_id": ..., "status":
     "deferred", "planning_mode": True}`` is deliberately OUT OF SCOPE:
@@ -618,7 +618,7 @@ def _ticket_id_from_submit_result(result) -> str | None:
     if not isinstance(result, dict):
         return None
     ticket_id = result.get("ticket")
-    return ticket_id if isinstance(ticket_id, str) else None
+    return ticket_id if isinstance(ticket_id, str) and ticket_id else None
 
 
 # ---------------------------------------------------------------------------

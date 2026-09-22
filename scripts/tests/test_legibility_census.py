@@ -813,10 +813,11 @@ def test_ticket_id_from_submit_result_rejects_empty_dict():
     assert mod._ticket_id_from_submit_result({}) is None
 
 
-def test_ticket_id_from_submit_result_rejects_non_string_ticket_values():
-    # An unusable value must never reach the report as a "- None" (or
-    # "- {'id': 1}") bullet -- the caller excludes on None, so the helper
-    # must answer None rather than pass a non-string through.
+def test_ticket_id_from_submit_result_rejects_unusable_ticket_values():
+    # An unusable value must never reach the report as a bare "- ", "- None"
+    # or "- {'id': 1}" bullet -- the caller excludes on None, so the helper
+    # must answer None rather than pass it through.
+    assert mod._ticket_id_from_submit_result({"ticket": ""}) is None
     assert mod._ticket_id_from_submit_result({"ticket": None}) is None
     assert mod._ticket_id_from_submit_result({"ticket": {"id": 1}}) is None
     assert mod._ticket_id_from_submit_result({"ticket": 42}) is None
