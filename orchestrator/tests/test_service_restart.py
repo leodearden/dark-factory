@@ -2597,3 +2597,102 @@ async def test_out_of_range_lease_pid_fires_fail_open(tmp_path: Path) -> None:
     assert await coord.maybe_restart(agents_idle=True) is True
     executor.assert_awaited_once()
     assert coord.is_pending is False
+
+
+# ---------------------------------------------------------------------------
+# A non-finite or future-dated started_ts must not make a lease IMMORTAL
+# (task 4755 review fix 2/4).
+#
+# json.loads accepts bare NaN / Infinity / -Infinity, and the parsed value's
+# type is float -- so it passes lease_is_live's isinstance(started_ts, (int,
+# float)) guard and reaches the arithmetic. Every comparison against NaN is
+# False, so `now - started_ts >= max_age_secs` is False and the reader falls
+# through to the pid test, reporting LIVE for as long as any process holds
+# that pid. Infinity arrives at the same place by a different route (the age
+# is -inf, and -inf >= bound is False). A future-dated started_ts is the same
+# hole with an ordinary float.
+#
+# That defeats the max-age bound, which this class's docstring names as the
+# ONLY thing standing between a stranded lease and a wedged fleet -- i.e. it
+# is precisely the "fail toward holding the fleet" outcome the fail-direction
+# docstrings say must never happen, and it is silent: the absent-is-silent
+# branch never fires and the type check passes.
+# ---------------------------------------------------------------------------
+
+#: 2100-01-01T00:00:00Z -- a started_ts no sweep could honestly have written.
+_YEAR_2100_EPOCH = 4102444800
+
+
+def _write_raw_lease(path: Path, started_ts_literal: str) -> Path:
+    """Write a lease whose started_ts is the LITERAL on-disk JSON text given.
+
+    Deliberately not json.dumps(float('nan')): the defect is about what
+    json.loads ACCEPTS off disk, so the fixture states the bytes a torn mv or
+    a hand-edit would leave rather than trusting a serializer to spell them
+    that way.
+    """
+    path.write_text(
+        f'{{"pid": {os.getpid()}, "started_ts": {started_ts_literal}, '
+        f'"current_unit": "orchestrator-fake-sweeping.service"}}'
+    )
+    return path
+
+
+@pytest.mark.parametrize(
+    'started_ts_literal',
+    ['NaN', 'Infinity', '-Infinity', str(_YEAR_2100_EPOCH)],
+    ids=['nan', 'infinity', 'neg-infinity', 'future-dated'],
+)
+def test_lease_is_live_rejects_an_unusable_age(
+    tmp_path: Path, caplog, started_ts_literal: str
+) -> None:
+    """A lease whose age cannot be trusted is NOT live, and says so.
+
+    The pid here is this process, trivially alive, so only the timestamp can
+    reject these -- which is the point: the age test has to be able to fail a
+    lease on its own, or the bound is decorative.
+
+    Logged, not silent: "present but unusable" is this reader's documented
+    logged branch, exactly as an unreadable body is, while an ABSENT lease
+    stays quiet.
+    """
+    import logging
+
+    lease = _write_raw_lease(tmp_path / 'lease.json', started_ts_literal)
+
+    with caplog.at_level(logging.WARNING, logger='orchestrator.service_restart'):
+        assert lease_is_live(lease, now=0.0, max_age_secs=7200.0) is False
+    assert any('lease' in r.message.lower() for r in caplog.records), (
+        f'an unusable age must be journalled; got {[r.message for r in caplog.records]!r}'
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'started_ts_literal',
+    ['NaN', 'Infinity', str(_YEAR_2100_EPOCH)],
+    ids=['nan', 'infinity', 'future-dated'],
+)
+async def test_unusable_lease_age_fires_rather_than_deferring_forever(
+    tmp_path: Path, started_ts_literal: str
+) -> None:
+    """END TO END: the coordinator FIRES instead of standing down indefinitely.
+
+    This is the half that makes the defect matter. A lease the bound cannot
+    expire is held for as long as its pid lives, so every redeploy tier reading
+    it stays suppressed with nothing logged and nothing to expire -- the exact
+    wedged-fleet outcome the bound exists to make impossible.
+    """
+    lease = _write_raw_lease(tmp_path / 'lease.json', started_ts_literal)
+    coord, current_time, _, executor = _make_force_fire_coordinator(
+        force_fire_after_secs=4500.0,
+        require_idle=True,
+        debounce_secs=300.0,
+        lease_path=lease,
+    )
+    await coord.note_merge('task-1', 'base', 'head')
+
+    current_time[0] = 301.0
+    assert await coord.maybe_restart(agents_idle=True) is True
+    executor.assert_awaited_once()
+    assert coord.is_pending is False

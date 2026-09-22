@@ -9859,6 +9859,12 @@ def test_cli_report_exit_code_unchanged_by_the_new_fields(
 # ---------------------------------------------------------------------------
 
 
+#: 2100-01-01T00:00:00Z. A started_ts no sweep could honestly have written,
+#: used wherever a FUTURE-dated lease must be shown not to be immortal. An
+#: absolute literal rather than time.time() + delta so the fixture states the
+#: shape it defends against and cannot drift with the suite's clock.
+_YEAR_2100_EPOCH = 4102444800
+
 def _reliably_dead_pid() -> int:
     """A pid that has exited AND been reaped, so it names no live process."""
     proc = subprocess.Popen([sys.executable, "-c", ""])
@@ -10015,13 +10021,45 @@ def test_live_fleet_lease_rejects_an_unusable_pid_without_calling_os_kill(
 
 @pytest.mark.parametrize(
     "started_ts",
-    [None, "recently", [], {}, "NaN-ish"],
-    ids=["missing", "string", "list", "dict", "unparseable"],
+    [
+        None,
+        "recently",
+        [],
+        {},
+        "NaN-ish",
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        _YEAR_2100_EPOCH,
+    ],
+    ids=[
+        "missing",
+        "string",
+        "list",
+        "dict",
+        "unparseable",
+        "nan",
+        "infinity",
+        "neg-infinity",
+        "future-dated",
+    ],
 )
 def test_live_fleet_lease_is_none_when_started_ts_is_unusable(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, started_ts
 ) -> None:
-    """Without a usable timestamp the bound cannot be applied, so the lease is not live."""
+    """Without a usable timestamp the bound cannot be applied, so the lease is not live.
+
+    TWO classes of unusable, and only the first was covered before task 4755's
+    review. The first five values float() itself rejects, so the arithmetic was
+    never reached at all. The last four PARSE -- json.loads accepts bare NaN /
+    Infinity / -Infinity, and json.dumps writes them back in exactly that
+    spelling -- and then defeat the bound instead of failing it: every
+    comparison against NaN is False, -inf >= bound is False, and a future date
+    gives a negative age, so each falls through to the pid test and reports
+    LIVE for as long as any process holds that pid. That is the max-age bound
+    -- the only thing standing between a stranded lease and a wedged fleet --
+    silently not applying.
+    """
     wdog = _load_watchdog()
     body = {"pid": os.getpid(), "current_unit": synthetic_unit("no-ts")}
     if started_ts is not None:
@@ -10920,3 +10958,87 @@ def test_report_renders_an_out_of_range_lease_pid_without_raising(
         f"--report must not claim a lease is live when _live_fleet_lease says "
         f"it is not: {line!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# --report must AGREE with _live_fleet_lease about liveness (4755 review fix)
+#
+# Distinguishing WHY a lease is not live is _format_fleet_lease's entire
+# stated purpose, so agreeing with the predicate about WHETHER it is live is
+# its contract, not a nicety. A lease the gate treats as expired but --report
+# calls "live" sends an operator looking for a sweep that is not running.
+# ---------------------------------------------------------------------------
+
+
+def _write_raw_lease(
+    wdog: types.ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    started_ts_literal: str,
+    unit: str,
+) -> pathlib.Path:
+    """Write a lease whose started_ts is the LITERAL on-disk JSON text given.
+
+    Deliberately not json.dumps(float('nan')): the defect is about what
+    json.loads ACCEPTS off disk, so the fixture states the bytes a torn mv or
+    a hand-edit would leave rather than trusting a serializer to spell them
+    that way.
+    """
+    return _write_lease(
+        wdog,
+        monkeypatch,
+        tmp_path,
+        f'{{"pid": {os.getpid()}, "started_ts": {started_ts_literal}, '
+        f'"current_unit": "{unit}"}}',
+    )
+
+
+def test_report_does_not_call_a_non_finite_lease_live(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A NaN age must not render as ``live (... age nanm)``.
+
+    Every comparison against NaN is False, so the bound never rejects it and
+    the renderer falls through to its live arm -- printing a literal "nan"
+    where an age belongs, which is the visible half of a lease the gate would
+    hold forever.
+    """
+    wdog = _load_watchdog()
+    _wire_report_fleet(wdog, monkeypatch)
+    _write_raw_lease(wdog, monkeypatch, tmp_path, "NaN", synthetic_unit("not-a-number"))
+
+    wdog.report()
+
+    line = _fleet_lease_line(capsys.readouterr().out)
+    assert "live" not in line, line
+    assert "nan" not in line.lower(), (
+        f"a NaN age must be reported as unusable, not printed as an age: {line!r}"
+    )
+
+
+def test_report_distinguishes_a_future_dated_lease_from_a_live_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A lease stamped in the future is not live, and must not read as live.
+
+    Same shape as the dead-holder / overrun pair above: the two states call
+    for different operator actions -- a future-dated lease means a clock
+    stepped, not that a sweep is running -- so they must be distinguishable
+    without opening the file.
+    """
+    wdog = _load_watchdog()
+    _wire_report_fleet(wdog, monkeypatch)
+    _write_raw_lease(
+        wdog, monkeypatch, tmp_path, str(_YEAR_2100_EPOCH), synthetic_unit("time-traveller")
+    )
+    wdog.report()
+    future_line = _fleet_lease_line(capsys.readouterr().out)
+
+    _write_raw_lease(
+        wdog, monkeypatch, tmp_path, str(int(time.time()) - 600), synthetic_unit("genuine")
+    )
+    wdog.report()
+    live_line = _fleet_lease_line(capsys.readouterr().out)
+
+    assert "live" in live_line, f"sanity: a genuine lease still renders live: {live_line!r}"
+    assert "live" not in future_line, future_line
