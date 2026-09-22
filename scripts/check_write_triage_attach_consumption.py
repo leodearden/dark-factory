@@ -48,11 +48,15 @@ EXIT-CODE CONTRACT
 from __future__ import annotations
 
 import argparse
+import ast
 import asyncio
+import contextlib
 import importlib
 import inspect
 import logging
+import re
 import sys
+import textwrap
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -125,6 +129,47 @@ _FAIL_MARKER = 'FAIL  the judge-bound candidate is NOT CONSUMED by the attach'
 
 _ANNOUNCED_BRANCH = 'announced-target branch'
 _ANNOUNCEMENT_IGNORED = 'the attach did not land on the announced target'
+
+_JUDGE_MODULE_NAME = 'fused_memory.server.write_triage_judge'
+_JUDGE_TARGET_BRANCH = 'judge-target branch'
+_BUILDER_NAME = 'build_judge_prompt'
+_WRITER_NAME = 'judge_write'
+
+#: A parameter NAME that reads as designating the attach target. Item 1's
+#: vocabulary, kept word for word (``_TARGET_NAME_RE`` there) so the two
+#: probes cannot come to disagree about what a target-named parameter is. NOT
+#: imported across: they are separate executables with separate ``--src-root``
+#: contracts, and an import would make each one's failure the other's.
+_TARGET_NAME_RE = re.compile(r'attach|target|candidate_id', re.IGNORECASE)
+
+#: The attribute a judge-side attach target is read off the decision through.
+_CANONICAL_ATTR = 'canonical_id'
+
+#: Backstop bound on the one ``judge_write`` call this probe makes. The
+#: recorder below is the primary guarantee that no model request goes out --
+#: it aborts the call at the prompt -- and this is what covers a ref that
+#: renders AFTER its request rather than before it. Small against the gate's
+#: 45s per-probe budget, because nothing correct here takes any time at all.
+_JUDGE_DRIVE_TIMEOUT = 5.0
+
+#: THE ONE MACHINE-READABLE LINE saying which branch satisfied item 5, and the
+#: three names it can carry. `PASS  item 5` alone cannot tell an operator
+#: whether a swap was MEASURED or whether option (b) held BY CONSTRUCTION, and
+#: those authorise the production flag flip on different evidence. The gate
+#: greps this prefix and quotes the rest into its own report.
+#:
+#: ASCII only, deliberately: the gate bounds the quoted text with a substring
+#: expansion, and a cut through a multi-byte character would emit a broken one.
+_BRANCH_PREFIX = 'ITEM5-BRANCH  '
+_BRANCH_SWAP = 'judge-side designation swap (option (a)) - a MEASURED consumption result'
+_BRANCH_JUDGE_TARGET = (
+    'judge-module attach target (option (b)) - holds BY CONSTRUCTION, '
+    'not by a measured swap'
+)
+_BRANCH_ANNOUNCED = (
+    'triage-side announced target (hypothetical channel) - a MEASURED '
+    'consumption result'
+)
 
 #: The kwargs main ALREADY hands the judge. An announcement read out of any of
 #: these is one main already makes -- `decision.canonical_id` is precisely the
@@ -261,6 +306,32 @@ def _import_triage(src_root: Path, extra_paths: list[Path]) -> Any:
             f'{_MODULE_NAME} resolved to {origin!r}, which is outside --src-root '
             f'{src_root} — the probe would be testing the wrong tree',
         )
+    return module
+
+
+def _import_judge(src_root: Path) -> Any | None:
+    """The ref's judge module, or None. NON-FATAL, unlike :func:`_import_triage`.
+
+    A src-root with no judge module, or one whose import blows up, leaves the
+    judge-target branch unsatisfied rather than raising :class:`_Unverifiable`.
+    Every fixture repo written before option (b) carries no judge module at
+    all, and a branch that ERRORED on them would have invented a new way for
+    this gate to report UNVERIFIABLE against a tree it reads perfectly well.
+
+    ``BaseException``, for :func:`main`'s reason: a ``SystemExit`` out of the
+    ref's own module body is not an ``Exception``, and letting one through
+    here would end the probe mid-report with the REF's exit code.
+
+    *src_root* is already on ``sys.path`` — :func:`_import_triage` put it
+    there, and the two modules are siblings in the one tree the gate extracts.
+    """
+    try:
+        module = importlib.import_module(_JUDGE_MODULE_NAME)
+    except BaseException:  # noqa: BLE001 - see the docstring; never fatal
+        return None
+    origin = getattr(module, '__file__', None)
+    if origin is None or not _is_inside(Path(origin), src_root):
+        return None
     return module
 
 
@@ -707,6 +778,333 @@ def _announced_target_branch(
     )
 
 
+class _JudgeAborted(Exception):
+    """Raised out of the recorder to stop ``judge_write`` at the prompt."""
+
+
+class _PromptRecorder:
+    """Stands in for ``build_judge_prompt``: records its call, then aborts.
+
+    THE RAISE IS LOAD-BEARING. ``judge_write`` builds the prompt and posts it
+    to a model provider; a recorder that RETURNED a string would let that
+    request go out — from a before_done predicate, against a 45s bound, on the
+    operator's key. So the recorder never returns: it records and raises, which
+    unwinds the call before the request is made.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        self.calls.append((args, kwargs))
+        raise _JudgeAborted
+
+
+class _Fed(NamedTuple):
+    """What ``judge_write`` handed a target-named parameter of the renderer."""
+
+    name: str
+    value: Any
+    #: Is *value* the id the write will attach to? A target fed SOMETHING is
+    #: not a target fed the RIGHT thing, and the two want different remedies.
+    matched: bool
+
+
+def _usable_parameters(fn: Any) -> list[Any]:
+    """*fn*'s parameters that can be supplied by position or by keyword."""
+    try:
+        params = list(inspect.signature(fn).parameters.values())
+    except (TypeError, ValueError):
+        return []
+    kinds = (
+        inspect.Parameter.POSITIONAL_ONLY,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    )
+    return [p for p in params if p.kind in kinds]
+
+
+def _target_parameter_names(fn: Any) -> list[str]:
+    """Names beyond the first two that read as designating the attach target.
+
+    The first two are the new entry and the slate. ALL of the rest are
+    returned rather than just the third, for item 1's measured reason: the
+    POSITION of a target parameter is a mechanism, and a fix spelled
+    ``build_judge_prompt(content, candidates, *, verdict_words=None,
+    attach_target_id=None)`` must not be read as having none.
+    """
+    return [
+        p.name for p in _usable_parameters(fn)[2:] if _TARGET_NAME_RE.search(p.name)
+    ]
+
+
+def _judge_decision(module: Any, canonical_id: str) -> Any:
+    """The ref's own ``BandDecision``, carrying a canonical id the probe chose.
+
+    The ref's class rather than a stand-in, so what ``judge_write`` reads is
+    the shape it reads in production. The namespace is the fallback for a ref
+    that renamed the dataclass — a mechanism this gate may not pin.
+    """
+    cls = getattr(module, 'BandDecision', None)
+    outcome = getattr(module, 'OUTCOME_JUDGE', 'judge')
+    if cls is not None:
+        try:
+            return cls(outcome, canonical_id, _CHILD_SCORE, _T_HIGH, _T_LOW)
+        except Exception:  # noqa: BLE001 - a changed shape is not fatal
+            pass
+    return SimpleNamespace(
+        outcome=outcome,
+        canonical_id=canonical_id,
+        similarity=_CHILD_SCORE,
+        t_high=_T_HIGH,
+        t_low=_T_LOW,
+    )
+
+
+def _drive_judge_write(writer: Any, decision: Any, slate: list[Any]) -> None:
+    """Run ``judge_write`` far enough to see what it tells the renderer.
+
+    Every exception is swallowed, including the recorder's own abort: what is
+    measured is the recorder's log, and a judge that blows up against this
+    probe's fake service has told it nothing about the attach target either
+    way — which is what :func:`_statically_fed_target` then covers.
+    """
+    service = _Service(_SearchResults())
+    # BaseException, for :func:`main`'s reason: a SystemExit out of the ref's
+    # own judge is not an Exception, and letting one through here would end
+    # the probe mid-report carrying the REF's exit code.
+    with contextlib.suppress(BaseException):
+        asyncio.run(
+            asyncio.wait_for(
+                writer(
+                    memory_service=service,
+                    content=_NEW_ENTRY,
+                    project_id=_PROJECT_ID,
+                    decision=decision,
+                    candidates=slate,
+                ),
+                _JUDGE_DRIVE_TIMEOUT,
+            ),
+        )
+
+
+def _fed_in_call(
+    builder: Any,
+    call: tuple[tuple[Any, ...], dict[str, Any]],
+    targets: list[str],
+    wanted: str,
+) -> _Fed | None:
+    """What one recorded render call handed a target parameter, if anything.
+
+    Bound against the REAL builder's signature, so a target supplied by
+    POSITION counts as much as one supplied by keyword — which of the two a
+    remedy picks is a spelling, and this gate may not pin one.
+    """
+    args, kwargs = call
+    try:
+        bound = inspect.signature(builder).bind(*args, **kwargs)
+    except (TypeError, ValueError):
+        return None
+    for name in targets:
+        if name in bound.arguments:
+            value = bound.arguments[name]
+            return _Fed(name, value, value == wanted)
+    return None
+
+
+def _called_name(func: ast.AST) -> str | None:
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
+def _reads_canonical_id(expr: ast.AST, aliases: frozenset[str]) -> bool:
+    """Does *expr* read the decision's canonical id, directly or via a local?
+
+    Both spellings of the direct read count: the attribute (``decision.canonical_id``)
+    and the string a defensive ``getattr(decision, 'canonical_id', None)``
+    names it by.
+    """
+    for node in ast.walk(expr):
+        if isinstance(node, ast.Attribute) and node.attr == _CANONICAL_ATTR:
+            return True
+        if isinstance(node, ast.Constant) and node.value == _CANONICAL_ATTR:
+            return True
+        if isinstance(node, ast.Name) and node.id in aliases:
+            return True
+    return False
+
+
+def _canonical_id_aliases(tree: ast.AST) -> frozenset[str]:
+    """Locals assigned from an expression that reads the canonical id.
+
+    ONE level, deliberately. main spells it ``attach_target_id =
+    getattr(decision, 'canonical_id', None)`` and passes that local one call
+    later, which is the shape this has to see. Chasing a chain of rebindings
+    would be a dataflow analysis, and the DYNAMIC route above is what covers a
+    module too clever for this one.
+    """
+    aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and _reads_canonical_id(
+            node.value, frozenset(),
+        ):
+            aliases.update(t.id for t in node.targets if isinstance(t, ast.Name))
+    return frozenset(aliases)
+
+
+def _statically_fed_target(writer: Any, targets: list[str]) -> str | None:
+    """The target parameter *writer*'s SOURCE feeds the decision's canonical id.
+
+    The fallback for a ``judge_write`` that raises before it renders — main's
+    own does exactly that on a deployment with no provider configured, which
+    is the state this probe's fake service is in. Reading the call rather than
+    executing it is what stops a mechanism the dynamic route cannot reach from
+    being reported as an absent remedy.
+    """
+    try:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(writer)))
+    except (OSError, TypeError, SyntaxError, ValueError):
+        return None
+    aliases = _canonical_id_aliases(tree)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or _called_name(node.func) != _BUILDER_NAME:
+            continue
+        for keyword in node.keywords:
+            if keyword.arg in targets and _reads_canonical_id(keyword.value, aliases):
+                return keyword.arg
+    return None
+
+
+def _fed_target(
+    judge_module: Any,
+    builder: Any,
+    writer: Any,
+    targets: list[str],
+    decision: Any,
+    slate: list[Any],
+) -> _Fed | None:
+    """What ``judge_write`` feeds the renderer's attach target, or None.
+
+    None means NOTHING was fed: neither a measured render call nor the source
+    of one hands a target-named parameter anything at all.
+
+    The DYNAMIC route first, because it measures rather than reads; the static
+    one only where the dynamic route never saw a render, so a module that
+    demonstrably renders is judged on what it actually passed.
+    """
+    wanted = getattr(decision, _CANONICAL_ATTR, None)
+    recorder = _PromptRecorder()
+    setattr(judge_module, _BUILDER_NAME, recorder)
+    try:
+        _drive_judge_write(writer, decision, slate)
+    finally:
+        setattr(judge_module, _BUILDER_NAME, builder)
+    fed = [
+        seen
+        for seen in (
+            _fed_in_call(builder, call, targets, wanted) for call in recorder.calls
+        )
+        if seen is not None
+    ]
+    for seen in fed:
+        if seen.matched:
+            return seen
+    if fed:
+        return fed[0]
+    if recorder.calls:
+        return None
+    name = _statically_fed_target(writer, targets)
+    return _Fed(name, wanted, True) if name is not None else None
+
+
+def _judge_target_branch(
+    triage_module: Any,
+    judge_module: Any,
+    band_canonical: Any,
+    observed: Any,
+    slate: list[Any],
+) -> tuple[bool, str]:
+    """Option (b) as it exists HERE: does the judge module name the attach target?
+
+    Returns ``(satisfied, report line)``. The line is emitted whether or not
+    the branch holds, so a reader can see it was EVALUATED rather than skipped.
+
+    Under option (b) the caller picks the attach target and tells the judge, so
+    the judge names nothing back and the judge-side swap cannot hold however
+    correct the module is. Requiring the swap would FAIL a correct fix and
+    re-block task 3169 — this gate family's false-FAIL disease. Measured before
+    this branch existed: with option (b) on main, item 1 PASSed and item 5
+    reported a consumption defect the run had never measured.
+
+    THREE conditions, each rejecting a different near-miss: the renderer can be
+    TOLD (a signature); ``judge_write`` actually TELLS it the id the write will
+    use (consumption, not a widened signature — this is also what keeps item
+    1's target-carrying judge fixtures, none of which defines ``judge_write``,
+    inert here); and the write LANDS there, without which a triage module that
+    ignores everything would ride the judge module's signature to a PASS.
+    """
+    if judge_module is None:
+        return False, (
+            f'{_JUDGE_TARGET_BRANCH}: --src-root carries no importable '
+            f'{_JUDGE_MODULE_NAME}, so nothing here could read a judge-side '
+            'attach target'
+        )
+    builder = getattr(judge_module, _BUILDER_NAME, None)
+    writer = getattr(judge_module, _WRITER_NAME, None)
+    if not callable(builder) or not callable(writer):
+        return False, (
+            f'{_JUDGE_TARGET_BRANCH}: the judge module exposes no callable '
+            f'{_BUILDER_NAME}/{_WRITER_NAME} pair, so nothing here could read '
+            'a judge-side attach target'
+        )
+    if not isinstance(band_canonical, str) or not band_canonical:
+        # Before the feed test, and load-bearing: `value == wanted` against a
+        # `wanted` of None would match every target parameter that simply
+        # DEFAULTED to None, i.e. every widened signature nothing ever fed.
+        return False, (
+            f'{_JUDGE_TARGET_BRANCH}: the band named no canonical id '
+            f'({band_canonical!r}), so there was no attach target for the '
+            'judge to be told about'
+        )
+    targets = _target_parameter_names(builder)
+    if not targets:
+        return False, (
+            f'{_JUDGE_TARGET_BRANCH}: {_BUILDER_NAME} takes no attach-target '
+            'parameter beyond the new entry and the slate, so the renderer '
+            'cannot be told which candidate the attach will touch'
+        )
+    decision = _judge_decision(triage_module, band_canonical)
+    fed = _fed_target(judge_module, builder, writer, targets, decision, slate)
+    if fed is None:
+        return False, (
+            f'{_JUDGE_TARGET_BRANCH}: {_BUILDER_NAME} accepts {targets!r}, but '
+            f'{_WRITER_NAME} never feeds one the decision canonical '
+            f'{band_canonical!r} — a widened signature is not consumption'
+        )
+    if not fed.matched:
+        return False, (
+            f'{_JUDGE_TARGET_BRANCH}: {_WRITER_NAME} feeds {fed.name!r} '
+            f"{fed.value!r}, which is not the decision's canonical id "
+            f'{band_canonical!r} — the model is told to reason about a '
+            'candidate the write will not attach to'
+        )
+    if observed != band_canonical:
+        return False, (
+            f'{_JUDGE_TARGET_BRANCH}: {_WRITER_NAME} feeds {fed.name!r} the '
+            f'decision canonical {band_canonical!r}, but the attach landed on '
+            f'{observed!r} — the write did not use the target the judge was '
+            'told about'
+        )
+    return True, (
+        f'{_JUDGE_TARGET_BRANCH}: satisfied — {_WRITER_NAME} feeds '
+        f"{_BUILDER_NAME}'s {fed.name!r} the decision canonical "
+        f'{band_canonical!r}, and the attach landed there'
+    )
+
+
 def _search_spellings(
     module: Any,
     designations: tuple[str, str],
@@ -751,12 +1149,26 @@ def _pass_scope_note() -> list[str]:
     ]
 
 
+def _pass(out: list[str], branch: str) -> int:
+    """Report a satisfied invariant, NAMING the branch that satisfied it.
+
+    One exit for all three branches, so the marker the gate greps, the branch
+    line it quotes and the scope note an operator reads can never be emitted
+    by one branch and forgotten by another.
+    """
+    out.append(_BRANCH_PREFIX + branch)
+    out.append(_PASS_MARKER)
+    out.extend(_pass_scope_note())
+    return EXIT_OK
+
+
 def _probe(src_root: Path, extra_paths: list[Path], out: list[str]) -> int:
     out.append(
         f'write_triage attach-consumption probe — src-root={src_root}',
     )
     module = _import_triage(src_root, extra_paths)
     out.append(f'triage module: {getattr(module, "__file__", "<unknown>")}')
+    judge_module = _import_judge(src_root)
 
     measured, slate, band_canonical = _measure(module)
     slate_ids = [candidate.id for candidate in slate]
@@ -764,17 +1176,26 @@ def _probe(src_root: Path, extra_paths: list[Path], out: list[str]) -> int:
         f'slate: {slate_ids!r} — band canonical {band_canonical!r}',
     )
     usable = _designated_ids(module, slate, band_canonical)
+    observed = getattr(measured.decision, 'canonical_id', None)
 
-    # The option-(b) branch first: it is decided by the run already measured,
-    # and a module that satisfies it has no judge-side designation for the swap
-    # to find, so searching for one would only spend the report on four
-    # spellings none of which could ever have held.
+    # BOTH by-construction branches are evaluated and REPORTED before either
+    # can return, and both before the swap. Each is decided from the run
+    # already measured plus at most one judge call, so neither costs anything
+    # a reader would notice -- while a branch that returned before the other
+    # printed would leave an operator unable to see that it had been
+    # considered at all. The swap comes last because it is the only branch
+    # that drives the write eight more times, and because a module satisfying
+    # either branch above has no judge-side designation for it to find.
+    judged, judge_line = _judge_target_branch(
+        module, judge_module, band_canonical, observed, slate,
+    )
+    out.append(judge_line)
     announced, announced_line = _announced_target_branch(module, measured, usable)
     out.append(announced_line)
+    if judged:
+        return _pass(out, _BRANCH_JUDGE_TARGET)
     if announced:
-        out.append(_PASS_MARKER)
-        out.extend(_pass_scope_note())
-        return EXIT_OK
+        return _pass(out, _BRANCH_ANNOUNCED)
 
     if len(usable) < 2:
         # UNVERIFIABLE, never PASS. With fewer than two candidates that are
@@ -797,9 +1218,7 @@ def _probe(src_root: Path, extra_paths: list[Path], out: list[str]) -> int:
             f'designation channel: {winner.label} — the attach tracked both '
             f'designated candidates {designations!r}',
         )
-        out.append(_PASS_MARKER)
-        out.extend(_pass_scope_note())
-        return EXIT_OK
+        return _pass(out, _BRANCH_SWAP)
 
     out.append(f'spellings tried: {_first_few(attempts)}')
     out.append(_FAIL_MARKER)
