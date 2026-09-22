@@ -56,6 +56,7 @@ const INDEX_HTML = path.join(REDUX_DIR, 'index.html');
 // defined after the shared load is strictly stronger than "did not throw": it
 // proves each script ran all the way through its trailing `window.* =` line.
 const EXPECTED_WINDOW_GLOBALS = {
+  'datum.js': 'DF_DATUM',
   'data.js': 'DF_DATA_LOADER',
   'graph_layout.js': 'DF_GRAPH_LAYOUT',
   'prd_grouping.js': 'DF_PRD_GROUPING',
