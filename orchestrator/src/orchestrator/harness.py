@@ -130,6 +130,7 @@ from orchestrator.scheduler import (
 )
 from orchestrator.service_restart import (
     FLEET_DEPLOY_CLOCK_RELPATH,
+    FLEET_LEASE_RELPATH,
     StaleServiceRestartCoordinator,
     schedule_detached_systemd_restart,
 )
@@ -12234,6 +12235,21 @@ class Harness:
           bounds rather than indefinitely vetoes. The check fails toward
           proceeding (no grace) on any internal error, so it can never itself
           introduce a new indefinite veto.
+        - ``lease_path`` / ``lease_max_age_secs`` (task 4755): the in-flight
+          fleet-redeploy lease, and THE ONLY gate on this coordinator that
+          reads disk at gate time. That is not an optimisation choice — it is
+          forced. ``_load_last_fire_wall`` runs once, inside
+          ``StaleServiceRestartCoordinator.__init__``, and is never re-read,
+          so nothing ``restart-all-orchestrators.sh`` writes during this
+          process's lifetime is otherwise observable here. The clock records
+          when a sweep FINISHED; only the lease says one is running NOW, which
+          is why a long sweep previously let this coordinator force-fire on
+          top of it (measured 2026-08-24/25: "pending restart owed 17300s").
+          Gates the polite and force-fire paths alike, defers without clearing
+          pending, and is fail-OPEN — a missing, corrupt or over-age lease
+          redeploys anyway, so a stranded file can never wedge the fleet.
+          The fused-memory and dashboard builders pass neither, leaving their
+          gate disabled and their behaviour byte-identical.
 
         ``require_idle=True`` and ``script_args=[]`` mirror the fused-memory
         coordinator (idle-only; restart-orchestrator.sh takes no positional
@@ -12286,6 +12302,10 @@ class Harness:
         # gets a non-zero cap — the fused-memory/dashboard builders keep the
         # 0.0 default (no gating), so their behaviour is unchanged.
         redeploy_state_path = Path(self.config.project_root) / FLEET_DEPLOY_CLOCK_RELPATH
+        # In-flight fleet-redeploy lease (task 4755). The clock above says when
+        # a sweep last FINISHED; this says one is running RIGHT NOW, which the
+        # clock structurally cannot -- see the builder docstring's lease bullet.
+        redeploy_lease_path = Path(self.config.project_root) / FLEET_LEASE_RELPATH
 
         return StaleServiceRestartCoordinator(
             git_ops=self.git_ops,
@@ -12312,6 +12332,14 @@ class Harness:
             # hold, byte-identical).
             merge_phase_hold=self._merge_phase_grace_active,
             merge_phase_grace_secs=self.config.orchestrator_restart_merge_phase_grace_secs,
+            # In-flight fleet-redeploy lease (task 4755). While
+            # restart-all-orchestrators.sh holds it, maybe_restart stands down
+            # on BOTH the polite and the force-fire path, so this coordinator
+            # cannot redeploy the fleet on top of a sweep still restarting it.
+            # The fused-memory/dashboard builders omit both (defaults None /
+            # the class max-age -> no gate, byte-identical).
+            lease_path=redeploy_lease_path,
+            lease_max_age_secs=self.config.orchestrator_restart_lease_max_age_secs,
             state_path=redeploy_state_path,
             # restart-all-orchestrators.sh is the SOLE on-disk clock writer,
             # stamping only on its verified-fresh exit-0 path — the watchdog
@@ -12320,9 +12348,13 @@ class Harness:
             # silently silence the backstop for a full min_interval_secs
             # window (task 2396, fleet-redeploy β; closes hole I2).
             # Caveat: this coordinator's OWN _last_fire_wall still re-seeds
-            # from state_path on every process restart, so it can transiently
-            # lag the script's post-restart stamp by one fire — see
-            # StaleServiceRestartCoordinator's stamp_clock_on_fire docstring.
+            # from state_path on every process restart, so it can lag the
+            # script's post-restart stamp. That used to be described here and
+            # in StaleServiceRestartCoordinator's stamp_clock_on_fire
+            # docstring as "by one fire"; the 2026-08-24/25 measurement
+            # falsified it (it recurred every cycle), and the coordinator's
+            # in-flight fleet-redeploy lease gate is what now covers the race
+            # — see that docstring for the measurement.
             stamp_clock_on_fire=False,
         )
 
