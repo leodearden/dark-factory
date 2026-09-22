@@ -49,6 +49,35 @@ def _lag_records(caplog) -> list[logging.LogRecord]:
     return [r for r in caplog.records if 'loop_lag' in r.getMessage()]
 
 
+async def _await_samples(recorded: list, count: int, *, bound_secs: float = 5.0) -> None:
+    """Wait until *recorded* holds *count* samples — CAUSALLY, not by wall clock.
+
+    "Sleep N intervals, then assert N samples landed" is a bet that the loop
+    gets N turns inside that window.  It does not on an oversubscribed host:
+    the whole process is descheduled, the monitor's timer and the test's own
+    timer both expire inside one freeze, and the test resumes having seen
+    fewer samples than it slept for — with the monitor entirely healthy.
+
+    Measured on this branch (injected loop-thread block, monitor alive
+    throughout, against ``sleep(interval * 15)`` at a 10 ms interval):
+    0 ms block -> 14 samples, 100 ms -> 4, 120 ms -> 2, 130 ms -> 1, 145 ms ->
+    0.  The verify leg that went red recorded exactly one sample at 37.7 ms of
+    lag, on a box at load average 92-154 across 32 cores running 8 xdist
+    workers — the same regime commit c8bdd6e89e measured 0.7 s of loop
+    starvation in, and the same de-flake that commit applied there.
+
+    Callers keep their existing sleep and add this gate before asserting, so a
+    healthy run is unchanged (the gate returns immediately) and only a starved
+    one waits.  *bound_secs* keeps a genuine regression — a monitor that really
+    did die — failing loudly on the caller's own assertion instead of hanging;
+    it sits far under the 60 s ``timeout`` in pyproject.toml, whose thread
+    method would kill the whole xdist worker.
+    """
+    deadline = time.monotonic() + bound_secs
+    while len(recorded) < count and time.monotonic() < deadline:
+        await asyncio.sleep(0.005)
+
+
 class _StubConfig:
     """Minimal stand-in for FusedMemoryConfig carrying only ``.server``."""
 
@@ -187,6 +216,10 @@ class TestLoopLagMonitorMeasurement:
             )
             try:
                 await asyncio.sleep(interval * 8)
+                # Gate to ONE sample, not to the ~8 the sleep expects: the
+                # assertion below is on the MAXIMUM overshoot, so every extra
+                # sample can only raise it. One is what 'must still beat' needs.
+                await _await_samples(recorded, 1)
             finally:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -224,6 +257,11 @@ class TestLoopLagMonitorMeasurement:
         )
         try:
             await asyncio.sleep(interval * 5.5)
+            # Gate to THREE samples: the assertion below is on the MINIMUM, so
+            # extra samples only ever help it, and 'several samples' is the
+            # property the docstring above leans on — a starved box that landed
+            # a single delayed sample would otherwise fail on that one alone.
+            await _await_samples(recorded, 3)
         finally:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -258,8 +296,10 @@ class TestLoopLagMonitorMeasurement:
         )
         try:
             # ~15 samples' worth of wall clock; two are enough to prove the
-            # loop survived the first raise, with slack for a loaded box.
+            # loop survived the first raise. The gate, not the sleep, is what
+            # makes "two happened" true on a starved box (see _await_samples).
             await asyncio.sleep(interval * 15)
+            await _await_samples(calls, 2)
             assert len(calls) >= 2, 'monitor stopped after the first raise'
             assert not task.done(), 'monitor task died on a logging error'
         finally:
@@ -433,6 +473,7 @@ class TestLoopLagThresholdIsConfigSourced:
         task = server_main._start_loop_lag_monitor(config)
         try:
             await asyncio.sleep(0.05)
+            await _await_samples(seen, 1)
         finally:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -528,8 +569,12 @@ class TestLoopLagReportingCadence:
         try:
             # ~15 samples' worth of wall clock. Only two reports are required:
             # under the throttle constant patched above, a throttled
-            # implementation emits at most one in any realistic window.
+            # implementation emits at most one in any realistic window. The
+            # gate makes the sample count causal rather than a wall-clock bet
+            # (see _await_samples); a throttled implementation still reports
+            # at most one, so it waits out the bound and fails below.
             await asyncio.sleep(interval * 15)
+            await _await_samples(reported, 2)
         finally:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
