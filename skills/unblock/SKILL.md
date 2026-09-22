@@ -727,7 +727,12 @@ The merge procedure is iterative — don't assume one pass will be enough:
     --grep="Merge task/<TIP_ID> into main" --max-count=1 --format=%H`, where `<TIP_ID>` is parsed
     off the `coalesce-<TIP_ID>-<hex>` id by stripping the `coalesce-` prefix and the trailing `-`
     plus 8 hex chars (`uuid.uuid4().hex[:8]`) — **not** a naive split on `-`, which breaks for any
-    hyphen-bearing tip id; and
+    hyphen-bearing tip id.
+    A hit counts as the tip's marker **only if its SUBJECT matches** — `git log -1 --format=%s
+    "<hit sha>"` must equal `Merge task/<TIP_ID> into main` exactly, per
+    [`skills/_shared/deriving-landed-sha.md`](../_shared/deriving-landed-sha.md#step-1-subject-check).
+    `--grep` matches commit **bodies** too, and on this arm a body match would be stamped as the
+    tip merge sha; treat a body-only match as an empty search. And
     **(b)** **this task's own scheduler status**, read fresh with
     `get_task(id="<TASK_ID>", project_root="<PROJECT_ROOT>")`. The orchestrator flips it to `done`
     for every absorbed member once the train lands
