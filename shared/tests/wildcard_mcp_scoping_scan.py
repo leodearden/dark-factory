@@ -61,6 +61,7 @@ from __future__ import annotations
 import ast
 from typing import NamedTuple
 
+from loop_blocking_scan import _shallow_nodes
 from silent_fallthrough_scan import (
     _build_parent_map,
     _callee_name,
@@ -96,6 +97,10 @@ _VIOLATION_MESSAGE = (
 _STRICT_MCP_MESSAGE = (
     'MCP closed explicitly: a truthy mcp_config with strict_mcp_config=True '
     'scopes the run to only those servers'
+)
+_NEUTRAL_CWD_MESSAGE = (
+    f'runs at {NEUTRAL_CWD_CALLEE}(), an empty scratch dir, so there is no '
+    f'ambient .mcp.json for the CLI to merge'
 )
 
 
@@ -233,10 +238,11 @@ def find_wildcard_mcp_scoping_sites(
         if schema is None or _is_falsy_literal(schema):
             continue
 
-        exemption, message = _classify(node)
+        pmap = parent_map()
+        exemption, message = _classify(node, pmap)
         sites.append(WildcardMcpScopingSite(
             filename=filename,
-            qualname=_compute_qualname(node, parent_map()),
+            qualname=_compute_qualname(node, pmap),
             callee=callee,
             lineno=node.lineno,
             exemption=exemption,
@@ -246,9 +252,103 @@ def find_wildcard_mcp_scoping_sites(
     return sites
 
 
-def _classify(call: ast.Call) -> tuple[str, str]:
-    """Return the ``(exemption, message)`` pair describing how *call* is (un)safe."""
+def _enclosing_function(
+    node: ast.AST,
+    parent_map: dict[int, ast.AST],
+) -> ast.AST | None:
+    """Return the NEAREST enclosing ``def``/``async def``, or None at module scope."""
+    current = parent_map.get(id(node))
+    while current is not None:
+        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return current
+        current = parent_map.get(id(current))
+    return None
+
+
+def _neutral_cwd_locals(func: ast.AST) -> set[str]:
+    """Local names *func*'s OWN body binds to a ``neutral_cli_cwd()`` call.
+
+    ``_shallow_nodes`` (borrowed from ``loop_blocking_scan``, which in turn
+    mirrors ``silent_fallthrough_scan``) stops descent at nested ``def`` /
+    ``class`` / ``lambda``, so an assignment made inside a nested helper cannot
+    launder the exemption up to its enclosing function.
+
+    Both assignment spellings are read: ``ast.Assign`` — including the chained
+    ``a = b = neutral_cli_cwd()`` form, which binds every ``Name`` target — and
+    ``ast.AnnAssign`` carrying a value. A tuple-unpacking target binds no single
+    name to the call's result and is skipped.
+    """
+    bound: set[str] = set()
+    for node in _shallow_nodes(func):
+        if isinstance(node, ast.Assign):
+            targets: list[ast.expr] = list(node.targets)
+            value = node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets = [node.target]
+            value = node.value
+        else:
+            continue
+        if _callee_name(value) == NEUTRAL_CWD_CALLEE:
+            bound.update(t.id for t in targets if isinstance(t, ast.Name))
+    return bound
+
+
+def _resolves_to_neutral_cwd(
+    call: ast.Call,
+    parent_map: dict[int, ast.AST],
+) -> bool:
+    """True when *call*'s ``cwd=`` argument is a ``neutral_cli_cwd()`` result.
+
+    Two spellings resolve, and they are the two that actually occur:
+
+    (i)  DIRECT — ``cwd=neutral_cli_cwd()``, bare or attribute-qualified.
+    (ii) VIA A LOCAL NAME — ``cwd=<name>`` where the enclosing function's own
+         body assigns ``<name> = neutral_cli_cwd()``. This is the spelling ALL
+         THREE real neutral-cwd sites use.
+
+    The scope limits below are the guard's PRECISION BOUNDARY, each deliberate:
+
+    * ONE level of indirection, no transitive chains. No real site needs a
+      second hop, and each hop widens the ways a non-neutral value could be
+      laundered past the guard.
+    * FUNCTION-LOCAL ONLY — never a module global, never an attribute such as
+      ``self._cwd``. A guard that accepted ``cwd=self._cwd`` would pass ANY
+      instance attribute whatsoever, which is precisely the silent-exposure
+      shape being guarded against.
+    * LAST-ASSIGNMENT-WINS IS NOT MODELLED: any matching assignment anywhere in
+      the function exempts. A function that assigns ``cwd`` from
+      ``neutral_cli_cwd()`` and then reassigns it to a project root is not a
+      shape that occurs, and a false RED costs more here than this miss.
+
+    This resolution is deliberately used INSTEAD of listing the three real
+    sites in an allowlist. They are COMPLIANT, not exempt; an allowlist entry
+    would freeze that judgement, so a later edit changing
+    ``cwd = neutral_cli_cwd()`` to ``cwd = self._project_root`` would leave the
+    blessing in place and the guard silent exactly where it matters. Tied to
+    the property that makes the call safe, the exemption evaporates the moment
+    the property does.
+    """
+    cwd = _keyword(call, 'cwd')
+    if cwd is None:
+        return False
+    if _callee_name(cwd) == NEUTRAL_CWD_CALLEE:
+        return True
+    if not isinstance(cwd, ast.Name):
+        return False
+    func = _enclosing_function(call, parent_map)
+    return func is not None and cwd.id in _neutral_cwd_locals(func)
+
+
+def _classify(call: ast.Call, parent_map: dict[int, ast.AST]) -> tuple[str, str]:
+    """Return the ``(exemption, message)`` pair describing how *call* is (un)safe.
+
+    Explicit scoping is reported ahead of neutral-cwd when a call carries both,
+    so the exemption named is the one the call states rather than the one it
+    inherits from where it happens to run.
+    """
     strict = _is_true_literal(_keyword(call, 'strict_mcp_config'))
     if strict and not _is_falsy_literal(_keyword(call, 'mcp_config')):
         return EXEMPT_STRICT_MCP, _STRICT_MCP_MESSAGE
+    if _resolves_to_neutral_cwd(call, parent_map):
+        return EXEMPT_NEUTRAL_CWD, _NEUTRAL_CWD_MESSAGE
     return NOT_EXEMPT, _VIOLATION_MESSAGE
