@@ -21,6 +21,13 @@ a module under ``orchestrator/tests`` can import ``_orch_helpers``'s
 ``assert_isolated_git_repo`` / ``git_env_with_ceiling`` -- the two per-call
 layers of the esc-3072-3 defence that every git-in-tmp_path test here must use.
 The instrument's own pure helpers stay unit-tested next to the instrument.
+
+EVERY REFUSAL PINS THE EXIT CODE rather than merely non-zero. The ladder -- 0
+clean, 1 a policy refusal this commit must fix, 2 the gate could not do its job
+-- is the gate's only machine-readable output, and a caller that reads 2 as
+"instrument down, retry or ignore" must never be handed a policy refusal under
+it. Asserting ``!= 0`` everywhere is what let exactly that drift in unseen: a
+rewritten ledger exited 2 with a fully green suite.
 """
 from __future__ import annotations
 
@@ -252,7 +259,7 @@ class TestTheStagedDiffIsAudited:
 
         result = repo.gate()
 
-        assert result.returncode != 0
+        assert result.returncode == 1, result.stdout + result.stderr
         message = result.stderr
         assert 'lines' in message
         assert 'a.py' in message
@@ -297,7 +304,40 @@ class TestTheStagedDiffIsAudited:
 
         result = repo.gate()
 
-        assert result.returncode != 0
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert '1005' in result.stderr
+
+    def test_a_recorded_raise_in_heads_ledger_is_not_a_standing_permission(
+        self, tmp_path: Path
+    ) -> None:
+        # LEDGER_README, in terms: "It is NOT a permission list: nothing in this
+        # file grants a future raise, and no entry here will ever let
+        # --write-baseline absorb one." The gate honours that by asking only
+        # THIS COMMIT's appended entries to cover the rise, so a record already
+        # committed -- naming the exact measure, key and landing value -- must
+        # license nothing. Every other covering case writes its record in the
+        # same commit, so a refactor that passed the whole staged ledger (or
+        # HEAD's) to `unrecorded_raises` would turn the file into the standing
+        # permission list its own README forbids with all of them still green.
+        repo = _Repo.seeded(tmp_path)
+        repo.write_ledger(
+            _ledger_with(
+                _record([
+                    metrics._violation('lines', 'a.py', 1000, 1005),
+                    metrics._violation(
+                        'total:lines', metrics.CLUSTER_TOTAL_KEY, 1200, 1205
+                    ),
+                ])
+            )
+        )
+        repo.commit_all('record a raise in a commit that does not take it')
+
+        repo.write_baseline(_report_with(_raise_lines))
+        repo.stage(metrics.BASELINE_RELPATH)
+
+        result = repo.gate()
+
+        assert result.returncode == 1, result.stdout + result.stderr
         assert '1005' in result.stderr
 
     def test_a_staged_deletion_of_the_baseline_is_refused(
@@ -310,7 +350,7 @@ class TestTheStagedDiffIsAudited:
 
         # The first half of "delete the destination first", closed at the
         # cheapest possible point -- before any comparison is attempted.
-        assert result.returncode != 0
+        assert result.returncode == 1, result.stdout + result.stderr
         assert 'delete' in result.stderr.lower()
         assert metrics.BASELINE_RELPATH in result.stderr
 
@@ -325,7 +365,7 @@ class TestTheStagedDiffIsAudited:
 
         result = repo.gate()
 
-        assert result.returncode != 0
+        assert result.returncode == 2, result.stdout + result.stderr
         # load_baseline's named hard failure, surfaced as a line a reader can
         # act on -- never a traceback, which reads as a broken instrument and
         # sends them hunting the wrong thing (INV-11).
@@ -435,7 +475,7 @@ class TestRestoreCarveOut:
 
         # A blob never recorded at this path, with an empty ledger: the
         # 0b04534c7b case, which reached main unexamined.
-        assert result.returncode != 0
+        assert result.returncode == 1, result.stdout + result.stderr
         message = result.stderr
         assert _PORTS in message
         assert 'lines' in message and 'prose_lines' in message
@@ -454,7 +494,7 @@ class TestRestoreCarveOut:
 
         result = repo.gate()
 
-        assert result.returncode != 0
+        assert result.returncode == 1, result.stdout + result.stderr
         assert _CONFTEST in result.stderr
 
     def test_the_same_blob_at_another_path_does_not_license_the_baseline(
@@ -477,7 +517,7 @@ class TestRestoreCarveOut:
 
         result = repo.gate()
 
-        assert result.returncode != 0
+        assert result.returncode == 1, result.stdout + result.stderr
         assert _CONFTEST in result.stderr
 
     def test_a_fall_is_clean_without_consulting_history(
@@ -540,7 +580,7 @@ class TestLedgerIsAppendOnlyAtTheGate:
 
         result = repo.gate()
 
-        assert result.returncode != 0
+        assert result.returncode == 1, result.stdout + result.stderr
         assert 'append-only' in result.stderr
         assert '1' in result.stderr
 
@@ -558,15 +598,19 @@ class TestLedgerIsAppendOnlyAtTheGate:
 
         result = repo.gate()
 
-        assert result.returncode != 0
+        assert result.returncode == 1, result.stdout + result.stderr
         assert 'append-only' in result.stderr
 
     def test_a_covering_append_does_not_launder_a_rewritten_history(
         self, tmp_path: Path
     ) -> None:
-        # THE PIN THAT THE TWO AUDITS CANNOT SHORT-CIRCUIT EACH OTHER. The raise
-        # is correctly authorized AND a recorded entry is gone; either alone
-        # decides nothing, so both must be reported.
+        # A CORRECTLY COVERING APPEND DOES NOT LAUNDER A REWRITTEN HISTORY.
+        # The raise is authorized exactly as the sanctioned path asks and a
+        # recorded entry is gone in the same commit; the append-only refusal
+        # TAKES PRECEDENCE, which is what this pins. The two are not reported
+        # together: the ledger arm is resolved before the baseline arm and
+        # returns on its own, because a rewritten history cannot be excused by
+        # anything else in the commit.
         repo, _history = self._with_history(tmp_path)
         repo.write_baseline(_report_with(_raise_lines))
         repo.write_ledger(
@@ -583,7 +627,7 @@ class TestLedgerIsAppendOnlyAtTheGate:
 
         result = repo.gate()
 
-        assert result.returncode != 0
+        assert result.returncode == 1, result.stdout + result.stderr
         assert 'append-only' in result.stderr
 
     def test_a_malformed_staged_ledger_is_refused_by_name(
@@ -600,7 +644,7 @@ class TestLedgerIsAppendOnlyAtTheGate:
         # A ledger that cannot be parsed is one whose history cannot be audited,
         # and it must NEVER read as "nothing was authorized" (load_ledger's own
         # stated polarity).
-        assert result.returncode != 0
+        assert result.returncode == 2, result.stdout + result.stderr
         assert 'not valid JSON' in result.stderr
         assert 'Traceback' not in result.stderr
 
@@ -800,7 +844,7 @@ class TestTheCarveOutIsOneStepBack:
 
         result = repo.gate()
 
-        assert result.returncode != 0, result.stdout
+        assert result.returncode == 1, result.stdout + result.stderr
 
     def test_the_deep_reach_is_refused_naming_the_measures(
         self, tmp_path: Path
@@ -815,7 +859,7 @@ class TestTheCarveOutIsOneStepBack:
 
         result = repo.gate()
 
-        assert result.returncode != 0, result.stdout
+        assert result.returncode == 1, result.stdout + result.stderr
         # It refuses through the ordinary unrecorded-raise arm, so the message
         # names what rose and how to authorize it.
         assert 'lines' in result.stderr and 'a.py' in result.stderr
@@ -842,7 +886,7 @@ class TestTheCarveOutIsOneStepBack:
 
         result = repo.gate()
 
-        assert result.returncode != 0, result.stdout
+        assert result.returncode == 1, result.stdout + result.stderr
 
     def test_the_immediately_previous_value_is_still_allowed(
         self, tmp_path: Path

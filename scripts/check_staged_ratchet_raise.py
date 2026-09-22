@@ -25,8 +25,13 @@ policy stays pure and testable on dicts in microseconds while the plumbing stays
 testable against a real repo. Same-directory import: running this file puts
 ``scripts/`` on ``sys.path[0]``, so no path surgery is needed.
 
-Exit ladder, matching the instrument's own: 0 clean, 1 a raise this commit did
-not record, 2 the gate could not do its job.
+EXIT LADDER: 0 clean; 1 a POLICY refusal this commit must fix -- an unrecorded
+raise, a staged deletion of the baseline, or a rewritten ledger history; 2 the
+gate could not do its job -- its environment is wrong, git failed, or a staged
+artifact is unreadable. The split is the only machine-readable thing this gate
+says, and it is what lets a later caller (CI, a merge-lane gate, the residual
+``RAISE_REMEDY`` already names) treat 2 as "instrument down, retry or ignore"
+without ever waving a policy refusal through under it.
 """
 from __future__ import annotations
 
@@ -201,8 +206,9 @@ def _appended_ledger_entries(root: Path, scratch: Path) -> list[dict]:
     the ledger ALONE, so an audit conditioned on the baseline would leave it
     unenforced in the one case that breaks it (heuristic 10, uniformly).
 
-    The refusal is ``ledger_appended_entries``' own ``MetricsError`` rather than
-    a line this function composes. That asymmetry against the baseline arm is
+    The refusal is ``ledger_appended_entries``' own ``AppendOnlyViolation``
+    rather than a line this function composes, and :func:`_audit` gives it the
+    policy rung of the ladder. That asymmetry against the baseline arm is
     deliberate: a rewritten history cannot be excused by anything else in the
     commit, whereas a measured raise can be -- by a covering ledger entry, or by
     a restore.
@@ -288,7 +294,14 @@ def _audit(root: Path) -> int:
         # baseline is staged. Neither can excuse the other: a covering append
         # does not launder a rewritten history, and an untouched history does
         # not excuse an unrecorded raise.
-        appended = _appended_ledger_entries(root, Path(scratch))
+        try:
+            appended = _appended_ledger_entries(root, Path(scratch))
+        except metrics.AppendOnlyViolation as exc:
+            # A VERDICT, so the POLICY rung -- never the instrument-failure one
+            # its ``MetricsError`` siblings take at ``main``. It returns here
+            # rather than joining the baseline arm's lines because nothing else
+            # in the commit can excuse it.
+            return _refuse([f'ratchet commit gate: {exc}'])
         refusals = (
             _audit_baseline(root, Path(scratch), appended)
             if metrics.BASELINE_RELPATH in staged

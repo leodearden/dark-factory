@@ -101,7 +101,21 @@ class MetricsError(Exception):
 
     Always raised with the offending path / tool / version named in the message.
     Mapped to exit code 2 at the ``main()`` boundary, categorically apart from
-    the exit-1 "the tree regressed" outcome.
+    the exit-1 "the tree regressed" outcome. ``AppendOnlyViolation`` is the one
+    subclass that is a VERDICT rather than a fault, and it says so itself.
+    """
+
+
+class AppendOnlyViolation(MetricsError):
+    """The ledger's recorded history was REWRITTEN -- a verdict, not a fault.
+
+    A ``MetricsError`` subclass, so nothing that already catches one changes
+    behaviour; a DISTINCT type, because the two are read differently at a
+    boundary. ``scripts/check_staged_ratchet_raise.py`` exits 1 for this (the
+    committer did something the ratchet forbids and can fix) and 2 for its
+    siblings (the gate could not do its job). Collapsing them would leave a
+    caller that reasonably treats 2 as "instrument down, retry or ignore"
+    waving a rewritten ledger through.
     """
 
 
@@ -1650,7 +1664,9 @@ def ledger_appended_entries(previous: dict, current: dict) -> list[dict]:
     for its own writes, while the file is edited by rebases, merges and hands.
     *previous* must be a PREFIX of *current* -- length equality is not prefix
     equality, so an entry rewritten in place is refused exactly like a dropped
-    one, and a reorder like both.
+    one, and a reorder like both. The refusal is an ``AppendOnlyViolation``
+    rather than a bare ``MetricsError`` so a caller can tell this VERDICT apart
+    from an instrument failure at its own exit boundary.
 
     Pure: two loaded dicts in, the suffix out. The caller decides where the two
     images came from, which is what keeps every git invocation in
@@ -1660,7 +1676,7 @@ def ledger_appended_entries(previous: dict, current: dict) -> list[dict]:
     current_raises = list(current.get('raises', ()))
     if current_raises[: len(previous_raises)] != previous_raises:
         kept = _common_prefix_length(previous_raises, current_raises)
-        raise MetricsError(
+        raise AppendOnlyViolation(
             'the authorized-raise ledger is append-only, and this change '
             f'rewrites its history: {len(previous_raises) - kept} of its '
             f'{len(previous_raises)} recorded entr(ies) are no longer where '
