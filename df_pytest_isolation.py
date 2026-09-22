@@ -58,13 +58,10 @@ been written yet.
 Task 4755 widened the defence from clocks to fleet-redeploy coordination state
 generally, by registering its IN-FLIGHT LEASE
 (``data/orchestrator/fleet_redeploy_lease.json``, env ``ORCH_FLEET_LEASE``) in
-the same table — one entry, which buys the guard, the redirect and the "set
-$VAR" remedy together.  A lease is exposed in BOTH directions where a clock is
-exposed in one: one left behind by a test SUPPRESSES real fleet redeploys until
-its max-age bound expires, and a test running the script's ``lease_release``
-against the live path DELETES a genuine in-flight sweep's lease.  Unlike a
-clock it has no benign-external-write case, so a stamp on the real lease path
-stays FALSIFIED rather than being downgraded by the attribution below.
+the same table.  It gets the REDIRECT half of this defence and deliberately not
+the change-detection half — ``REDIRECT_ONLY_RELPATHS`` implements that split and
+the comment at ``FLEET_LEASE_RELPATH`` states why, once.  Do not restate it
+here.
 
 Task 5299 closed an asymmetry the guard's own message used to invite: the
 GUARD above is autoused into all nine conftests that import this module, but
@@ -511,16 +508,41 @@ FM_DEPLOY_CLOCK_RELPATH = 'data/fused-memory/last_redeploy_fused_memory.json'
 
 # NOT a clock — task 4755's IN-FLIGHT LEASE, written by
 # scripts/restart-all-orchestrators.sh while a fleet sweep is running and
-# removed on every catchable exit path. It is protected by the same table
-# because it shares the table's exact invariant: a test run must never falsify
-# live fleet-redeploy coordination state. A lease is in fact exposed in BOTH
-# directions where a clock is exposed in one — one left behind SUPPRESSES real
-# redeploys until the max-age bound expires, and a lease_release run against
-# the live path DELETES a genuine in-flight sweep's lease. Registered here
-# rather than given a parallel fixture precisely because this table exists to
-# make two tables naming different files (or different vars) for the same thing
-# unrepresentable (heuristic 11, SPOT). Its four mirrors are pinned by
-# tests/scripts/test_orchestrator_watchdog.py::test_fleet_lease_path_matches_across_tiers.
+# removed on every catchable exit path. It gets the REDIRECT half of this
+# section's defence and deliberately NOT the change-detection half; the split
+# is stated here once, and REDIRECT_ONLY_RELPATHS below is what implements it.
+#
+# REDIRECT: yes, and it is what a lease actually needs. Its exposure is a TEST
+# spawning the producer without $ORCH_FLEET_LEASE set, and a lease is exposed
+# in BOTH directions where a clock is exposed in one — one left behind
+# SUPPRESSES real redeploys until the max-age bound expires, and a
+# lease_release run against the live path DELETES a genuine in-flight sweep's
+# lease. Pointing the var at a tmp file removes that at the source. Registered
+# in the table below rather than given a parallel fixture precisely because
+# that table exists to make two structures naming different files (or
+# different vars) for the same thing unrepresentable (heuristic 11, SPOT).
+#
+# CHANGE DETECTION: no, and it CANNOT work for a lease, for two independent
+# reasons. (i) deploy_clock_guard_roots deliberately watches the MAIN checkout
+# as well as this one, and a real sweep creates, per-unit rewrites and removes
+# the live lease there for its whole duration — so a real sweep IS a benign
+# external write, which is the only reason that root is watched at all, and a
+# verify run straddling either end of one would fail an innocent branch
+# (REWRITTEN / DELETED / CREATED). That is the false-positive class task 4823
+# closed, with a far wider window than a clock, which moves once and
+# instantaneously. (ii) Unlike a clock, no provenance in the body could rescue
+# it: the DELETED case has after=None and leaves nothing to attribute.
+#
+# ACCEPTED RESIDUAL, named rather than left to be discovered: a spawner that
+# HARDCODES the lease path instead of reading $ORCH_FLEET_LEASE is no longer
+# detected. Nothing in the repo does that, and what keeps it true is the
+# four-way drift pin plus the per-test monkeypatch.setenv('ORCH_FLEET_LEASE',
+# ...) discipline the existing lease tests follow.
+#
+# Its four mirrors are pinned by
+# tests/scripts/test_orchestrator_watchdog.py::test_fleet_lease_path_matches_across_tiers,
+# and the behaviour above by
+# tests/scripts/test_deploy_clock_isolation.py::TestALeaseOnlyChangeIsNeverReported.
 FLEET_LEASE_RELPATH = 'data/orchestrator/fleet_redeploy_lease.json'
 
 # The env var a forgetful spawner needed to set to avoid stamping each protected
@@ -536,13 +558,24 @@ PROTECTED_DEPLOY_CLOCK_ENV_VARS: dict[str, str] = {
     FLEET_LEASE_RELPATH: 'ORCH_FLEET_LEASE',
 }
 
+# Which entries of the table above get the REDIRECT half of the defence only,
+# and not change detection. A NAMED, structured statement of that split rather
+# than an `if 'lease' in relpath` string test (heuristic 12) and rather than a
+# second literal list of files (which is exactly what task 5299 folded away).
+# The reasoning for the one member is at FLEET_LEASE_RELPATH above.
+REDIRECT_ONLY_RELPATHS: frozenset[str] = frozenset({FLEET_LEASE_RELPATH})
+
 # DERIVED, not a second literal list (heuristic 11, SPOT): a protected clock the
 # guard watches but the table above omits would have made the message path raise
 # KeyError from the session-teardown `finally` below — replacing the actionable
 # 3am message with a traceback at exactly the moment a REAL clock was falsified.
 # Deriving makes that state unrepresentable. Dicts preserve insertion order, so
 # the reporting order documented above is retained.
-PROTECTED_DEPLOY_CLOCK_RELPATHS: tuple[str, ...] = tuple(PROTECTED_DEPLOY_CLOCK_ENV_VARS)
+PROTECTED_DEPLOY_CLOCK_RELPATHS: tuple[str, ...] = tuple(
+    relpath
+    for relpath in PROTECTED_DEPLOY_CLOCK_ENV_VARS
+    if relpath not in REDIRECT_ONLY_RELPATHS
+)
 
 # A real clock body is ~70 bytes (`{"ts": <int>, "iso": "<timestamp>"}`), so this
 # truncates nothing legitimate; it exists only so a failure message stays
