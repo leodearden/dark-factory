@@ -96,21 +96,29 @@ _ESC_ID_PREFIXES: dict[str, str] = {
 # so the fold key and the record's own category can never drift apart.
 _ESCALATION_CATEGORY = 'infra_issue'
 
-# Keys BacklogPolicy stamps onto its escalation records that are NOT
-# ``Escalation`` dataclass fields. THREE queue operations destroy them, not
-# one, because each persists a record round-tripped through the dataclass:
+# Keys BacklogPolicy stamps onto its escalation records. THREE queue
+# operations destroy them, not one, because each persists a record
+# round-tripped through the dataclass:
 #   * ``EscalationQueue.resolve()`` rewrites from ``Escalation.to_json()``
 #     (== ``asdict(Escalation)``) — the close path;
 #   * ``EscalationQueue.submit()`` persists the same ``to_json()`` — so the
 #     FIRST write drops them too;
 #   * ``attach_dedupe_child()`` re-hydrates via ``Escalation.from_json`` before
 #     rewriting — so does every FOLD.
-# With ``project_id``/``error_type`` gone the record is no longer attributable
-# to a project or a fault kind, breaking the exact forensic query that
-# diagnosed the 48h reify incident ('0 of 96 escalation files carried
-# ReconciliationJudgeHalted'). That is why ``_merge_onto_persisted`` runs on
-# the write and fold paths (``_maybe_write_escalation``) as well as the close
-# path (``_restore_policy_keys``).
+# With ``error_type`` gone the record is no longer attributable to a fault
+# kind, breaking the exact forensic query that diagnosed the 48h reify
+# incident ('0 of 96 escalation files carried ReconciliationJudgeHalted').
+# That is why ``_merge_onto_persisted`` runs on the write and fold paths
+# (``_maybe_write_escalation``) as well as the close path
+# (``_restore_policy_keys``).
+#
+# ``project_id`` is no longer one of the non-field keys — task 4951 made it a
+# first-class ``Escalation`` field, so it alone now survives all three
+# operations above. It stays in this constant because the ``Escalation(...)``
+# call in ``_maybe_write_escalation`` still does not pass ``project_id=``:
+# this merge remains the only thing that puts the value on the record, and
+# dropping the name here without adding that constructor argument would remove
+# project attribution outright.
 _POLICY_ONLY_KEYS: tuple[str, ...] = ('project_id', 'error_type', 'backlog', 'threshold')
 
 
@@ -394,9 +402,13 @@ class BacklogPolicy:
         Only ``judge_halt``-prefixed records that are still ``pending`` AND
         carry a matching ``project_id`` are touched — backlog/wedge records
         and other projects' halts are left alone. The project filter reads the
-        RAW json because ``Escalation.from_dict`` keeps only dataclass fields
-        and therefore DROPS the ``project_id`` key this policy writes, making
-        ``queue.get_pending()`` unfilterable by project.
+        RAW json. That was once the only option, because
+        ``Escalation.from_dict`` kept only dataclass fields and therefore
+        DROPPED the ``project_id`` key this policy writes. Task 4951 made
+        ``project_id`` a real field, so ``get_pending()`` is filterable by
+        project now — including for records written before 4951, whose raw key
+        ``from_dict`` reads into the field. The raw read is kept because it is
+        still correct here, not because it is still forced.
 
         Returns the ids actually resolved (empty when there is nothing to do),
         so the caller can report them to the operator. An id is reported ONLY

@@ -1586,11 +1586,19 @@ class TestDegradedFilingPaths:
         """The fold branch degrades the SAME way, because it breaks the same way.
 
         Measured on this branch: ``attach_dedupe_child`` re-hydrates through
-        ``Escalation.from_json``, so a fold strips the four policy keys its
-        parent's own first merge put there. A fold whose merge then fails
-        leaves exactly the unattributable record a failed first write leaves —
-        so reporting the parent's path here would claim the halt sentinel on a
-        record nothing can ever close.
+        ``Escalation.from_json``, so a fold strips the policy keys its parent's
+        own first merge put there. A fold whose merge then fails leaves exactly
+        the unattributable record a failed first write leaves — so reporting
+        the parent's path here would claim the halt sentinel on a record
+        nothing can ever close.
+
+        ``project_id`` is the ONE member of ``_POLICY_ONLY_KEYS`` that is NOT
+        stripped any more, which is why the assertion below names
+        ``error_type`` instead: task 4951 made ``project_id`` a real
+        ``Escalation`` field, so it now survives the round-trip that still
+        strips its three siblings. The contract under test is unchanged — the
+        record remains unattributable to a FAULT KIND, which is what the
+        degraded no-path report exists to signal.
         """
         await _seed_buffered(event_buffer, 'proj', n=12)
         project_root = tmp_path / 'proj_root'
@@ -1626,8 +1634,10 @@ class TestDegradedFilingPaths:
             Path(first.escalation_path).read_text(encoding='utf-8'),
         )
         assert parent['dedupe_count'] == 1
-        # And the record really is unattributable, which is why no path is named.
-        assert 'project_id' not in parent
+        # And the record really is unattributable, which is why no path is
+        # named. Asserted on ``error_type`` rather than ``project_id`` — only
+        # the latter became a dataclass field in 4951 (see docstring).
+        assert 'error_type' not in parent
 
     @pytest.mark.asyncio
     async def test_a_closed_halt_is_never_a_fold_parent_for_the_next_one(
