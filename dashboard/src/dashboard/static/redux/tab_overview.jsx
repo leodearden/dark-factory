@@ -2,10 +2,8 @@
 const { Sparkline, LineChart, StatTile, PALETTE: P } = window.DF_CHARTS;
 const { Glyph, LiveFeed } = window.DF_SHELL;
 const D = window.DF_DATA;
-// The Datum wrapper, at module scope with no fallback — the DF_SPARK_PATH
-// convention index.html's load order backs: a missing or mis-ordered datum.js
-// throws here at load with a clear message rather than deferring to a TypeError
-// inside a render.
+// The Datum wrappers. Module scope, no fallback — see the CANONICAL note in
+// datum.js's header.
 const { plainDatum, derivedDatum } = window.DF_DATUM;
 const { useState, useEffect } = React;
 

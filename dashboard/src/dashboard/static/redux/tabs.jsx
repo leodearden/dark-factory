@@ -20,12 +20,8 @@ const { orchEmptyLabel } = window.DF_ORCH_FILTER || { orchEmptyLabel: () => 'No 
 // enforced contract, pinned per-module by test_index_html.py: both scripts are
 // asserted served-200 and asserted to load before this file.
 const { strandBadgeState, agentCellState, locksCellState } = window.DF_TASK_ROW_CELLS;
-// The Datum readers, at module scope with no fallback (the DF_SPARK_PATH
-// convention: throw loudly at load rather than defer to a TypeError inside a
-// render). Bound under datum.js's own names — this is a `type="text/babel"`
-// tag, whose top-level bindings Babel-standalone downlevels so they never join
-// the classic-script global lexical scope that forces the renames in data.js
-// and task_row_cells.js. See classic_script_scope.test.mjs's SCOPE note.
+// The Datum readers. Module scope, no fallback, bound under datum.js's own
+// names — see the CANONICAL note in datum.js's header.
 const { plainDatum, derivedDatum, unknownDatum } = window.DF_DATUM;
 const { burndownStacks, burndownLegend, parityBannerState } = window.DF_BURNDOWN_BANDS;
 const { reconRunCounts, reconSuccessPct, reconStatusTone } = window.DF_RECON_STATUS;

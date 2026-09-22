@@ -11,17 +11,9 @@
  * render and can be replaced freely.
  */
 
-// The Datum envelope's readers, destructured at module scope with no fallback
-// (the DF_SPARK_PATH convention: throw loudly at load rather than defer to a
-// TypeError inside a poll). index.html loads datum.js immediately before this
-// file and test_index_html.py pins that edge.
-//
-// RENAMED IN THE DESTRUCTURE, not bound under datum.js's own names. Classic
-// scripts share ONE global lexical scope, and each of these is already a
-// top-level `function` declaration in datum.js — a same-named `const` here
-// dies with "Identifier 'x' has already been declared" before this file
-// reaches its own `window.DF_DATA = {...}`, which would take the entire
-// dashboard down. classic_script_scope.test.mjs measures exactly that.
+// The Datum envelope's readers. Module scope, no fallback, RENAMED — this is a
+// classic script, so a bare `isDatum` would collide with datum.js's top-level
+// declaration of the same name. See the CANONICAL note in datum.js's header.
 const {
   isDatum: isDatumPayload,
   withReceipt: stampWithReceipt,

@@ -6,13 +6,8 @@ const PIP_AGE_STYLE = window.DF_CHARTS.DATUM_AGE_STYLE;
 // the four escalation-subsection pips each carried their own `fontSize: 9`, and
 // one of four drifting is how a summary row comes to have two type sizes.
 const PIP_BADGE_STYLE = Object.freeze({ fontSize: 9 });
-// The Datum render decision, at module scope with no fallback (the
-// DF_SPARK_PATH convention: throw loudly at load rather than defer to a
-// TypeError inside a render). Bound under datum.js's own name — this is a
-// `type="text/babel"` tag, whose top-level bindings Babel-standalone downlevels
-// so they never join the classic-script global lexical scope that forces the
-// renames in data.js and task_row_cells.js. See classic_script_scope.test.mjs's
-// SCOPE note for the three measured witnesses.
+// The Datum render decision. Module scope, no fallback, bound under datum.js's
+// own name — see the CANONICAL note in datum.js's header.
 const { datumView } = window.DF_DATUM;
 const SHELL_PROJECTS = window.DF_DATA.PROJECTS;
 const SHELL_AGENTS = window.DF_DATA.AGENTS;

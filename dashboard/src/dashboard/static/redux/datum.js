@@ -3,42 +3,57 @@
 // and — for anything but `fresh` — the producer's verbatim reason. This module
 // holds the one decision that turns that envelope into something to draw.
 //
-// NAMED FOR ITS SERVER TWIN. dashboard/src/dashboard/data/datum.py declares the
-// wire contract (the five keys Datum.to_wire() emits, the four DatumState
-// names, and the invariants validate_datum enforces). isDatum below is written
-// as the reader of exactly that shape, so the SPA checks the contract the
-// server already enforces rather than a second, drifting notion of "looks like
-// a datum". Matching filenames is what makes the two halves findable from each
-// other.
+// NAMED FOR ITS SERVER TWIN, dashboard/src/dashboard/data/datum.py, which
+// declares the wire contract this file reads. Matching filenames are what make
+// the two halves findable from each other.
 //
-// THE CLIENT NEVER CONSTRUCTS OR MUTATES A SERVER DATUM. datum.py's dataclass
-// is frozen for the same reason: a Datum is produced server-side only. Two
-// client-built envelopes are sanctioned and no more — unknownDatum, for "no
-// measurement exists yet", and plainDatum, confined to values not yet SERVED as
-// a Datum (see its own note). withReceipt returns a COPY; nothing here writes
-// through to a payload the poll loop is holding.
+// THE CLIENT NEVER CONSTRUCTS OR MUTATES A SERVER DATUM — datum.py's dataclass
+// is frozen for the same reason. Three client-built envelopes are sanctioned
+// and no more: unknownDatum, plainDatum and derivedDatum, each below with the
+// gap it covers.
 //
-// WHY A PLAIN-JS CLASSIC SCRIPT AND NOT A .jsx MODULE. charts.jsx's header
-// states the constraint: the .jsx files are `type="text/babel"` behind CDN
-// Babel with no node_modules, so nothing in one can be EXECUTED by a test. The
-// render DECISION therefore lives here, behaviourally covered by
-// dashboard/tests/js/datum.test.mjs, and each shared component becomes a thin
-// renderer of the descriptor datumView returns. spark_path.js and
-// task_row_cells.js are the same arrangement; the CANONICAL statement of why it
-// exists at all is in pins_recovery.js's header and is deliberately not
-// restated here.
+// A PLAIN-JS CLASSIC SCRIPT, NOT A .jsx MODULE, so the render decision is
+// EXECUTABLE: the .jsx files are `type="text/babel"` behind CDN Babel with no
+// node_modules. spark_path.js and task_row_cells.js are the same arrangement,
+// and pins_recovery.js's header holds the CANONICAL statement of why.
 //
 // Dual-loaded: a browser classic `<script>` assigns `window.DF_DATUM`, node
 // resolves the same file as CommonJS for `dashboard/tests/js/`. index.html
 // loads it after endpoint_staleness.js and before data.js, task_row_cells.js
 // and the Babel JSX tags, so the global exists before any consumer's top-level
 // destructure runs.
+//
+// ── CANONICAL: HOW A CONSUMER TAKES THIS MODULE, AND WHY ──────────────────
+// Stated once, here, because nine files now destructure DF_DATUM and nine
+// hand-copies of one rationale drift — the hazard these modules exist to
+// remove. Each consumer carries a one-line pointer to this block instead.
+// (task_row_cells.js's header points at pins_recovery.js's CANONICAL block for
+// the shared-substrate rationale by the same rule.)
+//
+// AT MODULE SCOPE, WITH NO `|| {}` FALLBACK — the DF_SPARK_PATH convention. A
+// missing or mis-ordered dependency throws at load with a clear message rather
+// than deferring to a TypeError inside a render or degrading silently.
+// index.html's load order is the enforced contract, pinned per-module by
+// tests/test_index_html.py.
+//
+// WHICH NAME TO BIND IT UNDER DEPENDS ON THE KIND OF FILE, and getting it wrong
+// fails at LOAD rather than at first use:
+//   · a classic `<script>` — data.js, task_row_cells.js, and this file — shares
+//     ONE global lexical scope with every other classic script, so a `const`
+//     matching a top-level declaration elsewhere dies with "Identifier 'x' has
+//     already been declared" before the file reaches its own `window.DF_*`
+//     assignment, taking every downstream destructure with it. Rename in the
+//     destructure: `{ datumView: viewOfDatum }`.
+//   · a `type="text/babel"` tag — charts.jsx, shell.jsx, tabs.jsx and the
+//     tab_*.jsx files — is downlevelled by Babel-standalone, whose top-level
+//     bindings never join that scope. Bind under datum.js's own names.
+// Measured, not assumed: classic_script_scope.test.mjs's SCOPE note records
+// three independent witnesses, and it caught the destructure below in its
+// first spelling.
 
 // ── One age formatter for the whole dashboard ──
-// Destructured at MODULE SCOPE with no `|| {}` fallback, the DF_SPARK_PATH
-// convention: a missing dependency throws at load with a clear message rather
-// than deferring to a TypeError inside a render or silently degrading. The
-// load-order edge it creates is pinned in tests/test_index_html.py.
+// Renamed per the CANONICAL note above: endpoint_staleness.js already declares
+// a top-level `function formatAge`.
 //
 // formatAge — not window.DF_SHELL.timeago, which PRD open question 4 floated.
 // formatAge already produces the coarse humanised shape that question asks for
@@ -47,14 +62,6 @@
 // would make this leaf's headline signal — a badge that grows under a mocked
 // clock — untestable by construction. Reusing it also means the tile badge and
 // the endpoint banner state an age in exactly one format.
-//
-// BOUND UNDER A MODULE-UNIQUE NAME, not as a bare `formatAge`. Classic scripts
-// share ONE global lexical scope, and endpoint_staleness.js already declares a
-// top-level `function formatAge` — a same-named const here dies with
-// "Identifier 'formatAge' has already been declared" BEFORE reaching the
-// window.DF_DATUM assignment at the foot of this file, taking every consumer's
-// destructure with it. classic_script_scope.test.mjs measures exactly this, and
-// did catch this line in its first spelling.
 const { formatAge: formatAgeMs } = window.DF_ENDPOINT_STALENESS;
 
 // ── The vocabulary, read from the server's declaration ──
@@ -69,15 +76,9 @@ const DATUM_STATES = ['fresh', 'stale', 'unknown', 'lower_bound'];
 const DATUM_WIRE_KEYS = ['value', 'as_of', 'state', 'reason', 'freshness_bound_seconds'];
 
 // ── Is this the envelope, or a bare value a call site forgot to wrap? ──
-// A SHAPE check — the five keys present, the state recognised — and
-// deliberately not a re-implementation of validate_datum's invariants. The
-// server enforces the invariants; the client's job is to notice when what
-// arrived is not an envelope at all. Duplicating the invariant rules here would
-// put the contract in two places free to drift, and would make the SPA the
-// second authority on a question the producer has already answered.
-//
-// `null` has typeof 'object' and an array has all its indices, so both are
-// excluded explicitly rather than by a lazy typeof test.
+// A SHAPE check, deliberately NOT a re-implementation of validate_datum's
+// invariants: the server enforces those, and a second copy here would make the
+// SPA a drifting authority on a question the producer has already answered.
 function isDatum(x) {
   if (x === null || typeof x !== 'object' || Array.isArray(x)) return false;
   for (const key of DATUM_WIRE_KEYS) {
@@ -86,20 +87,15 @@ function isDatum(x) {
   return DATUM_STATES.indexOf(x.state) !== -1;
 }
 
-// ── "No measurement exists" — the one client-built placeholder envelope ──
+// ── "No measurement exists" — the client-built placeholder envelope ──
 // The unknown TRIAD datum.py::validate_datum enforces: state 'unknown' iff
-// value is null iff as_of is null. Returning a real Datum rather than null or
-// undefined is what lets a hole travel through the same code path as a value —
-// datumView renders it as an em-dash carrying `reason` as its tooltip, so an
-// operator reads WHY a number is absent instead of seeing a seed zero.
-//
-// freshness_bound_seconds is 0 because there is no measurement for any bound to
-// apply to; the field is present because the contract has five keys and an
-// envelope missing one is not a Datum.
+// value is null iff as_of is null. Returning a real Datum rather than null lets
+// a hole travel the same path as a value, so an operator reads WHY a number is
+// absent instead of seeing a seed zero.
 //
 // A fresh object per call, never a shared frozen singleton: callers stamp
-// receipts onto datums, and a shared literal would let one call site's stamp
-// show up on every other site's placeholder.
+// receipts onto datums, and a shared literal would show one call site's stamp
+// on every other site's placeholder.
 function unknownDatum(reason) {
   return {
     value: null,
@@ -113,13 +109,11 @@ function unknownDatum(reason) {
 // ── The guard that makes a missed migration site fail loudly ──
 // Returns *x* unchanged so it composes inline at the head of a render.
 //
-// THROWS UNCONDITIONALLY — in the browser exactly as under node. There is no
-// environment sniff to condition it on, and a component that quietly renders a
-// bare number in production while throwing in tests is precisely the silent
-// degradation this repo's loud-over-silent norm rejects. During the 43-site
-// StatTile migration a missed site fails immediately and by name in dev, rather
-// than rendering an unprovenanced number that looks exactly like a measured
-// one — which is the failure the envelope exists to remove.
+// THROWS UNCONDITIONALLY, in the browser exactly as under node. A component
+// that quietly renders a bare number in production while throwing in tests is
+// the silent degradation this repo's loud-over-silent norm rejects — and an
+// unprovenanced number that looks exactly like a measured one is the failure
+// the envelope exists to remove.
 function assertDatum(x, who) {
   if (isDatum(x)) return x;
   throw new TypeError(
@@ -129,10 +123,9 @@ function assertDatum(x, who) {
   );
 }
 
-// A short, safe rendering of whatever arrived instead of a Datum. Its own
-// function so assertDatum's message stays one sentence, and so the description
-// can never itself throw on an exotic value (a getter, a revoked proxy) while
-// building an error about one.
+// A short, safe rendering of whatever arrived instead of a Datum — its own
+// function so it can never itself throw on an exotic value (a getter, a revoked
+// proxy) while building an error about one.
 function describeNonDatum(x) {
   if (x === null) return 'null';
   if (Array.isArray(x)) return 'an array';
@@ -141,16 +134,14 @@ function describeNonDatum(x) {
 }
 
 // ── Provenance: when did THIS browser receive THIS payload? ──
-// Returns a COPY of *datum* carrying the two receipt fields. A copy, never a
-// write-through: the poll loop holds the object the server sent, and stamping
-// into it would mutate state other readers are already looking at.
+// A COPY, never a write-through: the poll loop holds the object the server
+// sent, and stamping into it would mutate state other readers are looking at.
 //
-// `_served_at` is the server's own serving instant (ISO-8601, or null until PRD
-// leaf beta puts a top-level `served_at` on the wire); `_received_at` is this
-// browser's clock at the moment the response resolved. They are underscored to
-// mark them as client-side annotations on a server payload rather than part of
-// the five-key wire contract — isDatum ignores them, as it must, because a
-// datum is equally valid before and after it is stamped.
+// `_served_at` is the server's serving instant (null until PRD leaf beta puts
+// a top-level `served_at` on the wire); `_received_at` is this browser's clock
+// when the response resolved. Underscored as client-side annotations rather
+// than wire keys — isDatum ignores them, as it must, because a datum is equally
+// valid before and after it is stamped.
 function withReceipt(datum, receipt) {
   const r = receipt || {};
   return { ...datum, _served_at: r.servedAt, _received_at: r.receivedAt };
@@ -167,20 +158,17 @@ function withReceipt(datum, receipt) {
 // advances every time this is called, which is what makes a wedged endpoint's
 // tile visibly age instead of resting at a reassuring constant.
 //
-// RETURNS NULL, NOT ZERO AND NOT NaN, whenever a term is unavailable: an
-// unknown datum has no as_of to age, an unstamped one has no receipt. Rendering
-// an age of zero from a missing timestamp is the `_minutes_since` mistake
-// endpoint_staleness.js::noticeText already documents — it fabricates
-// reassurance during exactly the failure this signal exists to surface — and
-// NaN would reach the operator as 'an unknown time' via formatAgeMs, which says
-// the same thing far less clearly than showing no badge at all.
+// RETURNS NULL, NOT ZERO AND NOT NaN, whenever a term is unavailable. An age of
+// zero from a missing timestamp is the `_minutes_since` mistake
+// endpoint_staleness.js::noticeText documents — it fabricates reassurance
+// during exactly the failure this signal exists to surface — and NaN would
+// reach the operator as 'an unknown time' via formatAgeMs.
 //
-// A MISSING `_served_at` is the one absence that degrades rather than nulls,
-// because it is today's normal case: no polled payload carries a top-level
-// `served_at` yet, so the server-side gap is unknown rather than wrong.
-// Contributing zero for it makes the result a LOWER bound on the true age —
-// honest, and still growing — where nulling would leave every tile un-aged
-// until beta lands.
+// A MISSING `_served_at` DEGRADES RATHER THAN NULLS, because it is today's
+// normal case — no polled payload carries a top-level `served_at` yet, so the
+// server gap is unknown rather than wrong. Contributing zero makes the result a
+// LOWER bound: honest and still growing, where nulling would leave every tile
+// un-aged until beta lands.
 function displayedAgeMs(datum, now) {
   const d = datum || {};
   const clientGap = Number(now) - Number(d._received_at);
@@ -196,10 +184,10 @@ function displayedAgeMs(datum, now) {
 }
 
 // ── The one true placeholder, and the one true under-report prefix ──
-// Exported for the reason task_row_cells.js::STRAND_TITLE is: 43 StatTile call
-// sites hand-spelling a placeholder is 43 chances to disagree about it, and
-// this module is where the disagreement is settled. '≥' marks a `lower_bound`
-// value — measured, but known to under-report, so the number shown is a floor.
+// Exported for task_row_cells.js::STRAND_TITLE's reason: 43 call sites
+// hand-spelling a placeholder is 43 chances to disagree about it. '≥' marks a
+// `lower_bound` value — measured, but known to under-report, so it reads as a
+// floor rather than a count.
 const EM_DASH = '—';
 const LOWER_BOUND_PREFIX = '≥';
 
@@ -218,36 +206,29 @@ const LOWER_BOUND_PREFIX = '≥';
 //            hole rule — free to keep answering the old way if this arm ever
 //            widens. Reading it here is what keeps the answer in one place.
 //
-// ONE DECISION, NO PER-CALLER BRANCHING. This is the entire point of the leaf:
-// a component asks what to draw and draws it. A tile that grew its own arm for
-// holes or its own age spelling would be a second authority on a question
-// answered here, which is how 43 tiles came to hand-roll 14 different null
-// guards in the first place.
+// ONE DECISION, NO PER-CALLER BRANCHING — the entire point of the leaf. A tile
+// that grew its own arm for holes or its own age spelling would be a second
+// authority on a question answered here, which is how 43 tiles came to
+// hand-roll 14 different null guards in the first place.
 //
-// FORMAT IS NEVER INVOKED ON A HOLE. The unknown arm returns before `format` is
-// reached. charts.jsx::HBarChart already records why that, and not the
-// placeholder, is the load-bearing half: its live call sites pass formatters
-// that throw on a missing value, so invoking one on a hole takes down the whole
-// tab rather than blanking one cell. It is also what lets the migration DELETE
-// each site's `x == null ? '—' : f(x)` sentinel instead of keeping two hole
-// decisions per tile.
+// FORMAT IS NEVER INVOKED ON A HOLE — the unknown arm returns first. That, and
+// not the placeholder, is the load-bearing half: charts.jsx::HBarChart records
+// that its live call sites pass formatters which throw on a missing value, so
+// invoking one on a hole takes down the whole tab rather than blanking a cell.
+// It is also what let the migration DELETE each site's `x == null ? '—' : f(x)`
+// sentinel instead of keeping two hole decisions per tile.
 //
-// A NEGATIVE DISPLAYED AGE IS UNBADGEABLE, for the reason displayedAgeMs gives
-// for returning null rather than NaN: formatAgeMs answers any n < 0 with the
-// literal 'an unknown time', which says far less clearly than no badge at all
-// what a 10px chip beside a value is for. It is reachable — an NTP step
-// backwards between the poll and the render makes the client gap negative, and
-// once PRD leaf beta puts served Datums on the wire, a producer whose `as_of`
-// is later than the response's `served_at` makes the server gap negative. The
-// age is still computed and still honest; it is only the BADGE that is
-// withheld, because there is nothing legible to draw.
+// A NEGATIVE DISPLAYED AGE IS UNBADGEABLE, for displayedAgeMs's own reason:
+// formatAgeMs answers any n < 0 with 'an unknown time'. Reachable on both
+// clocks — an NTP step backwards makes the client gap negative, and a producer
+// whose `as_of` is later than the response's `served_at` makes the server gap
+// negative. The age stays computed and honest; only the badge is withheld.
 //
 // THE AGE BADGE WINS OVER THE SERVER'S STATE. A datum served `fresh` was fresh
 // when it was served; if it has since aged past its producer's bound sitting in
-// this browser, the badge appears anyway. The value still renders and no reason
-// is invented — the server gave none — but the operator reads the age rather
-// than a verdict that has quietly expired. That client-side expiry is the only
-// thing the naive `now − as_of` age could never express.
+// this browser, the badge appears anyway. No reason is invented — the server
+// gave none — but the operator reads the age rather than a verdict that has
+// quietly expired.
 function datumView(datum, opts) {
   assertDatum(datum, 'datumView');
   const o = opts || {};
@@ -273,66 +254,52 @@ function datumView(datum, opts) {
 }
 
 // ── How long a plain-wrapped value may sit before its tile badges ──
-// TWELVE SECONDS = FOUR POLL INTERVALS. data.js polls every
-// POLL_INTERVAL_MS = 3000 with JITTER_MAX_MS = 1500, so a healthy endpoint's
-// receipt is at most ~4.5s old; 12s gives ~2.6x headroom, which is enough that
-// a jittered late poll never makes a working tile twitch.
+// TWELVE SECONDS = FOUR POLL INTERVALS. data.js polls every 3000ms with up to
+// 1500ms of jitter, so a healthy endpoint's receipt is at most ~4.5s old; 12s
+// is ~2.6x headroom, enough that a jittered late poll never makes a working
+// tile twitch.
 //
 // ORDERED FINE-THEN-COARSE AGAINST THE BANNER, deliberately not aligned with
-// it. endpoint_staleness.js declares an endpoint stale at
-// STALE_FAILURE_THRESHOLD = 3 consecutive failures, documented there as ~21s of
-// backoff. Badging at 12s makes the tile the FIRST, per-value signal and the
-// banner the later, per-endpoint explanation — two signals of distinct
-// granularity with one authority each. Matching 21s would have made the badge
-// read as a duplicate of the banner; the PRD's suggested two-interval 6s would
-// have badged a healthy tile whenever a jittered poll ran late.
+// it: endpoint_staleness.js declares an endpoint stale after ~21s of backoff,
+// so badging at 12s makes the tile the FIRST per-value signal and the banner
+// the later per-endpoint explanation — one authority each. Matching 21s would
+// read as a duplicate of the banner; the PRD's suggested 6s would badge a
+// healthy tile whenever a jittered poll ran late.
 const PLAIN_DATUM_BOUND_SECONDS = 12;
 
 // ── Provenance for a value the server does not yet serve as a Datum ──
-// Every polled payload is still a bare number today: PRD leaf beta has not
-// landed. Rather than leave 43 tiles unprovenanced until it does, this wraps a
-// plain value in what IS known about it — which endpoint delivered it, and
-// when. That is ENDPOINT granularity, coarser than a served Datum's per-value
-// instant, and the wrapper exists only to cover exactly this gap (PRD
-// decision 7). A row whose payload starts carrying a real Datum stops coming
-// through here; data.js's registry is the one place that flips.
+// Every polled payload is still a bare number: PRD leaf beta has not landed.
+// Rather than leave 43 tiles unprovenanced until it does, this wraps a plain
+// value in what IS known — which endpoint delivered it, and when. That is
+// ENDPOINT granularity, coarser than a served Datum's per-value instant, and
+// the wrapper exists only to cover that gap (PRD decision 7). A row whose
+// payload starts carrying a real Datum stops coming through here; data.js's
+// registry is the one place that flips.
 //
 // `as_of` IS THE SERVING INSTANT, not a guess at a measurement one. A plain
-// value carries no measurement instant of its own — that is the whole
-// difference between it and a served Datum — so the strongest true statement
-// available is "the server had this value when it served the payload". The
-// server-side gap is therefore exactly zero: inventing an earlier as_of would
-// fabricate staleness, a later one would hide it. Until beta puts `served_at`
-// on the wire, even that is unavailable and the fallback is this browser's own
-// arrival instant, which is at least a real instant.
+// value carries no measurement instant of its own, so the strongest true
+// statement available is "the server had this when it served the payload", and
+// the server-side gap is exactly zero: an earlier as_of would fabricate
+// staleness, a later one would hide it.
 //
-// NO RECEIPT MEANS UNKNOWN, NOT ZERO. Before an endpoint's first payload
-// resolves, DF_DATA still holds the seed values it was initialised with — and a
-// seed 0 rendered as a number is indistinguishable from a measured one. The
-// unknown Datum makes that first render an em-dash carrying its reason.
+// NO RECEIPT MEANS UNKNOWN, NOT ZERO. Before the first payload resolves,
+// DF_DATA still holds its seeds, and a seed 0 rendered as a number is
+// indistinguishable from a measured one.
 //
-// READS `__receipt` AND NEVER `__stale`. The two answer different questions:
-// __stale records ATTEMPT history (and is republished on failure, by design),
-// __receipt records the provenance of the value currently in DF_DATA (and is
-// published on success only, which is what makes a wedged endpoint's tiles keep
-// ageing). A tile that consulted both would be a second staleness verdict fired
-// at the same instant as the banner. The parameter takes the __receipt map
-// alone so that separation is structural rather than a promise.
+// READS `__receipt` AND NEVER `__stale`. __stale records ATTEMPT history and is
+// republished on failure by design; __receipt records the provenance of the
+// value now in DF_DATA and advances on success only, which is what makes a
+// wedged endpoint's tiles keep ageing. A tile consulting both would be a second
+// staleness verdict fired at the same instant as the banner. Taking the
+// __receipt map as the parameter makes that separation structural.
 //
-// AN ABSENT VALUE IS A HOLE even once the endpoint HAS delivered, and saying so
-// here is what keeps this wrapper inside the envelope's own contract:
-// data/datum.py::validate_datum's UNKNOWN_TRIAD rule is that the state is
-// 'unknown' exactly when value and as_of are both absent. Stamping
+// AN ABSENT VALUE IS A HOLE even once the endpoint HAS delivered, which is what
+// keeps this wrapper inside validate_datum's UNKNOWN_TRIAD rule. Stamping
 // `value: null, state: 'fresh'` would build client-side the one envelope the
-// server is forbidden to emit, and datumView would then hand that null to a
-// call site's `format` callback and badge the result with a real age — a
-// fabricated measurement, which is the defect this PRD exists to remove. It is
-// also what lets every call site DELETE its `x == null ? '—' : f(x)` sentinel
-// rather than move it into the formatter: `format` now only ever sees a value
-// that was actually measured.
+// server is forbidden to emit, and datumView would hand that null to a call
+// site's `format` and badge the result with a real age.
 //
-// `== null` and never `!value`: a measured 0 (or '' or false) IS a measurement,
-// and reading it as absent is the very conflation the envelope removes.
+// `== null` and never `!value`: a measured 0 (or '' or false) IS a measurement.
 // `undefined` is in, because an optional-chained read (`x?.y`) is the commonest
 // way a missing payload field reaches a tile.
 function plainDatum(value, endpointKey, receipts) {
@@ -366,20 +333,17 @@ function plainDatum(value, endpointKey, receipts) {
 // answered perfectly. The site is the only place that knows the real reason,
 // and in several cases it is already sitting in the tile's `hint`.
 //
-// COMPOSES THE TWO SANCTIONED CONSTRUCTORS AND DECIDES NOTHING ITSELF. It is a
-// naming device, not a third envelope: `== null` is plainDatum's own absent
-// test, on purpose and for the same reason — a measured 0 IS a measurement.
-// Exported rather than hand-written per file because three copies of one
-// two-line composition is how the 14 null guards this leaf deleted began.
+// COMPOSES THE TWO CONSTRUCTORS AND DECIDES NOTHING ITSELF. Exported rather
+// than hand-written per file because three copies of one two-line composition
+// is how the 14 null guards this leaf deleted began.
 //
 // THE ENDPOINT'S OWN ABSENCE OUTRANKS THE SITE'S REASON. Before the first
 // payload resolves, a value derived from DF_DATA's seeds is null for a reason
 // that is not the domain's — an empty seed array has no last bucket — so
 // 'no ops in the last 24h' there would be a confident lie about data this
-// browser has never seen. That question is plainDatum's, and it is asked
-// rather than re-implemented: a probe value it cannot call absent comes back
-// unknown only when there is no receipt. The probe is never rendered; only its
-// state is read.
+// browser has never seen. That question stays plainDatum's and is ASKED rather
+// than re-implemented: a probe value it cannot call absent comes back unknown
+// only when there is no receipt. The probe is never rendered.
 //
 // `absentReason` is REQUIRED. A caller with nothing better to say than 'no
 // value in the payload' is describing the payload and should call plainDatum.
@@ -389,19 +353,15 @@ function derivedDatum(value, endpointKey, absentReason, receipts) {
   return probe.state === 'unknown' ? probe : unknownDatum(absentReason);
 }
 
-// The browser default for plainDatum's third parameter, read lazily so a node
-// caller that passes its own map never touches a browser global — and so a
-// render that happens before data.js has published anything degrades to "no
-// receipt" rather than throwing.
+// The browser default for plainDatum's third parameter, read LAZILY: a node
+// caller passing its own map never touches a browser global, and a render
+// before data.js has published degrades to "no receipt" rather than throwing.
 function plainDatumReceipts() {
   return typeof window !== 'undefined' && window.DF_DATA ? window.DF_DATA.__receipt : null;
 }
 
-// Module-unique export const, never a bare `API` — see the
-// shared-classic-script-scope note in graph_layout.js's header, enforced at
-// runtime by dashboard/tests/js/classic_script_scope.test.mjs. A collision here
-// would leave window.DF_DATUM undefined and break the top-level destructures in
-// data.js, task_row_cells.js, charts.jsx, shell.jsx and tabs.jsx.
+// Module-unique export const, never a bare `API` — the CANONICAL note at the
+// head of this file, enforced at runtime by classic_script_scope.test.mjs.
 const DATUM_API = {
   DATUM_STATES,
   isDatum,

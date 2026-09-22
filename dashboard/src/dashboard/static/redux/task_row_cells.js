@@ -50,18 +50,9 @@
 // keying the badge off `agent` instead of `stranded` — fails a named test
 // instead of nothing.
 
-// The Datum envelope's readers, destructured at module scope with no fallback
-// (the DF_SPARK_PATH convention: throw loudly at load rather than defer to a
-// TypeError inside a render). index.html loads datum.js before this file and
-// test_index_html.py pins that edge.
-//
-// RENAMED IN THE DESTRUCTURE, not bound under datum.js's own names. Classic
-// scripts share ONE global lexical scope, and each of these is already a
-// top-level declaration in datum.js — a same-named `const` here dies with
-// "Identifier 'x' has already been declared" before this file reaches its own
-// window.DF_TASK_ROW_CELLS assignment, which would break the top-level
-// destructures in tab_tasks.jsx and tabs.jsx. classic_script_scope.test.mjs
-// measures exactly that.
+// The Datum envelope's readers. Module scope, no fallback, RENAMED — this is a
+// classic script, so a bare `datumView` would collide with datum.js's top-level
+// declaration of the same name. See the CANONICAL note in datum.js's header.
 const {
   assertDatum: requireDatum,
   datumView: viewOfDatum,

@@ -2,24 +2,10 @@
 
 const { useRef, useEffect, useState, useMemo } = React;
 
-// The Datum render decision, destructured at module scope with no fallback —
-// the same DF_SPARK_PATH convention the spark_path.js destructure below
-// follows, for the same reason: a missing or mis-ordered datum.js throws at
-// load with a clear message rather than deferring to a TypeError inside a
-// render. index.html loads datum.js ahead of this file and test_index_html.py
-// pins the edge.
-//
-// BOUND UNDER DATUM.JS'S OWN NAME, deliberately unlike the renamed
-// destructures in data.js and task_row_cells.js. Those two are classic scripts,
-// which share ONE global lexical scope, so a const matching a top-level
-// declaration in datum.js kills them at declaration-instantiation time. This
-// file is a `type="text/babel"` tag: Babel-standalone downlevels its top-level
-// bindings, so they never join that scope. That is measured, not assumed —
-// classic_script_scope.test.mjs's SCOPE note records three independent
-// witnesses (three tabs each declaring `const C`, three more each declaring
-// `const D`, three sharing `const DF`/usePersistedState/useOpenSet), and the
-// spark_path.js destructure below already binds `plottableMax` and `axisY`
-// under their own top-level names for the same reason.
+// The Datum render decision. Module scope, no fallback, bound under datum.js's
+// own name — a text/babel tag joins no classic-script scope, so there is
+// nothing to collide with. See the CANONICAL note in datum.js's header; the
+// spark_path.js destructure below follows the same rule.
 const { datumView } = window.DF_DATUM;
 
 // The scale+path math for every chart primitive here lives in the plain-JS

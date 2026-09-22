@@ -14,9 +14,8 @@ const { ProjectGroup, Pip, taskId } = window.DF_SHELL;
 const DF = window.DF_DATA;
 const C = window.DF_CHARTS;
 const { pinningSummary } = window.DF_PINS_RECOVERY;
-// The Datum wrapper, at module scope with no fallback — the DF_SPARK_PATH
-// convention index.html's load order backs: a missing or mis-ordered datum.js
-// throws here at load rather than inside a render.
+// The Datum wrappers. Module scope, no fallback — see the CANONICAL note in
+// datum.js's header.
 const { plainDatum, derivedDatum } = window.DF_DATUM;
 
 // Every number this tab renders arrives on one endpoint, and the path is the
