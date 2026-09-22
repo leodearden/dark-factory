@@ -1265,8 +1265,12 @@ def _pid_alive(pid) -> bool:
       off disk must be rejected before the syscall rather than by catching its
       exception. session_registry.resolve_session_pid documents the same trap.
     - os.kill(pid, 0) succeeding -> alive; ProcessLookupError -> dead;
-      PermissionError -> alive (visible but unsignalable); other OSError ->
-      treated as dead.
+      PermissionError -> alive (visible but unsignalable); other OSError, or
+      an OverflowError from a pid too large for the platform's C pid_t ->
+      treated as dead. The too-large case is the one input this predicate
+      lets REACH the syscall and still answers False for: unlike pid 0 or a
+      negative one, it carries no signalling hazard, and the platform's own
+      refusal is the answer.
     """
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return False
@@ -1277,7 +1281,7 @@ def _pid_alive(pid) -> bool:
         return False
     except PermissionError:
         return True
-    except OSError:
+    except (OSError, OverflowError):
         return False
 
 

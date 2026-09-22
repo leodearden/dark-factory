@@ -1899,12 +1899,25 @@ def _pid_alive(pid: int) -> bool:
 
     Copied (not imported) from harness.py:295-317 to keep this module
     stdlib-only and self-contained (invocable as a standalone script from
-    bash with no orchestrator package import).
+    bash with no orchestrator package import). That copy's contract is
+    preserved verbatim EXCEPT in the OverflowError branch, where this one
+    deliberately diverges (task 4755): harness.py::_pid_alive and the
+    fused_memory orchestrator_detector copy it mirrors still raise there, and
+    widening them is filed as follow-up work rather than done here, because
+    neither sits on the fleet-redeploy lease's read path.
 
     - Returns False for pid <= 0 (invalid).
     - Uses os.kill(pid, 0): success -> alive; ProcessLookupError -> dead;
-      PermissionError -> alive (visible but unsignalable); other OSError ->
+      PermissionError -> alive (visible but unsignalable); other OSError, or
+      an OverflowError from a pid too large for the platform's C pid_t ->
       treated as dead.
+
+    The OverflowError case is ordinary untrusted input, not a hypothetical:
+    service_restart.lease_is_live imports this predicate to evaluate a pid
+    parsed out of JSON another process wrote, so a value no pid_t can hold
+    arrives the same way a negative one does. "Cannot name a live process" is
+    exactly the judgment the OSError branch already makes for every other
+    value the syscall refuses.
     """
     if pid <= 0:
         return False
@@ -1915,7 +1928,7 @@ def _pid_alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True
-    except OSError:
+    except (OSError, OverflowError):
         return False
 
 
