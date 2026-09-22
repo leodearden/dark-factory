@@ -41,14 +41,25 @@ to avoid. Mutation is instead recognised by CALL SHAPE, in two tiers:
   ``collections.update(...)``, a plain dict update in
   ``bake_off_storage_shape.py`` -- so it alone stays dropped, with
   ``'store'`` dropped alongside it without an independently identified false
-  positive of its own. ``'client'`` is RESTORED here (amendment, task 4848):
-  re-measured against the live tree it introduces zero new hits, and
-  dropping it was a real false negative -- ``client.delete(...)`` /
+  positive of its own. ``'client'`` is RESTORED (amendment, task 4848)
+  because dropping it was a real false negative -- ``client.delete(...)`` /
   ``self._client.delete(...)`` is a receiver idiom this codebase already
   uses (``fused_memory/middleware/task_curator.py:2064,2307``), and a
   mutating script written in that shape would otherwise escape this check
   entirely: no allowlist entry, no audit-column row, nothing to signal the
   gap.
+
+  A hint matches a receiver SEGMENT, never a bare substring. The amendment
+  that restored ``'client'`` claimed it introduced zero new hits;
+  re-measured against that same tree the claim was false, and the one hit
+  it did introduce was a false positive -- ``testclient.add(local)`` in
+  ``check_module_local_testclient.py``, a plain ``set.add`` on a local
+  ``set[str]`` in an AST linter that never contacts a substrate, matched
+  only because ``'client'`` occurs inside ``'testclient'``. Splitting the
+  receiver on ``.`` and ``_`` before testing keeps every idiom the hints
+  exist for (``qdrant_client``, ``memory.mem0``, ``self._client``,
+  ``backend``, ``graph``) while making a hint buried mid-identifier a
+  non-match; see :func:`_has_substrate_hint`.
 
 AST, NOT GREP. A docstring or comment that merely names ``delete_memory`` or
 ``assert_store_mutation_allowed`` must not be flagged as a candidate, nor
@@ -104,6 +115,7 @@ from __future__ import annotations
 
 import ast
 import pathlib
+import re
 
 import pytest
 from _ast_guard import calls_named, imported_names_from, parse_python_module
@@ -163,11 +175,12 @@ GENERIC_MUTATING_VERBS: frozenset[str] = frozenset({'delete', 'update', 'add', '
 #: dict update in bake_off_storage_shape.py -- so it alone stays dropped,
 #: with 'store' dropped alongside it without an independently identified
 #: false positive of its own. 'client' was dropped in the same early draft
-#: but is RESTORED here (amendment, task 4848): re-measured against the
-#: live tree it produces zero new hits, and dropping it was a real false
-#: negative -- `client.delete(...)` / `self._client.delete(...)` is a
+#: but is RESTORED (amendment, task 4848) because dropping it was a real
+#: false negative -- `client.delete(...)` / `self._client.delete(...)` is a
 #: receiver idiom already used in this codebase (see
-#: fused_memory/middleware/task_curator.py:2064,2307).
+#: fused_memory/middleware/task_curator.py:2064,2307). Every hint here is
+#: matched against a receiver SEGMENT, never a bare substring -- see
+#: _has_substrate_hint for the false positive that distinction closes.
 SUBSTRATE_RECEIVER_HINTS: tuple[str, ...] = (
     'qdrant',
     'mem0',
@@ -184,8 +197,8 @@ def _dotted_receiver(node: ast.Attribute) -> str:
     Recurses through nested ``ast.Attribute``/``ast.Name`` nodes so a
     multi-hop receiver renders in full. Any other expression as the ultimate
     base (a call result, a subscript, ...) renders as ``'<expr>'`` rather
-    than raising -- Tier B only needs to test *membership* of a hint
-    substring, not a faithful source reprint.
+    than raising -- Tier B only needs to test whether a hint is one of this
+    chain's identifier segments, not a faithful source reprint.
     """
     if isinstance(node.value, ast.Name):
         base = node.value.id
@@ -196,11 +209,30 @@ def _dotted_receiver(node: ast.Attribute) -> str:
     return f'{base}.{node.attr}'
 
 
+def _has_substrate_hint(receiver: str) -> bool:
+    """True iff any IDENTIFIER SEGMENT of *receiver* is a substrate hint.
+
+    Segments, not substrings (amendment, task 4848). Testing
+    ``hint in receiver`` reads a hint out of the middle of an unrelated
+    identifier: measured, it flagged ``testclient.add(local)`` in
+    ``check_module_local_testclient.py`` -- a plain ``set.add`` on a local
+    ``set[str]`` in an AST linter that contacts no substrate at all --
+    because ``'client'`` occurs inside ``'testclient'``. Splitting on ``.``
+    and ``_`` is what keeps ``self._client`` and ``qdrant_client`` matching
+    while ``testclient`` stops; whole SEGMENTS rather than whole RECEIVERS,
+    because the hint may sit at any position in the chain.
+    """
+    return any(
+        segment in SUBSTRATE_RECEIVER_HINTS
+        for segment in re.split(r'[._]+', receiver)
+    )
+
+
 def mutating_calls(tree: ast.Module) -> list[tuple[str, int]]:
     """Every Tier A / Tier B mutating call in *tree*, as ``(callee_name, lineno)``.
 
-    Tier A hits are unconditional on the receiver. Tier B hits require the
-    receiver's dotted name to contain a substrate hint -- see the module
+    Tier A hits are unconditional on the receiver. Tier B hits require one of
+    the receiver's identifier segments to BE a substrate hint -- see the module
     docstring for why both tiers exist and why the hint set is shaped the
     way it is. A module with zero hits is not a mutation CANDIDATE at all,
     which is what keeps a purely read-only script (one that only constructs
@@ -230,8 +262,7 @@ def mutating_calls(tree: ast.Module) -> list[tuple[str, int]]:
         # two `if`/`elif` branches) so ruff's duplicate-body check does not
         # flag it -- both conditions lead to the identical append.
         if name in MUTATING_CALL_NAMES or (
-            name in GENERIC_MUTATING_VERBS
-            and any(hint in receiver for hint in SUBSTRATE_RECEIVER_HINTS)
+            name in GENERIC_MUTATING_VERBS and _has_substrate_hint(receiver)
         ):
             hits.append((name, node.lineno))
     return hits
@@ -355,8 +386,34 @@ class TestMutatingCallsTierB:
 
         assert ('delete', 2) in hits, (
             f'self._client.delete(...) must be flagged for the same reason as '
-            f"a bare client.delete(...) -- the hint matches the receiver's "
-            f'dotted name by substring, not by exact position; got {hits}'
+            f'a bare client.delete(...) -- a hint matches ANY identifier '
+            f"segment of the receiver's dotted name, not just the whole of "
+            f'it; got {hits}'
+        )
+
+    def test_hint_buried_inside_a_longer_identifier_is_not_flagged(
+        self, tmp_path
+    ):
+        """The negative half of the two ``client`` tests above.
+
+        ``testclient.add(local)`` is real source, from
+        ``scripts/check_module_local_testclient.py``: a plain ``set.add`` on
+        a local ``set[str]`` in an AST linter that contacts no substrate.
+        Under a raw ``hint in receiver`` test it was flagged, making a
+        read-only script a conformance candidate that no guard call and no
+        allowlist entry could ever satisfy -- exactly the false-positive
+        failure mode the module docstring says Tier B is shaped to avoid.
+        """
+        source = tmp_path / 'candidate.py'
+        source.write_text('def run():\n    testclient.add(local)\n')
+
+        hits = mutating_calls(parse_python_module(source))
+
+        assert hits == [], (
+            f"'client' occurs inside 'testclient', but no SEGMENT of the "
+            f'receiver is a substrate hint, so this plain set.add must not be '
+            f'flagged -- fix _has_substrate_hint, not this expectation; '
+            f'got {hits}'
         )
 
     @pytest.mark.parametrize(
@@ -545,8 +602,8 @@ CANDIDATE_SCRIPTS = _discover_candidate_scripts()
 #: `qdrant_client.delete` and `memory.mem0.update`, the exact two spellings
 #: the production module's docstring calls "a mutation no pattern search
 #: finds". CANDIDATE_FLOOR alone gives Tier B ZERO live-tree protection:
-#: measured, 14 of the current 16 real candidates are Tier A, so a
-#: regression that wiped out Tier B entirely (an emptied
+#: re-measured (task 4848 debug pass), 15 of the current 17 real candidates
+#: carry a Tier A hit, so a regression that wiped out Tier B entirely (an emptied
 #: SUBSTRATE_RECEIVER_HINTS, a GENERIC_MUTATING_VERBS that stopped matching)
 #: would still clear the floor on Tier A hits alone -- see
 #: TestCandidateDiscoveryIsNotVacuous.test_tier_b_only_candidates_are_still_discovered.
@@ -578,9 +635,10 @@ class TestCandidateDiscoveryIsNotVacuous:
     def test_tier_b_only_candidates_are_still_discovered(self):
         """Pin the two known Tier-B-only candidates by name.
 
-        CANDIDATE_FLOOR is satisfiable by Tier A hits alone (measured: 14 of
-        the 16 live candidates are Tier A), so it gives the tier the module
-        docstring calls load-bearing zero live-tree protection on its own.
+        CANDIDATE_FLOOR is satisfiable by Tier A hits alone (re-measured:
+        15 of the 17 live candidates carry a Tier A hit), so it gives the
+        tier the module docstring calls load-bearing zero live-tree
+        protection on its own.
         These two files' only mutating hit is Tier B; if either drops out of
         CANDIDATE_SCRIPTS, Tier B has silently stopped matching the real
         tree, even though the floor above may still be satisfied by Tier A
