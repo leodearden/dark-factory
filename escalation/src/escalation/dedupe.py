@@ -209,12 +209,13 @@ def gate_backlog_fingerprint_key(esc: Escalation) -> str | None:
     records this adapter exists to rescue the field is ``None`` regardless,
     leaving ``detail``'s first line their only recovery site.  That couples
     this helper to the emitter's format: a change to ``detail_parts[0]`` in
-    ``stage1_stall_detector`` must update this parser.  Because the parse fails CLOSED, the blast radius of such a drift is
-    duplicate records (visible, self-correcting once the new stamped record
-    becomes the parent), never wrong folds (which silently destroy an
-    escalation).  The same asymmetry drives taking the line remainder VERBATIM
-    rather than via ``\\S+``: truncating ``my project`` to ``my`` would turn a
-    parse ambiguity into a different, possibly colliding key.
+    ``stage1_stall_detector`` must update this parser.  Because the parse fails
+    CLOSED, the blast radius of such a drift is duplicate records (visible,
+    self-correcting once the new stamped record becomes the parent), never wrong
+    folds (which silently destroy an escalation).  The same asymmetry drives
+    taking the line remainder VERBATIM rather than via ``\\S+``: truncating
+    ``my project`` to ``my`` would turn a parse ambiguity into a different,
+    possibly colliding key.
 
     The literal token ``None`` is deliberately not special-cased: the emitter
     writes ``f'project_id: {project_id}'`` and stamps children as
