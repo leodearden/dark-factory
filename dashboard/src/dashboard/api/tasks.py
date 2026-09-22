@@ -217,13 +217,24 @@ async def api_tasks(request: Request) -> JSONResponse:
     # whatever the clock says when each one happens to be shaped, so the
     # freshness claims the payload makes are claims about the payload.
     served_at = resolve_now(None)
-    # Bounded fan-out, TWO bounded operations per project: one `statuses`-
+    # That instant must be the PRODUCER's too, not only the validator's.
+    # validate_datum deliberately refuses a NEGATIVE age under
+    # DatumInvariant.FRESHNESS_BOUND, because clamping would let a skewed
+    # producer's value render as freshly measured. A collector left to resolve
+    # its own clock reads it microseconds later and stamps every fresh datum
+    # at as_of > served_at. Measured before this was threaded: on every
+    # cache-miss render _validated turned every root into an unknown unit,
+    # routed all of them to TASKS_OFFLINE_PROJECTS, raised the global
+    # TASKS_OFFLINE flag and logged a WARNING per root. The payload then
+    # contradicted itself: ACTIVE_TASKS carried rows that TASKS_SNAPSHOT[p].rows
+    # said were never measured.
+    #
+    # The fan-out spends TWO bounded operations per project: one `statuses`-
     # narrowed active fetch and one compact get_statuses walk, concurrent and
     # under one TTL. The third slot in task_snapshot.PER_PROJECT_MCP_CALLS is
-    # the terminal window, which only the `?terminal=` request spends — so this
-    # render's cost no longer grows with the terminal tree at all.
+    # the terminal window, which only the `?terminal=` request spends.
     active, snapshots = await collect_tasks_with_counts(
-        http_client, config, resolve_external=True,
+        http_client, config, resolve_external=True, now=served_at,
     )
     offline_projects: list[str] = []
     degraded_projects: list[str] = []
