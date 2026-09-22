@@ -2,9 +2,10 @@
 normalization migration (task 4878).
 
 Sibling of ``test_retro_stamp_topics.py`` and deliberately built from the same
-scaffolding: the importlib-by-path ``_load_module`` (``scripts/`` is not a
-package and is not on PYTHONPATH), the autouse fixture neutralising the
-store-mutation preflight, and ``AsyncMock`` doubles at the single I/O boundary.
+scaffolding: the shared by-path ``load_script_module`` (``scripts/`` is not a
+package and is not on PYTHONPATH), the shared store-mutation-preflight contract
+(``neutralise_fixture`` for the suite, ``deny`` for the guard's own tests), and
+``AsyncMock`` doubles at the single I/O boundary.
 
 What is DIFFERENT from that suite, and why it matters here: this script's sweep
 is corpus-wide rather than id-bounded, so its enumeration, its collision
@@ -20,60 +21,28 @@ from __future__ import annotations
 import ast
 import copy
 import dataclasses
-import importlib.util
-import sys
-import types
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _fm_helpers import load_script_module
+from _store_mutation_preflight_contract import SENTINEL, deny, neutralise_fixture
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'normalize_topic_slugs.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load normalize_topic_slugs.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    reflection-based decorators work correctly.
-    """
-    mod_name = 'normalize_topic_slugs'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
+_mod = load_script_module(SCRIPT_PATH, mod_name='normalize_topic_slugs')
 
 
-_mod = _load_module()
-
-
-@pytest.fixture(autouse=True)
-def _neutralise_store_mutation_preflight(monkeypatch):
-    """Keep this MOCK-unit suite independent of the REAL ``~/.mem0``.
-
-    ``run(..., apply=True)`` runs a fail-closed capability preflight before it
-    scrolls.  That probe touches the real filesystem, so without this fixture
-    every ``--apply`` test would pass or fail according to whether the machine
-    running pytest happens to be able to write mem0's history directory — and
-    it genuinely cannot inside an agent sandbox, which is the whole reason the
-    guard exists.  This suite is deliberately MOCK-unit, so the environment
-    must not be an input to it.
-
-    ``TestRunApplyStoreMutationPreflight`` re-rigs this per test — to refuse,
-    to record, or to pass — so the guard's own behaviour is still pinned
-    explicitly rather than assumed away.
-
-    Deliberately NOT ``raising=False``: if the guard is ever removed from the
-    script this fixture must break loudly rather than silently no-op.
-    """
-    monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+_neutralise = neutralise_fixture(
+    _mod,
+    note="""``run(..., apply=True)`` runs the preflight once, before it scrolls
+    (task 4878). This suite is deliberately MOCK-unit (``AsyncMock`` services
+    and the stateful in-memory ``_FakeCorpus``, no live store).
+    ``TestRunApplyStoreMutationPreflight`` re-rigs this per test -- to refuse,
+    to record, or to pass -- so the guard's own behaviour is still pinned
+    explicitly rather than assumed away.""",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1988,13 +1957,10 @@ class TestRunApplyStoreMutationPreflight:
 
     @pytest.mark.asyncio
     async def test_a_refusal_scrolls_nothing_and_re_raises(self, monkeypatch):
-        def _refuse(**_kw):
-            raise _mod.StoreMutationUnavailable('cannot write ~/.mem0/history')
-
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _refuse)
+        deny(_mod, monkeypatch)
         service, corpus = _run_service({'dark_factory': [_crec('m1', 'a_topic')]})
 
-        with pytest.raises(_mod.StoreMutationUnavailable):
+        with pytest.raises(_mod.StoreMutationUnavailable, match=SENTINEL):
             await run_sweep(service, projects=('dark_factory',), apply=True)
 
         assert corpus.scrolls == []
@@ -2005,10 +1971,7 @@ class TestRunApplyStoreMutationPreflight:
         self, monkeypatch, caplog, capsys,
     ):
         """stdout carries the machine-read artifact; a diagnosis must not."""
-        def _refuse(**_kw):
-            raise _mod.StoreMutationUnavailable('cannot write ~/.mem0/history')
-
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _refuse)
+        deny(_mod, monkeypatch)
         service, _corpus = _run_service({'dark_factory': []})
 
         with (
