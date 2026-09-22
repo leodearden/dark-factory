@@ -81,8 +81,44 @@ restricted to merge commits, matches any commit merely *mentioning* the task, an
 `task/1`/`task/10` collision. If a project overrides `git.branch_prefix` (default `task/`) or
 `git.main_branch`, build the subject from `_merge_subject` rather than hardcoding it.
 
-- **Returned a sha** → go to [step 2](#step-2); whether it is authoritative depends on the branch ref.
-- **Returned nothing** → go to [step 3](#step-3). An empty search is **not** a not-landed verdict.
+**Substring-safety is not subject-scoping, and the search alone does not give you the latter.**
+`git log --grep` matches the **whole commit message**, not the subject, so this command also
+returns any ordinary commit whose *body* happens to quote the marker string — a documentation
+commit describing this very mechanism, a revert, a commit message citing another task's merge.
+That is a live hazard in this repo, not a hypothetical: measured 2026-09-22,
+`git log main --fixed-strings --grep="Merge task/4181 into main" --max-count=1 --format=%H`
+returns `d0d67f0c53`, a **non-merge** docs commit from task 4612 whose body quotes the subject,
+rather than the true train merge `d25b24468c`. The substring-safety argument above covers only
+the `task/1`-inside-`task/10` collision; it says nothing about a body match.
+
+<a id="step-1-subject-check"></a>
+**So a hit is not a marker until its SUBJECT matches.** On **any** sha this search returns, before
+it may be treated as a marker on either of [step 2](#step-2)'s arms:
+
+```bash
+git log -1 --format=%s "<marker sha>"
+```
+
+Accept it only on **exact equality** with the `_merge_subject` string you searched for. A hit that
+matches only in the body is **not** a marker: treat the search as empty and continue to
+[step 3](#step-3). This costs nothing when the hit is genuine and is the only thing standing
+between a body match and a stamped `done_provenance` — see [step 2](#step-2)'s *branch GONE* arm,
+which otherwise treats the marker as authoritative on its own with no further check.
+
+Do **not** instead add `--merges` to the search. It would diverge from the in-repo authority this
+command explicitly mirrors (`GitOps.find_merge_marker` and `GitOps._scan_merge_marker` use the same
+bare `--grep`), whose whole value is that writer and reader share one derivation and so cannot
+silently drift apart; and it is lossy — measured in this repo, `ba1bba2611 Merge task/176 into main`
+is a genuine subject-shaped marker with a **single parent**, which `--merges` drops. Subject
+equality loses nothing and needs no divergence.
+
+The root cause is in that production search, which this doc faithfully mirrors; the shell-side
+subject check is the guard available to an agent. It is the same relationship [step 2](#step-2)'s
+containment check already has to `find_merge_marker`'s branch-existence gate: the agent re-supplies
+in the shell a guard the bare search does not carry. The production half is tracked separately.
+
+- **Returned a sha whose subject matches** → go to [step 2](#step-2); whether it is authoritative depends on the branch ref.
+- **Returned nothing, or only a body match** → go to [step 3](#step-3). An empty search is **not** a not-landed verdict.
 
 <a id="step-2"></a>
 ### Step 2 — is the marker authoritative? Ref existence, then containment
@@ -90,8 +126,9 @@ restricted to merge commits, matches any commit merely *mentioning* the task, an
 Establish ref existence per [Two entry points](#entry-points) — the `rev-parse --verify
 --quiet` probe, or the ancestry rc you already hold.
 
-- **ref rc≠0 / ancestry rc=128 (branch GONE)** → the marker **is** authoritative on its own.
-  This is the ordinary post-merge state, not an anomaly:
+- **ref rc≠0 / ancestry rc=128 (branch GONE)** → the marker **is** authoritative on its own —
+  *provided it passed [step 1](#step-1-subject-check)'s subject-equality check*, which is the only
+  guard on this arm. This is the ordinary post-merge state, not an anomaly:
   `orchestrator/src/orchestrator/git_ops.py::GitOps._delete_branch_if_on_main` deletes any
   branch carrying no commits beyond main, which is exactly what a successful merge leaves
   behind — it is "the single most common post-merge state". A deleted ref is also precisely the
@@ -104,7 +141,8 @@ Establish ref existence per [Two entry points](#entry-points) — the `rev-parse
   request), `found_on_main` when the work was already on main when you found it. Carry the `note`
   either way: it is **mandatory** for `found_on_main`, and it is what makes a `merged` stamp
   auditable.
-- **ref rc=0 / ancestry rc=0 or rc=1 (branch still EXISTS)** → the marker is **NOT authoritative
+- **ref rc=0 / ancestry rc=0 or rc=1 (branch still EXISTS)** → the marker (again, only one that
+  passed [step 1](#step-1-subject-check)'s subject-equality check) is **NOT authoritative
   on its own**, and `GitOps.find_merge_marker`'s own **branch-existence gate** returns None in
   exactly that situation — it "prevents finding a stale merge marker from a *previous* run of a
   re-opened task that shared the same branch name". Running the search anyway (as we do, because
