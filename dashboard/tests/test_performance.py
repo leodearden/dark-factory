@@ -2322,7 +2322,9 @@ def test_no_sql_side_clock_reads_in_data_layer():
     stays here rather than being relocated because `test_clock_discipline.py`
     is not one of the modules this task holds a lock on
     (`dashboard/src/dashboard/data/performance.py` and this file only); the
-    move is filed as a follow-up instead of being done here.
+    move is filed as a follow-up instead of being done here --
+    tkt_0RTY030WB80YZK4EZ5JBJ6EB0T (a fused-memory ticket; the curator
+    converts it to a task_id asynchronously).
     """
     data_dir = Path(__file__).resolve().parent.parent / 'src' / 'dashboard' / 'data'
     violations: list[str] = []
