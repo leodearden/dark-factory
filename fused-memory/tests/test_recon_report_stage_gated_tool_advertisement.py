@@ -409,6 +409,10 @@ class TestHazardsTheNewBlocksAreExposedTo:
         # One of the two is a renderer and one a constant; take the TEXT either way
         # so this pin does not have to be re-decided when a section changes form.
         block = attr() if callable(attr) else attr
+        assert isinstance(block, str), (
+            f'{block_name} resolved to a {type(block).__name__}, not the prompt TEXT '
+            'this pin scans: a renderer must RETURN str, a constant must BE str.'
+        )
         assert '## Available Tools' not in block, (
             f'{block_name} contains the literal "## Available Tools". That sentinel must '
             'occur exactly once in STAGE2_SYSTEM_PROMPT or build_stage2_system_prompt '
