@@ -1,4 +1,8 @@
-"""Standalone stand-ins for ``fused_memory.server.write_triage``.
+"""Standalone stand-ins for the two modules the flip gate's probes execute.
+
+``fused_memory.server.write_triage`` first, and — below the triage variants —
+``fused_memory.server.write_triage_judge``, because option (b) lives in the
+judge module and item 5 has to be able to see it there.
 
 Shared by BOTH gate test files — ``test_check_write_triage_attach_consumption.py``
 drives the consumption probe against them directly, and
@@ -709,4 +713,177 @@ def write_fake_triage(src_root: Path, *, variant: str) -> Path:
     (src_root / 'fused_memory' / '__init__.py').write_text('')
     (server / '__init__.py').write_text('')
     (server / 'write_triage.py').write_text(TRIAGE_PREAMBLE + VARIANT_TAILS[variant])
+    return src_root
+
+
+#: ============================= JUDGE STAND-INS ==============================
+#:
+#: Option (b) in THIS codebase lives in the JUDGE module, not in the triage
+#: module: ``judge_write`` already holds the ``decision``, so it reads
+#: ``decision.canonical_id`` and hands it to ``build_judge_prompt``, and
+#: ``triage_write`` stays byte-identical to :data:`_BAND_TOP1`. A probe that
+#: looked only at what ``triage_write`` tells its judge therefore cannot see
+#: that remedy at all — so item 5 reads the judge module too, and these are the
+#: stand-ins it is measured against.
+#:
+#: DELIBERATELY SEPARATE from the item-1 judge fixtures in
+#: ``test_check_write_triage_flip_preconditions.py``. Those are shaped for
+#: prompt-TEXT assertions — item 1 renders a prompt twice and diffs it — and
+#: none of them defines ``judge_write`` at all, which is what keeps every
+#: existing pairing's item-5 verdict unchanged. What item 5 needs is the
+#: opposite half: a ``judge_write`` whose call to ``build_judge_prompt`` is the
+#: thing under test, and a prompt body that matters to nobody.
+JUDGE_PREAMBLE = r'''"""Standalone stand-in for fused_memory.server.write_triage_judge.
+
+Dependency-free by construction: the probe imports this out of a bare directory
+tree, so it may import nothing but the stdlib.
+
+Only the two functions item 5 reads are defined. The prompt body is trivial on
+purpose: what item 5 measures is whether judge_write TELLS the renderer which
+candidate the attach will touch, never what the rendering then says about it.
+"""
+from __future__ import annotations
+
+OUTCOME_RESTATED = 'restated'
+
+
+def _render(content, candidates, marked=None):
+    lines = ['NEW ENTRY:', str(content)]
+    for candidate in candidates or ():
+        ident = getattr(candidate, 'id', None)
+        mark = '  <- attach target' if ident == marked else ''
+        lines.append('- id: ' + str(ident) + mark)
+    return '\n'.join(lines)
+
+
+def _require_provider(memory_service):
+    """main's unresolvable-provider raise, which fires before any model call."""
+    config = getattr(memory_service, 'config', None)
+    provider = getattr(getattr(config, 'llm', None), 'provider', None)
+    if not isinstance(provider, str) or not provider:
+        raise RuntimeError('no judge provider is configured')
+    return provider
+'''
+
+
+#: THE REMEDY THAT HAS LANDED, end to end: the renderer can be told which
+#: candidate the attach will touch, and ``judge_write`` feeds it the very id the
+#: write will use. Consumption holds BY CONSTRUCTION here — announced target
+#: and attach target are one expression — which is why item 5 may not demand a
+#: measured swap of it.
+_JUDGE_FEEDS_TARGET = r'''
+
+def build_judge_prompt(content, candidates, *, attach_target_id=None):
+    return _render(content, candidates, marked=attach_target_id)
+
+
+async def judge_write(*, memory_service, content, project_id, decision,
+                      candidates=()):
+    attach_target_id = getattr(decision, 'canonical_id', None)
+    build_judge_prompt(content, candidates, attach_target_id=attach_target_id)
+    return OUTCOME_RESTATED
+'''
+
+
+#: The same remedy, reached only by READING the call. Its judge_write raises
+#: before it renders — an unresolvable provider, which is what main's own judge
+#: does on a deployment with no key — so the recorder never fires and a probe
+#: with no static route would report a correct option (b) as absent.
+_JUDGE_FEEDS_TARGET_AFTER_RAISING = r'''
+
+def build_judge_prompt(content, candidates, *, attach_target_id=None):
+    return _render(content, candidates, marked=attach_target_id)
+
+
+async def judge_write(*, memory_service, content, project_id, decision,
+                      candidates=()):
+    attach_target_id = getattr(decision, 'canonical_id', None)
+    _require_provider(memory_service)
+    build_judge_prompt(content, candidates, attach_target_id=attach_target_id)
+    return OUTCOME_RESTATED
+'''
+
+
+#: The shape this codebase's judge had BEFORE option (b): the renderer cannot be
+#: told anything, so every candidate looks alike to the model and the attach
+#: target is whatever the band picked.
+_JUDGE_NO_TARGET_PARAMETER = r'''
+
+def build_judge_prompt(content, candidates):
+    return _render(content, candidates)
+
+
+async def judge_write(*, memory_service, content, project_id, decision,
+                      candidates=()):
+    build_judge_prompt(content, candidates)
+    return OUTCOME_RESTATED
+'''
+
+
+#: A WIDENED SIGNATURE, and nothing else. The parameter exists and is never
+#: fed, so the prompt is byte-identical to the one above and the model is told
+#: nothing. This is the whole difference between a signature and consumption —
+#: and it is also the shape of all 17 target-carrying item-1 fixtures, none of
+#: which defines judge_write, so it is what keeps their item-5 verdicts inert.
+_JUDGE_TARGET_NEVER_FED = r'''
+
+def build_judge_prompt(content, candidates, *, attach_target_id=None):
+    return _render(content, candidates, marked=attach_target_id)
+
+
+async def judge_write(*, memory_service, content, project_id, decision,
+                      candidates=()):
+    build_judge_prompt(content, candidates)
+    return OUTCOME_RESTATED
+'''
+
+
+#: Fed, but fed the WRONG id: the slate's first entry rather than the one the
+#: write will attach to. The model is then told to reason about a candidate the
+#: verdict will not be filed against, which is item 1's harm with an extra step.
+_JUDGE_FEEDS_A_DIFFERENT_ID = r'''
+
+def build_judge_prompt(content, candidates, *, attach_target_id=None):
+    return _render(content, candidates, marked=attach_target_id)
+
+
+async def judge_write(*, memory_service, content, project_id, decision,
+                      candidates=()):
+    slate = list(candidates or ())
+    elsewhere = getattr(slate[0], 'id', None) if slate else None
+    build_judge_prompt(content, candidates, attach_target_id=elsewhere)
+    return OUTCOME_RESTATED
+'''
+
+
+#: judge variant name -> the tail appended to :data:`JUDGE_PREAMBLE`.
+JUDGE_VARIANT_TAILS: dict[str, str] = {
+    'feeds_attach_target': _JUDGE_FEEDS_TARGET,
+    'feeds_attach_target_after_raising': _JUDGE_FEEDS_TARGET_AFTER_RAISING,
+    'no_target_parameter': _JUDGE_NO_TARGET_PARAMETER,
+    'target_never_fed': _JUDGE_TARGET_NEVER_FED,
+    'feeds_a_different_id': _JUDGE_FEEDS_A_DIFFERENT_ID,
+}
+
+
+def write_fake_judge(src_root: Path, *, variant: str) -> Path:
+    """Lay a standalone judge module beside the triage one, and return *src_root*.
+
+    The SAME ``<src_root>/fused_memory/server/`` tree the triage stand-in goes
+    into, because that is how the gate ships them: one ``git archive`` of one
+    source tree, read by both probe items.
+
+    ``variant='missing'`` writes no module at all — the case every fixture
+    written before this one is in, and the one that must leave their verdicts
+    exactly as they were.
+    """
+    if variant == 'missing':
+        return src_root
+    server = src_root / 'fused_memory' / 'server'
+    server.mkdir(parents=True, exist_ok=True)
+    (src_root / 'fused_memory' / '__init__.py').write_text('')
+    (server / '__init__.py').write_text('')
+    (server / 'write_triage_judge.py').write_text(
+        JUDGE_PREAMBLE + JUDGE_VARIANT_TAILS[variant],
+    )
     return src_root

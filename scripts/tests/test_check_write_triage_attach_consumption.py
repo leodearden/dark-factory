@@ -41,7 +41,10 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
-from write_triage_attach_fixtures import write_fake_triage  # noqa: E402
+from write_triage_attach_fixtures import (  # noqa: E402
+    write_fake_judge,
+    write_fake_triage,
+)
 
 _REPO_ROOT = _HERE.parent.parent
 _PROBE = _REPO_ROOT / 'scripts' / 'check_write_triage_attach_consumption.py'
@@ -117,6 +120,24 @@ _UNVERIFIABLE_VARIANTS = (
 #: belongs to NO candidate in the slate — that is what separates "the attach
 #: followed the designation" from "the attach used the band's winner" — so the
 #: NOT-CONSUMED report has to name it for an operator to read the finding.
+_JUDGE_BRANCH = 'judge-target branch'
+_JUDGE_BRANCH_SATISFIED = 'judge-target branch: satisfied'
+_NO_JUDGE_MODULE = 'carries no importable'
+_NO_TARGET_PARAMETER = 'takes no attach-target parameter'
+_NEVER_FED = 'never feeds'
+_NOT_THE_CANONICAL = "is not the decision's canonical id"
+_TOLD_NOT_USED = 'did not use the target the judge was told about'
+
+#: The probe's one machine-readable "which branch satisfied item 5" line, and
+#: the three names it can carry. The gate quotes this line into its own item-5
+#: PASS note, because `PASS  item 5` alone cannot tell an operator whether a
+#: swap was MEASURED or whether option (b) held BY CONSTRUCTION — and those two
+#: authorise the production flag flip on different evidence.
+_BRANCH_MARKER = 'ITEM5-BRANCH'
+_BRANCH_SWAP = 'judge-side designation swap'
+_BRANCH_JUDGE_TARGET = 'judge-module attach target'
+_BRANCH_ANNOUNCED = 'triage-side announced target'
+
 _BAND_CANONICAL = 'parent-1'
 #: The slate's evidence child: the top-scoring candidate, and the one
 #: `_canonical_id_of` hoists to `_BAND_CANONICAL`. It is on the slate (that is
@@ -127,6 +148,19 @@ _EVIDENCE_CHILD = 'child-1'
 #: line rather than to the whole report: the slate line names the child too, and
 #: legitimately so.
 _DESIGNATED_PAIR = 'the judge designated'
+
+
+def _src_with(tmp_path: Path, *, triage: str, judge: str = 'missing') -> Path:
+    """A --src-root carrying a triage stand-in and, optionally, a judge one.
+
+    ONE tree for both, because that is how the gate ships them: a single
+    ``git archive`` of ``fused-memory/src``, read by both probe items.
+    ``judge`` defaults to ``'missing'`` — the state every fixture written
+    before the judge-target branch is in, and the one whose verdicts that
+    branch must leave exactly where they were.
+    """
+    src_root = write_fake_triage(tmp_path / 'src', variant=triage)
+    return write_fake_judge(src_root, variant=judge)
 
 
 def _run_probe(src_root: Path, *, extra_paths: tuple[Path, ...] = ()):
@@ -433,3 +467,188 @@ class TestFailsClosed:
         assert _PASS in proc.stdout, proc.stdout
         lines = [line for line in proc.stdout.splitlines() if line.strip()]
         assert _WARN in lines[-1], proc.stdout
+
+
+class TestJudgeModuleAttachTarget:
+    """Option (b) as it actually exists here, and why the probe has to read it.
+
+    The judge-side swap cannot hold under option (b): the caller picks the
+    attach target, so the judge names nothing back for the write to track.
+    Requiring the swap would therefore FAIL a correct fix and re-block task
+    3169 — this gate family's false-FAIL disease.
+
+    The branch is decided from the ref's JUDGE module rather than from what
+    ``triage_write`` tells its judge, because that is where this codebase's
+    option (b) lives: ``judge_write`` already holds the ``decision``, so it
+    reads ``decision.canonical_id`` and hands it to ``build_judge_prompt``, and
+    ``triage_write`` stays byte-identical to the ``band_top1`` fixture. Measured
+    against main before this branch existed: item 1 PASSed and item 5 FAILed
+    with "the judge-bound candidate is NOT CONSUMED by the attach" — naming a
+    defect the run had not measured.
+
+    THREE conditions, and each rejects a different near-miss: the renderer can
+    be TOLD (a signature), ``judge_write`` actually TELLS it the id the write
+    will use (consumption, not a widened signature), and the write LANDS there
+    (or the judge module's shape would excuse a triage module that ignores
+    everything).
+    """
+
+    def test_a_judge_that_feeds_the_attach_target_satisfies_item_5(self, tmp_path):
+        """The remedy that has landed, with triage_write untouched."""
+        src_root = _src_with(
+            tmp_path, triage='band_top1', judge='feeds_attach_target',
+        )
+        proc = _run_probe(src_root)
+        assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
+        assert _PASS in proc.stdout, proc.stdout
+        assert _JUDGE_BRANCH_SATISFIED in proc.stdout, proc.stdout
+
+    def test_a_judge_that_raises_before_rendering_is_read_statically(
+        self, tmp_path,
+    ):
+        """A correct option (b) whose judge_write never reaches the renderer.
+
+        main's judge raises on an unresolvable provider, which on a deployment
+        with no key happens before the prompt is built — so the recorder never
+        fires. Reading the call instead of executing it is what keeps a
+        mechanism the dynamic route cannot reach from being reported as an
+        absent remedy.
+        """
+        src_root = _src_with(
+            tmp_path,
+            triage='band_top1',
+            judge='feeds_attach_target_after_raising',
+        )
+        proc = _run_probe(src_root)
+        assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
+        assert _PASS in proc.stdout, proc.stdout
+        assert _JUDGE_BRANCH_SATISFIED in proc.stdout, proc.stdout
+
+    def test_a_judge_with_no_target_parameter_does_not_satisfy_item_5(
+        self, tmp_path,
+    ):
+        """The shape this codebase's judge had before option (b) landed.
+
+        Every candidate looks alike to the model, so nothing tells it which one
+        the verdict will be filed against. Non-vacuity in its plainest form: if
+        this passed, the branch would hold on a codebase where nothing changed.
+        """
+        src_root = _src_with(
+            tmp_path, triage='band_top1', judge='no_target_parameter',
+        )
+        proc = _run_probe(src_root)
+        assert proc.returncode != 0, f'{proc.stdout}\n{proc.stderr}'
+        assert _PASS not in proc.stdout, proc.stdout
+        assert _NO_TARGET_PARAMETER in proc.stdout, proc.stdout
+
+    def test_a_widened_signature_alone_does_not_satisfy_item_5(self, tmp_path):
+        """A target parameter nothing ever feeds renders an identical prompt.
+
+        This is the conjunct that does the work, and it is also what keeps the
+        17 target-carrying item-1 judge fixtures inert: none of them defines
+        ``judge_write`` at all, so none can feed anything.
+        """
+        src_root = _src_with(
+            tmp_path, triage='band_top1', judge='target_never_fed',
+        )
+        proc = _run_probe(src_root)
+        assert proc.returncode != 0, f'{proc.stdout}\n{proc.stderr}'
+        assert _PASS not in proc.stdout, proc.stdout
+        assert _NEVER_FED in proc.stdout, proc.stdout
+
+    def test_a_target_fed_some_other_id_does_not_satisfy_item_5(self, tmp_path):
+        """Told about one candidate, filed against another — item 1's harm.
+
+        Diagnosed apart from the never-fed case above: "wire the id through"
+        and "wire the RIGHT id through" are different remedies, and an operator
+        who reads the wrong one looks in the wrong place.
+        """
+        src_root = _src_with(
+            tmp_path, triage='band_top1', judge='feeds_a_different_id',
+        )
+        proc = _run_probe(src_root)
+        assert proc.returncode != 0, f'{proc.stdout}\n{proc.stderr}'
+        assert _PASS not in proc.stdout, proc.stdout
+        assert _NOT_THE_CANONICAL in proc.stdout, proc.stdout
+
+    def test_a_correct_judge_does_not_excuse_an_attach_that_lands_elsewhere(
+        self, tmp_path,
+    ):
+        """The false pass this branch newly makes possible, and must not take.
+
+        A target parameter on the judge is not evidence of consumption unless
+        the write actually lands on the value the judge was told about. Without
+        the third condition a triage module that ignores everything would ride
+        the judge module's signature to a PASS.
+        """
+        src_root = _src_with(
+            tmp_path,
+            triage='hardcodes_last_candidate',
+            judge='feeds_attach_target',
+        )
+        proc = _run_probe(src_root)
+        assert proc.returncode != 0, f'{proc.stdout}\n{proc.stderr}'
+        assert _PASS not in proc.stdout, proc.stdout
+        assert _TOLD_NOT_USED in proc.stdout, proc.stdout
+
+    @pytest.mark.parametrize(
+        ('triage', 'expected'),
+        [
+            ('band_top1', 1),
+            ('consumes_designated_id', 0),
+            ('announces_attach_target', 0),
+        ],
+    )
+    def test_a_src_root_with_no_judge_module_keeps_its_verdict(
+        self, tmp_path, triage, expected,
+    ):
+        """Every fixture written before this branch is judge-less; none may move.
+
+        The judge import is NON-FATAL for exactly this reason: a tree with no
+        judge module — every hermetic gate repo laid down before option (b),
+        and any project laid out differently — must still get its ordinary
+        verdict rather than a new way to be UNVERIFIABLE.
+        """
+        src_root = _src_with(tmp_path, triage=triage)
+        proc = _run_probe(src_root)
+        assert proc.returncode == expected, f'{proc.stdout}\n{proc.stderr}'
+        assert _NO_JUDGE_MODULE in proc.stdout, proc.stdout
+        assert _UNVERIFIABLE not in proc.stdout, proc.stdout
+
+
+class TestThePassNamesItsBranch:
+    """`PASS  item 5` alone does not say what was measured.
+
+    Three branches can satisfy item 5 and they rest on different evidence: a
+    swap the probe MEASURED, and an option (b) that holds BY CONSTRUCTION
+    because the announced target and the attach target are one expression. An
+    operator flipping a production flag is entitled to know which ran, so the
+    PASS carries one stable, machine-readable line naming it — which the gate
+    then quotes into its own report.
+    """
+
+    @pytest.mark.parametrize(
+        ('triage', 'judge', 'branch'),
+        [
+            ('consumes_designated_id', 'missing', _BRANCH_SWAP),
+            ('announces_attach_target', 'missing', _BRANCH_ANNOUNCED),
+            ('band_top1', 'feeds_attach_target', _BRANCH_JUDGE_TARGET),
+        ],
+    )
+    def test_each_pass_branch_names_itself(self, tmp_path, triage, judge, branch):
+        src_root = _src_with(tmp_path, triage=triage, judge=judge)
+        proc = _run_probe(src_root)
+        assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
+        named = [
+            line for line in proc.stdout.splitlines() if _BRANCH_MARKER in line
+        ]
+        assert len(named) == 1, proc.stdout
+        assert branch in named[0], proc.stdout
+
+    def test_a_fail_names_no_branch(self, tmp_path):
+        """The line is a PASS-path fact. A FAIL that carried one would read as
+        a branch that held, on the run where none did."""
+        src_root = _src_with(tmp_path, triage='band_top1')
+        proc = _run_probe(src_root)
+        assert proc.returncode != 0, f'{proc.stdout}\n{proc.stderr}'
+        assert _BRANCH_MARKER not in proc.stdout, proc.stdout
