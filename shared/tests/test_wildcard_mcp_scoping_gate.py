@@ -51,8 +51,11 @@ from __future__ import annotations
 
 import ast
 import textwrap
+from collections.abc import Sequence
+from pathlib import Path
 
 import pytest
+from silent_fallthrough_scan import ParsedFile
 from wildcard_mcp_scoping_scan import (
     EXEMPT_STRICT_MCP,
     NOT_EXEMPT,
@@ -62,6 +65,7 @@ from wildcard_mcp_scoping_scan import (
 )
 
 _SYNTHETIC = 'synthetic/module.py'
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _scan(src: str, filename: str = _SYNTHETIC) -> list[WildcardMcpScopingSite]:
@@ -279,6 +283,145 @@ class TestNonMatchingCallsAreNotSites:
             def call_the_model(**kwargs):
                 return invoke_with_cap_retry(**kwargs)
         ''') == []
+
+
+# --------------------------------------------------------------------------- #
+# The whole-tree gate
+# --------------------------------------------------------------------------- #
+
+#: Every matching call site in the first-party tree, measured at HEAD
+#: 89e37fd6fb on 2026-09-22: 5 matched, 0 violations. Three are protected by
+#: running at ``neutral_cli_cwd()``, two by ``no_mcp_servers_config()`` +
+#: ``strict_mcp_config=True``. Kept as an exact SET, not a count: a new
+#: matching caller anywhere in the tree must be looked at even when it is
+#: correctly scoped, and none of these five may silently vanish.
+_KNOWN_SITES: frozenset[tuple[str, str]] = frozenset({
+    ('fused-memory/src/fused_memory/middleware/path_scope_adjudicator.py',
+     'PathScopeAdjudicator.adjudicate'),
+    ('fused-memory/src/fused_memory/middleware/task_curator.py',
+     'TaskCurator._call_llm'),
+    ('fused-memory/src/fused_memory/middleware/task_curator.py',
+     'TaskCurator._call_llm_batch'),
+    ('fused-memory/src/fused_memory/reconciliation/agent_loop.py',
+     'AgentLoop._call_claude_cli'),
+    ('fused-memory/src/fused_memory/reconciliation/judge.py',
+     'Judge._call_judge_cli'),
+})
+
+
+@pytest.fixture(scope='session')
+def tree_sites(first_party_tree: Sequence[ParsedFile]) -> list[WildcardMcpScopingSite]:
+    """Every matching call site in the first-party tree.
+
+    Takes the session-scoped ``first_party_tree`` fixture (``conftest.py``) so
+    the ASTs ``parse_first_party_tree`` already built are WALKED, never
+    re-parsed — and so this module never names the enumerator, which is what
+    keeps ``test_tree_scan_sharing.py::TestNoRegrownWholeTreeParse`` green
+    while ``_scan`` above is still free to parse synthetic fixtures.
+
+    The ASTs are shared with every other gate in this directory and are walked
+    READ-ONLY. A file that failed to parse carries ``tree is None`` and
+    contributes nothing; ``test_silent_fallthrough_gate.test_no_unparseable_files``
+    is what reports those, so this gate does not duplicate the complaint.
+    """
+    sites: list[WildcardMcpScopingSite] = []
+    for record in first_party_tree:
+        if record.tree is None:
+            continue
+        sites.extend(find_wildcard_mcp_scoping_sites(record.tree, record.relpath))
+    return sites
+
+
+class TestWholeTreeGate:
+    """No first-party caller reaches the CLI with ambient MCP still exposed."""
+
+    def test_no_unprotected_wildcard_schema_callers(
+        self, tree_sites: list[WildcardMcpScopingSite]
+    ) -> None:
+        offenders = sorted(
+            (site for site in tree_sites if is_violation(site)),
+            key=lambda site: (site.filename, site.lineno),
+        )
+        if not offenders:
+            return
+        listing = '\n'.join(
+            f'  {site.filename}::{site.qualname} -> {site.callee}  ~L{site.lineno}'
+            for site in offenders
+        )
+        raise AssertionError(
+            f"{len(offenders)} call site(s) pass disallowed_tools=['*'] with an "
+            f"output_schema, at a cwd whose ambient MCP servers are not closed:\n"
+            f'{listing}\n'
+            f'(~L is a hint for finding the call, never its identity — it drifts '
+            f'on any edit above the site.)\n'
+            f'\n'
+            f"THE SUBTLETY: that call reads as \"deny every tool\", and it is not. "
+            f"shared/src/shared/cli_invoke.py::build_claude_argv silently replaces "
+            f"the '*' with _REAL_BUILTIN_TOOLS_DENYLIST whenever an output_schema "
+            f'is present, because the schema rides on a synthetic StructuredOutput '
+            f'tool a wildcard would block. That list is BUILT-INS ONLY and carries '
+            f'no MCP pattern, so MCP tools stay REACHABLE — and the CLI '
+            f'ambient-merges the .mcp.json at cwd. Under bypassPermissions, which '
+            f'every one of these callers uses, that is unreviewed MCP WRITE access; '
+            f'halt_scheduler and delete_memory are in the blast radius.\n'
+            f'\n'
+            f'TO FIX, either close MCP explicitly at the call:\n'
+            f'    mcp_config=no_mcp_servers_config(),\n'
+            f'    strict_mcp_config=True,\n'
+            f'  — the config must stay TRUTHY. --strict-mcp-config is emitted '
+            f'inside build_claude_argv\'s `if mcp_config:` block, so a bare {{}} '
+            f'emits NEITHER flag and silently reinstates the hole while looking '
+            f'correct. See cli_invoke.py::no_mcp_servers_config.\n'
+            f'OR run somewhere with no ambient .mcp.json to merge:\n'
+            f'    cwd=neutral_cli_cwd(),   # shared/src/shared/neutral_cwd.py\n'
+            f'\n'
+            f'shared/tests is the FIRST segment of the repo test_command, so this '
+            f'red blocks verify for EVERY subsequent task until it is resolved. '
+            f'Fix the call site; do not weaken this assertion.\n'
+            f'\n'
+            f'If a caller GENUINELY needs ambient MCP, there is deliberately no '
+            f'allowlist to add it to — ESCALATE instead. Given the blast radius '
+            f'above, the first such caller gets a human look.'
+        )
+
+    def test_the_sweep_is_not_vacuous(
+        self, tree_sites: list[WildcardMcpScopingSite]
+    ) -> None:
+        """Anti-vacuity: the ratchet above passes trivially over a green tree.
+
+        This tree IS green, so a detector that silently stopped detecting — a
+        renamed kwarg, a changed call spelling, a refactor of the match logic —
+        would leave the suite green and the protection gone. This floor is what
+        keeps it honest, and it is set AT the measured value rather than below
+        it: unlike the sibling gates, which scan for defects whose count
+        legitimately falls as fixes land, this one scans for load-bearing
+        production callers, none of which may silently vanish.
+        """
+        assert len(tree_sites) >= len(_KNOWN_SITES), (
+            f'the sweep found only {len(tree_sites)} matching call site(s); '
+            f'{len(_KNOWN_SITES)} were measured at HEAD 89e37fd6fb on 2026-09-22:\n'
+            + '\n'.join(f'  {relpath}::{qualname}'
+                        for relpath, qualname in sorted(_KNOWN_SITES))
+            + f'\n\nEither the detector stopped detecting, or a load-bearing '
+              f'caller was deleted. Neither is a reason to lower this floor.\n'
+              f'Repo root resolved to: {_REPO_ROOT}'
+        )
+
+    def test_every_known_site_is_accounted_for(
+        self, tree_sites: list[WildcardMcpScopingSite]
+    ) -> None:
+        """A NEW matching caller is surfaced for review even when it is scoped
+        correctly, so nobody adds a sixth one without reading this gate.
+        """
+        found = {(site.filename, site.qualname) for site in tree_sites}
+        assert found == _KNOWN_SITES, (
+            f'the matching call sites have changed.\n'
+            f'  NEW (add to _KNOWN_SITES once reviewed): '
+            f'{sorted(found - _KNOWN_SITES) or "none"}\n'
+            f'  GONE (a load-bearing caller vanished, or the detector broke): '
+            f'{sorted(_KNOWN_SITES - found) or "none"}\n'
+            f'Repo root resolved to: {_REPO_ROOT}'
+        )
 
 
 if __name__ == '__main__':
