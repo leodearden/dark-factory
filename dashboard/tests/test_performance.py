@@ -2176,6 +2176,7 @@ def _sql_clock_read_violations(source: str, label: str) -> list[str]:
             violations.append(f'{label}:{lineno}: {excerpt}')
     return violations
 
+
 # ---------------------------------------------------------------------------
 # Detection-helper unit tests for the data-layer SQL clock-read guard
 # ---------------------------------------------------------------------------
