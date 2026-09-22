@@ -21,18 +21,36 @@ The same rule governs the vocabulary's CAPTURE classes, which is why the digit
 captures are ASCII-explicit ('[0-9]', never '\\d') at this one normative site
 rather than re-narrowed per caller. Task 4850 extended the same rule to the
 literal task-vocabulary WORD (the _TASK_WORD constant,
-'[Tt][Aa][Ss][Kk][Ss]?', never 'tasks?' plus re.IGNORECASE — see the comment
-on _TASK_NODE_NAME_PATTERN), which decides
-whether the word 'task' was written at all rather than handing a character
-onward as data, so the rule is no longer scoped to captures alone. Still not
-every class: the '\\s' padding and the '\\w' lookbehinds stay Unicode-broad
-(see the comment on _TASK_NODE_NAME_PATTERN, whose padding is the one that
-actually still is — _QUALIFIED_NODE_NAME_PATTERN has no '\\s' padding LEFT
-since task 4850, so it cannot illustrate the rule it used to be cited for).
-The vocabulary is
-ASCII-explicit wherever a character reaches a consumer as DATA or decides
-that the task-vocabulary word was written, and broad only where it merely
-decides whether to refuse. Before that,
+'[Tt][Aa][Ss][Kk][Ss]?', never 'tasks?' plus re.IGNORECASE — see the comment on
+_TASK_NODE_NAME_PATTERN), which decides whether the word 'task' was written at
+all rather than handing a character onward as data, so the rule is no longer
+scoped to captures alone. Still not every class: the '\\s' padding and the
+'\\w' lookbehinds stay Unicode-broad (see the comment on
+_TASK_NODE_NAME_PATTERN, whose padding is the one that actually still is —
+_QUALIFIED_NODE_NAME_PATTERN has no '\\s' padding LEFT since task 4850, so it
+cannot illustrate the rule it used to be cited for). The vocabulary is
+ASCII-explicit wherever a character reaches a consumer as DATA or decides that
+the task-vocabulary word was written, and broad only where it merely decides
+whether to refuse.
+
+That rule is SPELLED at two sites and GUARANTEED at a third — scoping a reader
+needs BEFORE "closing" the third. _TASK_VOCABULARY_QUALIFIER also decides
+whether the task-vocabulary word was written, and it is NOT ASCII-explicit: it
+fullmatches a qualifier its CALLER canonicalized with str.lower(), which does
+not fold U+017F, so is_task_vocabulary_qualifier('ta\u017fk') is False. MEASURED
+twice: that is unreachable on every live path, not a hole. The two in-module
+callers get a qualifier captured by '[A-Za-z][A-Za-z0-9_-]{2,}', so a non-ASCII
+letter can never be in the string; the third,
+referent_resolution._declared_referents, runs validate_project_id's ASCII-only
+allowlist on the line ABOVE its vocabulary guard, so
+{'id': 2500, 'project_id': 'ta\u017fk'} raises InputValidationError naming the
+CHARSET rather than minting a 'ta\u017fk:2500' node. Casefolding the predicate
+would add a branch no live input can reach AND fork validation.py's charset
+rule into a second site, the lockstep duplication INV-5 forbids. If a future
+caller ever hands this predicate an unvalidated qualifier, narrow it THERE or
+at canonicalize_project_id — not here.
+
+Before the digit and word narrowings above,
 utils/referent_resolution._is_task_number was the only guard enforcing "a
 Unicode digit is not a task id" — it does so with ``isascii() and isdigit()``
 (task 3668) — so the DECLARED path refused what this DERIVED path happily
@@ -245,6 +263,13 @@ _QUALIFIED_NODE_NAME_PATTERN = re.compile(
 # the CANONICALIZED qualifier, so every spelling ('Task', 'TASK', 'sub-task',
 # 'Sub-Tasks') collapses onto this one check, while a real project id that
 # merely starts with 'task' ('taskmaster') is not rejected.
+#
+# This is the THIRD site that decides whether the task-vocabulary word was
+# written, and the only one not spelled ASCII-explicitly — deliberately, and
+# measurably safe because every caller's qualifier is ASCII before it arrives.
+# Do not casefold it without reading the module docstring's scoping paragraph
+# first: the branch that would add is unreachable, and it forks validation.py's
+# charset rule.
 #
 # Moved verbatim from cross_project_refs, where it guards the ONE rejection the
 # split consumer's decisive 'episode touched a node named Task N' guard cannot
