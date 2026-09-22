@@ -350,27 +350,18 @@ class TestHarnessNoLandingsResume:
 class TestHarnessBreakerConfigWiring:
     """Harness.__init__ builds the breaker from config knobs, not module defaults.
 
-    RED until step-06 GREEN wires config into _NLCB() construction.
+    One test, because there is one line of wiring: setting both knobs in a
+    single construction pins each of them exactly as two single-knob tests
+    did, and additionally pins that neither knob's value leaks into the
+    other's slot.
+
+    The floor is read off the public ``disk_free_floor_bytes`` property, the
+    reading its own docstring directs callers (test sanity checks included) to
+    use and the one ``harness.py`` uses in its escalation messages.
+    ``window_samples`` has no public counterpart, and adding one is a
+    production change outside this task's scope -- so that half stays a
+    private read until the breaker grows the matching property.
     """
-
-    def test_window_samples_wired_from_config(self, tmp_path: Path) -> None:
-        """harness._no_landings_breaker._window_samples == config.no_landings_breaker_window_samples."""
-        config = OrchestratorConfig(project_root=tmp_path)
-        config.no_landings_breaker_window_samples = 17  # non-default
-        harness = Harness(config)
-        assert harness._no_landings_breaker._window_samples == 17, (
-            f'expected _window_samples=17, got {harness._no_landings_breaker._window_samples}'
-        )
-
-    def test_disk_free_floor_bytes_wired_from_config(self, tmp_path: Path) -> None:
-        """harness._no_landings_breaker._disk_free_floor_bytes == config.no_landings_breaker_disk_free_floor_bytes."""
-        config = OrchestratorConfig(project_root=tmp_path)
-        config.no_landings_breaker_disk_free_floor_bytes = 123_456_789  # non-default
-        harness = Harness(config)
-        assert harness._no_landings_breaker._disk_free_floor_bytes == 123_456_789, (
-            f'expected _disk_free_floor_bytes=123456789, '
-            f'got {harness._no_landings_breaker._disk_free_floor_bytes}'
-        )
 
     def test_both_config_knobs_wired_together(self, tmp_path: Path) -> None:
         """Both config knobs reach the lane breaker in one Harness construction."""
@@ -382,8 +373,13 @@ class TestHarnessBreakerConfigWiring:
         assert isinstance(breaker, NoLandingsCircuitBreaker), (
             'Harness must build the lane breaker itself, not a stand-in'
         )
-        assert breaker._window_samples == 17
-        assert breaker._disk_free_floor_bytes == 123_456_789
+        assert breaker.disk_free_floor_bytes == 123_456_789, (
+            f'expected disk_free_floor_bytes=123456789, '
+            f'got {breaker.disk_free_floor_bytes}'
+        )
+        assert breaker._window_samples == 17, (
+            f'expected window_samples=17, got {breaker._window_samples}'
+        )
 
 
 # ---------------------------------------------------------------------------
