@@ -21,6 +21,7 @@ is per-PROJECT, not per-agent.
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 
@@ -324,10 +325,26 @@ class TestNeverRaises:
 def test_without_the_escalation_package_it_no_ops(tmp_path, monkeypatch, caplog):
     """The minimal-env path: logged, nothing filed, `None` returned. The
     repair pass must behave identically whether or not the optional
-    `escalation` workspace package is installed."""
+    `escalation` workspace package is installed.
+
+    AT WARNING, WHICH IS WHY THIS FILER DIVERGES from the six siblings that
+    share `file_folded_escalation`'s DEBUG default. A referent-repair storm is
+    a sustained scanner/resolver regression against a measured ~0.22% base
+    rate, not a routine event — so in a deployment or CI env lacking the
+    optional `escalation` package, the DEBUG default would produce NO output
+    at the default log level. That is the exact silence
+    `_folded_escalation`'s own module docstring argues against: it is
+    indistinguishable from health, while every episode keeps arriving
+    mis-attributed.
+
+    Pinned on `levelno` rather than on the presence of any record at all: a
+    downgrade on a never-raise alarm path has no symptom EXCEPT absence of
+    output, so `assert caplog.records` under a permissive capture level cannot
+    tell a lost alarm from a quiet one.
+    """
     monkeypatch.setattr(_folded_escalation, 'HAS_ESCALATION', False)
 
-    with caplog.at_level('DEBUG'):
+    with caplog.at_level(logging.DEBUG):
         result = emit_referent_repair_storm_escalation(
             str(tmp_path),
             project_id='dark_factory',
@@ -339,7 +356,52 @@ def test_without_the_escalation_package_it_no_ops(tmp_path, monkeypatch, caplog)
 
     assert result is None
     assert not (tmp_path / 'data' / 'escalations').exists()
-    assert caplog.records, 'a no-op alarm must still say so'
+    assert [r.levelno for r in caplog.records] == [logging.WARNING], (
+        'a repair storm that goes unescalated because the optional package is '
+        'absent is a LOST ALARM, not a DEBUG detail'
+    )
+
+
+def test_the_fold_is_announced_at_warning_on_this_modules_own_logger(
+    tmp_path, caplog,
+):
+    """A fold is a SUPPRESSION, and this filer's suppressions stay at WARNING.
+
+    Same divergence as the no-op arm above, for the same measured reason: once
+    a project is storming, EVERY subsequent episode breaches the threshold and
+    folds into the open record, so the fold line is the only ongoing evidence
+    that the storm is still running. At the helper's INFO default that
+    evidence disappears from a default-threshold log, and an operator reading
+    it sees one old escalation and no sign the regression is still firing.
+
+    Asserted on `r.name` as well as `r.levelno`: the line must come from THIS
+    module's logger, not the helper's, or every `caplog` filter and every
+    log-routing rule keyed on `fused_memory.middleware.*` loses the
+    attribution that says WHICH alarm folded.
+    """
+    first = _emit(tmp_path)
+    assert first is not None
+
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG):
+        second = _emit(tmp_path, streak=11, repairs=2)
+
+    assert second == first
+    folds = [
+        r for r in caplog.records
+        if r.name == 'fused_memory.middleware.referent_repair_storm_escalator'
+        and r.levelno == logging.WARNING
+    ]
+    assert len(folds) == 1, (
+        f'expected one WARNING fold line on this module\'s own logger, got '
+        f'{[(r.name, r.levelno) for r in caplog.records]!r}'
+    )
+    message = folds[0].getMessage()
+    assert first in message
+    assert "already open for project_id='dark_factory'" in message
+    assert 'streak now 11' in message
+    assert '2 repair(s) this episode' in message
+    assert 'folding into it rather than filing a duplicate' in message
 
 
 class TestDelegatesToTheSharedHelper:

@@ -21,8 +21,11 @@ helper would be a behaviour change, not a refactor.
 
 from __future__ import annotations
 
+import importlib
 import json
 import logging
+from collections.abc import Callable
+from typing import Any, NamedTuple
 
 import pytest
 
@@ -554,6 +557,177 @@ class TestTheEmittedLevelIsACallerConcern:
             assert _emit(tmp_path) == first
 
         assert [r.levelno for r in caplog.records] == [logging.INFO]
+
+
+class _Filer(NamedTuple):
+    """One migrated filer: where its spy goes, how to fire it, what it forwards."""
+
+    label: str
+    #: Dotted path of the filer's OWN module. The spy is installed HERE, not on
+    #: `_folded_escalation`, because that is where the name the filer body
+    #: resolves actually lives — patching the helper's home would prove nothing
+    #: about what this caller forwards.
+    module: str
+    fire: Callable[[Any, str], object]
+    #: The level this filer's package-unavailable arm must be emitted at.
+    no_escalation_level: int
+
+
+def _storm(module: Any, project_root: str) -> object:
+    return module.emit_markup_storm_escalation(
+        project_root,
+        {'count': 3, 'threshold': 3, 'window_seconds': 3600.0,
+         'outcome': 'rejected', 'project': '/project-a'},
+    )
+
+
+def _residue(module: Any, project_root: str) -> object:
+    return module.emit_markup_residue_escalation(
+        project_root, {'tool': 'add_memory', 'field': 'content'},
+    )
+
+
+def _unverified_claim(module: Any, project_root: str) -> object:
+    return module.emit_unverified_claim_escalation(
+        project_root,
+        {'claims': [{'subject': 'task', 'ref': '5422', 'kind': 'task',
+                     'project_id': 'dark_factory', 'status': 'mismatch',
+                     'observed': 'in-progress', 'text': 'task 5422 has been applied'}]},
+    )
+
+
+#: THE SINGLE POINT OF TRUTH (heuristic 11) for the level each migrated filer
+#: emits its package-unavailable arm at: the DEBUG house level, and its ONE
+#: deliberate exception.
+#:
+#: A never-raise alarm path is where a silent level downgrade is most costly —
+#: the only symptom is absence of output — so the levels are fenced here rather
+#: than left implicit in seven call sites. Changing what a filer forwards means
+#: editing this table, which is the point: it cannot land unnoticed.
+_MIGRATED_FILERS: tuple[_Filer, ...] = (
+    _Filer(
+        'write_triage',
+        'fused_memory.server.write_triage',
+        lambda m, root: m.emit_triage_fail_open_storm_escalation(
+            root, {'count': 5, 'window_seconds': 60},
+        ),
+        logging.DEBUG,
+    ),
+    _Filer(
+        'markup_tripwire storm',
+        'fused_memory.server.markup_tripwire',
+        _storm,
+        logging.DEBUG,
+    ),
+    _Filer(
+        'markup_tripwire residue',
+        'fused_memory.server.markup_tripwire',
+        _residue,
+        logging.DEBUG,
+    ),
+    _Filer(
+        'candidate_key_escalation',
+        'fused_memory.middleware.candidate_key_escalation',
+        lambda m, root: m.emit_residual_candidate_key_escalation(
+            root,
+            [{'tag': 't', 'candidate_key': 'k', 'task_ids': ['1', '2'],
+              'count': 2, 'reason': 'mixed_status'}],
+        ),
+        logging.DEBUG,
+    ),
+    # THE ONE EXCEPTION, and the defect this table exists to fence. A repair
+    # storm is a sustained scanner/resolver regression against a measured
+    # ~0.22% base rate, so an env without the optional `escalation` package
+    # emitting nothing at the default threshold is a LOST ALARM, not a detail.
+    # Merge-base 6f9cddb0bb logged it at WARNING; consolidation flattened it to
+    # DEBUG and 417 passing tests said nothing.
+    _Filer(
+        'referent_repair_storm_escalator',
+        'fused_memory.middleware.referent_repair_storm_escalator',
+        lambda m, root: m.emit_referent_repair_storm_escalation(
+            root, project_id='dark_factory', streak=10, threshold=10,
+            repairs=1, records=[],
+        ),
+        logging.WARNING,
+    ),
+    _Filer(
+        'completion_claim_gate',
+        'fused_memory.services.completion_claim_gate',
+        _unverified_claim,
+        logging.DEBUG,
+    ),
+    _Filer(
+        'memory_metadata_census',
+        'fused_memory.services.memory_metadata_census',
+        lambda m, root: m.file_unknown_key_storm_escalation(
+            root, project_id='dark_factory', agent_id='claude-x',
+            keys=['weird_key'],
+        ),
+        logging.DEBUG,
+    ),
+)
+
+
+class TestEveryFilerPinsItsUnavailableLevel:
+    """The house level, its one exception, and a fence against a third answer.
+
+    Deliberately NOT decorated with `_needs_escalation`: the spy replaces
+    `file_folded_escalation` outright, so no queue is ever built — and a level
+    regression that only fails where the escalation package happens to be
+    installed is an alarm switched off exactly where nobody is looking.
+    """
+
+    @pytest.mark.parametrize(
+        'filer', _MIGRATED_FILERS, ids=[f.label for f in _MIGRATED_FILERS],
+    )
+    def test_the_forwarded_no_escalation_level_matches_the_table(
+        self, filer, tmp_path, monkeypatch,
+    ):
+        module = importlib.import_module(filer.module)
+        seen: dict = {}
+
+        def _spy(_project_root, **kwargs):
+            seen.update(kwargs)
+            return 'esc-spied-1'
+
+        monkeypatch.setattr(module, 'file_folded_escalation', _spy)
+        filer.fire(module, str(tmp_path))
+
+        assert seen, f'{filer.label} did not reach file_folded_escalation at all'
+        # `.get` with the helper's own default, so a row reading DEBUG passes
+        # whether the caller omits the keyword or passes it explicitly: the
+        # property under test is the EMITTED level, not the call spelling.
+        assert seen.get('no_escalation_level', logging.DEBUG) == filer.no_escalation_level, (
+            f'{filer.label} forwards no_escalation_level='
+            f'{seen.get("no_escalation_level", logging.DEBUG)!r}, table says '
+            f'{filer.no_escalation_level!r}. If the change is deliberate, edit '
+            'the table and say why in the row; if not, a never-raise alarm '
+            'just changed how loudly it fails, and the only symptom would have '
+            'been absence of output.'
+        )
+
+    def test_the_table_covers_every_folded_filer_and_names_one_exception(self):
+        """Anti-vacuity: a parametrized fence passes trivially for a filer that
+        is simply absent from the table, which is how the predecessor
+        anchor sweep missed two of them."""
+        assert {f.label for f in _MIGRATED_FILERS} == {
+            'write_triage',
+            'markup_tripwire storm',
+            'markup_tripwire residue',
+            'candidate_key_escalation',
+            'referent_repair_storm_escalator',
+            'completion_claim_gate',
+            'memory_metadata_census',
+        }
+        raised = {
+            f.label for f in _MIGRATED_FILERS
+            if f.no_escalation_level != logging.DEBUG
+        }
+        assert raised == {'referent_repair_storm_escalator'}, (
+            'DEBUG is the house level and referent_repair is its ONE deliberate '
+            f'exception; {raised!r} says a second answer arrived without the '
+            'house-level question being settled'
+        )
 
 
 # ---------------------------------------------------------------------------
