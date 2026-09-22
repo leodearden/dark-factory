@@ -27,7 +27,7 @@ tasks:
       expect: present
   - name: generated-task-vocab
     binding: capability→producer (wired) — scripts/gen_dashboard_task_vocab.py renders
-      static/redux/task_vocab.js; parity test in tests/scripts/ per the render_dashboard_unit
+      static/redux/task_vocab.js; parity test in tests/scripts/ per the render_systemd_unit
       precedent
     verdict: PASS
     delivered_check:

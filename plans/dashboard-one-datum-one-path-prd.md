@@ -147,7 +147,7 @@ pointing at ι (a dependency edge on a `deferred` task would be inert). Task
    renders `dashboard/src/dashboard/static/redux/task_vocab.js` (members, view
    membership, display tones) from `shared.task_statuses`; the parity test lives in
    root `tests/scripts/` beside the existing generator precedent
-   (`scripts/render_dashboard_unit.py` + `tests/scripts/test_dashboard_service_template.py`),
+   (`scripts/render_systemd_unit.py` + `tests/scripts/test_dashboard_service_template.py`),
    where `scripts/` is on `sys.path` by design. Rejected: the hand-maintained-twin
    pattern of `recon_status.js` (kept there as landed) and views-only.
 5. **The task snapshot is one acquisition unit.** `dashboard/data/task_snapshot.py`
@@ -387,7 +387,7 @@ pointing at ι (a dependency edge on a `deferred` task would be inert). Task
 | `scheduler_utils.jsx::lockChipState`, `scheduler_heatmap.jsx::cellStateFor`, `tabs.jsx::LocksCell` | present |
 | `data.js::applyKey` + `__loaded` marker; `DEFAULT_POLL_DEPS` | present — the registry extension point |
 | node `--test` harness in the merge gate | `dashboard/tests/test_graph_layout_js.py::test_graph_layout_js_suite_passes` (subprocess + TAP count), collected by `cd dashboard && uv run pytest tests/` |
-| generator + parity-test precedent | `scripts/render_dashboard_unit.py` + `tests/scripts/test_dashboard_service_template.py::test_template_renders_to_hardcoded_file` |
+| generator + parity-test precedent | `scripts/render_systemd_unit.py` + `tests/scripts/test_dashboard_service_template.py::test_template_renders_to_hardcoded_file` |
 | AST guard precedent with exemption apparatus | `dashboard/tests/test_clock_discipline.py::find_clock_violations` |
 | root `.venv` carries every workspace member | `CLAUDE.md` § Locating installed code |
 

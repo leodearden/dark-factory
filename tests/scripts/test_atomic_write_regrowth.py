@@ -365,7 +365,7 @@ _ALLOWED_RENAMERS = {
     # scope" boilerplate, and none was migrated here — a source migration
     # folded into a merge resolution is an unreviewed change arriving on the
     # one path nobody diffs, which is the opposite of what this guard is for.
-    ('scripts/render_dashboard_unit.py', 'main'):
+    ('scripts/render_systemd_unit.py', 'main'):
         'STDLIB-ONLY STANDALONE ENTRYPOINT — the class of dashboard-watchdog.'
         'save_state and orchestrator-watchdog._atomic_write_json above, and of '
         'session_registry._atomic_write_text before them, but under a HARDER '
