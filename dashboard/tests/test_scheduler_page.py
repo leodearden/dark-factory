@@ -504,6 +504,51 @@ async def test_collect_scheduler_state_surfaces_offline_when_mcp_unreachable(
     assert offline_projects == [project]
 
 
+async def test_collect_scheduler_state_surfaces_degraded_projects_distinctly(
+    dummy_client, dummy_config
+):
+    """A budget-expired project is DEGRADED, never folded into offline.
+
+    The two facts mean different things and send an operator to different
+    places: offline means the read demonstrably FAILED (fused-memory is
+    unreachable — go restart it); degraded means the whole-handler budget
+    expired before this project was read, so its state is simply UNKNOWN and
+    nothing was proven down. Merging degraded into ``offline_projects`` would
+    send an operator to restart a healthy fused-memory, which is why this test
+    asserts the SEPARATION and not merely the presence of the new element.
+
+    ``collect_tasks_with_counts`` already computes the marker; the defect is
+    that ``collect_scheduler_state`` read it through ``collect_active_tasks``,
+    whose narrower two-element contract absorbs it (see that function's
+    docstring, which names this call as the escape hatch).
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from dashboard.data.scheduler import collect_scheduler_state
+
+    mock_active = AsyncMock(return_value=([], ['down-proj'], {}, ['slow-proj'], []))
+
+    async def _mcp(client, url, tool, args):
+        if tool == 'get_scheduler_state':
+            return _scheduler_snapshot()
+        return []
+
+    with (
+        patch('dashboard.data.scheduler.mcp_tool_call', AsyncMock(side_effect=_mcp)),
+        patch('dashboard.data.scheduler.collect_tasks_with_counts', mock_active),
+    ):
+        (
+            _rows, _modules, _pin_queue, _events, offline_projects,
+            _paused, _recovery, degraded_projects,
+        ) = await collect_scheduler_state(dummy_client, dummy_config)
+
+    assert degraded_projects == ['slow-proj']
+    assert offline_projects == ['down-proj'], (
+        'a degraded project must never be reclassified as offline'
+    )
+    assert 'slow-proj' not in offline_projects
+
+
 # ---------------------------------------------------------------------------
 # task-2218 step-3: guard the first_success + whole-pair-retry + None-sentinel
 # contract that the upcoming _one_project -> first_success conversion must
