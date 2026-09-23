@@ -1005,7 +1005,13 @@ class SessionResumeConfig(BaseModel):
             'nothing chained at ANY threshold. 5 sits two above the measured '
             "null's longest run of 3 inside the shipped 24h window, and "
             'reset-on-success rather than the clock is what suppresses false '
-            'alarms.'
+            'alarms. '
+            'ALSO EXCLUDED: the recovered-config-dir ambiguity L1 '
+            '(session_config_dir_ambiguous) does NOT feed this streak — it is '
+            'deduped one-open-at-a-time rather than thresholded, so this knob '
+            'has no effect on it and an ambiguity L1 alone is not evidence of '
+            'a resume storm; see event_store.py::EventType.'
+            'session_config_dir_ambiguous.'
         ),
     )
     storm_window_secs: int = Field(
