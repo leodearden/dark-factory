@@ -14,6 +14,7 @@ import random
 import re
 import time
 from collections.abc import Callable, Coroutine, Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -237,6 +238,45 @@ CallbackFn = Callable[[str, Any, dict[str, Any]], Coroutine[Any, Any, None]]
 # this module's deliberate independence from fused-memory-specific components.
 TerminalHookFn = Callable[[str, str, str | None], Coroutine[Any, Any, None]]
 
+
+@dataclass(frozen=True)
+class DeadLetterEvent:
+    """Everything an operator alarm needs about one permanently-abandoned write.
+
+    A frozen dataclass rather than positional hook arguments: the event has
+    eight fields with no natural order, and a consumer that had to remember
+    which position held ``operation`` versus ``group_id`` would be a meaningful
+    string in disguise (structured data, not positional convention). Frozen
+    because the hook runs after the item's state is already committed — there
+    is nothing a consumer could usefully mutate, and a mutation would only
+    diverge the alarm from the row it describes.
+
+    ``attempts`` is the COMMITTED count (the value now on the row), not the
+    pre-increment count the claimed item carried, so it matches both the
+    ``write_queue`` row and the dead-letter WARN line.
+
+    ``post_execute`` is the structured form of ``POST_EXECUTE_DEAD_PREFIX``:
+    True means the backend write LANDED and only the post-execute work kept
+    failing, so a blind replay DUPLICATES it. The prefix is still applied to
+    ``error`` — nothing about the journal contract changes — but a consumer
+    branching on remediation should read this flag rather than re-parse it.
+    """
+
+    item_id: int
+    group_id: str
+    operation: str
+    attempts: int
+    error: str | None
+    write_op_id: str | None
+    payload: dict[str, Any] | None
+    post_execute: bool
+
+
+# (event) -> None. Invoked once per item that reaches 'dead', and never on
+# 'completed' or an intermediate retry. Injected exactly as ``on_terminal`` is,
+# keeping this module free of any fused-memory-specific import.
+DeadLetterHookFn = Callable[[DeadLetterEvent], Coroutine[Any, Any, None]]
+
 # Prefix applied to the reported error when an item dead-letters AFTER
 # _execute_write already returned — i.e. the registered callback (or the
 # completion commit) is what kept failing, not the backend write. 'dead' alone
@@ -266,10 +306,12 @@ class DurableWriteQueue:
         transient_error_names: Iterable[str] | None = None,
         identity_payload_keys: Mapping[str, str] | None = None,
         on_terminal: TerminalHookFn | None = None,
+        on_dead_letter: DeadLetterHookFn | None = None,
     ):
         self._data_dir = Path(data_dir)
         self._execute_write = execute_write
         self._on_terminal = on_terminal
+        self._on_dead_letter = on_dead_letter
         self._workers_per_group = workers_per_group
         self._max_attempts = max_attempts
         self._retry_base_seconds = retry_base_seconds
@@ -480,8 +522,10 @@ class DurableWriteQueue:
         Callbacks run *before* marking completed so that a callback
         failure triggers retry instead of being silently lost.
 
-        The terminal hook, by contrast, runs AFTER the queue's own commit and
-        OUTSIDE the semaphore — see ``_notify_terminal``.
+        Both post-commit hooks, by contrast, run AFTER the queue's own commit
+        and OUTSIDE the semaphore: ``_notify_terminal`` (the durable write-back
+        onto the ``write_ops`` row) and then, for a dead item only,
+        ``_notify_dead_letter`` (the operator alarm).
         """
         terminal: tuple[str, str | None] | None = None
         write_op_id: str | None = None
@@ -521,6 +565,13 @@ class DurableWriteQueue:
             if status == 'dead' and executed:
                 error = f'{POST_EXECUTE_DEAD_PREFIX}{error}'
             await self._notify_terminal(item.id, write_op_id, status, error)
+            if status == 'dead':
+                # AFTER the journal write-back, deliberately: the durable audit
+                # trail must land before the best-effort alarm gets a chance to
+                # misbehave.
+                await self._notify_dead_letter(
+                    item, write_op_id, error, post_execute=executed
+                )
 
     async def _notify_terminal(
         self,
@@ -551,6 +602,64 @@ class DurableWriteQueue:
             logger.warning(
                 'Item %d: on_terminal hook failed for write_op %s (%s)',
                 item_id, write_op_id, status, exc_info=True,
+            )
+
+    async def _notify_dead_letter(
+        self,
+        item: QueueItem,
+        write_op_id: str | None,
+        error: str | None,
+        *,
+        post_execute: bool,
+    ) -> None:
+        """Report a permanently-abandoned write to the ``on_dead_letter`` hook.
+
+        Shares ``_notify_terminal``'s post-commit, outside-the-semaphore
+        discipline for the same two reasons — the queue's correctness must
+        never depend on a hook, and a hook's own work must not hold a slot in a
+        pool shared across every group — and DIVERGES from it on exactly one
+        point, deliberately: there is no ``or not write_op_id`` guard here.
+
+        That guard is right for the journal write-back, which has nothing to
+        join an outcome back to without a key. It is wrong for an alarm, which
+        needs no join key at all — and inheriting it would silently exempt
+        every ``mem0_classify_and_add`` (one per extracted fact per episode)
+        and every ``replay_from_store`` from the only push signal they have.
+        Those deaths currently reach nothing but a WARNING log.
+
+        A raising hook is logged and swallowed. Unlike the journal write-back,
+        a raise here would not merely lose one record: it escapes
+        ``_process_item`` into ``_worker_loop``, which has no handler, so the
+        worker task dies and the group stops draining. A failed alarm must cost
+        the operator a heads-up, never the queue.
+        """
+        if self._on_dead_letter is None:
+            return
+        try:
+            payload: dict[str, Any] | None = item.parsed_payload()
+        except (ValueError, TypeError):
+            # A payload that will not parse still has to raise the alarm — the
+            # unparseable payload is itself part of what went wrong.
+            payload = None
+        event = DeadLetterEvent(
+            item_id=item.id,
+            group_id=item.group_id,
+            operation=item.operation,
+            # The committed count: _handle_failure wrote item.attempts + 1.
+            attempts=item.attempts + 1,
+            error=error,
+            write_op_id=write_op_id,
+            payload=payload,
+            # Structured, so the consumer never re-parses POST_EXECUTE_DEAD_PREFIX.
+            post_execute=post_execute,
+        )
+        try:
+            await self._on_dead_letter(event)
+        except Exception:
+            logger.warning(
+                'Item %d (%s, group_id=%s): on_dead_letter hook failed; the '
+                'dead-letter is committed but was NOT escalated',
+                item.id, item.operation, item.group_id, exc_info=True,
             )
 
     async def _mark_completed(self, item: QueueItem) -> None:
@@ -739,13 +848,29 @@ class DurableWriteQueue:
         return count
 
     async def get_stats(self, group_id: str | None = None) -> dict[str, Any]:
-        """Return counts by status and oldest pending age.
+        """Return counts by status, oldest pending age, and dead-by-operation.
+
+        ``dead_by_operation`` maps operation name -> count over ``status='dead'``
+        rows only.  A nonzero entry means writes of that operation have been
+        PERMANENTLY abandoned: the queue exhausted their attempts and gave up,
+        after the caller was already told the write had been accepted.  It is
+        always present, and ``{}`` when nothing is dead — a probe must never
+        have to distinguish "no deaths" from "an older server".
+
+        This counter is the health-probe CONFIRMATION, not the primary alarm.
+        The push signal is the ``durable_write_dead_letter`` escalation
+        (``middleware/dead_letter_escalator.py::emit_dead_letter_escalation``),
+        which survives cleanup; this reads the live ``write_queue`` table, so
+        it returns to zero once :mcp-tool:`delete_dead_letters` sweeps the rows.
+        ``counts['dead']`` is the same population without the attribution, so
+        the two always sum consistently.
 
         Args:
-            group_id: When given, restrict counts and oldest-pending age to
-                rows whose ``group_id`` matches.  Default ``None`` returns
-                unscoped (global) statistics — preserving the behaviour
-                required by :mcp-tool:`get_queue_stats` and the dashboard.
+            group_id: When given, restrict counts, oldest-pending age and the
+                dead-by-operation breakdown to rows whose ``group_id``
+                matches.  Default ``None`` returns unscoped (global)
+                statistics — preserving the behaviour required by
+                :mcp-tool:`get_queue_stats` and the dashboard.
         """
         assert self._db is not None
 
@@ -784,9 +909,33 @@ class DurableWriteQueue:
             if min_created is not None:
                 oldest_pending_age = time.time() - min_created
 
+        # No new index: idx_wq_status_group is on (status, group_id,
+        # next_retry_at), so both spellings below seek the status='dead'
+        # prefix — and the scoped one seeks (status, group_id). An index is
+        # not free on a live DB; see write_journal.py's idx_wo_created note,
+        # where adding one measured ~47 s of one-time startup DDL.
+        if group_id is not None:
+            cursor = await self._db.execute(
+                'SELECT operation, COUNT(*) as cnt FROM write_queue '
+                "WHERE status = 'dead' AND group_id = ? GROUP BY operation",
+                (group_id,),
+            )
+        else:
+            cursor = await self._db.execute(
+                'SELECT operation, COUNT(*) as cnt FROM write_queue '
+                "WHERE status = 'dead' GROUP BY operation"
+            )
+        rows = await cursor.fetchall()
+        dead_by_operation = {
+            row[0] if isinstance(row, tuple) else row['operation']:
+            row[1] if isinstance(row, tuple) else row['cnt']
+            for row in rows
+        }
+
         return {
             'counts': counts,
             'oldest_pending_age_seconds': oldest_pending_age,
+            'dead_by_operation': dead_by_operation,
         }
 
     async def delete_dead(

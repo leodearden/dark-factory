@@ -55,32 +55,48 @@ def _register_fetch_tasks(monkeypatch, tasks: list[dict]) -> None:
     """Monkeypatch fetch_tasks (and its compact map) to a fixed shaped task list.
 
     ``_shape_one_project`` narrows its fetch server-side and reads its counts
-    from ``fetch_statuses`` (task 3857), so the fake honours ``statuses`` /
-    ``page_size`` / ``offset`` — emulating the substrate's row filter and
-    ascending-id slice — and derives the compact map from the same list.
-    Ignoring the narrowing would hand the whole list to both fetch calls and
-    duplicate every row; leaving ``fetch_statuses`` unpatched would reach for
-    the network.
+    from ``fetch_statuses`` (task 3857), so the fakes honour ``statuses`` —
+    emulating the substrate's row filter and ascending-id order — and derive
+    the compact map from the same list.  Ignoring the narrowing would hand the
+    whole list to both fetch calls and duplicate every row; leaving
+    ``fetch_statuses`` unpatched would reach for the network.
+
+    TWO fakes: ``fetch_tasks`` returns the COMPLETE set and has no window,
+    ``fetch_task_page`` returns ONE page and REQUIRES ``page_size``/``offset``.
+    Each matches its real signature exactly — a laxer fake would let a
+    call-site regression pass.
     """
 
-    async def _fake_fetch_tasks(
-        client, config, project_root, *,
-        statuses=None, page_size=None, offset=0, timeout=None,
-    ):
+    def _filtered(statuses):
         rows = list(tasks)
         if statuses is not None:
             rows = [r for r in rows if r.get('status') in statuses]
         rows.sort(key=lambda r: r.get('id') or 0)  # ORDER BY id ASC
-        if page_size is not None:
-            rows = rows[offset:offset + page_size]
         return rows
 
-    async def _fake_fetch_statuses(client, config, project_root):
+    # ``timeout`` accepted-and-ignored by all three fakes: _shape_one_project
+    # threads active_tasks._TASKS_PER_CALL_TIMEOUT into every call it makes.
+    async def _fake_fetch_tasks(
+        client, config, project_root, *,
+        statuses=None, chunk_size=None, timeout=None,
+    ):
+        return _filtered(statuses)
+
+    async def _fake_fetch_task_page(
+        client, config, project_root, *,
+        page_size, offset, statuses=None, timeout=None,
+    ):
+        return _filtered(statuses)[offset:offset + page_size]
+
+    async def _fake_fetch_statuses(client, config, project_root, *, timeout=None):
         return {
             r['id']: r.get('status') for r in tasks if isinstance(r.get('id'), int)
         }
 
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch_tasks)
+    monkeypatch.setattr(
+        'dashboard.data.active_tasks.fetch_task_page', _fake_fetch_task_page,
+    )
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_statuses', _fake_fetch_statuses)
 
 
@@ -104,9 +120,19 @@ def _producer_wire_entry(
     }
 
 
-def _producer_wire_dict(*, offline: bool = False, tasks: list[dict] | None = None) -> dict:
-    """The exact get_task_runtime_state JSON envelope shape."""
-    return {'offline': offline, 'tasks': tasks or []}
+def _producer_wire_dict(
+    *,
+    offline: bool = False,
+    offline_reason: str | None = None,
+    tasks: list[dict] | None = None,
+) -> dict:
+    """The exact get_task_runtime_state JSON envelope shape.
+
+    ``offline_reason`` is dashboard-synthesized (task 3517) — the producer
+    itself always emits ``None`` — but it travels through this SAME envelope
+    and must decode through the SAME shared contract, so it belongs here.
+    """
+    return {'offline': offline, 'offline_reason': offline_reason, 'tasks': tasks or []}
 
 
 def _decode(wire: dict) -> TaskRuntimeSnapshot:
@@ -161,6 +187,7 @@ async def test_b5_producer_wire_entry_populates_row_via_join(dummy_client, monke
     assert row['agent'] == 'claude-task-42'
     assert row['started'] == 7
     assert row['runtime_offline'] is False
+    assert row['runtime_status'] == 'ok'
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +210,37 @@ async def test_b6_offline_snapshot_yields_none_not_zero(dummy_client, monkeypatc
 
     assert len(active) == 1
     row = active[0]
+    assert row['runtime_offline'] is True
+    for key in ('loops', 'attempts', 'started', 'lane', 'phase', 'lane_state'):
+        assert row[key] is None, f'expected {key} is None when offline, got {row[key]!r}'
+    # No reason on the snapshot -> the honest sentinel, not a guessed diagnosis.
+    assert row['runtime_status'] == 'unknown'
+
+
+@pytest.mark.asyncio
+async def test_b6_wire_offline_reason_reaches_the_row(dummy_client, monkeypatch, tmp_path):
+    """A wire envelope carrying offline_reason decodes through the SAME shared
+    contract and lands on the row as runtime_status (task 3517).
+
+    Ropes the new discriminator end-to-end — decode -> _probe_status ->
+    _runtime_fields -> row — rather than only against hand-built models.
+    """
+    snapshot = _decode(_producer_wire_dict(
+        offline=True, offline_reason='deadline_exceeded',
+    ))
+    assert snapshot.offline_reason == 'deadline_exceeded'
+
+    _register_fetch_tasks(monkeypatch, [_shape_task(5, 'stuck task', 'in-progress')])
+    root = _project_root(tmp_path, 'starvedlane')
+    config = DashboardConfig(project_root=root)
+
+    active, _, _ = await _shape_one_project(
+        dummy_client, config, root, runtime=snapshot,
+    )
+
+    assert len(active) == 1
+    row = active[0]
+    assert row['runtime_status'] == 'deadline_exceeded'
     assert row['runtime_offline'] is True
     for key in ('loops', 'attempts', 'started', 'lane', 'phase', 'lane_state'):
         assert row[key] is None, f'expected {key} is None when offline, got {row[key]!r}'
@@ -209,6 +267,7 @@ async def test_b6_online_but_task_absent_gets_honest_zero_contrast(dummy_client,
     assert len(active) == 1
     row = active[0]
     assert row['runtime_offline'] is False
+    assert row['runtime_status'] == 'ok'
     assert row['loops'] == 0
     assert row['attempts'] == 0
     assert row['started'] == 0

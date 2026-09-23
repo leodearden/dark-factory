@@ -20,7 +20,9 @@ the same funnel with a real config and a real ``LocalRunner``.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -62,6 +64,8 @@ from orchestrator.merge_queue import (
     _do_train_merge,
     _run_post_merge_verify,
 )
+from orchestrator.merge_lane.ports import ProductionVerifier, VerifyPort
+from orchestrator.merge_queue import PRODUCTION_VERIFIER, _run_post_merge_verify
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import VerifyRunner, result_from_json, result_to_json
 
@@ -129,6 +133,51 @@ def _still_failing(s: FlakeSuppression) -> VerifyResult:
     return replace(_failing_scoped_result(_BETA_FAILING_ID), flake_suppression=s)
 
 
+class _ScriptedRed:
+    """The production ``VerifyPort`` with ONLY the two legs this file scripts.
+
+    ``ProductionVerifier`` holds one zero-argument RESOLVER per leg, so
+    replacing ``scoped`` and ``unscoped`` states this file's scene through the
+    port ``_run_post_merge_verify`` already takes — and no wider.  That pair is
+    leg-for-leg what the two ``orchestrator.merge_queue`` patches
+    (``run_scoped_verification``, ``_run_unscoped_typechecks``) did before the
+    port existed, so the other five legs — the disk guard, post-merge pyright,
+    post-merge equivalence, cold shadow and dry-run — stay genuinely
+    production here, exactly as they were then.  A blanket fake port would
+    answer all seven clean and silently narrow what this file exercises
+    ``_run_post_merge_verify`` on, which no row here asks for.
+
+    The scripted red is the boundary's INPUT, not its answer: it carries
+    ``flake_suppression=None``, so every observation these tests assert on is
+    one the real ``verify.apply_merge_flake_suppression`` produced inside the
+    boundary's own ``LocalRunner`` (verify_runner.py:864) off the isolated
+    re-run.
+
+    ``verified`` records the task ids the scoped leg was asked about — an
+    injection that silently went unused leaves it empty, which is what keeps
+    the local row's "nothing is hand-fed" claim CHECKED rather than asserted.
+    """
+
+    def __init__(self) -> None:
+        self.result = _failing_scoped_result(_BETA_FAILING_ID)
+        self.verified: list[str | None] = []
+
+    async def _scoped(self, *_args: Any, **options: Any) -> VerifyResult:
+        self.verified.append(options.get('task_id'))
+        return self.result
+
+    async def _unscoped(self, *_args: Any, **_options: Any) -> PostMergePyrightResult:
+        return PostMergePyrightResult()
+
+    @property
+    def port(self) -> ProductionVerifier:
+        return dataclasses.replace(
+            cast(ProductionVerifier, PRODUCTION_VERIFIER),
+            scoped=lambda: self._scoped,
+            unscoped=lambda: self._unscoped,
+        )
+
+
 def _remote_runner(*results: VerifyResult) -> MagicMock:
     """A fake REMOTE runner returning *results* in order (one per dispatch)."""
     r = MagicMock(spec=VerifyRunner)
@@ -149,15 +198,21 @@ async def _drive(
     rerun_passes: bool = True,
     max_enospc: int = 1,
     task_client=None,
+    verifier: VerifyPort | None = None,
 ):
     """Drive the REAL ``_run_post_merge_verify``.
 
-    On the LOCAL path (*runner* None) the boundary builds its own ``LocalRunner``,
-    so ``run_scoped_verification`` is patched to the red and
-    ``verify.run_verification`` to the isolated re-run — the production gate then
-    produces the ``FlakeSuppression`` itself, rather than the test hand-feeding one.
-    On the REMOTE path the injected runner returns its own queued results directly,
-    which is exactly how a real remote's already-suppressed verdict arrives.
+    On the LOCAL path (*runner* None) the boundary builds its own ``LocalRunner``
+    over the INJECTED ``VerifyPort``, so *verifier*'s scoped leg answers the red
+    and ``verify.run_verification`` the isolated re-run — the production gate
+    then produces the ``FlakeSuppression`` itself, rather than the test
+    hand-feeding one.  On the REMOTE path the injected runner returns its own
+    queued results directly, which is exactly how a real remote's
+    already-suppressed verdict arrives.
+
+    Pass *verifier* to inspect the port afterwards; the default is a fresh
+    :class:`_ScriptedRed` port, which leaves five of the seven ``VerifyPort``
+    legs production.
 
     ``verify_cross_check_remote_green`` is OFF by default so the dispatched
     verdict's recording is measured on its own; the one case that needs the
@@ -178,21 +233,14 @@ async def _drive(
     req = _make_req(task_id, task_wt, config)
     req.module_configs = [mc_alpha]
 
-    with (
-        patch(
-            'orchestrator.merge_queue.run_scoped_verification',
-            new=AsyncMock(return_value=_failing_scoped_result(_BETA_FAILING_ID)),
-        ),
-        patch(
-            'orchestrator.merge_queue._run_unscoped_typechecks',
-            new=AsyncMock(return_value=PostMergePyrightResult()),
-        ),
-        patch.object(
-            verify, 'run_verification',
-            new=AsyncMock(
-                return_value=_passing_result() if rerun_passes
-                else _failing_scoped_result(_BETA_FAILING_ID),
-            ),
+    # `verify.run_verification` stays PATCHED: it is one layer BELOW the port —
+    # the isolated re-run `apply_merge_flake_suppression` makes to decide the
+    # verdict — so no `VerifyPort` leg covers it.
+    with patch.object(
+        verify, 'run_verification',
+        new=AsyncMock(
+            return_value=_passing_result() if rerun_passes
+            else _failing_scoped_result(_BETA_FAILING_ID),
         ),
     ):
         return await _run_post_merge_verify(
@@ -206,6 +254,7 @@ async def _drive(
             merge_sha=_MERGE_SHA,
             runner=runner,
             task_client=task_client,
+            verifier=_ScriptedRed().port if verifier is None else verifier,
         )
 
 
@@ -269,14 +318,30 @@ class TestDispatcherRecordsTheFlakeObservation:
         Here the production gate inside the boundary's own ``LocalRunner``
         produces the observation — nothing is hand-fed — and the same three
         land, with ``runner`` reading ``'local'`` because that is where it ran.
+
+        The two guards around the drive are what keep "nothing is hand-fed"
+        CHECKED rather than asserted.  Before: the scripted port hands the
+        boundary a bare red carrying no observation at all.  After: the port
+        was actually consulted for this task — an injection that silently went
+        unused would leave ``verified`` empty and make every count below the
+        answer to a question nobody asked.
         """
         store, queue = _FakeEventStore(), _FakeEscalationQueue()
+        verifier = _ScriptedRed()
+        assert verifier.result.flake_suppression is None, (
+            'the injected port must hand the boundary a bare red; a '
+            'pre-suppressed result would make every assertion below vacuous'
+        )
 
         outcome = await _drive(
             tmp_path, task_id='b3-local', runner=None,
-            event_store=store, escalation_queue=queue,
+            event_store=store, escalation_queue=queue, verifier=verifier.port,
         )
 
+        assert verifier.verified == ['b3-local'], (
+            f'the LocalRunner must have gone through the injected port; '
+            f'verified={verifier.verified!r}'
+        )
         assert outcome is None
         assert len(_suppression_events(store)) == 1, store.emits
         rows = _rows(tmp_path)

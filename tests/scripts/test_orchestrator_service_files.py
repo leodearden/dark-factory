@@ -35,9 +35,9 @@ this directory's lift trigger is a second consumer, not proximity.
 for the same reason; it is no longer imported here at all, having left with
 the installer suite that was its only consumer in this module.
 
-tests/scripts/test_orchestrator_watchdog.py's ``_unit_sections`` remains a
-third hand-copy of the section parse, and is now a straightforward de-dup
-against systemd_unit_invariants.parse_sections; filed as a follow-up.
+tests/scripts/test_orchestrator_watchdog.py's ``_unit_sections`` was the
+third hand-copy of the section parse; task 3913 retired it, and that module
+now imports systemd_unit_invariants.parse_sections just like this one.
 
 See also:
   - tests/scripts/test_setup_host_unit_installation.py — the installer and
@@ -125,15 +125,18 @@ def test_dark_factory_orchestrator_service_structure() -> None:
         in content
     ), "Missing ExecStartPre wait-for-port gate on fused-memory's port"
     assert (
-        "uv run --frozen --project orchestrator orchestrator run --config /home/leo/src/dark-factory/dark-factory-orchestrator.yaml"
+        "uv run --no-sync --project orchestrator orchestrator run --config /home/leo/src/dark-factory/dark-factory-orchestrator.yaml"
         in content
-    ), "ExecStart must invoke the orchestrator with the df config, frozen"
-    # --frozen: process start must NEVER implicitly re-sync the shared
-    # dark-factory/.venv (the 2026-05-29 ghost-venv fix — a frozen start fails
-    # fast instead of bootstrapping/mutating the runtime interpreter).
-    assert "uv run --frozen" in content, (
-        "ExecStart must pass --frozen so unit start never re-syncs the shared venv"
-    )
+    ), "ExecStart must invoke the orchestrator with the df config, no-sync"
+    # --no-sync, and its position before the command token, are pinned by the
+    # contiguous substring above. CORRECTION (task 5553): this pinned --frozen
+    # from the 2026-05-29 ghost-venv fix until then, believing a frozen start
+    # could not bootstrap the runtime interpreter — measured false; --frozen is
+    # a lockfile option (scripts/orchestrator-autopilot-video.service holds the
+    # measurement). The INVARIANT now lives fleet-wide in
+    # tests/scripts/test_uv_run_venv_isolation.py, which checks both arms
+    # (--no-sync present, no lockfile flag) against every committed unit; what
+    # stays here is this unit's config path, which no sweep can know.
     assert "Restart=on-failure" in content
     assert "RestartSec=10" in content
     assert "RestartMaxDelaySec=60" in content
@@ -208,14 +211,11 @@ def test_reify_orchestrator_service_structure() -> None:
         in content
     ), "Missing ExecStartPre wait-for-port gate on fused-memory's port"
     assert (
-        "uv run --frozen --project orchestrator orchestrator run --config /home/leo/src/reify/dark-factory-orchestrator.yaml"
+        "uv run --no-sync --project orchestrator orchestrator run --config /home/leo/src/reify/dark-factory-orchestrator.yaml"
         in content
-    ), "ExecStart must invoke the orchestrator with the reify config, frozen"
-    # --frozen: see the df structure test — unit start must never re-sync the
-    # shared dark-factory/.venv that the reify orchestrator also runs under.
-    assert "uv run --frozen" in content, (
-        "ExecStart must pass --frozen so unit start never re-syncs the shared venv"
-    )
+    ), "ExecStart must invoke the orchestrator with the reify config, no-sync"
+    # --no-sync: see the df structure test above, and
+    # tests/scripts/test_uv_run_venv_isolation.py for the fleet-wide arm.
     assert "Restart=on-failure" in content
     assert "RestartSec=10" in content
     assert "RestartMaxDelaySec=60" in content
@@ -237,11 +237,20 @@ def test_reify_orchestrator_service_structure() -> None:
 
 def test_reify_and_df_differ_only_in_config_and_description() -> None:
     """The two orchestrator service files must be identical except Description,
-    --config path, and the reify-only warm-lane mount gate.
+    --config path, the reify-only warm-lane mount gate, and the df-only
+    pytest-xdist worker cap.
 
     This guards the 'same shape' invariant: any structural drift (missing key,
     different Restart policy, etc.) that appears in one but not the other will
     break this test.
+
+    The two carve-outs below are per-project blocks, not drift. Each is stripped
+    from the file that carries it before the line-for-line comparison, so the
+    invariant still catches genuine drift in everything else. Ruled 2026-09-08
+    (esc-5063-5, option b): a degree of divergence between the units is
+    inevitable, so a new project-specific block belongs here as a named
+    carve-out rather than being mirrored into the other unit to keep the
+    line counts equal.
     """
     df_lines = DF_SERVICE.read_text(encoding="utf-8").splitlines()
     reify_lines = REIFY_SERVICE.read_text(encoding="utf-8").splitlines()
@@ -262,6 +271,25 @@ def test_reify_and_df_differ_only_in_config_and_description() -> None:
         # Drop the comment block, the directive itself, and the single
         # trailing blank line that separates it from the next block.
         del reify_lines[start_idx : end_idx + 2]
+
+    # orchestrator-dark-factory.service alone caps pytest-xdist's `-n auto` for
+    # env inheritors that are NOT verify legs (the offline lane and agent-shell
+    # pytest runs). It is df-only because df's dark-factory-orchestrator.yaml
+    # carries a `verify_env: PYTEST_XDIST_AUTO_NUM_WORKERS` entry that overlays
+    # this value last and so keeps verify legs at their own width; reify's
+    # config has no such entry, so mirroring the cap here would silently narrow
+    # reify's verify legs instead of only its offline lane. Stripped rather than
+    # mirrored, per the esc-5063-5 ruling above.
+    xdist_cap_block_start = (
+        "# Cap pytest-xdist `-n auto` for everything that inherits this unit's env and is"
+    )
+    xdist_cap_directive = "Environment=PYTEST_XDIST_AUTO_NUM_WORKERS=8"
+    if xdist_cap_block_start in df_lines:
+        start_idx = df_lines.index(xdist_cap_block_start)
+        end_idx = df_lines.index(xdist_cap_directive, start_idx)
+        # Drop the comment block, the directive itself, and the single
+        # trailing blank line that separates it from the next block.
+        del df_lines[start_idx : end_idx + 2]
 
     assert len(df_lines) == len(reify_lines), (
         f"Service files have different line counts: df={len(df_lines)} reify={len(reify_lines)}"
@@ -318,8 +346,9 @@ def test_autopilot_video_service_exists_and_structure() -> None:
 
     Until the 2026-05-29 venv-isolation fix this unit was live in
     ~/.config/systemd/user/ but had NO source template in scripts/ — so
-    setup-host.sh would never reinstall it and it could not pick up --frozen.
-    This test guards the now-tracked template going forward.
+    setup-host.sh would never reinstall it and it could not pick up a fleet-wide
+    ExecStart change at all. This test guards the now-tracked template going
+    forward.
     """
     assert AUTOPILOT_SERVICE.exists(), (
         "scripts/orchestrator-autopilot-video.service must exist as a tracked "
@@ -353,10 +382,9 @@ def test_autopilot_video_service_exists_and_structure() -> None:
         in content
     )
     assert (
-        "uv run --frozen --project orchestrator orchestrator run --config /home/leo/src/autopilot-video/dark-factory-orchestrator.yaml"
+        "uv run --no-sync --project orchestrator orchestrator run --config /home/leo/src/autopilot-video/dark-factory-orchestrator.yaml"
         in content
-    ), "ExecStart must invoke the orchestrator with the autopilot-video config, frozen"
-    assert "uv run --frozen" in content
+    ), "ExecStart must invoke the orchestrator with the autopilot-video config, no-sync"
     assert "Restart=on-failure" in content
     assert "StartLimitIntervalSec=600" in content
     assert "StartLimitBurst=10" in content

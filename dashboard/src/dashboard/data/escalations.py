@@ -415,6 +415,7 @@ async def _fetch_pins_one(
         result = await asyncio.wait_for(
             mcp_tool_call(
                 client, base_url, 'get_pending_escalations', {'compact': True},
+                timeout=timeout,
             ),
             timeout=timeout,
         )

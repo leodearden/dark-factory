@@ -18,6 +18,9 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from shared.cli_invoke import invoke_with_cap_retry
+from shared.usage_gate import UsageGate
+
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.evals.reviewer_trial.corpus import CorpusDiff, CorpusManifest
@@ -68,6 +71,10 @@ _DEFAULT_CWD = Path('/home/leo/src/dark-factory')
 # Results directory
 _RESULTS_DIR = Path(__file__).parent / 'results'
 
+# Production's build_reviewer_prompt truncates the diff at this many chars;
+# the trial mirrors it by default and lets a campaign lift it.
+DIFF_CAP_CHARS = 50_000
+
 
 @dataclass
 class PanelRunResult:
@@ -81,7 +88,7 @@ class PanelRunResult:
     errors: list[str] = field(default_factory=list)
 
 
-def _build_reviewer_prompt(diff_text: str) -> str:
+def _build_reviewer_prompt(diff_text: str, diff_cap_chars: int = DIFF_CAP_CHARS) -> str:
     """Build a simple reviewer prompt with just the diff.
 
     Simplified from BriefingAssembler.build_reviewer_prompt — no memory
@@ -91,8 +98,8 @@ def _build_reviewer_prompt(diff_text: str) -> str:
     than emit JSON/prose — so this action prompt no longer tells them to
     "output pure JSON" (that would contradict the frozen CONTRACT).
     """
-    if len(diff_text) > 50_000:
-        diff_text = diff_text[:50_000] + '\n\n... [diff truncated] ...'
+    if diff_cap_chars > 0 and len(diff_text) > diff_cap_chars:
+        diff_text = diff_text[:diff_cap_chars] + '\n\n... [diff truncated] ...'
 
     return f"""\
 # Code Diff to Review
@@ -107,12 +114,32 @@ Review the diff according to your specialization. Explore the codebase as needed
 """
 
 
+async def _dispatch_reviewer(usage_gate: UsageGate | None, label: str, **kwargs):
+    """Invoke one reviewer, through the shared OAuth pool when a gate is given.
+
+    Without a gate the CLI's own default credentials are used (the
+    historical trial behaviour). With a gate, ``invoke_with_cap_retry``
+    leases a pool account per attempt and fails over on cap hits, so a
+    campaign never burns the interactive account and survives a capped
+    pool. A spec-supplied ``oauth_token`` still wins over the pool.
+    """
+    if usage_gate is None or kwargs.get('oauth_token'):
+        return await invoke_agent(**kwargs)
+    backend = kwargs.pop('backend', 'claude')
+    kwargs.pop('oauth_token', None)
+    return await invoke_with_cap_retry(
+        usage_gate, label, invoke_fn=invoke_agent, backend=backend, **kwargs,
+    )
+
+
 async def _run_single_reviewer(
     spec: ReviewerSpec,
     diff: CorpusDiff,
     max_retries: int = 2,
     prices: dict | None = None,
     meta_root: Path | None = None,
+    usage_gate: UsageGate | None = None,
+    diff_cap_chars: int = DIFF_CAP_CHARS,
 ) -> tuple[str, dict | None, float]:
     """Run a single reviewer against a diff via the live verdict-tools transport.
 
@@ -154,7 +181,7 @@ async def _run_single_reviewer(
     downstream auth error inside the backend invocation.
     """
     role = build_trial_reviewer_role(spec)
-    prompt = _build_reviewer_prompt(diff.diff_text)
+    prompt = _build_reviewer_prompt(diff.diff_text, diff_cap_chars)
     cwd = diff.cwd or _DEFAULT_CWD
     owns_root = meta_root is None
     root = meta_root if meta_root is not None else Path(tempfile.mkdtemp(prefix='reviewer_trial_'))
@@ -194,7 +221,9 @@ async def _run_single_reviewer(
             # clear_verdict).
             artifacts.clear_verdict(role.name)
             try:
-                result = await invoke_agent(
+                result = await _dispatch_reviewer(
+                    usage_gate,
+                    f'reviewer_trial {spec.name} x {diff.diff_id}',
                     prompt=prompt,
                     system_prompt=role.system_prompt,
                     cwd=cwd,
@@ -204,6 +233,11 @@ async def _run_single_reviewer(
                     allowed_tools=role.allowed_tools,
                     disallowed_tools=role.disallowed_tools,
                     mcp_config=mcp_config,
+                    # The CLI ambient-merges the .mcp.json at cwd (the live
+                    # escalation + fused-memory servers) under
+                    # bypassPermissions; scope the reviewer to the
+                    # verdict-tools server above and nothing else.
+                    strict_mcp_config=True,
                     effort=spec.effort,
                     backend=spec.backend,
                     env_overrides=spec.env_overrides,
@@ -267,6 +301,8 @@ async def run_panel(
     stagger_secs: float = 2.0,
     max_retries: int = 2,
     prices: dict | None = None,
+    usage_gate: UsageGate | None = None,
+    diff_cap_chars: int = DIFF_CAP_CHARS,
 ) -> PanelRunResult:
     """Run one panel variant against one corpus diff.
 
@@ -286,7 +322,10 @@ async def run_panel(
         if i > 0 and stagger_secs > 0:
             await asyncio.sleep(stagger_secs)
         task = asyncio.create_task(
-            _run_single_reviewer(spec, corpus_diff, max_retries=max_retries, prices=prices),
+            _run_single_reviewer(
+                spec, corpus_diff, max_retries=max_retries, prices=prices,
+                usage_gate=usage_gate, diff_cap_chars=diff_cap_chars,
+            ),
             name=f'{variant.name}__{spec.name}__{corpus_diff.diff_id}',
         )
         tasks.append(task)
@@ -321,6 +360,9 @@ async def run_trial(
     corpus: CorpusManifest,
     max_parallel_panels: int = 3,
     prices: dict | None = None,
+    results_dir: Path | None = None,
+    usage_gate: UsageGate | None = None,
+    diff_cap_chars: int = DIFF_CAP_CHARS,
 ) -> list[PanelRunResult]:
     """Run all (variant x diff) pairs with bounded concurrency.
 
@@ -329,13 +371,14 @@ async def run_trial(
     *prices* (default-off) is threaded through to each ``run_panel`` call so
     cross-family (codex/gemini) reviewers get a non-sentinel cost column.
     """
-    _RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    out_dir = results_dir or _RESULTS_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
     semaphore = asyncio.Semaphore(max_parallel_panels)
     all_results: list[PanelRunResult] = []
 
     async def _run_and_save(variant: VariantConfig, diff: CorpusDiff) -> PanelRunResult:
         async with semaphore:
-            result_path = _RESULTS_DIR / f'{variant.name}__{diff.diff_id}.json'
+            result_path = out_dir / f'{variant.name}__{diff.diff_id}.json'
 
             # Skip if already completed
             if result_path.exists():
@@ -354,7 +397,10 @@ async def run_trial(
                     pass  # Re-run if result file is corrupt
 
             logger.info('Running %s against %s', variant.name, diff.diff_id)
-            result = await run_panel(variant, diff, prices=prices)
+            result = await run_panel(
+                variant, diff, prices=prices, usage_gate=usage_gate,
+                diff_cap_chars=diff_cap_chars,
+            )
 
             # Persist incrementally
             result_path.write_text(json.dumps(asdict(result), indent=2))

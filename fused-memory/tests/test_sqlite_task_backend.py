@@ -17,6 +17,8 @@ from pydantic import ValidationError
 from shared.task_metadata import SchemaWarning
 
 from fused_memory.backends.sqlite_task_backend import (
+    _REPLACE_ONLY_FIELDS,
+    _SCHEMA_VERSION,
     SqliteTaskBackend,
     _classify_residual_group,
     _emit_schema_warning,
@@ -25,10 +27,12 @@ from fused_memory.backends.sqlite_task_backend import (
     _migrate_v3_to_v4,
     _parse_qualified_dep,
     _parse_task_id,
+    _reject_append_on_replace_only_fields,
     _resolve_metadata_mode,
     _StatusWriteNotPersisted,
 )
 from fused_memory.backends.task_backend_errors import (
+    AppendUnsupportedFieldError,
     DoneProvenanceWriteAuthorityError,
     StatusWriteAuthorityError,
     TaskmasterError,
@@ -204,6 +208,86 @@ async def test_add_task_status_defaults_to_pending(backend, project_root):
 
 
 @pytest.mark.asyncio
+async def test_add_task_pending_insert_stamps_pending_since(backend, project_root):
+    """A default (pending) insert carries the wait anchor (task 3816, PRD §C1).
+
+    Asserts ``pending_since == updatedAt`` EXACTLY, not within a tolerance
+    window: add_task hoists one ``task_timestamp_now()`` and binds it to both (design
+    decision 5), so a freshly inserted pending row satisfies the same identity
+    the one-shot back-fill establishes for the legacy population — the two
+    populations are indistinguishable in shape as well as in format. A
+    tolerance window is how a real two-clocks drift defect hides.
+    """
+    dto = await backend.add_task(project_root=project_root, title='Default task')
+    one = await backend.get_task(dto['id'], project_root=project_root)
+    assert one['status'] == 'pending'
+    anchor = one['metadata']['pending_since']
+    assert re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z', anchor), (
+        f'pending_since must use the updated_at format; got {anchor!r}'
+    )
+    assert anchor == one['updatedAt']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status', ('deferred', 'blocked', 'infra-hold'))
+async def test_add_task_non_pending_insert_writes_no_anchor(
+    backend, project_root, status,
+):
+    """Only a PENDING landing stamps — a parked task accrues no wait.
+
+    ``status='deferred'`` is the planning_mode shape: a batch filed under
+    ``planning_mode=True`` must accrue nothing until ``commit_planning``
+    flips it to pending, or the batch would arrive pre-aged.
+    """
+    dto = await backend.add_task(
+        project_root=project_root, title=f'{status} task', status=status,
+    )
+    one = await backend.get_task(dto['id'], project_root=project_root)
+    assert one['status'] == status
+    assert 'pending_since' not in (one['metadata'] or {})
+
+
+@pytest.mark.asyncio
+async def test_add_task_stamp_preserves_caller_supplied_metadata(backend, project_root):
+    """The anchor is merged into the caller's blob, never substituted for it."""
+    dto = await backend.add_task(
+        project_root=project_root, title='t',
+        metadata=json.dumps({'files': ['a.py'], 'source': 'agent-followup'}),
+    )
+    one = await backend.get_task(dto['id'], project_root=project_root)
+    assert one['metadata']['files'] == ['a.py']
+    assert one['metadata']['source'] == 'agent-followup'
+    assert 'pending_since' in one['metadata']
+
+
+@pytest.mark.asyncio
+async def test_add_task_stamped_anchor_emits_no_schema_warning(
+    backend, project_root, caplog,
+):
+    """The stamp must not manufacture an unknown_key census line.
+
+    This is what pins the Tier-A blessing of ``pending_since`` to the write
+    path: ``_validate_metadata_on_write`` parses in warn-mode
+    unconditionally and emits one ``task_metadata.schema_warning`` line per
+    warning, so an unblessed key would produce one on EVERY task write in the
+    factory. Sibling canary:
+    ``test_add_task_valid_metadata_emits_no_schema_warning``.
+    """
+    with caplog.at_level(logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'):
+        dto = await backend.add_task(project_root=project_root, title='t')
+
+    census_msgs = [
+        r.message for r in caplog.records
+        if r.levelno >= logging.WARNING and 'task_metadata.schema_warning' in r.message
+    ]
+    assert census_msgs == [], (
+        f'Expected no census line for the stamped anchor; got: {census_msgs}'
+    )
+    one = await backend.get_task(dto['id'], project_root=project_root)
+    assert 'pending_since' in one['metadata']
+
+
+@pytest.mark.asyncio
 async def test_add_task_increments_id(backend, project_root):
     await backend.add_task(project_root=project_root, title='one')
     await backend.add_task(project_root=project_root, title='two')
@@ -327,9 +411,16 @@ async def test_add_task_warn_mode_emits_schema_warning_and_proceeds(
     )
 
     # The write proceeded: the task exists and its metadata is preserved raw
-    # (original bytes — no repair, no schema_version stamp).
+    # (original bytes — no repair, no schema_version stamp). The pending-wait
+    # anchor is the one key add_task itself adds (task 3816); it is asserted
+    # here rather than scoped out so the whole blob stays pinned, and its
+    # value is spelled as the insert's own updated_at because a fresh pending
+    # insert binds one clock read to both.
     task = await backend.get_task(dto['id'], project_root=project_root)
-    assert task['metadata'] == {'task_kind': 'deterministic'}
+    assert task['metadata'] == {
+        'task_kind': 'deterministic',
+        'pending_since': task['updatedAt'],
+    }
 
 
 @pytest.mark.asyncio
@@ -1598,6 +1689,11 @@ async def test_update_task_preserves_sibling_keys_during_memory_hints_append(bac
             'audit': {'created_by': 'x'},
         }),
     )
+    # The insert stamped the pending-wait anchor (task 3816); it is a sibling
+    # like any other, so it must survive the append too.
+    anchor = (await backend.get_task('1', project_root=project_root))['metadata'][
+        'pending_since'
+    ]
     await backend.update_task(
         '1', project_root=project_root,
         metadata=json.dumps({'memory_hints': {'entities': ['E1'], 'queries': ['q1']}}),
@@ -1609,6 +1705,7 @@ async def test_update_task_preserves_sibling_keys_during_memory_hints_append(bac
         'spawned_from': 'task-100',
         'audit': {'created_by': 'x'},
         'memory_hints': {'entities': ['E1'], 'queries': ['q1']},
+        'pending_since': anchor,
     }
 
 
@@ -1739,6 +1836,11 @@ async def test_update_task_legacy_hints_migration_preserves_sibling_metadata(bac
             'memory_hints': [{'entity': 'E1', 'query': 'q1'}],
         }),
     )
+    # The insert stamped the pending-wait anchor (task 3816); the legacy
+    # memory_hints normalisation must not disturb it.
+    anchor = (await backend.get_task('1', project_root=project_root))['metadata'][
+        'pending_since'
+    ]
     await backend.update_task(
         '1', project_root=project_root,
         metadata=json.dumps({'memory_hints': {'entities': ['E2'], 'queries': ['q2']}}),
@@ -1750,6 +1852,7 @@ async def test_update_task_legacy_hints_migration_preserves_sibling_metadata(bac
         'spawned_from': 'task-100',
         'audit': {'created_by': 'x'},
         'memory_hints': {'entities': ['E1', 'E2'], 'queries': ['q1', 'q2']},
+        'pending_since': anchor,
     }
 
 
@@ -2621,7 +2724,7 @@ async def test_migration_drops_parent_id_column_and_straggler(tmp_path):
     assert 'parent_id' not in tasks_cols, f'tasks still has parent_id column: {tasks_cols}'
     assert 'parent_id' not in deps_cols, f'dependencies still has parent_id column: {deps_cols}'
     assert 'parent_id' not in counters_cols, f'id_counters still has parent_id column: {counters_cols}'
-    assert user_version == 4, f'Expected user_version=4 after migration; got {user_version}'
+    assert user_version == 5, f'Expected user_version=5 after migration; got {user_version}'
     assert {'claimant_run_id', 'heartbeat_at'} <= tasks_cols, (
         f'Expected claimant_run_id/heartbeat_at columns after full-rebuild migration; got {tasks_cols}'
     )
@@ -2639,7 +2742,7 @@ async def test_migration_drops_parent_id_column_and_straggler(tmp_path):
 
 @pytest.mark.asyncio
 async def test_migration_idempotent_second_open(tmp_path):
-    """Opening an already-migrated DB a second time is a no-op: user_version stays 4."""
+    """Opening an already-migrated DB a second time is a no-op: user_version stays 5."""
     import sqlite3
 
     project_root = str(tmp_path / 'proj')
@@ -2666,13 +2769,13 @@ async def test_migration_idempotent_second_open(tmp_path):
     finally:
         conn.close()
 
-    assert user_version == 4
+    assert user_version == 5
     assert 'parent_id' not in tasks_cols
     assert {'claimant_run_id', 'heartbeat_at'} <= tasks_cols
 
 
 @pytest.mark.asyncio
-async def test_fresh_db_has_no_parent_id_and_user_version_4(tmp_path):
+async def test_fresh_db_has_no_parent_id_and_user_version_5(tmp_path):
     """A brand-new DB is created with the post-migration schema from the start."""
     import sqlite3
 
@@ -2698,7 +2801,7 @@ async def test_fresh_db_has_no_parent_id_and_user_version_4(tmp_path):
         conn.close()
 
     assert 'parent_id' not in tasks_cols, f'New DB should not have parent_id; got {tasks_cols}'
-    assert user_version == 4, f'Fresh DB should have user_version=4; got {user_version}'
+    assert user_version == 5, f'Fresh DB should have user_version=5; got {user_version}'
     assert {'claimant_run_id', 'heartbeat_at'} <= tasks_cols, (
         f'Expected claimant_run_id/heartbeat_at columns in fresh schema; got {tasks_cols}'
     )
@@ -2796,7 +2899,7 @@ async def test_migration_v1_to_v2_adds_claimant_columns(tmp_path):
     assert {'claimant_run_id', 'heartbeat_at'} <= tasks_cols, (
         f'Expected ALTER TABLE to add claimant_run_id/heartbeat_at; got {tasks_cols}'
     )
-    assert user_version == 4, f'Expected user_version=4 after v1->v4 migration; got {user_version}'
+    assert user_version == 5, f'Expected user_version=5 after v1->v5 migration; got {user_version}'
 
 
 def _make_v1_schema_db_no_candidate_key(db_path: Path) -> None:
@@ -3063,8 +3166,9 @@ async def test_v2_to_v3_migration_clean_audit_logs_info_with_zero_duplicates(
     assert by_id[3] == compute_candidate_key('Refactor the thing', [])
     # The v2->v3 backfill's own audit is clean (3/3 unique), and the v3->v4
     # residual audit over the same rows is trivially clean too, so the chain
-    # reaches v4 (index built) rather than stopping at v3.
-    assert user_version == 4, f'Expected user_version=4 after migration; got {user_version}'
+    # runs on past v4 (index built) to the v4->v5 pending_since back-fill
+    # rather than stopping at v3.
+    assert user_version == 5, f'Expected user_version=5 after migration; got {user_version}'
 
     # Exactly one audit record, at INFO (not WARNING), naming duplicate_groups=0.
     audit_records = [r for r in caplog.records if 'duplicate_groups=' in r.message]
@@ -3237,6 +3341,305 @@ def _make_v3_db_with_dup_groups(
     conn.close()
 
 
+def _make_v4_db_for_backfill(
+    db_path: Path,
+    rows: list[tuple[int, str, str, str | None, str]],
+) -> None:
+    """Create a tasks.db seeded directly at schema v4 for the v4->v5 back-fill.
+
+    Mirrors ``_make_v3_db_with_dup_groups`` (same raw-sqlite3 CREATE TABLE
+    with the full v4 column set, same ``dependencies``/``id_counters``
+    tables) but seeds straight at ``user_version = 4`` WITH the partial
+    UNIQUE index a real v4 DB carries, so these tests drive the v4->v5 step
+    in isolation without re-exercising v1->v2->v3->v4.
+
+    ``rows`` entries are ``(id, title, status, metadata_raw, updated_at)``.
+    ``metadata_raw`` is stored VERBATIM — including deliberately unparseable
+    text, which is how the corrupt-row arm is seeded.
+    """
+    import sqlite3
+
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            tag             TEXT NOT NULL DEFAULT 'master',
+            id              INTEGER NOT NULL,
+            title           TEXT NOT NULL,
+            description     TEXT,
+            details         TEXT,
+            test_strategy   TEXT,
+            status          TEXT NOT NULL,
+            priority        TEXT,
+            metadata        TEXT,
+            updated_at      TEXT NOT NULL,
+            claimant_run_id TEXT,
+            heartbeat_at    TEXT,
+            candidate_key   TEXT,
+            PRIMARY KEY (tag, id)
+        );
+        CREATE INDEX IF NOT EXISTS ix_tasks_status ON tasks (tag, status);
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_tasks_candidate_key
+            ON tasks (tag, candidate_key)
+            WHERE candidate_key IS NOT NULL AND status != 'cancelled';
+        CREATE TABLE IF NOT EXISTS dependencies (
+            tag        TEXT NOT NULL DEFAULT 'master',
+            task_id    INTEGER NOT NULL,
+            depends_on INTEGER NOT NULL,
+            PRIMARY KEY (tag, task_id, depends_on)
+        );
+        CREATE TABLE IF NOT EXISTS id_counters (
+            tag    TEXT NOT NULL DEFAULT 'master',
+            max_id INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (tag)
+        );
+    """)
+    max_id = 0
+    for task_id, title, status, metadata_raw, updated_at in rows:
+        conn.execute(
+            "INSERT INTO tasks (tag, id, title, status, metadata, updated_at, "
+            "candidate_key) VALUES ('master', ?, ?, ?, ?, ?, ?)",
+            (task_id, title, status, metadata_raw, updated_at,
+             compute_candidate_key(title, [])),
+        )
+        max_id = max(max_id, task_id)
+    conn.execute("INSERT INTO id_counters (tag, max_id) VALUES ('master', ?)", (max_id,))
+    conn.execute('PRAGMA user_version = 4')
+    conn.commit()
+    conn.close()
+
+
+# (id, title, status, metadata_raw, updated_at) — the v4->v5 back-fill corpus.
+# Covers every arm of the migration's branch logic: anchorless pending rows
+# with DISTINCT updated_at values (so a back-fill stamping one shared clock
+# instead of each row's own updated_at would be caught), an already-anchored
+# pending row whose anchor differs from its updated_at, one row in each
+# non-pending status, and the three SKIP arms — an unparseable blob, a
+# valid-JSON-but-not-a-dict blob, and a row whose updated_at is itself
+# unusable. Row 10 pins the present-but-BLANK anchor, which the
+# `_usable_timestamp` gate deliberately treats as absent and re-back-fills:
+# that is asserted for the pure helper in test_pending_since_anchor.py, but
+# the migration is the writer that has to get it right for the legacy
+# population.
+_BACKFILL_ROWS: list[tuple[int, str, str, str | None, str]] = [
+    (1, 'anchorless one', 'pending', None, '2026-01-01T00:00:00.000Z'),
+    (2, 'anchorless two', 'pending', '{"source": "keep me"}',
+     '2026-02-02T00:00:00.000Z'),
+    (3, 'already anchored', 'pending',
+     '{"pending_since": "2025-12-25T00:00:00.000Z"}', '2026-03-03T00:00:00.000Z'),
+    (4, 'running', 'in-progress', None, '2026-04-04T00:00:00.000Z'),
+    (5, 'held', 'blocked', '{"source": "x"}', '2026-05-05T00:00:00.000Z'),
+    (6, 'finished', 'done', None, '2026-06-06T00:00:00.000Z'),
+    (7, 'discarded', 'cancelled', None, '2026-07-07T00:00:00.000Z'),
+    (8, 'corrupt', 'pending', 'NOT_JSON_BACKFILL', '2026-08-08T00:00:00.000Z'),
+    (9, 'valid json, not an object', 'pending', '[1,2,3]',
+     '2026-09-09T00:00:00.000Z'),
+    (10, 'blank anchor', 'pending', '{"pending_since": ""}',
+     '2026-10-10T00:00:00.000Z'),
+    (11, 'blank updated_at', 'pending', None, ''),
+]
+_BACKFILL_UPDATED_AT = {row[0]: row[4] for row in _BACKFILL_ROWS}
+
+
+def _backfilled_metadata(state: dict[int, str | None], task_id: int) -> dict:
+    """Parse one seeded row's blob, failing loudly if the column went NULL.
+
+    The back-fill rewrites ``metadata`` in place, so a NULL here would mean the
+    migration erased a blob rather than merging into it — a distinct and much
+    worse failure than a wrong value, and one a bare ``json.loads`` would
+    report only as an opaque TypeError.
+    """
+    raw = state[task_id]
+    assert raw is not None, f'row {task_id} lost its metadata blob entirely'
+    return json.loads(raw)
+
+
+def _read_backfill_state(db_path: Path) -> tuple[dict[int, str | None], int]:
+    """Return ``({id: metadata_raw}, user_version)`` via a fresh connection."""
+    import sqlite3
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        metadata = {
+            row[0]: row[1]
+            for row in conn.execute('SELECT id, metadata FROM tasks ORDER BY id')
+        }
+        user_version = conn.execute('PRAGMA user_version').fetchone()[0]
+    finally:
+        conn.close()
+    return metadata, user_version
+
+
+@pytest.mark.asyncio
+async def test_v4_to_v5_backfills_pending_since_from_updated_at(tmp_path, caplog):
+    """The one-shot back-fill (task 3816, PRD §C1 back-fill + D4).
+
+    Every task currently ``pending`` with no anchor gets
+    ``pending_since = updated_at`` and ``pending_since_backfilled = true``.
+    Seeding from ``updated_at`` gives the true filing time for a never-touched
+    task and a younger-than-truth anchor for a previously-requeued one: the
+    mis-aging direction is conservative — it can UNDER-age a task but never
+    over-age one, so it cannot manufacture a queue jump. The marker key makes
+    that distortion countable rather than invisible.
+    """
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v4_db_for_backfill(db_path, _BACKFILL_ROWS)
+    before, _ = _read_backfill_state(db_path)
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg)
+    await b.start()
+    try:
+        with caplog.at_level(
+            logging.INFO, logger='fused_memory.backends.sqlite_task_backend',
+        ):
+            # Triggers connection-open (_SCHEMA_SQL + _migrate) -- must not raise.
+            await b.get_tasks(project_root=project_root)
+    finally:
+        await b.close()
+
+    after, user_version = _read_backfill_state(db_path)
+
+    # (a) exactly the anchorless pending rows are anchored from their OWN
+    # updated_at and marked as back-filled. Row 10's anchor is PRESENT but
+    # blank, which reads as absent (`_usable_timestamp`) — leaving it in place
+    # would pin the row at age 0 forever, since this migration is one-shot and
+    # the live stamp only fires on a `* -> pending` landing.
+    for task_id in (1, 2, 10):
+        parsed = _backfilled_metadata(after, task_id)
+        assert parsed['pending_since'] == _BACKFILL_UPDATED_AT[task_id]
+        assert parsed['pending_since_backfilled'] is True
+    assert _backfilled_metadata(after, 2)['source'] == 'keep me', 'siblings must survive'
+
+    # (b) the already-anchored pending row keeps its own value and gains no marker.
+    assert after[3] == before[3]
+
+    # (c) NO non-pending row is touched -- the back-fill must not manufacture
+    # anchors for rows that are not waiting.
+    for task_id in (4, 5, 6, 7):
+        assert after[task_id] == before[task_id], f'row {task_id} must be untouched'
+
+    # (d) all three SKIP arms leave their row's bytes exactly as found: the
+    # unparseable blob, the valid-JSON-that-is-not-a-dict blob (a DISTINCT
+    # branch — it parses, it just isn't an object), and the row whose
+    # updated_at is unusable, which has nothing to anchor FROM. An empty
+    # updated_at is representable: the v0->v1 rebuild inserts
+    # COALESCE(updated_at, ''), so a legacy row carried through that path can
+    # hold '' in a NOT NULL column.
+    assert after[8] == 'NOT_JSON_BACKFILL'
+    assert after[9] == '[1,2,3]'
+    assert after[11] is None
+
+    # (e) the chain lands at the new top.
+    assert user_version == 5, f'Expected user_version=5; got {user_version}'
+
+    # (f) exactly one line, reporting the COUNT -- the migration reporting N is
+    # part of the user-observable signal (PRD boundary row 3).
+    lines = [
+        r.getMessage() for r in caplog.records if 'v4->v5' in r.getMessage()
+    ]
+    assert len(lines) == 1, f'Expected exactly one v4->v5 log line; got {lines}'
+    assert 'rows_backfilled=3' in lines[0], (
+        f'the count of rows touched must be reported; got {lines[0]!r}'
+    )
+    # The skip counts are part of that signal too — without asserting them a
+    # counter wired to the wrong variable, or one that stopped incrementing,
+    # would leave every assertion above green.
+    assert 'skipped_corrupt_metadata=2' in lines[0], (
+        f'both non-dict skip arms must be counted; got {lines[0]!r}'
+    )
+    assert 'skipped_unusable_updated_at=1' in lines[0], (
+        f'a row with no usable seed must be counted, not silently dropped; '
+        f'got {lines[0]!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_v4_to_v5_backfill_is_a_no_op_on_reopen(tmp_path, caplog):
+    """A second open touches nothing and logs nothing -- the gate holds."""
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v4_db_for_backfill(db_path, _BACKFILL_ROWS)
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg)
+    await b.start()
+    try:
+        await b.get_tasks(project_root=project_root)
+    finally:
+        await b.close()
+    after_first, _ = _read_backfill_state(db_path)
+
+    b2 = SqliteTaskBackend(TaskmasterConfig(project_root=str(tmp_path)))
+    await b2.start()
+    try:
+        with caplog.at_level(
+            logging.INFO, logger='fused_memory.backends.sqlite_task_backend',
+        ):
+            await b2.get_tasks(project_root=project_root)
+    finally:
+        await b2.close()
+
+    after_second, user_version = _read_backfill_state(db_path)
+    assert after_second == after_first, 'a second open must touch no row'
+    assert [r.getMessage() for r in caplog.records if 'v4->v5' in r.getMessage()] == []
+    assert user_version == 5
+
+
+@pytest.mark.asyncio
+async def test_v4_to_v5_does_not_run_when_v3_to_v4_self_gated(tmp_path, caplog):
+    """THE CRITICAL GUARD (task 3816, design decision 7).
+
+    ``_migrate``'s v3->v4 call does NOT reassign its local ``version`` (it was
+    the last step), and ``_migrate_v3_to_v4`` is SELF-GATING: it stamps
+    ``user_version = 4`` only on the clean-build path and deliberately leaves
+    the version at 3 on a flagged residual, a race, or an unexpected failure,
+    returning ``index_built: False`` so the NEXT open retries.
+
+    So a naive ``if version < 5:`` appended after it would run against a DB
+    still at v3 and stamp 5 — permanently skipping the candidate_key partial
+    UNIQUE index build and converting a deliberately self-healing degraded
+    state into an unrecoverable one, with ``add_task``'s index-independent
+    dedup guard left as the only backstop forever. The v4->v5 step must
+    therefore gate on a RE-READ of ``PRAGMA user_version``.
+    """
+    import sqlite3
+
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    # A title-divergent (stale stored key) group flags as residual, so the
+    # v3->v4 step skips the index build and leaves user_version at 3.
+    _make_v3_db_with_dup_groups(
+        db_path,
+        [
+            (1, 'first title', 'pending', ['a.py'], 'stale-shared-key'),
+            (2, 'second title', 'pending', ['b.py'], 'stale-shared-key'),
+        ],
+    )
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg)
+    await b.start()
+    try:
+        await b.get_tasks(project_root=project_root)  # must not raise
+    finally:
+        await b.close()
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        user_version = conn.execute('PRAGMA user_version').fetchone()[0]
+        indexes = {row[1] for row in conn.execute('PRAGMA index_list(tasks)')}
+    finally:
+        conn.close()
+
+    assert user_version == 3, (
+        'the v4->v5 step must not stamp 5 over a self-gated v3 DB; got '
+        f'{user_version} -- the candidate_key index build would be skipped forever'
+    )
+    assert not any('candidate_key' in idx for idx in indexes)
+
+
 class _FailingExecuteConn:
     """Delegating proxy over an aiosqlite.Connection that raises from
     `execute()` when `should_fail(sql, self)` returns True.
@@ -3276,9 +3679,11 @@ async def _open_raw_v3_conn(db_path: Path) -> aiosqlite.Connection:
 async def test_v3_to_v4_migration_clean_audit_builds_partial_unique_index(
     backend, project_root,
 ):
-    """A fresh DB chains through v0->v4: the v3->v4 step's residual-duplicate
+    """A fresh DB chains through v0->v5: the v3->v4 step's residual-duplicate
     audit is trivially clean on an empty table, so it builds the partial
-    UNIQUE index over (tag, candidate_key) and stamps user_version=4.
+    UNIQUE index over (tag, candidate_key) and stamps user_version=4 — after
+    which the chain continues to the v4->v5 back-fill, so the version
+    observed at the end is the top of the chain, not that step's own stamp.
     """
     import sqlite3
 
@@ -3309,9 +3714,10 @@ async def test_v3_to_v4_migration_clean_audit_builds_partial_unique_index(
     assert 'candidate_key IS NOT NULL' in index_sql, index_sql
     assert "status != 'cancelled'" in index_sql, index_sql
     assert 'tag' in index_sql and 'candidate_key' in index_sql, index_sql
-    # (d) user_version advances to 4 on a clean build.
-    assert user_version == 4, (
-        f'Expected user_version=4 after clean v3->v4 migration; got {user_version}'
+    # (d) the version advances past 4 on a clean build -- the v3->v4 step
+    # stamps 4 and the chain then runs the v4->v5 back-fill to the top.
+    assert user_version == 5, (
+        f'Expected user_version=5 after clean v3->v4 migration + chain; got {user_version}'
     )
 
 
@@ -3552,13 +3958,14 @@ async def test_v3_to_v4_self_heal_cancels_non_canonical_and_builds_index(
     assert cancelled_metadata['files'] == ['a.py', 'b.py'], cancelled_metadata
 
     # (d) no residual remains after healing, so the partial UNIQUE index IS
-    # built and user_version advances to 4 in this SAME connection-open —
-    # no restart required.
+    # built and the version advances past 4 in this SAME connection-open —
+    # no restart required. It lands at the top of the chain (5) because the
+    # v3->v4 step stamped 4, which is what lets the v4->v5 step run.
     assert 'ux_tasks_candidate_key' in indexes, (
         f'Expected the index to be built once the residual is self-healed; got {indexes}'
     )
-    assert user_version == 4, (
-        f'Expected user_version=4 after a fully self-healed residual; got {user_version}'
+    assert user_version == 5, (
+        f'Expected user_version=5 after a fully self-healed residual; got {user_version}'
     )
 
     # (e) nothing ambiguous here — the escalation callback must NOT fire.
@@ -4131,6 +4538,52 @@ async def test_reaudit_candidate_key_index_builds_on_live_connection_without_res
         assert result2.get('already_at_v4') is True, result2
     finally:
         await b.close()
+
+
+@pytest.mark.asyncio
+async def test_reaudit_candidate_key_index_reports_the_actual_user_version(tmp_path):
+    """The short-circuit must REPORT the version, not restate a constant.
+
+    ``reaudit_candidate_key_index`` returns early on ``current_version >= 4``
+    and used to hand back the LITERAL ``'user_version': 4``. Once v5 exists
+    (task 3816) that is a fabricated observation about the store's own state
+    — and one the method's own docstring contradicts ("Returns ... merged
+    with the final ``user_version``"). A caller inspecting the dict to decide
+    whether a store still needs migrating must not be handed a stale 4 for a
+    v5 DB.
+
+    ``already_at_v4`` stays True and keeps its name: it means "at or past
+    v4", which remains accurate and is what the ``>= 4`` gate tests.
+    """
+    import sqlite3
+
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg)
+    await b.start()
+    try:
+        # A fresh DB chains the whole migration to _SCHEMA_VERSION.
+        await b.get_tasks(project_root=project_root)
+        conn = sqlite3.connect(str(db_path))
+        try:
+            actual_version = conn.execute('PRAGMA user_version').fetchone()[0]
+        finally:
+            conn.close()
+
+        result = await b.reaudit_candidate_key_index(project_root)
+    finally:
+        await b.close()
+
+    assert actual_version == _SCHEMA_VERSION, (
+        f'Precondition: a fresh DB must chain to the top; got {actual_version}'
+    )
+    assert result['user_version'] == actual_version, (
+        'the re-audit must report the version PRAGMA user_version actually '
+        f'reports ({actual_version}), not a hardcoded literal; got {result}'
+    )
+    assert result['already_at_v4'] is True, result
 
 
 # ── index-independent write-path dedup (fm-task-dedup self-heal amendment) ──
@@ -5925,6 +6378,128 @@ def test_resolve_metadata_mode_append_false_no_metadata_ok():
     assert _resolve_metadata_mode(None, False, metadata_present=False) == 'replace'
 
 
+# ── _reject_append_on_replace_only_fields (task 4039) ──────────────────────
+#
+# The pure-function twin of _resolve_metadata_mode's guards, for the three
+# text columns that can only ever REPLACE. See the guard's docstring for the
+# defect (append=True silently overwrote description instead of appending).
+
+
+def test_replace_only_fields_pinned():
+    """The covered field set is pinned so adding a fourth replace-only column
+    is a DELIBERATE act, not an accident. ``dependencies`` is also
+    replace-only and is deliberately NOT covered (design decision 3): a
+    dependency list is short, structurally visible in ``get_task`` and cheap
+    to re-derive, unlike the multi-KB authored prose the recorded repros
+    destroyed."""
+    assert _REPLACE_ONLY_FIELDS == ('title', 'description', 'priority'), (
+        f'unexpected replace-only field set: {_REPLACE_ONLY_FIELDS!r}'
+    )
+
+
+@pytest.mark.parametrize(
+    'field, value',
+    [
+        ('description', 'x'),
+        ('title', 'x'),
+        ('priority', 'high'),
+    ],
+)
+def test_reject_append_on_replace_only_fields_raises_per_field(field, value):
+    """append=True with any single replace-only field raises, and the message
+    names that field so the caller knows which one to fix."""
+    with pytest.raises(AppendUnsupportedFieldError) as exc:
+        _reject_append_on_replace_only_fields(True, **{field: value})
+    assert field in str(exc.value), (
+        f'message must name the offending field {field!r}; got: {exc.value!s}'
+    )
+
+
+def test_reject_append_on_replace_only_fields_names_all_offenders_in_order():
+    """A call carrying several offenders raises ONCE and names them all, in
+    _REPLACE_ONLY_FIELDS order — deterministic, not set-iteration order."""
+    with pytest.raises(AppendUnsupportedFieldError) as exc:
+        _reject_append_on_replace_only_fields(True, description='d', title='t')
+    assert exc.value.fields == ('title', 'description'), (
+        f'offending fields must be in _REPLACE_ONLY_FIELDS order; '
+        f'got {exc.value.fields!r}'
+    )
+    msg = str(exc.value)
+    assert 'title' in msg and 'description' in msg, (
+        f'message must name BOTH offending fields; got: {msg!r}'
+    )
+    assert msg.index('title') < msg.index('description'), (
+        f'message must list offenders in _REPLACE_ONLY_FIELDS order; got: {msg!r}'
+    )
+
+
+def test_reject_append_on_replace_only_fields_typed_error_contract():
+    """The raised error keeps the TaskmasterError/TASKMASTER_TOOL_ERROR shape so
+    every existing ``except TaskmasterError`` site and ``err.code ==
+    'TASKMASTER_TOOL_ERROR'`` branch keeps working unchanged; the subclass
+    exists for isinstance discrimination and a specific wire ``error_type``.
+    Also carries the offending field names and the task id for callers that
+    want to branch structurally rather than on prose."""
+    with pytest.raises(AppendUnsupportedFieldError) as exc:
+        _reject_append_on_replace_only_fields(True, description='x', task_id='7')
+    assert isinstance(exc.value, TaskmasterError), (
+        f'must subclass TaskmasterError; mro={type(exc.value).__mro__}'
+    )
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR', (
+        f'Expected TASKMASTER_TOOL_ERROR; got {exc.value.code!r}'
+    )
+    assert exc.value.fields == ('description',), (
+        f'Expected fields == (description,); got {exc.value.fields!r}'
+    )
+    assert exc.value.task_id == '7', (
+        f'Expected task_id == "7"; got {exc.value.task_id!r}'
+    )
+
+
+@pytest.mark.parametrize(
+    'append, kwargs',
+    [
+        # append=True but none of the three replace-only fields — a
+        # details-only or metadata-only write, which is exactly what append
+        # is FOR. Inert.
+        (True,  {}),
+        (True,  {'title': None, 'description': None, 'priority': None}),
+        # append is not the sanctioned True: replace-only fields are honored
+        # as plain overwrites, exactly as before this guard existed.
+        (False, {'description': 'x'}),
+        (None,  {'description': 'x'}),
+        (None,  {'title': 't', 'description': 'd', 'priority': 'high'}),
+        (False, {'title': 't', 'description': 'd', 'priority': 'high'}),
+    ],
+)
+def test_reject_append_on_replace_only_fields_inert_cases(append, kwargs):
+    """The guard is inert for every combination that is not the trap — it must
+    not broaden into a general validator."""
+    assert _reject_append_on_replace_only_fields(append, **kwargs) is None, (
+        f'guard must be inert for append={append!r}, {kwargs!r}'
+    )
+
+
+def test_reject_append_on_replace_only_fields_keys_on_identity_not_truthiness():
+    """``append`` is checked with ``is True``, not truthiness — the same
+    identity check _resolve_metadata_mode's merge+append carve-out uses. A
+    truthy non-bool (e.g. ``1``) is not the sanctioned flag value and does not
+    trip the guard, keeping the two sibling guards on this method consistent
+    about what counts as append=True.
+
+    This pins a cell that is KNOWINGLY left to the details/prompt path (which
+    does key on truthiness), not an oversight, and it is only reachable from
+    an in-process caller that bypasses the wire annotation — the reasoning and
+    the coercion measurement live with the guard itself,
+    sqlite_task_backend.py::_reject_append_on_replace_only_fields."""
+    assert _reject_append_on_replace_only_fields(
+        1,  # pyright: ignore[reportArgumentType] - off-type BY DESIGN, see docstring
+        description='x',
+    ) is None, (
+        'guard must key on `append is True`, not truthiness'
+    )
+
+
 # ── _merge_metadata mode= API (step-3 RED / step-4 GREEN) ───────────────────
 
 
@@ -6105,6 +6680,291 @@ async def test_update_task_bare_append_false_rejected_preserves_blob(backend, pr
     assert meta.get('_causation_id') == 'keep', f'original blob wiped: {meta}'
     assert meta.get('extra') == 'keep2', f'original blob wiped: {meta}'
     assert 'files' not in meta, f'rejected write must not land: {meta}'
+
+
+# ── update_task append-on-replace-only-fields, end-to-end (task 4039) ──────
+#
+# The headline defect: update_task(description=…, append=True) silently
+# OVERWROTE the description instead of appending. Tests 1-5 pin the
+# rejection; the fence below them pins everything the guard must NOT touch.
+
+_ORIGINAL_DESCRIPTION = (
+    'ORIGINAL defect report. ' * 40
+    + 'This is the multi-KB authored prose the four recorded live repros '
+    'destroyed — it exists nowhere else and cannot be re-derived.'
+)
+
+
+@pytest.mark.asyncio
+async def test_update_task_description_append_true_rejected_preserves_description(
+    backend, project_root,
+):
+    """The headline task-4039 repro: an append=True description write is
+    REJECTED and the stored description is left byte-identical. The raise
+    fires before the DB txn, so the original is never touched and the
+    rejected addendum never lands."""
+    await backend.add_task(
+        project_root=project_root, title='t', description=_ORIGINAL_DESCRIPTION,
+    )
+    addendum = '\n\n--- PRD ADOPTION ---\nthis was meant to be appended'
+    with pytest.raises(AppendUnsupportedFieldError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root, description=addendum, append=True,
+        )
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR', (
+        f'Expected TASKMASTER_TOOL_ERROR; got {exc.value.code!r}'
+    )
+    assert 'description' in str(exc.value), (
+        f'message must name the offending field; got: {exc.value!s}'
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['description'] == _ORIGINAL_DESCRIPTION, (
+        f'original description must survive verbatim; got: '
+        f'{task["description"]!r}'
+    )
+    assert 'PRD ADOPTION' not in task['description'], (
+        f'rejected write must not land: {task["description"]!r}'
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'field, original, incoming',
+    [
+        ('title', 'ORIGINAL TITLE', 'x-new'),
+        ('priority', 'high', 'low'),
+    ],
+)
+async def test_update_task_title_and_priority_append_true_rejected(
+    backend, project_root, field, original, incoming,
+):
+    """title and priority share description's unconditional-overwrite
+    treatment, so they are covered in the same pass — rejected, and the
+    seeded original survives."""
+    await backend.add_task(
+        project_root=project_root,
+        title=original if field == 'title' else 't',
+        priority=original if field == 'priority' else 'medium',
+    )
+    with pytest.raises(AppendUnsupportedFieldError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root, append=True, **{field: incoming},
+        )
+    assert field in str(exc.value), (
+        f'message must name {field!r}; got: {exc.value!s}'
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task[field] == original, (
+        f'{field} must be unchanged after the rejection; got {task[field]!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_task_append_rejection_names_all_offending_fields(
+    backend, project_root,
+):
+    """One call carrying several offenders raises ONCE and reports them all,
+    so the caller fixes every field in a single round-trip."""
+    await backend.add_task(
+        project_root=project_root, title='ORIGINAL TITLE',
+        description=_ORIGINAL_DESCRIPTION,
+    )
+    with pytest.raises(AppendUnsupportedFieldError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root,
+            description='addendum', title='new title', append=True,
+        )
+    assert exc.value.fields == ('title', 'description'), (
+        f'Expected offenders in _REPLACE_ONLY_FIELDS order; '
+        f'got {exc.value.fields!r}'
+    )
+    msg = str(exc.value)
+    assert 'title' in msg and 'description' in msg, (
+        f'message must name both offenders; got: {msg!r}'
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['title'] == 'ORIGINAL TITLE', f'title clobbered: {task["title"]!r}'
+    assert task['description'] == _ORIGINAL_DESCRIPTION, (
+        f'description clobbered: {task["description"]!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_task_append_rejection_precedes_existence_check(
+    backend, project_root,
+):
+    """The guard runs BEFORE the task SELECT, so the rejection beats
+    'No tasks found' — mirroring the status write-authority floor and its
+    test_update_task_status_rejection_precedes_existence_check. This is what
+    makes the guard a pure pre-connection floor rather than a row-aware
+    check."""
+    with pytest.raises(AppendUnsupportedFieldError) as exc:
+        await backend.update_task(
+            '99999', project_root=project_root, description='x', append=True,
+        )
+    assert exc.value.code == 'TASKMASTER_TOOL_ERROR'
+    assert 'No tasks found' not in str(exc.value), (
+        f'append rejection must precede the existence check; got: {exc.value!s}'
+    )
+    assert not isinstance(exc.value, TaskNotFoundError), (
+        f'Expected AppendUnsupportedFieldError, not a not-found error: '
+        f'{type(exc.value).__name__}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_task_append_rejection_precedes_metadata_mode_resolution(
+    backend, project_root,
+):
+    """A call tripping BOTH this guard and _resolve_metadata_mode's
+    merge+append carve-out raises AppendUnsupportedFieldError — the
+    content-loss guard wins. Either ordering is correct (nothing is written
+    both ways), so it is chosen on which message helps more: the
+    description-wipe is the failure mode that was SILENT and destroyed
+    content four times, while the metadata contradiction already raises
+    today. Pinned so it cannot drift."""
+    await backend.add_task(
+        project_root=project_root, title='t', description=_ORIGINAL_DESCRIPTION,
+        metadata=json.dumps({'_causation_id': 'keep', 'extra': 'keep2'}),
+    )
+    with pytest.raises(AppendUnsupportedFieldError):
+        await backend.update_task(
+            '1', project_root=project_root, description='x',
+            metadata=json.dumps({'k': 'v'}), metadata_mode='merge', append=True,
+        )
+    task = await backend.get_task('1', project_root=project_root)
+    meta = task['metadata']
+    assert meta.get('_causation_id') == 'keep', f'metadata disturbed: {meta}'
+    assert meta.get('extra') == 'keep2', f'metadata disturbed: {meta}'
+    assert 'k' not in meta, f'rejected write must not land: {meta}'
+    assert task['description'] == _ORIGINAL_DESCRIPTION, (
+        f'description clobbered: {task["description"]!r}'
+    )
+
+
+# ── Non-regression fence for the task-4039 guard ───────────────────────────
+#
+# These pass on pre-guard code too — deliberately green-on-arrival. They
+# exist so the wiring step fails loudly if the guard is over-broadened past
+# `append is True` + the three replace-only columns.
+
+
+@pytest.mark.asyncio
+async def test_update_task_details_append_true_still_concatenates(
+    backend, project_root,
+):
+    """A plain details append=True write (no metadata_mode) still
+    concatenates. append's ACTUAL job must be untouched by the guard; the
+    suite otherwise covers this only via the metadata_mode='merge' variant."""
+    await backend.add_task(project_root=project_root, title='t', details='D0')
+    await backend.update_task(
+        '1', project_root=project_root, details='D1', append=True,
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['details'] == 'D0\n\nD1', (
+        f'details append=True must concatenate; got {task["details"]!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_task_prompt_append_true_still_concatenates(
+    backend, project_root,
+):
+    """Same for the legacy prompt= path, which feeds details when no explicit
+    details is passed."""
+    await backend.add_task(project_root=project_root, title='t', details='D0')
+    await backend.update_task(
+        '1', project_root=project_root, prompt='D1', append=True,
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['details'] == 'D0\n\nD1', (
+        f'prompt append=True must concatenate; got {task["details"]!r}'
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'field, original, incoming',
+    [
+        ('title', 'old title', 'new title'),
+        ('description', 'old description', 'new description'),
+        ('priority', 'high', 'low'),
+    ],
+)
+async def test_update_task_replace_only_fields_unaffected_when_append_omitted(
+    backend, project_root, field, original, incoming,
+):
+    """With append omitted the three columns still overwrite, exactly as
+    before — the guard closes the trap without changing any call shape that
+    works today."""
+    await backend.add_task(
+        project_root=project_root,
+        title=original if field == 'title' else 't',
+        description=original if field == 'description' else None,
+        priority=original if field == 'priority' else 'medium',
+    )
+    await backend.update_task(
+        '1', project_root=project_root, **{field: incoming},
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task[field] == incoming, (
+        f'{field} must still overwrite when append is omitted; '
+        f'got {task[field]!r}'
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'field, original, incoming',
+    [
+        ('title', 'old title', 'new title'),
+        ('description', 'old description', 'new description'),
+        ('priority', 'high', 'low'),
+    ],
+)
+async def test_update_task_replace_only_fields_unaffected_under_append_false(
+    backend, project_root, field, original, incoming,
+):
+    """An explicit append=False overwrites without raising — the guard is
+    scoped to `append is True` only, so append=False stays the way a caller
+    confirms a deliberate replace."""
+    await backend.add_task(
+        project_root=project_root,
+        title=original if field == 'title' else 't',
+        description=original if field == 'description' else None,
+        priority=original if field == 'priority' else 'medium',
+    )
+    await backend.update_task(
+        '1', project_root=project_root, append=False, **{field: incoming},
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task[field] == incoming, (
+        f'{field} must still overwrite under append=False; got {task[field]!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_task_metadata_only_append_true_still_additive(
+    backend, project_root,
+):
+    """A metadata-only append=True write still resolves to the additive union
+    — _resolve_metadata_mode's legacy shim must be untouched by the new
+    guard."""
+    await backend.add_task(
+        project_root=project_root, title='t',
+        metadata=json.dumps({'items': [1], '_causation_id': 'keep'}),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps({'items': [2]}), append=True,
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata']['items'] == [1, 2], (
+        f'metadata-only append=True must additive-union: {task["metadata"]}'
+    )
+    assert task['metadata'].get('_causation_id') == 'keep', (
+        f'sibling key lost: {task["metadata"]}'
+    )
 
 
 @pytest.mark.asyncio
@@ -6420,6 +7280,11 @@ async def test_update_task_warn_mode_emits_schema_warning_and_proceeds(
         metadata=json.dumps({'foo': 'bar'}),
     )
     tid = dto['id']
+    # The seed insert also stamped the pending-wait anchor (task 3816), which
+    # the update must carry through untouched.
+    anchor = (await backend.get_task(tid, project_root=project_root))['metadata'][
+        'pending_since'
+    ]
     # The seed add_task above emits its own census line for the "foo" unknown
     # key (unrelated to what this test verifies) — caplog.records accumulates
     # for the whole test regardless of the at_level() scope below, so drop it
@@ -6450,10 +7315,15 @@ async def test_update_task_warn_mode_emits_schema_warning_and_proceeds(
         f'Expected the invariant error text in census line; got: {combined!r}'
     )
 
-    # The write proceeded: the merged metadata (including the "foo" sibling)
-    # is stored raw/unchanged — no repair, no schema_version stamp.
+    # The write proceeded: the merged metadata (including the "foo" sibling
+    # and the insert's pending-wait anchor, task 3816) is stored raw/unchanged
+    # — no repair, no schema_version stamp.
     task = await backend.get_task(tid, project_root=project_root)
-    assert task['metadata'] == {'foo': 'bar', 'task_kind': 'deterministic'}
+    assert task['metadata'] == {
+        'foo': 'bar',
+        'task_kind': 'deterministic',
+        'pending_since': anchor,
+    }
 
 
 @pytest.mark.asyncio
@@ -6499,6 +7369,11 @@ async def test_update_task_enforce_mode_rejects_invariant_violation(tmp_path, pr
             project_root=project_root, title='t', metadata=seed_metadata,
         )
         tid = dto['id']
+        # The seed insert stamped the pending-wait anchor (task 3816); an
+        # unchanged row therefore still carries it after the rollback.
+        anchor = (await backend.get_task(tid, project_root=project_root))['metadata'][
+            'pending_since'
+        ]
 
         with pytest.raises(ValidationError):
             await backend.update_task(
@@ -6507,7 +7382,7 @@ async def test_update_task_enforce_mode_rejects_invariant_violation(tmp_path, pr
             )
 
         task = await backend.get_task(tid, project_root=project_root)
-        assert task['metadata'] == {'foo': 'bar'}, (
+        assert task['metadata'] == {'foo': 'bar', 'pending_since': anchor}, (
             f'Expected the rolled-back txn to leave metadata unchanged; got: {task["metadata"]}'
         )
     finally:
@@ -6690,6 +7565,11 @@ async def test_update_task_unknown_key_patch_still_rejects_invalid_known_field(
             project_root=project_root, title='t',
             metadata=json.dumps({'foo': 'bar'}),
         )
+        # The seed insert stamped the pending-wait anchor (task 3816); an
+        # unchanged row therefore still carries it after the rejection.
+        anchor = (await backend.get_task(dto['id'], project_root=project_root))[
+            'metadata'
+        ]['pending_since']
 
         with pytest.raises(ValidationError):
             await backend.update_task(
@@ -6702,7 +7582,7 @@ async def test_update_task_unknown_key_patch_still_rejects_invalid_known_field(
             )
 
         task = await backend.get_task(dto['id'], project_root=project_root)
-        assert task['metadata'] == {'foo': 'bar'}, (
+        assert task['metadata'] == {'foo': 'bar', 'pending_since': anchor}, (
             f'Expected the rejected txn to leave metadata unchanged; got: {task["metadata"]}'
         )
     finally:

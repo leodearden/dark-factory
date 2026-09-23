@@ -15,7 +15,7 @@ cross-checks every other site against it. It never stores its own snapshot slug
 list: a hardcoded constant here would be one more lock-step copy, stale on the
 next invariant exactly like the prose sites were.
 
-THE FOUR PINNED SITES (see ``PINNED_SITES`` for the machine-readable registry):
+THE FIVE PINNED SITES (see ``PINNED_SITES`` for the machine-readable registry):
   * ``docs/legibility/design-invariants.md`` — SOURCE OF TRUTH. Its
     ``## INV-N `slug``` headings define the family.
   * ``docs/legibility/design-invariants-fixtures.md`` — one fixture section per
@@ -25,6 +25,8 @@ THE FOUR PINNED SITES (see ``PINNED_SITES`` for the machine-readable registry):
     family-inventory row (ordered) and the G7 trigger-shape fallback list (set).
   * ``CONTRIBUTING.md`` — pinned as an ABSENCE: it may name at most one
     invariant, never a restatement of the family.
+  * ``docs/code-quality.md`` — a PARTIAL `INV-N`-to-heuristic mapping, pinned
+    pair-wise against the normative doc, never for completeness.
 
 STRUCTURE, NEVER WORDING. This guard pins WHICH SLUGS APPEAR WHERE across
 artifacts — the cross-artifact correspondence that fails to auto-extend when an
@@ -51,8 +53,14 @@ CONTRIBUTING.md's existing ``lint-command-mirror`` block.
 PLACEMENT IS LOAD-BEARING. ``scripts/tests/`` modules must import NO first-party
 package — that is what lets ``uv run --project shared pytest scripts/tests/``
 (``scripts/orchestrator.yaml``'s ``test_command``) satisfy them on a freshly
-synced verify worktree. This module is stdlib-only (``os``, ``re``, ``pathlib``)
-plus ``pytest``.
+synced verify worktree. This module is stdlib-only (``os``, ``re``,
+``subprocess``, ``pathlib``) plus ``pytest``. Both scans shell out to the
+``git`` binary (task 4971) for their tracked-file oracle — see
+``_walk_repo_files``. This module always runs inside a git worktree, so the
+REPOSITORY half of that oracle is guaranteed; the ``git`` EXECUTABLE's
+presence on ``PATH`` is not (a verify subprocess's ``PATH`` is rewritten by
+``orchestrator/src/orchestrator/verify.py::_target_subprocess_env``), which is
+why ``_walk_repo_files`` raises an actionable error rather than assuming it.
 
 EXTRACTOR CONTRACT. Every extractor below raises a loud ``AssertionError``
 naming its ``source`` rather than returning an empty list. An extractor that
@@ -66,6 +74,7 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 from pathlib import Path
 from typing import NamedTuple
 
@@ -77,6 +86,7 @@ NORMATIVE_DOC = REPO_ROOT / "docs" / "legibility" / "design-invariants.md"
 FIXTURES_DOC = REPO_ROOT / "docs" / "legibility" / "design-invariants-fixtures.md"
 GATES_DOC = REPO_ROOT / "skills" / "prd" / "references" / "gates.md"
 CONTRIBUTING_DOC = REPO_ROOT / "CONTRIBUTING.md"
+CODE_QUALITY_DOC = REPO_ROOT / "docs" / "code-quality.md"
 
 # A family this small would mean the normative doc stopped parsing, not that
 # dark-factory shrank its invariant list: eight are landed and none has ever been
@@ -417,6 +427,10 @@ PINNED_SITES = {
     "CONTRIBUTING.md": (
         "pinned as an ABSENCE: at most one by-name citation, never a restatement"
     ),
+    "docs/code-quality.md": (
+        "a partial `INV-N`-to-heuristic mapping, pinned pair-wise against the "
+        "normative doc — never for completeness"
+    ),
 }
 
 # Four distinct slugs is an enumeration, not a discussion. Below it sit the docs
@@ -443,11 +457,15 @@ _EXCLUDED_TREES = (
 
 _EXCLUDED_TREE_PARTS = tuple(tuple(tree.split("/")) for tree in _EXCLUDED_TREES)
 
-# Not repo content: build output and vendored trees. Dot-directories are pruned
-# by name rather than listed, which is what keeps the walk cheap in the main
-# checkout — `.worktrees/` there holds a full copy of the repo per in-flight task
-# (an unpruned `**/*.md` glob over it did not finish in 120s), and `.git`,
-# `.venv`, `.task` and `.pytest_cache` are the same shape of dead weight.
+# Not repo content: build output and vendored trees. Dot-directories are
+# pruned by name rather than listed, matching `.git`, `.venv`, `.task` and
+# `.pytest_cache` alike. Most of these never reach `git ls-files` at all,
+# since they are gitignored — task 4971 re-sourced the walk from the
+# tracked-file list, which is what keeps `.worktrees/` (a full repo copy per
+# in-flight task; an unpruned filesystem glob over it did not finish in 120s)
+# out cheaply, measured at 0.025s. But `.claude/` IS tracked, so the
+# dot-prefix rule still has to run explicitly on top of the tracked list
+# rather than being retired now that the walk no longer touches the disk tree.
 _PRUNED_DIR_NAMES = frozenset({"node_modules", "__pycache__", "site-packages", "venv"})
 
 
@@ -473,32 +491,114 @@ def _scan_label(path: Path) -> str:
 _THIS_MODULE = Path(__file__).resolve()
 
 
+def _scrubbed_git_env() -> dict[str, str]:
+    """``os.environ`` with every ``GIT_*`` override removed.
+
+    ``GIT_DIR``, ``GIT_WORK_TREE``, ``GIT_INDEX_FILE`` and
+    ``GIT_CEILING_DIRECTORIES`` are all inherited from ``os.environ`` by
+    default, and any one of them can silently retarget a git invocation at a
+    different repository or index than its ``cwd`` implies — undermining the
+    exact ambient-state independence task 4971 exists to give this module's
+    scans.
+    """
+    return {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+
+
+def _run_git(args: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
+    """Run ``git`` *args* against *cwd*, with `_scrubbed_git_env()`.
+
+    Shared by `_walk_repo_files` and the test fixtures' `_write_scan_tree` so
+    the two call sites cannot drift on the env-scrubbing.
+    """
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd, capture_output=True, text=True, check=True, timeout=60,
+        env=_scrubbed_git_env(),
+    )
+
+
 def _walk_repo_files(root: Path, suffixes: tuple[str, ...]) -> list[Path]:
-    """Every file under *root* ending in one of *suffixes*, excluded trees pruned.
+    """Every TRACKED file under *root* ending in one of *suffixes*, filtered.
 
     ONE walker behind both scans. Two walks that had to agree on a prune policy
     byte-for-byte would be the lock-step duplication INV-5 forbids — in the very
     module that enforces that family — and the copy would drift the first time an
     exclusion was added to one of them.
 
-    Walks with ``os.walk`` and PRUNES excluded directories in place rather than
-    globbing everything and filtering the result. The distinction is not cosmetic:
-    ``REPO_ROOT.glob("**/*.md")`` in the main checkout descends into ``.worktrees/``
-    — one full repo copy per in-flight task — and did not finish inside 120s when
-    measured. Pruning keeps the same walk at well under a second there.
+    Sourced from ``git ls-files``, never a filesystem walk (task 4971): an
+    untracked file — gitignored watcher output, a stray scratch file — must not
+    be able to flip either scan's verdict on nothing but local working-tree
+    state. MEASURED incident: the citation scan went red in project_root over
+    five backticked tokens in an untracked ``data/escalations/*`` digest, and
+    stayed green in an otherwise-identical worktree with no ``data/`` at all —
+    the verdict was a property of watcher timing, not of repo content.
+
+    Every exclusion below is still applied, component-wise, ON TOP of the
+    tracked list: trackedness is not a substitute for the policy, since some
+    excluded trees (``docs/prds/``, ``.claude/``) are themselves TRACKED and
+    gitignore says nothing about them (measured: the bare tracked list would
+    add 339 such files back).
+
+    COST, not just benefit: a file that has been written but not yet
+    ``git add``ed is invisible to both scans, same as an untracked one — an
+    author who writes a new doc restating four canonical slugs and runs this
+    module locally before staging it gets a GREEN verdict on content the old
+    filesystem walk would have flagged. Acceptable rather than a defect: every
+    dispatched agent commits before verify runs, and pre-commit sees staged
+    content — but stage a new file before trusting a green run of this module.
     """
+    pathspecs = [f"*{suffix}" for suffix in suffixes]
+    try:
+        listing = _run_git(["ls-files", "-z", "--", *pathspecs], cwd=root).stdout
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        # No filesystem-walk fallback here, ever (task 4971): this walker's
+        # entire purpose is that a scan's verdict comes from TRACKED files
+        # only, never from local working-tree state — falling back to
+        # `os.walk` on a failed oracle would silently restore the exact
+        # incident this task fixed, in precisely the situation nobody is
+        # watching for it (`no-silent-fail-soft`). A bare exception is not
+        # enough either: none of `CalledProcessError` (git exited non-zero,
+        # e.g. *root* is not a repo), `TimeoutExpired` (the 60s budget above)
+        # or `OSError` (no `git` on PATH, or *root* does not exist) names the
+        # root or the contract on its own (`structured-facts-at-failure`).
+        returncode = getattr(exc, "returncode", None)
+        stderr = getattr(exc, "stderr", None)
+        detail = stderr.strip() if stderr else str(exc)
+        outcome = f"exited {returncode}" if returncode is not None else "could not be run"
+        raise RuntimeError(
+            f"the tracked-file scan of {root} failed (task 4971): `git ls-files -z "
+            f"-- {' '.join(pathspecs)}` {outcome} — {detail}. This walker "
+            f"sources every scan from TRACKED files only, by design, so {root} must "
+            f"be a git repository (or a subdirectory of one), with `git` on PATH, "
+            f"for the scan to run at all — there is no filesystem-walk fallback."
+        ) from exc
+
     found: list[Path] = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        directory = Path(dirpath)
-        dirnames[:] = sorted(
-            name
-            for name in dirnames
-            if not name.startswith(".")
-            and name not in _PRUNED_DIR_NAMES
-            and not _in_excluded_tree(directory / name, root)
-        )
-        found.extend(directory / name for name in filenames if name.endswith(suffixes))
-    return sorted(found)
+    for relative in listing.split("\0"):
+        if not relative or not relative.endswith(suffixes):
+            continue
+        parent_parts = Path(relative).parts[:-1]
+        if any(part.startswith(".") or part in _PRUNED_DIR_NAMES for part in parent_parts):
+            continue
+        path = root / relative
+        if _in_excluded_tree(path, root):
+            continue
+        # `git ls-files` reads the INDEX, not the worktree: a path can be
+        # listed while missing on disk (routine mid-rebase or mid-merge).
+        # Dropping it here is safe — a file absent from the worktree has no
+        # content to scan — rather than letting a downstream `read_text` raise
+        # `FileNotFoundError` for a reason unrelated to citation drift (task
+        # 4971). The aggregate anti-vacuity guards still cover the case where
+        # the skew is large enough to matter.
+        if not path.is_file():
+            continue
+        found.append(path)
+    # `git ls-files` lists an UNMERGED path once per merge stage — a
+    # conflicted worktree can yield the same path 2-3x (verified: 3x after a
+    # conflicting `git merge`). Both callers treat this walker's result as
+    # set-like (no duplicates), so dedupe here rather than let a conflicted
+    # tree triplicate every drift entry downstream.
+    return sorted(set(found))
 
 
 def _enumeration_scan_files() -> list[Path]:
@@ -519,6 +619,11 @@ def _citation_scan_files(root: Path = REPO_ROOT) -> list[Path]:
     reach: it carries the phantom slug, but it is a CAPTURED replay corpus
     regenerated only by ``shared/tests/toolcall_markup_corpus_extract.py``, so a
     report against it would invite a hand-edit that corrupts the fixture.
+    Vendored upstream content (the ``graphiti``/``mem0`` submodules) is out of
+    reach for a different reason, by construction rather than by this filter:
+    ``git ls-files`` reports a submodule as an extensionless gitlink entry and
+    never descends into its tree, so the ``-- '*.py' '*.md'`` pathspecs passed
+    to ``_walk_repo_files`` cannot match it in the first place.
     """
     found = [path for path in _walk_repo_files(root, (".py", ".md")) if path != _THIS_MODULE]
     assert found, (
@@ -796,6 +901,65 @@ def near_miss_alias_pairs(
         if any(_is_confusable(token, slug) for slug in slugs):
             near_misses.append(pair)
     return near_misses
+
+
+def alias_pairs_not_in_family(
+    pairs: list[AliasPair], family: list[tuple[int, str]]
+) -> list[AliasPair]:
+    """The pairings of *pairs* whose `(number, token)` is not an EXACT member of *family*.
+
+    STRICT, where `near_miss_alias_pairs` above is deliberately LENIENT.
+    MEASURED against ``docs/code-quality.md``'s five live pairings rather than
+    reasoned about: `near_miss_alias_pairs` flags a RENUMBERING but returns
+    `[]` for a slug RENAME (``one-fact-one-home`` -> ``single-home-per-fact``)
+    and for a RETIREMENT (INV-11 removed), because its limb 3 deliberately
+    clears a token confusable with nothing canonical — and a renamed or
+    retired slug is exactly that: it no longer resembles anything in the
+    family, including its own former self. This predicate adds those two
+    modes; the renumbering case it also catches is coverage it shares with
+    `near_miss_alias_pairs`, not a duplicate of it — the rule here is a
+    different, stricter one that happens to catch it too.
+
+    MUST STAY PER-SITE, NEVER REPO-WIDE. The near-miss section comment above
+    already measured why a universal exact-match check is wrong: this repo
+    carries module-local `INV-n` numbering schemes unrelated to this family
+    (task 2885's PRD-local ``INV-3 dangling-successor-edge``,
+    test_lock_table.py's ``INV-1: strictly-higher-priority``), and "a guard
+    that is wrong half the time gets silenced". A registered `PINNED_SITES`
+    entry is the one context where that objection does not apply —
+    registration is the explicit claim that the file's relationship to the
+    family is mechanized — which is why this predicate is called only from a
+    per-site live assertion, never from the repo-wide scans.
+
+    A proper PREFIX shorthand under its own number — which
+    `near_miss_alias_pairs` clears as legitimate shorthand in ordinary prose —
+    IS reported here. That asymmetry is deliberate: shorthand is acceptable
+    when discussing an invariant, but not inside a mapping pinned for
+    correctness, where the pairing itself is the content being pinned.
+
+    Loud on an empty *family*, like `near_miss_alias_pairs`: with no canonical
+    pairings to check membership against, every pairing would trivially be a
+    non-member and the verdict would be meaningless.
+    """
+    assert family, (
+        "alias_pairs_not_in_family received an empty invariant family (task "
+        "5230) — with no canonical pairings to check membership against, "
+        "every pairing would trivially be a non-member and the verdict would "
+        "be meaningless."
+    )
+
+    canonical_pairs = set(family)
+
+    # Unpacked positionally rather than read by attribute, like
+    # `near_miss_alias_pairs` above: the rule is about a `(number, token)`
+    # pairing, not about the record type, so it stays exercisable with plain
+    # tuples in the fixture tests below.
+    non_members: list[AliasPair] = []
+    for pair in pairs:
+        _, number, token, _, _ = pair
+        if (number, token) not in canonical_pairs:
+            non_members.append(pair)
+    return non_members
 
 
 # The normative doc's FILENAME, not its full path: prose cites it as
@@ -1548,6 +1712,85 @@ def test_contributing_does_not_restate_the_invariant_family() -> None:
 
 
 # ---------------------------------------------------------------------------
+# docs/code-quality.md — pinned as a PARTIAL mapping, pair-wise against the
+# normative doc
+#
+# The "Relationship to the design invariants" section maps a subset of the
+# family to Leo's fourteen numbered quality heuristics — four of eleven
+# invariants today, only those that already encode a heuristic in checkable
+# form — and that mapping is the section's entire content. Ratified by Leo on
+# 2026-09-03 (commit 7938676c28); this guard pins the mapping pair-wise
+# without editing a byte of the doc (task 5230).
+#
+# STRICT membership (`alias_pairs_not_in_family`), not the repo-wide near-miss
+# rule: MEASURED against this doc's five live pairings, `near_miss_alias_pairs`
+# flags a renumbering but misses a slug RENAME and a RETIREMENT — see
+# `alias_pairs_not_in_family`'s docstring for the full comparison — and both
+# leave a citation resolving to nothing, which a mapping pinned for
+# correctness cannot tolerate.
+#
+# Deliberately NO completeness limb. The section is a MAPPING claim naming
+# only the invariants that encode a quality heuristic, so it is partial by
+# construction and an exhaustiveness assertion would be wrong.
+# ---------------------------------------------------------------------------
+
+
+def test_code_quality_doc_pairs_every_invariant_with_its_canonical_slug() -> None:
+    """LIVE: every `INV-N`/slug pairing in docs/code-quality.md is exact.
+
+    TWO assertions, deliberately no more.
+
+    NON-VACUITY FIRST. MEASURED: this doc's header carries a citation
+    (`INV-9 one-fact-one-home`) OUTSIDE the "Relationship to the design
+    invariants" mapping section, so deleting the whole mapping would still
+    leave `invariant_alias_pairs` returning one clean pairing without raising
+    its loud empty-parse error — the strict check below would then pass over
+    one clean pairing while the doc mapped nothing. This limb requires the
+    pairings to still name at least `_ENUMERATION_THRESHOLD` distinct
+    canonical slugs — exactly the condition that made this site registrable in
+    PINNED_SITES in the first place, so its failure means "de-register the
+    site", not "weaken this assertion".
+
+    THEN STRICT MEMBERSHIP. `alias_pairs_not_in_family` against
+    `canonical_family()` — no near-miss carve-outs — because a mapping pinned
+    for correctness must not let a renamed or retired slug read as clean.
+
+    NO COMPLETENESS LIMB. The section names only the invariants that already
+    encode a quality heuristic (4 of 11 today); it is a partial mapping by
+    construction, not an enumeration of the family, so asserting it covers
+    every invariant would be wrong.
+    """
+    text = CODE_QUALITY_DOC.read_text(encoding="utf-8")
+    source = _repo_relative(CODE_QUALITY_DOC)
+
+    pairs = invariant_alias_pairs(text, source=source)
+
+    distinct_slugs = {token for _, _, token, _, _ in pairs}
+    assert len(distinct_slugs) >= _ENUMERATION_THRESHOLD, (
+        f"{source} names only {len(distinct_slugs)} distinct canonical "
+        f"slug(s) {sorted(distinct_slugs)} across its `INV-N`/slug pairings — "
+        f"under the {_ENUMERATION_THRESHOLD}-slug enumeration threshold that "
+        f"made this site registrable in PINNED_SITES in the first place (task "
+        f"5230). If the mapping section was trimmed or removed on purpose, "
+        f"de-register {source} from PINNED_SITES instead of weakening this "
+        f"assertion."
+    )
+
+    drifted = alias_pairs_not_in_family(pairs, canonical_family())
+    assert not drifted, (
+        f"{source} pairs (line, number, token) "
+        f"{[(p.line, p.number, p.token) for p in drifted]} with a number/slug "
+        f"combination that is not in the canonical family (task 5230). "
+        f"{_repo_relative(NORMATIVE_DOC)} is the only place a slug is defined "
+        f"— either renumber the citation to match it, or the slug was "
+        f"respelled or retired there and this doc's citation needs the same "
+        f"treatment, or the citation used a shorthand prefix (e.g. `INV-4 "
+        f"storm-escape`) — ordinary prose may do that, but a mapping pinned "
+        f"for correctness may not, so spell the slug in full."
+    )
+
+
+# ---------------------------------------------------------------------------
 # The fixtures doc's rehearsal verdict table — pinned for COVERAGE only
 #
 # The doc carries an explicit "Snapshot caveat" declaring the Verdict column a
@@ -2186,6 +2429,112 @@ def test_near_miss_alias_pairs_fails_loudly_on_an_empty_family() -> None:
     assert "family" in str(excinfo.value).lower()
 
 
+def test_alias_pairs_not_in_family_clears_an_exact_pairing() -> None:
+    """An exact `(number, slug)` match is a member of the family — clean."""
+    pairs = [_pair(2, "structured-facts-at-failure")]
+
+    assert alias_pairs_not_in_family(pairs, _ALIAS_FIXTURE_FAMILY) == []
+
+
+def test_alias_pairs_not_in_family_flags_a_renamed_slug_under_its_own_number() -> None:
+    """RENAME drift: the right number, a slug the family no longer spells that way.
+
+    MEASURED gap: `near_miss_alias_pairs` returns `[]` for this pairing because
+    its limb 3 clears a token confusable with nothing canonical — a renamed
+    slug is exactly that, confusable with neither its own former spelling nor
+    any other canonical slug. Strict membership has no such carve-out.
+    """
+    pairs = [_pair(9, "quiet-degradation-forbidden")]
+
+    assert near_miss_alias_pairs(pairs, _ALIAS_FIXTURE_FAMILY) == []
+    assert alias_pairs_not_in_family(pairs, _ALIAS_FIXTURE_FAMILY) == pairs
+
+
+def test_alias_pairs_not_in_family_flags_a_pairing_under_a_retired_number() -> None:
+    """RETIRE drift: a number the family no longer defines at all.
+
+    Same measured gap as the rename case: the token is confusable with nothing
+    canonical, so `near_miss_alias_pairs` clears it while strict membership
+    cannot — the number is not even a key in the family.
+    """
+    pairs = [_pair(11, "legacy-fallback-behavior")]
+
+    assert near_miss_alias_pairs(pairs, _ALIAS_FIXTURE_FAMILY) == []
+    assert alias_pairs_not_in_family(pairs, _ALIAS_FIXTURE_FAMILY) == pairs
+
+
+def test_alias_pairs_not_in_family_flags_a_renumbered_slug() -> None:
+    """RENUMBER drift: a canonical slug cited under the wrong number.
+
+    Also caught by `near_miss_alias_pairs` (limb 2) — pinned here too so the
+    strict rule's whole coverage is stated in one place rather than split
+    across two test sections.
+    """
+    pairs = [_pair(2, "no-silent-fail-soft")]
+
+    assert near_miss_alias_pairs(pairs, _ALIAS_FIXTURE_FAMILY) == pairs
+    assert alias_pairs_not_in_family(pairs, _ALIAS_FIXTURE_FAMILY) == pairs
+
+
+def test_alias_pairs_not_in_family_flags_a_proper_prefix_under_its_own_number() -> None:
+    """Shorthand `near_miss_alias_pairs` clears is still not an EXACT member.
+
+    Deliberate asymmetry with the near-miss guard, which carves out a proper
+    prefix under its own number as legitimate shorthand (measured: twelve
+    correct citations live this way — see
+    `test_near_miss_alias_pairs_clears_a_proper_prefix_under_its_own_number`).
+    Strict family membership has no shorthand carve-out: only an exact
+    `(number, slug)` pairing counts as pinned.
+    """
+    pairs = [_pair(4, "storm-escape")]
+
+    assert near_miss_alias_pairs(pairs, _ALIAS_FIXTURE_FAMILY) == []
+    assert alias_pairs_not_in_family(pairs, _ALIAS_FIXTURE_FAMILY) == pairs
+
+
+def test_alias_pairs_not_in_family_flags_a_module_local_numbering_scheme() -> None:
+    """Proof the predicate is UNSAFE to run repo-wide — why it stays per-site.
+
+    `near_miss_alias_pairs` clears this because the token is confusable with
+    nothing canonical — a real citation of a PRD-local invariant list (task
+    2885's `INV-3 dangling-successor-edge`), not this family. Strict family
+    membership has no such carve-out and flags it too, which is exactly why
+    this predicate must never run over ordinary repo content: a guard wrong on
+    every module-local numbering scheme in the repo would be silenced.
+    """
+    pairs = [_pair(3, "dangling-successor-edge")]
+
+    assert near_miss_alias_pairs(pairs, _ALIAS_FIXTURE_FAMILY) == []
+    assert alias_pairs_not_in_family(pairs, _ALIAS_FIXTURE_FAMILY) == pairs
+
+
+def test_alias_pairs_not_in_family_filters_per_pair_not_all_or_nothing() -> None:
+    """Per-pair filtering, not all-or-nothing — pins order preservation too.
+
+    MEASURED gap: every other test in this section passes a single-element
+    `pairs` list, so an all-or-nothing mutant (`return list(pairs) if
+    any((n, t) not in family for ...) else []`) survives every one of them.
+    Mirrors `test_near_miss_alias_pairs_is_asymmetric_in_the_number` above,
+    which pins the equivalent per-pair property for the lenient sibling.
+    """
+    clean = _pair(2, "structured-facts-at-failure")
+    drift = _pair(2, "no-silent-fail-soft", line=3)
+
+    assert alias_pairs_not_in_family([clean, drift], _ALIAS_FIXTURE_FAMILY) == [drift]
+
+
+def test_alias_pairs_not_in_family_fails_loudly_on_an_empty_family() -> None:
+    """An empty family RAISES rather than returning `[]`, per the extractor contract.
+
+    With no canonical pairings to check membership against, every pairing
+    would trivially be a non-member and the verdict would be meaningless.
+    """
+    with pytest.raises(AssertionError) as excinfo:
+        alias_pairs_not_in_family([_pair(2, "no-silent-fail-soft")], [])
+
+    assert "family" in str(excinfo.value).lower()
+
+
 # ---------------------------------------------------------------------------
 # doc_anchored_slug_citations / noncanonical_citations — the CITATION guard
 #
@@ -2366,9 +2715,31 @@ def test_noncanonical_citations_fails_loudly_on_an_empty_family() -> None:
 # docstring documents for the `tmp_path` fixtures.
 # ---------------------------------------------------------------------------
 
-def _write_scan_tree(root: Path, relative_paths: list[str]) -> None:
-    """Create an empty file at each of *relative_paths* under *root*."""
+def _write_scan_tree(
+    root: Path, relative_paths: list[str], *, untracked: tuple[str, ...] = ()
+) -> None:
+    """Build a real git repo at *root*: *relative_paths* end up TRACKED via
+    ``git init`` + ``git add -A -f``; any *untracked* paths are written only
+    AFTER the add, so they stay out of the index.
+
+    A real repo, not a bare directory: task 4971 re-sources the scan from
+    ``git ls-files``, so trackedness must be exercised by the fixture rather
+    than asserted by reading the code — the same reasoning `_in_excluded_tree`'s
+    docstring gives for taking `root` from the caller. No commit and no
+    `user.email`/`user.name` config is needed: `git ls-files` reads the index,
+    not history. Both git calls go through `_run_git`, which scrubs ambient
+    `GIT_*` overrides — an ambient `GIT_DIR` would otherwise silently retarget
+    `git init`/`git add` at a different repository than *root*.
+    """
     for relative in relative_paths:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+
+    for args in (("init", "-q"), ("add", "-A", "-f")):
+        _run_git(list(args), cwd=root)
+
+    for relative in untracked:
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("", encoding="utf-8")
@@ -2444,12 +2815,158 @@ def test_citation_scan_files_fails_loudly_on_an_empty_scan(tmp_path: Path) -> No
 
     Same contract as `unregistered_enumeration_sites`: "no drift found" and
     "nothing was read" are indistinguishable downstream, and only one of them is
-    good news.
+    good news. The repo is initialised but empty — a non-repo root is a
+    different, louder failure mode covered separately (task 4971).
     """
+    _write_scan_tree(tmp_path, [])
+
     with pytest.raises(AssertionError) as excinfo:
         _citation_scan_files(root=tmp_path)
 
     assert "no files" in str(excinfo.value).lower()
+
+
+def test_citation_scan_files_ignores_untracked_files(tmp_path: Path) -> None:
+    """Reproduces task 4971 hermetically: an untracked file must not be scanned.
+
+    `project_root`'s gitignored `/data/` holds live escalation-watcher output.
+    `_citation_scan_files` used to walk the filesystem, so a digest the watcher
+    had just rewritten under `data/escalations/afk-digest.md` was scanned too —
+    and it happened to carry several backticked `esc-<task>-<n>` tokens beside
+    a `design-invariants.md` mention, which the citation guard's anchor logic
+    reads exactly like a slug citation. The guard went red over five "phantom"
+    citations that were never committed, while an otherwise-identical worktree
+    with no `data/` directory at all stayed green — the verdict was a property
+    of watcher timing, not of repo content.
+
+    The untracked fixture below is not merely absent-by-name: its body is the
+    same shape (an anchor mention within `_CITATION_WINDOW` lines of backticked
+    tokens), so it would actively surface as phantom citations were the scan to
+    reach it. Must FAIL against the os.walk-based walker, which returns both
+    files with no regard for git's index.
+    """
+    _write_scan_tree(
+        tmp_path,
+        ["docs/legibility/note.md"],
+        untracked=("data/escalations/afk-digest.md",),
+    )
+    (tmp_path / "data" / "escalations" / "afk-digest.md").write_text(
+        "Filed against `docs/legibility/design-invariants.md`'s citation guard:\n"
+        "`esc-3381-7`, `esc-3780-3`, `esc-3815-4`, `esc-4293-3`, `esc-4184-4`.\n",
+        encoding="utf-8",
+    )
+
+    scanned = _citation_scan_files(root=tmp_path)
+
+    assert tmp_path / "docs" / "legibility" / "note.md" in scanned
+    assert tmp_path / "data" / "escalations" / "afk-digest.md" not in scanned
+
+
+def test_citation_scan_files_skips_index_entries_absent_from_the_worktree(
+    tmp_path: Path,
+) -> None:
+    """A deleted-but-tracked index entry must be dropped, not crash the scan.
+
+    `git ls-files` keeps listing a path after it is deleted from the working
+    tree — verified in a scratch repo, and routine in a mid-rebase or
+    mid-merge tree. Left unguarded, mapping every index entry straight to
+    `root / relative` hands `_live_citations`/`_live_alias_pairs` a path whose
+    `read_text` raises `FileNotFoundError`, crashing the guard for a reason
+    that has nothing to do with citation drift. Must FAIL against the step-2
+    walker, which performs no `is_file()` check.
+    """
+    _write_scan_tree(tmp_path, ["keep.md", "gone.md"])
+    (tmp_path / "gone.md").unlink()
+
+    scanned = _citation_scan_files(root=tmp_path)
+
+    assert scanned == [tmp_path / "keep.md"]
+    for path in scanned:
+        path.read_text(encoding="utf-8")
+
+
+def test_walk_repo_files_fails_loudly_when_the_tracked_file_oracle_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    """A non-repo root must RAISE, actionably — never fall back to a filesystem walk.
+
+    `tmp_path` is deliberately never made into a git repo here. Git does NOT
+    refuse to look outside `cwd`: it resolves the enclosing repo by walking UP
+    from `cwd`, ceiling-less by default — verified: from a `deep/nested`
+    directory below an initialised repo, `git ls-files` still finds that repo
+    and exits 0. So this test's hermeticity was never about git declining to
+    walk up; it depends on pytest's default `tmp_path` base
+    (`/tmp/pytest-of-*`) happening to sit outside any repo. Guarded explicitly
+    below rather than assumed, because a `--basetemp` or `TMPDIR` pointed
+    inside a checkout would otherwise make `_walk_repo_files` silently return
+    `[]` instead of raising, under nothing but ambient test-runner
+    configuration.
+
+    A silent filesystem fall-back here would restore the exact incident this
+    task fixes, and do so precisely where nobody is watching —
+    `no-silent-fail-soft` is a canonical slug in the family this module
+    enforces. Asserts on the STRUCTURED facts a reader needs to act (the
+    offending root, and that the scan sources from tracked files), never on
+    git's raw stderr wording, which is the git binary's implementation detail,
+    not this module's contract (`structured-facts-at-failure`). Must FAIL
+    against step-2/step-4, where `check=True` surfaces a bare
+    `subprocess.CalledProcessError` naming neither.
+    """
+    probe = subprocess.run(
+        ["git", "rev-parse", "--is-inside-work-tree"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=60,
+        env=_scrubbed_git_env(),
+    )
+    if probe.returncode == 0:
+        pytest.skip(
+            f"{tmp_path} resolves inside a git repository via git's ceiling-less "
+            f"upward search from cwd, so this environment cannot exercise the "
+            f"non-repo failure mode hermetically."
+        )
+
+    with pytest.raises(Exception) as excinfo:
+        _walk_repo_files(tmp_path, (".py", ".md"))
+
+    message = str(excinfo.value)
+    assert str(tmp_path) in message, message
+    assert "tracked" in message.lower(), message
+
+
+def test_walk_repo_files_ignores_untracked_markdown(tmp_path: Path) -> None:
+    """ANTI-REGRESSION PIN: the SHARED walker excludes untracked `.md`, not just `.py`.
+
+    `_enumeration_scan_files` has no `root` seam of its own — it hardcodes
+    `_walk_repo_files(REPO_ROOT, (".md",))` — so this exercises the shared
+    walker directly instead. `project_root` carries 3313 untracked
+    `data/**/*.md` watcher digests (task 4971), any one of which could cross
+    `_ENUMERATION_THRESHOLD` and turn `test_every_enumeration_site_is_pinned`
+    red on nothing but watcher timing — the identical flake fixed for the
+    citation scan, because both scans share this one walker.
+
+    The untracked fixture restates FOUR canonical slugs, at
+    `_ENUMERATION_THRESHOLD`: it is not merely absent-by-name, it is the exact
+    shape that would flag as an enumeration site were the walk to reach it.
+
+    Expected to PASS already on arrival — the walker is shared with
+    `_citation_scan_files`, fixed in step-2/step-6, so this is not a RED test.
+    It is kept as an explicit anti-regression PIN: a future change that
+    re-narrows the tracked-file fix back onto `_citation_scan_files` alone, or
+    that re-diverges the enumeration path onto its own filesystem walk, must
+    turn this red.
+    """
+    _write_scan_tree(
+        tmp_path,
+        ["docs/site.md"],
+        untracked=("data/digests/digest.md",),
+    )
+    (tmp_path / "data" / "digests" / "digest.md").write_text(
+        "Restates the family: `contracts-machine-checked`, "
+        "`structured-facts-at-failure`, `corroborate-before-acting`, "
+        "`storm-escape-required`.\n",
+        encoding="utf-8",
+    )
+
+    assert _walk_repo_files(tmp_path, (".md",)) == [tmp_path / "docs" / "site.md"]
 
 
 # ---------------------------------------------------------------------------
@@ -2462,12 +2979,19 @@ def test_citation_scan_files_fails_loudly_on_an_empty_scan(tmp_path: Path) -> No
 # stored here, which would be one more lock-step copy of the family and stale on
 # the next invariant, exactly like the prose sites this module was written for.
 #
-# MEASURED ON BASE eba215060c, as a starting point rather than a pinned
-# constant: the scan reads 1737 files and finds 173 numbered pairings — 97 that
-# name their invariant's canonical slug exactly, 12 that use a legitimate
-# shorthand or line-wrapped prefix of it, 56 that belong to module-local INV-n
-# schemes and are confusable with nothing canonical, and 8 that contradict the
-# family. It finds 12 doc-anchored backticked citations, all canonical.
+# MEASURED ON BASE 16fd29df5698, under the tracked-file oracle (task 4971), as
+# a starting point rather than a pinned constant: the scan reads 1845 files
+# and finds 153 exactly-correct pairings, 12 legitimate shorthand prefixes, 14
+# written with reST double-backticks and 36 wrapped across a line break —
+# these four are the overlapping ANTI-VACUITY OBSERVATIONS the test below
+# gates on, not a partition, so they do not sum to a pairing total. It finds
+# 14 doc-anchored backticked citations, all canonical.
+#
+# `git ls-files` reports the `graphiti` and `mem0` submodules as gitlink
+# entries rather than descending into their trees, so their vendored upstream
+# files never reach either scan — they are not this repo's authored content,
+# and the counts above were re-measured AFTER that drop, not compensated for
+# it.
 # ---------------------------------------------------------------------------
 
 

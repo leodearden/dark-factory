@@ -19,8 +19,9 @@ CONTENT arrives as a string (or None), and the composed entry point takes a
 seam exactly rather than introducing a second I/O seam.
 
 FAIL-SAFE IN EXACTLY ONE DIRECTION.  Any unreadable file, TOML/AST/shlex failure,
-unsupported expression node, merely-unknown marker, module shape the per-item
-tier cannot exhaustively enumerate (see :func:`per_item_marker_names`), or a
+unsupported expression node, merely-unknown marker, module shape neither the
+per-item nor the class-level tier can exhaustively enumerate (see
+:func:`per_item_marker_names` and :func:`guaranteed_marker_names`), or a
 module with zero collected items resolves to "no widening" — i.e. precisely
 today's behaviour.  Widening is only ever chosen on positive proof.  Nothing
 here raises: ``verify._safe_derive_verify_plan_dict`` swallows exceptions and
@@ -32,7 +33,7 @@ from __future__ import annotations
 import ast
 import shlex
 import tomllib
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 
 
 class _Unsupported(Exception):
@@ -212,6 +213,42 @@ def _marker_name(element: ast.expr) -> str | None:
     return None
 
 
+def _pytestmark_marker_names(body: Sequence[ast.stmt]) -> frozenset[str]:
+    """Marker names the ``pytestmark`` binding in *body* names, else an empty set.
+
+    THE ONE SHARED FOLD, covering both scopes at which pytest honours
+    ``pytestmark``: a MODULE body (:func:`module_level_marker_names` and its
+    tree-consuming twin :func:`_module_level_marker_names_from_tree`) and a
+    CLASS body (:func:`_class_marker_names`).  Those three held
+    character-for-character copies of this fold, differing only in the
+    statement container, until they were collapsed here.  ONE copy is what
+    stops the two readings of ``pytestmark`` syntax drifting apart — a drift
+    would silently let the class tier accept a value shape the module tier
+    rejects, breaking the "same shapes at both scopes" promise
+    :func:`_class_marker_names` makes.
+
+    Only DIRECT children of *body* are considered — never ``ast.walk`` — so a
+    ``pytestmark`` bound inside an ``if`` is not the enclosing scope's marker.
+    Accepted value shapes: a bare ``pytest.mark.NAME``, a
+    ``pytest.mark.NAME(...)`` call, or a list/tuple of either.  A non-marker
+    element yields None from :func:`_marker_name` and is skipped silently,
+    without suppressing its siblings.  If the scope rebinds ``pytestmark`` more
+    than once, the LAST binding wins, mirroring Python's own semantics.
+    """
+    value: ast.expr | None = None
+    for statement in body:
+        bound = _pytestmark_value(statement)
+        if bound is not None:
+            value = bound
+    if value is None:
+        return frozenset()
+
+    elements = list(value.elts) if isinstance(value, ast.List | ast.Tuple) else [value]
+    return frozenset(
+        name for name in (_marker_name(element) for element in elements) if name is not None
+    )
+
+
 def module_level_marker_names(source: str | None) -> frozenset[str]:
     """Marker names a module-level ``pytestmark`` applies to EVERY item in *source*.
 
@@ -227,16 +264,25 @@ def module_level_marker_names(source: str | None) -> frozenset[str]:
     A name ABSENT from this set is therefore UNKNOWN, not absent — which is
     precisely what makes :func:`expression_definitely_deselects`' Kleene
     treatment sound.  Excluding decorators makes the detector under-fire on some
-    genuinely-deselected files, which is the safe direction.  Per-function and
-    per-class decorators are instead handled by the separate, enumeration-guarded
-    tier :func:`per_item_marker_names`, which this function's own contract is
-    unaffected by.
+    genuinely-deselected files, which is the safe direction.  Those decorators are
+    instead handled by two separate, enumeration-guarded tiers, neither of which
+    affects this function's own contract: per-FUNCTION decorators by
+    :func:`per_item_marker_names`, and per-CLASS markers by
+    :func:`guaranteed_marker_names`.
 
-    Accepted value shapes: a bare ``pytest.mark.NAME``, a ``pytest.mark.NAME(...)``
-    call, or a list/tuple of either.  Only ``tree.body`` is walked (never
-    ``ast.walk``), so a ``pytestmark`` bound inside a class or function body does
-    not count.  If the module rebinds ``pytestmark`` more than once, the LAST
-    assignment wins, mirroring Python's own semantics.
+    :func:`guaranteed_marker_names` is deliberately a SIBLING that widens this
+    bound rather than an edit to it (task 4561, esc-3513-2).  Consumers reason
+    about the set returned HERE as the strict module-only bound — it is what
+    each of those tiers is defined as a superset OF — so widening it in place
+    would move the baseline every one of them is stated against.
+
+    The ``pytestmark`` read itself is :func:`_pytestmark_marker_names`, the ONE
+    shared fold this module uses at every scope: accepted value shapes are a bare
+    ``pytest.mark.NAME``, a ``pytest.mark.NAME(...)`` call, or a list/tuple of
+    either; only ``tree.body`` is walked (never ``ast.walk``), so a ``pytestmark``
+    bound inside a class or function body does not count; and if the module
+    rebinds ``pytestmark`` more than once the LAST assignment wins, mirroring
+    Python's own semantics.
 
     ``source is None``, a ``SyntaxError``, or a ``ValueError`` yields an empty
     set.  Never raises.
@@ -248,18 +294,259 @@ def module_level_marker_names(source: str | None) -> frozenset[str]:
     except (SyntaxError, ValueError):
         return frozenset()
 
-    value: ast.expr | None = None
-    for statement in tree.body:
-        bound = _pytestmark_value(statement)
-        if bound is not None:
-            value = bound
-    if value is None:
+    return _pytestmark_marker_names(tree.body)
+
+
+def _class_marker_names(node: ast.ClassDef) -> frozenset[str]:
+    """Marker names *node* applies to every item collected from its own body.
+
+    Reads BOTH spellings pytest honours on a class, and unions them: the
+    ``@pytest.mark.NAME`` DECORATORS on the class itself, and a ``pytestmark``
+    bound in the class BODY.  The body form is read by the SAME
+    :func:`_pytestmark_marker_names` fold :func:`module_level_marker_names` uses
+    at module scope, so the two readings of ``pytestmark`` syntax cannot drift
+    apart — that is now structural rather than a claim maintained by hand.  It
+    inherits that fold's rules verbatim: the same accepted value shapes, the
+    same LAST-binding-wins rule, and DIRECT children of ``node.body`` only, so a
+    ``pytestmark`` bound inside an ``if`` in the class body is not the class's
+    marker.
+
+    A non-marker element (e.g. the ``qdrant_skipif()`` call heading the real
+    shape at ``fused-memory/tests/test_mem0_client.py``) yields None from
+    :func:`_marker_name` and is skipped silently, without suppressing its
+    siblings.
+    """
+    markers = {
+        name
+        for name in (_marker_name(decorator) for decorator in node.decorator_list)
+        if name is not None
+    }
+
+    return frozenset(markers) | _pytestmark_marker_names(node.body)
+
+
+def _is_collectable_class(node: ast.ClassDef) -> bool:
+    """True iff pytest may collect test items from *node* itself.
+
+    Collectable iff the class is ``test``-PREFIXED (case-insensitively,
+    matching the default ``python_classes = Test*``) **OR** its body directly
+    defines a ``test*``-named function.
+
+    THE SECOND DISJUNCT IS WHAT MAKES THE PREFIX ASSUMPTION SELF-CHECKING.
+    :func:`per_item_marker_names`' docstring already records that the default
+    ``python_classes`` is a premise this module cannot verify; a repo that
+    overrides it to collect ``FooSuite`` would slip straight past a pure
+    prefix rule.  Requiring that a non-``Test*``-named class holding ``test*``
+    methods also be marked — or else force a refusal — moves that premise's
+    failure into the SAFE direction.
+
+    Deliberately NOT :func:`per_item_marker_names`' "refuse on class SHAPE,
+    not class NAME": that tier can afford to refuse on any class because a
+    class is outside the item shape it models at all, whereas
+    :func:`guaranteed_marker_names` exists precisely to reason about classes,
+    and refusing on every unmarked helper class (``class _Config: ...``) would
+    kill it on most real modules.  The ``test`` prefix is not a new rule
+    either — :func:`_bound_names_start_with_test_ci` already applies exactly
+    this case-insensitive prefix to imported names, for the same reason.
+    """
+    if node.name.lower().startswith('test'):
+        return True
+    return any(
+        isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef)
+        and statement.name.startswith('test')
+        for statement in node.body
+    )
+
+
+def guaranteed_marker_names(source: str | None) -> frozenset[str]:
+    """Marker names that provably apply to EVERY item collected from *source*.
+
+    THE LOAD-BEARING CONTRACT, inherited verbatim from
+    :func:`module_level_marker_names`: the return value is a **LOWER BOUND** on
+    every collected item's marker set, so a name ABSENT from it is UNKNOWN
+    rather than absent — which is exactly what keeps
+    :func:`expression_definitely_deselects`' Kleene reading sound.  This tier
+    widens that bound WITHOUT editing it: it is a sibling, not a replacement,
+    because ``module_level_marker_names``' own set must stay the strict
+    module-only bound its consumers reason about.
+
+    The answer is ``module_level_marker_names(source)`` unioned with the
+    INTERSECTION of the marker sets of every COLLECTABLE top-level class (see
+    :func:`_is_collectable_class`), and only when the all-items-accounted-for
+    guard below proves no collected item can exist outside those classes.
+    Class markers are read from BOTH spellings pytest honours — the class
+    decorators and a class-body ``pytestmark`` (:func:`_class_marker_names`).
+
+    INTERSECTION, NEVER UNION.  If ``TestA`` carries ``slow`` and ``TestB``
+    carries ``integration``, neither marker is a module-wide bound: a union
+    would claim ``slow`` for ``TestB``'s items, ``not slow`` would read
+    definitely-False, and a run that genuinely collects ``TestB`` would be
+    widened away — the over-fire that reopens esc-3292-1 / task 1852.  The
+    intersection is the only fold that preserves the bound.
+
+    THE ALL-ITEMS-ACCOUNTED-FOR GUARD.  Falls back to the module-level answer
+    alone on any of:
+
+    * a ``test*``-named function (``def`` or ``async def``) that is NOT a
+      direct child of a top-level class body — the ONE rule covering a
+      module-level test function, a test hidden inside a top-level ``if``,
+      and a test nested inside another function;
+    * a ``ClassDef`` anywhere below ``tree.body`` — nested in another class,
+      or inside a top-level ``if`` — whose body this fold never reaches;
+    * a MODULE-SCOPE ``pytest_*`` hook (``pytest_collection_modifyitems``,
+      ``pytest_generate_tests``), which can add items this walk never sees;
+    * a star import, whose bound names are statically unknowable;
+    * any import binding a ``test``-prefixed name case-insensitively,
+      honouring ``asname`` — an imported ``Test*`` CLASS or ``test_*``
+      FUNCTION is collected in THIS module;
+    * a MODULE-SCOPE ``Assign``/``AnnAssign`` binding a ``test*``-prefixed name
+      (``test_generated = _make_case()``) — a dynamically generated item.
+      Every target spelling counts, including the unpackings
+      (``test_a, test_b = ...``, ``test_first, *test_rest = ...``, nested);
+    * ZERO collectable classes.  Guarded EXPLICITLY rather than left to the
+      fold: ``frozenset.intersection()`` over an empty family is
+      conventionally "every marker", which would prove any expression false.
+
+    WHY THE RESULT IS STILL A LOWER BOUND.  Every item pytest collects from
+    the module is a test function; by the first rule every such function is a
+    direct child of a top-level class body; by the second there is no
+    un-walked class body; by the import and dynamic-binding rules no item
+    enters from elsewhere; by the hook rule nothing in this file adds one.
+    Every owning class is collectable by definition (it holds a ``test*``
+    method), hence contributes to the intersection, hence carries every marker
+    in it.  Marks compose ADDITIVELY up the Module -> Class -> Function node
+    chain, so ``parametrize`` and ``pytest.param(marks=...)`` can only ever
+    ADD to an item's set: they multiply items but cannot break a
+    universally-quantified bound.  Inherited test methods are collected under
+    the marked SUBCLASS's node and carry its marks, so a base class defined in
+    another module is not a hole either.
+
+    DELIBERATE OVER-REFUSALS, all in the safe direction: any non-top-level
+    class refuses even when it is plainly inert; a collectable-looking class
+    that is simply unmarked drops the intersection to empty; and a helper
+    class that happens to define a ``test*``-named method counts as
+    collectable and so must be marked or refuse.
+
+    MODULE SCOPE, NOT ``tree.body``.  The last two rules and the hook rule are
+    keyed on :func:`_module_scope_statements` — every statement that executes at
+    module scope, including one nested inside a top-level ``if``/``try``/
+    ``for``/``while``/``with`` — because a name bound in any of those is still a
+    module ATTRIBUTE and a hook defined in any of them is still registered.
+    Keying them on DIRECT CHILDREN of ``tree.body`` (as they originally were)
+    conflated the two, and let ``if True:\n    test_generated = _mk()`` past the
+    very rule this docstring's first bullet claims to cover.  The ClassDef rule
+    deliberately keeps the stricter direct-child test: an out-of-body class
+    refuses outright rather than being reasoned about.
+
+    ASSUMPTIONS THIS WALK CANNOT CHECK, identical to
+    :func:`per_item_marker_names`': the caller's pytest configuration uses the
+    DEFAULT collection prefixes (``python_functions = test*``,
+    ``python_classes = Test*``), and no ancestor ``conftest.py`` implements an
+    item-ADDING ``pytest_collection_modifyitems``/``pytest_generate_tests``
+    hook — this walk only refuses on such a hook defined INSIDE *source*
+    itself, a sibling ``conftest.py`` being outside a single module string's
+    reach.  Both are pre-existing limits of a purely per-file static analysis,
+    recorded here rather than fixed, since fixing them would need reading
+    files this function is not given.
+
+    ONE KNOWN RESIDUE, left unfixed deliberately: the dynamic-binding rule reads
+    ``Assign``/``AnnAssign`` targets only, so a module-scope ``for test_x in
+    ...:``, a ``with _ctx() as test_x:``, or a walrus ``(test_x := ...)`` binds a
+    ``test*`` module attribute this walk does not see.  All three are vanishingly
+    rare as a way to define a test and none appears anywhere in this repo; they
+    are recorded rather than fixed so the rule stays one readable predicate.
+
+    STRICTLY ADDITIVE.  Every guard failure returns exactly
+    ``module_level_marker_names``' answer — never a smaller set — so this
+    function is a provable SUPERSET of that tier on every input and can never
+    refuse a file the primary tier already proves.
+
+    ``source is None``, a ``SyntaxError``, or a ``ValueError`` yields an empty
+    set.  Never raises.
+    """
+    if not source:
+        return frozenset()
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
         return frozenset()
 
-    elements = list(value.elts) if isinstance(value, ast.List | ast.Tuple) else [value]
-    return frozenset(
-        name for name in (_marker_name(element) for element in elements) if name is not None
-    )
+    module_markers = _module_level_marker_names_from_tree(tree)
+
+    body_ids = {id(statement) for statement in tree.body}
+    module_scope_ids = {id(statement) for statement in _module_scope_statements(tree)}
+    class_body_ids = {
+        id(statement)
+        for node in tree.body
+        if isinstance(node, ast.ClassDef)
+        for statement in node.body
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            if id(node) not in body_ids:
+                return module_markers
+        elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            if node.name.startswith('test') and id(node) not in class_body_ids:
+                return module_markers
+            if node.name.startswith('pytest_') and id(node) in module_scope_ids:
+                return module_markers
+        elif isinstance(node, ast.ImportFrom):
+            if any(alias.name == '*' for alias in node.names):
+                return module_markers
+            if _bound_names_start_with_test_ci(node):
+                return module_markers
+        elif (
+            (isinstance(node, ast.Import) and _bound_names_start_with_test_ci(node))
+            or (
+                isinstance(node, ast.Assign | ast.AnnAssign)
+                and id(node) in module_scope_ids
+                and _assign_binds_test_prefixed_name(node)
+            )
+        ):
+            return module_markers
+
+    collectable = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and _is_collectable_class(node)
+    ]
+    if not collectable:
+        return module_markers
+    shared = frozenset.intersection(*(_class_marker_names(node) for node in collectable))
+    return module_markers | shared
+
+
+def _module_scope_statements(node: ast.AST) -> Iterator[ast.stmt]:
+    """Every statement of the enclosing module that executes at MODULE SCOPE.
+
+    Yields ``tree.body`` and everything nested below it through compound
+    statements that do NOT open a new scope — ``if``/``else``, ``try``/
+    ``except``/``finally``, ``for``, ``while``, ``with``, ``match`` — because a
+    name bound in any of those is still a MODULE ATTRIBUTE, which is exactly
+    what pytest's ``python_functions``/``python_classes`` collection reads, and
+    a ``pytest_*`` hook defined in any of them is still registered for the
+    module.
+
+    ``FunctionDef``/``AsyncFunctionDef``/``ClassDef`` ARE yielded — they are
+    module-scope statements themselves — but are not descended INTO: a name
+    bound in a function body is a local pytest never sees, and one bound in a
+    class body is a class attribute collected, if at all, under that class's own
+    node, where it inherits the class's marks.  Descending would refuse on
+    ordinary modules and cost both tiers most of their reach.
+
+    This replaces an ``id(statement) in {id(s) for s in tree.body}`` test used by
+    :func:`guaranteed_marker_names` and :func:`per_item_marker_names`, which
+    conflated "at module scope" with "a DIRECT CHILD of ``tree.body``".  The two
+    coincide for the common case and diverge for exactly the case
+    ``guaranteed_marker_names``' own docstring claimed to cover: an item binding
+    or a hook one level down inside a top-level ``if``.
+    """
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, ast.stmt):
+            yield child
+        if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            continue
+        yield from _module_scope_statements(child)
 
 
 def _bound_names_start_with_test_ci(node: ast.Import | ast.ImportFrom) -> bool:
@@ -279,52 +566,69 @@ def _bound_names_start_with_test_ci(node: ast.Import | ast.ImportFrom) -> bool:
     )
 
 
+def _target_binds_test_prefixed_name(target: ast.expr) -> bool:
+    """True iff assignment *target* binds any ``test``-prefixed name (case-insensitive).
+
+    Recurses through the UNPACKING forms, which bind exactly the same module
+    attributes a bare ``Name`` target does: ``ast.Tuple``/``ast.List``
+    (``test_a, test_b = ...``, arbitrarily nested) and ``ast.Starred``
+    (``test_first, *test_rest = ...``).  Reading only ``ast.Name`` let every one
+    of those spellings through.
+
+    An ``Attribute`` or ``Subscript`` target (``obj.test_x = ...``) binds no
+    module attribute of its own and is correctly ignored.
+    """
+    if isinstance(target, ast.Name):
+        return target.id.lower().startswith('test')
+    if isinstance(target, ast.Starred):
+        return _target_binds_test_prefixed_name(target.value)
+    if isinstance(target, ast.Tuple | ast.List):
+        return any(_target_binds_test_prefixed_name(element) for element in target.elts)
+    return False
+
+
 def _assign_binds_test_prefixed_name(node: ast.Assign | ast.AnnAssign) -> bool:
-    """True iff *node* binds a ``test*``-prefixed name (case-insensitive) to a ``Name`` target.
+    """True iff *node* binds a ``test*``-prefixed name (case-insensitive).
 
     Pytest's default ``python_functions = test*`` collects any module
     attribute so named that resolves to a callable — including one bound by
     a plain assignment (``test_generated = _make_case()``), not only a
     ``def``.  This walk cannot tell statically whether the bound value is
     actually callable, so any ``test*``-prefixed target refuses, in the safe
-    direction.
+    direction.  Targets are read by :func:`_target_binds_test_prefixed_name`,
+    which covers the unpacking spellings as well as a bare ``Name``.
     """
     targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-    return any(
-        isinstance(target, ast.Name) and target.id.lower().startswith('test')
-        for target in targets
-    )
+    return any(_target_binds_test_prefixed_name(target) for target in targets)
 
 
 def _module_level_marker_names_from_tree(tree: ast.Module) -> frozenset[str]:
     """Same result as :func:`module_level_marker_names`, from an already-parsed *tree*.
 
-    Deliberately a SEPARATE, small duplicate of that function's body rather
-    than a shared helper the two delegate to: ``module_level_marker_names``
-    is the exact edit site of task 4561, the still-pending owner of Gap 2
-    (class-level markers), and this task leaves that function byte-identical
-    to avoid a textual merge conflict with it (see the plan's design
-    decisions).  Used only by :func:`per_item_marker_names`, which already
-    holds a parsed *tree* and would otherwise pay a second, wholly redundant
-    ``ast.parse`` of the same source purely to re-derive this set.  A later
-    reader may collapse the two into one shared tree-walker once 4561 has
-    landed and that merge-conflict risk is gone.  Sequencing: whichever of
-    this task (Gap 3) and 4561 lands second should fold its walk into the
-    tier the other already added — :func:`per_item_marker_names` or
-    :func:`module_level_marker_names` — rather than adding a third.
-    """
-    value: ast.expr | None = None
-    for statement in tree.body:
-        bound = _pytestmark_value(statement)
-        if bound is not None:
-            value = bound
-    if value is None:
-        return frozenset()
+    THE SHARED tree-consuming walk: both :func:`per_item_marker_names` and
+    :func:`guaranteed_marker_names` call it off a tree they already hold,
+    rather than calling ``module_level_marker_names(source)`` and paying a
+    second, wholly redundant ``ast.parse`` of the same source purely to
+    re-derive this set.
 
-    elements = list(value.elts) if isinstance(value, ast.List | ast.Tuple) else [value]
-    return frozenset(
-        name for name in (_marker_name(element) for element in elements) if name is not None
-    )
+    It was introduced (task 3513 Gap 3) as a deliberate small duplicate of
+    ``module_level_marker_names``' body, on the then-current understanding
+    that task 4561 would edit that function IN PLACE, and it left a
+    sequencing note asking whichever task landed second to fold its walk into
+    the tier the other had added rather than adding a THIRD copy.  4561 has
+    since landed and did NOT edit ``module_level_marker_names``: esc-3513-2
+    re-specced Gap 2 as a SIBLING, :func:`guaranteed_marker_names`.
+
+    The note's instruction is honoured in the strongest available form: there
+    is now exactly ONE copy of the fold, :func:`_pytestmark_marker_names`, and
+    every scope that reads ``pytestmark`` — this helper,
+    ``module_level_marker_names`` and :func:`_class_marker_names` — calls it.
+    What survives here is only the tree-consuming ENTRY POINT, kept because
+    ``per_item_marker_names`` and ``guaranteed_marker_names`` hold a tree
+    rather than a body and because this docstring is the record of the
+    3513/4561 sequencing agreement.
+    """
+    return _pytestmark_marker_names(tree.body)
 
 
 def per_item_marker_names(source: str | None) -> tuple[frozenset[str], ...] | None:
@@ -401,6 +705,7 @@ def per_item_marker_names(source: str | None) -> tuple[frozenset[str], ...] | No
         return None
 
     body_ids = {id(statement) for statement in tree.body}
+    module_scope_ids = {id(statement) for statement in _module_scope_statements(tree)}
     for node in ast.walk(tree):
         if isinstance(node, ast.ClassDef):
             return None
@@ -408,7 +713,7 @@ def per_item_marker_names(source: str | None) -> tuple[frozenset[str], ...] | No
             is_top_level = id(node) in body_ids
             if node.name.startswith('test') and not is_top_level:
                 return None
-            if node.name.startswith('pytest_') and is_top_level:
+            if node.name.startswith('pytest_') and id(node) in module_scope_ids:
                 return None
         elif isinstance(node, ast.ImportFrom):
             if any(alias.name == '*' for alias in node.names):
@@ -419,7 +724,7 @@ def per_item_marker_names(source: str | None) -> tuple[frozenset[str], ...] | No
             (isinstance(node, ast.Import) and _bound_names_start_with_test_ci(node))
             or (
                 isinstance(node, ast.Assign | ast.AnnAssign)
-                and id(node) in body_ids
+                and id(node) in module_scope_ids
                 and _assign_binds_test_prefixed_name(node)
             )
         ):
@@ -522,18 +827,30 @@ def deselecting_expression_for_targets(
     provably fully deselected by it under a TWO-TIER proof, tried in order per
     target:
 
-    1. the PRIMARY tier — :func:`module_level_marker_names` +
-       :func:`expression_definitely_deselects` — a module-wide lower bound that
-       alone covers test classes, imported test classes and dynamically
-       generated items;
+    1. the PRIMARY tier — :func:`guaranteed_marker_names` +
+       :func:`expression_definitely_deselects` — a MODULE-WIDE lower bound,
+       covering a module-level ``pytestmark`` and, under that function's
+       all-items-accounted-for guard, CLASS-level markers too (task 4561);
     2. only if that fails to prove deselection, the FALLBACK tier —
        :func:`per_item_marker_names` — which enumerates every collected item's
        own (module-level union per-decorator) marker set and requires EVERY
        one of them to be individually, definitely deselected.
 
-    The second tier is strictly ADDITIVE: it only ever turns a tier-1 refusal
-    into a proof, never the reverse, so this function can never refuse a
-    target it already accepts today.  ALL, not ANY — across both tiers and
+    WHAT TIER 1 DOES WITH THE HARD SHAPES.  It covers test classes, imported
+    test classes and dynamically generated items by REFUSING to widen on
+    them, unless its guard can prove every collected item lives inside a
+    marked class.  An imported test class and a dynamic top-level binding
+    still refuse OUTRIGHT — no guard can see what they bring in — so only the
+    all-classes-marked shape is newly provable.
+
+    Both tiers are strictly ADDITIVE: each only ever turns a refusal into a
+    proof, never the reverse, so this function can never refuse a target it
+    already accepts today.  For tier 2 that holds because it is consulted only
+    after tier 1 declines; for tier 1 it holds because
+    :func:`guaranteed_marker_names` returns exactly
+    :func:`module_level_marker_names`' answer on every guard failure and a
+    SUPERSET of it otherwise, and :func:`expression_definitely_deselects` is
+    monotone in its marker set.  ALL, not ANY — across both tiers and
     across every target — a single target (or a single item within a target)
     that still collects means the file-scoped run is not empty.  The
     EXPRESSION is returned rather than a bool so the caller can name it in the
@@ -564,7 +881,7 @@ def deselecting_expression_for_targets(
         return None
     for target in targets:
         source = read_source(target)
-        if expression_definitely_deselects(expr, module_level_marker_names(source)):
+        if expression_definitely_deselects(expr, guaranteed_marker_names(source)):
             continue
         item_markers = per_item_marker_names(source)
         if not item_markers:

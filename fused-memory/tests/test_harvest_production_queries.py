@@ -184,6 +184,126 @@ def _standard_journal(tmp_path: Path) -> Path:
     return _build_journal(tmp_path / 'journal.db', rows)
 
 
+# ---------------------------------------------------------------------------
+# Read-only connection proxies
+# ---------------------------------------------------------------------------
+# Inert scaffolding: these classes carry NO assertions of their own.  They are
+# an injection seam that lets a test observe HOW `harvest()` consumes its scan
+# cursor, or make ONE specific statement fail while every other statement runs
+# for real against the synthetic journal.
+#
+# `_connect_readonly` is already treated as a public-to-tests seam by
+# `TestReadOnlyAccess`, which calls it directly, so patching it introduces no
+# new coupling.
+
+
+class _CursorProxy:
+    """A real cursor with `fetchall()` forbidden and iteration left intact.
+
+    `fetchone` DELEGATES rather than raising, deliberately: the schema probe
+    in `harvest()` legitimately calls it.  Blocking everything would drag the
+    probe into the streaming contract this exists to pin, so the guard names
+    exactly one property -- the SCAN is streamed -- and nothing more.
+
+    `fail_after_rows` is the MID-ITERATION seam: the cursor yields that many
+    real rows and then raises `exc` from the NEXT `next()`.  An `execute()`
+    failure cannot reach that path at all -- no row has been yielded yet --
+    so it is the only way to pin a failure that surfaces mid-scan.
+    """
+
+    def __init__(
+        self,
+        cursor,
+        *,
+        fail_after_rows: int | None = None,
+        exc: BaseException | None = None,
+    ):
+        self._cursor = cursor
+        self._fail_after_rows = fail_after_rows
+        self._exc = exc
+
+    def __iter__(self):
+        if self._fail_after_rows is None:
+            return iter(self._cursor)
+        return self._iter_then_fail()
+
+    def _iter_then_fail(self):
+        # Raises UNCONDITIONALLY once the row budget is spent OR the real rows
+        # run out, so a short journal cannot silently skip the injection.
+        assert self._exc is not None, 'fail_after_rows requires exc'
+        budget = self._fail_after_rows
+        assert budget is not None
+        for yielded, row in enumerate(self._cursor):
+            if yielded >= budget:
+                break
+            yield row
+        raise self._exc
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def fetchall(self):
+        raise AssertionError('harvest must stream the scan cursor, not materialize it')
+
+
+class _ConnectionProxy:
+    """A real connection that hands out `_CursorProxy` cursors.
+
+    `fail_on` is an optional predicate over the SQL string; when it matches,
+    `exc` is raised INSTEAD of executing.  That is what lets a test fail
+    exactly one statement -- the `write_ops` scan -- while the schema probe
+    and every PRAGMA still run for real.
+
+    `fail_after_rows` moves that same injection from `execute()` to the
+    matched statement's ITERATION: the statement succeeds and `exc` lands
+    mid-scan instead, after the given number of real rows.
+    """
+
+    def __init__(
+        self,
+        con,
+        *,
+        fail_on=None,
+        exc: BaseException | None = None,
+        fail_after_rows: int | None = None,
+    ):
+        self._con = con
+        self._fail_on = fail_on
+        self._exc = exc
+        self._fail_after_rows = fail_after_rows
+
+    def execute(self, *args, **kwargs):
+        if self._fail_on is not None and args and self._fail_on(args[0]):
+            # `fail_on` is never passed without `exc`; the check narrows
+            # `_exc` for the type checker rather than adding a contract.
+            assert self._exc is not None, 'fail_on requires exc'
+            if self._fail_after_rows is None:
+                raise self._exc
+            return _CursorProxy(
+                self._con.execute(*args, **kwargs),
+                fail_after_rows=self._fail_after_rows,
+                exc=self._exc,
+            )
+        return _CursorProxy(self._con.execute(*args, **kwargs))
+
+    def close(self):
+        self._con.close()
+
+
+def _patch_connect(monkeypatch, mod, factory):
+    """Route `mod._connect_readonly` through `factory(real_connection)`.
+
+    monkeypatch restores the real callable on teardown, so the seam is not
+    left patched for the next test in the worker.
+    """
+    real = mod._connect_readonly
+
+    def _connect(db_path, *args, **kwargs):
+        return factory(real(db_path, *args, **kwargs))
+
+    monkeypatch.setattr(mod, '_connect_readonly', _connect)
+
+
 class TestHarvestSelectsOnlySearchOps:
     """Only `operation='search'` rows carrying query text are counted."""
 
@@ -474,6 +594,42 @@ class TestPinnedTail:
             mod.harvest(db, pin_tail_texts=['a query nobody ever ran'])
 
 
+class TestTheScanIsStreamed:
+    """The `write_ops` scan is consumed row-by-row, never materialized.
+
+    Not a style preference -- a measured cost.  The module docstring frames
+    the journal as multi-gigabyte (measured at 15,422,816,256 bytes) and the
+    committed sidecar records 431,621 search ops, so a `.fetchall()` on the
+    scan is a multi-hundred-MB peak allocation for a stream of `params` JSON
+    blobs that is consumed exactly once, into a Counter.  Nothing downstream
+    ever indexes the list.
+
+    "Consumed streaming, never materialized" has no direct observable in the
+    result value, and a memory-watermark assertion would be flaky under
+    `-n auto --dist loadgroup`.  So the property is pinned behaviourally:
+    forbid `.fetchall()` on the scan cursor while still requiring the harvest
+    to measure correctly.
+    """
+
+    def test_the_search_scan_is_streamed_not_materialized(self, tmp_path, monkeypatch):
+        mod = _mod()
+        db = _standard_journal(tmp_path)
+        _patch_connect(monkeypatch, mod, _ConnectionProxy)
+
+        # The AssertionError from `_CursorProxy.fetchall` is not a
+        # `sqlite3.Error`, so it propagates rather than being swallowed and
+        # relabelled by the scan's error handler.
+        result = mod.harvest(db, tail_sample=5)
+
+        # Streaming must not cost accuracy: the same hand-computable shares
+        # `_standard_journal` is built for.
+        assert result.total_search_ops == 200
+        assert result.literal_share == 0.60
+        assert result.tail_share == 0.20
+        tail_rows = [r for r in result.rows if r['source'] == 'production_tail']
+        assert len(tail_rows) == 5
+
+
 class TestReadOnlyAccess:
     """The live journal is a 10 GB file a running server is writing to."""
 
@@ -483,6 +639,30 @@ class TestReadOnlyAccess:
         con = mod._connect_readonly(db)
         try:
             assert con.execute('PRAGMA query_only').fetchone()[0] == 1
+        finally:
+            con.close()
+
+    def test_the_read_only_connection_carries_an_explicit_busy_timeout(self, tmp_path):
+        """A read that WAITS beats a read that refuses.
+
+        The journal is a live multi-gigabyte file a running fused-memory
+        server is appending to, so lock contention is the expected case, not
+        an exceptional one.  The busy timeout is what makes the reader wait
+        out a writer's lock instead of refusing -- and, before this change
+        set, `database is locked` was reported as a missing table.
+
+        The `> 5000` assertion is load-bearing and must not be dropped: 5000
+        is sqlite3's IMPLICIT default (measured on the pre-change code), so a
+        constant of 5.0 would let the equality assertion pass without any
+        `timeout=` ever being passed.
+        """
+        mod = _mod()
+        db = _standard_journal(tmp_path)
+        con = mod._connect_readonly(db)
+        try:
+            busy_timeout = con.execute('PRAGMA busy_timeout').fetchone()[0]
+            assert busy_timeout == int(mod.JOURNAL_CONNECT_TIMEOUT * 1000)
+            assert busy_timeout > 5000
         finally:
             con.close()
 
@@ -508,6 +688,105 @@ class TestReadOnlyAccess:
         before = hashlib.sha256(db.read_bytes()).hexdigest()
         mod.harvest(db)
         assert hashlib.sha256(db.read_bytes()).hexdigest() == before
+
+
+class TestTheJournalPathIsRepoRelative:
+    """A published artifact must not name somebody's home directory.
+
+    An absolute checkout path is neither reproducible nor readable by anyone
+    else, and it leaks the worktree the run happened in -- the rule
+    `fused-memory/scripts/bake_off_storage_shape.py::fixture_digests`
+    already states.
+
+    Both tests patch `mod._REPO_ROOT`, a module global `_repo_relative` reads
+    at call time, so the property is pinned without depending on the
+    filesystem layout the suite happens to run under.
+    """
+
+    def test_a_journal_under_the_repo_root_is_recorded_repo_relative(
+        self, tmp_path, monkeypatch
+    ):
+        mod = _mod()
+        db = _standard_journal(tmp_path)
+        # Move it under a `data/` subdir so the relative value has structure.
+        nested = tmp_path / 'data'
+        nested.mkdir()
+        db = db.rename(nested / 'j.db')
+        # Resolve BOTH sides: `_repo_relative` resolves its input, so an
+        # unresolved anchor would spuriously fail behind a symlinked tmpdir.
+        monkeypatch.setattr(mod, '_REPO_ROOT', tmp_path.resolve())
+
+        result = mod.harvest(db, tail_sample=5)
+
+        assert result.journal_path == 'data/j.db'
+        assert not Path(result.journal_path).is_absolute()
+        # The sidecar is what actually gets published, so pin it too.
+        assert result.provenance()['journal_path'] == 'data/j.db'
+
+    def test_a_journal_genuinely_outside_the_repo_root_stays_absolute(
+        self, tmp_path, monkeypatch
+    ):
+        """The fallback is ABSOLUTE, not a bare filename.
+
+        This is the regression guard against over-relativizing: a journal
+        parked outside the tree is genuinely checkout-independent and must
+        stay identifiable.  It distinguishes the census-shaped helper (which
+        this uses) from the bake-off one, whose fallback is `resolved.name`.
+        """
+        mod = _mod()
+        db = _standard_journal(tmp_path)
+        monkeypatch.setattr(mod, '_REPO_ROOT', (tmp_path / 'somewhere_else').resolve())
+
+        result = mod.harvest(db, tail_sample=5)
+
+        assert Path(result.journal_path).is_absolute()
+        assert Path(result.journal_path).name == 'journal.db'
+
+
+class TestTheCommittedArtifactsCarryNoAbsolutePath:
+    """The published artifacts must not name anyone's home directory either.
+
+    NEW coverage: nothing anywhere read
+    `fixtures/production_query_sample.provenance.json` from disk, so the leak
+    was entirely unguarded.  Pure file reads -- no network, no Qdrant, no
+    OPENAI_API_KEY -- so this stays inside the lane discipline stated in this
+    module's header docstring.
+    """
+
+    def test_the_committed_sidecar_records_a_repo_relative_journal_path(self):
+        import json  # noqa: PLC0415
+
+        sidecar = FIXTURES_DIR / 'production_query_sample.provenance.json'
+        value = json.loads(sidecar.read_text(encoding='utf-8'))['journal_path']
+
+        assert not Path(value).is_absolute()
+        assert '/home/' not in value
+        # So the guard cannot be satisfied by blanking the field.
+        assert value.endswith('write_journal.db')
+
+    def test_the_committed_selection_report_carries_the_same_relative_path(self):
+        """Pins the PROPAGATION path, which is otherwise invisible.
+
+        `read_transform_selection.py` copies sidecar keys into
+        `block['harvest']` through a key-name whitelist guarded by
+        `if key in sidecar`, so a silent divergence between the two committed
+        artifacts would produce no error anywhere.
+
+        The report's absence is ASSERTED, not skipped: it is tracked in the
+        repo and present in every normal checkout, so a skip would let the
+        guard evaporate silently the moment the artifact is deleted, renamed
+        or moved -- the silently-empty measurement this module's header
+        docstring ("READ-ONLY, LOUDLY") rejects everywhere else.
+        """
+        import json  # noqa: PLC0415
+
+        report = Path(__file__).parents[2] / 'plans' / 'read-transform-selection-report.json'
+        assert report.exists(), f'published selection report is missing: {report}'
+        sidecar = FIXTURES_DIR / 'production_query_sample.provenance.json'
+
+        expected = json.loads(sidecar.read_text(encoding='utf-8'))['journal_path']
+        published = json.loads(report.read_text(encoding='utf-8'))
+        assert published['production_queries']['harvest']['journal_path'] == expected
 
 
 class TestLoudDegradation:
@@ -557,6 +836,135 @@ class TestLoudDegradation:
         with pytest.raises(mod.EmptyHarvestError):
             mod.main(['--journal', str(db), '--out', str(out)])
         assert not out.exists()
+
+
+class TestTheRefusalNamesTheRealFailure:
+    """A refusal must be named ACCURATELY, not merely loudly.
+
+    This module's whole posture is that an unreadable journal raises a NAMED
+    error rather than returning an empty sample (module docstring, "READ-ONLY,
+    LOUDLY").  Yet every `sqlite3.Error` from the scan was relabelled as a
+    schema fault: `database is locked` -- the single most likely failure
+    against a journal a running server is writing to -- was reported as
+    `has no readable write_ops table`, sending an operator to diagnose a
+    missing table that is right there.
+
+    These tests close that contradiction from both sides: the injected
+    failures must stop claiming a schema fault, and a GENUINELY absent
+    `write_ops` table must still say so.
+    """
+
+    # The scan is the only statement that reads FROM write_ops; the schema
+    # probe reads FROM sqlite_master, so this predicate fails exactly the
+    # scan and lets every other statement run for real.
+    _SCAN = staticmethod(lambda sql: 'FROM write_ops' in sql)
+
+    def _harvest_with_scan_error(self, tmp_path, monkeypatch, exc, *, after_rows=None):
+        import functools  # noqa: PLC0415
+
+        mod = _mod()
+        db = _standard_journal(tmp_path)
+        _patch_connect(
+            monkeypatch,
+            mod,
+            functools.partial(
+                _ConnectionProxy,
+                fail_on=self._SCAN,
+                exc=exc,
+                fail_after_rows=after_rows,
+            ),
+        )
+        return mod, db
+
+    def test_a_lock_contention_error_is_not_reported_as_a_missing_table(
+        self, tmp_path, monkeypatch
+    ):
+        import sqlite3  # noqa: PLC0415
+
+        import pytest  # noqa: PLC0415
+
+        injected = sqlite3.OperationalError('database is locked')
+        mod, db = self._harvest_with_scan_error(tmp_path, monkeypatch, injected)
+        with pytest.raises(mod.JournalUnavailableError) as exc:
+            mod.harvest(db)
+        msg = str(exc.value)
+        assert 'database is locked' in msg
+        # The load-bearing assertion: the pre-change message satisfied the
+        # first one too, as `<path> has no readable write_ops table: database
+        # is locked`.
+        assert 'write_ops table' not in msg
+        assert exc.value.__cause__ is injected
+
+    def test_a_disk_io_error_is_not_reported_as_a_missing_table(
+        self, tmp_path, monkeypatch
+    ):
+        import sqlite3  # noqa: PLC0415
+
+        import pytest  # noqa: PLC0415
+
+        injected = sqlite3.OperationalError('disk I/O error')
+        mod, db = self._harvest_with_scan_error(tmp_path, monkeypatch, injected)
+        with pytest.raises(mod.JournalUnavailableError) as exc:
+            mod.harvest(db)
+        msg = str(exc.value)
+        assert 'disk I/O error' in msg
+        assert 'write_ops table' not in msg
+        assert exc.value.__cause__ is injected
+
+    def test_a_disk_io_error_MID_SCAN_is_still_named(self, tmp_path, monkeypatch):
+        """The guard must wrap the LOOP, not just the `execute()` call.
+
+        Streaming MOVED the point of failure, which is the whole reason
+        `harvest()` keeps `except sqlite3.Error` around the entire scan loop:
+        a `disk I/O error` can now surface on any `next()`, after rows have
+        already been consumed.  Both sibling tests raise from `execute()`,
+        i.e. before the first row, so narrowing the guard to the `execute()`
+        call alone would leave them GREEN while letting a mid-scan sqlite
+        failure escape raw and unnamed -- verified: that narrowing passes the
+        whole file without this test.
+
+        Same three assertions as its `execute()`-time sibling, from
+        mid-iteration instead.
+        """
+        import sqlite3  # noqa: PLC0415
+
+        import pytest  # noqa: PLC0415
+
+        injected = sqlite3.OperationalError('disk I/O error')
+        mod, db = self._harvest_with_scan_error(
+            tmp_path, monkeypatch, injected, after_rows=1
+        )
+        with pytest.raises(mod.JournalUnavailableError) as exc:
+            mod.harvest(db)
+        msg = str(exc.value)
+        assert 'disk I/O error' in msg
+        assert 'write_ops table' not in msg
+        assert exc.value.__cause__ is injected
+
+    def test_a_genuinely_absent_write_ops_table_still_says_so(self, tmp_path):
+        """Pins the wording that must SURVIVE.
+
+        Without this, the two tests above could be greened by simply deleting
+        the schema-fault message -- trading one inaccurate refusal for
+        another.  The cause chain is `None` here because nothing raised: an
+        empty probe is a READING, not a failure.
+        """
+        import sqlite3  # noqa: PLC0415
+
+        import pytest  # noqa: PLC0415
+
+        mod = _mod()
+        db = tmp_path / 'wrong.db'
+        con = sqlite3.connect(str(db))
+        con.execute('CREATE TABLE other (id TEXT)')
+        con.commit()
+        con.close()
+        with pytest.raises(mod.JournalUnavailableError) as exc:
+            mod.harvest(db)
+        msg = str(exc.value)
+        assert 'write_ops' in msg
+        assert str(db) in msg
+        assert exc.value.__cause__ is None
 
 
 class TestFixtureWrite:

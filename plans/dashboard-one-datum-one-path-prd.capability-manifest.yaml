@@ -1,0 +1,235 @@
+prd: plans/dashboard-one-datum-one-path-prd.md
+schema_version: 1
+tasks:
+- label: α
+  task_id: 5585
+  title: Datum envelope, TaskCensus + views, generated task vocabulary + parity test
+  capabilities:
+  - name: build-census-partition
+    binding: field-population — census.py::build_census yields views in_flight/backlog/terminal
+      partitioning shared.task_statuses.TaskStatus and sub_views.running ⊆ in_flight
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def build_census
+      paths:
+      - dashboard/src/dashboard/data/census.py
+      expect: present
+  - name: datum-envelope-validator
+    binding: field-population — datum.py declares the Datum envelope and its invariants,
+      validated at shaping
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def validate_datum
+      paths:
+      - dashboard/src/dashboard/data/datum.py
+      expect: present
+  - name: generated-task-vocab
+    binding: capability→producer (wired) — scripts/gen_dashboard_task_vocab.py renders
+      static/redux/task_vocab.js; parity test in tests/scripts/ per the render_systemd_unit
+      precedent
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: DF_TASK_VOCAB
+      paths:
+      - dashboard/src/dashboard/static/redux/task_vocab.js
+      expect: present
+- label: α2
+  task_id: 5586
+  title: Extract the touched handlers and the two background loops from app.py
+  capabilities:
+  - name: loops-module
+    binding: capability→producer (wired) — _burndown_loop and _metrics_loop move to
+      dashboard/src/dashboard/loops.py unchanged
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def _burndown_loop
+      paths:
+      - dashboard/src/dashboard/loops.py
+      expect: present
+  - name: healthz-probe-keeps-raw-fetch
+    binding: rejection-mechanism — app.py::_fanout_probe_completion still calls the
+      raw uncached fetch; decision 17 exemption
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: behavioural property of the probe, verified by ι's access-path check
+        exemption
+- label: β
+  task_id: 5587
+  title: One task snapshot unit on /tasks; /orchestrators loses summary
+  capabilities:
+  - name: task-snapshot-unit
+    binding: capability→producer (wired) — task_snapshot.py acquires paged status
+      map + active rows as one cached unit; DAG-direction α, α2 upstream
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def acquire_snapshot
+      paths:
+      - dashboard/src/dashboard/data/task_snapshot.py
+      expect: present
+  - name: stale-on-transient
+    binding: field-population — last-good unit served with state=stale and reason
+      on a failed refresh (sketch 13)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: exercised by β's own test and ι's boundary suite, not a stable grep
+  - name: orchestrators-summary-removed
+    binding: rejection-mechanism — discover_orchestrators no longer fetches tasks
+      or emits summary
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: an expect:absent grep would false-positive on prose naming the retired
+        key
+- label: γ1
+  task_id: 5588
+  title: Shared components render a Datum; registry with receipt metadata
+  capabilities:
+  - name: components-take-datum
+    binding: capability→producer (wired) — StatTile/ST/ProjectGroup pips/LocksCell
+      accept a Datum; non-Datum throws under the node harness
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: JSX render behaviour, exercised by tests/js and ι
+  - name: registry-receipt-metadata
+    binding: capability→producer (wired) — data.js attaches _served_at/_received_at
+      at apply time; endpoint freshness stays with endpoint_staleness.js
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _received_at
+      paths:
+      - dashboard/src/dashboard/static/redux/data.js
+      expect: present
+- label: γ2
+  task_id: 5589
+  title: Orchestrators tab, Overview and app chrome consume the census views
+  capabilities:
+  - name: zero-over-one-cannot-render
+    binding: rejection-mechanism — o.summary and total||1 gone; sketch 1–3 fixtures
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: JSX render assertion, exercised by ι
+- label: γ3
+  task_id: 5590
+  title: Tasks tab and PRD boxes consume the census; on-demand terminal fetch; bucketers
+    deleted; 4416 landed
+  capabilities:
+  - name: task-status-counts-and-pins-deleted
+    binding: rejection-mechanism — task_status_counts.js and its four pins removed
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: deletion; an expect:absent grep would false-positive on prose
+- label: δ1
+  task_id: 5591
+  title: Burndown sampler consumes the snapshot unit; gap rows; nullable member columns
+  capabilities:
+  - name: in-progress-rows-column
+    binding: field-population — snapshot row stores in_progress_rows beside the nine
+      census members; live + stranded == in_progress_rows
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: in_progress_rows
+      paths:
+      - dashboard/src/dashboard/data/burndown.py
+      expect: present
+  - name: gap-row-on-failure
+    binding: field-population — a failed acquisition writes state='gap' with reason
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: exercised against a fixture store by δ1's test and ι
+- label: δ2
+  task_id: 5592
+  title: Carry-last aggregate, staleness on the wire, parity/forecast over measured
+    rows
+  capabilities:
+  - name: carry-last-aggregate
+    binding: capability→producer — shape_burndown carries each project's last measured
+      row forward; parity/forecast read measured rows only; ragged test updated
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: behavioural, exercised by test_redux_api and ι sketch 7
+- label: ε1
+  task_id: 5593
+  title: Window echo, per-tab chip validation, labels from payload, recent merges
+    follow the chip
+  capabilities:
+  - name: window-echo
+    binding: capability→producer — every windowed payload carries WINDOW {requested,
+      served, days}
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: exercised by ε1's tests and ι sketch 8
+- label: ε2
+  task_id: 5594
+  title: Performance wall-clock cutoff + idle state; model-role bound semantics
+  capabilities:
+  - name: single-cutoff-convention
+    binding: capability→producer — _project_cutoffs removed; idle projects render
+      stale
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: behavioural; exercised by ε2's tests
+- label: ζ
+  task_id: 5595
+  title: Merge attempts one datum; live In-queue-now with sampled history; task_lookup
+    datum
+  capabilities:
+  - name: task-lookup-datum
+    binding: capability→producer (wired) — task_lookup.py resolves ids from snapshot
+      rows first, per-id get_task for misses; load_task_titles removed
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def lookup_tasks
+      paths:
+      - dashboard/src/dashboard/data/task_lookup.py
+      expect: present
+- label: η
+  task_id: 5596
+  title: Escalations one corpus walk; complete classes; cards read task_lookup
+  capabilities:
+  - name: single-corpus-loader
+    binding: capability→producer — one root+archive loader with location field and
+      one cache feeds escalations.py and escalation_analytics.py
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: import-topology property judged by η's tests and ι sketch 10
+- label: θ
+  task_id: 5597
+  title: Memory ops one query; queue normaliser; recon rule; single lock classifier
+  capabilities:
+  - name: single-lock-classifier
+    binding: capability→producer — cellStateFor calls lockChipState; offline project
+      yields unknown Locks datum
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: JSX behaviour, exercised by θ's tests and ι sketch 12
+- label: ι
+  task_id: 5598
+  title: Integration gate — AST access-path check, old-path census, boundary suite,
+    cold-render measurement
+  capabilities:
+  - name: boundary-suite-green
+    binding: DAG-direction — every producer upstream; the task IS the suite; no downstream
+      consumer to gate
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the task is the check suite; nothing downstream consumes it

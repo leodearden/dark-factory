@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from dashboard.app import _parse_window
+from dashboard.api.window import _parse_window
 from dashboard.data import redux_api
 
 # ---------------------------------------------------------------------------
@@ -69,7 +69,7 @@ def test_health_endpoint(client):
 def test_orchestrators_returns_orchestrators_and_projects(client):
     """Even with no running orchestrators the response carries both keys."""
     with patch(
-        'dashboard.app.discover_orchestrators',
+        'dashboard.api.orchestrators.discover_orchestrators',
         new=AsyncMock(return_value=[]),
     ):
         resp = client.get('/api/v2/dashboard/orchestrators')
@@ -85,7 +85,7 @@ def test_orchestrators_returns_orchestrators_and_projects(client):
 
 def test_tasks_endpoint_omits_file_locks_and_returns_active_only(client):
     with patch(
-        'dashboard.app.collect_tasks_with_counts',
+        'dashboard.api.tasks.collect_tasks_with_counts',
         new=AsyncMock(return_value=([], [], {}, [], [])),
     ):
         resp = client.get('/api/v2/dashboard/tasks')
@@ -106,7 +106,7 @@ def test_tasks_endpoint_omits_file_locks_and_returns_active_only(client):
 def test_tasks_endpoint_includes_done_counts(client):
     """DONE_COUNTS payload carries the per-project done count from collect_tasks_with_counts."""
     with patch(
-        'dashboard.app.collect_tasks_with_counts',
+        'dashboard.api.tasks.collect_tasks_with_counts',
         new=AsyncMock(return_value=([], [], {'dark-factory': 7}, [], [])),
     ):
         resp = client.get('/api/v2/dashboard/tasks')
@@ -118,7 +118,7 @@ def test_tasks_endpoint_includes_done_counts(client):
 def test_tasks_surfaces_offline_marker_when_mcp_unreachable(client):
     """When the tasks collector reports offline projects, the payload sets ``offline=True``."""
     with patch(
-        'dashboard.app.collect_tasks_with_counts',
+        'dashboard.api.tasks.collect_tasks_with_counts',
         new=AsyncMock(return_value=([], ['dark-factory'], {}, [], [])),
     ):
         resp = client.get('/api/v2/dashboard/tasks')
@@ -146,7 +146,7 @@ def test_tasks_endpoint_passes_resolve_external_true_and_forwards_external_deps(
     }
     mock = AsyncMock(return_value=([mock_row], [], {}, [], []))
 
-    with patch('dashboard.app.collect_tasks_with_counts', new=mock):
+    with patch('dashboard.api.tasks.collect_tasks_with_counts', new=mock):
         resp = client.get('/api/v2/dashboard/tasks')
 
     assert resp.status_code == 200
@@ -187,7 +187,7 @@ def test_tasks_endpoint_passes_max_cancelled_per_project(client):
 
     mock = AsyncMock(return_value=([], [], {}, [], []))
 
-    with patch('dashboard.app.collect_tasks_with_counts', new=mock):
+    with patch('dashboard.api.tasks.collect_tasks_with_counts', new=mock):
         resp = client.get('/api/v2/dashboard/tasks')
 
     assert resp.status_code == 200
@@ -247,8 +247,8 @@ def _tasks_body(
             list(degraded_projects), list(count_unknown_projects),
         )
     )
-    with patch('dashboard.app.collect_tasks_with_counts', new=collector), patch(
-        'dashboard.app._all_project_roots', new=lambda config: _fake_roots(total_roots)
+    with patch('dashboard.api.tasks.collect_tasks_with_counts', new=collector), patch(
+        'dashboard.api.tasks._all_project_roots', new=lambda config: _fake_roots(total_roots)
     ):
         resp = client.get('/api/v2/dashboard/tasks')
     assert resp.status_code == 200
@@ -439,8 +439,8 @@ def test_merge_queue_uses_24h_recent_window(client):
     the JSON payload (it returns an empty MERGE_QUEUE map regardless of window)."""
     mock_build = AsyncMock(return_value={})
     with (
-        patch('dashboard.app.build_per_project_merge_queue', new=mock_build),
-        patch('dashboard.app.get_merge_halt_status', new=AsyncMock(return_value=None)),
+        patch('dashboard.api.merge_queue.build_per_project_merge_queue', new=mock_build),
+        patch('dashboard.api.merge_queue.get_merge_halt_status', new=AsyncMock(return_value=None)),
     ):
         resp = client.get('/api/v2/dashboard/merge-queue')
     assert resp.status_code == 200
@@ -604,8 +604,8 @@ def test_burndown_route_threads_shared_now_to_all_aggregates(client):
     })
 
     with (
-        patch('dashboard.app.aggregate_burndown_projects', new=mock_projects),
-        patch('dashboard.app.aggregate_burndown_series', new=mock_series),
+        patch('dashboard.api.burndown.aggregate_burndown_projects', new=mock_projects),
+        patch('dashboard.api.burndown.aggregate_burndown_series', new=mock_series),
     ):
         resp = client.get('/api/v2/dashboard/burndown?window=30d')
 
@@ -650,10 +650,10 @@ _EMPTY_QUEUES = {
 def test_escalations_endpoint_returns_escalations_block(client):
     """GET /api/v2/dashboard/escalations returns 200 with ESCALATIONS key."""
     with patch(
-        'dashboard.app.build_escalation_queues',
+        'dashboard.api.escalations.build_escalation_queues',
         return_value=_EMPTY_QUEUES,
     ), patch(
-        'dashboard.app.fetch_tasks',
+        'dashboard.api.escalations.fetch_tasks',
         new=AsyncMock(return_value=[]),
     ):
         resp = client.get('/api/v2/dashboard/escalations')
@@ -668,7 +668,7 @@ def test_escalations_endpoint_returns_escalations_block(client):
 
 def test_escalations_endpoint_attaches_task_cards_and_resolves_recon(client, tmp_path):
     """Full endpoint→shaper integration: task attachment + reconciliation resolution."""
-    from dashboard.app import _task_cards_cache_clear
+    from dashboard.api.escalations import _task_cards_cache_clear
     _task_cards_cache_clear()
 
     proj_a = tmp_path / 'projA'
@@ -708,10 +708,10 @@ def test_escalations_endpoint_attaches_task_cards_and_resolves_recon(client, tmp
     }
 
     with patch(
-        'dashboard.app.build_escalation_queues',
+        'dashboard.api.escalations.build_escalation_queues',
         return_value=queues,
     ), patch(
-        'dashboard.app.fetch_tasks',
+        'dashboard.api.escalations.fetch_tasks',
         new=AsyncMock(return_value=[task_dict]),
     ):
         resp = client.get('/api/v2/dashboard/escalations')
@@ -738,7 +738,7 @@ def test_escalations_endpoint_attaches_task_cards_and_resolves_recon(client, tmp
 
 def test_load_task_cards_caches_within_ttl(client, tmp_path):
     """_load_task_cards: cache hit within TTL + offline result not cached."""
-    from dashboard.app import _task_cards_cache_clear
+    from dashboard.api.escalations import _task_cards_cache_clear
 
     proj_a = tmp_path / 'projA'
     orch_sub = {
@@ -765,8 +765,8 @@ def test_load_task_cards_caches_within_ttl(client, tmp_path):
     # Case 1: cache hit — second request should NOT call fetch_tasks again.
     _task_cards_cache_clear()
     mock_ft = AsyncMock(return_value=task_list)
-    with patch('dashboard.app.build_escalation_queues', return_value=one_orch_queues), \
-         patch('dashboard.app.fetch_tasks', new=mock_ft):
+    with patch('dashboard.api.escalations.build_escalation_queues', return_value=one_orch_queues), \
+         patch('dashboard.api.escalations.fetch_tasks', new=mock_ft):
         client.get('/api/v2/dashboard/escalations')
         client.get('/api/v2/dashboard/escalations')
     assert mock_ft.call_count == 1, f'expected 1 fetch_tasks call, got {mock_ft.call_count}'
@@ -774,8 +774,8 @@ def test_load_task_cards_caches_within_ttl(client, tmp_path):
     # Case 2: offline result NOT cached — each request should call fetch_tasks.
     _task_cards_cache_clear()
     mock_offline = AsyncMock(return_value={'offline': True, 'error': 'x'})
-    with patch('dashboard.app.build_escalation_queues', return_value=one_orch_queues), \
-         patch('dashboard.app.fetch_tasks', new=mock_offline):
+    with patch('dashboard.api.escalations.build_escalation_queues', return_value=one_orch_queues), \
+         patch('dashboard.api.escalations.fetch_tasks', new=mock_offline):
         r1 = client.get('/api/v2/dashboard/escalations')
         r2 = client.get('/api/v2/dashboard/escalations')
     assert r1.status_code == 200
@@ -785,8 +785,8 @@ def test_load_task_cards_caches_within_ttl(client, tmp_path):
 
 def test_load_task_cards_ttl_expiry(client, tmp_path):
     """_load_task_cards: after TTL expires, fetch_tasks is called again."""
-    import dashboard.app as app_module
-    from dashboard.app import _task_cards_cache_clear
+    import dashboard.api.escalations as escalations_module
+    from dashboard.api.escalations import _task_cards_cache_clear
 
     proj_a = tmp_path / 'projA'
     one_orch_queues = {
@@ -802,22 +802,22 @@ def test_load_task_cards_ttl_expiry(client, tmp_path):
                   'status': 'pending', 'priority': 'low', 'dependencies': [], 'metadata': {}}]
 
     _task_cards_cache_clear()
-    original_ttl = app_module._TASK_CARDS_TTL_SECONDS
+    original_ttl = escalations_module._TASK_CARDS_TTL_SECONDS
     mock_ft = AsyncMock(return_value=task_list)
     try:
-        with patch('dashboard.app.build_escalation_queues', return_value=one_orch_queues), \
-             patch('dashboard.app.fetch_tasks', new=mock_ft):
+        with patch('dashboard.api.escalations.build_escalation_queues', return_value=one_orch_queues), \
+             patch('dashboard.api.escalations.fetch_tasks', new=mock_ft):
             # First request: cache miss — fetch_tasks called once, result cached.
             client.get('/api/v2/dashboard/escalations')
             assert mock_ft.call_count == 1
 
             # Zero out TTL so the cached entry is immediately treated as expired.
-            app_module._TASK_CARDS_TTL_SECONDS = 0.0
+            escalations_module._TASK_CARDS_TTL_SECONDS = 0.0
 
             # Second request: TTL expired — fetch_tasks called again.
             resp = client.get('/api/v2/dashboard/escalations')
     finally:
-        app_module._TASK_CARDS_TTL_SECONDS = original_ttl
+        escalations_module._TASK_CARDS_TTL_SECONDS = original_ttl
 
     assert resp.status_code == 200
     assert mock_ft.call_count == 2, (
@@ -845,7 +845,7 @@ async def test_load_task_cards_single_flight_collapses_concurrent_cold_callers(
     """
     import asyncio
 
-    from dashboard.app import _load_task_cards, _task_cards_cache_clear
+    from dashboard.api.escalations import _load_task_cards, _task_cards_cache_clear
 
     # Case 1: single-flight collapse
     _task_cards_cache_clear()
@@ -862,7 +862,7 @@ async def test_load_task_cards_single_flight_collapses_concurrent_cold_callers(
         await release.wait()
         return list(task_list)
 
-    with patch('dashboard.app.fetch_tasks', new=AsyncMock(side_effect=slow_fetch_tasks)):
+    with patch('dashboard.api.escalations.fetch_tasks', new=AsyncMock(side_effect=slow_fetch_tasks)):
         tasks = [
             asyncio.create_task(_load_task_cards(dummy_client, dummy_config, '/proj/X'))
             for _ in range(3)
@@ -878,7 +878,7 @@ async def test_load_task_cards_single_flight_collapses_concurrent_cold_callers(
     # Case 2: offline result NOT cached — each direct call re-fetches.
     _task_cards_cache_clear()
     mock_offline = AsyncMock(return_value={'offline': True, 'error': 'x'})
-    with patch('dashboard.app.fetch_tasks', new=mock_offline):
+    with patch('dashboard.api.escalations.fetch_tasks', new=mock_offline):
         r1 = await _load_task_cards(dummy_client, dummy_config, '/proj/Y')
         r2 = await _load_task_cards(dummy_client, dummy_config, '/proj/Y')
 
@@ -886,9 +886,157 @@ async def test_load_task_cards_single_flight_collapses_concurrent_cold_callers(
     assert mock_offline.call_count == 2, f'expected 2 fetch_tasks calls, got {mock_offline.call_count}'
 
 
+# ---------------------------------------------------------------------------
+# task-4788: _load_task_cards whole-operation budget
+#
+# ``fetch_tasks``' own *timeout* is a PER-HTTP-REQUEST budget: it bounds
+# connect/read/write and pool acquisition and nothing else. The incident that
+# motivated these two tests hung inside httpcore's connection lock, where no
+# outbound socket is ever opened and that timeout never fires — so
+# /api/v2/dashboard/escalations wedged for 19.8 h with the per-request budget
+# fully in place. Only an enclosing ``asyncio.wait_for`` cancels that wait.
+#
+# Both hang stubs are ``await asyncio.Event().wait()`` on an event nothing
+# ever sets, deliberately NOT a sleep: a sleep shorter than the budget passes
+# against the pre-fix code too and would prove nothing. Since that would
+# otherwise hang pytest forever, each call is wrapped in a TEST-SIDE
+# ``wait_for(2.0)`` — 40x the monkeypatched 0.05 s budget, so it can only trip
+# on a real regression, never on scheduling jitter.
+# ---------------------------------------------------------------------------
+
+
+async def test_a_hanging_fetch_tasks_does_not_hang_load_task_cards(
+    monkeypatch, dummy_client, dummy_config, caplog
+):
+    """A fetch that never returns degrades to [] — loudly, and uncached.
+
+    The WARNING is asserted, not incidental: ``[]`` is exactly what an
+    ordinary empty result looks like, so the log line is the ONLY thing that
+    distinguishes "this project has no task cards" from "we ran out of budget
+    and never found out". Without it a timeout is invisible to an operator,
+    which is the 19.8 h failure mode in miniature.
+    """
+    import asyncio
+    import logging
+
+    import dashboard.api.escalations as _esc
+    from dashboard.api.escalations import _load_task_cards, _task_cards_cache_clear
+
+    # A warm entry would be served without ever reaching the hang.
+    _task_cards_cache_clear()
+
+    call_count = 0
+
+    async def hang_fetch_tasks(client, config, project_root):
+        nonlocal call_count
+        call_count += 1
+        await asyncio.Event().wait()  # nothing ever sets it
+
+    monkeypatch.setattr(_esc, '_TASK_CARDS_BUDGET', 0.05)
+
+    with (
+        patch('dashboard.api.escalations.fetch_tasks', new=hang_fetch_tasks),
+        caplog.at_level(logging.WARNING, logger='dashboard.api.escalations'),
+    ):
+        result = await asyncio.wait_for(
+            _load_task_cards(dummy_client, dummy_config, '/proj/HANG'),
+            timeout=2.0,
+        )
+        assert result == [], (
+            'the shape _load_task_cards already promises for an offline '
+            'marker or MCP failure — the escalation tab renders cardless '
+            'rather than hanging'
+        )
+        assert call_count == 1
+
+        # A timeout must not pin an empty card list for the TTL window:
+        # nothing was written to the cache, so the next poll re-attempts.
+        await asyncio.wait_for(
+            _load_task_cards(dummy_client, dummy_config, '/proj/HANG'),
+            timeout=2.0,
+        )
+    assert call_count == 2, (
+        'the second call must re-enter the stub — a timeout that cached its '
+        '[] would blank the tab for the whole TTL window'
+    )
+
+    warnings = [
+        r.getMessage() for r in caplog.records
+        if r.levelno >= logging.WARNING and r.name == 'dashboard.api.escalations'
+    ]
+    assert any('whole-operation budget' in m for m in warnings), (
+        f'no timeout WARNING was logged (records: {warnings}) — the returned '
+        '[] is indistinguishable from an ordinary empty result, so the log '
+        'line is the only operator-visible trace that the budget expired'
+    )
+    assert any('/proj/HANG' in m for m in warnings), (
+        f'the WARNING must name the project root that degraded: {warnings}'
+    )
+
+
+async def test_a_concurrent_task_cards_caller_on_the_same_root_is_bounded_too(
+    monkeypatch, dummy_client, dummy_config
+):
+    """Both callers are bounded, not just the one that wins the lock.
+
+    This pins the wrap PLACEMENT, mirroring the merge_queue.load_task_titles
+    test. ``TTLCache.get_or_refresh`` serializes cold callers for one key
+    behind a per-key lock and runs the refresh WHILE HOLDING it, so an
+    inner-only wrap would leave caller B queued UNBOUNDED for caller A's whole
+    budget and then running its own full-budget refresh — the pair costs 2x
+    the budget and N waiters cost N x. The dashboard polls every 3 s, so
+    waiters are the routine case, not a corner.
+    """
+    import asyncio
+
+    import dashboard.api.escalations as _esc
+    from dashboard.api.escalations import _load_task_cards, _task_cards_cache_clear
+
+    _task_cards_cache_clear()
+
+    async def hang_fetch_tasks(client, config, project_root):
+        await asyncio.Event().wait()
+
+    budget = 0.5
+    monkeypatch.setattr(_esc, '_TASK_CARDS_BUDGET', budget)
+    loop = asyncio.get_running_loop()
+
+    with patch('dashboard.api.escalations.fetch_tasks', new=hang_fetch_tasks):
+        started = loop.time()
+        results = await asyncio.wait_for(
+            asyncio.gather(*[
+                _load_task_cards(dummy_client, dummy_config, '/proj/SHARED')
+                for _ in range(2)
+            ]),
+            timeout=2.0,
+        )
+        elapsed = loop.time() - started
+
+    assert results == [[], []]
+    # The assertion is about SERIALIZATION, not merely about returning:
+    # an inner-only wrap costs 2 x budget here and scales with waiters.
+    #
+    # The budget is deliberately LARGE for a test whose subject is a timeout.
+    # It is not scaled because the operation needs 0.5 s — it is scaled so the
+    # assertion's ABSOLUTE jitter margin exceeds real-world event-loop
+    # scheduling, GC and pytest overhead. Correct behaviour (outer wrap) costs
+    # ~1x budget; the inner-only-wrap regression costs ~2x; 1.5x sits exactly
+    # midway, giving 0.25 s of slack on BOTH sides. At the original 0.05 s the
+    # discrimination was sound in ratio and worthless in absolute terms (50 ms
+    # of slack), and it flaked at ~4% per run. Do NOT shrink the budget back to
+    # "speed up the suite" — that silently reintroduces the flake.
+    assert elapsed < 1.5 * budget, (
+        f'two concurrent callers took {elapsed:.3f}s against a '
+        f'{1.5 * budget}s threshold (1.5 x the {budget}s per-call budget); '
+        f'the inner-only-wrap regression costs ~{2 * budget}s — that is the '
+        'serialized cost of an inner-only wrap; the wait_for must enclose '
+        'get_or_refresh so a caller QUEUED on the per-key lock is bounded too'
+    )
+
+
 def test_escalations_endpoint_multi_root_gather(client, tmp_path):
     """Endpoint fetches each orchestrator root separately and maps tasks to the right subsection."""
-    from dashboard.app import _task_cards_cache_clear
+    from dashboard.api.escalations import _task_cards_cache_clear
 
     _task_cards_cache_clear()
 
@@ -921,8 +1069,8 @@ def test_escalations_endpoint_multi_root_gather(client, tmp_path):
             return [task_b]
         return []
 
-    with patch('dashboard.app.build_escalation_queues', return_value=queues), \
-         patch('dashboard.app.fetch_tasks', side_effect=fetch_side_effect):
+    with patch('dashboard.api.escalations.build_escalation_queues', return_value=queues), \
+         patch('dashboard.api.escalations.fetch_tasks', side_effect=fetch_side_effect):
         resp = client.get('/api/v2/dashboard/escalations')
 
     assert resp.status_code == 200
@@ -1041,11 +1189,11 @@ def test_merge_queue_live_path_uses_live_entries(client):
         },
     }
     with (
-        patch('dashboard.app.build_per_project_merge_queue',
+        patch('dashboard.api.merge_queue.build_per_project_merge_queue',
               new=AsyncMock(return_value=_proj_raw([_EVENT_ENTRY]))),
-        patch('dashboard.app.get_merge_halt_status', new=AsyncMock(return_value={})),
-        patch('dashboard.app.load_task_titles', new=AsyncMock(return_value={})),
-        patch('dashboard.app.fetch_live_merge_queues', new=AsyncMock(return_value=live_map)),
+        patch('dashboard.api.merge_queue.get_merge_halt_status', new=AsyncMock(return_value={})),
+        patch('dashboard.api.merge_queue.load_task_titles', new=AsyncMock(return_value={})),
+        patch('dashboard.api.merge_queue.fetch_live_merge_queues', new=AsyncMock(return_value=live_map)),
     ):
         resp = client.get('/api/v2/dashboard/merge-queue')
 
@@ -1078,11 +1226,11 @@ def test_merge_queue_fallback_path_when_unreachable(client):
     """
     # fetch_live_merge_queues returns {} (no live data) → resolve_active falls back
     with (
-        patch('dashboard.app.build_per_project_merge_queue',
+        patch('dashboard.api.merge_queue.build_per_project_merge_queue',
               new=AsyncMock(return_value=_proj_raw([_EVENT_ENTRY]))),
-        patch('dashboard.app.get_merge_halt_status', new=AsyncMock(return_value={})),
-        patch('dashboard.app.load_task_titles', new=AsyncMock(return_value={})),
-        patch('dashboard.app.fetch_live_merge_queues', new=AsyncMock(return_value={})),
+        patch('dashboard.api.merge_queue.get_merge_halt_status', new=AsyncMock(return_value={})),
+        patch('dashboard.api.merge_queue.load_task_titles', new=AsyncMock(return_value={})),
+        patch('dashboard.api.merge_queue.fetch_live_merge_queues', new=AsyncMock(return_value={})),
     ):
         resp = client.get('/api/v2/dashboard/merge-queue')
 

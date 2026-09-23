@@ -22,12 +22,12 @@ convention with a REAL LandedOutbox on ``tmp_path`` so ``lookup()``/
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from orchestrator.delivered_checks import DeliveredChecksBlock
 from orchestrator.landed_outbox import LandedOutbox, LandedRow
 from orchestrator.merge_queue import reconcile_landed_task
 
@@ -50,6 +50,38 @@ def _fake_scheduler(*, get_status_result: str | None = None) -> MagicMock:
     scheduler.get_status = AsyncMock(return_value=get_status_result)
     scheduler.mark_done = AsyncMock()
     return scheduler
+
+
+_CHECK_SCRIPT_REL_PATH = 'scripts/capability_check.sh'
+_ABSENT_CAPABILITY_SCRIPT = '#!/bin/sh\nexit 1\n'
+
+
+def _absent_capability_check(name: str) -> dict:
+    """A ``metadata.delivered_checks`` entry naming :data:`_CHECK_SCRIPT_REL_PATH`.
+
+    Script kind rather than grep so the check runs against a plain temp
+    directory — no throwaway git repository is needed to make the real guard
+    reach a DEFINITIVE verdict, and the outcome is whatever
+    :func:`_write_check_script` wrote rather than a property of the ambient
+    filesystem.
+    """
+    return {
+        'name': name, 'kind': 'script', 'script': _CHECK_SCRIPT_REL_PATH,
+        'args': [], 'timeout_secs': 10,
+    }
+
+
+def _write_check_script(project_root: Path, body: str) -> None:
+    """Install an executable delivered-check script under *project_root*.
+
+    Mirrors test_delivered_check_gate_e2e.py's convention. The script kind
+    runs against the WORKING CHECKOUT, so writing the file is all that is
+    needed for the real ``gate_mark_done_on_delivered_checks`` to evaluate it.
+    """
+    target = project_root / _CHECK_SCRIPT_REL_PATH
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(body, encoding='utf-8')
+    os.chmod(target, 0o755)
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +315,12 @@ class TestReconcileLandedTaskDeliveredChecksWithheld:
     ``'stale_conflict'``, which DOES gate — a contested task under
     provenance-conflict arbitration must never dispatch (task 2677). Both
     contracts are pinned here so neither can drift into the other.
+
+    The withholding is DRIVEN, not asserted: a failing delivered check is
+    declared on the injected scheduler's task record and evaluated by the real
+    ``gate_mark_done_on_delivered_checks`` against ``project_root``, so the
+    test still reds if the guard stops being consulted from this path at all
+    (task 5027 γ4).
     """
 
     async def test_withheld_disposition_does_not_gate_dispatch(
@@ -298,22 +336,14 @@ class TestReconcileLandedTaskDeliveredChecksWithheld:
         scheduler.mark_done = AsyncMock()
         scheduler.get_task = AsyncMock(return_value={
             'id': 'Z',
-            'metadata': {'delivered_checks': [{
-                'name': 'cap-x', 'kind': 'grep',
-                'pattern': 'SomePattern', 'expect': 'present',
-            }]},
+            'metadata': {'delivered_checks': [_absent_capability_check('cap-x')]},
         })
+        _write_check_script(tmp_path, _ABSENT_CAPABILITY_SCRIPT)
 
-        with patch(
-            'orchestrator.merge_queue.gate_mark_done_on_delivered_checks',
-            AsyncMock(return_value=DeliveredChecksBlock(
-                reason='failed', main_sha='MAIN',
-            )),
-        ):
-            result = await reconcile_landed_task(
-                'Z', git_ops=git_ops, scheduler=scheduler, outbox=outbox,
-                project_root='/tmp/proj', check_timeout_secs=7.5,
-            )
+        result = await reconcile_landed_task(
+            'Z', git_ops=git_ops, scheduler=scheduler, outbox=outbox,
+            project_root=tmp_path, check_timeout_secs=7.5,
+        )
 
         assert result is False, 'a withholding must let the task re-dispatch'
         scheduler.mark_done.assert_not_called()

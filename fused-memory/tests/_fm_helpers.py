@@ -154,11 +154,21 @@ class MockAddEpisodeResult:
     'nodes' mirrors AddEpisodeResults.nodes (graphiti_core/graphiti.py:111) —
     the entity nodes this episode touched — consumed by the post-write
     node-dedup sweep (MemoryService._dedup_episode_nodes).
+
+    'episode' mirrors AddEpisodeResults.episode — the EpisodicNode that
+    graphiti_core actually minted and persisted (task 3561). It is the ONLY
+    place the real episode uuid is observable: the uuid the caller passes in
+    means "LOAD this existing episode", never "create under this uuid", so
+    MemoryService._execute_graphiti_write reads registration identity off
+    ``result.episode.uuid``. Defaults to None so the ~10 pre-existing users of
+    this dataclass are unaffected; tests that care about episode identity set
+    it to e.g. ``SimpleNamespace(uuid='real-uuid')``.
     """
 
     entity_edges: list[MockEdge] = field(default_factory=list)
     edges: list[MockEdge] = field(default_factory=list)
     nodes: list[MockNode] = field(default_factory=list)
+    episode: Any = None
 
     def __post_init__(self) -> None:
         if self.edges == [] and self.entity_edges:
@@ -1707,9 +1717,11 @@ def _warn_if_drain_closed_a_foreign_client(preexisting: weakref.WeakSet) -> None
 
 
 # ---------------------------------------------------------------------------
-# Non-package script loading — shared by test_sweep_toolcall_xml_leak.py and
-# test_toolcall_xml_leak_sweep_artifacts.py (task 3738; originally two
-# independent copies of the same loader).
+# Non-package script loading — the single loader for every test module that
+# imports a script by file path. Task 3738 hoisted it here out of two
+# independent copies; task 3895 migrated the 42 further copies that had
+# accumulated since, and tests/test_script_loader_routing_guard.py holds that
+# population at zero.
 # ---------------------------------------------------------------------------
 
 # sys.modules keys this helper itself installed. Only these may be REPLACED by

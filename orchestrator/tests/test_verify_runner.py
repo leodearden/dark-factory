@@ -14,6 +14,7 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import (
+    HEARTBEAT_STOP_JOIN_SECS,
     LocalRunner,
     MergeVerifySpec,
     RemoteRunner,
@@ -1792,7 +1793,6 @@ class TestDispatchStampsFlakeSuppressionRunner:
         from orchestrator import flake_recorder
         from orchestrator.verify_runner import VerifyRunnerPool
 
-        flake_recorder._merge_flake_suppression_streak = 0
         remote = self._runner(
             'remote-lab-1', is_local=False,
             result=self._result_with(_make_suppression(runner='local')),
@@ -1809,7 +1809,6 @@ class TestDispatchStampsFlakeSuppressionRunner:
         record.assert_not_called()
         # The pre-existing merge_verify telemetry is unaffected; nothing else is emitted.
         assert emitted == [EventType.merge_verify]
-        assert flake_recorder._merge_flake_suppression_streak == 0
 
 # ---------------------------------------------------------------------------
 # retry_scope_event_fields — merge_verify event honesty (task 2837, PRD D5)
@@ -2505,7 +2504,7 @@ class TestRunMergeVerifyOnWorktree:
             'host/gone': ModuleConfig(prefix='host/gone', test_command='STALE_HOST_TEST_2'),
         }
         caller_config._module_configs = host_modules
-        original_dict = caller_config._module_configs
+        original_dict = caller_config.module_configs_or_empty
         original_items = dict(host_modules)
 
         spec = MergeVerifySpec(
@@ -2526,15 +2525,15 @@ class TestRunMergeVerifyOnWorktree:
             run_scoped=run_scoped, run_unscoped=run_unscoped,
         )
 
-        assert caller_config._module_configs is original_dict, (
+        assert caller_config.module_configs_or_empty is original_dict, (
             'the caller\'s registry dict object must be untouched — the copy\'s '
             '_module_configs starts out as the SAME dict object, so an in-place '
             'mutation of the COPY reaches through that shared value and '
             'corrupts the caller\'s config'
         )
-        assert caller_config._module_configs == original_items, (
+        assert caller_config.module_configs_or_empty == original_items, (
             f'the caller\'s registry contents must be unchanged; got '
-            f'{set(caller_config._module_configs)!r}'
+            f'{set(caller_config.module_configs_or_empty)!r}'
         )
         # Sanity: the copy really did receive the spec's set, so the identity
         # assertion above is not passing vacuously against a no-op fix.
@@ -2625,6 +2624,186 @@ class TestRunMergeVerifyOnWorktree:
         assert effective_config.test_command == 'ORIG_TEST'
         assert effective_config.lint_command == 'ORIG_LINT'
         assert effective_config.type_check_command == 'ORIG_TYPE'
+
+    @staticmethod
+    def _host_config(**kwargs):
+        """A real (never MagicMock) host config on the merge-verify shape.
+
+        run_merge_verify_on_worktree calls a real ``model_copy``, and the whole
+        point of the verify_env merge is what the REAL config properties compute.
+        """
+        return OrchestratorConfig(
+            merge_verify_workspace=False, merge_verify_breadth='scoped', **kwargs
+        )
+
+    @staticmethod
+    async def _merge_verify_effective_config(config, spec_env, verify_commands=()):
+        """Run the merge-verify path; return what was threaded into run_scoped.
+
+        Returns ``(effective_config, module_configs)`` — ``run_scoped.await_args``
+        positions 1 and 2, the observation point the sibling 2822/2883/4536
+        override tests use.  ``verify_commands=()`` is the zero-module-config
+        project (reify), where no ModuleConfig is reconstructed at all.
+        """
+        from orchestrator.verify_runner import run_merge_verify_on_worktree
+
+        run_scoped = AsyncMock(return_value=_make_pass_result())
+        run_unscoped = AsyncMock(
+            return_value=MagicMock(
+                broken=False, timed_out=False,
+                failing_subprojects=[], timed_out_subprojects=[],
+            )
+        )
+        spec = MergeVerifySpec(
+            verify_commands=verify_commands,
+            unscoped_typecheck=UnscopedTypecheckSpec(commands=()),
+            task_files=('src/a/m.py',),
+            verify_env=dict(spec_env),
+            cold_timeout_secs=60.0,
+        )
+
+        await run_merge_verify_on_worktree(
+            MagicMock(), config, spec,
+            run_scoped=run_scoped, run_unscoped=run_unscoped,
+        )
+
+        assert run_scoped.await_args is not None
+        return run_scoped.await_args[0][1], run_scoped.await_args[0][2]
+
+    async def test_host_only_verify_env_key_survives_spec_merge(self):
+        """Both sides' keys reach the zero-module remote config at once.
+
+        Without the merge, spec.verify_env has NO consumer on this path (no
+        ModuleConfig is reconstructed), so the remote decides the merge under its
+        own config's test-selection env — the task-2822 false-green class.  With
+        a 'replace' spelling the host's own keys vanish instead.  The live
+        host-only class is the remote verify runner's own ``--config`` (reify
+        wires one at ``/home/leo/.config/orchestrator/reify-laptop.yaml``): the
+        16-thread laptop widens the ``REIFY_VERIFY_*_TIMEOUT`` budgets from
+        per-host measurements the workstation-built spec cannot know.
+        """
+        config = self._host_config(verify_env={'REIFY_VERIFY_TEST_TIMEOUT': '90m'})
+
+        effective_config, _ = await self._merge_verify_effective_config(
+            config, {'REIFY_RELEASE_DELTA_SKIP': '1'},
+        )
+
+        # Asserted together so neither the 'ignore' nor the 'replace' spelling
+        # can pass: both sides' keys must be present at once.
+        assert effective_config.verify_env['REIFY_VERIFY_TEST_TIMEOUT'] == '90m', (
+            'a host key absent from the spec must survive — the spec is dispatcher-shaped'
+        )
+        assert effective_config.verify_env['REIFY_RELEASE_DELTA_SKIP'] == '1', (
+            "the dispatcher's verify_env must reach the reconstructed remote config "
+            'even with zero module configs'
+        )
+
+    async def test_sccache_backend_env_reaches_zero_module_remote_config(self):
+        """The host side is read through ``effective_verify_env``, the PROPERTY.
+
+        Property and field differ exactly when the config was built directly
+        rather than through ``load_config`` (which folds the one into the
+        other): the shared sccache backend then lives ONLY in
+        ``sccache.backend_env``.  Reading the field would drop it from the
+        zero-module remote leg — the same κ fidelity hole
+        ``build_merge_verify_spec`` reads the property to close on the
+        producing side.
+        """
+        from orchestrator.config import SccacheConfig
+
+        config = self._host_config(
+            sccache=SccacheConfig(
+                enabled=True, backend_env={'SCCACHE_REDIS': 'redis://backend:6380'},
+            ),
+        )
+        assert 'SCCACHE_REDIS' not in config.verify_env  # the field read would miss it
+
+        effective_config, _ = await self._merge_verify_effective_config(
+            config, {'REIFY_RELEASE_DELTA_SKIP': '1'},
+        )
+
+        assert effective_config.verify_env['SCCACHE_REDIS'] == 'redis://backend:6380', (
+            'the shared sccache backend must reach the remote leg; it is absent '
+            'from both config.verify_env and spec.verify_env, so only the '
+            'effective_verify_env property carries it'
+        )
+        assert effective_config.verify_env['REIFY_RELEASE_DELTA_SKIP'] == '1'
+
+    async def test_caller_config_verify_env_is_not_mutated(self):
+        """The merge must REBIND a fresh dict, never mutate in place.
+
+        ``model_copy`` carries the field's VALUE over unchanged, so the copy's
+        ``verify_env`` is initially the SAME dict object as the caller's — the
+        identical hazard task 4536 records for the module registry. A
+        ``config.verify_env.update(...)`` spelling would reach through that
+        shared value and corrupt the CALLER's config, the object cli.py loaded
+        from disk and may still use.
+        """
+        caller_config = self._host_config(verify_env={'REIFY_VERIFY_TEST_TIMEOUT': '90m'})
+        original_dict = caller_config.verify_env
+        original_items = dict(caller_config.verify_env)
+
+        effective_config, _ = await self._merge_verify_effective_config(
+            caller_config, {'REIFY_RELEASE_DELTA_SKIP': '1'},
+        )
+
+        assert caller_config.verify_env is original_dict, (
+            "the caller's verify_env dict object must be untouched — the copy's "
+            'field starts out as the SAME dict object, so an in-place mutation '
+            "of the COPY reaches through and corrupts the caller's config"
+        )
+        assert caller_config.verify_env == original_items, (
+            f"the caller's verify_env contents must be unchanged; got "
+            f'{dict(caller_config.verify_env)!r}'
+        )
+        # Sanity: the copy really did receive the spec's key, so the identity
+        # assertion above is not passing vacuously against a no-op.
+        assert effective_config.verify_env['REIFY_RELEASE_DELTA_SKIP'] == '1'
+
+    async def test_zero_module_and_per_module_resolve_the_same_verify_env(self):
+        """Close the loop past the config field to the env actually handed to
+        verify commands: both paths must resolve the IDENTICAL mapping.
+
+        The defect was a config field populated with no consumer on one path, so
+        a test that only inspects the field would repeat the defect's own blind
+        spot. ``verify._resolve_verify_env`` is the sole builder of the executed
+        env and the real consumer is an AsyncMock here, so this asserts the
+        byte-identity claim rather than deriving it.
+        """
+        from orchestrator.verify import _resolve_verify_env
+
+        host_env = {
+            'REIFY_VERIFY_TEST_TIMEOUT': '90m',
+            'REIFY_GATE_EXCLUDE_HEAVY': '0',
+        }
+        spec_env = {
+            'REIFY_GATE_EXCLUDE_HEAVY': '1',
+            'REIFY_RELEASE_DELTA_SKIP': '1',
+        }
+
+        zero_config, zero_modules = await self._merge_verify_effective_config(
+            self._host_config(verify_env=dict(host_env)), spec_env,
+        )
+        assert zero_modules == []
+        zero_env = _resolve_verify_env(zero_config, None, role='merge')
+
+        per_config, per_modules = await self._merge_verify_effective_config(
+            self._host_config(verify_env=dict(host_env)), spec_env,
+            verify_commands=(VerifyCommand('src/a', test_command='true'),),
+        )
+        assert len(per_modules) == 1
+        per_env = _resolve_verify_env(per_config, per_modules[0], role='merge')
+
+        assert zero_env['REIFY_RELEASE_DELTA_SKIP'] == '1'
+        assert zero_env['REIFY_GATE_EXCLUDE_HEAVY'] == '1', 'the spec wins the conflict'
+        assert zero_env['REIFY_VERIFY_TEST_TIMEOUT'] == '90m', (
+            'the host-only key survives into the executed env'
+        )
+        assert zero_env == per_env, (
+            'the two paths must hand verify commands the IDENTICAL env — that '
+            'uniformity is what the fix buys, and it is the per-module path '
+            'that is unchanged'
+        )
 
     async def test_gate_broken_returns_sentinel_result(self):
         """When run_unscoped returns broken=True, result carries UNSCOPED_TYPECHECK_FAILED_CATEGORY."""
@@ -2983,8 +3162,8 @@ class TestRemoteRunnerHappyPath:
 class TestRemoteRunnerTransportVsTimeout:
     """Invariant 5: RunnerUnavailable ↔ transport failure only; VerifyResult returned for any verdict."""
 
-    def _make_runner(self, responses, *, raise_on=None):
-        """Build a RemoteRunner with a fake `run` that returns successive responses.
+    def _make_runner_and_calls(self, responses, *, raise_on=None):
+        """Return (runner, calls_list) where calls_list records each run() argv.
 
         ``responses`` is a list of (rc, stdout, stderr) tuples.
         ``raise_on`` is an optional exception to raise on the Nth call (0-indexed dict).
@@ -3008,17 +3187,16 @@ class TestRemoteRunnerTransportVsTimeout:
             run=fake_run,
             id_factory=lambda: 'req-id',
         )
-        runner._calls = calls
-        return runner
+        return runner, calls
 
     async def test_raises_runner_unavailable_on_push_failure(self):
         """git push rc!=0 → RunnerUnavailable; ssh is never called."""
         from orchestrator.verify_runner import RunnerUnavailable
-        runner = self._make_runner([(1, '', 'push error'), (0, '', '')])
+        runner, calls = self._make_runner_and_calls([(1, '', 'push error'), (0, '', '')])
         with pytest.raises(RunnerUnavailable):
             await runner.run_merge_verify('abc123', _make_spec())
         # ssh must NOT have been attempted
-        assert not any(a[0] == 'ssh' for a in runner._calls)
+        assert not any(a[0] == 'ssh' for a in calls)
 
     async def test_raises_runner_unavailable_on_ssh_nonzero(self):
         """ssh rc!=0 (e.g. 255 connection refused) → RunnerUnavailable.
@@ -3032,21 +3210,21 @@ class TestRemoteRunnerTransportVsTimeout:
         keepalive flags are actually present on every ssh site).
         """
         from orchestrator.verify_runner import RunnerUnavailable
-        runner = self._make_runner([(0, '', ''), (255, '', 'ssh: connect to host laptop.local port 22')])
+        runner, _ = self._make_runner_and_calls([(0, '', ''), (255, '', 'ssh: connect to host laptop.local port 22')])
         with pytest.raises(RunnerUnavailable):
             await runner.run_merge_verify('abc123', _make_spec())
 
     async def test_raises_runner_unavailable_on_empty_stdout(self):
         """ssh rc=0 but stdout is empty → RunnerUnavailable (unparseable)."""
         from orchestrator.verify_runner import RunnerUnavailable
-        runner = self._make_runner([(0, '', ''), (0, '', '')])
+        runner, _ = self._make_runner_and_calls([(0, '', ''), (0, '', '')])
         with pytest.raises(RunnerUnavailable):
             await runner.run_merge_verify('abc123', _make_spec())
 
     async def test_raises_runner_unavailable_on_non_json_stdout(self):
         """ssh rc=0 but stdout is non-JSON → RunnerUnavailable."""
         from orchestrator.verify_runner import RunnerUnavailable
-        runner = self._make_runner([(0, '', ''), (0, 'not valid json!!!', '')])
+        runner, _ = self._make_runner_and_calls([(0, '', ''), (0, 'not valid json!!!', '')])
         with pytest.raises(RunnerUnavailable):
             await runner.run_merge_verify('abc123', _make_spec())
 
@@ -3059,18 +3237,18 @@ class TestRemoteRunnerTransportVsTimeout:
         """
         from orchestrator.verify_runner import RunnerUnavailable
         # Valid JSON dict but unrecognised keys — triggers TypeError in result_from_json
-        runner = self._make_runner([(0, '', ''), (0, '{"unexpected": 1}', '')])
+        runner, _ = self._make_runner_and_calls([(0, '', ''), (0, '{"unexpected": 1}', '')])
         with pytest.raises(RunnerUnavailable):
             await runner.run_merge_verify('abc123', _make_spec())
         # JSON list — also a TypeError because ** unpacking requires a mapping
-        runner2 = self._make_runner([(0, '', ''), (0, '[1, 2, 3]', '')])
+        runner2, _ = self._make_runner_and_calls([(0, '', ''), (0, '[1, 2, 3]', '')])
         with pytest.raises(RunnerUnavailable):
             await runner2.run_merge_verify('abc123', _make_spec())
 
     async def test_raises_runner_unavailable_when_run_raises_oserror(self):
         """An OSError from the subprocess runner → RunnerUnavailable."""
         from orchestrator.verify_runner import RunnerUnavailable
-        runner = self._make_runner([], raise_on={0: FileNotFoundError('git not found')})
+        runner, _ = self._make_runner_and_calls([], raise_on={0: FileNotFoundError('git not found')})
         with pytest.raises(RunnerUnavailable):
             await runner.run_merge_verify('abc123', _make_spec())
 
@@ -3084,7 +3262,7 @@ class TestRemoteRunnerTransportVsTimeout:
             summary='timed out',
             timed_out=True,
         )
-        runner = self._make_runner([(0, '', ''), (0, result_to_json(timed_out_result), '')])
+        runner, _ = self._make_runner_and_calls([(0, '', ''), (0, result_to_json(timed_out_result), '')])
         result = await runner.run_merge_verify('abc123', _make_spec())
         assert result.timed_out is True
         assert result == timed_out_result
@@ -3099,7 +3277,7 @@ class TestRemoteRunnerTransportVsTimeout:
             summary='2 failures',
             category='test_failure',
         )
-        runner = self._make_runner([(0, '', ''), (0, result_to_json(fail_result), '')])
+        runner, _ = self._make_runner_and_calls([(0, '', ''), (0, result_to_json(fail_result), '')])
         result = await runner.run_merge_verify('abc123', _make_spec())
         assert result.passed is False
         assert result == fail_result
@@ -3115,10 +3293,9 @@ class TestRemoteRunnerRefCleanup:
     """The pushed ref is deleted best-effort on return (PRD open-Q4)."""
 
     def _make_tracking_runner(self, responses_by_argv_prefix):
-        """Build a RemoteRunner whose fake `run` logs all calls.
+        """Return (runner, calls_list) where calls_list records each run() argv.
 
         ``responses_by_argv_prefix`` maps an argv[0] to (rc, stdout, stderr).
-        The fake always records every call in `runner._calls`.
         """
         calls = []
 
@@ -3142,14 +3319,15 @@ class TestRemoteRunnerRefCleanup:
             run=fake_run,
             id_factory=lambda: 'cleanup-id',
         )
-        runner._calls = calls
-        return runner
+        return runner, calls
 
     async def test_delete_called_after_success(self):
         """After a successful run, the pushed ref is deleted via git push --delete."""
-        runner = self._make_tracking_runner({'git': (0, '', ''), 'ssh': (0, result_to_json(_make_pass_result()), '')})
+        runner, calls = self._make_tracking_runner(
+            {'git': (0, '', ''), 'ssh': (0, result_to_json(_make_pass_result()), '')}
+        )
         await runner.run_merge_verify('abc123', _make_spec())
-        delete_calls = [c for c in runner._calls if c[:2] == ['git', 'push'] and '--delete' in c]
+        delete_calls = [c for c in calls if c[:2] == ['git', 'push'] and '--delete' in c]
         assert len(delete_calls) == 1
         assert 'refs/merge-verify/cleanup-id' in delete_calls[0]
 
@@ -3157,8 +3335,10 @@ class TestRemoteRunnerRefCleanup:
         """When ssh fails (→ RunnerUnavailable), the ref is still deleted (cleanup in finally)."""
         from orchestrator.verify_runner import RunnerUnavailable
 
+        calls = []
+
         async def fake_run(argv, *, cwd=None):
-            runner._calls.append(argv[:])
+            calls.append(argv[:])
             if argv[:2] == ['git', 'push'] and '--delete' in argv:
                 return (0, '', '')
             if argv[0] == 'git':
@@ -3173,10 +3353,9 @@ class TestRemoteRunnerRefCleanup:
             run=fake_run,
             id_factory=lambda: 'cleanup-id',
         )
-        runner._calls = []
         with pytest.raises(RunnerUnavailable):
             await runner.run_merge_verify('abc123', _make_spec())
-        delete_calls = [c for c in runner._calls if c[:2] == ['git', 'push'] and '--delete' in c]
+        delete_calls = [c for c in calls if c[:2] == ['git', 'push'] and '--delete' in c]
         assert len(delete_calls) == 1
 
     async def test_no_delete_when_push_failed(self):
@@ -4392,6 +4571,52 @@ class TestDriftDetectorAgree:
         await detector.check('sha1', _make_spec())
         assert pool.is_quarantined('laptop') is False
 
+    # -- task 4188: verify categories surfaced on the AGREE result AND event --
+
+    @pytest.mark.parametrize(
+        'local_result, remote_result, expected_local, expected_remote',
+        [
+            # A suppression-implicated LOCAL arm is named on both artifacts.
+            (_make_pass_result(category='merge_flake_suppressed'),
+             _make_pass_result(), 'merge_flake_suppressed', ''),
+            # The mirror case -- the REMOTE arm's category is threaded too, in
+            # its own slot, not just whichever arm happens to be suppressed.
+            (_make_pass_result(),
+             _make_pass_result(category='merge_flake_suppressed'), '', 'merge_flake_suppressed'),
+            # Always-populated, not only-on-divergence.  A NON-EMPTY category on
+            # BOTH arms, so this cannot pass vacuously against the '' default.
+            (_make_fail_result(category='test_failure'),
+             _make_fail_result(category='test_failure'), 'test_failure', 'test_failure'),
+            # Uniform shape: a clean, category-less pass still carries both keys.
+            (_make_pass_result(), _make_pass_result(), '', ''),
+        ],
+        ids=['local-suppressed', 'remote-suppressed', 'both-test-failure', 'clean-pass'],
+    )
+    async def test_agree_carries_both_categories_on_result_and_event(
+        self, local_result, remote_result, expected_local, expected_remote
+    ):
+        """Both arms' categories reach the AGREE result AND the parity payload.
+
+        The two ``*_category`` keys are emitted UNCONDITIONALLY, so a consumer
+        reads the same two keys on every drift parity event and never has to
+        distinguish an absent key from a clean, sentinel-free result.
+        """
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict
+        pool, _, _ = _make_drift_pool(local_result=local_result, remote_result=remote_result)
+        event_store = MagicMock()
+        detector = DriftDetector(pool, event_store=event_store)
+        result = await detector.check('sha1', _make_spec())
+
+        assert result.verdict == DriftVerdict.AGREE
+        assert result.local_category == expected_local
+        assert result.remote_category == expected_remote
+
+        data = event_store.emit.call_args[1]['data']
+        assert 'local_category' in data
+        assert 'remote_category' in data
+        assert data['local_category'] == expected_local
+        assert data['remote_category'] == expected_remote
+
 
 # ---------------------------------------------------------------------------
 # ι step-5: DriftDetector diverge path
@@ -4519,6 +4744,83 @@ class TestDriftDetectorDivergence:
         assert result.verdict == DriftVerdict.DIVERGE
         assert pool.is_quarantined('laptop') is True
         escalation_queue.submit.assert_called_once()
+
+    # -- task 4188: verify categories surfaced on the DIVERGE artifacts --
+
+    def _diverge_queue(self):
+        queue = MagicMock()
+        queue.has_open_l1 = MagicMock(return_value=False)
+        queue.make_id = MagicMock(return_value='esc-__drift__-1')
+        return queue
+
+    async def test_diverge_result_carries_both_categories(self):
+        """The DIVERGE return carries both arms' categories, not just the AGREE one."""
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_fail_result(category='test_failure'),
+            remote_result=_make_pass_result(category='merge_flake_suppressed'),
+        )
+        detector = DriftDetector(pool, escalation_queue=self._diverge_queue())
+        result = await detector.check('divergesha', _make_spec())
+        assert result.verdict == DriftVerdict.DIVERGE
+        assert result.local_category == 'test_failure'
+        assert result.remote_category == 'merge_flake_suppressed'
+
+    async def test_diverge_escalation_detail_names_suppressed_arm(self):
+        """The suppressed arm is named in the artifact an operator actually rules on.
+
+        Asserts the STRUCTURED, !r-quoted spelling rather than the bare word, so
+        it cannot be satisfied vacuously by the operator footnote that also names
+        the category.  Also guards that the rewrite stayed ADDITIVE.
+        """
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_fail_result(category='test_failure'),
+            remote_result=_make_pass_result(category='merge_flake_suppressed'),
+        )
+        escalation_queue = self._diverge_queue()
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        await detector.check('mydivergesha', _make_spec())
+        esc = escalation_queue.submit.call_args[0][0]
+        assert "remote_category='merge_flake_suppressed'" in esc.detail
+        # Regression guard: the pre-existing detail content survives.
+        assert "merge_sha='mydivergesha'" in esc.detail
+        assert "local_runner='local'" in esc.detail
+        assert "remote_runner='laptop'" in esc.detail
+        # The operator footnote fires when an arm IS suppressed.  Pinned by the
+        # stable function identifier it names, not by its prose wording.
+        assert 'apply_merge_flake_suppression' in esc.detail
+
+    async def test_diverge_escalation_detail_names_local_category(self):
+        """The mirror case: both arms are threaded, into the right slots."""
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_pass_result(category='merge_flake_suppressed'),
+            remote_result=_make_fail_result(category='test_failure'),
+        )
+        escalation_queue = self._diverge_queue()
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        await detector.check('divergesha', _make_spec())
+        esc = escalation_queue.submit.call_args[0][0]
+        assert "local_category='merge_flake_suppressed'" in esc.detail
+        assert "remote_category='test_failure'" in esc.detail
+
+    async def test_diverge_escalation_detail_carries_categories_when_neither_suppressed(self):
+        """Always-populated at the escalation artifact, including the '' arm."""
+        from orchestrator.verify_runner import DriftDetector
+        pool, _, _ = _make_drift_pool(
+            local_result=_make_fail_result(category='test_failure'),
+            remote_result=_make_pass_result(),
+        )
+        escalation_queue = self._diverge_queue()
+        detector = DriftDetector(pool, escalation_queue=escalation_queue)
+        await detector.check('divergesha', _make_spec())
+        esc = escalation_queue.submit.call_args[0][0]
+        assert "local_category='test_failure'" in esc.detail
+        assert "remote_category=''" in esc.detail
+        # ...and the suppression footnote is omitted entirely, so it never
+        # dilutes the artifact with guidance irrelevant to this divergence.
+        assert 'apply_merge_flake_suppression' not in esc.detail
 
 
 # ---------------------------------------------------------------------------
@@ -4704,6 +5006,25 @@ class TestDriftDetectorInconclusive:
         detector = DriftDetector(pool)
         await detector.check('sha1', _make_spec())
         assert pool.is_quarantined('laptop') is False
+
+    # -- task 4188: categories stay empty when nothing was compared --
+
+    async def test_inconclusive_remote_unavailable_leaves_categories_empty(self):
+        """Remote transport failure → categories stay ''.
+
+        Mirrors how ``local_passed`` stays None on this path even though the
+        local arm genuinely produced a result — ``verdict`` is the disambiguator.
+        """
+        from orchestrator.verify_runner import DriftDetector, DriftVerdict, RunnerUnavailable
+        pool, _, remote_fake = _make_drift_pool(
+            local_result=_make_pass_result(category='merge_flake_suppressed'),
+        )
+        remote_fake.run_merge_verify = AsyncMock(side_effect=RunnerUnavailable('host down'))
+        detector = DriftDetector(pool)
+        result = await detector.check('sha1', _make_spec())
+        assert result.verdict == DriftVerdict.INCONCLUSIVE
+        assert result.local_category == ''
+        assert result.remote_category == ''
 
 
 # ---------------------------------------------------------------------------
@@ -5252,15 +5573,8 @@ class TestRemoteRunnerRequestId:
         rid_idx = parsed.index('--request-id')
         assert rid_idx > cfg_idx, '--request-id must come after --config'
 
-    async def test_inflight_request_id_cleared_after_return(self):
-        """_inflight_request_id is None after run_merge_verify returns."""
-        runner, _ = self._make_runner_and_calls()
-        assert runner._inflight_request_id is None
-        await runner.run_merge_verify('abc123', _make_spec())
-        assert runner._inflight_request_id is None
-
-    async def test_inflight_request_id_cleared_after_exception(self):
-        """_inflight_request_id is cleared in the finally even on RunnerUnavailable."""
+    async def test_dispatch_not_in_flight_after_exception(self):
+        """The dispatch is no longer in flight after RunnerUnavailable (cleared in the finally)."""
         from orchestrator.verify_runner import RunnerUnavailable
 
         calls = []
@@ -5282,7 +5596,7 @@ class TestRemoteRunnerRequestId:
         with pytest.raises(RunnerUnavailable):
             await runner.run_merge_verify('abc123', _make_spec())
 
-        assert runner._inflight_request_id is None
+        assert runner.dispatch_in_flight is False
 
     async def test_dispatch_in_flight_false_before_and_after_return(self):
         """dispatch_in_flight is False before run_merge_verify and False again after it returns."""
@@ -5326,7 +5640,8 @@ class TestRemoteRunnerRequestId:
 class TestRemoteRunnerCancelVerify:
     """cancel_verify() issues ssh cancel-verify; probe_clean() issues ssh pgrep."""
 
-    def _make_runner(self, *, config_path=None, cancel_rc=0, probe_rc=1):
+    def _make_runner_and_calls(self, *, config_path=None, cancel_rc=0, probe_rc=1):
+        """Return (runner, calls_list) where calls_list records each run() argv."""
         calls = []
 
         async def fake_run(argv, *, cwd=None):
@@ -5346,26 +5661,25 @@ class TestRemoteRunnerCancelVerify:
             run=fake_run,
             id_factory=lambda: 'req-42',
         )
-        runner._calls = calls
-        return runner
+        return runner, calls
 
     async def test_cancel_verify_no_inflight_returns_zero_no_ssh(self):
         """cancel_verify() with _inflight_request_id=None returns 0 without issuing ssh."""
-        runner = self._make_runner()
+        runner, calls = self._make_runner_and_calls()
         rc = await runner.cancel_verify()
         assert rc == 0
-        ssh_calls = [c for c in runner._calls if c[0] == 'ssh']
+        ssh_calls = [c for c in calls if c[0] == 'ssh']
         assert len(ssh_calls) == 0
 
     async def test_cancel_verify_issues_correct_argv(self):
         """cancel_verify() issues ssh BatchMode/ConnectTimeout cancel-verify --request-id."""
         import shlex as _shlex
 
-        runner = self._make_runner(cancel_rc=0)
+        runner, calls = self._make_runner_and_calls(cancel_rc=0)
         runner._inflight_request_id = 'req-42'
         await runner.cancel_verify()
 
-        ssh_calls = [c for c in runner._calls if c[0] == 'ssh']
+        ssh_calls = [c for c in calls if c[0] == 'ssh']
         assert len(ssh_calls) == 1
         argv = ssh_calls[0]
 
@@ -5382,11 +5696,11 @@ class TestRemoteRunnerCancelVerify:
         """cancel_verify() appends --config <path> when config_path is set."""
         import shlex as _shlex
 
-        runner = self._make_runner(config_path='/etc/orch.yaml', cancel_rc=0)
+        runner, calls = self._make_runner_and_calls(config_path='/etc/orch.yaml', cancel_rc=0)
         runner._inflight_request_id = 'req-42'
         await runner.cancel_verify()
 
-        ssh_calls = [c for c in runner._calls if c[0] == 'ssh']
+        ssh_calls = [c for c in calls if c[0] == 'ssh']
         remote_cmd = ssh_calls[0][-1]
         parsed = _shlex.split(remote_cmd)
         cfg_idx = parsed.index('--config')
@@ -5394,18 +5708,18 @@ class TestRemoteRunnerCancelVerify:
 
     async def test_cancel_verify_returns_ssh_rc(self):
         """cancel_verify() returns the ssh return code."""
-        runner = self._make_runner(cancel_rc=1)
+        runner, calls = self._make_runner_and_calls(cancel_rc=1)
         runner._inflight_request_id = 'req-42'
         rc = await runner.cancel_verify()
         assert rc == 1
 
     async def test_probe_clean_true_when_pgrep_rc_is_1(self):
         """probe_clean() issues ssh pgrep -f verify-merge; rc==1 (no match) → True."""
-        runner = self._make_runner(probe_rc=1)
+        runner, calls = self._make_runner_and_calls(probe_rc=1)
         result = await runner.probe_clean()
         assert result is True
 
-        ssh_calls = [c for c in runner._calls if c[0] == 'ssh']
+        ssh_calls = [c for c in calls if c[0] == 'ssh']
         assert len(ssh_calls) == 1
         remote_cmd = ssh_calls[0][-1]
         assert 'pgrep' in remote_cmd
@@ -5413,13 +5727,13 @@ class TestRemoteRunnerCancelVerify:
 
     async def test_probe_clean_false_when_pgrep_rc_is_0(self):
         """probe_clean() rc==0 (process running) → False."""
-        runner = self._make_runner(probe_rc=0)
+        runner, calls = self._make_runner_and_calls(probe_rc=0)
         result = await runner.probe_clean()
         assert result is False
 
     async def test_probe_clean_false_when_pgrep_rc_is_2(self):
         """probe_clean() rc>=2 (error) → False (conservative: stay parked)."""
-        runner = self._make_runner(probe_rc=2)
+        runner, _ = self._make_runner_and_calls(probe_rc=2)
         result = await runner.probe_clean()
         assert result is False
 
@@ -6441,17 +6755,99 @@ class TestRemoteRunnerPassSummaryArchival:
 # ---------------------------------------------------------------------------
 
 
+# Task 4195 step-7: sizing for test_beats_survive_a_blocked_event_loop, which
+# blocks the dispatching event loop for longer than the child's own heartbeat
+# deadline and lets the CHILD return the verdict.
+#
+# The bound needs a basis, because the flake class it must avoid is measured:
+# test_laptop_warm_verify_boundary.py's HeartbeatWriter comment records an
+# Event.wait-driven writer showing inter-write gaps of p999 0.386s / MAX 0.845s
+# at loadavg 113-178, with the overshoot largely ADDITIVE scheduling delay
+# rather than multiplicative.  Five beats at 0.05s is 0.25s nominal; even a
+# pathological run costing one full 0.845s gap plus four 0.386s gaps totals
+# ~2.4s, inside the 2.5s deadline.  That is why BEATS_REQUIRED is 5 rather than
+# 10 and the deadline is 10x nominal rather than 2x.
+#
+# If this ever measures tight under an xdist storm, raise CHILD_DEADLINE_SECS
+# and LOOP_HOG_SECS together (keeping the hog longer than the deadline); do NOT
+# lower BEAT_INTERVAL_SECS, which is what re-creates the additive-delay cliff.
+# The discriminator survives any such widening, because the pre-4195 producer
+# delivers exactly ZERO beats for the whole hog.
+#: The three sizings below are all MULTIPLES of production's teardown bound,
+#: verify_runner.HEARTBEAT_STOP_JOIN_SECS, rather than independent literals:
+#: that constant is the single home of both the number and the argument for it
+#: (SPOT, docs/code-quality.md #11), and each relationship these comments claim
+#: stays true through any retune of it.
+#:
+#: How long the wedged-writer thread stays parked: comfortably longer than that
+#: bound, so the dispatch can only return by giving up on it rather than by
+#: outlasting it.
+WEDGED_WRITER_PARK_SECS = 6 * HEARTBEAT_STOP_JOIN_SECS
+
+#: Budget for that test.  A regression to an unbounded join() must fail HERE as
+#: a timeout rather than wedging the suite; sized above the bound it is meant to
+#: observe and under WEDGED_WRITER_PARK_SECS, so it fires before the parked
+#: thread expires on its own.
+WEDGED_WRITER_TEST_TIMEOUT_SECS = 4 * HEARTBEAT_STOP_JOIN_SECS
+
+#: Join ceiling for the parked thread's own cleanup once released — a wedge
+#: detector, paid only if that thread is already stuck.
+HEARTBEAT_STOP_JOIN_CEILING_SECS = HEARTBEAT_STOP_JOIN_SECS
+
+#: Cadence of that test's loop-responsiveness ticker, and how many of its ticks
+#: must land inside the teardown join.  The discriminator is EXACT in the
+#: failing direction — a synchronous join lets precisely ZERO ticks run between
+#: stop() and the dispatch returning, since nothing else runs on a blocked loop
+#: — so any positive floor detects it and a low one cannot be flaky.  Two, in a
+#: window of HEARTBEAT_STOP_JOIN_SECS: even if every tick cost the ~0.85s worst
+#: single-gap scheduling delay measured at loadavg 113-178
+#: (test_laptop_warm_verify_boundary.py's HeartbeatWriter comment) rather than
+#: this cadence, that window still fits five.
+LOOP_TICK_SECS = 0.05
+LOOP_TICKS_REQUIRED_DURING_TEARDOWN = 2
+
+
+BEATS_REQUIRED = 5
+BEAT_INTERVAL_SECS = 0.05
+CHILD_DEADLINE_SECS = 2.5
+LOOP_HOG_SECS = 4.0
+
+#: Child program for that test: counts beats off fd 0 under its own deadline and
+#: exits with a verdict — 0 with BEATS_OK on stdout, 3 if it starved, 4 on EOF.
+#: Computing the verdict in the child keeps the measurement off the very thread
+#: the test deliberately blocks, and off any inter-beat gap measured in the
+#: parent (the shape the 0.845s figure above makes flaky).
+_BEAT_COUNTING_CHILD = f'''
+import os, select, sys, time
+deadline = time.monotonic() + {CHILD_DEADLINE_SECS}
+beats = 0
+while beats < {BEATS_REQUIRED}:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        sys.exit(3)
+    ready, _, _ = select.select([0], [], [], remaining)
+    if not ready:
+        sys.exit(3)
+    data = os.read(0, 4096)
+    if data == b'':
+        sys.exit(4)
+    beats += data.count(b'\\n')
+print('BEATS_OK')
+'''
+
+
 @pytest.mark.asyncio
 class TestDefaultSshHeartbeatRun:
-    """_default_ssh_heartbeat_run opens the child with stdin=PIPE and writes a
-    heartbeat newline every heartbeat_interval seconds while awaiting completion.
-    A heartbeat write against an already-closed child stdin (EPIPE) is swallowed
-    and never surfaces as an exception."""
+    """_default_ssh_heartbeat_run opens the child on the read end of a pipe it
+    owns and writes a heartbeat token every heartbeat_interval seconds, from a
+    dedicated OS thread, while awaiting completion.  A heartbeat write against
+    an already-closed child stdin (EPIPE) is swallowed and never surfaces as an
+    exception."""
 
     async def test_delivers_heartbeats(self):
         """A child blocked reading 2 stdin lines only prints its marker and exits
         once the heartbeat writer has fed it 2 newlines — proving heartbeats are
-        actually written to the child's stdin=PIPE while the run is in flight."""
+        actually written to the child's stdin while the run is in flight."""
         import sys
 
         from orchestrator.verify_runner import _default_ssh_heartbeat_run
@@ -6494,6 +6890,218 @@ class TestDefaultSshHeartbeatRun:
         assert rc == 0
         assert stdout == ''
         assert stderr == ''
+
+    async def test_beats_survive_a_blocked_event_loop(self):
+        """The beat keeps its cadence while the dispatching event loop is blocked.
+
+        THE HEADLINE PROPERTY of task 4195.  The orchestrator's single shared
+        loop carries the scheduler, agent dispatch, the merge worker and the
+        uvicorn escalation server; a producer scheduled on it stops beating for
+        exactly as long as any of them stalls it, and the remote correctly reads
+        a silent channel as a dead one.
+
+        The loop is blocked here by a SYNCHRONOUS ``time.sleep`` for longer than
+        the child's own heartbeat deadline.  That is an optimistic model of a
+        real stall (it releases the GIL, where ``shutil.rmtree`` and sqlite
+        commits hold it between syscalls), but modelling GIL contention is not
+        this test's job: it discriminates the asyncio-scheduled producer from
+        the OS-thread producer, which is the change under test.
+
+        The PARENT asserts no timing at all — only the child's exit code.
+        """
+        import sys
+        import time
+
+        from orchestrator.verify_runner import _default_ssh_heartbeat_run
+
+        argv = [sys.executable, '-c', _BEAT_COUNTING_CHILD]
+
+        async def hog():
+            await asyncio.sleep(0)  # let the dispatch coroutine reach its spawn
+            time.sleep(LOOP_HOG_SECS)  # synchronous: blocks the whole loop
+
+        (rc, stdout, stderr), _ = await asyncio.gather(
+            _default_ssh_heartbeat_run(argv, heartbeat_interval=BEAT_INTERVAL_SECS),
+            hog(),
+        )
+
+        assert rc == 0, f'child exited {rc} (3=heartbeat starved, 4=EOF): {stderr!r}'
+        assert 'BEATS_OK' in stdout
+
+    async def test_writer_does_not_outlive_the_dispatch(self):
+        """The writer is stopped and joined before the call returns; its fd closed once.
+
+        Stated against the thread NAME as well as the handle, so it also catches
+        a writer leaked by some OTHER concurrently-finished dispatch in the same
+        interpreter — which is the production shape, since the orchestrator runs
+        many dispatches on one process.
+        """
+        import os
+        import sys
+        import threading
+
+        from orchestrator.verify_cancel import HEARTBEAT_THREAD_NAME, start_stdin_heartbeat
+        from orchestrator.verify_runner import _default_ssh_heartbeat_run
+
+        handles = []
+        closed = []
+
+        def closing_spy(fd):
+            closed.append(fd)
+            os.close(fd)
+
+        def spy_start(write_fd, **kw):
+            handle = start_stdin_heartbeat(write_fd, **{**kw, 'close_fn': closing_spy})
+            handles.append((write_fd, handle))
+            return handle
+
+        rc, stdout, stderr = await _default_ssh_heartbeat_run(
+            [sys.executable, '-c', 'print("DONE")'],
+            heartbeat_interval=0.02,
+            start_heartbeat=spy_start,
+        )
+
+        assert rc == 0
+        assert 'DONE' in stdout
+        ((write_fd, handle),) = handles
+        assert not handle.thread.is_alive()  # joined before the call returned
+        assert closed == [write_fd]  # closed exactly once, by its owner
+        assert [t for t in threading.enumerate() if t.name == HEARTBEAT_THREAD_NAME] == []
+
+    @pytest.mark.skipif(not Path('/proc/self/fd').exists(), reason='needs procfs')
+    async def test_a_failed_spawn_leaks_neither_the_writer_nor_its_pipe(self, tmp_path):
+        """The ordering comment above os.pipe(), made executable.
+
+        The writer is started BEFORE the spawn so that exactly one owner exists
+        for write_fd on every path — and the failed-spawn path is the only one
+        where that claim carries weight, because nothing else there stops the
+        thread or closes either end of the pipe. It is also an ordinary
+        condition rather than a hypothetical: a missing ssh binary or a worktree
+        reaped out from under the cwd raises FileNotFoundError here, which
+        callers already convert to RunnerUnavailable. Moving start_heartbeat
+        after the spawn, or dropping the inner try/finally that closes read_fd,
+        would leak descriptors per failed dispatch with every other test in this
+        class — all of which take the happy spawn path — still green.
+        """
+        import os
+        import threading
+
+        from orchestrator.verify_cancel import HEARTBEAT_THREAD_NAME, start_stdin_heartbeat
+        from orchestrator.verify_runner import _default_ssh_heartbeat_run
+
+        handles = []
+        closed = []
+
+        def closing_spy(fd):
+            closed.append(fd)
+            os.close(fd)
+
+        def spy_start(write_fd, **kw):
+            handle = start_stdin_heartbeat(write_fd, **{**kw, 'close_fn': closing_spy})
+            handles.append((write_fd, handle))
+            return handle
+
+        argv = [str(tmp_path / 'no-such-ssh-binary'), 'irrelevant']
+
+        async def failed_dispatch():
+            with pytest.raises(FileNotFoundError):
+                await _default_ssh_heartbeat_run(
+                    argv, heartbeat_interval=0.01, start_heartbeat=spy_start
+                )
+
+        # The first failed spawn on a loop can allocate asyncio machinery (child
+        # watcher, self-pipe) that legitimately outlives it, so the count is
+        # taken around the SECOND one: this stays an fd-LEAK assertion instead of
+        # an asyncio-warm-up one.
+        await failed_dispatch()
+        before = len(os.listdir('/proc/self/fd'))
+        await failed_dispatch()
+        after = len(os.listdir('/proc/self/fd'))
+
+        assert after == before, f'a failed spawn leaked {after - before} descriptor(s)'
+        assert closed == [write_fd for write_fd, _ in handles]  # each fd closed once, by its owner
+        assert all(not handle.thread.is_alive() for _, handle in handles)
+        assert [t for t in threading.enumerate() if t.name == HEARTBEAT_THREAD_NAME] == []
+
+    @pytest.mark.timeout(WEDGED_WRITER_TEST_TIMEOUT_SECS)
+    async def test_a_wedged_writer_costs_one_teardown_and_not_the_loop(self):
+        """A writer that ignores stop() costs its own dispatch's teardown — and nothing else.
+
+        Two properties, and the bound means what it says only if both hold.
+
+        BOUNDED: the dispatch still returns its rc and stdout. Regressing to a
+        bare join() fails this as a timeout — the failure class (one stuck
+        dispatch halting the merge lane) this task exists to remove.
+
+        PAID OFF THE LOOP: a synchronous join in the coroutine's finally would
+        freeze the orchestrator's shared loop — scheduler, agent dispatch, merge
+        worker, uvicorn escalation server — for that whole bound, re-creating on
+        the teardown side exactly the stall the beat was moved to a thread to
+        survive. The ticker counts loop iterations between ``stop()`` (the last
+        thing to run before the join) and the dispatch returning; a blocking
+        join admits exactly zero, because nothing else can run on a loop that is
+        blocked.
+        """
+        import os
+        import sys
+        import threading
+
+        from orchestrator.verify_cancel import HeartbeatHandle
+        from orchestrator.verify_runner import _default_ssh_heartbeat_run
+
+        never_set = threading.Event()
+        parked = threading.Thread(
+            target=never_set.wait, args=(WEDGED_WRITER_PARK_SECS,), daemon=True
+        )
+        parked.start()
+
+        ticks = 0
+        ticks_at_stop: list[int] = []
+
+        async def ticker():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(LOOP_TICK_SECS)
+                ticks += 1
+
+        ticker_task = asyncio.create_task(ticker())
+        write_fds: list[int] = []
+
+        def wedged_start(write_fd, **kw):
+            # No writer is started, so nothing else owns write_fd and this test
+            # closes it below. Production delegates that close to the writer
+            # thread (verify_cancel.run_stdin_heartbeat) — saying so here is how
+            # this test states the ownership contract it is standing in for.
+            write_fds.append(write_fd)
+            return HeartbeatHandle(stop=lambda: ticks_at_stop.append(ticks), thread=parked)
+
+        try:
+            rc, stdout, stderr = await _default_ssh_heartbeat_run(
+                [sys.executable, '-c', 'print("DONE")'],
+                heartbeat_interval=LOOP_TICK_SECS,
+                start_heartbeat=wedged_start,
+            )
+            ticks_at_return = ticks
+            still_parked = parked.is_alive()  # the call returned without waiting it out
+        finally:
+            ticker_task.cancel()
+            await asyncio.gather(ticker_task, return_exceptions=True)
+            never_set.set()
+            parked.join(timeout=HEARTBEAT_STOP_JOIN_CEILING_SECS)
+            for fd in write_fds:
+                os.close(fd)
+
+        assert rc == 0
+        assert 'DONE' in stdout
+        assert still_parked
+
+        (stopped_at,) = ticks_at_stop
+        assert ticks_at_return - stopped_at >= LOOP_TICKS_REQUIRED_DURING_TEARDOWN, (
+            f'the loop ran {ticks_at_return - stopped_at} times while the dispatch waited out '
+            f'its {HEARTBEAT_STOP_JOIN_SECS}s join bound. Zero means the join is synchronous '
+            f'again and the shared event loop — scheduler, merge worker, escalation server — '
+            f'is frozen for that whole bound by every wedged writer.'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -7183,11 +7791,23 @@ class TestRemoteRunnerMainPushMirror:
 # ---------------------------------------------------------------------------
 
 
-def _pool_fake_remote(name='laptop', *, sync_outcome, result=None) -> Any:
-    """A REAL RemoteRunner (so isinstance(selected, RemoteRunner) holds) with
-    sync_if_stale + run_merge_verify replaced by instance stubs.
+@dataclasses.dataclass
+class _PoolRemoteCalls:
+    """What a fake remote's stubbed sync_if_stale / run_merge_verify were handed."""
 
-    Records the event_store/task_id each stub was called with.
+    sync_seen: dict[str, Any] | None = None
+    rmv_calls: list[dict[str, Any]] = dataclasses.field(default_factory=list)
+
+
+def _pool_fake_remote(
+    name='laptop', *, sync_outcome, result=None,
+) -> tuple[Any, _PoolRemoteCalls]:
+    """Return (runner, calls) for a REAL RemoteRunner (so isinstance(selected,
+    RemoteRunner) holds) with sync_if_stale + run_merge_verify replaced by
+    instance stubs.
+
+    The record of what each stub was handed lives in the returned *calls* —
+    the stubs close over it, so nothing is attached to the runner itself.
     """
     async def _noop_run(argv, *, cwd=None):
         return (0, '', '')
@@ -7195,23 +7815,22 @@ def _pool_fake_remote(name='laptop', *, sync_outcome, result=None) -> Any:
     r = RemoteRunner(
         name=name, ssh_host='h', git_remote='origin', cwd='/repo', run=_noop_run,
     )
-    r._sync_seen = None  # type: ignore[attr-defined]
-    r._rmv_calls = []  # type: ignore[attr-defined]
+    calls = _PoolRemoteCalls()
     _res = result if result is not None else VerifyResult(
         passed=True, test_output='', lint_output='', type_output='', summary='remote-ok',
     )
 
     async def _sync(*, event_store=None, task_id=None):
-        r._sync_seen = {'event_store': event_store, 'task_id': task_id}  # type: ignore[attr-defined]
+        calls.sync_seen = {'event_store': event_store, 'task_id': task_id}
         return sync_outcome
 
     async def _rmv(merge_sha, spec, *, task_id=None, archive_root=None, event_store=None):
-        r._rmv_calls.append({'event_store': event_store, 'task_id': task_id})  # type: ignore[attr-defined]
+        calls.rmv_calls.append({'event_store': event_store, 'task_id': task_id})
         return _res
 
     r.sync_if_stale = _sync  # type: ignore[assignment]
     r.run_merge_verify = _rmv  # type: ignore[assignment]
-    return r
+    return r, calls
 
 
 class _PoolFakeLocal:
@@ -7241,7 +7860,7 @@ class TestVerifyRunnerPoolContractCurrency:
         """(a) [remote, local], sync ok -> REMOTE runs, not quarantined, sync got the store."""
         from orchestrator.verify_runner import SyncOutcome, VerifyRunnerPool
 
-        remote = _pool_fake_remote(sync_outcome=SyncOutcome(configured=True, ok=True))
+        remote, remote_calls = _pool_fake_remote(sync_outcome=SyncOutcome(configured=True, ok=True))
         local = _PoolFakeLocal()
         store = _RecordingEventStore()
         pool = VerifyRunnerPool([remote, local], event_store=store, task_id='t9')
@@ -7254,14 +7873,14 @@ class TestVerifyRunnerPoolContractCurrency:
         assert pool.is_quarantined('laptop') is False
         assert local.calls == []
         # sync_if_stale received the pool's event_store + task_id
-        assert remote._sync_seen == {'event_store': store, 'task_id': 't9'}
+        assert remote_calls.sync_seen == {'event_store': store, 'task_id': 't9'}
 
     async def test_two_runner_sync_fail_benches_remote_and_falls_back_local(self):
         """(b) sync configured=True/ok=False -> quarantine remote AND dispatch local;
         remote.run_merge_verify NEVER called."""
         from orchestrator.verify_runner import SyncOutcome, VerifyRunnerPool
 
-        remote = _pool_fake_remote(sync_outcome=SyncOutcome(configured=True, ok=False))
+        remote, remote_calls = _pool_fake_remote(sync_outcome=SyncOutcome(configured=True, ok=False))
         local = _PoolFakeLocal()
         store = _RecordingEventStore()
         pool = VerifyRunnerPool([remote, local], event_store=store, task_id='t1')
@@ -7270,7 +7889,7 @@ class TestVerifyRunnerPoolContractCurrency:
 
         assert result.summary == 'local-ok'
         assert pool.is_quarantined('laptop') is True
-        assert remote._rmv_calls == []  # remote verdict never taken
+        assert remote_calls.rmv_calls == []  # remote verdict never taken
         assert len(local.calls) == 1
         mv = store.events_of(EventType.merge_verify)
         assert mv and mv[0]['runner'] == 'local'
@@ -7283,20 +7902,20 @@ class TestVerifyRunnerPoolContractCurrency:
             VerifyRunnerPool,
         )
 
-        remote = _pool_fake_remote(sync_outcome=SyncOutcome(configured=True, ok=False))
+        remote, remote_calls = _pool_fake_remote(sync_outcome=SyncOutcome(configured=True, ok=False))
         store = _RecordingEventStore()
         pool = VerifyRunnerPool([remote], event_store=store, task_id='t1')
 
         with pytest.raises(RunnerUnavailable):
             await pool.dispatch('abc123', _make_spec())
         assert pool.is_quarantined('laptop') is True
-        assert remote._rmv_calls == []
+        assert remote_calls.rmv_calls == []
 
     async def test_sync_not_configured_dispatches_remote_no_quarantine(self):
         """(d) sync configured=False -> byte-identical: remote dispatched, not benched."""
         from orchestrator.verify_runner import SyncOutcome, VerifyRunnerPool
 
-        remote = _pool_fake_remote(sync_outcome=SyncOutcome(configured=False, ok=True))
+        remote, remote_calls = _pool_fake_remote(sync_outcome=SyncOutcome(configured=False, ok=True))
         local = _PoolFakeLocal()
         store = _RecordingEventStore()
         pool = VerifyRunnerPool([remote, local], event_store=store, task_id='t1')
@@ -7311,14 +7930,14 @@ class TestVerifyRunnerPoolContractCurrency:
         """(e) happy path threads event_store=pool._event_store into run_merge_verify."""
         from orchestrator.verify_runner import SyncOutcome, VerifyRunnerPool
 
-        remote = _pool_fake_remote(sync_outcome=SyncOutcome(configured=True, ok=True))
+        remote, remote_calls = _pool_fake_remote(sync_outcome=SyncOutcome(configured=True, ok=True))
         store = _RecordingEventStore()
         pool = VerifyRunnerPool([remote], event_store=store, task_id='t1')
 
         await pool.dispatch('abc123', _make_spec())
 
-        assert len(remote._rmv_calls) == 1
-        assert remote._rmv_calls[0]['event_store'] is store
+        assert len(remote_calls.rmv_calls) == 1
+        assert remote_calls.rmv_calls[0]['event_store'] is store
 
     async def test_multi_remote_first_fail_tries_second_remote_before_local(self):
         """[remote_a(fail), remote_b(ok), local]: the fail-closed bench re-selects
@@ -7326,8 +7945,8 @@ class TestVerifyRunnerPoolContractCurrency:
         never burdened (multi-remote pools no longer fall straight to local)."""
         from orchestrator.verify_runner import SyncOutcome, VerifyRunnerPool
 
-        remote_a = _pool_fake_remote(name='a', sync_outcome=SyncOutcome(configured=True, ok=False))
-        remote_b = _pool_fake_remote(name='b', sync_outcome=SyncOutcome(configured=True, ok=True))
+        remote_a, calls_a = _pool_fake_remote(name='a', sync_outcome=SyncOutcome(configured=True, ok=False))
+        remote_b, calls_b = _pool_fake_remote(name='b', sync_outcome=SyncOutcome(configured=True, ok=True))
         local = _PoolFakeLocal()
         store = _RecordingEventStore()
         pool = VerifyRunnerPool([remote_a, remote_b, local], event_store=store, task_id='t1')
@@ -7337,8 +7956,8 @@ class TestVerifyRunnerPoolContractCurrency:
         assert result.summary == 'remote-ok'
         assert pool.is_quarantined('a') is True
         assert pool.is_quarantined('b') is False
-        assert remote_a._rmv_calls == []       # benched remote verdict never taken
-        assert len(remote_b._rmv_calls) == 1   # second remote served
+        assert calls_a.rmv_calls == []       # benched remote verdict never taken
+        assert len(calls_b.rmv_calls) == 1   # second remote served
         assert local.calls == []               # local anchor untouched
         mv = store.events_of(EventType.merge_verify)
         assert mv and mv[0]['runner'] == 'b'
@@ -7348,8 +7967,8 @@ class TestVerifyRunnerPoolContractCurrency:
         local trust anchor serves."""
         from orchestrator.verify_runner import SyncOutcome, VerifyRunnerPool
 
-        remote_a = _pool_fake_remote(name='a', sync_outcome=SyncOutcome(configured=True, ok=False))
-        remote_b = _pool_fake_remote(name='b', sync_outcome=SyncOutcome(configured=True, ok=False))
+        remote_a, calls_a = _pool_fake_remote(name='a', sync_outcome=SyncOutcome(configured=True, ok=False))
+        remote_b, calls_b = _pool_fake_remote(name='b', sync_outcome=SyncOutcome(configured=True, ok=False))
         local = _PoolFakeLocal()
         store = _RecordingEventStore()
         pool = VerifyRunnerPool([remote_a, remote_b, local], event_store=store, task_id='t1')
@@ -7359,8 +7978,8 @@ class TestVerifyRunnerPoolContractCurrency:
         assert result.summary == 'local-ok'
         assert pool.is_quarantined('a') is True
         assert pool.is_quarantined('b') is True
-        assert remote_a._rmv_calls == []
-        assert remote_b._rmv_calls == []
+        assert calls_a.rmv_calls == []
+        assert calls_b.rmv_calls == []
         assert len(local.calls) == 1
         mv = store.events_of(EventType.merge_verify)
         assert mv and mv[0]['runner'] == 'local'
@@ -7374,8 +7993,8 @@ class TestVerifyRunnerPoolContractCurrency:
             VerifyRunnerPool,
         )
 
-        remote_a = _pool_fake_remote(name='a', sync_outcome=SyncOutcome(configured=True, ok=False))
-        remote_b = _pool_fake_remote(name='b', sync_outcome=SyncOutcome(configured=True, ok=False))
+        remote_a, calls_a = _pool_fake_remote(name='a', sync_outcome=SyncOutcome(configured=True, ok=False))
+        remote_b, calls_b = _pool_fake_remote(name='b', sync_outcome=SyncOutcome(configured=True, ok=False))
         store = _RecordingEventStore()
         pool = VerifyRunnerPool([remote_a, remote_b], event_store=store, task_id='t1')
 
@@ -7383,5 +8002,5 @@ class TestVerifyRunnerPoolContractCurrency:
             await pool.dispatch('abc123', _make_spec())
         assert pool.is_quarantined('a') is True
         assert pool.is_quarantined('b') is True
-        assert remote_a._rmv_calls == []
-        assert remote_b._rmv_calls == []
+        assert calls_a.rmv_calls == []
+        assert calls_b.rmv_calls == []

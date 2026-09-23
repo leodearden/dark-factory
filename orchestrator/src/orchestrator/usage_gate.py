@@ -6,6 +6,4 @@ from shared.usage_gate import (  # noqa: F401 — explicit re-exports for type c
     ProbeSpawnError,
     SessionBudgetExhausted,
     UsageGate,
-    _extract_cap_message,
-    _parse_resets_at,
 )

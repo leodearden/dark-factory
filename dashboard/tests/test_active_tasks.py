@@ -25,6 +25,25 @@ from dashboard.data.active_tasks import (
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _reset_root_rotation_between_tests():
+    """Start every test from rotation offset 0.
+
+    REQUIRED, not tidy. ``active_tasks._root_rotation_offset`` is module state
+    that ``collect_tasks_with_counts`` advances on every call (task 4884), so
+    without this any test that asserts WHICH roots were served — or in what
+    order they were admitted — silently depends on how many times an EARLIER
+    test in the session happened to call the collector. That is a test that
+    passes or fails by file order, which is worse than one that fails.
+    """
+    import dashboard.data.active_tasks as at_mod
+
+    at_mod._reset_root_rotation()
+    yield
+    at_mod._reset_root_rotation()
+
+
+
 def test_minutes_since_handles_z_suffix_and_naive_iso():
     one_hour_ago = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace('+00:00', 'Z')
     minutes = _minutes_since(one_hour_ago)
@@ -32,20 +51,28 @@ def test_minutes_since_handles_z_suffix_and_naive_iso():
     assert 59 <= minutes <= 61
 
 
-def test_minutes_since_returns_none_on_missing_and_zero_on_bad():
-    """A MISSING start time is an honest unknown (None); a bad one keeps 0.
+def test_minutes_since_returns_none_on_missing_and_on_bad(caplog):
+    """A MISSING start time and a present-but-unparseable one are both None.
 
     ``None``/``''`` is the per-task artifact-read-failure signal on
     ``TaskRuntimeEntry.started`` (see ``shared/src/shared/task_runtime_state.py``
     — "never a fabricated 0"), so the helper must propagate the unknown rather
     than render it as '0m running'. A present-but-unparseable timestamp is a
-    different failure (upstream data damage, no known producer) and
-    deliberately keeps the existing 0 — out of scope for task 4055, see the
-    plan's design decisions.
+    different failure (upstream data damage, no known producer), but renders
+    identically misleadingly as '0m running' if faked to 0, so it is also
+    surfaced as None rather than fabricated (task 4365; task 4055 scoped its
+    fix to the missing/empty case only and left this branch for follow-up).
+    The unparseable case must also be LOUD (loud-over-silent-degradation): a
+    WARNING naming the offending value, not just a silently-swapped return —
+    mirroring ``test_queue.py::test_unparseable_timestamp_logs_a_warning``.
     """
     assert _minutes_since(None) is None
     assert _minutes_since('') is None
-    assert _minutes_since('not-a-date') == 0
+
+    with caplog.at_level(logging.WARNING):
+        assert _minutes_since('not-a-date') is None
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any('not-a-date' in m for m in warnings), warnings
 
 
 def test_minutes_since_uses_provided_now():
@@ -158,30 +185,51 @@ def _register_fetch_tasks(monkeypatch, fetch) -> None:
     ``fetch_statuses`` unpatched would reach for the network.
 
     So the wrapper emulates exactly what the substrate does — a ``statuses``
-    row filter, then a ``page_size``/``offset`` slice over an ASCENDING-id
-    list — and derives the compact map from the same canned tree.  Tests here
-    are about SHAPING; the wire contract itself is asserted against a canned
-    ``mcp_tool_call`` in ``TestShapeOneProjectNarrowing``.
+    row filter, then (for a page read) a ``page_size``/``offset`` slice over an
+    ASCENDING-id list — and derives the compact map from the same canned tree.
+    Tests here are about SHAPING; the wire contract itself is asserted against
+    a canned ``mcp_tool_call`` in ``TestShapeOneProjectNarrowing``.
+
+    TWO fakes, not one permissive fake, because the module now reads through
+    two functions with DIFFERENT contracts: ``fetch_tasks`` returns the
+    COMPLETE set and takes no window at all, ``fetch_task_page`` returns ONE
+    page and REQUIRES both ``page_size`` and ``offset``.  A fake laxer than the
+    real signature is how a call-site regression passes its tests — so each
+    fake here accepts exactly what its real counterpart accepts.
 
     *fetch* keeps its original ``(client, config, project_root)`` signature and
     may still return an offline marker dict, which is propagated unchanged.
     """
 
-    async def _narrowed(
-        client, config, project_root, *,
-        statuses=None, page_size=None, offset=0, timeout=None,
-    ):
+    async def _rows(client, config, project_root, statuses):
         rows = await fetch(client, config, project_root)
         if not isinstance(rows, list):
             return rows
         if statuses is not None:
             rows = [r for r in rows if r.get('status') in statuses]
-        rows = sorted(rows, key=lambda r: r.get('id') or 0)  # ORDER BY id ASC
-        if page_size is not None:
-            rows = rows[offset:offset + page_size]
-        return rows
+        return sorted(rows, key=lambda r: r.get('id') or 0)  # ORDER BY id ASC
 
-    async def _statuses(client, config, project_root):
+    async def _narrowed(
+        client, config, project_root, *,
+        statuses=None, chunk_size=None, timeout=None,
+    ):
+        # The COMPLETE set: chunk_size selects transport, so the fake ignores
+        # it exactly as the real one's ANSWER does.
+        return await _rows(client, config, project_root, statuses)
+
+    async def _page(
+        client, config, project_root, *,
+        page_size, offset, statuses=None, timeout=None,
+    ):
+        rows = await _rows(client, config, project_root, statuses)
+        if not isinstance(rows, list):
+            return rows
+        return rows[offset:offset + page_size]
+
+    # ``timeout`` is accepted-and-ignored: _shape_one_project threads
+    # active_tasks._TASKS_PER_CALL_TIMEOUT into all three of its calls, so a
+    # stub without the keyword raises TypeError instead of shaping rows.
+    async def _statuses(client, config, project_root, *, timeout=None):
         rows = await fetch(client, config, project_root)
         if not isinstance(rows, list):
             return {'offline': True, 'error': 'task fetch offline'}
@@ -190,6 +238,7 @@ def _register_fetch_tasks(monkeypatch, fetch) -> None:
         }
 
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _narrowed)
+    monkeypatch.setattr('dashboard.data.active_tasks.fetch_task_page', _page)
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_statuses', _statuses)
 
 
@@ -363,6 +412,7 @@ async def test_collect_active_tasks_handles_missing_worktree_metadata(tmp_path, 
         'started': 0, 'loops': 0, 'attempts': 0, 'deps': [],
         'meta_files': [], 'train': None, 'external_deps': [], 'prd': None,
         'lane': None, 'phase': None, 'lane_state': None, 'runtime_offline': False,
+        'runtime_status': 'ok',
         # Claim projection (task 3543): carried on every row. A 'pending' task
         # is never stranded — the shared predicate gates on 'in-progress'.
         'claimant_run_id': None, 'heartbeat_at': None, 'stranded': False,
@@ -430,6 +480,39 @@ async def test_collect_active_tasks_runtime_join_populates_lane_phase_lane_state
 
 
 @pytest.mark.asyncio
+async def test_collect_active_tasks_runtime_unparseable_started_yields_none_row(
+    tmp_path, monkeypatch, dummy_client,
+):
+    """An ONLINE entry whose ``started`` is present-but-unparseable renders as
+    ``None`` on the row, not a fabricated ``0`` — the row-level counterpart to
+    ``test_minutes_since_returns_none_on_missing_and_on_bad`` (task 4365),
+    mirroring ``test_task_runtime_boundary.py``'s
+    ``test_b6_online_per_task_read_failure_yields_none_started`` shape for the
+    unparseable-rather-than-missing case. ``runtime_offline`` stays False: this
+    is a damaged field on an otherwise-online snapshot, not an outage.
+    """
+    root, shaped = _make_project(
+        tmp_path, project_dir='damagedlane',
+        tasks=[{'id': 9, 'title': 'damaged task', 'status': 'in-progress', 'dependencies': []}],
+    )
+
+    async def _fake_fetch_tasks(client, config, project_root):
+        return list(shaped)
+
+    _register_fetch_tasks(monkeypatch, _fake_fetch_tasks)
+    _register_runtime(monkeypatch, {
+        'damagedlane': [_runtime_entry(9, started='not-a-date')],
+    })
+    cfg = DashboardConfig(project_root=root)
+
+    active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
+    assert len(active) == 1
+    row = active[0]
+    assert row['started'] is None
+    assert row['runtime_offline'] is False
+
+
+@pytest.mark.asyncio
 async def test_collect_active_tasks_runtime_offline_snapshot_yields_all_none(
     tmp_path, monkeypatch, dummy_client,
 ):
@@ -457,6 +540,10 @@ async def test_collect_active_tasks_runtime_offline_snapshot_yields_all_none(
     for key in ('agent', 'loops', 'attempts', 'started', 'lane', 'phase', 'lane_state'):
         assert row[key] is None, f'expected {key}=None when runtime offline, got {row[key]!r}'
     assert row['runtime_offline'] is True
+    # offline=True with NO reason is out-of-contract for a dashboard-synthesized
+    # snapshot. Report it as an honest 'unknown' — never guess 'unreachable',
+    # which is precisely the fabricated diagnosis task 3517 exists to prevent.
+    assert row['runtime_status'] == 'unknown'
 
 
 @pytest.mark.asyncio
@@ -485,6 +572,9 @@ async def test_collect_active_tasks_no_escalation_url_treated_as_offline(
     for key in ('agent', 'loops', 'attempts', 'started', 'lane', 'phase', 'lane_state'):
         assert row[key] is None, f'expected {key}=None when no escalation URL, got {row[key]!r}'
     assert row['runtime_offline'] is True
+    # ...but the CAUSE is separable now: nothing was ever probed here, so this
+    # is the expected/permanent case, not an orchestrator fault.
+    assert row['runtime_status'] == 'not_configured'
 
 
 @pytest.mark.asyncio
@@ -524,6 +614,112 @@ async def test_collect_active_tasks_runtime_per_task_read_failure_stays_online(
     assert row['runtime_offline'] is False, (
         'a per-task read failure is an honest error, not an offline project'
     )
+    assert row['runtime_status'] == 'ok', (
+        'the PROBE succeeded — the failure is per-task, not a probe fault domain'
+    )
+
+
+# ---------------------------------------------------------------------------
+# runtime_status probe discriminator (task 3517)
+# ---------------------------------------------------------------------------
+
+
+async def _one_task_row_with_snapshot(
+    tmp_path, monkeypatch, dummy_client, snapshot: TaskRuntimeSnapshot | None,
+) -> dict:
+    """Collect a single-task project whose runtime map holds *snapshot*.
+
+    ``None`` means the label is absent from the map entirely (no escalation
+    URL configured for it) — the never-probed case.
+    """
+    root, shaped = _make_project(
+        tmp_path, project_dir='probe',
+        tasks=[{'id': 3, 'title': 'probed task', 'status': 'in-progress', 'dependencies': []}],
+    )
+
+    async def _fake_fetch_tasks(client, config, project_root):
+        return list(shaped)
+
+    async def _fake_fetch_task_runtime(client, escalation_urls):
+        return {} if snapshot is None else {'probe': snapshot}
+
+    _register_fetch_tasks(monkeypatch, _fake_fetch_tasks)
+    monkeypatch.setattr(
+        'dashboard.data.active_tasks.fetch_task_runtime', _fake_fetch_task_runtime,
+    )
+    active, _ = await collect_active_tasks(
+        client=dummy_client, config=DashboardConfig(project_root=root),
+    )
+    assert len(active) == 1
+    return active[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('reason', ['deadline_exceeded', 'unreachable'])
+async def test_collect_active_tasks_row_carries_probe_reason(
+    tmp_path, monkeypatch, dummy_client, reason,
+):
+    """The probe's fault-domain discriminator reaches the task row intact.
+
+    Without this an operator sees identical blank cells whether the
+    orchestrator is down or the dashboard was too starved to ask — the
+    2026-07-30 misdiagnosis.
+    """
+    row = await _one_task_row_with_snapshot(
+        tmp_path, monkeypatch, dummy_client,
+        TaskRuntimeSnapshot(offline=True, offline_reason=reason),
+    )
+    assert row['runtime_status'] == reason
+    # Back-compat: runtime_offline keeps its exact prior meaning, and degraded
+    # rows still carry honest Nones rather than fabricated zeros.
+    assert row['runtime_offline'] is True
+    for key in ('agent', 'loops', 'attempts', 'started', 'lane', 'phase', 'lane_state'):
+        assert row[key] is None, f'expected {key}=None when probe failed, got {row[key]!r}'
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_online_snapshot_with_entry_is_ok(
+    tmp_path, monkeypatch, dummy_client,
+):
+    row = await _one_task_row_with_snapshot(
+        tmp_path, monkeypatch, dummy_client,
+        TaskRuntimeSnapshot(tasks=[_runtime_entry(3, loops=4)]),
+    )
+    assert row['runtime_status'] == 'ok'
+    assert row['runtime_offline'] is False
+    assert row['loops'] == 4
+
+
+@pytest.mark.asyncio
+async def test_collect_active_tasks_terminal_rows_carry_runtime_status(
+    tmp_path, monkeypatch, dummy_client,
+):
+    """Terminal (done) rows get the discriminator too — the row shape must not
+    diverge between the active loop and the terminal bucket."""
+    root, shaped = _make_done_project(
+        tmp_path, project_dir='term',
+        active_tasks=[{'id': 1, 'title': 'active', 'status': 'in-progress', 'dependencies': []}],
+        done_tasks=[{'id': 60, 'title': 'finished', 'status': 'done', 'dependencies': [],
+                     'updated_at': '2026-05-29T12:00:00+00:00'}],
+    )
+
+    async def _fake_fetch_tasks(client, config, project_root):
+        return list(shaped)
+
+    async def _fake_fetch_task_runtime(client, escalation_urls):
+        return {'term': TaskRuntimeSnapshot(offline=True, offline_reason='unreachable')}
+
+    _register_fetch_tasks(monkeypatch, _fake_fetch_tasks)
+    monkeypatch.setattr(
+        'dashboard.data.active_tasks.fetch_task_runtime', _fake_fetch_task_runtime,
+    )
+    active, _ = await collect_active_tasks(
+        client=dummy_client, config=DashboardConfig(project_root=root),
+        max_done_per_project=1,
+    )
+    done_row = next(r for r in active if r['id'] == 'term/T-60')
+    assert done_row['runtime_status'] == 'unreachable'
+    assert all('runtime_status' in r for r in active)
 
 
 @pytest.mark.asyncio
@@ -790,7 +986,7 @@ async def test_collect_done_counts_returns_per_project_done_count(tmp_path, monk
     # reify: 1 done
     reify_statuses = {10: 'done', 11: 'in-progress', 12: 'pending'}
 
-    async def _fake_fetch_statuses(client, config, project_root):
+    async def _fake_fetch_statuses(client, config, project_root, *, timeout=None):
         resolved = project_root.resolve()
         if resolved == df_root.resolve():
             return dict(df_statuses)
@@ -814,7 +1010,7 @@ async def test_collect_done_counts_skips_offline_projects(tmp_path, monkeypatch,
     offline_root = tmp_path / 'offline-project'
     offline_root.mkdir()
 
-    async def _fake_fetch_statuses(client, config, project_root):
+    async def _fake_fetch_statuses(client, config, project_root, *, timeout=None):
         if project_root.resolve() == offline_root.resolve():
             return {'offline': True, 'error': 'connection refused'}
         return {1: 'done', 2: 'in-progress'}
@@ -834,7 +1030,7 @@ async def test_collect_done_counts_all_done_zero(tmp_path, monkeypatch, dummy_cl
     root = tmp_path / 'empty-project'
     root.mkdir()
 
-    async def _fake_fetch_statuses(client, config, project_root):
+    async def _fake_fetch_statuses(client, config, project_root, *, timeout=None):
         return {1: 'in-progress', 2: 'pending'}
 
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_statuses', _fake_fetch_statuses)
@@ -2167,21 +2363,30 @@ class TestShapeOneProjectNarrowing:
         """The budget ROSTER must describe the shipped calls, not merely count them.
 
         ``test_tasks_budget.py`` machine-checks
-        ``DEFAULT_PER_CALL_TIMEOUT * len(_PER_PROJECT_MCP_CALLS) <=
+        ``_TASKS_PER_CALL_TIMEOUT * len(_PER_PROJECT_MCP_CALLS) <=
         _TASKS_PER_PROJECT_BUDGET``.  That arithmetic is only a true statement
         ABOUT THIS SYSTEM if every enumerated call actually threads the term.
         ``fetch_statuses`` shipped without it, so one of the three ran on
-        ``mcp_tool_call``'s 10 s default and could alone overrun the 7 s
+        ``mcp_tool_call``'s 10 s default and could alone overrun the
         per-project budget the roster claims to bound — a constants-only test
         cannot see that, which is why this one asserts at the WIRE.
+
+        The term is the Tasks-tab-LOCAL ``_TASKS_PER_CALL_TIMEOUT`` (task
+        4884), NOT ``tasks.DEFAULT_PER_CALL_TIMEOUT``.  Asserting the shared
+        default here would be actively wrong in a way this test exists to
+        catch: three route budgets bind the shared default by reference, so
+        pinning the Tasks tab to it re-couples exactly what the local constant
+        was introduced to decouple.  If this assertion fails because the two
+        values converged, delete the local constant — do not edit this test to
+        follow it.
 
         Driving the full three-call path (caps > 0) also means adding a fourth
         per-project call without the keyword fails here, rather than silently
         widening the budget.
         """
-        import dashboard.data.tasks as tasks_mod
         from dashboard.data.active_tasks import (
             _PER_PROJECT_MCP_CALLS,
+            _TASKS_PER_CALL_TIMEOUT,
             _shape_one_project,
         )
 
@@ -2203,12 +2408,79 @@ class TestShapeOneProjectNarrowing:
             f'{[c["tool"] for c in calls]}'
         )
         for call in calls:
-            assert call['kwargs'].get('timeout') == tasks_mod.DEFAULT_PER_CALL_TIMEOUT, (
-                f"{call['tool']} was issued without the per-request budget "
-                f"(timeout={call['kwargs'].get('timeout')!r}) — it falls back to "
-                "mcp_tool_call's 10s default, so the per-project budget "
+            assert call['kwargs'].get('timeout') == _TASKS_PER_CALL_TIMEOUT, (
+                f"{call['tool']} was issued with timeout="
+                f"{call['kwargs'].get('timeout')!r}, not the Tasks tab's own "
+                f'_TASKS_PER_CALL_TIMEOUT ({_TASKS_PER_CALL_TIMEOUT}s) — with '
+                "no keyword it falls back to mcp_tool_call's 10s default, and "
+                'with the SHARED default it silently under-budgets the '
+                '5 000-task trees this tab reads, so the per-project budget '
                 'arithmetic in test_tasks_budget.py does not describe it'
             )
+
+    async def test_the_terminal_window_goes_through_fetch_task_page(
+        self, monkeypatch, tmp_path, dummy_client
+    ):
+        """The ONE call site whose CONTRACT changes reads through the page API.
+
+        The terminal window wants a PARTIAL answer and its own truncation
+        WARNING already says so ("only the %d highest-id terminal rows are
+        fetched"). After task 5018 that intent is in the function name rather
+        than in an argument combination, so a reader cannot mistake it for a
+        whole-tree read. The ACTIVE read is the control: it wants everything
+        matching its filter and must stay on `fetch_tasks`, with NO page
+        arguments at all.
+        """
+        import dashboard.data.active_tasks as at_mod
+        from dashboard.data.active_tasks import (
+            _ACTIVE_STATUSES,
+            _TERMINAL_FETCH_WINDOW,
+            _TERMINAL_STATUSES,
+            _shape_one_project,
+        )
+
+        config = self._one_project_config(tmp_path)
+        rows = [
+            {'id': i, 'title': f't{i}', 'status': 'done', 'dependencies': [],
+             'metadata': {}}
+            for i in range(1, 6)
+        ]
+        whole: list[dict] = []
+        paged: list[dict] = []
+
+        async def _fake_tasks(client, cfg, project_root, **kwargs):
+            whole.append(kwargs)
+            return []
+
+        async def _fake_page(client, cfg, project_root, **kwargs):
+            paged.append(kwargs)
+            return rows
+
+        async def _fake_statuses(client, cfg, project_root, **kwargs):
+            # **kwargs absorbs the Tasks-tab-local ``timeout``
+            # ``_shape_one_project`` threads into all three of its calls.
+            return {r['id']: 'done' for r in rows}
+
+        monkeypatch.setattr(at_mod, 'fetch_tasks', _fake_tasks)
+        monkeypatch.setattr(at_mod, 'fetch_task_page', _fake_page)
+        monkeypatch.setattr(at_mod, 'fetch_statuses', _fake_statuses)
+
+        await _shape_one_project(
+            dummy_client, config, config.project_root,
+            max_done_per_project=10, max_cancelled_per_project=10,
+        )
+
+        assert len(paged) == 1, f'exactly one windowed read, got {paged}'
+        assert paged[0]['statuses'] == sorted(_TERMINAL_STATUSES)
+        assert paged[0]['page_size'] == _TERMINAL_FETCH_WINDOW
+        assert paged[0]['offset'] == max(0, len(rows) - _TERMINAL_FETCH_WINDOW)
+
+        assert len(whole) == 1, f'exactly one whole-set read, got {whole}'
+        assert whole[0]['statuses'] == sorted(_ACTIVE_STATUSES)
+        assert 'page_size' not in whole[0] and 'offset' not in whole[0], (
+            'the active read asks for everything matching its filter — a page '
+            f'argument here would silently truncate it, got {whole[0]}'
+        )
 
     async def test_tasks_tab_path_issues_a_bounded_terminal_window(
         self, monkeypatch, tmp_path, dummy_client
@@ -2851,6 +3123,18 @@ class TestCollectTasksBudget:
         the entire 0.3s handler budget. Timers overshoot and never undershoot,
         so ``delta`` and ``epsilon`` are guaranteed to find a non-positive
         remaining budget — they can only be reached by the deadline branch.
+
+        ``_TASKS_ROOT_CONCURRENCY`` is pinned to 1 for exactly that reason,
+        and the pin is what makes the derivation above true rather than a
+        coincidence. This test is about the DEADLINE branch, not about the
+        width: at the shipped width the fast roots slot into the first wave
+        and the never-reached branch is simply not the one under test. That
+        the branch still fires at the shipped width is asserted separately by
+        ``TestCollectTasksWithCountsConcurrency::
+        test_degraded_is_preserved_under_concurrency`` (task 4884) — so
+        isolating the two here costs no coverage and buys a deterministic
+        arithmetic that does not have to be re-derived every time the width
+        moves.
         """
         invoked = _register_shaper(
             monkeypatch,
@@ -2858,6 +3142,9 @@ class TestCollectTasksBudget:
             done_counts={'alpha': 7},
         )
         self._tighten(monkeypatch, total=0.3, per_project=0.2)
+        monkeypatch.setattr(
+            'dashboard.data.active_tasks._TASKS_ROOT_CONCURRENCY', 1
+        )
         config = _budget_config(
             tmp_path, ['alpha', 'beta', 'gamma', 'delta', 'epsilon']
         )
@@ -3251,3 +3538,663 @@ class TestCountUnknownProjectsAreNamedOnTheWire:
             'never measured must still be NAMED, or it renders as a healthy '
             f'project with a confident "0 done"; got {count_unknown!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# workstream C cause 2 (task 4884, #4795): the per-root walk is CONCURRENT
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCollectTasksWithCountsConcurrency:
+    """The per-root walk must be parallel-but-bounded, and still deterministic.
+
+    The starvation this closes is arithmetic. The walk used to be SEQUENTIAL,
+    so with N roots the wall clock was the SUM of the per-root costs against a
+    single ``_TASKS_TOTAL_BUDGET`` — and the incident's 9 roots could not fit,
+    so the same trailing roots were reported degraded on every render
+    (``project pump-web-ui: skipped — the 20.0s Tasks budget was already
+    spent``). Concurrency at width W turns the worst case into roughly
+    ``ceil(N / W) * _TASKS_PER_PROJECT_BUDGET``.
+
+    (a) and (b) are the fix. (c)-(f) are the REGRESSION FENCE around it: the
+    offline/degraded/order semantics are load-bearing product facts and
+    concurrency is exactly the kind of change that quietly breaks them, so
+    they are asserted here rather than assumed to be covered elsewhere.
+    """
+
+    def _n_root_config(self, tmp_path, n: int) -> DashboardConfig:
+        """A config with *n* roots: the primary plus ``n - 1`` known roots."""
+        roots = []
+        for i in range(n):
+            root = tmp_path / f'proj-{i:02d}'
+            root.mkdir()
+            roots.append(root)
+        return DashboardConfig(
+            project_root=roots[0], known_project_roots=roots[1:],
+        )
+
+    def _tracking_stub(self, monkeypatch, *, dwell: float = 0.05, rows=None,
+                       offline_for=None, raise_for=None, serve_first=None):
+        """Patch ``_shape_one_project`` with a stub that records enter/exit.
+
+        Returns the shared ``events`` list of ``(label, 'enter'|'exit', t)``.
+
+        With *serve_first* set to N the first N ADMISSIONS return without
+        awaiting at all and every admission after them hangs forever, so which
+        roots a render serves is a property of the admission order rather than
+        a race between a dwell and a budget. Same idiom, and the same reason,
+        as ``TestCollectTasksWithCountsFairness._admission_recorder``.
+        """
+        import dashboard.data.active_tasks as at_mod
+
+        events: list[tuple[str, str, float]] = []
+        offline_for = set(offline_for or ())
+        raise_for = set(raise_for or ())
+        admitted = 0
+
+        async def _stub(client, config, project_root, **kwargs):
+            nonlocal admitted
+            label = project_root.name
+            loop = asyncio.get_running_loop()
+            events.append((label, 'enter', loop.time()))
+            admitted += 1
+            try:
+                if serve_first is not None:
+                    if admitted > serve_first:
+                        # A wedged MCP leg: never returns, so the caller's own
+                        # budget is what ends it — on every host alike.
+                        await asyncio.Event().wait()
+                else:
+                    await asyncio.sleep(dwell)
+                if label in raise_for:
+                    raise RuntimeError(f'shaping blew up for {label}')
+                if label in offline_for:
+                    return [], True, 0
+                row = (
+                    [dict(rows_for_label) for rows_for_label in rows(label)]
+                    if rows is not None
+                    else [{'_task_uid': f'{label}/T-1', 'project': label}]
+                )
+                return row, False, 7
+            finally:
+                events.append((label, 'exit', asyncio.get_running_loop().time()))
+
+        monkeypatch.setattr(at_mod, '_shape_one_project', _stub)
+        return events
+
+    @staticmethod
+    def _max_simultaneous(events) -> int:
+        """Peak number of roots inside the stub at once, from the event log."""
+        live = peak = 0
+        # Tie-break ENTER before EXIT at an identical loop.time(): the loop
+        # clock is coarse enough for a fast stub's exit and the next root's
+        # entry to share a timestamp, and ordering the exit first would
+        # under-count live occupancy and fail the strict `peak == width`
+        # assertion below for a reason that is not about the semaphore.
+        for _label, kind, _t in sorted(events, key=lambda e: (e[2], e[1] == 'exit')):
+            if kind == 'enter':
+                live += 1
+                peak = max(peak, live)
+            else:
+                live -= 1
+        return peak
+
+    async def test_walk_saturates_the_semaphore_and_never_exceeds_it(
+        self, monkeypatch, tmp_path, dummy_client,
+    ):
+        """(a) The peak in-flight root count is EXACTLY the configured width.
+
+        Asserting equality rather than ``> 1`` is deliberate and is the whole
+        value of this test: a semaphore that is present but never saturated
+        proves nothing (the walk could still be effectively serial), and an
+        unbounded ``gather`` would show all 9 — the ``httpx.PoolTimeout``
+        hazard ``burndown.py`` records against the shared client.
+        """
+        import dashboard.data.active_tasks as at_mod
+
+        config = self._n_root_config(tmp_path, 9)
+        _register_runtime(monkeypatch, {})
+        events = self._tracking_stub(monkeypatch)
+
+        await collect_tasks_with_counts(client=dummy_client, config=config)
+
+        peak = self._max_simultaneous(events)
+        assert peak == at_mod._TASKS_ROOT_CONCURRENCY, (
+            f'peak in-flight roots was {peak}, expected exactly '
+            f'_TASKS_ROOT_CONCURRENCY={at_mod._TASKS_ROOT_CONCURRENCY} over 9 '
+            'roots — 1 means the sequential walk that starved the tail is '
+            'still in place, 9 means the semaphore is missing (an unbounded '
+            'fan-out against the single fused-memory server on the httpx '
+            'client the 3s render polls share), and anything strictly between '
+            '1 and the width means the semaphore is never saturated so the '
+            'concurrency it claims to provide is not actually delivered'
+        )
+
+    async def test_admission_proceeds_in_ceil_n_over_w_waves(
+        self, monkeypatch, tmp_path, dummy_client,
+    ):
+        """(b) The 9 roots are admitted in ``ceil(N/W)`` waves, not 9 turns.
+
+        This is the assertion that actually pins the user-visible symptom —
+        "a cold render costs the entire 20 s budget and the tail degrades" —
+        because wall clock is ``waves * per-root cost``.
+
+        DERIVED FROM THE EVENT LOG, NOT FROM A CLOCK. The earlier form ran 9
+        real ``asyncio.sleep(0.05)``s and asserted ``elapsed < 0.30s``, which
+        leaves ~0.15 s of headroom for scheduling — the same class of
+        host-speed race commit a83febb5bc removed three of elsewhere on this
+        branch, and one that fails LOUDEST under the xdist contention CI
+        actually runs with. Here each wave is released by an explicit gate, so
+        the wave COUNT is observed directly and no host can be too slow.
+        """
+        import math
+
+        import dashboard.data.active_tasks as at_mod
+
+        width = at_mod._TASKS_ROOT_CONCURRENCY
+        config = self._n_root_config(tmp_path, 9)
+        _register_runtime(monkeypatch, {})
+
+        entered: list[str] = []
+        gate = asyncio.Event()
+
+        async def _stub(client, config_, project_root, **kwargs):
+            entered.append(project_root.name)
+            # Reads `gate` at CALL time, so a root admitted in wave k waits on
+            # wave k's gate object and is unaffected by the rebinding below.
+            await gate.wait()
+            return [{'_task_uid': f'{project_root.name}/T-1', 'project': project_root.name}], False, 1
+
+        monkeypatch.setattr(at_mod, '_shape_one_project', _stub)
+
+        async def _settle() -> None:
+            """Yield until the walk stops admitting. Bounded, and clock-free."""
+            stable = 0
+            while stable < 5:
+                before = len(entered)
+                await asyncio.sleep(0)
+                stable = stable + 1 if len(entered) == before else 0
+
+        walk = asyncio.create_task(
+            collect_tasks_with_counts(client=dummy_client, config=config),
+        )
+
+        admitted = 0
+        wave_sizes: list[int] = []
+        while admitted < 9:
+            await _settle()
+            newly = len(entered) - admitted
+            assert 0 < newly <= width, (
+                f'wave {len(wave_sizes) + 1} admitted {newly} roots against a '
+                f'_TASKS_ROOT_CONCURRENCY of {width} — 0 means the walk '
+                'stalled with slots free, more than the width means the '
+                'semaphore is not bounding anything (an unbounded fan-out '
+                'against the single fused-memory server on the httpx client '
+                'the 3 s render polls share)'
+            )
+            wave_sizes.append(newly)
+            admitted += newly
+            opening, gate = gate, asyncio.Event()
+            opening.set()  # let this wave finish, freeing its slots
+
+        active, _offline, _counts, degraded, _unknown = await walk
+
+        assert len(wave_sizes) == math.ceil(9 / width), (
+            f'the 9-root walk took {len(wave_sizes)} waves '
+            f'({wave_sizes}) at width {width}, not the expected '
+            f'{math.ceil(9 / width)} — 9 means the roots are still walked one '
+            'at a time, which is the cost model that made the cold render '
+            'exhaust _TASKS_TOTAL_BUDGET and starve the tail'
+        )
+        assert wave_sizes[0] == width, (
+            f'the first wave admitted {wave_sizes[0]} of {width} slots; a '
+            'semaphore that is never saturated delivers none of the '
+            'concurrency it claims'
+        )
+        assert len(active) == 9 and degraded == [], (
+            'every root was released, so every root must have been served'
+        )
+
+    async def test_row_order_is_root_order_not_completion_order(
+        self, monkeypatch, tmp_path, dummy_client,
+    ):
+        """(c) Concurrency must not be allowed to reorder the payload.
+
+        The Tasks tab renders ``all_active`` directly, so completion order
+        leaking into the payload would reshuffle the table on every 3 s poll.
+        The stub finishes roots in REVERSE root order to force the issue.
+        """
+        config = self._n_root_config(tmp_path, 6)
+        _register_runtime(monkeypatch, {})
+
+        async def _stub(client, config_, project_root, **kwargs):
+            label = project_root.name
+            # Earlier roots dwell LONGER, so completion order is the reverse
+            # of root order and an append-as-you-finish implementation would
+            # emit proj-05 first.
+            await asyncio.sleep(0.01 * (6 - int(label.split('-')[1])))
+            return [{'_task_uid': f'{label}/T-1', 'project': label}], False, 1
+
+        monkeypatch.setattr(
+            'dashboard.data.active_tasks._shape_one_project', _stub,
+        )
+
+        active, _offline, _counts, _degraded, _unknown = (
+            await collect_tasks_with_counts(client=dummy_client, config=config)
+        )
+
+        got = [row['project'] for row in active]
+        assert got == [f'proj-{i:02d}' for i in range(6)], (
+            f'rows came back in {got}, not primary-first ROOT order — the '
+            'concurrent walk is appending rows from inside the per-root '
+            'coroutines, so completion order (here deliberately the reverse) '
+            'leaks into the rendered table'
+        )
+
+    async def test_two_roots_sharing_a_basename_both_render(
+        self, monkeypatch, tmp_path, dummy_client,
+    ):
+        """(g) Per-root results are paired by ROOT, never by display label.
+
+        ``_project_label`` is the directory BASENAME, so two configured roots
+        can share one (``/a/proj`` and ``/b/proj``). Keying the gathered
+        results by label collapses them: the survivor's rows are extended into
+        ``all_active`` TWICE — duplicate ``_task_uid``s, which the React tab
+        uses as its map key — and the other root's rows vanish with no
+        offline or degraded marker naming them. That is silent DATA LOSS, and
+        it is the invisible-failure class this whole task exists to close.
+        """
+        a = tmp_path / 'a' / 'proj'
+        b = tmp_path / 'b' / 'proj'
+        for root in (a, b):
+            root.mkdir(parents=True)
+        config = DashboardConfig(project_root=a, known_project_roots=[b])
+        _register_runtime(monkeypatch, {})
+
+        async def _stub(client, config_, project_root, **kwargs):
+            uid = f'{project_root.parent.name}/{project_root.name}/T-1'
+            return [{'_task_uid': uid, 'project': project_root.name}], False, 1
+
+        monkeypatch.setattr(
+            'dashboard.data.active_tasks._shape_one_project', _stub,
+        )
+
+        active, offline, _counts, degraded, _unknown = (
+            await collect_tasks_with_counts(client=dummy_client, config=config)
+        )
+
+        uids = [row['_task_uid'] for row in active]
+        assert sorted(uids) == ['a/proj/T-1', 'b/proj/T-1'], (
+            f'the two same-named roots rendered {uids}; each root must '
+            'contribute its OWN rows exactly once. A duplicated uid means one '
+            "root's rows were emitted twice under the other's identity, and a "
+            'missing one means a root was dropped with nothing naming it'
+        )
+        assert offline == [] and degraded == [], (
+            'both roots answered — neither may be marked offline or degraded'
+        )
+
+    async def test_degraded_is_preserved_under_concurrency(
+        self, monkeypatch, tmp_path, dummy_client, caplog,
+    ):
+        """(d) A root the budget never served is degraded, not offline, and has NO count.
+
+        A MIXED partition is the whole point, and the earlier form of this
+        test never produced one: it dwelled 0.05 s against a 0.03 s
+        per-project budget, so all 9 roots blew their budget, `active` was
+        empty and `counts` was `{}` — the three `label not in ...` assertions
+        below iterated 9 labels against three EMPTY collections and could not
+        fail. The `serve_first` cut makes the partition deterministic: the
+        first 3 admissions return without awaiting, the rest hang until their
+        own per-project budget ends them.
+        """
+        import dashboard.data.active_tasks as at_mod
+
+        config = self._n_root_config(tmp_path, 9)
+        _register_runtime(monkeypatch, {})
+        self._tracking_stub(monkeypatch, serve_first=3)
+        monkeypatch.setattr(at_mod, '_TASKS_PER_PROJECT_BUDGET', 0.05)
+        # Generous, deliberately: the TOTAL budget expiring is a DIFFERENT
+        # branch (tested by the fairness class). What must be exercised here
+        # is the per-project expiry.
+        monkeypatch.setattr(at_mod, '_TASKS_TOTAL_BUDGET', 5.0)
+
+        with caplog.at_level(logging.WARNING):
+            active, offline, counts, degraded, _unknown = (
+                await collect_tasks_with_counts(client=dummy_client, config=config)
+            )
+
+        assert degraded, (
+            'no root was reported degraded even though 6 of the 9 roots never '
+            'returned — a root the handler never served must be NAMED, or it '
+            'renders as "no active work"'
+        )
+        served = {row['project'] for row in active}
+        # VACUITY GUARD, mirroring the fairness class's: the three assertions
+        # below compare the degraded labels against `served`/`counts`/`offline`,
+        # so all three pass trivially if those are empty.
+        assert 0 < len(served) < 9, (
+            f'{len(served)} of 9 roots were served — this test asserts a MIXED '
+            'partition, and is vacuous unless both halves are non-empty'
+        )
+        assert counts, 'the served roots must carry done counts, or the count assertions are vacuous'
+        assert len(degraded) == 9 - len(served)
+        for label in degraded:
+            assert label not in served, f'{label} is both degraded and served'
+            assert label not in counts, (
+                f'{label} timed out but carries a done_count of '
+                f'{counts.get(label)!r} — no count was measured, so none may '
+                'be fabricated (not even a 0, which renders as a confident '
+                '"this project has zero done tasks")'
+            )
+            assert label not in offline, (
+                f'{label} is reported BOTH degraded and offline — the two are '
+                'distinct facts: offline means the read demonstrably failed, '
+                'degraded means the budget expired so the state is UNKNOWN. '
+                'Merging them tells an operator to restart a healthy service.'
+            )
+
+    async def test_offline_is_preserved_under_concurrency(
+        self, monkeypatch, tmp_path, dummy_client,
+    ):
+        """(e) #4795 acceptance 3: a genuinely unreachable root still reports OFFLINE.
+
+        Acceptance 1 (a clean cold render) may not be bought by widening
+        budgets until nothing can fail — so the offline marker must survive
+        the concurrency change under a budget generous enough that nothing
+        degrades.
+        """
+        config = self._n_root_config(tmp_path, 4)
+        _register_runtime(monkeypatch, {})
+        self._tracking_stub(monkeypatch, dwell=0.0, offline_for={'proj-02'})
+
+        active, offline, counts, degraded, _unknown = (
+            await collect_tasks_with_counts(client=dummy_client, config=config)
+        )
+
+        assert offline == ['proj-02'], (
+            f'expected proj-02 offline, got offline={offline!r} — a fetch that '
+            'demonstrably failed must still be reported offline under the '
+            'concurrent walk'
+        )
+        assert 'proj-02' not in degraded, (
+            'proj-02 is offline (the read failed), not degraded (the budget '
+            'expired) — the concurrent walk must not collapse the two'
+        )
+        assert 'proj-02' not in counts, (
+            'an offline project must contribute no done_count'
+        )
+        assert {row['project'] for row in active} == {
+            'proj-00', 'proj-01', 'proj-03',
+        }, 'one offline root must not cost the other three their rows'
+
+    async def test_broad_exception_path_is_preserved_under_concurrency(
+        self, monkeypatch, tmp_path, dummy_client, caplog,
+    ):
+        """(f) A raising root is marked offline and the other eight still render.
+
+        The broad ``except Exception`` must stay INSIDE the per-root unit. If
+        it moved out to the gather, one shaping bug would unwind the whole
+        walk and 500 the handler — the "one bad root blanks the whole tab"
+        failure relocated from the banner to the aggregator.
+        """
+        config = self._n_root_config(tmp_path, 9)
+        _register_runtime(monkeypatch, {})
+        self._tracking_stub(monkeypatch, dwell=0.0, raise_for={'proj-04'})
+
+        with caplog.at_level(logging.WARNING):
+            active, offline, _counts, degraded, _unknown = (
+                await collect_tasks_with_counts(client=dummy_client, config=config)
+            )
+
+        assert offline == ['proj-04'], (
+            f'expected proj-04 offline after it raised, got {offline!r}'
+        )
+        assert 'proj-04' not in degraded, (
+            'a root that RAISED is offline (the read demonstrably failed), '
+            'never degraded (which means the budget expired first)'
+        )
+        assert len(active) == 8, (
+            f'only {len(active)} of the 8 healthy roots rendered — one root '
+            'raising must not unwind the concurrent gather and take the '
+            'others with it; the broad except must stay inside the per-root '
+            'coroutine'
+        )
+        assert any(
+            'proj-04' in rec.message or 'proj-04' in str(rec.args)
+            for rec in caplog.records
+        ), (
+            'the raising root was absorbed into an offline marker with no '
+            'WARNING — an exception logged as a routine outage is a bug that '
+            'renders as an outage forever'
+        )
+
+
+# ---------------------------------------------------------------------------
+# workstream C cause 3 (task 4884, #4795): the walk ORDER rotates
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCollectTasksWithCountsFairness:
+    """A budget that cannot serve every root must not starve the SAME ones.
+
+    Concurrency (cause 2) shrinks the wall clock but does not make the walk
+    fair: at 9 roots and a 20 s total, some render will still run out, and
+    with a FIXED order the roots that lose are always the last ones. That is
+    what the journal shows — ``project solar-challenge-platform: skipped — the
+    20.0s Tasks budget was already spent before this project was reached``
+    and ``project pump-web-ui: skipped ...``, the same trailing pair, render
+    after render. Those two projects were effectively invisible on the Tasks
+    tab while the dashboard reported itself healthy.
+
+    Rotation makes the starvation FAIR, not absent. These tests assert the
+    fairness, not the absence.
+    """
+
+    def _n_root_config(self, tmp_path, n: int) -> DashboardConfig:
+        roots = []
+        for i in range(n):
+            root = tmp_path / f'proj-{i:02d}'
+            root.mkdir()
+            roots.append(root)
+        return DashboardConfig(
+            project_root=roots[0], known_project_roots=roots[1:],
+        )
+
+    def _admission_recorder(self, monkeypatch, *, dwell: float, serve_first=None):
+        """Patch ``_shape_one_project`` to record ADMISSION order per call.
+
+        With *serve_first* set to N, the first N admissions recorded in
+        ``admissions`` return WITHOUT awaiting at all and every admission
+        after them hangs forever.  That makes "which roots this render
+        served" a property of the ADMISSION ORDER alone — the thing these
+        tests are about — instead of a race between a dwell and a budget.
+        Callers using it must clear ``admissions`` between renders.
+        """
+        admissions: list[str] = []
+
+        async def _stub(client, config, project_root, **kwargs):
+            label = project_root.name
+            admissions.append(label)
+            if serve_first is not None and len(admissions) > serve_first:
+                # A wedged MCP leg: never returns, so the caller's own budget
+                # is what ends it — and ends it whatever the host's speed.
+                await asyncio.Event().wait()
+            elif dwell:
+                await asyncio.sleep(dwell)
+            return [{'_task_uid': f'{label}/T-1', 'project': label}], False, 1
+
+        monkeypatch.setattr(
+            'dashboard.data.active_tasks._shape_one_project', _stub,
+        )
+        return admissions
+
+    async def test_no_root_is_systematically_starved(
+        self, monkeypatch, tmp_path, dummy_client,
+    ):
+        """(a) Across enough consecutive renders, EVERY root gets served.
+
+        This is stronger than "two runs differ": a two-cycle alternation would
+        satisfy that and still leave roots 5-9 permanently invisible. The
+        assertion is on the UNION over consecutive calls covering all nine.
+
+        The number of calls is DERIVED from the observed rotation stride
+        rather than hard-coded. With ``s`` roots served per render and the
+        offset advancing by ONE slot per render, the served window is
+        contiguous and slides by one, so covering ``N`` roots takes
+        ``N - s + 1`` renders — not ``ceil(N / s)``, which would be the count
+        for a stride of ``s``. Stride one is the finer-grained rotation and
+        the one ``_rotated_project_roots`` implements; deriving the count here
+        keeps this test correct if that choice is ever revisited.
+        """
+        import dashboard.data.active_tasks as at_mod
+
+        config = self._n_root_config(tmp_path, 9)
+        _register_runtime(monkeypatch, {})
+        # DETERMINISTIC cut, not a wall-clock one. The served count must be a
+        # strict subset on EVERY host, so the first three admissions of each
+        # render return without awaiting at all and the rest hang until the
+        # budget kills them. The earlier form derived the cut from
+        # `asyncio.sleep(0.05)` against a 0.16s budget and read 0 of 9 served
+        # under xdist contention, tripping the vacuousness guard below.
+        admissions = self._admission_recorder(
+            monkeypatch, dwell=0.0, serve_first=3,
+        )
+        # Width 1 so the served subset is a contiguous window of the admission
+        # order and the arithmetic above is exact rather than probabilistic.
+        monkeypatch.setattr(at_mod, '_TASKS_ROOT_CONCURRENCY', 1)
+        # Small enough that the six hung roots cost ~0.3s per render, large
+        # enough that no scheduling delay can starve a root that the stub
+        # above serves without awaiting. The TOTAL budget is deliberately NOT
+        # the constraint here: it is measured from before the runtime fan-out,
+        # so tightening it would reintroduce exactly the host-speed dependence
+        # this test just removed.
+        monkeypatch.setattr(at_mod, '_TASKS_PER_PROJECT_BUDGET', 0.05)
+        monkeypatch.setattr(at_mod, '_TASKS_TOTAL_BUDGET', 5.0)
+        at_mod._reset_root_rotation()
+
+        async def _one_render() -> set[str]:
+            admissions.clear()  # serve_first counts within ONE render
+            active, _offline, _counts, _degraded, _unknown = (
+                await collect_tasks_with_counts(client=dummy_client, config=config)
+            )
+            return {row['project'] for row in active}
+
+        first = await _one_render()
+        served_per_render = len(first)
+        assert 0 < served_per_render < 9, (
+            f'the budget served {served_per_render} of 9 roots — this test is '
+            'vacuous unless a STRICT subset is served (0 means nothing ran, 9 '
+            'means the budget was never the constraint and starvation cannot '
+            'be observed at all). Adjust the tightened budgets, not the claim.'
+        )
+
+        union = set(first)
+        for _ in range(9 - served_per_render):
+            union |= await _one_render()
+
+        missing = {f'proj-{i:02d}' for i in range(9)} - union
+        assert not missing, (
+            f'{sorted(missing)} were never served across '
+            f'{9 - served_per_render + 1} consecutive renders while '
+            f'{served_per_render} roots were served each time — the walk '
+            'order is FIXED, so the same trailing roots starve on every '
+            'render. That is the incident behaviour: solar-challenge-platform '
+            'and pump-web-ui were skipped render after render while the '
+            'dashboard reported itself healthy.'
+        )
+
+    async def test_rotation_advances_by_exactly_one_slot_per_call(
+        self, monkeypatch, tmp_path, dummy_client,
+    ):
+        """(b) The rotation is a DETERMINISTIC round-robin, not randomised.
+
+        Determinism is the point: an operator reading two consecutive renders
+        can predict which roots were served, and this test can assert it.
+        A random shuffle would also spread the starvation but would make both
+        of those impossible.
+        """
+        import dashboard.data.active_tasks as at_mod
+
+        config = self._n_root_config(tmp_path, 5)
+        _register_runtime(monkeypatch, {})
+        admissions = self._admission_recorder(monkeypatch, dwell=0.0)
+        # Width 1 so admission order is unambiguous rather than a race between
+        # concurrently-admitted roots.
+        monkeypatch.setattr(at_mod, '_TASKS_ROOT_CONCURRENCY', 1)
+        at_mod._reset_root_rotation()
+
+        await collect_tasks_with_counts(client=dummy_client, config=config)
+        first = list(admissions)
+        admissions.clear()
+        await collect_tasks_with_counts(client=dummy_client, config=config)
+        second = list(admissions)
+
+        assert len(first) == 5 and len(second) == 5, (
+            f'expected all 5 roots admitted in each render, got {first!r} then '
+            f'{second!r} — the budget must not be the constraint in this test'
+        )
+        assert second == first[1:] + first[:1], (
+            f'render 2 admitted {second!r}; expected {first[1:] + first[:1]!r} '
+            f'— render 1 admitted {first!r} and the offset must advance by '
+            'exactly ONE slot, so the order is a predictable round-robin an '
+            'operator can reason about across two consecutive renders'
+        )
+
+    async def test_all_project_roots_stays_primary_first(
+        self, monkeypatch, tmp_path, dummy_client,
+    ):
+        """(c) The rotation must NOT leak into the shared root helper.
+
+        ``_all_project_roots`` has four other callers that depend on
+        primary-first ordering (``app.py``, ``scheduler.py``,
+        ``active_tasks.collect_done_counts``, and ``test_app.py``'s patch
+        point). Rotating it in place would silently repoint every one of them
+        at a different project — a far larger blast radius than the Tasks tab.
+        """
+        import dashboard.data.active_tasks as at_mod
+
+        config = self._n_root_config(tmp_path, 5)
+        _register_runtime(monkeypatch, {})
+        self._admission_recorder(monkeypatch, dwell=0.0)
+        at_mod._reset_root_rotation()
+
+        for render in range(4):
+            await collect_tasks_with_counts(client=dummy_client, config=config)
+            roots = at_mod._all_project_roots(config)
+            assert roots[0] == config.project_root, (
+                f'after {render + 1} render(s) _all_project_roots returned '
+                f'{[r.name for r in roots]} — the primary root is no longer '
+                'first, so the rotation has leaked into the shared helper and '
+                'every other caller now reads a different project'
+            )
+
+    async def test_output_order_is_unaffected_by_rotation(
+        self, monkeypatch, tmp_path, dummy_client,
+    ):
+        """(d) Rotation changes ADMISSION order only, never rendered order.
+
+        If the rotated order reached the payload, the Tasks table would
+        reshuffle on every 3 s poll — a fix for invisibility that trades it
+        for unreadability.
+        """
+        import dashboard.data.active_tasks as at_mod
+
+        config = self._n_root_config(tmp_path, 5)
+        _register_runtime(monkeypatch, {})
+        self._admission_recorder(monkeypatch, dwell=0.0)
+        at_mod._reset_root_rotation()
+
+        expected = [f'proj-{i:02d}' for i in range(5)]
+        for render in range(4):
+            active, _offline, _counts, _degraded, _unknown = (
+                await collect_tasks_with_counts(client=dummy_client, config=config)
+            )
+            got = [row['project'] for row in active]
+            assert got == expected, (
+                f'render {render + 1} returned rows in {got}, expected '
+                f'{expected} — the rendered order must stay canonical '
+                'primary-first root order at every rotation offset'
+            )

@@ -90,14 +90,30 @@ _lane_state_record() {
 # lane_state_read <lane-dir|lane-name> [<state-dir>]
 #
 # Resolves EVERYTHING a caller needs about <lane>'s assignment from a SINGLE
-# read of <state-dir>/<lane>.json, publishing it in three globals and echoing
+# read of <state-dir>/<lane>.json, publishing it in four globals and echoing
 # the headline pair on stdout:
 #
-#   LANE_STATE_RAW      the record's raw `state` string; 'unknown' when none
-#                       could be read
-#   LANE_STATE_TASK_ID  the record's task_id ('' when absent, null, or unread)
-#   LANE_STATE_CAUSE    why the state is unknown; EMPTY when it is not
-#   stdout              '<raw>' or '<raw> <task_id>'
+#   LANE_STATE_RAW         the record's raw `state` string; 'unknown' when none
+#                          could be read
+#   LANE_STATE_TASK_ID     the record's task_id ('' when absent, null, unread)
+#   LANE_STATE_CAUSE       why the state is unknown; EMPTY when it is not
+#   LANE_STATE_UPDATED_AT  the record's `updated_at` string, VERBATIM and
+#                          unreformatted; '' when the record is absent,
+#                          unparseable, or carries no such key. That EMPTY
+#                          reading means "this record's age is unjudgeable" —
+#                          it is not a claim that the lane is new. The consumer
+#                          is warm-lane-gc.sh's Pass-1 record gate, whose
+#                          staleness bound preserves (fails SAFE) on it: a
+#                          readable `assigned` state is a trustworthy claim
+#                          about STATE, so an unreadable timestamp leaves only
+#                          the AGE unknown, and reclaiming on that would let a
+#                          malformed field delete a genuinely live lane's
+#                          build.
+#   stdout                 '<raw>' or '<raw> <task_id>'
+#
+# stdout carries only the headline pair, NOT the timestamp: warm-lane-audit.sh
+# parses that string, and the timestamp has no column there. It travels in the
+# global alone.
 #
 # <state-dir> defaults to `<dirname of lane-dir>/.lane-state`; an explicit
 # second argument WINS and is honoured verbatim, including a path outside the
@@ -126,13 +142,16 @@ _lane_state_record() {
 # the caller from lane_state_class returning UNKNOWN for a non-empty raw, so
 # there is no second copy of the recognized-state table to drift out of sync.
 lane_state_read() {
-    # Reset FIRST: every lane's triple is resolved from scratch, so a lane whose
-    # record cannot be read can never inherit its predecessor's values. Without
+    # Reset FIRST: every lane's values are resolved from scratch, so a lane
+    # whose record cannot be read can never inherit its predecessor's. Without
     # this the audit's `pin` column would report "lane X is held by task N" —
-    # a claim about a lane that X's record never made.
+    # a claim about a lane that X's record never made — and the gc gate's age
+    # bound would judge an unjudgeable lane by a fresh predecessor's stamp,
+    # silently disabling itself for the records in the worst shape.
     LANE_STATE_RAW='unknown'
     LANE_STATE_TASK_ID=''
     LANE_STATE_CAUSE=''
+    LANE_STATE_UPDATED_AT=''
 
     local raw_arg="${1:-}" explicit_dir="${2:-}"
 
@@ -161,6 +180,12 @@ lane_state_read() {
     fi
 
     LANE_STATE_TASK_ID="$(_lane_state_scalar "$text" task_id)"
+    # From the SAME already-slurped $text, through the SAME extractor: no second
+    # read, no second parser. `updated_at` is a flat top-level quoted string,
+    # the exact shape _lane_state_scalar documents itself as handling, and its
+    # miss behaviour (absent key or non-string value yields empty) is already
+    # the unjudgeable-age reading the gc consumer wants.
+    LANE_STATE_UPDATED_AT="$(_lane_state_scalar "$text" updated_at)"
     local raw
     raw="$(_lane_state_scalar "$text" state)"
     if [ -n "$raw" ]; then
@@ -440,6 +465,9 @@ lane_protect_glob() {
 
 # Published defaults, so a caller that sources this lib and inspects the
 # globals before any read sees the same fail-open shape a failed read yields.
+# Under the callers' `set -u` an unpublished global would abort the script
+# rather than degrade one lane, which is the opposite of this lib's contract.
 LANE_STATE_RAW='unknown'
 LANE_STATE_TASK_ID=''
 LANE_STATE_CAUSE=''
+LANE_STATE_UPDATED_AT=''

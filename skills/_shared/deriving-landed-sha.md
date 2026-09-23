@@ -131,7 +131,7 @@ marker from a previous incarnation does not: it predates the recreated ref, so t
 
 (The escalation server layers a second guard on the same risk — the marker must not predate the
 recorded `branch_base_sha`; see
-`escalation/src/escalation/server.py::_found_on_main_response` and the `merge_status` Tier-3.5
+`escalation/src/escalation/git_authority.py::found_on_main_response` and the `merge_status` Tier-3.5
 docstring. The containment check above is the shell-side equivalent available to an agent.)
 
 <a id="step-3"></a>
@@ -170,11 +170,20 @@ path and keeps all three outcomes distinguishable. Do not "tidy" it away.
 
 #### rc=0 — landed; ancestry has proved it, so not-landed is ruled out
 
+**Which train member actually lands here.** If you arrived from [step 3](#step-3)'s
+*coalesce-absorbed non-tip train member*, only one shape of it reaches this arm: a member whose
+pre-merge rebase was a **no-op** — it was already atop main, so nothing was rewritten, its own
+commits went into the group merge verbatim, and that is why ancestry says rc=0. The **ordinary**
+non-tip member — the one whose stacked shas the pre-merge rebase *did* rewrite while its own ref
+stayed put — can never become an ancestor of main, so it lands on the **rc=1** arm below,
+permanently; see [`merge-queue/SKILL.md`](../merge-queue/SKILL.md)'s "Follow the superseded
+successor" rule 3, and handle it there rather than here.
+
 Look for a group/train merge, and **verify it before stamping** — a non-empty result is not
 authoritative on its own:
 
 ```bash
-c=$(git rev-list --ancestry-path --merges task/<TASK_ID>..main | tail -1)
+c=$(git rev-list --topo-order --ancestry-path --merges task/<TASK_ID>..main | tail -1)
 if [ -n "$c" ]; then
     git merge-base --is-ancestor task/<TASK_ID> "$c^1"
     echo "contained-before rc=$?"
@@ -183,22 +192,49 @@ fi
 
 `--ancestry-path task/<TASK_ID>..main` lists every merge that *descends from* this branch, so
 once the branch is on main it also lists every unrelated merge landed afterwards, and `tail -1`
-returns the **oldest** of those — the first unrelated task's merge. The containment check on
-`$c`'s first parent (main just before that merge) decides:
+returns the **oldest** of them. That oldest descendant is the merge that brought this branch in
+when one exists, and an unrelated later merge only when the branch was already in main before it
+— which is exactly the distinction the containment check below is there to make.
+
+**`--topo-order` is REQUIRED, not decoration.** `git rev-list` orders by **commit date** by
+default, *not* topologically, so the "oldest" claim above holds only while dates happen to agree
+with topology. A merge whose committer date is skewed or was rewritten — a rebase, a replayed
+patch, a clock-skewed machine — can sort out of position, and `tail -1` then returns a *later*
+merge instead of the one that brought this branch in. Dropping `--topo-order` fails **silently**:
+`$c^1` is then that later merge's parent, which already contains the branch, so the check reports
+`contained-before rc=0`, the arm reads "unrelated later merge, do not stamp", and the real group
+merge is skipped — the procedure degrades to the citation gate below and stamps a citing commit
+where an actual merge sha was available. Do not "tidy" it away.
+(`orchestrator/tests/test_group_merge_candidate_ordering.py` reproduces this against real git.)
+
+The containment check on `$c`'s **first parent** decides — but read the caveat below first:
+
+**`$c^1` is main-just-before-the-merge only when `$c` was created ON main.**
+`orchestrator/src/orchestrator/git_ops.py::GitOps.merge_to_main` merges with `git merge --no-ff`
+*from* main, so that holds for every dark-factory landing. It is **not** guaranteed for a target
+project reached via [`orchestrate/SKILL.md`](../orchestrate/SKILL.md)'s call site, where the
+project's own merge convention decides parent order: a merge built on the branch side (e.g. an
+integration branch cut from the task branch, then fast-forwarded onto main) has the **task tip**
+at `$c^1`, the containment check exits 0 trivially, and this arm falsely concludes "unrelated
+later merge, do not stamp" — discarding a merge sha you were already holding. On a project whose
+merge direction you do not know, confirm the parent order before trusting the rc:
+`git rev-list --parents -n 1 "$c"` (or `git log --format=%P -n 1 "$c"`) — the first parent listed
+must itself be on main *before* `$c`; if it is the branch side, read `$c^2` instead.
 
 - **contained-before rc=1** → the branch was not in main before `$c`, so `$c` **is** the merge
   that brought it in. Stamp `{"kind": "<merged|found_on_main>", "commit": "$c", "note": "absorbed
   into group merge; sha verified by ancestry containment"}` — `$c` is a merge commit that brought
   this branch in, so the same `kind` rule as [step 2](#step-2) applies. Carry the note here too.
 - **contained-before rc=0** (or `$c` empty) → the branch was already in main before `$c`, so
-  `$c` is an unrelated later merge. No merge commit exists for this branch. **Do not stamp the
-  tip yet** — continue to the citation gate below.
+  `$c` is an unrelated later merge. No merge commit exists for this branch. **Do not stamp
+  yet** — continue to the citation gate below, whose only stampable sha is the citing commit.
 
 **The citation gate (phantom-branch check).** rc=0 does not by itself prove this branch carries
 any work: a branch that never advanced past its creation point has main's own old base commit as
-its tip, so it passes ancestry trivially, searches marker-empty, and yields no rev-list
-candidate — exactly this arm — while carrying none of the task's work. Stamping it would
-fabricate landing evidence for a phantom branch, and the server's only backstop
+its tip, so it passes ancestry trivially, searches marker-empty, and yields no *stampable*
+rev-list candidate — either none at all, or one whose containment check returns rc=0 because
+main already contained the branch — exactly this arm, while carrying none of the task's work.
+Stamping it would fabricate landing evidence for a phantom branch, and the server's only backstop
 (`git merge-base --is-ancestor <sha> main`) passes for it. Require a **positive task citation on
 main** first:
 
@@ -219,13 +255,34 @@ applies `^`/`$` per line, so a body line can match spuriously; the function uses
 as a coarse pre-filter and re-tests each candidate's **subject** alone. Do the same: walk the
 output most-recent-first and take the first row whose **subject** cites this task.
 
-- **A subject-matching row exists** → a genuine fast-forward / already-contained landing: real
-  work citing this task is on main. Stamp the branch tip per
-  `orchestrator/src/orchestrator/agents/briefing.py`'s fast-forward rule,
-  `{"kind": "found_on_main", "commit": "<git rev-parse task/<TASK_ID>>", "note": "fast-forward
-  merge, no separate merge commit; landing confirmed by task citation <citing sha> on main"}`
-  (rc=0 guarantees the ref still resolves). Recording the citing sha in the note is what makes
-  the stamp auditable.
+- **A subject-matching row exists** → real work citing this task is on main. Stamp **that row's
+  sha** — the citing commit — as `commit`:
+  `{"kind": "found_on_main", "commit": "<citing sha>", "note": "landing confirmed by task
+  citation on main; no separate merge commit (branch tip <git rev-parse task/<TASK_ID>>)"}`
+  (rc=0 guarantees the ref still resolves, so the tip renders for the note). The citing commit
+  is on main by construction (`git log main` found it) and cites this task by construction (that
+  is how the walk selected it) — that pairing is what makes the attribution auditable. Do **not**
+  stamp the branch tip: on a sibling-covered branch the tip is main's own old base commit,
+  carrying none of this task's work, and the server's only backstop
+  ([below](#never-from-head)) passes it. This matches
+  `escalation/src/escalation/git_authority.py::found_on_main_response`, whose live-branch path returns
+  exactly this citation commit, discovered by `validate_landing_evidence` (task 3103 changed it
+  from the branch tip for precisely this reason). Do **not** assert "fast-forward" in the note:
+  this arm cannot distinguish a genuine fast-forward from a sibling-covered landing — recording
+  the tip lets an auditor tell them apart at zero extra commands — and `found_on_main` is honest
+  for both.
+  **Among subject-citing rows, prefer one whose diff touches this task's declared
+  `metadata.files`** (`git show --name-only --format= --first-parent -m <sha>`); walk order
+  decides among the rows that qualify. Citing the citing commit fixes *attribution*, not
+  *deliverability*: on a sibling-covered landing that row is the sibling's commit, whose diff
+  need not touch this task's files at all, and
+  `fused-memory/scripts/audit_found_on_main_provenance.py::classify` then returns
+  `deliverable_absent` — which `check_found_on_main_spurious_rate.py` counts as spurious
+  exactly like `misattributed`. If **no** subject-citing row touches a declared file, still
+  stamp the first row and say so in the `note` (append e.g. `; no citing commit on main
+  touches this task's declared files`): the landing is real, and the honest note is what lets
+  a later `deliverable_absent` read as this known sibling-covered shape rather than as
+  fabricated evidence.
 - **No subject-matching row** → nothing on main cites this task. This is the **phantom-branch**
   case, NOT a landing. Do **not** stamp. Stop and report it as not-landed/phantom-branch. This
   is the same signal [`unblock/SKILL.md`](../unblock/SKILL.md)'s `already_merged` guidance

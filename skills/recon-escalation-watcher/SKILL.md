@@ -588,15 +588,91 @@ Both archive the record. Be specific in the note — it is the only audit trail.
   and resolved by 2026-07-25T17:03Z the same day (~4h round trip);
   `esc-646-1` dismissed 2026-08-01T14:10Z → `esc-646-2` filed and still
   pending now; `esc-3361-1` resolved 2026-08-02T10:40Z → `esc-3361-2` filed
-  and still pending now. As of 2026-08-02 the pending queue holds 32
+  and still pending now. As of **2026-08-02** the pending queue held 32
   records, 100% this category, with only one (`esc-648-1`) ever
-  triage-stamped — treat the exact count as a snapshot, not a fixture: it
-  moves with every filing/resolve cycle, so re-census
-  `data/reconciliation/escalations/` yourself if the number matters to your
-  decision. **Resolve only** when the underlying task will genuinely
+  triage-stamped; by **2026-09-02** the same census read 124 (see the dated
+  census in the terminal-subject branch below) — treat every count here as a
+  snapshot, not a fixture: it moves with every filing/resolve cycle, so
+  re-census `data/reconciliation/escalations/` yourself if the number matters
+  to your decision. **Resolve only** when the underlying task will genuinely
   stop qualifying for re-selection — you completed the gate and can close
   the task, or recon will reconcile the task to a terminal status next
-  cycle regardless. **You cannot drive the gate itself terminal from
+  cycle regardless.
+
+  **A terminal-or-missing subject is exactly that case, and cannot churn
+  (task 3052).** `extract_stalled_gate_backlog_task_ids` selects only tasks
+  with `status == 'blocked'` (same module, `if task.get('status') !=
+  'blocked': continue`), so a subject that is `done`, `cancelled`, or absent
+  from its project's task store can never be re-selected and the filing rule
+  can never re-arm. The churn argument above does not apply to it. Resolve
+  such a record with `resolution_class='moot-terminal-subject'` (a member of
+  `escalation/src/escalation/models.py::RESOLUTION_CLASSES`, which validates
+  it at call time); do **not** park it. This is the one sanctioned exit from
+  the PARK default — the default itself is unchanged and stays correct for
+  every still-`blocked` subject.
+
+  *How to find them, two ways.* (i) Stage 1 now computes the set every full
+  cycle: read the report stats `orphaned_recon_escalations_terminal` and
+  `orphaned_recon_escalations_missing`, and the emitted
+  `orphaned_recon_escalation` flags, each of which names the escalation id,
+  the subject's project, and the observed subject status. (ii) On demand,
+  re-derive it live. **Run from the project root** — `--queue-dir` defaults to
+  the relative `./data/reconciliation/escalations`, so the cwd is what decides
+  which queue is read; from anywhere else the script refuses with
+  `TargetStoreMissing` rather than manufacturing an empty queue and reporting a
+  false clean run (see
+  `fused-memory/src/fused_memory/utils/target_store_preflight.py`). Pass an
+  absolute `--queue-dir` if you cannot control the cwd.
+  ```bash
+  cd /home/leo/src/dark-factory
+  python fused-memory/scripts/derive_orphaned_recon_escalations.py            # dry run (default)
+  python fused-memory/scripts/derive_orphaned_recon_escalations.py --apply    # closes them
+  ```
+  **Read the exit code, not just the JSON.** `0` is a clean scan — `reaped: 0`
+  then genuinely means nothing to do. `1` is the refusal above (wrong
+  `--queue-dir`/cwd; the reason is one line on stderr). `3` means at least one
+  project's task store could not be READ, so its records were classified as
+  nothing at all — re-run once the store is readable, since the set is
+  re-derived every run. `4` means a record could not be scoped to a known
+  project (the registry gap below). A `3` or a `4` is a partial scan wearing a
+  clean-looking report: do **not** treat that run's `reaped` count as the
+  whole story.
+  Detection is recon-side only; **you are the sole closer** — no
+  reconciliation stage ever calls `queue.resolve()` on this queue (the A7b
+  invariant above `_RECON_DEDUP_CONFIG` in
+  `fused-memory/src/fused_memory/reconciliation/harness.py`).
+
+  *The scale, as a dated snapshot — re-derive, never drain a roster.* As of
+  **2026-09-02** the pending queue held **124** records of this category
+  (100% of pending `reconciliation_stale_*`), all `level=1`, across seven
+  projects: dark_factory 56, reify 48, autopilot_video 7, solar_challenge 5,
+  know_live 3, solar_challenge_platform 3, pump_web_ui 2. Trend: 108 measured
+  2026-08-30 (of which 104 were orphaned under this rule), 117 at task-3052
+  planning, 124 on 2026-09-02. The queue accumulates continuously, so a list
+  of ids goes stale between the moment it is written and the moment you act
+  on it — **always re-derive live; never work a copied roster.**
+
+  *The `ambiguous` bucket is NOT an orphan either.* Task ids are per-tag, not
+  global (`PRIMARY KEY (tag, id)` in
+  `fused-memory/src/fused_memory/backends/sqlite_task_backend.py`), so the same
+  id in two tags is normal — and a record names only its `project_id`, never a
+  tag. When a subject id carries differing statuses across tags the subject
+  cannot be identified, so the record is counted
+  `orphaned_recon_escalations_ambiguous`, never flagged, and never reaped by
+  `--apply`. Check by hand which tag the record's subject actually lives in
+  before touching it.
+
+  *The `unresolvable` bucket is NOT an orphan.* A record whose `project_id:`
+  detail line is unparseable, or whose project is absent from the known-projects
+  registry, is counted `orphaned_recon_escalations_unresolvable` and
+  deliberately never flagged — the sweep cannot see that project's task store,
+  so it holds no evidence either way. Verify that project's tasks by hand
+  before touching such a record. Empirically 0 of the 124 fail the parse today
+  and the deployed `DASHBOARD_KNOWN_PROJECT_ROOTS` covers all seven projects
+  present, so a non-empty bucket signals a **registry gap** worth investigating
+  rather than a reapable record.
+
+  **You cannot drive the gate itself terminal from
   here:** the gate is a born-at-L2 `milestone_gate` escalation filed on the
   *target project's own* orchestrator queue, not this one — resolving the
   recon surfacing changes nothing about the gate or the task. If you find a
@@ -623,6 +699,12 @@ Both archive the record. Be specific in the note — it is the only audit trail.
   `reconciliation_stale_gate_backlog` L1 on
   the **same task** CAN suppress a would-be HOR escalation, while the
   reverse can't happen (the gate-backlog lookup is category-scoped).
+  **The terminal-or-missing-subject RESOLVE branch in the gate-backlog row
+  above covers this category too** — the task-3052 reaper reads both
+  categories, so a `done`/`cancelled`/absent subject here is likewise resolved
+  with `resolution_class='moot-terminal-subject'` rather than parked; as of
+  2026-09-02 this category had **zero** pending records, so that coverage is
+  future-proofing, not a backlog waiting to be worked.
   Practically: a parked gate-backlog record may be masking a HOR condition
   on that same task — don't read "no pending HOR record for this task" as
   "no HOR condition for this task". **Same resolve-to-tidy trap as above,
@@ -762,11 +844,16 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
     merges spellings that differ only by case or separator; only an entry in
     `PROJECT_TOKEN_ALIASES` can bridge a project whose filed decisions fold to something *other*
     than its declared `memory.project_id`, and today `df → dark_factory` is the only such entry.
-    **solar-challenge is the known open case**: its config declares `my_solar_challenge`, but its
-    decisions are filed under `solar-challenge`/`solar_challenge` (which fold together, but not
-    onto `my_solar_challenge`), so reaping it with the declared token matches **zero** rows —
-    pass `solar_challenge` there until the alias decision (task 3813) lands. To check your own
-    project, list the tokens its rows actually carry:
+    **solar-challenge is the known standing case**: its config declares `my_solar_challenge`, but
+    its decisions are filed under `solar-challenge`/`solar_challenge` (which fold together, but
+    not onto `my_solar_challenge`), so reaping it with the declared token matches **zero** rows —
+    pass `solar_challenge` there. That guidance is **permanent, not provisional**: task 3813
+    decided the alias question and **declined** it (the fold left no split to heal, and the
+    identity question is an open human gate in that project marked "Do NOT auto-act"), recording
+    the evidence in `PROJECT_TOKEN_ALIASES_DECLINED`. You no longer have to remember this
+    unaided — `write-decision` and `reap-decisions` both **warn** if you pass
+    `my_solar_challenge`, so the mismatch announces itself instead of returning a silent
+    zero-row no-op. To check your own project, list the tokens its rows actually carry:
     ```bash
     python3 -c "import json,glob,collections;print(collections.Counter(json.load(open(f))['project'] for f in glob.glob('$HOME/.claude/fleet/decisions/*.json')))"
     ```

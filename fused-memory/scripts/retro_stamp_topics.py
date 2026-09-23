@@ -91,14 +91,17 @@ import functools
 import importlib.util
 import json
 import logging
-import re
 import sys
 import types
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from fused_memory.memory_metadata import normalize_supersedes
-from fused_memory.topic_slug import TOPIC_SLUG_MAX_LEN, is_valid_topic_slug
+from fused_memory.topic_slug import (
+    TOPIC_SLUG_MAX_LEN,
+    derive_topic_slug,
+    is_valid_topic_slug,
+)
 from fused_memory.utils.store_mutation_preflight import (
     StoreMutationUnavailable,
     assert_store_mutation_allowed,
@@ -234,48 +237,12 @@ Phrasing = _probe.Phrasing
 # Pure core — derivation
 # ---------------------------------------------------------------------------
 
-#: Any run of characters that cannot appear inside a slug segment.  Note the
-#: complement class is ``[a-z0-9]`` only: ``_`` is NOT preserved, which is the
-#: whole point of the fold (98 of 352 live topic values are snake_case).
-#:
-#: This is deliberately NOT the anchored slug validator — that lives once, in
-#: :mod:`fused_memory.topic_slug`, and is called below.  Two different
-#: patterns doing two different jobs; the *verdict* has one home.
-_NON_SLUG_RUN_RE = re.compile(r'[^a-z0-9]+')
-
-
-def derive_topic_slug(value: object) -> str | None:
-    """Fold *value* into ε's topic-slug shape, or ``None`` if it cannot be.
-
-    The fold: lowercase, strip, collapse every run of non-``[a-z0-9]``
-    characters (which includes ``_``, so snake_case becomes hyphen-case) to a
-    single ``-``, then strip leading/trailing hyphens.  The result is returned
-    **only** if :func:`fused_memory.topic_slug.is_valid_topic_slug` accepts
-    it — which is also where the ``TOPIC_SLUG_MAX_LEN`` cap is enforced.
-
-    Returning ``None`` rather than a repaired value is load-bearing.  An
-    over-long topic truncated to 100 chars, or ``'!!!'`` turned into
-    ``'unnamed-topic'``, would file a record under a topic no human chose;
-    the caller instead reports it and moves on (loud over silent).
-
-    NOT a copy of ``memory_eval_retrieval_probe._slugify``, and the two must
-    not be "unified": that one preserves ``_`` and falls back to
-    ``'unnamed-topic'``, so it emits slugs ε *rejects*.  It is right for its
-    own job (naming derivation candidates for human review) and wrong for
-    this one (writing a validated vocabulary key to the corpus).
-
-    Args:
-        value: Any object.  A non-``str`` is a ``None`` verdict, matching
-            ``is_valid_topic_slug``'s "non-str is False" convention — both
-            are handed untrusted values off live records and fixtures.
-
-    Returns:
-        The conforming slug, or ``None`` when no honest fold exists.
-    """
-    if not isinstance(value, str):
-        return None
-    folded = _NON_SLUG_RUN_RE.sub('-', value.strip().lower()).strip('-')
-    return folded if is_valid_topic_slug(folded) else None
+# ``derive_topic_slug`` — the snake_case -> hyphen-case fold — is IMPORTED
+# above, not defined here.  It lived in this script until task 4878 gave
+# ``scripts/normalize_topic_slugs.py`` a second need for the same fold;
+# INV-5 then moved it next to the predicate whose verdict it defers to.
+# ``tests/test_retro_stamp_topics.py::TestTopicSlugNamespaceIsShared`` pins
+# the identity by ``is``, so re-inlining it here fails by design.
 
 
 @dataclass(frozen=True)
@@ -1145,10 +1112,18 @@ def merge_plans(*plan_lists: list[ClusterPlan]) -> tuple[list[StampTarget], list
 # The single I/O boundary
 # ---------------------------------------------------------------------------
 
-#: Written to every ``update_memory`` so the write journal attributes each
-#: stamp to this sweep rather than to a generic ``mcp_tool``.  The amendment
-#: storm alarm reads this field; a bulk run under the default source would
-#: look exactly like the runaway rewrite that alarm exists to catch.
+#: Passed as BOTH ``_source`` and ``agent_id`` to every ``update_memory``
+#: call below, because the two kwargs feed different consumers and neither
+#: substitutes for the other. ``_source`` becomes the write journal's
+#: ``source`` column, attributing each stamp to this sweep rather than to a
+#: generic ``mcp_tool``. ``agent_id`` is what
+#: ``_apply_memory_metadata_validation`` forwards to ``emit_schema_warnings``,
+#: ``UnknownKeyStormDetector.record``, and ``file_unknown_key_storm_escalation``
+#: — and it is also what the write journal records in its own ``agent_id``
+#: column alongside ``source``. Leaving ``agent_id`` unset would attribute
+#: every census line and unknown-key storm bucket from this sweep to a null
+#: agent even though the journal correctly names it, so both kwargs are set
+#: to the same value to keep every view in agreement.
 WRITE_SOURCE = 'retro_stamp_topics'
 
 #: Recorded on the write journal row beside the patch.
@@ -1337,6 +1312,7 @@ async def stamp_one(memory_service, target: StampTarget, *, apply: bool) -> dict
             metadata_patch=dict(decision.patch),
             metadata_mode='merge',
             reason=WRITE_REASON,
+            agent_id=WRITE_SOURCE,
             _source=WRITE_SOURCE,
         )
     except Exception as exc:

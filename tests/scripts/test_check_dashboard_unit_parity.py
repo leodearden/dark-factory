@@ -2414,9 +2414,9 @@ def _gate_repo(
     #   ordering them first makes it structural that a stub checker body can
     #   never shadow the renderer's dependencies.
     #
-    # This is also why render_dashboard_unit.py must not import the checker: see
+    # This is also why render_systemd_unit.py must not import the checker: see
     # its module docstring, which names this harness as the concrete obstacle.
-    for _name in ("render_dashboard_unit.py", "systemd_unit_parity.py"):
+    for _name in ("render_systemd_unit.py", "systemd_unit_parity.py"):
         (repo / "scripts" / _name).write_text(
             (REPO_ROOT / "scripts" / _name).read_text(encoding="utf-8"),
             encoding="utf-8",
@@ -2872,7 +2872,7 @@ def test_section_8_render_failure_leaves_the_installed_unit_intact(
     """
     mod = _load_checker()
     repo = _gate_repo(tmp_path, mod)
-    (repo / "scripts" / "render_dashboard_unit.py").write_text(
+    (repo / "scripts" / "render_systemd_unit.py").write_text(
         _FAILING_RENDERER, encoding="utf-8"
     )
     unit_dir = _seeded_with_nine_roots(tmp_path, mod, repo)
@@ -2896,7 +2896,7 @@ def test_section_8_missing_renderer_does_not_clobber_host_local_values(
     """
     mod = _load_checker()
     repo = _gate_repo(tmp_path, mod)
-    (repo / "scripts" / "render_dashboard_unit.py").unlink()
+    (repo / "scripts" / "render_systemd_unit.py").unlink()
     unit_dir = _seeded_with_nine_roots(tmp_path, mod, repo)
     before = (unit_dir / _DASHBOARD_SERVICE).read_bytes()
 
@@ -2926,7 +2926,7 @@ def test_section_8_bare_host_with_a_failed_render_still_installs_the_watchdog(
     """
     mod = _load_checker()
     repo = _gate_repo(tmp_path, mod)
-    (repo / "scripts" / "render_dashboard_unit.py").write_text(
+    (repo / "scripts" / "render_systemd_unit.py").write_text(
         _FAILING_RENDERER, encoding="utf-8"
     )
     unit_dir = tmp_path / "bare-unit-dir"
@@ -3576,3 +3576,26 @@ def test_no_parity_call_site_branches_on_a_bare_exit_status(
         "the status anywhere but inside `_parity_verdict` re-creates the "
         f"defect the helper centralises.\n{block}"
     )
+def test_dashboard_reuses_the_shared_drift_and_absent():
+    """``Drift`` and ``_ABSENT`` are the SHARED objects, not local look-alikes.
+
+    IDENTITY, not equality, and the distinction is the whole point: a pasted
+    copy of a six-field frozen dataclass compares equal field-for-field with
+    the original while being a DISTINCT TYPE, so an ``==`` check on the class
+    — or on instances of it — would pass over exactly the fork this guard
+    exists to forbid. ``_ABSENT`` is worse still: two ``"<absent>"`` literals
+    may or may not be interned, so equality says nothing at all about whether
+    there is one definition or three.
+
+    The same pin the three earlier lifts carry (see
+    tests/scripts/test_check_orchestrator_unit_parity.py, which asserts this
+    shape for the parser and for ``find_dropins``). Duplicating a record inside
+    the tooling built to report silent duplication is the failure this family
+    exists to catch, one level up.
+    """
+    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
+
+    mod = _load_checker()
+
+    assert mod.Drift is systemd_unit_parity.Drift
+    assert mod._ABSENT is systemd_unit_parity._ABSENT

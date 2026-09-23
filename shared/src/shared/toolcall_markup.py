@@ -55,6 +55,29 @@ the sweep's bare list items, prose scans), and an optional keyword would make
 each site's blindness ungreppable. The predicates split by NAME so a reader can
 see at a glance which gates are parameter-aware.
 
+## What ``repair`` guarantees about its OWN output — and what it does not
+
+Two outputs, two different contracts. Confusing them is how this module's one
+narrowing (task **4502**) reads as a weakening when it is not.
+
+* ``Repair.clean_value`` is the value the repairer REWROTE, and it is
+  ENVELOPE-FREE: ``detect_for(clean_value, param, schema_params) is None``.
+  That is contract C1's post-condition, it is what the C2 middleware forwards
+  as the repaired argument, and it is UNCHANGED — non-negotiable, because a
+  residual envelope there would re-trip the write-time tripwire downstream
+  while permanently dropping whatever hid in the residue.
+* ``Repair.recovered`` values are VERBATIM CALLER TEXT, guaranteed by invariant
+  D5 to be substrings of the input. A recovered value MAY legitimately contain
+  an envelope literal, because a faithful REPORT of a markup leak necessarily
+  quotes the pattern that tripped the tripwire. Refusing to deliver it drops
+  the caller's own characters on the floor — the exact information loss this
+  module exists to end. Boundary row B5 is therefore an alternative-boundary
+  test (:func:`_inner_markup_blocks`), not a bare substring refusal.
+
+The C2 middleware makes that quoting COUNTABLE rather than silent: it publishes
+the recovered parameter names whose delivered value still trips
+:func:`detect` on the ``markup_detected`` fact and on both policy payloads.
+
 ## Staged API — the consumer of :func:`repair` and :func:`detect`
 
 This is task ALPHA of a staged PRD: it shipped its API one task ahead of the
@@ -198,6 +221,29 @@ ENVELOPE_LITERALS: tuple[str, ...] = tuple(
 _ENVELOPE_RE = re.compile('|'.join(re.escape(literal) for literal in ENVELOPE_LITERALS))
 
 
+# A pseudo-parameter NAME as the harness emits it. Deliberately narrow: a tag
+# whose name is not an identifier is not a dropped parameter, it is prose.
+#
+# ONE grammar, bounding BOTH halves of the gate/repairer pair. :data:`_CLOSER_RE`
+# builds the repairer's candidate matcher from it, so a mis-close whose name
+# falls outside this shape can never be QUALIFIED for repair; :func:`_extra_names`
+# applies it to the gate's widening vocabulary for exactly that reason, so the
+# gate cannot spell a needle the repairer standing behind it could never act on.
+# Keeping the two aligned is what stops a widened detection from routing
+# authored text into the human queue for nothing — the mirror image of the
+# schema-aware-repairer-behind-a-schema-blind-detector asymmetry this module's
+# docstring identifies as the original silent write path.
+_TAG_NAME = r'[A-Za-z_]\w*'
+
+#: :data:`_TAG_NAME` as a whole-string test, for callers holding a NAME rather
+#: than scanning text for one.
+_TAG_NAME_RE = re.compile(_TAG_NAME + r'\Z')
+
+#: The canonical empty widening set, so the overwhelmingly common
+#: "no schema in hand" call shape reuses one object instead of building one.
+_NO_NAMES: frozenset[str] = frozenset()
+
+
 def detect(value: object) -> str | None:
     """Return the earliest :data:`ENVELOPE_LITERALS` member occurring in *value*.
 
@@ -253,6 +299,43 @@ def _widened_re(extra_names: frozenset[str]) -> re.Pattern[str]:
     return re.compile('|'.join(re.escape(literal) for literal in literals))
 
 
+@lru_cache(maxsize=512)
+def _extra_names(param: str, schema_params: frozenset[str]) -> frozenset[str]:
+    """The widening vocabulary for one ``(param, schema_params)`` pair.
+
+    CACHED, because :func:`detect_for` sits on a per-tool-call boundary and
+    answers ``None`` for 99.7% of the values it sees — so on the dominant path
+    its whole cost is setup that finds nothing. The distinct pairs a running
+    server produces are bounded by its tool table, not by its traffic, so the
+    normalization is genuinely a once-per-pair computation that was being
+    redone per call.
+
+    Both arguments are pre-coerced by the caller and HASHABLE: *param* is a
+    ``str`` (``''`` when the caller had none) and *schema_params* a frozenset,
+    produced by the same fail-safe :func:`_as_name_set` :func:`repair` uses, so
+    the cache key can never be the caller's own mutable object.
+
+    Two names are dropped, for two different reasons:
+
+    * one whose closer is ALREADY in :data:`ENVELOPE_LITERALS` — re-adding it
+      would enumerate a literal twice (INV-5) and change nothing;
+    * one outside the :data:`_TAG_NAME` shape — see that constant. The gate's
+      widening vocabulary is held exactly equal to the repairer's candidate
+      grammar, so a needle can never be spelled for a name :func:`repair` would
+      refuse to qualify. It also bounds what a caller-controlled *param* can
+      turn into a cache key: ``_first_markup_argument`` passes each key of the
+      caller's argument mapping straight through.
+    """
+    names = set(schema_params)
+    if param:
+        names.add(param)
+    return frozenset(
+        name
+        for name in names
+        if _TAG_NAME_RE.match(name) and closer_for(name) not in ENVELOPE_LITERALS
+    )
+
+
 def detect_for(
     value: object,
     param: object,
@@ -276,7 +359,8 @@ def detect_for(
     NO NEW LITERAL IS ENUMERATED (INV-5). Every added needle is built by
     :func:`closer_for`, the one place a closing tag is spelled; a name whose
     closer is already in :data:`ENVELOPE_LITERALS` is dropped rather than
-    re-added.
+    re-added, and so is a name outside the :data:`_TAG_NAME` shape the
+    repairer's own candidate grammar accepts.
 
     Total, on the same terms as :func:`detect` and for the same reason — the
     gates that call it must need no pre-validation. A *value* that is not a
@@ -286,28 +370,26 @@ def detect_for(
     *schema_params* that is not a collection of names — including a bare
     ``str``, which would iterate into CHARACTERS and manufacture one-letter
     needles — contributes nothing, via the same fail-safe :func:`repair` uses.
+
+    COST on the clean path: the widening is normalized once per distinct
+    ``(param, schema_params)`` pair by :func:`_extra_names` and compiled once
+    per distinct result by :func:`_widened_re`, so a repeat call is two cache
+    lookups and one scan of *value*. The no-schema shape — every middleware
+    call site — reuses :data:`_NO_NAMES` and allocates nothing at all.
     """
     if not value or not isinstance(value, str):
         return None
-    extra = _as_name_set(schema_params)
-    if isinstance(param, str) and param:
-        extra = extra | {param}
-    extra = frozenset(
-        name
-        for name in extra
-        if name and closer_for(name) not in ENVELOPE_LITERALS
+    names = _extra_names(
+        param if isinstance(param, str) else '',
+        _as_name_set(schema_params),
     )
-    match = _widened_re(extra).search(value)
+    match = _widened_re(names).search(value)
     return match.group(0) if match is not None else None
 
 
 # ---------------------------------------------------------------------------
 # Repair — recovering the parameters the harness parser silently dropped.
 # ---------------------------------------------------------------------------
-
-# A pseudo-parameter NAME as the harness emits it. Deliberately narrow: a tag
-# whose name is not an identifier is not a dropped parameter, it is prose.
-_TAG_NAME = r'[A-Za-z_]\w*'
 
 # Candidate mis-close positions, and the closing half of a pseudo-parameter
 # pair. The trailing ``"?`` is the DIALECT BLEND tolerance: PRD section 2.1's
@@ -328,12 +410,31 @@ _CANONICAL_OPENER_RE = re.compile(r'\x3cparameter\s+name="([^"]+)"\s*"?>')
 # by the closing bracket) nor with any closing tag (``/`` is not a name char).
 _ECHO_OPENER_RE = re.compile(r'\x3c(' + _TAG_NAME + r')"?>')
 
+# "an opener in EITHER dialect", for the one caller that does not care which:
+# _inner_markup_blocks, which asks only whether _parse_body would have opened a
+# sibling item here. An ALTERNATION rather than two searches, so the common
+# no-opener case scans the value ONCE — this runs on the repair path, where the
+# cost claims are measured and load-bearing. Exactly equivalent to searching
+# both: the two patterns are disjoint by the note above, so neither can mask a
+# match of the other (verified over 4054 generated fragments, 0 divergences).
+# The group numbering of the parts is deliberately not relied on; this pattern
+# answers a boolean and the two names are never read back off it.
+_ANY_OPENER_RE = re.compile(
+    _CANONICAL_OPENER_RE.pattern + '|' + _ECHO_OPENER_RE.pattern
+)
+
 # Structural bounds. repair() must be total for adversarial input WITHOUT a
 # blanket try/except (that is signature (b) of shared/tests/silent_fallthrough_scan.py
 # and would demand an allowlist entry), so the two unbounded loops are bounded
 # by construction instead. Both ceilings are far above any real call: no MCP
 # tool has 64 parameters, and a value carrying 64 qualifying closers is prose
 # about markup, not a leak.
+#
+# A BOUNDED STEP COUNT IS ONLY A BOUND ON COST WHILE EACH STEP STAYS CHEAP, and
+# these ceilings MULTIPLY: candidates x tail items x inner closers. Task 4502's
+# ambiguity probe briefly made the innermost step O(len(body)) by slicing, which
+# these ceilings do not contain — see :func:`_parse_body`'s *start* parameter.
+# Anything added inside these loops must be O(1) in the input length.
 _MAX_CANDIDATES = 64
 _MAX_TAIL_ITEMS = 64
 
@@ -351,9 +452,18 @@ class Repair(NamedTuple):
     #: The dropped parameters, name -> value. Empty is a success, not a
     #: refusal — the last-parameter case (PRD boundary row B4) drops nothing.
     recovered: dict[str, str]
-    #: The envelope literal :func:`detect` matched, i.e. the earliest one BY
-    #: TEXT POSITION. Falls back to :attr:`misclose` when the drifted tag is
-    #: not itself a literal and no literal appears anywhere in the value.
+    #: The needle :func:`detect_for` matched for this ``(value, param,
+    #: schema_params)`` triple, i.e. the earliest one BY TEXT POSITION over the
+    #: fixed literals widened by the names the repair itself qualifies on.
+    #: Falls back to :attr:`misclose` when no needle appears anywhere.
+    #:
+    #: ONE PATTERN PER EVENT. Every gate in front of :func:`repair` asks that
+    #: same predicate on those same inputs, so the value published here, the
+    #: fact's ``pattern`` and the caller's ``matched_pattern`` agree BY
+    #: CONSTRUCTION rather than by convention — and all three name the HEAD of
+    #: the leak rather than whatever fixed literal happens to trail it (PRD
+    #: section 2.2). Asking the blanket :func:`detect` here instead is what
+    #: made one event publishable with two answers; see the accept site.
     pattern: str
     #: The wrong closing tag, verbatim as it appeared — including the dialect
     #: blend's stray quote. This is the diagnostic PRD section 2.2 says the
@@ -381,36 +491,206 @@ def _as_name_set(names: object) -> frozenset[str]:
     It is defined here rather than beside :func:`detect_for` because
     :func:`repair` was its first consumer and this is where its fail-safe
     direction is argued.
+
+    An empty or unusable collection yields the canonical :data:`_NO_NAMES`
+    object rather than a fresh empty frozenset. That is the overwhelmingly
+    common shape — every middleware call site passes no schema at all — and it
+    is on :func:`detect_for`'s 99.7%-clean path, where building a set to hold
+    nothing was measurably the largest remaining per-call allocation.
     """
     if isinstance(names, (str, bytes)) or not isinstance(names, Iterable):
-        return frozenset()
+        return _NO_NAMES
+    if not names:
+        return _NO_NAMES
     return frozenset(name for name in names if isinstance(name, str))
 
 
-def _parse_tail(tail: str) -> dict[str, str] | None:
-    """Parse *tail* as a sequence of pseudo-parameters, else ``None``.
+def _inner_markup_blocks(
+    body: str,
+    value_start: int,
+    item_value: str,
+    name: str,
+    closer_name: str,
+) -> bool:
+    """Does markup inside a recovered item's value make its boundary a GUESS?
 
-    The grammar is PRD section 4 C1's, verbatim: a name-echoing pair, a
-    canonical ``parameter`` pair, or a final UNTERMINATED opener whose value
-    runs to end-of-string (the parser consumed that closer as its terminator),
-    with one trailing invoke closer stripped and whitespace allowed between
-    items. ``None`` means the tail did not parse with ZERO leftover, which
-    rejects the candidate and advances the scan — this function never yields a
-    partial parse of one tail.
+    Boundary row B5's real question, asked properly (task **4502**). B5 refuses
+    a recovered item whose "value is itself doubly corrupted, so its boundary
+    is a guess" — but it was implemented as a bare substring test for a closing
+    tag ANYWHERE in the value, which is strictly wider than that. The shape it
+    over-refused is a faithful REPORT of a markup leak: such a report quotes
+    the pattern that tripped the tripwire, so the quote lands inside a
+    swallowed argument and the guard fired on the caller's own prose. Those
+    characters were then dropped on the floor — the exact information loss this
+    module exists to end, inflicted by its own refusal.
 
-    That is a per-tail guarantee only, and on its own it is NOT enough to rule
-    out a partial REPAIR: advancing the scan leaves the rejected closer inside
-    the next candidate's prefix. The prefix-clean accept-time condition in
-    :func:`repair` is what closes that gap.
+    An inner closer naming ``N`` blocks recovery iff EITHER:
 
-    Every returned value is a SLICE of *tail*; nothing is rebuilt or decoded.
+    (i) ``N`` names the item ITSELF, EITHER dialect's closer for it — the
+        name-echoing ``closer_name`` AND the canonical ``parameter``, the
+        latter regardless of which dialect this item's OPENER used — or
+        ``invoke``: a cross-dialect or repeated mis-close of this very item,
+        or a tail spanning a tool-call boundary. An item's own closing tag
+        appearing inside its own value is a mis-close BY DEFINITION, never
+        prose about itself, so this may be stated categorically; or
+
+        ``parameter`` IS LISTED SEPARATELY FROM ``closer_name``, and dropping
+        it reintroduces a live corruption (task **4502**, esc-4502-3). The two
+        coincide only in the CANONICAL dialect; for an ECHO-dialect item
+        ``closer_name`` is the item's own name, so a bare ``(name,
+        closer_name)`` membership test collapses to a single entry and lets
+        ``parameter`` through. That is not a cosmetic gap: :func:`_parse_body`
+        treats the canonical ``parameter`` closer as a UNIVERSAL terminator, so
+        its appearance inside a value is ambiguous with the item's real
+        boundary in BOTH dialects — a fact about the parser, not about the
+        opener. The dialects also demonstrably BLEND (``_CLOSER_RE``'s
+        stray-quote tolerance exists for that measured shape). Measured before
+        the fix: a value opening echo-dialect for ``agent_id`` and closing with
+        the canonical ``parameter`` closer recovered ``agent_id`` as
+        ``'claude-interactive'`` plus that closer plus a whole trailing
+        next-tool-call paragraph, reported as ``outcome=repaired`` and, under
+        FORWARD_REPAIR, written straight into the tool's arguments — the exact
+        swallow-the-next-call failure this condition exists to prevent, reached
+        through the mirror image of negative control (a). The ambiguity probe
+        (ii) does not catch it, because that trailing prose does not itself
+        parse as pseudo-parameters; or
+    (ii) reading that closer as this item's terminator ALSO yields a valid
+        parse of the remainder — the genuine AMBIGUITY B5's own wording
+        describes, where the item's boundary really is a guess.
+
+    Otherwise the occurrence is QUOTED PROSE and recovery proceeds.
+
+    CONDITION (i)'S OPENER MIRROR (task **5620**). A well-formed parameter
+    OPENER anywhere in the value — EITHER dialect's, exactly as (i) lists
+    either dialect's closer — blocks outright, before any closer is examined.
+    4502 fixed the CLOSER side of this class (condition (i)'s separately-listed
+    ``parameter``, esc-4502-3) but reasoned only about closers, so the opener
+    side was admitted by OMISSION: a sibling opener was glued into the value
+    verbatim while the parameter it named went silently UNRECOVERED — the
+    record-25 failure below, reached through an opener instead of a closer. The
+    PRD's B5 entry owns the archaeology and the measured blast radius.
+
+    It is stated CATEGORICALLY, for condition (i)'s own three reasons:
+
+    * An opener naming a parameter is a shape :func:`_parse_body` would have
+      opened a SIBLING ITEM on, so reading it as prose is a guess about where
+      this item ends — precisely what B5 refuses — and guessing wrong writes
+      one argument's text into another and reports it ``repaired``.
+    * Probe (ii) cannot decide it from EITHER position: run from an inner
+      CLOSER, as it is, the remainder ahead of such an opener begins mid-prose;
+      run from an inner OPENER — the alternative weighed for 5620 — it stays
+      silent whenever the sibling's own text carries a closing tag, which the
+      depth-1 bound reads as "does not parse".
+    * BOTH DIALECTS, via :data:`_ANY_OPENER_RE`, because :func:`_parse_body`
+      tries the canonical opener first and falls back to the name-echoing one:
+      both are shapes it would have opened on — a property of the PARSER, not
+      of the enclosing item's dialect, which is why ``parameter`` sits in (i)
+      independent of that dialect too. The echo half is deliberately BROAD (any
+      identifier-named tag); qualifying it on schema membership was available
+      and rejected, because this function is not given the schema and taking it
+      would couple the boundary rule to the caller's tool. Breadth is the
+      conservative direction here: refusing costs a ``None`` the caller
+      survives, accepting wrongly is unrecoverable.
+
+    ONE BOUNDED SEARCH, once per (candidate, tail item) and never inside the
+    inner-closer loop, over a string the prefilter has just scanned and only
+    when it fired — nothing is added to the innermost of the three multiplying
+    ceilings :data:`_MAX_CANDIDATES` warns about. IT MUST NOT TOUCH
+    ``considered``, whose final ``return considered == 0`` is the
+    malformed-closer fallback (negative control (e)) and has to keep meaning
+    "no WELL-FORMED CLOSER was present".
+
+    THE RULE STOPS AT THE PREFILTER. A value carrying a sibling opener and NO
+    closing tag anywhere never reaches this function at all, so it is still
+    swallowed; that shape predates 4502 and is owned by task **5639**.
+
+    CONDITION (i) IS NOT REDUNDANT, and dropping it is the single most likely
+    way a reimplementation goes wrong. The ambiguity probe alone — or
+    qualifying inner closers only on schema membership — also accepts
+    committed-corpus record 25 (``mcp__plan-tools__add_design_decision`` /
+    ``decision``), whose value opens canonically for ``rationale``, closes with
+    the name-echoing ``rationale`` closer, and is followed by an invoke closer
+    plus the head of a whole NEXT invoke block. The probe does not catch it
+    because that residue does not itself parse as pseudo-parameters, so the
+    naive rule would silently swallow the next tool call's fragment into the
+    recovered ``rationale`` — a no-silent-partial-repair failure, and strictly
+    worse than the ``None`` returned today.
+
+    *value_start* is *item_value*'s offset within *body*, so the probe can read
+    the remainder from the shared string rather than copying it: it is passed
+    as :func:`_parse_body`'s *start*, NOT used to slice. That is a performance
+    contract, not a stylistic one — see *start*'s own docstring for the
+    measurement and for why slicing here is super-linear on the request path.
+
+    Bounded like everything else here: at most :data:`_MAX_CANDIDATES` inner
+    closers are considered, and the probe runs at depth 1 with the blanket
+    substring behaviour restored, so it cannot recurse. Beyond the budget the
+    answer is BLOCK, the conservative direction.
     """
-    body = tail.rstrip()
-    if body.endswith(INVOKE_CLOSER):
-        body = body[: -len(INVOKE_CLOSER)].rstrip()
+    if _ANY_OPENER_RE.search(item_value) is not None:
+        return True  # (i)'s OPENER MIRROR: a sibling this parser would have opened
 
+    considered = 0
+    for inner in _CLOSER_RE.finditer(item_value):
+        considered += 1
+        if considered > _MAX_CANDIDATES:
+            return True
+        inner_name = inner.group(1)
+        if (
+            inner_name in (name, closer_name, _NAME_PARAMETER)
+            or closer_for(inner_name) == INVOKE_CLOSER
+        ):
+            return True  # (i) a mis-close of THIS item, or a call boundary
+        if _parse_body(body, probe=True, start=value_start + inner.end()) is not None:
+            return True  # (ii) the alternative boundary parses too — a guess
+    # The prefilter fired but no WELL-FORMED closer is present, so there is
+    # nothing to reason about: keep B5's original answer rather than widening
+    # the carve-out onto a shape this rule was never measured against.
+    return considered == 0
+
+
+def _parse_body(body: str, *, probe: bool, start: int = 0) -> dict[str, str] | None:
+    """The item loop of :func:`_parse_tail`, after the invoke closer is stripped.
+
+    Factored out (task **4502**) so :func:`_inner_markup_blocks` can ask whether
+    a remainder ALSO parses without standing up a second parser that could
+    drift from this one. *probe* is that reentrant call: it restores the blanket
+    bare-substring refusal, which bounds the recursion at depth 1 by
+    construction — deliberately a flag rather than a depth counter, because
+    there is exactly one legal depth and a counter would invite a second.
+
+    THAT DEPTH-1 REFUSAL NO LONGER FIRES (task **5620**), and is kept anyway.
+    :func:`_inner_markup_blocks` now blocks any value carrying a well-formed
+    parameter opener, and an opener at the remainder's start position is the
+    only thing the probe could have parsed an item from — so the branch is
+    unreachable BY CONSTRUCTION rather than merely untested, and condition (ii)
+    decides only whether the remainder is blank. Instrumented across the five
+    markup suites: 1 execution at ``1b9fedeb97``, 0 at ``715bf54b9d``. Stated
+    here as the measurement it is, with the collapse owned by ticket
+    task **5640**, so a reader meets a known dead branch
+    rather than an oversight. Note what the collapse may NOT take with it:
+    *start* below carries its own separately-measured performance contract and
+    has nothing to do with this rule.
+
+    *start* is where in *body* to begin, and is what keeps the probe CHEAP. It
+    exists instead of the obvious ``_parse_body(body[offset:], ...)`` because
+    that slice is O(len(body)) and runs once per inner closer per tail item per
+    candidate, while the probe itself almost always answers in O(1) — the
+    remainder starts mid-prose, neither opener matches at *pos*, and it returns
+    immediately. Measured on the sliced version at a CONSTANT 1024 probes,
+    growing only the body: 216 KB -> 0.0042 s, 3.2 MB -> 0.0496 s, i.e. linear
+    in a length the parse work does not depend on, and :func:`repair` pays that
+    up to :data:`_MAX_CANDIDATES` times over. Since :func:`repair` runs
+    synchronously on the middleware's request path, a large leaked argument
+    stalled the server for the duration. DO NOT "simplify" *start* back into a
+    slice: no regex here is anchored (see :data:`_CANONICAL_OPENER_RE`,
+    :data:`_ECHO_OPENER_RE`, :func:`_closer_re` — none uses ``^`` or a
+    lookbehind), so passing a position is exactly equivalent and merely free.
+
+    ``None`` means the body did not parse with ZERO leftover.
+    """
     recovered: dict[str, str] = {}
-    pos = 0
+    pos = start
     for _ in range(_MAX_TAIL_ITEMS):
         while pos < len(body) and body[pos].isspace():
             pos += 1
@@ -436,15 +716,68 @@ def _parse_tail(tail: str) -> dict[str, str] | None:
             item_value = body[match.end(): closer.start()]
             pos = closer.end()
 
+        # THE CHEAP PREFILTER, retained verbatim so the clean path pays exactly
+        # what it paid before: one substring scan, and nothing else.
         if '\x3c/' in item_value:
-            # A second mis-close INSIDE the recovered tail: the value is itself
-            # doubly corrupted, so its boundary is a guess. Refuse (PRD B5).
-            return None
+            if probe:
+                # Depth 1. The probe only has to answer "does this remainder
+                # parse at all"; re-entering the narrowing here would recurse.
+                #
+                # MEASURED UNREACHABLE as of task 5620, and deliberately kept.
+                # Instrumented across the five markup suites: 1 execution at
+                # 1b9fedeb97, 0 at 715bf54b9d. The probe can only parse an item
+                # when an opener sits at its start position, and that value is
+                # now blocked by the opener mirror before condition (ii) is
+                # consulted, so (ii) decides only whether the remainder is
+                # blank. Collapsing the apparatus belongs to task 5640,
+                # not here: it means deleting a
+                # recursion bound task 4502 landed with an explicit
+                # flag-not-counter argument. *start* must survive that collapse
+                # regardless — its contract is independent of this rule.
+                return None
+            if _inner_markup_blocks(body, match.end(), item_value, name, closer_name):
+                return None  # a SECOND mis-close: the boundary is a guess (B5)
         if name in recovered:
             return None  # the same parameter twice is not a well-formed tail
         recovered[name] = item_value
 
     return None  # more items than any real call has — refuse rather than guess
+
+
+def _parse_tail(tail: str) -> dict[str, str] | None:
+    """Parse *tail* as a sequence of pseudo-parameters, else ``None``.
+
+    The grammar is PRD section 4 C1's, verbatim: a name-echoing pair, a
+    canonical ``parameter`` pair, or a final UNTERMINATED opener whose value
+    runs to end-of-string (the parser consumed that closer as its terminator),
+    with one trailing invoke closer stripped and whitespace allowed between
+    items. ``None`` means the tail did not parse with ZERO leftover, which
+    rejects the candidate and advances the scan — this function never yields a
+    partial parse of one tail.
+
+    That is a per-tail guarantee only, and on its own it is NOT enough to rule
+    out a partial REPAIR: advancing the scan leaves the rejected closer inside
+    the next candidate's prefix. The prefix-clean accept-time condition in
+    :func:`repair` is what closes that gap.
+
+    BOUNDARY ROW B5 lives in :func:`_inner_markup_blocks`, which this delegates
+    to via :func:`_parse_body`. As of tasks **4502** and **5620** it is an
+    ALTERNATIVE-BOUNDARY test rather than a bare substring refusal: markup
+    inside a recovered item's value blocks recovery when a closing tag
+    mis-closes THAT item or spans a tool-call boundary, when reading it as the
+    terminator also parses, or when the value carries a well-formed parameter
+    OPENER in either dialect — but NOT when a closer is merely quoted prose. A recovered value is verbatim caller
+    text under invariant D5, and a faithful report of a markup leak necessarily
+    quotes the leak; ``clean_value``'s envelope-free post-condition is
+    untouched, because that is the value the repairer REWROTE.
+
+    Every returned value is a SLICE of *tail*; nothing is rebuilt or decoded.
+    """
+    body = tail.rstrip()
+    if body.endswith(INVOKE_CLOSER):
+        body = body[: -len(INVOKE_CLOSER)].rstrip()
+
+    return _parse_body(body, probe=False)
 
 
 def repair(
@@ -489,6 +822,15 @@ def repair(
     exists to end, reintroduced by its own repairer. When the only candidates
     that parse would leave a poisoned prefix, the honest answer is ``None``.
 
+    THE POST-CONDITION IS ON ``clean_value`` ONLY, and deliberately so (task
+    **4502**). A RECOVERED value may still trip :func:`detect`: it is verbatim
+    caller text under invariant D5, and a faithful report of a markup leak
+    quotes the leak. Boundary row B5 is an alternative-boundary test rather
+    than a bare substring refusal precisely so those characters are recovered
+    instead of dropped — see :func:`_inner_markup_blocks` for the rule and for
+    why its own-name condition is not redundant. The C2 middleware surfaces
+    which recovered names carry a literal rather than letting it pass silently.
+
     The guard is stated against :func:`detect_for` rather than :func:`detect`
     as of task **4696**, because the gates that consume ``clean_value`` are
     parameter-aware: a prefix carrying a canonical closer for *param* or for a
@@ -497,6 +839,12 @@ def repair(
     task's HEAD — 504 records, 443 accepted, ZERO carrying a qualifying closer
     in the accepted prefix — so the tightening changed no per-specimen
     expectation; it closed the DOUBLE SELF-NAME MISCLOSE hole and nothing else.
+    The committed corpus now reads 504 records / **444 accepted** after task
+    **4502** moved one record repaired-ward; the 443 above is 4696's datum and
+    stays as it was measured, so a reader who checks it against today's fixture
+    and finds 444 knows which task moved it rather than suspecting rot. The
+    ZERO clause is unchanged and was re-verified at 4502: the newly-accepted
+    record's ``clean_value`` carries no qualifying closer either.
 
     The canonical closer is always a candidate even though C1's literal wording
     does not list it. PRD section 2.1's fourth specimen mis-closes ``content``
@@ -612,15 +960,33 @@ def repair(
         # unchanged by task 4696: the accept path now pays the WIDENED scan
         # above, and the refuse path still pays neither.
         #
-        # DELIBERATELY the BLANKET predicate, unlike the guard above (4696).
-        # `pattern` below already falls back to `misclose` when no literal is
-        # present, so it ALREADY self-heals for a name outside the literal set
-        # and detect_for here would change no observable value — while making
-        # the blanket/param-aware split at this one site harder to read. It
-        # matters that it keeps its exact current values: Repair.pattern is
-        # what mcp_markup_middleware's _reject and _forward publish as
-        # `matched_pattern`.
-        detected = detect(value)
+        # THE SAME PARAMETER-AWARE PREDICATE the guard above and every gate in
+        # front of this function ask (task 5283). This site used to ask the
+        # blanket `detect`, on the argument that the `misclose` fallback below
+        # "ALREADY self-heals for a name outside the literal set and detect_for
+        # here would change no observable value".
+        #
+        # MEASURED FALSE. Where a fixed literal is present the fallback never
+        # fires, so the two predicates are free to disagree — and they do.
+        # Specimen: prose, the absorbing parameter's own closer, then a
+        # canonical opener naming the swallowed sibling, with param='how' and
+        # schema=('what','where','how'):
+        #
+        #     detect(value)            '\x3cparameter name='   offset 39
+        #     detect_for(value, ...)   the `how` closer        offset 33
+        #
+        # Repair.pattern is published as `matched_pattern` by
+        # mcp_markup_middleware's _reject and _forward and as the repaired
+        # fact's `pattern` by plan_tools, so the disagreement put ONE event on
+        # the wire with TWO answers: the fact stream naming the head of the
+        # leak and the caller's payload naming a literal that merely trails it
+        # — the exact diagnostic defect PRD section 2.2 exists to close.
+        #
+        # detect_for is a strict superset of detect's needle set and reports
+        # earliest-by-text-position, so this can only ever name an earlier-or-
+        # equal literal. The `misclose` fallback is unchanged and still covers
+        # the case where nothing at all is found.
+        detected = detect_for(value, param, schema)
         return Repair(
             clean_value=clean_value,
             recovered=recovered,

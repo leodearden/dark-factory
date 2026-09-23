@@ -195,6 +195,77 @@ _WATCHDOG_SLOW_READ_WARN_SECS = 1.0
 # wrapper, where a wait in before_invoke is definitionally a cap wait and can
 # be attributed correctly — a caller-side asyncio.wait_for cannot tell a frozen
 # pool from a slow agent and would misattribute the latter.
+#
+# AUDITED NON-CALLERS (task 4736).  A caller that deliberately does NOT route
+# through invoke_with_cap_retry still gets a row, so the next investigator
+# finds an audit ANSWER here rather than an absence and re-derives nothing.
+#
+# Caller                                  Policy / WHY
+# ───────────────────────────────────────────────────────────────────────────
+# scripts/legibility/coder.py             DELIBERATE NON-CALLER — no
+#   (nightly legibility trickle, spawned  cap_wait_sanity_secs, because there
+#    via scripts/legibility/nightly.py)   is no cap WAIT to bound.  Its
+#                                         contract is IMMEDIATE defer/taint,
+#                                         in the shape of evals/runner.py's
+#                                         `cap_exhausted:` marker above: a
+#                                         capped digest is EXCLUDED (labelled
+#                                         CoderCapExhausted, tallied into
+#                                         RunResult.capped, no record
+#                                         fabricated), and a majority-capped
+#                                         storm defers the whole night at
+#                                         exit 0 (coder.is_cap_deferral).
+#                                         Three measured reasons, not an
+#                                         omission:
+#                                         (1) the systemd unit runs `uv run
+#                                             --frozen --project shared python
+#                                             scripts/legibility/nightly.py`;
+#                                             under that interpreter `import
+#                                             orchestrator` resolves to a
+#                                             NAMESPACE package with
+#                                             __file__ is None, so
+#                                             OrchestratorConfig is
+#                                             unreachable — and the unit
+#                                             exports none of the
+#                                             `oauth_token_env` vars named in
+#                                             config/usage-accounts.yaml, so a
+#                                             UsageGate built here would
+#                                             resolve only the single default
+#                                             ~/.claude/.credentials.json
+#                                             credential.  One account: no
+#                                             failover target to wait FOR.
+#                                         (2) with usage_gate=None this
+#                                             function performs NO cap
+#                                             classification at all
+#                                             (classify_invocation runs only
+#                                             in the gated `else` branch), so
+#                                             any cap_wait_sanity_secs
+#                                             documented for it would be
+#                                             inert, and the caller would
+#                                             still have to detect the cap
+#                                             itself.
+#                                         (3) a nightly systemd oneshot must
+#                                             not block on a cap wait across
+#                                             the NEXT night's timer, and its
+#                                             digests are re-derivable — a
+#                                             deferred night simply re-mines
+#                                             tomorrow, so patience buys
+#                                             nothing and costs a missed run.
+#                                         So the trickle detects the cap with
+#                                         the LOOSE defer-gate matcher
+#                                         shared.cap_markers::
+#                                         looks_like_blocking_banner — exactly
+#                                         as its sibling
+#                                         census.py::preflight_headroom does,
+#                                         and per that module's own docstring
+#                                         on skip-guard vs production-detector
+#                                         contracts — and defers.
+#                                         TO CHANGE THIS: making the trickle a
+#                                         real caller requires first giving it
+#                                         an ACCOUNT POOL (a reachable
+#                                         OrchestratorConfig + the
+#                                         oauth_token_env vars in the unit).
+#                                         Until then a row in the bound table
+#                                         above would be decoration.
 # ─────────────────────────────────────────────────────────────────────────────
 _DEFAULT_CAP_WAIT_SANITY_SECS = 14 * 86400  # 14 days: outer sanity bound for patient cap waits
 _CAP_WAIT_LOG_INTERVAL_SECS = 600.0  # emit at most one cap_wait log per ~10 min
@@ -289,10 +360,16 @@ class AllAccountsCappedException(Exception):
 # ``'*'`` does NOT work: deny precedence beats allow, so the wildcard must be
 # removed entirely (confirmed against live CLI 2.1.168).
 #
-# KEEP IN SYNC with the CLI's built-in tool names: a *future new* built-in tool
-# would not be auto-denied by this list.  Accepted because (a) these prompts forbid
-# tool use, and (b) a future change to the CLI's tool-exclusion semantics is caught
-# loudly by the ``schema_tool_denied`` detection below rather than degrading silently.
+# A deliberately OVER-WIDE deny set, and the honest statement of its upkeep: it
+# is NOT in sync with the CLI's built-in tool names and does not need to be.  A
+# stale entry is harmless (``BashOutput``, ``KillShell`` and ``KillBash`` below
+# are measured absent from the registry — task 5332; see the citation on
+# ``_BACKGROUND_REAP_TOOLS`` below — and denying a tool that does not exist
+# denies nothing), whereas a MISSING entry is the real
+# hole: a *future new* built-in would not be auto-denied.  Accepted because
+# (a) these prompts forbid tool use, and (b) a future change to the CLI's
+# tool-exclusion semantics is caught loudly by the ``schema_tool_denied``
+# detection below rather than degrading silently.
 #
 # SCOPE — BUILT-INS ONLY: this list contains no MCP tool pattern, so expanding the
 # ``'*'`` narrows the deny to built-ins and leaves every MCP tool REACHABLE.  That
@@ -368,8 +445,22 @@ class AgentResult:
     - ``account_name``: the OAuth account used for this invocation
     - ``timed_out``: True when the subprocess was killed by a wall-clock timeout
     - ``schema_salvaged``: True when the CLI reported is_error=True but a valid
-      ``structured_output`` was present — commonly ``error_max_turns`` paired
-      with a completed JSON schema tool-use turn. Callers treat this as success.
+      ``structured_output`` was present, so the call is treated as success. The
+      salvage branch fires whenever a dict structured payload accompanies an
+      is_error result — which makes a *surfaced* ``error_max_turns`` failure
+      itself proof that no *dict* payload was attached (a non-dict
+      ``structured_output`` is a payload that IS present yet still is not
+      salvaged — see
+      ``test_is_error_with_non_dict_structured_output_not_salvaged`` — whereas
+      a dict payload would already have flipped the result to success before a
+      caller ever saw the failure). Measured (CLI 2.1.236/2.1.241, via
+      ``fused-memory/scripts/probe_schema_max_turns.py`` — added by task 3241,
+      unmerged as of this writing; the path resolves once that branch lands):
+      ``error_max_turns`` almost never carries a completed JSON schema
+      tool-use turn — the model spent its turns on prose and never invoked
+      the schema tool — so at that boundary salvage is rarely a backstop and
+      usually has nothing to recover. Re-run the probe to re-check this claim
+      if CLI turn-budget behavior changes.
     - ``schema_tool_denied``: True when the CLI reported is_error=True with NO
       structured payload AND a ``StructuredOutput`` permission denial — i.e. the
       schema tool itself was blocked.  This is a systemic config break (the
@@ -642,13 +733,40 @@ def note_unreadable_transcript(
     return True
 
 
-# Background-management tool names that "reap" a launched background task — a
-# poll (``BashOutput``) or a kill (``KillShell`` / ``KillBash``, the latter an
-# older CLI spelling), plus their Task-tool analogues: ``TaskOutput`` collects a
-# backgrounded Task/subagent's result and ``TaskStop`` terminates it (task
-# 3639).  All five are equally conclusive evidence that the session engaged with
-# its pending work rather than abandoning it, so any of them AFTER the last
-# background launch clears the abandonment verdict.
+# Background-management tool names that "reap" a launched background task.  Any
+# of them AFTER the last background launch is conclusive evidence the session
+# engaged with its pending work rather than abandoning it, so it clears the
+# abandonment verdict.
+#
+# WHICH OF THESE ARE REAL: only ``TaskStop`` (task 5332).  ``BashOutput`` and
+# ``KillShell`` were never observed in this fleet at all, ``KillBash`` is an
+# older CLI spelling, and ``TaskOutput`` was live until the registry dropped it.
+# The query behind those claims, its dates and the fleet census live at exactly
+# one site -- orchestrator/tests/test_roles_harness_tool_inventory.py::
+# MEASURED_ABSENT_TOOLS -- and are deliberately not restated here, because six
+# hand-copies of them had already drifted apart in shape.
+#
+# KEEP EVERY MEMBER ANYWAY.  This is an ACCEPT set, so the two directions of
+# error are not symmetric: a never-observed name costs nothing, while dropping
+# one silently regresses detection if a CLI build ever ships it again — and the
+# registry demonstrably churns in BOTH directions, so "absent today" is not
+# "gone forever".
+#
+# AND THE SET DOES NOT HAVE TO BE CURRENT, which is the part a future reader
+# tempted to "resync" it needs first.  ``detect_ended_awaiting_background`` reaps
+# on EITHER this set OR its second clause (task 3639): a tool_use of ANY kind
+# whose input references the background task's id or output-file path.  That
+# clause is tool-agnostic, so it catches the ``Read``-the-output-file shape the
+# role wait-guidance now prescribes (roles.py WAIT_PATTERN_GUIDANCE) — which is
+# why correcting those prompts needed no change to this detector.  If the first
+# clause were the whole mechanism, only ``TaskStop`` would still fire it.
+#
+# That is an executable claim, not a comment's promise: the exact prescribed
+# shape — a ``Read`` tool_use whose ``file_path`` is the launch's output file —
+# is pinned by tests/test_cli_invoke_background.py::TestForegroundBgLogReadIsAReap::
+# test_read_tool_of_bg_log_is_false.  Narrowing ``_iter_input_strings`` (say, to
+# a ``command`` key) fails there rather than silently downgrading every
+# correctly-behaved session to failure.
 _BACKGROUND_REAP_TOOLS = frozenset(
     {'BashOutput', 'KillShell', 'KillBash', 'TaskOutput', 'TaskStop'}
 )

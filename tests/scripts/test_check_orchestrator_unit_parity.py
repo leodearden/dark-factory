@@ -7,29 +7,42 @@ tests/scripts/test_check_dashboard_unit_parity.py each state in their own
 docstrings.
 
 That rule is load-bearing here for a specific, measured reason rather than
-mere portability. As measured on 2026-08-02, five of the (then seven, now
-nine — see the REBASE NOTE below) registered units (the orchestrator-*.service
-ones) diverge from their committed copies on this host, and — importantly —
-NOT all in the same direction: every installed copy lacks ``RestartSteps=4``
-(so its ``RestartMaxDelaySec=60`` is silently discarded by systemd, and the
-REPO copy is the correct one), while four have an ExecStart ``--config`` path
-where the INSTALLED copy is the correct one (it names the canonical
-``dark-factory-orchestrator.yaml``; the committed copy still names a legacy
-filename that, for reify and autopilot-video, does not exist at all). Fixing
-them is owned by a named follow-up task (see the checker's module docstring)
-— so a test asserting parity against the live host would be red on landing,
-and one asserting drift would flip red the moment that task lands. Either
-encodes host state rather than checker behaviour.
+mere portability, and the strongest evidence for it is that THE HOST HAS
+MOVED UNDER THIS DOCSTRING THREE TIMES — 2026-08-02, 2026-08-16 and
+2026-09-05 — disagreeing on every measurement. A test asserting parity
+against the live host would have been red on landing; one asserting drift
+would have flipped red the moment the owning task landed. Either encodes host
+state rather than checker behaviour, and would have needed re-editing three
+times by now.
 
-REBASE NOTE (2026-08-06): this branch was rebased onto a main that had, in
-the interim, wired orchestrator-know-live.service and
-orchestrator-pump-web-ui.service into setup-host.sh (task 3641) and repointed
-four of the five --config paths above at the canonical filename (task 3512,
-commit 4fcd43eec0, landed 2026-08-04). The two new units are registered below
-to keep the staleness guard satisfied; see
-scripts/check_orchestrator_unit_parity.py's own REBASE NOTE for both — neither
-the two new units nor the 2026-08-02 numbers above were re-measured against
-the live host as part of this rebase.
+HISTORICAL, measured 2026-08-02 and RESOLVED by commit 4fcd43eec0 (task 3512,
+landed 2026-08-04). Five of the then-seven registered orchestrator-*.service
+units diverged from their committed copies, and — importantly — NOT all in
+the same direction: every installed copy lacked ``RestartSteps=4`` (so its
+``RestartMaxDelaySec=60`` was silently discarded by systemd, and the REPO
+copy was the correct one), while four had an ExecStart ``--config`` path
+where the INSTALLED copy was the correct one (it named the canonical
+``dark-factory-orchestrator.yaml``; the committed copy still named a legacy
+filename that, for reify and autopilot-video, did not exist at all). That is
+the instance which motivated the installer's decline-on-drift policy, and it
+is kept here as that policy's recorded reason.
+
+CURRENT, measured 2026-09-05 (task 4882). Seven of the nine registered units
+are clean; orchestrator-reify.service carries a deliberate drop-in
+(``override``) and orchestrator-watchdog.service drifts on one directive.
+The "direction varies per unit" claim SURVIVES on this new evidence, which is
+the point of re-dating rather than deleting it: the live drift is an
+installed-only ``Environment=ORCH_RESTART_MIN_INTERVAL_SECS=259200`` that the
+committed copy lacks (a deliberate, self-expiring deploy pause owned by task
+5020), so the installed side is still not automatically the stale one — only
+now the asymmetry runs the opposite way from 2026-08-02's first bullet.
+Full measurement and owners: the checker's own KNOWN RED section.
+
+The two 2026-08-06 REBASE NOTEs that stood here and in the checker are
+DISCHARGED — orchestrator-know-live.service and
+orchestrator-pump-web-ui.service, the units task 3641 wired into
+setup-host.sh and which were registered below unmeasured, are both clean as
+of 2026-09-05.
 
 The only real-tree reads are REPO-side: the committed scripts/*.service and
 *.timer files, and scripts/setup-host.sh, used by the registry staleness guard.
@@ -1946,11 +1959,16 @@ def test_installer_does_not_overwrite_units_the_gate_reported_drift_on(
 
     A warning is not an intervention point in a non-interactive `set -e`
     script: it scrolls past and the next line overwrites the installed units.
-    And drift does not mean the installed copy is the stale one — measured
-    2026-08-02, two COMMITTED units name --config paths that do not exist on
-    this host, so an unconditional copy would break those orchestrators on
-    their next restart. The installer must decline to act on an unverified
-    diff.
+    And drift does not mean the installed copy is the stale one. The instance
+    that motivated this policy: measured 2026-08-02, two COMMITTED units named
+    --config paths that did not exist on this host, so an unconditional copy
+    would have broken those orchestrators on their next restart (resolved by
+    commit 4fcd43eec0, task 3512). The hazard is not historical, only that
+    instance is — re-measured 2026-09-05, the live drift on
+    orchestrator-watchdog.service is an installed-only
+    Environment=ORCH_RESTART_MIN_INTERVAL_SECS the committed copy lacks, so an
+    unconditional copy would today silently delete a deliberate deploy pause.
+    The installer must decline to act on an unverified diff.
     """
     repo = _fake_repo(tmp_path)
     unit_dir = tmp_path / "installed"
@@ -2736,3 +2754,26 @@ def test_setup_host_parses_cleanly():
     assert result.returncode == 0, (
         f"bash -n rejected {SETUP_HOST_PATH}: {result.stderr}"
     )
+def test_orchestrator_reuses_the_shared_drift_and_absent():
+    """``Drift`` and ``_ABSENT`` are the SHARED objects, not local look-alikes.
+
+    IDENTITY, not equality, and the distinction is the whole point: a pasted
+    copy of a six-field frozen dataclass compares equal field-for-field with
+    the original while being a DISTINCT TYPE, so an ``==`` check on the class
+    — or on instances of it — would pass over exactly the fork this guard
+    exists to forbid. ``_ABSENT`` is worse still: two ``"<absent>"`` literals
+    may or may not be interned, so equality says nothing at all about whether
+    there is one definition or three.
+
+    The same pin the three earlier lifts carry (see
+    tests/scripts/test_check_orchestrator_unit_parity.py, which asserts this
+    shape for the parser and for ``find_dropins``). Duplicating a record inside
+    the tooling built to report silent duplication is the failure this family
+    exists to catch, one level up.
+    """
+    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
+
+    mod = _load_checker()
+
+    assert mod.Drift is systemd_unit_parity.Drift
+    assert mod._ABSENT is systemd_unit_parity._ABSENT

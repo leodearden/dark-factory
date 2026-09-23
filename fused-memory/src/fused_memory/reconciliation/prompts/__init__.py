@@ -5,6 +5,8 @@ import inspect
 import logging
 from collections.abc import Mapping
 
+from fused_memory.reconciliation.standing_decision_writer import ARM2_MIN_DISTINCT_RUNS
+
 logger = logging.getLogger(__name__)
 
 # Base template — use {{project_id}} so it survives .format(tools=...) as {project_id}.
@@ -70,6 +72,237 @@ destroys entities and edges exclusively sourced from that episode.\
 """
 
 # ---------------------------------------------------------------------------
+# Stage-gated citation-repair tool listing (task 4395)
+# ---------------------------------------------------------------------------
+# Stage 1 and Stage 2 both HOLD `repair_memory_citation` — it appears only in
+# DISALLOW_RECON_REPORT_JOURNAL_WRITES, which only STAGE3_DISALLOWED folds
+# (cli_stage_runner.py) — yet neither stage's prompt named it, so neither agent
+# ever learned it exists. `--disallowed-tools` OMITS a denied tool rather than
+# rejecting a call, so a held-but-unadvertised tool is indistinguishable from
+# one the stage does not have: there is nothing for the agent to probe.
+#
+# The stage-agnostic server-level listing is NOT the channel for this. The
+# claude CLI truncates FastMCP server `instructions` at 2048 characters and
+# RECON_REPORT_INSTRUCTIONS (server/recon_report.py) is ~7560: the tool NAME
+# survives in the roster line near the top, while the numbered entry carrying
+# its call shape, its two-id contract and its error codes sits past the cut and
+# reaches no agent. The stage prompt is passed as the system prompt and is
+# subject to no such cap, so this block is the ONLY channel that delivers the
+# contract — which is why it states the call shape in full rather than
+# deferring to the server listing.
+#
+# SHARED between Stage 1 and Stage 2 because every sentence below is true
+# verbatim in both: the holding map, the two-id contract, and the reasons
+# Stage 3 is denied it are all stage-independent facts. Stage 3 must NOT
+# interpolate it — pinned by test_recon_report_stage_gated_tool_advertisement.py
+# and by test_recon_report_guidance_drift.py's absence guard.
+#
+# The block states the TRIGGER, not only the capability, because an
+# advertisement whose trigger is unstated is inert. Measured while writing it:
+# no MCP tool either stage holds reads a closed run's findings back (the
+# recon-report surface writes the in-flight report and repairs the journal; it
+# has no journal READ), and no stage prompt describes a handoff from the stage
+# that detects a dangling cross-run citation to the two that may repair one —
+# stage3.py names neither the defect nor the tool, which is correct for the
+# denial but leaves the detect->repair route unbuilt. So the block says
+# plainly that the caller does not prospect for candidates and that the ids
+# must arrive from outside the tool. Building that handoff is deliberately NOT
+# this task (it would touch stage3.py and the Stage 3 detector, both outside
+# its scope); it is filed as follow-up work.
+#
+# MUST NOT contain the literal '## Available Tools' — build_stage2_system_prompt
+# raises RuntimeError unless that sentinel appears exactly once in
+# STAGE2_SYSTEM_PROMPT. MUST NOT reference any section by HEADING NAME: the
+# block is shared between two prompts whose section sets differ, so a heading
+# that exists in one may not exist in the other (the hazard
+# STALE_KNOWLEDGE_ANNOTATION_NORM's comment records twice) — name parameters and
+# tools instead. Every `mcp__recon-report__` call example below carries BOTH
+# `run_id` and `target_run_id`, pinned by
+# test_recon_report_stage_gated_tool_advertisement.py: the existing assembled-
+# prompt run_id scan is scoped to the shared-guidance tools and does not reach
+# this one. Not an f-string: it is interpolated INTO f-strings, and braces
+# inside an interpolated value are not re-parsed by the enclosing f-string, so
+# its own text needs no {{/}} escaping.
+CITATION_REPAIR_TOOL_BLOCK = """\
+## Repairing a Prior Run's Dangling Citation
+You hold `mcp__recon-report__repair_memory_citation`. Stage 1 and Stage 2 both hold it; \
+Stage 3 is denied it because Stage 3 is read-only and is the stage that DETECTS dangling \
+citations — detect and repair must not be the same actor. Nothing in your tool listing \
+distinguishes a tool you lack from one nobody told you about, so treat this paragraph as \
+the grant.
+
+**When to reach for it.** A memory cited by a PRIOR, already-completed run's finding no \
+longer backs that finding — either it no longer resolves (a consolidation or supersession \
+dropped the record) or it resolves but is the wrong record. The `cite_*` tools cannot \
+reach such a finding: they require the OWNING run to have a live active stage, and a \
+closed run's report state is evicted within minutes. This tool rewrites the durable \
+journal instead, which is why it is the only path.
+
+**Where `target_run_id` and `finding_id` come from — you do NOT go prospecting.** No \
+tool you hold reads a closed run's findings back, so you cannot enumerate candidates and \
+must not try. Act only when something OUTSIDE this tool has already named both ids for \
+you: an operator instruction or an escalation that carries them, or a finding in your own \
+payload that does. Note there is currently no automated handoff from detection to repair \
+— the stage positioned to detect a dangling cross-run citation is read-only by contract \
+and nothing routes its detection here — so absent such a pointer, this tool is not your \
+move.
+
+**Call shape.**
+`mcp__recon-report__repair_memory_citation(run_id=<your current run_id>, \
+target_run_id=<the run that OWNS the finding>, finding_id=..., memory_id=<the cited \
+memory>, store="mem0", replacement_memory_id=<the correct memory, or omit to DROP the \
+citation>, reason=..., justification=...)`
+
+The two ids are the trap: `run_id` keeps its usual meaning everywhere else here — YOUR \
+current run, which also supplies the repair's attribution — and `target_run_id` is the \
+run that owns the finding. Passing the target's id as `run_id` does not silently do the \
+right thing; it just fails `run_id_unknown`. Omit `replacement_memory_id` to DROP the \
+citation rather than re-point it.
+
+**`reason` names the defect CLASS and is CHECKED, not trusted** — it is written verbatim \
+into the durable provenance record. `"memory_not_found"` (the default) requires the cited \
+memory to be CONFIRMED ABSENT. `"wrong_memory"` requires it to RESOLVE, and additionally \
+requires a non-blank `justification` saying why it does not back the finding — that record \
+is the only surviving account of removing a citation that was still live. Picking the \
+wrong class is not a judgement call you win: it is a refusal naming the other one.
+
+**Two containment rules.** Only `store="mem0"` can be corroborated (`"graphiti"` is \
+refused with `unsupported_store` — the absence check is a Mem0 point read and would \
+false-flag every graphiti citation as dangling). And the repair is confined to YOUR OWN \
+project: the journal holds runs for every project this process reconciles, so a \
+`target_run_id` owned by another project is refused with `project_mismatch` before any \
+lookup or write.
+
+On success `status` is `"repaired"`. Every refusal is keyed by `"error"` and carries no \
+`"status"`, so `status` is safe to branch on.\
+"""
+
+# ---------------------------------------------------------------------------
+# Stage-2-only entity-standing-decision writer listing (task 4395)
+# ---------------------------------------------------------------------------
+# STAGE 2 ONLY. `write_entity_standing_decision` sits in
+# DISALLOW_RECON_REPORT_LEDGER_WRITES (cli_stage_runner.py), which STAGE1_DISALLOWED
+# and STAGE3_DISALLOWED both fold — it is the first recon-report tool with a durable
+# SQLite-ledger write. So this section must be interpolated into stage2.py and
+# NOWHERE else: naming the tool in Stage 1 or Stage 3 licenses a ledger write from a
+# stage that is read-only with respect to the ledger, and is failed by
+# test_recon_report_guidance_drift.py's absence guard as well as
+# test_recon_report_stage_gated_tool_advertisement.py.
+#
+# A RENDERER rather than a plain constant, matching the form of the two sections it
+# is wedged between and cross-references (render_entity_standing_decision_schema_section
+# / render_investigation_outcome_section, recon_self_model.py): they are functions
+# precisely so the values that live in code reach the prompt by INTERPOLATION rather
+# than by being re-typed. The value this one owes the agent is ARM2_MIN_DISTINCT_RUNS
+# (standing_decision_writer.py) — the arm-2 threshold. Omitting it does not satisfy
+# SPOT, it just moves the cost: with the number unstated, the only way to learn it is
+# to make a doomed call and read the `insufficient_evidence` hint, which is a wasted
+# round-trip on every arm-2 write and an arm the agent cannot plan toward. Neither
+# cross-referenced section states the number (render_investigation_outcome_section()
+# says only that the writer "counts" the records), so interpolating it here is the
+# FIRST statement of it in any prompt, not a second one.
+# The house form for that is adjacent string literals with an f-string only on the
+# segment that interpolates — which is also what keeps the literal `{status: ...}`
+# braces in the Responses paragraph out of any f-string, so no {{/}} escaping arises
+# anywhere in this section. (The rendered TEXT is interpolated INTO stage2.py's
+# f-string, where a value's braces are not re-parsed.)
+#
+# A SEPARATE ENTITY rather than an extension of either existing renderer:
+#   - render_entity_standing_decision_schema_section() is pinned BYTE-IDENTICALLY into
+#     BOTH the Stage 1 and Stage 2 prompts by test_standing_decision_prompt_drift.py,
+#     so anything added there leaks the tool name into Stage 1.
+#   - render_investigation_outcome_section() is Stage-2-only and could carry it, but
+#     that function renders the investigation_outcome RECORD schema; folding the
+#     writer tool into it would make its name lie. A sibling section placed immediately
+#     after it buys the same narrative adjacency — record schema, then the arm-2
+#     evidence pool, then the writer those records unlock — at no cost to either
+#     entity's purpose.
+# It is also separate from CITATION_REPAIR_TOOL_BLOCK above because the two have
+# different HOLDING SETS (Stage 1 + Stage 2 vs. Stage 2 alone); one merged block
+# would force this text into Stage 1.
+#
+# The server-level listing is not an alternative channel: the claude CLI truncates
+# FastMCP server `instructions` at 2048 characters and RECON_REPORT_INSTRUCTIONS
+# (server/recon_report.py) is ~7560, so this tool's numbered entry — the one carrying
+# its "Stage-2 ONLY" gating and both evidence arms — falls past the cut and reaches no
+# agent. Only the roster line naming it survives. That is why the text below states
+# the contract in full instead of pointing at the listing.
+#
+# MUST NOT contain the literal '## Available Tools' — build_stage2_system_prompt
+# raises RuntimeError unless that sentinel appears exactly once in
+# STAGE2_SYSTEM_PROMPT. Unlike the two shared blocks above, this one DOES reference
+# sections by heading name, and points at them with "above"; that is safe only because
+# it is single-stage, so both headings are reachable, and both their PRESENCE and their
+# ORDER relative to this section are pinned by
+# test_recon_report_stage_gated_tool_advertisement.py rather than left to trust.
+# Restates no OTHER value that lives in code: the grounds enum stays single-sourced by
+# render_entity_standing_decision_schema_section(), which is why this section names the
+# enum's home instead of re-listing its members.
+def render_entity_standing_decision_write_section() -> str:
+    """Render the STAGE-2-ONLY write_entity_standing_decision advertisement (task 4395).
+
+    Wired into the Stage-2 prompt only — Stage 1 and Stage 3 are denied the tool via
+    ``DISALLOW_RECON_REPORT_LEDGER_WRITES``, and naming a tool a stage cannot call
+    surfaces as a silently missing tool rather than a refusal it could act on.
+
+    Interpolates :data:`~fused_memory.reconciliation.standing_decision_writer.ARM2_MIN_DISTINCT_RUNS`
+    into the arm-2 sentence, so the threshold the writer actually enforces reaches the
+    agent as a number it can plan toward rather than as a hint it must provoke a
+    rejection to read.  Everything else it states is a tool-contract fact with no
+    in-code value to track; the grounds enum is deliberately left to the section this
+    one points at.
+    """
+    return (
+        '## Writing an Entity Standing Decision\n'
+        '`mcp__recon-report__write_entity_standing_decision(project_id=..., '
+        'entity_uuid=..., grounds=..., evidence=[...])` is the tool that WRITES the '
+        '`entity_standing_decision` ledger record described under `## Entity Standing '
+        'Decisions` above, and the records you write under `## Investigation Outcome '
+        'Records` are what unlock it. Stage 2 is the ONLY stage that holds it — Stage 1 '
+        'and Stage 3 are denied it (it is the one recon-report tool with a durable '
+        'ledger write, and they are read-only with respect to that ledger). Nothing in '
+        'your tool listing distinguishes a tool you lack from one nobody told you about, '
+        'so treat this paragraph as the grant.\n\n'
+        'It takes NO `run_id`: the decision is about an ENTITY, not about an entry in '
+        "this run's report. It also takes no `authorized_by` — that operator bypass "
+        'lives on the underlying helper and deliberately not on this tool, so your write '
+        'is ALWAYS evidence-gated.\n\n'
+        '**The gate has two arms, and EITHER one authorizes the write.**\n'
+        '- **Arm 1 — cited human-authored evidence.** At least one ref in `evidence` '
+        'must be a mem0 ref that resolves locally IN THIS PROJECT and whose record was '
+        "authored by a HUMAN (checked against the record's own `agent_id`, not against "
+        'anything you assert). An agent-authored record, or one that does not resolve, '
+        'does not count however many you cite.\n'
+        '- **Arm 2 — independent investigation outcomes.** Satisfied by the record pool '
+        'described under `## Investigation Outcome Records` above, with no `evidence` '
+        'cited at all: `investigation_outcome` records for this same `entity_uuid`, '
+        'marked `actionable=false`, spanning at least '
+        f'{ARM2_MIN_DISTINCT_RUNS} DISTINCT `run_id`s. A record carrying no `run_id` '
+        'cannot establish independence and is not counted. Distinct RUNS are the point '
+        '— repeating the same conclusion inside one run buys nothing.\n\n'
+        '**`evidence` is OPTIONAL.** Supply it for arm 1. OMIT it when you are relying '
+        'on arm 2, which is satisfied by mem0 record history alone and needs nothing '
+        'cited: do NOT fabricate an evidence list to reach that path. Refs to other '
+        'stores (escalation ids, task ids) are recorded as provenance but never count '
+        'toward EITHER arm.\n\n'
+        '`grounds` must be a value from the closed enum named under `## Entity Standing '
+        'Decisions` above — that section is where the enum is stated; do not invent a '
+        'value.\n\n'
+        "**Responses.** On success: `{status: 'written', entity_uuid, grounds, "
+        'edge_count_at_decision, expires_at, decided_at}`. Three structured errors, each '
+        'keyed by `error`: `insufficient_evidence` when NEITHER arm holds — it carries '
+        '`unmet_arms` (each unmet arm with what it needs, and for arm 2 the distinct-run '
+        'count observed so far) plus a `hint`, so read it and act on it rather than '
+        'retrying the same call; `invalid_grounds` when `grounds` is outside the enum; '
+        'and `service_not_configured` when the ledger is not wired, which is an operator '
+        'problem and not something more evidence will fix. A BACKEND FAILURE is a fourth '
+        'outcome and does NOT arrive in that shape: the decision-time edge-count '
+        'sampling fails loudly by design rather than persisting a poisoned count, so it '
+        'reaches you as a RAISED tool error with no `error` key at all. It is raised '
+        'BEFORE the ledger row is written — nothing was persisted, so a retry is safe.'
+    )
+
+# ---------------------------------------------------------------------------
 # Shared stale/wrong-knowledge annotation norm (esc-3391-1 ruling)
 # ---------------------------------------------------------------------------
 # States the precedence order for annotating superseded, wrong, or corrupted
@@ -78,6 +311,9 @@ destroys entities and edges exclusively sourced from that episode.\
 # face value. Shared between Stage 1 and Stage 2 because both hold every tool
 # named below (neither STAGE1_DISALLOWED nor STAGE2_DISALLOWED folds
 # DISALLOW_MEMORY_WRITES) and every sentence is true verbatim in both stages.
+# That precondition is what lets clause (d) name `consolidate_memories`
+# (task 3134): the op sits behind DISALLOW_MEMORY_WRITES, which neither stage
+# folds, so both stages hold it.
 # Placed in the prompt rather than CLAUDE.md because the recon stages are the
 # only consumer of raw episode prose.
 #
@@ -88,7 +324,13 @@ destroys entities and edges exclusively sourced from that episode.\
 # and requires every such example to carry `run_id=`; this section introduces
 # none. MUST NOT reference "## UUID Resolution Discipline" by heading name —
 # stage2.py has no such section; refer to `replacement_memory_id` by
-# parameter name instead, a tool-level fact true in both stages. Not an
+# parameter name instead, a tool-level fact true in both stages. For the same
+# reason MUST NOT reference "## Executing a Cluster Fold" by heading name
+# (task 3134): that section is stage1.py-only, so clause (d) names the op by
+# tool name and the stage-1 section cross-references the op, never the
+# reverse. These four MUST-NOTs are pinned in
+# tests/test_stage1_consolidation_guidance.py::TestSharedNormNamesTheSanctionedPath.
+# Not an
 # f-string: it is interpolated INTO f-strings, and braces inside an
 # interpolated value are not re-parsed by the enclosing f-string, so its own
 # text needs no {{/}} escaping (there are none below regardless).
@@ -123,10 +365,17 @@ for what `cascade=True` destroys. Use this only when (a) and (b) cannot resolve 
 problem. A `redact_episode_content` REFUSAL is not such a case: `redact_episode_content` \
 exists precisely to avoid the cascade, so a rejected redaction means fix the \
 `new_content` and retry (b), never escalate to (c).
-(d) **Mem0 cluster consolidation**: amend the SURVIVOR in place via \
-`mcp__fused-memory__update_memory` — see the tool listing above for why — and only THEN \
-delete the redundant siblings, naming the survivor via `replacement_memory_id`. Never \
-delete and re-add the survivor.
+(d) **Mem0 cluster consolidation**: to fold a MULTI-record duplicate cluster, call \
+`mcp__fused-memory__consolidate_memories`. It writes the canonical BEFORE any delete, \
+repoints task-metadata citations onto it, tags the retained peers in place (preserving \
+their point ids) and corroborates closure by a deterministic re-read — none of which the \
+hand-rolled sequence guarantees, which is why that sequence nets +1 entry per failed pass. \
+The amend-in-place-then-delete sequence remains right for exactly two cases: (i) \
+superseding a SINGLE record, where `mcp__fused-memory__update_memory` preserves the \
+survivor's id — see the tool listing above for why that matters — and (ii) hand-finishing \
+a `partial` consolidation. In both, amend the SURVIVOR in place FIRST and only THEN delete \
+the redundant entries, naming the survivor via `replacement_memory_id`. Never delete and \
+re-add the survivor.
 
 **Episode prose is a point-in-time narration, not current truth.** An episode's content \
 may assert work as complete that is still in progress by the time you read it. Before \
@@ -564,6 +813,7 @@ _RECON_REPORT_PLACEHOLDERS = {
     'actionable': '<actionable>',
     'task_id': '<task_id>',
     'flag_type': '<flag_type>',
+    'supersedes': '<finding_id of the earlier finding this one makes historical>',
     'key': '<key>',
     'value': '<value>',
     'delta': '<delta>',
@@ -687,7 +937,11 @@ _GUIDANCE_TOOL_PROSE: dict[str, str] = {
         ' filed, not overriding a verdict a finished stage already closed.'
         ' Structured errors: run_id_unknown / finding_unknown /'
         ' report_already_completed. Retract and re-file rather than filing a'
-        ' correction alongside a finding you know to be wrong.\n'
+        ' correction alongside a finding you know to be wrong — that applies to'
+        ' your OWN stage. To retire an EARLIER stage\'s claim, which this tool'
+        ' refuses, pass `supersedes=<that finding_id>` on `add_finding` instead:'
+        ' it marks the old finding historical and keeps it readable rather than'
+        ' destroying it.\n'
     ),
     'cite_entity': (
         '- `{call}` — pass the ENTITY NAME (not a UUID); the server resolves the UUID'
@@ -951,6 +1205,7 @@ _FROZEN_RECON_REPORT_SIGNATURE_SPECS: dict[str, tuple[tuple[str, bool], ...]] = 
         ('actionable', False),
         ('task_id', False),
         ('flag_type', False),
+        ('supersedes', False),
     ),
     'delete_finding': (('run_id', True), ('finding_id', True)),
     'cite_entity': (('run_id', True), ('finding_id', True), ('name', True)),
