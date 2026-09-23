@@ -183,6 +183,7 @@ ERROR_OUTCOMES: frozenset[str] = frozenset({
     'topic_moved_since_plan',
     'update_failed',
     'rename_error',
+    'gate_ambiguous',
     'gate_lockstep_failed',
     'legacy_slug_residue',
 })
@@ -207,6 +208,7 @@ SKIP_BUCKETS: tuple[str, ...] = (
     'rename_error',
     # from pair_gate_blocks / rename_group — the two-store lockstep
     'orphan_gate_topic',
+    'gate_ambiguous',
     'gate_lockstep_failed',
     # from verify_old_slugs_drained
     'legacy_slug_residue',
@@ -934,6 +936,17 @@ def pair_gate_blocks(renames, gate_tasks) -> tuple[list[GateGroup], list[dict]]:
     needs to adjudicate the gate.  The source task is never mutated — the
     planner's whole job is to leave the corpus untouched.
 
+    A renamed slug carrying MORE THAN ONE gate is refused as
+    ``gate_ambiguous``: no group is built, so neither store moves.  A
+    :class:`GateGroup` moves exactly one gate, and :func:`rename_group`'s
+    commit-point argument — the single gate patch is the one atomic write of
+    the pair — depends on that.  Moving one of several gates would strand the
+    rest on the vacated slug, the same failure as moving none.  Refusing
+    leaves both stores on the legacy slug for hand resolution, the posture
+    ``slug_collision`` already takes.  It costs nothing today: no
+    non-conforming gate topic in either live store carries more than one gate
+    (measured 2026-09-23).
+
     An unmatched gate on a NON-conforming slug is reported as
     ``orphan_gate_topic``: this sweep found no live record carrying it, so
     renaming would not help and staying silent would hide a gate that is
@@ -941,8 +954,8 @@ def pair_gate_blocks(renames, gate_tasks) -> tuple[list[GateGroup], list[dict]]:
     work nor an orphan and is reported nowhere — nothing to migrate is not
     the same fact as a dangling gate.
     """
-    # (project_id, topic) -> the gate tasks carrying it, lowest id first so a
-    # pairing is a property of the corpus rather than of read order.
+    # (project_id, topic) -> the gate tasks carrying it, lowest id first so
+    # every verdict below is a property of the corpus rather than of read order.
     gates_by_topic: dict[tuple[str, str], list[dict]] = {}
     for task in gate_tasks or ():
         metadata = task.get('metadata') or {}
@@ -962,15 +975,29 @@ def pair_gate_blocks(renames, gate_tasks) -> tuple[list[GateGroup], list[dict]]:
         by_slug.setdefault((rename.project_id, rename.old_topic), []).append(rename)
 
     groups: list[GateGroup] = []
-    # (project_id, topic, gate_task_id): the id is load-bearing because one
-    # topic's bucket can hold several gate tasks and only the first is paired.
-    paired: set[tuple[str, str, str]] = set()
+    ambiguous: list[dict] = []
     for key, members in sorted(by_slug.items(), key=lambda kv: (kv[0][0], kv[1][0].new_topic)):
         project_id, old_topic = key
-        gate = (gates_by_topic.get(key) or [None])[0]
+        bucket = gates_by_topic.get(key) or []
+        if len(bucket) > 1:
+            ambiguous.append({
+                'reason': 'gate_ambiguous',
+                'project_id': project_id,
+                'old_topic': old_topic,
+                'new_topic': members[0].new_topic,
+                'gate_task_ids': [str(task.get('id')) for task in bucket],
+                'memory_ids': sorted(r.memory_id for r in members),
+                'note': (
+                    'more than one consolidation gate is filed against this '
+                    'legacy slug, and moving one would strand the others on '
+                    'the vacated slug — neither store was touched; resolve the '
+                    'duplicate gates by hand before re-running'
+                ),
+            })
+            continue
+        gate = bucket[0] if bucket else None
         block: dict[str, Any] | None = None
         if gate is not None:
-            paired.add((project_id, old_topic, str(gate.get('id'))))
             live_block = gate['metadata'][GATE_METADATA_KEY]
             # Copy, then move exactly one key: the source task stays as read.
             block = {**live_block, 'topic': members[0].new_topic}
@@ -985,14 +1012,16 @@ def pair_gate_blocks(renames, gate_tasks) -> tuple[list[GateGroup], list[dict]]:
         ))
     groups.sort(key=lambda g: (g.project_id, g.new_topic))
 
-    skips: list[dict] = []
+    # A gate on a slug this sweep renames was paired or refused above; only a
+    # gate whose slug no rename reached can be an orphan.
+    orphans: list[dict] = []
     for (project_id, topic), bucket in gates_by_topic.items():
         for task in bucket:
-            if (project_id, topic, str(task.get('id'))) in paired:
+            if (project_id, topic) in by_slug:
                 continue
             if is_valid_topic_slug(topic):
                 continue
-            skips.append({
+            orphans.append({
                 'reason': 'orphan_gate_topic',
                 'project_id': project_id,
                 'gate_task_id': str(task.get('id')),
@@ -1006,8 +1035,8 @@ def pair_gate_blocks(renames, gate_tasks) -> tuple[list[GateGroup], list[dict]]:
                     'cluster is genuinely empty)'
                 ),
             })
-    skips.sort(key=lambda s: (s['project_id'], s['gate_topic'], s['gate_task_id']))
-    return groups, skips
+    orphans.sort(key=lambda s: (s['project_id'], s['gate_topic'], s['gate_task_id']))
+    return groups, ambiguous + orphans
 
 
 def _gate_row(group: GateGroup, outcome: str, **extra) -> dict:
@@ -1570,7 +1599,7 @@ DEFAULT_MD_OUT = str(_REPO_ROOT / 'plans' / 'topic-slug-normalization-report.md'
 #: envelope, which would bury the fields that identify the record.
 _SKIP_DETAIL_KEYS: tuple[str, ...] = (
     'project_id', 'category', 'memory_id', 'memory_ids', 'gate_task_id',
-    'topic', 'raw_topic', 'old_topic', 'new_topic', 'gate_topic',
+    'gate_task_ids', 'topic', 'raw_topic', 'old_topic', 'new_topic', 'gate_topic',
     'legacy_topic', 'existing_topic', 'target_topic', 'source_topics',
     'canonical_memory_ids', 'incumbent_ids', 'record_count', 'residue_count',
     'expected', 'scrolled', 'recount', 'delta', 'half', 'error', 'error_type',
