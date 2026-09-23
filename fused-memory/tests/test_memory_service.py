@@ -16,10 +16,10 @@ from fused_memory.services import memory_service
 from fused_memory.services.memory_service import (
     MemoryService,
     ReferentRepairStats,
-    ReferentStats,
     _is_rate_limit_or_quota_error,
     _serialize_temporal,
 )
+from fused_memory.utils.referent_verification import ReferentStats
 
 # A realistic stored Qdrant point payload: the mem0-owned keys mem0's own
 # _update_memory recomputes-or-restores, plus this record's CUSTOM provenance
@@ -755,35 +755,44 @@ class TestAddEpisode:
         assert call_kwargs['payload']['project_id'] == 'test'
 
     @pytest.mark.asyncio
-    async def test_enqueue_payload_contains_uuid(self, service):
-        """The enqueue payload must include 'uuid' matching the returned episode_id."""
-        result = await service.add_episode(
+    async def test_enqueue_payload_omits_uuid(self, service):
+        """The enqueue payload must NOT carry 'uuid' (task 3561).
+
+        Inverted from the old contract ("payload must include 'uuid' matching
+        the returned episode_id"), which was fatal: graphiti_core reads a
+        caller-supplied uuid as "LOAD this existing episode", so a
+        freshly-minted one is unconditionally NodeNotFoundError. The uuid is
+        minted by graphiti_core and read back off result.episode.uuid.
+        """
+        await service.add_episode(
             content='User discussed auth changes',
             project_id='test',
         )
         call_kwargs = service.durable_queue.enqueue.call_args[1]
         payload = call_kwargs['payload']
-        assert 'uuid' in payload, "Payload must include 'uuid' field"
-        assert payload['uuid'] == result.episode_id
+        assert 'uuid' not in payload, (
+            "Payload must not carry 'uuid' — graphiti_core would try to LOAD "
+            f'that node and raise NodeNotFoundError; got {payload.get("uuid")!r}'
+        )
 
 
 class TestExecuteGraphitiWrite:
     @pytest.mark.asyncio
-    async def test_uuid_passed_to_graphiti_backend(self, service):
-        """_execute_graphiti_write must forward uuid from payload to graphiti.add_episode."""
-        test_uuid = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
-        payload = {
-            'uuid': test_uuid,
-            'name': 'episode_aaaaaaaa',
-            'content': 'test content',
-            'source': 'text',
-            'group_id': 'test',
-            'source_description': '',
-        }
+    async def test_none_uuid_passed_to_graphiti_backend(self, service):
+        """The enqueue->execute path must reach graphiti.add_episode with uuid=None.
+
+        Inverted from the old contract ("must forward uuid from payload to
+        graphiti.add_episode", task 3561). uuid=None is the only value
+        graphiti_core's CREATE branch accepts — any other value is read as
+        "LOAD this existing episode" and raises NodeNotFoundError.
+        """
+        await service.add_episode(content='test content', project_id='test')
+        payload = service.durable_queue.enqueue.call_args[1]['payload']
+
         await service._execute_graphiti_write('add_episode', payload)
         service.graphiti.add_episode.assert_called_once()
         call_kwargs = service.graphiti.add_episode.call_args[1]
-        assert call_kwargs.get('uuid') == test_uuid
+        assert call_kwargs.get('uuid') is None
 
     @pytest.mark.asyncio
     async def test_missing_uuid_passes_none(self, service):
@@ -4778,235 +4787,399 @@ class TestDedupEpisodeNodes:
 # task 2110 step-5: MemoryService._normalize_task_node_names
 # ---------------------------------------------------------------------------
 
+# The fixture family every family-keyed test below is built on: three spellings
+# of task 605, in the survivor-first order the backend's substring probe returns
+# them (highest provenance_rank, then oldest, then uuid — where provenance_rank
+# is edge_count + mentions_count, task 4986).
+#
+# The richest node is the LOWERCASE one, not the canonically-named one. That
+# inversion is deliberate and is the tracked motivating case: it is exactly
+# where the uniform family[0] survivor rule differs from the old
+# "a canonically-named node wins regardless of provenance" policy, and it is
+# why the rewrite moves 2 edges instead of 13.
+#
+# The mentions values are chosen so 'u-lower' still survives: task 4986 changed
+# what RANKS a survivor, and re-deciding this tracked case while doing so would
+# have silently retired the very scenario these tests exist to hold.
+_FAMILY_605 = [
+    {'uuid': 'u-lower', 'name': 'task 605', 'created_at': 100,
+     'edge_count': 13, 'mentions_count': 2, 'provenance_rank': 15},
+    {'uuid': 'u-canon', 'name': 'Task 605', 'created_at': 50,
+     'edge_count': 2, 'mentions_count': 1, 'provenance_rank': 3},
+    {'uuid': 'u-plural', 'name': 'tasks 605', 'created_at': 150,
+     'edge_count': 1, 'mentions_count': 0, 'provenance_rank': 1},
+]
+
+
+def _install_family_probe(service, rows_by_substring):
+    """Stand the backend's family probe over *rows_by_substring* and neutralize
+    both mutating calls, so each test asserts on the calls the pass MADE rather
+    than on a simulated graph.
+
+    Keyed by substring because that is the pass's only read: one
+    ``find_entity_nodes_by_name_substring(number, group_id=...)`` per distinct
+    task number the episode touched.
+    """
+    async def fake_probe(substring, *, group_id):
+        return list(rows_by_substring.get(substring, []))
+
+    service.graphiti.find_entity_nodes_by_name_substring = AsyncMock(side_effect=fake_probe)
+    service.graphiti.rename_entity_node = AsyncMock(return_value={})
+    service.graphiti.merge_entities = AsyncMock(return_value={})
+
+
 class TestNormalizeTaskNodeNames:
     """Unit tests for MemoryService._normalize_task_node_names — the post-write
-    hook that canonicalizes non-canonical task-entity node names (e.g.
-    'task 132', 'tasks 153') minted by graphiti_core's LLM extraction to the
-    canonical 'Task N' form (task 2110).
+    hook that collapses every spelling of one task's node onto the canonical
+    'Task N' form (task 2110; rewritten family-keyed by task 5264).
 
-    Collision policy: when a canonical 'Task N' node already exists, the
-    bad-named node is MERGED into it; only when no canonical node exists is
-    the bad-named survivor RENAMED (and any remaining bad-named duplicates
-    merged into it).
+    The pass is keyed on the FAMILY the episode touched, not on the spelling
+    that happened to arrive. Arrival-keying had two structural blind spots: an
+    already-canonical arrival returned before a single backend call, so an
+    episode touching a fragmented task could not heal it at all; and even on
+    the bad-name path only two exact names were ever probed, so a third
+    spelling in the same family was never looked at and a 3-way split collapsed
+    to 2 at best. One group-scoped substring probe on the task's verbatim
+    digits replaces both.
+
+    Survivor policy is now ONE rule: the family's first member under the
+    backend's survivor-first ordering survives, every other member is merged
+    into it, and it is renamed onto the canonical name last. The old "a
+    canonically-named node wins regardless of provenance" special case is gone
+    — it existed to avoid recreating the exact-name duplicate
+    _dedup_episode_nodes resolves, and what rules that duplicate out now is the
+    merge-before-rename ORDER rather than family-keying on its own.
     """
 
     @pytest.mark.asyncio
-    async def test_renames_when_no_canonical_exists(self, service):
-        """(a) A single 'task 132' node with no existing 'Task 132' canonical
-        is renamed in place — merge_entities is never called."""
+    @pytest.mark.parametrize('arriving_name', ['Task 605', 'task 605', 'tasks 605'])
+    async def test_outcome_is_identical_whichever_spelling_arrived(
+        self, service, arriving_name,
+    ):
+        """THE acceptance assertion: the repair no longer depends on which
+        spelling graphiti_core's extraction happened to mint.
+
+        Under arrival-keying these three episodes produced three different
+        outcomes — the canonical arrival did nothing at all, and each bad
+        arrival saw only itself plus the canonical name. Here all three produce
+        the same one rename and the same two merges, collapsing the family to a
+        single canonical node.
+        """
         from _fm_helpers import MockAddEpisodeResult, MockNode
 
-        async def fake_find_duplicates(name, *, group_id):
-            if name == 'task 132':
-                return [{'uuid': 'survivor', 'created_at': 100, 'edge_count': 3}]
-            return []  # 'Task 132' has no canonical match
+        _install_family_probe(service, {'605': _FAMILY_605})
 
-        service.graphiti.find_duplicate_entity_nodes = AsyncMock(side_effect=fake_find_duplicates)
-        service.graphiti.rename_entity_node = AsyncMock(return_value={})
-        service.graphiti.merge_entities = AsyncMock(return_value={})
+        result = MockAddEpisodeResult(nodes=[MockNode(name=arriving_name)])
+        count = await service._normalize_task_node_names(result, group_id='test')
 
-        result = MockAddEpisodeResult(nodes=[MockNode(name='task 132')])
+        assert count == 3  # one rename + two merges
+        service.graphiti.find_entity_nodes_by_name_substring.assert_awaited_once_with(
+            '605', group_id='test',
+        )
+        service.graphiti.rename_entity_node.assert_awaited_once_with(
+            'u-lower', 'Task 605', group_id='test',
+        )
+        assert [
+            (c.args, c.kwargs) for c in service.graphiti.merge_entities.await_args_list
+        ] == [
+            (('u-canon', 'u-lower'), {'group_id': 'test'}),
+            (('u-plural', 'u-lower'), {'group_id': 'test'}),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_the_family_is_merged_before_the_survivor_is_renamed(self, service):
+        """The order is the guarantee, and it is only observable as an order.
+
+        _FAMILY_605 holds both a high-edge non-canonical survivor and an
+        already-canonically-named member, so renaming the survivor FIRST would
+        leave two nodes named 'Task 605' until the merge landed. The pass is
+        best-effort by design — a merge failing in that window would leave the
+        exact-name pair behind, and _dedup_episode_nodes has already run by
+        then (see the call-order tests below), so nothing later in the chain
+        collapses it and the pair survives until some future episode mentions
+        the task again.
+
+        Both calls are recorded on one parent mock because each mock knows only
+        its own await list; the interleaving is exactly what is under test.
+        """
+        from _fm_helpers import MockAddEpisodeResult, MockNode
+
+        _install_family_probe(service, {'605': _FAMILY_605})
+        recorder = MagicMock()
+        recorder.attach_mock(service.graphiti.merge_entities, 'merge')
+        recorder.attach_mock(service.graphiti.rename_entity_node, 'rename')
+
+        result = MockAddEpisodeResult(nodes=[MockNode(name='task 605')])
+        await service._normalize_task_node_names(result, group_id='test')
+
+        assert [name for name, _, _ in recorder.mock_calls] == [
+            'merge', 'merge', 'rename',
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_merge_leaves_no_exact_name_duplicate_behind(self, service):
+        """The failure this ordering exists for, exercised end to end.
+
+        The merge of the canonically-named member raises, so the family stays
+        split — that much is unavoidable on a best-effort path. What must NOT
+        happen is the survivor arriving at 'Task 605' alongside the member that
+        already carries that name: the graph would then hold an exact-name pair
+        with no later pass in this chain to resolve it.
+        """
+        from _fm_helpers import MockAddEpisodeResult, MockNode
+
+        _install_family_probe(service, {'605': _FAMILY_605})
+        service.graphiti.merge_entities = AsyncMock(
+            side_effect=RuntimeError('write timeout'),
+        )
+
+        result = MockAddEpisodeResult(nodes=[MockNode(name='task 605')])
+        count = await service._normalize_task_node_names(result, group_id='test')
+
+        assert count == 0
+        service.graphiti.rename_entity_node.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_already_canonical_arrival_now_probes_and_collapses(self, service):
+        """The direct inversion of the deleted test_already_canonical_name_is_noop.
+
+        That test asserted ``find_duplicate_entity_nodes.assert_not_awaited()``
+        for an arriving 'Task 605' — it ENCODED the bug rather than guarding
+        against it. ``canonical == name`` returned before a single backend
+        call, which is why an episode about a fragmented task was structurally
+        unable to heal that task. Probing on the canonical spelling is not
+        incidental extra cost; it is the fix.
+        """
+        from _fm_helpers import MockAddEpisodeResult, MockNode
+
+        _install_family_probe(service, {'605': _FAMILY_605})
+
+        result = MockAddEpisodeResult(nodes=[MockNode(name='Task 605')])
+        count = await service._normalize_task_node_names(result, group_id='test')
+
+        service.graphiti.find_entity_nodes_by_name_substring.assert_awaited_once_with(
+            '605', group_id='test',
+        )
+        assert count == 3
+        assert service.graphiti.merge_entities.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_a_lone_canonical_node_costs_one_probe_and_no_writes(self, service):
+        """A family already down to one canonically-named node is the common
+        case, and it must stay cheap: the probe still runs (that is the only
+        way to know the family is whole), and nothing is written."""
+        from _fm_helpers import MockAddEpisodeResult, MockNode
+
+        _install_family_probe(service, {'700': [
+            {'uuid': 'u-solo', 'name': 'Task 700', 'created_at': 10,
+             'edge_count': 4, 'mentions_count': 0, 'provenance_rank': 4},
+        ]})
+
+        result = MockAddEpisodeResult(nodes=[MockNode(name='Task 700')])
+        count = await service._normalize_task_node_names(result, group_id='test')
+
+        assert count == 0
+        service.graphiti.find_entity_nodes_by_name_substring.assert_awaited_once_with(
+            '700', group_id='test',
+        )
+        service.graphiti.rename_entity_node.assert_not_awaited()
+        service.graphiti.merge_entities.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_lone_non_canonical_node_is_still_renamed(self, service):
+        """The other half of the skip condition: a one-member family is left
+        alone only when its single member is ALREADY canonically named. A lone
+        'task 800' is a real repair — nothing to merge, but a name to fix."""
+        from _fm_helpers import MockAddEpisodeResult, MockNode
+
+        _install_family_probe(service, {'800': [
+            {'uuid': 'u-solo', 'name': 'task 800', 'created_at': 10,
+             'edge_count': 4, 'mentions_count': 0, 'provenance_rank': 4},
+        ]})
+
+        result = MockAddEpisodeResult(nodes=[MockNode(name='task 800')])
         count = await service._normalize_task_node_names(result, group_id='test')
 
         assert count == 1
         service.graphiti.rename_entity_node.assert_awaited_once_with(
-            'survivor', 'Task 132', group_id='test',
+            'u-solo', 'Task 800', group_id='test',
         )
         service.graphiti.merge_entities.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_merges_into_existing_canonical(self, service):
-        """(b) A 'tasks 153' node with an existing 'Task 153' canonical is
-        merged into the canonical survivor — rename_entity_node is never called."""
+    async def test_a_non_task_name_is_never_probed(self, service):
+        """'Alice' names no family, so it costs nothing — the pass must not
+        turn every entity an episode touches into a backend query."""
         from _fm_helpers import MockAddEpisodeResult, MockNode
 
-        async def fake_find_duplicates(name, *, group_id):
-            if name == 'tasks 153':
-                return [{'uuid': 'bad-uuid', 'created_at': 100, 'edge_count': 1}]
-            if name == 'Task 153':
-                return [{'uuid': 'canon-uuid', 'created_at': 50, 'edge_count': 5}]
-            return []
-
-        service.graphiti.find_duplicate_entity_nodes = AsyncMock(side_effect=fake_find_duplicates)
-        service.graphiti.rename_entity_node = AsyncMock(return_value={})
-        service.graphiti.merge_entities = AsyncMock(return_value={})
-
-        result = MockAddEpisodeResult(nodes=[MockNode(name='tasks 153')])
-        count = await service._normalize_task_node_names(result, group_id='test')
-
-        assert count == 1
-        service.graphiti.merge_entities.assert_awaited_once_with(
-            'bad-uuid', 'canon-uuid', group_id='test',
-        )
-        service.graphiti.rename_entity_node.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_merges_extra_preexisting_canonical_duplicates_too(self, service):
-        """When more than one canonical 'Task N' node already exists (a
-        pre-existing duplicate this episode's dedup pass didn't touch), every
-        extra canonical duplicate is folded into the chosen survivor as well
-        — not just the bad-named node this episode introduced. Otherwise
-        those pre-existing canonical duplicates are only ever fixed if some
-        future episode happens to touch them again."""
-        from _fm_helpers import MockAddEpisodeResult, MockNode
-
-        async def fake_find_duplicates(name, *, group_id):
-            if name == 'tasks 153':
-                return [{'uuid': 'bad-uuid', 'created_at': 100, 'edge_count': 1}]
-            if name == 'Task 153':
-                return [
-                    {'uuid': 'canon-uuid', 'created_at': 50, 'edge_count': 5},
-                    {'uuid': 'canon-dup-uuid', 'created_at': 60, 'edge_count': 2},
-                ]
-            return []
-
-        service.graphiti.find_duplicate_entity_nodes = AsyncMock(side_effect=fake_find_duplicates)
-        service.graphiti.rename_entity_node = AsyncMock(return_value={})
-        service.graphiti.merge_entities = AsyncMock(return_value={})
-
-        result = MockAddEpisodeResult(nodes=[MockNode(name='tasks 153')])
-        count = await service._normalize_task_node_names(result, group_id='test')
-
-        assert count == 2
-        service.graphiti.merge_entities.assert_any_await('bad-uuid', 'canon-uuid', group_id='test')
-        service.graphiti.merge_entities.assert_any_await('canon-dup-uuid', 'canon-uuid', group_id='test')
-        assert service.graphiti.merge_entities.await_count == 2
-        service.graphiti.rename_entity_node.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_renames_survivor_and_merges_remaining_dups_when_no_canonical(self, service):
-        """(c) Two 'task 132' duplicates with no canonical -> the survivor is
-        renamed and the remaining duplicate is merged into it."""
-        from _fm_helpers import MockAddEpisodeResult, MockNode
-
-        async def fake_find_duplicates(name, *, group_id):
-            if name == 'task 132':
-                return [
-                    {'uuid': 'survivor', 'created_at': 100, 'edge_count': 5},
-                    {'uuid': 'dup-1', 'created_at': 200, 'edge_count': 1},
-                ]
-            return []  # 'Task 132' has no canonical match
-
-        service.graphiti.find_duplicate_entity_nodes = AsyncMock(side_effect=fake_find_duplicates)
-        service.graphiti.rename_entity_node = AsyncMock(return_value={})
-        service.graphiti.merge_entities = AsyncMock(return_value={})
-
-        result = MockAddEpisodeResult(nodes=[MockNode(name='task 132')])
-        count = await service._normalize_task_node_names(result, group_id='test')
-
-        assert count == 2
-        service.graphiti.rename_entity_node.assert_awaited_once_with(
-            'survivor', 'Task 132', group_id='test',
-        )
-        service.graphiti.merge_entities.assert_awaited_once_with(
-            'dup-1', 'survivor', group_id='test',
-        )
-
-    @pytest.mark.asyncio
-    async def test_non_task_node_name_is_untouched(self, service):
-        """(d) A non-task entity name ('Alice') is never looked up or mutated."""
-        from _fm_helpers import MockAddEpisodeResult, MockNode
-
-        service.graphiti.find_duplicate_entity_nodes = AsyncMock(return_value=[])
-        service.graphiti.rename_entity_node = AsyncMock(return_value={})
-        service.graphiti.merge_entities = AsyncMock(return_value={})
+        _install_family_probe(service, {})
 
         result = MockAddEpisodeResult(nodes=[MockNode(name='Alice')])
         count = await service._normalize_task_node_names(result, group_id='test')
 
         assert count == 0
-        service.graphiti.find_duplicate_entity_nodes.assert_not_awaited()
+        service.graphiti.find_entity_nodes_by_name_substring.assert_not_awaited()
         service.graphiti.rename_entity_node.assert_not_awaited()
         service.graphiti.merge_entities.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_already_canonical_name_is_noop(self, service):
-        """(e) An already-canonical name ('Task 42') is a no-op — canonicalize
-        maps it to itself, so the canonical!=name guard skips it entirely."""
+    async def test_a_project_qualified_candidate_is_never_folded_into_the_family(
+        self, service,
+    ):
+        """'reify:605' is exactly what a CONTAINS '605' probe hands back, and
+        merging it would have this hook commit the cross-project
+        misattribution utils/cross_project_refs.py exists to DETECT — the
+        normalization hook causing the very bug the split hook repairs."""
         from _fm_helpers import MockAddEpisodeResult, MockNode
 
-        service.graphiti.find_duplicate_entity_nodes = AsyncMock(return_value=[])
-        service.graphiti.rename_entity_node = AsyncMock(return_value={})
-        service.graphiti.merge_entities = AsyncMock(return_value={})
+        foreign = {'uuid': 'u-foreign', 'name': 'reify:605', 'created_at': 20,
+             'edge_count': 7, 'mentions_count': 0, 'provenance_rank': 7}
+        _install_family_probe(service, {'605': [_FAMILY_605[0], foreign, *_FAMILY_605[1:]]})
 
-        result = MockAddEpisodeResult(nodes=[MockNode(name='Task 42')])
+        result = MockAddEpisodeResult(nodes=[MockNode(name='task 605')])
         count = await service._normalize_task_node_names(result, group_id='test')
 
-        assert count == 0
-        service.graphiti.find_duplicate_entity_nodes.assert_not_awaited()
-        service.graphiti.rename_entity_node.assert_not_awaited()
-        service.graphiti.merge_entities.assert_not_awaited()
+        assert count == 3
+        merged = [c.args[0] for c in service.graphiti.merge_entities.await_args_list]
+        assert 'u-foreign' not in merged
+        assert merged == ['u-canon', 'u-plural']
+        service.graphiti.rename_entity_node.assert_awaited_once_with(
+            'u-lower', 'Task 605', group_id='test',
+        )
 
     @pytest.mark.asyncio
-    async def test_none_result_returns_zero(self, service):
-        """(f) None result -> 0, no backend calls."""
-        service.graphiti.find_duplicate_entity_nodes = AsyncMock(return_value=[])
-        service.graphiti.rename_entity_node = AsyncMock(return_value={})
-        service.graphiti.merge_entities = AsyncMock(return_value={})
+    async def test_unrelated_substring_matches_are_filtered_out_and_never_touched(
+        self, service,
+    ):
+        """The probe is a deliberately dumb PREFILTER; precision comes from
+        canonicalize_task_node_name afterwards.
+
+        'Task 6051' leads the candidate list with 99 edges, so if the pass
+        picked its survivor from the raw rows it would rename the WRONG node.
+        Family grouping is what keeps survivor selection scoped to the family.
+        """
+        from _fm_helpers import MockAddEpisodeResult, MockNode
+
+        _install_family_probe(service, {'605': [
+            {'uuid': 'u-6051', 'name': 'Task 6051', 'created_at': 5,
+             'edge_count': 99, 'mentions_count': 0, 'provenance_rank': 99},
+            _FAMILY_605[0],
+            _FAMILY_605[1],
+            {'uuid': 'u-notes', 'name': 'release 605 notes', 'created_at': 7,
+             'edge_count': 2, 'mentions_count': 0, 'provenance_rank': 2},
+            _FAMILY_605[2],
+            {'uuid': 'u-1605', 'name': 'Task 1605', 'created_at': 9,
+             'edge_count': 1, 'mentions_count': 0, 'provenance_rank': 1},
+        ]})
+
+        result = MockAddEpisodeResult(nodes=[MockNode(name='tasks 605')])
+        count = await service._normalize_task_node_names(result, group_id='test')
+
+        assert count == 3
+        service.graphiti.rename_entity_node.assert_awaited_once_with(
+            'u-lower', 'Task 605', group_id='test',
+        )
+        touched = {c.args[0] for c in service.graphiti.merge_entities.await_args_list}
+        assert touched == {'u-canon', 'u-plural'}
+
+    @pytest.mark.asyncio
+    async def test_one_probe_per_task_number_however_many_spellings_arrived(self, service):
+        """De-duplication is on the family's Referent, not on the raw spelling,
+        so probe count is proportional to tasks touched rather than to
+        spellings extraction produced."""
+        from _fm_helpers import MockAddEpisodeResult, MockNode
+
+        _install_family_probe(service, {'605': _FAMILY_605})
+
+        result = MockAddEpisodeResult(nodes=[
+            MockNode(name='Task 605'),
+            MockNode(name='task 605'),
+            MockNode(name='tasks 605'),
+        ])
+        count = await service._normalize_task_node_names(result, group_id='test')
+
+        assert count == 3
+        service.graphiti.find_entity_nodes_by_name_substring.assert_awaited_once_with(
+            '605', group_id='test',
+        )
+
+    @pytest.mark.asyncio
+    async def test_none_result_returns_zero_without_probing(self, service):
+        _install_family_probe(service, {'605': _FAMILY_605})
 
         count = await service._normalize_task_node_names(None, group_id='test')
 
         assert count == 0
-        service.graphiti.find_duplicate_entity_nodes.assert_not_awaited()
+        service.graphiti.find_entity_nodes_by_name_substring.assert_not_awaited()
         service.graphiti.rename_entity_node.assert_not_awaited()
         service.graphiti.merge_entities.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_empty_nodes_returns_zero(self, service):
-        """(f) Empty result.nodes -> 0, no backend calls."""
+    async def test_empty_nodes_returns_zero_without_probing(self, service):
         from _fm_helpers import MockAddEpisodeResult
 
-        service.graphiti.find_duplicate_entity_nodes = AsyncMock(return_value=[])
-        service.graphiti.rename_entity_node = AsyncMock(return_value={})
-        service.graphiti.merge_entities = AsyncMock(return_value={})
+        _install_family_probe(service, {'605': _FAMILY_605})
 
         result = MockAddEpisodeResult(nodes=[])
         count = await service._normalize_task_node_names(result, group_id='test')
 
         assert count == 0
-        service.graphiti.find_duplicate_entity_nodes.assert_not_awaited()
+        service.graphiti.find_entity_nodes_by_name_substring.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_rename_failure_is_swallowed_and_other_names_still_processed(
+    async def test_a_failure_on_one_family_still_leaves_the_next_one_processed(
         self, service, caplog,
     ):
-        """(g) A rename_entity_node failure for one bad name does not propagate
-        and does not stop a second bad name from being processed."""
+        """Best-effort, unchanged by the rewrite: this runs AFTER the episode is
+        already committed, so a transient backend error must neither propagate
+        into an successful write nor abandon the families behind it.
+
+        The failing call is the 605 family's RENAME, which merge-before-rename
+        makes the last one — so that family's merges have already landed and
+        are counted. What it is left in is the benign half-repaired state the
+        ordering buys: one collapsed node still spelled 'task 605', with no
+        second node holding the canonical name."""
         from _fm_helpers import MockAddEpisodeResult, MockNode
 
-        async def fake_find_duplicates(name, *, group_id):
-            if name in ('task 132', 'Task 132'):
-                return [{'uuid': 'survivor-a', 'created_at': 100, 'edge_count': 1}] \
-                    if name == 'task 132' else []
-            if name in ('tasks 200', 'Task 200'):
-                return [{'uuid': 'survivor-b', 'created_at': 100, 'edge_count': 1}] \
-                    if name == 'tasks 200' else []
-            return []
-
-        service.graphiti.find_duplicate_entity_nodes = AsyncMock(side_effect=fake_find_duplicates)
+        _install_family_probe(service, {
+            '605': _FAMILY_605,
+            '700': [
+                {'uuid': 'u-700-lower', 'name': 'task 700', 'created_at': 10,
+             'edge_count': 5, 'mentions_count': 0, 'provenance_rank': 5},
+                {'uuid': 'u-700-canon', 'name': 'Task 700', 'created_at': 20,
+             'edge_count': 1, 'mentions_count': 0, 'provenance_rank': 1},
+            ],
+        })
 
         async def fake_rename(node_uuid, new_name, *, group_id):
-            if node_uuid == 'survivor-a':
+            if node_uuid == 'u-lower':
                 raise RuntimeError('transient write timeout')
             return {}
 
         service.graphiti.rename_entity_node = AsyncMock(side_effect=fake_rename)
-        service.graphiti.merge_entities = AsyncMock(return_value={})
 
         result = MockAddEpisodeResult(nodes=[
-            MockNode(name='task 132'),
-            MockNode(name='tasks 200'),
+            MockNode(name='task 605'),
+            MockNode(name='task 700'),
         ])
 
         with caplog.at_level(logging.ERROR, logger='fused_memory.services.memory_service'):
             count = await service._normalize_task_node_names(result, group_id='test')
 
-        assert count == 1, 'Only the second (successful) rename should count'
-        assert service.graphiti.rename_entity_node.await_count == 2, (
-            'The second name must still be attempted after the first fails'
+        assert count == 4, "605's two merges landed before its rename failed, plus 700's pair"
+        service.graphiti.rename_entity_node.assert_any_await(
+            'u-700-lower', 'Task 700', group_id='test',
         )
-        error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
-        assert error_records, 'Expected an exception/error log for the failed rename'
+        service.graphiti.merge_entities.assert_any_await(
+            'u-700-canon', 'u-700-lower', group_id='test',
+        )
+        service.graphiti.merge_entities.assert_any_await(
+            'u-canon', 'u-lower', group_id='test',
+        )  # 605's canonical member was absorbed before the rename was attempted,
+        # so the failure cannot leave two nodes sharing the canonical name.
+        assert [r for r in caplog.records if r.levelno >= logging.ERROR], (
+            'Expected an exception log for the failed family'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -5165,7 +5338,7 @@ class TestReconcileEpisodeIdentity:
 
         service._verify_episode_referents.assert_awaited_once_with(
             mock_result, group_id='test', referents=(Referent(number='3127'),),
-            content='', referent_source='derived',
+            content='', referent_source='derived', ambiguous=None,
         )
 
     @pytest.mark.asyncio
@@ -5183,7 +5356,7 @@ class TestReconcileEpisodeIdentity:
 
         service._verify_episode_referents.assert_awaited_once_with(
             mock_result, group_id='test', referents=(),
-            content='', referent_source='derived',
+            content='', referent_source='derived', ambiguous=None,
         )
 
     @pytest.mark.asyncio
@@ -5193,8 +5366,8 @@ class TestReconcileEpisodeIdentity:
         observable, not merely counted."""
         from _fm_helpers import MockAddEpisodeResult
 
-        from fused_memory.services.memory_service import ReferentFinding
         from fused_memory.utils.canonical_labels import Referent
+        from fused_memory.utils.referent_verification import ReferentFinding
 
         populated = ReferentStats(edges_scanned=2, endpoints_checked=3)
         populated.findings.append(ReferentFinding(
@@ -5202,6 +5375,7 @@ class TestReconcileEpisodeIdentity:
             old_endpoint_uuid='n-3129', old_endpoint_name='Task 3129',
             endpoint_referent=Referent(number='3129'),
             referent_set=('Task 3127',),
+            group_id='test', project_id='test',
         ))
         mock_result = MockAddEpisodeResult()
         service._dedup_episode_edges = AsyncMock(return_value=1)
@@ -5927,7 +6101,8 @@ class TestWriteTimeIdentityGate:
             return mock_result
 
         async def fake_reconcile(result, *, group_id, referents=(),
-                                 content='', referent_source='derived'):
+                                 content='', referent_source='derived',
+                                 ambiguous=None):
             observed_locked['reconcile'] = lock.locked()
             observed_same_lock['reconcile'] = (
                 service.graphiti._identity_lock_for(group_id) is lock
@@ -5957,9 +6132,12 @@ class TestWriteTimeIdentityGate:
         assert lock.locked() is False, 'lock must be released after _execute_graphiti_write returns'
         service._reconcile_episode_identity.assert_awaited_once_with(
             mock_result, group_id='test', referents=(),
-            # zeta re-derives the producer's ambiguity set from the FULL body and
-            # reads the source to decide whether the declared-set fallback is
-            # licensed; both ride this same locked call.
+            # zeta reads the producer's ambiguity set off the wire (`None` here:
+            # this payload carries no 'referents' blob at all, the legacy shape),
+            # falls back to the FULL body for such a row, and reads the source to
+            # decide whether the declared-set fallback is licensed; all three ride
+            # this same locked call.
+            ambiguous=None,
             content='test content', referent_source='none',
         )
 
@@ -5996,7 +6174,8 @@ class TestWriteTimeIdentityGate:
             return MockAddEpisodeResult()
 
         async def fake_reconcile(result, *, group_id, referents=(),
-                                 content='', referent_source='derived'):
+                                 content='', referent_source='derived',
+                                 ambiguous=None):
             await _bump()
             return ReconcileStats()
 
@@ -6313,13 +6492,24 @@ class TestExecuteGraphitiWritePlanningRegistration:
     @pytest.mark.asyncio
     async def test_planning_episode_registered_in_registry(self, service):
         """After successful graphiti.add_episode with temporal_context='planning',
-        the episode UUID should be registered in the planned_episode_registry."""
+        the MINTED episode UUID (result.episode.uuid) is registered.
+
+        Task 3561: registration used to key on payload['uuid'], a caller-minted
+        value that named no graph node — so the search filter could never match
+        it. It now keys on the uuid graphiti_core actually created.
+        """
+        from types import SimpleNamespace
+
+        from _fm_helpers import MockAddEpisodeResult
+
         mock_registry = MagicMock()
         mock_registry.register = AsyncMock()
         service.planned_episode_registry = mock_registry
+        service.graphiti.add_episode = AsyncMock(
+            return_value=MockAddEpisodeResult(episode=SimpleNamespace(uuid='real-uuid'))
+        )
 
         payload = {
-            'uuid': 'episode-plan-uuid',
             'name': 'episode_plan',
             'content': 'PRD content',
             'source': 'text',
@@ -6329,7 +6519,7 @@ class TestExecuteGraphitiWritePlanningRegistration:
         }
         await service._execute_graphiti_write('add_episode', payload)
 
-        mock_registry.register.assert_called_once_with('episode-plan-uuid', 'myproject')
+        mock_registry.register.assert_called_once_with('real-uuid', 'myproject')
 
     @pytest.mark.asyncio
     async def test_no_temporal_context_skips_registration(self, service):
@@ -7504,6 +7694,62 @@ class TestGetStatusScoping:
         assert result['queue'] == fixed_stats, (
             f'queue section should equal get_stats output; got {result["queue"]}'
         )
+
+
+class TestGetStatusSurfacesDeadByOperation:
+    """`get_status()['queue']` must carry the per-operation dead breakdown.
+
+    This is the health-probe half of the dead-letter signal: the escalation
+    pushes, this confirms. `get_status` assigns `get_stats(group_id=project_id)`
+    straight through, so a REAL queue is used here rather than the fixture's
+    mocked `get_stats` — mocking the return value would assert only that a dict
+    survives the assignment, which was already true before this key existed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_queue_section_carries_dead_by_operation(self, service, tmp_path):
+        """A dead `add_episode` shows up attributed, scoped to the project."""
+        from _fm_helpers import poll_until
+
+        from fused_memory.services.durable_queue import DurableWriteQueue
+
+        async def always_fail(op, payload):
+            raise RuntimeError('forced fail')
+
+        queue = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=always_fail,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=1,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+        )
+        await queue.initialize()
+        service.durable_queue = queue
+        service.graphiti.list_graphs = AsyncMock(return_value=[])
+        service.mem0.list_projects = AsyncMock(return_value=[])
+
+        try:
+            await queue.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'ep', 'group_id': 'proj1', 'name': 'ep'},
+            )
+
+            async def _has_a_dead_row():
+                stats = await queue.get_stats(group_id='proj1')
+                return stats['counts'].get('dead', 0) >= 1
+
+            await poll_until(_has_a_dead_row, timeout=5.0, interval=0.05)
+
+            result = await service.get_status(project_id='proj1')
+
+            assert result['queue']['dead_by_operation'] == {'add_episode': 1}, (
+                'get_status must pass the per-operation breakdown through; got '
+                f'{result["queue"].get("dead_by_operation")!r}'
+            )
+        finally:
+            await queue.close()
 
 
 # ---------------------------------------------------------------------------
@@ -13426,3 +13672,373 @@ class TestListChildIds:
         service.mem0.delete.assert_not_awaited()
         journal.log_write_op.assert_not_awaited()
         buffer.push.assert_not_awaited()
+
+
+class TestQueueGroupIdToProjectId:
+    """`_project_id_from_queue_group_id`: the queue's group_id -> a project_id.
+
+    The dead-letter alarm needs a `project_root`, which resolves from a
+    `project_id` through the injected `_known_projects` map. The item PAYLOAD
+    cannot supply one uniformly — `add_episode`'s carries `project_id`,
+    `add_memory_graphiti`'s does not — but `group_id` is present on EVERY queue
+    item and is derivable: `Scope.graphiti_group_id` IS the project_id, and
+    `_dual_write_callback` writes `f'mem0_{project_id}'`.
+    """
+
+    def test_a_graphiti_group_id_is_the_project_id(self, service):
+        service.set_known_projects({'dark_factory': '/root/df'})
+        assert service._project_id_from_queue_group_id('dark_factory') == 'dark_factory'
+
+    def test_a_mem0_group_id_has_its_prefix_stripped(self, service):
+        service.set_known_projects({'dark_factory': '/root/df'})
+        assert (
+            service._project_id_from_queue_group_id('mem0_dark_factory')
+            == 'dark_factory'
+        )
+
+    def test_an_exact_registry_match_outranks_the_prefix_strip(self, service):
+        """The load-bearing ambiguity.
+
+        A project literally NAMED `mem0_thing` has a Graphiti group_id of
+        `mem0_thing`, which is indistinguishable by shape from the Mem0 group
+        of a project named `thing`. An exact match against the injected
+        registry is the only evidence that settles it, so it wins.
+        """
+        service.set_known_projects({'mem0_thing': '/root/mem0_thing'})
+        assert service._project_id_from_queue_group_id('mem0_thing') == 'mem0_thing'
+
+    def test_the_prefix_strip_applies_when_only_the_stripped_form_is_known(
+        self, service,
+    ):
+        service.set_known_projects({'thing': '/root/thing'})
+        assert service._project_id_from_queue_group_id('mem0_thing') == 'thing'
+
+    def test_an_unknown_group_id_is_returned_unchanged(self, service):
+        """So the caller reaches its documented unresolvable-root WARNING
+        rather than silently filing into the wrong project."""
+        service.set_known_projects({'thing': '/root/thing'})
+        assert service._project_id_from_queue_group_id('nobody') == 'nobody'
+
+    def test_an_unknown_mem0_group_id_still_strips(self, service):
+        """The map may be empty or stale, and a prefix the codebase itself
+        writes is better evidence than nothing."""
+        service.set_known_projects({})
+        assert service._project_id_from_queue_group_id('mem0_ghost') == 'ghost'
+        assert service._project_id_from_queue_group_id('ghost') == 'ghost'
+
+
+class TestDeadLetterAlarmWiring:
+    """`initialize()` wires the alarm; `_report_queue_dead_letter` files it."""
+
+    @pytest.mark.asyncio
+    async def test_initialize_wires_the_bound_report_method(self, service):
+        """A BOUND METHOD, for the same call-time-resolution reason
+        `_record_queue_terminal_outcome`'s docstring gives: `server/main.py`
+        calls `initialize()` BEFORE `set_known_projects()`, so the map is still
+        empty at the moment the hook is constructed."""
+        service.graphiti.initialize = AsyncMock()
+        await service.initialize()
+        try:
+            assert (
+                service.durable_queue._on_dead_letter
+                == service._report_queue_dead_letter
+            )
+        finally:
+            await service.durable_queue.close()
+
+    @pytest.mark.asyncio
+    async def test_an_unresolvable_project_files_nothing_and_warns(
+        self, service, caplog, monkeypatch,
+    ):
+        """No cwd fallback, ever.
+
+        `config.taskmaster.project_root` defaults to `'.'`, so a fallback would
+        file into the server's cwd where no operator watches and report success
+        doing it — a silent misfile is strictly worse than a logged refusal,
+        because it also destroys the evidence the alarm ever fired.
+        """
+        from fused_memory.services.durable_queue import DeadLetterEvent
+
+        emitted = []
+        monkeypatch.setattr(
+            memory_service, 'emit_dead_letter_escalation',
+            lambda *a, **kw: emitted.append((a, kw)),
+        )
+        service.set_known_projects({'somewhere_else': '/root/elsewhere'})
+
+        event = DeadLetterEvent(
+            item_id=3, group_id='orphan', operation='add_episode', attempts=5,
+            error='RuntimeError: boom', write_op_id='W1',
+            payload={'content': 'x'}, post_execute=False,
+        )
+        with caplog.at_level(logging.WARNING, logger=memory_service.__name__):
+            await service._report_queue_dead_letter(event)
+
+        assert emitted == [], 'nothing may be filed against a guessed root'
+        assert caplog.records, 'the refusal must stay recoverable from logs'
+        assert 'orphan' in caplog.text, caplog.text
+        assert 'add_episode' in caplog.text, caplog.text
+
+    @pytest.mark.asyncio
+    async def test_a_resolvable_project_emits_off_the_event_loop(
+        self, service, monkeypatch,
+    ):
+        """`EscalationQueue.submit` is blocking file I/O and this hook runs on
+        the event loop inside the queue worker, so the emit must go through
+        `asyncio.to_thread` — the same discipline as `_record_entity_mint`."""
+        from fused_memory.services.durable_queue import DeadLetterEvent
+
+        calls = []
+        monkeypatch.setattr(
+            memory_service, 'emit_dead_letter_escalation',
+            lambda *a, **kw: calls.append((a, kw)),
+        )
+        service.set_known_projects({'proj1': '/root/proj1'})
+
+        threads = []
+        real_to_thread = asyncio.to_thread
+
+        async def spy_to_thread(fn, *a, **kw):
+            threads.append(fn)
+            return await real_to_thread(fn, *a, **kw)
+
+        monkeypatch.setattr(asyncio, 'to_thread', spy_to_thread)
+
+        event = DeadLetterEvent(
+            item_id=3, group_id='proj1', operation='add_episode', attempts=5,
+            error='RuntimeError: boom', write_op_id='W1',
+            payload={'content': 'lost content'}, post_execute=False,
+        )
+        await service._report_queue_dead_letter(event)
+
+        assert len(calls) == 1, calls
+        args, kwargs = calls[0]
+        assert args == ('/root/proj1',), 'project_root is passed positionally'
+        assert kwargs['project_id'] == 'proj1'
+        assert kwargs['operation'] == 'add_episode'
+        assert kwargs['group_id'] == 'proj1'
+        assert kwargs['item_id'] == 3
+        assert kwargs['attempts'] == 5
+        assert kwargs['write_op_id'] == 'W1'
+        assert kwargs['post_execute'] is False
+        assert kwargs['content_preview'] == 'lost content'
+        assert memory_service.emit_dead_letter_escalation in threads, (
+            'the blocking escalation write must not run on the event loop'
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_raising_emit_never_reaches_the_queue_worker(
+        self, service, monkeypatch, caplog,
+    ):
+        """Belt to the escalator's own never-raise braces."""
+        from fused_memory.services.durable_queue import DeadLetterEvent
+
+        def _explode(*_a, **_kw):
+            raise OSError('escalation queue is on fire')
+
+        monkeypatch.setattr(
+            memory_service, 'emit_dead_letter_escalation', _explode
+        )
+        service.set_known_projects({'proj1': '/root/proj1'})
+
+        event = DeadLetterEvent(
+            item_id=3, group_id='proj1', operation='add_episode', attempts=5,
+            error='RuntimeError: boom', write_op_id=None,
+            payload=None, post_execute=False,
+        )
+        with caplog.at_level(logging.ERROR, logger=memory_service.__name__):
+            await service._report_queue_dead_letter(event)
+
+        assert caplog.records, 'a swallowed failure must still be visible'
+
+    @pytest.mark.asyncio
+    async def test_a_missing_payload_still_files(self, service, monkeypatch):
+        """`payload` is None when the queue row would not parse; the alarm is
+        needed MORE in that case, not less."""
+        from fused_memory.services.durable_queue import DeadLetterEvent
+
+        calls = []
+        monkeypatch.setattr(
+            memory_service, 'emit_dead_letter_escalation',
+            lambda *a, **kw: calls.append((a, kw)),
+        )
+        service.set_known_projects({'proj1': '/root/proj1'})
+
+        event = DeadLetterEvent(
+            item_id=3, group_id='mem0_proj1',
+            operation='mem0_classify_and_add', attempts=5,
+            error='RuntimeError: boom', write_op_id=None,
+            payload=None, post_execute=False,
+        )
+        await service._report_queue_dead_letter(event)
+
+        assert len(calls) == 1, calls
+        assert calls[0][1]['project_id'] == 'proj1'
+        assert calls[0][1]['content_preview'] == ''
+
+
+class TestReferentScanNarrowsWithTheProjectRegistry:
+    """The three producer call sites scan with `MemoryService._known_projects`.
+
+    Asserted through BEHAVIOUR rather than introspection: each write path is
+    driven with a body carrying a junk-qualified referent, and the assertion
+    reads the ENCODED wire blob off the enqueued payload. That also pins the
+    thing that actually matters downstream — the NARROWED set is what reaches
+    the durable queue, and therefore what the verifier reads back.
+
+    'evil_proj' is absent from every registry here, so it stands for the
+    measured junk shapes ('localhost:6379', 'INFO:1234') without depending on
+    a port number that also has to survive the ambiguity partition.
+    """
+
+    REGISTRY = {'test': '/src/test-project', 'reify': '/src/reify'}
+    JUNK_BODY = 'mirrors evil_proj:132'
+    GENUINE_BODY = 'mirrors reify:132'
+    REIFY_REF = {'kind': 'task', 'project_id': 'reify', 'number': '132'}
+    EVIL_REF = {'kind': 'task', 'project_id': 'evil_proj', 'number': '132'}
+
+    @staticmethod
+    def _enqueued_refs(service) -> list[dict]:
+        return service.durable_queue.enqueue.call_args[1]['payload']['referents']['refs']
+
+    @staticmethod
+    def _batched_refs(service) -> list[dict]:
+        batch = service.durable_queue.enqueue_batch.call_args[0][0]
+        return batch[0]['payload']['referents']['refs']
+
+    @pytest.mark.asyncio
+    async def test_add_memory_narrows_with_a_populated_registry(self, service):
+        service.set_known_projects(self.REGISTRY)
+        await service.add_memory(
+            content=self.JUNK_BODY, category='entities_and_relations', project_id='test'
+        )
+        assert self._enqueued_refs(service) == []
+
+    @pytest.mark.asyncio
+    async def test_add_memory_stays_permissive_with_an_empty_registry(self, service):
+        service.set_known_projects({})
+        await service.add_memory(
+            content=self.JUNK_BODY, category='entities_and_relations', project_id='test'
+        )
+        assert self._enqueued_refs(service) == [self.EVIL_REF]
+
+    @pytest.mark.asyncio
+    async def test_add_memory_preserves_a_genuine_in_registry_foreign_ref(self, service):
+        service.set_known_projects(self.REGISTRY)
+        await service.add_memory(
+            content=self.GENUINE_BODY, category='entities_and_relations', project_id='test'
+        )
+        assert self._enqueued_refs(service) == [self.REIFY_REF]
+
+    @pytest.mark.asyncio
+    async def test_add_episode_narrows_with_a_populated_registry(self, service):
+        service.set_known_projects(self.REGISTRY)
+        await service.add_episode(content=self.JUNK_BODY, project_id='test')
+        assert self._enqueued_refs(service) == []
+
+    @pytest.mark.asyncio
+    async def test_add_episode_stays_permissive_with_an_empty_registry(self, service):
+        service.set_known_projects({})
+        await service.add_episode(content=self.JUNK_BODY, project_id='test')
+        assert self._enqueued_refs(service) == [self.EVIL_REF]
+
+    @pytest.mark.asyncio
+    async def test_add_episode_preserves_a_genuine_in_registry_foreign_ref(self, service):
+        service.set_known_projects(self.REGISTRY)
+        await service.add_episode(content=self.GENUINE_BODY, project_id='test')
+        assert self._enqueued_refs(service) == [self.REIFY_REF]
+
+    @pytest.mark.asyncio
+    async def test_replay_narrows_with_a_populated_registry(self, service):
+        service.set_known_projects(self.REGISTRY)
+        service.mem0.get_all = AsyncMock(return_value={
+            'results': [{'memory': self.JUNK_BODY, 'metadata': {'category': 'temporal_facts'}}]
+        })
+        await service.replay_from_store(source_project_id='test')
+        assert self._batched_refs(service) == []
+
+    @pytest.mark.asyncio
+    async def test_replay_stays_permissive_with_an_empty_registry(self, service):
+        service.set_known_projects({})
+        service.mem0.get_all = AsyncMock(return_value={
+            'results': [{'memory': self.JUNK_BODY, 'metadata': {'category': 'temporal_facts'}}]
+        })
+        await service.replay_from_store(source_project_id='test')
+        assert self._batched_refs(service) == [self.EVIL_REF]
+
+    @pytest.mark.asyncio
+    async def test_replay_preserves_a_genuine_in_registry_foreign_ref(self, service):
+        service.set_known_projects(self.REGISTRY)
+        service.mem0.get_all = AsyncMock(return_value={
+            'results': [{'memory': self.GENUINE_BODY, 'metadata': {'category': 'temporal_facts'}}]
+        })
+        await service.replay_from_store(source_project_id='test')
+        assert self._batched_refs(service) == [self.REIFY_REF]
+
+
+class TestSetKnownProjectsLogsTheWireUp:
+    """One INFO line per wire-up, naming whether referent narrowing is ACTIVE.
+
+    `set_known_projects` is the single injection point every caller goes
+    through (`server/main.py` plus tests), so a future second caller cannot
+    bypass the report by wiring the registry somewhere else.
+
+    The PERMISSIVE arm is logged too, and is the one an operator most needs:
+    `MemoryService` is constructed before `build_known_projects_map` runs, so
+    an empty registry is a real and easily-missed window — and while it lasts,
+    every producer scan silently stays permissive.
+    """
+
+    @staticmethod
+    def _records(caplog) -> list[logging.LogRecord]:
+        return [
+            r for r in caplog.records
+            if r.levelno == logging.INFO and 'narrow' in r.getMessage().lower()
+        ]
+
+    @staticmethod
+    def _fields(record: logging.LogRecord) -> dict:
+        """The structured payload, not a prose sentence an operator must parse.
+
+        Mirrors the sibling `logger.info` in `_verify_episode_referents`'
+        unregistered-qualifier arm: a message template plus ONE dict argument.
+        """
+        assert record.args, f'no structured argument on the wire-up record: {record!r}'
+        fields = record.args[0] if isinstance(record.args, tuple) else record.args
+        assert isinstance(fields, dict), f'expected a structured dict, got {fields!r}'
+        return fields
+
+    def test_a_populated_registry_reports_narrowing_active(self, service, caplog):
+        with caplog.at_level(logging.INFO):
+            service.set_known_projects({f'proj{n}': f'/root/proj{n}' for n in range(9)})
+
+        records = self._records(caplog)
+        assert len(records) == 1, records
+        fields = self._fields(records[0])
+        assert fields['known_project_count'] == 9
+        assert fields['referent_narrowing'] == 'active'
+
+    @pytest.mark.parametrize('registry', [{}, None], ids=['empty', 'none'])
+    def test_an_unpopulated_registry_still_reports_and_says_permissive(
+        self, service, caplog, registry
+    ):
+        with caplog.at_level(logging.INFO):
+            service.set_known_projects(registry)
+
+        records = self._records(caplog)
+        assert len(records) == 1, records
+        fields = self._fields(records[0])
+        assert fields['known_project_count'] == 0
+        assert fields['referent_narrowing'] == 'permissive'
+
+    def test_a_rewire_reports_the_last_call_not_a_stale_one(self, service, caplog):
+        """Called twice, the second report describes the state the second call
+        left behind — a re-wire must not read stale."""
+        with caplog.at_level(logging.INFO):
+            service.set_known_projects({'proj1': '/root/proj1'})
+            service.set_known_projects({})
+
+        records = self._records(caplog)
+        assert len(records) == 2, records
+        assert self._fields(records[-1])['known_project_count'] == 0
+        assert self._fields(records[-1])['referent_narrowing'] == 'permissive'

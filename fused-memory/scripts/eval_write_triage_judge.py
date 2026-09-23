@@ -162,6 +162,52 @@ EVAL_CLASSES: tuple[str, ...] = (
     CLASS_DISTRACTOR,
 )
 
+#: The confusion table's OTHER axis, in report order — the same "one list,
+#: two consumers" shape as ``EVAL_CLASSES`` above, for the same reason.
+#: DERIVED rather than hand-written, so a fifth triage outcome added to
+#: ``write_triage`` joins this report automatically instead of becoming a
+#: second list to keep in sync.
+#:
+#: ``TRIAGE_OUTCOMES`` is a frozenset, whose iteration order is
+#: PYTHONHASHSEED-dependent, and this script's output is a COMMITTED artifact
+#: read by an operator at the task-3169 flip gate: iterating it directly makes
+#: two identical runs produce two differently-ordered reports, and makes the
+#: committed markdown stop being provably the render of the committed JSON.
+#: Measured 2026-08-27 — the committed pair disagreed on exactly this.
+EVAL_OUTCOMES: tuple[str, ...] = tuple(sorted(TRIAGE_OUTCOMES))
+
+#: Every provenance field the report is expected to carry, in report order —
+#: the same "one list, two consumers" shape as ``EVAL_CLASSES`` above, and for
+#: a sharper version of the same reason. :func:`build_report` backfills from
+#: THIS tuple and ``_run`` supplies its own subset of it, so a field added in
+#: one place cannot go missing from reports assembled through the other. Two
+#: hand-typed lists is exactly how ``candidate_count_min`` and
+#: ``distractor_count_requested`` — the pair that discloses a NARROWED slate —
+#: came to be absent from every report ``build_report`` backfilled.
+#:
+#: An ABSENT key cannot be told apart from an artifact predating the field, so
+#: an unmeasured one reads ``None`` rather than vanishing.
+PROVENANCE_KEYS: tuple[str, ...] = (
+    # Supplied by the caller — what was run, against what.
+    'fixture_path',
+    'judge_provider',
+    'judge_model',
+    'limit',
+    # Measured by `run_judge_eval` — the population and the slate it BUILT.
+    'record_count',
+    'case_count',
+    'candidate_count',
+    'candidate_count_min',
+    'distractor_count',
+    'distractor_count_requested',
+    # Resolved from config — what the model could actually SEE, and whether
+    # it was asked at all. `judge_write` re-trims the slate to
+    # `judge_candidate_count`, and returns `stored` on its first line when
+    # `judge_enabled` is false.
+    'judge_candidate_count',
+    'judge_enabled',
+)
+
 #: Curator label -> the verdicts that count as correct for it. See the module
 #: docstring for the rationale behind each entry; every one traces to a human
 #: adjudication rather than to an opinion formed here.
@@ -334,6 +380,16 @@ def score_cases(
     cases out of the denominator and report an accuracy over a population
     nobody chose.
 
+    An ``expected_class`` outside :data:`EVAL_CLASSES` and a verdict outside
+    :data:`EVAL_OUTCOMES` RAISE for the same reason, and the pre-seeded
+    ``per_class``/``confusion`` dicts are therefore never widened here. An
+    absorbed row inflates ``case_count`` in :func:`build_report` while
+    :func:`render_markdown` iterates only ``EVAL_CLASSES``/``EVAL_OUTCOMES``,
+    so it vanishes from the artifact entirely: the denominator moves and
+    nothing in the report says so. ``UnknownLabelError`` is reused rather than
+    re-invented so this boundary and :func:`_acceptable_for`'s
+    case-construction boundary agree about what an unknown label is.
+
     Returned shape, all of it JSON-serializable (it is written to disk
     verbatim):
 
@@ -360,19 +416,30 @@ def score_cases(
 
     per_class = {name: {'n': 0, 'correct': 0} for name in EVAL_CLASSES}
     confusion = {
-        name: dict.fromkeys(TRIAGE_OUTCOMES, 0) for name in EVAL_CLASSES
+        name: dict.fromkeys(EVAL_OUTCOMES, 0) for name in EVAL_CLASSES
     }
     duplicate_split = {OUTCOME_RESTATED: 0, OUTCOME_AMENDED: 0}
     false_contested = 0
 
     for case, verdict in zip(cases, verdicts, strict=True):
         name = str(case['expected_class'])
-        bucket = per_class.setdefault(name, {'n': 0, 'correct': 0})
+        if name not in per_class:
+            raise UnknownLabelError(
+                f'no report class for expected_class {name!r}; known classes '
+                f'are {sorted(EVAL_CLASSES)}. Add it to EVAL_CLASSES rather '
+                f'than bucketing it.',
+            )
+        if verdict not in EVAL_OUTCOMES:
+            raise ValueError(
+                f'verdict {verdict!r} is outside the closed triage vocabulary '
+                f'{sorted(EVAL_OUTCOMES)}: an absorbed verdict grows the '
+                f'confusion row a column render_markdown never emits',
+            )
+        bucket = per_class[name]
         bucket['n'] += 1
         if verdict in case['acceptable_outcomes']:
             bucket['correct'] += 1
-        row = confusion.setdefault(name, dict.fromkeys(TRIAGE_OUTCOMES, 0))
-        row[verdict] = row.get(verdict, 0) + 1
+        confusion[name][verdict] += 1
         if name == LABEL_DUPLICATE and verdict in duplicate_split:
             duplicate_split[verdict] += 1
         if verdict == OUTCOME_CONTESTED:
@@ -428,11 +495,29 @@ CAVEATS: tuple[str, ...] = (
     'The duplicate class accepts BOTH `restated` and `amended`, because the '
     "curator's labels do not separate a verbatim restatement from a "
     'rediscovery carrying a novel fragment. The split between them is '
-    'reported as a distribution and is not scored as error.',
+    'reported as a distribution and is not scored as error. NOT SCORED IS '
+    'NOT THE SAME AS NOT CONSEQUENTIAL: `_TRIAGE_ATTACH_KINDS` in '
+    '`server/tools.py` files a `restated` verdict as a SIGHTING, which '
+    '`grouped_read` only counts, and an `amended` one as an AMENDMENT, whose '
+    "text is digested into the canonical's grouped read. A swing between the "
+    'two therefore changes what an operator reads while leaving every '
+    'accuracy above unmoved, so read this split as a behaviour selector '
+    'rather than as noise.',
     'The distractor class is a control this script constructs, not a curator '
     'label: one case per cluster whose slate carries no correct attach target '
     'at all. It is what distinguishes a judge that classifies from a judge '
     'that attaches to whatever it is shown.',
+    'Every accuracy here is measured over the WHOLE labelled corpus, not over '
+    'the [t_low, t_high) middle band the production judge is actually '
+    'responsible for. `build_judge_cases` emits a case for every non-canonical '
+    'record and `run_judge_eval` calls the judge on each one directly — '
+    '`decide_band`, `t_high` and `t_low` never enter the picture, and the band '
+    'decision handed to `judge_write` is SYNTHESIZED as a middle-band one. So '
+    'these figures include records that in production are answered '
+    'deterministically without the judge ever seeing them, and whether the '
+    'middle band alone would score higher or lower is not measured here. '
+    'Filtering the cases to the band would need real per-record similarities '
+    'and is deliberately not done.',
 )
 
 
@@ -453,13 +538,20 @@ def build_report(
     from already-scored cases still produces an artifact whose provenance
     block has every key, with ``None`` where nothing was measured. An ABSENT
     key cannot be told apart from an artifact predating the field.
+
+    The backfill iterates :data:`PROVENANCE_KEYS` rather than a literal, so
+    that promise covers the WHOLE vocabulary. It used to name three of its
+    members by hand, which left ``candidate_count_min`` and
+    ``distractor_count_requested`` — the two fields that disclose a narrowed
+    slate — absent from every report assembled here, so a report built from
+    already-scored cases read exactly like a full-width run.
     """
     per_class = dict(scored['per_class'])
     run_provenance = dict(provenance)
     run_provenance.setdefault(
         'case_count', sum(entry['n'] for entry in per_class.values()),
     )
-    for key in ('record_count', 'candidate_count', 'distractor_count'):
+    for key in PROVENANCE_KEYS:
         run_provenance.setdefault(key, None)
 
     return {
@@ -492,7 +584,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             f'| {name} | {entry["n"]} | {entry["correct"]} | {entry["accuracy"]} |',
         )
 
-    outcomes = list(TRIAGE_OUTCOMES)
+    outcomes = list(EVAL_OUTCOMES)
     lines += [
         '', '## Confusion — expected class by observed verdict', '',
         '| class | ' + ' | '.join(outcomes) + ' |',
@@ -531,6 +623,42 @@ def render_markdown(report: Mapping[str, Any]) -> str:
 # The runner
 # ---------------------------------------------------------------------------
 
+def markdown_sibling(report_path: str | Path) -> Path:
+    """Where the markdown for *report_path* goes, or ``ValueError`` if nowhere.
+
+    COMPOSED from the stem, not derived by replacing the last suffix.
+    ``with_suffix('.md')`` maps ``foo.md`` back to ``foo.md``, so the markdown
+    overwrote the JSON that had just been written — every number the run paid
+    for, gone, with no error, on a script whose output is a committed
+    artifact.
+
+    A FUNCTION OF THE ARGUMENT ALONE, which is why it is one: nothing about
+    the collision depends on what the run measures, so it is knowable before
+    any work is done. It used to be evaluated at the bottom of
+    :func:`run_judge_eval`, after ``build_judge_cases``, after the whole
+    per-case ``judge_fn`` loop and after ``score_cases`` — which protected
+    the two FILES and nothing else. On a live run ``--report-path foo.md``
+    spent every LLM call for the corpus and then raised with no artifact
+    written at all, so the operator paid for the run and got nothing.
+    Callers evaluate it up front instead: :func:`run_judge_eval` at its first
+    statement, and :func:`_run` before it so much as reads the fixture.
+
+    ``guard_committed_report`` does not cover this: that guard addresses
+    dry-run/``--limit`` publishing and returns early for any non-committed
+    path, so ``--report-path foo.md`` sailed straight through it.
+    """
+    report_path = Path(report_path)
+    sibling = report_path.parent / (report_path.stem + '.md')
+    if sibling == report_path:
+        raise ValueError(
+            f'report_path {str(report_path)!r} composes the same path as its '
+            f'markdown sibling {str(sibling)!r}, so the markdown would '
+            f'overwrite the JSON report — pass a report_path whose stem+".md" '
+            f'differs from it (e.g. a .json suffix)',
+        )
+    return sibling
+
+
 def run_judge_eval(
     *,
     records: Sequence[Mapping[str, Any]],
@@ -552,7 +680,16 @@ def run_judge_eval(
 
     A dangling candidate id raises ``KeyError`` for the same reason — a
     silently-skipped candidate narrows a slate the report claims was 5 wide.
+
+    THE MARKDOWN SIBLING NEVER OVERWRITES THE REPORT. :func:`markdown_sibling`
+    composes it and RAISES on a *report_path* that composes back to itself —
+    resolved as this function's FIRST statement, before a single case is
+    built or a single verdict is bought, so the mistake costs nothing rather
+    than merely leaving the two files intact after a paid run.
     """
+    report_path = Path(report_path)
+    markdown_path = markdown_sibling(report_path)
+
     cases = build_judge_cases(records, distractors=distractors)
     by_id = {str(r['memory_id']): r for r in records}
     logger.info('Built %d case(s) from %d record(s)', len(cases), len(records))
@@ -587,13 +724,28 @@ def run_judge_eval(
             'records what was measured, not what was asked for',
             min(widths), max(widths), distractors + 1,
         )
+    # The OTHER direction, and a different mechanism: `judge_write` re-trims
+    # the slate to `judge_candidate_count` before the prompt is built, so a
+    # slate built wider than that cap is measured narrower than it is
+    # published. Silent today because the shipped cap (5) and the default
+    # `--distractors 4` happen to agree.
+    effective_cap = run_provenance.get('judge_candidate_count')
+    if widths and isinstance(effective_cap, int) and max(widths) > effective_cap:
+        logger.warning(
+            'slate widths ran %d..%d but judge_candidate_count caps the '
+            'prompt at %d — the report records what the model was measured '
+            'on, not the wider slate that was built',
+            min(widths), max(widths), effective_cap,
+        )
     report = build_report(scored=scored, provenance=run_provenance)
 
-    report_path = Path(report_path)
+    # `markdown_path` was composed (and its collision with `report_path`
+    # rejected) at the top of this function — reused here rather than
+    # recomposed, so the path that was validated is the path that is written.
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2) + '\n')
-    report_path.with_suffix('.md').write_text(render_markdown(report))
-    logger.info('Wrote %s and its .md sibling', report_path)
+    markdown_path.write_text(render_markdown(report))
+    logger.info('Wrote %s and %s', report_path, markdown_path)
 
     return report
 
@@ -771,6 +923,8 @@ def _run(args: Any) -> int:
 
     from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
     from fused_memory.server.write_triage_judge import (  # noqa: PLC0415
+        resolve_judge_candidate_count,
+        resolve_judge_enabled,
         resolve_judge_model,
         resolve_judge_provider,
     )
@@ -778,6 +932,14 @@ def _run(args: Any) -> int:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)
+
+    # FIRST, ahead of the fixture load and the config: `--report-path foo.md`
+    # is a bad ARGUMENT, and whether it collides with its markdown sibling is
+    # decided by the string alone. `run_judge_eval` re-resolves this on the
+    # path it is finally handed (which `guard_committed_report` may have
+    # redirected); rejecting here just means the operator is told now instead
+    # of after a corpus-wide run they paid for.
+    markdown_sibling(args.report_path)
 
     # BEFORE any work, and outside the --limit block: a bare --dry-run also
     # defaults to the committed path, and used to rewrite both committed
@@ -790,6 +952,16 @@ def _run(args: Any) -> int:
     service = types.SimpleNamespace(config=config)
     provider = resolve_judge_provider(service)
     model = resolve_judge_model(service)
+    # Resolved from the SAME config the shipped judge reads, and recorded even
+    # on a --dry-run: the two facts the numbers cannot be read without.
+    # `judge_candidate_count` is the width `judge_write` trims the slate to,
+    # so it — not the width this script builds — is what the model saw.
+    # `judge_enabled` false makes `judge_write` return `stored` on its first
+    # line for every case, which scores the `distractor` control 1.0 and
+    # `duplicate` 0.0 while spending nothing and writing a report that is
+    # otherwise indistinguishable from a measurement.
+    judge_candidate_count = resolve_judge_candidate_count(service)
+    judge_enabled = resolve_judge_enabled(service)
 
     records = load_fixture(args.fixture)
     logger.info('Loaded %d labeled record(s) from %s', len(records), args.fixture)
@@ -871,6 +1043,8 @@ def _run(args: Any) -> int:
             # smoke rather than the corpus-wide measurement the task-3169
             # flip gate reads it as.
             'limit': args.limit,
+            'judge_candidate_count': judge_candidate_count,
+            'judge_enabled': judge_enabled,
         },
         distractors=args.distractors,
     )

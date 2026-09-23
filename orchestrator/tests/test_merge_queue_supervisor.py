@@ -8,6 +8,12 @@ born-at-L2 terminal escalation and halts the worker via _loops_finished.
 Fixture mirrors: test_merge_queue_restart_hook.py (git_repo/git_config/git_ops/config).
 MagicMock escalation_queue: mirrors TestRunDriftCheck._make_fake_escalation_queue in
 test_merge_queue_multihost_wiring.py.
+
+These real-git cases observe the lane through an injected ``VerifyPort``
+rather than a patch of ``run_scoped_verification``.  What that does and
+does NOT stub of the post-merge gate chain is stated once, with the
+measurement behind it, in ``_merge_lane_verifier_doubles.py``'s module
+docstring.
 """
 
 from __future__ import annotations
@@ -15,9 +21,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _merge_lane_fakes import FakeClock, FakeVerifier, RecordingEscalations
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
@@ -106,20 +112,6 @@ def _make_request(
     )
 
 
-def _mock_verify_pass() -> AsyncMock:
-    """Return a mock that makes run_scoped_verification always pass."""
-    return AsyncMock(return_value=type('VR', (), {'passed': True, 'summary': '', 'failing_test_ids': None})())
-
-
-def _make_fake_escalation_queue() -> MagicMock:
-    """MagicMock escalation queue (mirrors TestRunDriftCheck pattern)."""
-    eq = MagicMock()
-    eq.has_open_l1 = MagicMock(return_value=False)
-    eq.make_id = MagicMock(side_effect=lambda key: f'esc-{key}')
-    eq.submit = MagicMock()
-    return eq
-
-
 # ---------------------------------------------------------------------------
 # Step 1 — RED: death → loud L1 escalation + new task + resume
 # ---------------------------------------------------------------------------
@@ -142,7 +134,7 @@ async def test_loop_death_escalates_loudly_and_restarts(
       3. invoke the stub exactly twice (initial crash + 1 restart that then idles).
     """
     queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-    eq = _make_fake_escalation_queue()
+    eq = RecordingEscalations()
     worker = SpeculativeMergeWorker(git_ops, queue, escalation_queue=eq)
     worker._shutdown_timeout = 0.1
 
@@ -163,14 +155,14 @@ async def test_loop_death_escalates_loudly_and_restarts(
 
     # Poll up to ~2s for the escalation to appear
     deadline = asyncio.get_running_loop().time() + 2.0
-    while eq.submit.call_count == 0 and asyncio.get_running_loop().time() < deadline:
+    while len(eq.filed) == 0 and asyncio.get_running_loop().time() < deadline:
         await asyncio.sleep(0.02)
 
     # ── Assert 1: escalation was submitted once ───────────────────────────
-    assert eq.submit.call_count == 1, (
-        f'Expected 1 escalation submission, got {eq.submit.call_count}'
+    assert len(eq.filed) == 1, (
+        f'Expected 1 escalation submission, got {len(eq.filed)}'
     )
-    esc = eq.submit.call_args[0][0]
+    esc = eq.filed[0]
     assert esc.level == 1, f'Expected level 1 escalation, got level={esc.level}'
     assert esc.severity == 'blocking', f'Expected severity blocking, got {esc.severity}'
     assert 'merge_worker_loop_died' in esc.summary, (
@@ -230,7 +222,7 @@ async def test_bounded_restarts_then_terminal_escalation(
       5. run() task completed with exception() is None (clean return, not a crash).
     """
     queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-    eq = _make_fake_escalation_queue()
+    eq = RecordingEscalations()
     worker = SpeculativeMergeWorker(git_ops, queue, escalation_queue=eq)
     worker._shutdown_timeout = 0.1
     worker._max_loop_restarts = 3
@@ -259,11 +251,11 @@ async def test_bounded_restarts_then_terminal_escalation(
     )
 
     # 3. Exactly 4 submissions: 3 × L1 restart + 1 × L2 terminal
-    assert eq.submit.call_count == 4, (
-        f'Expected 4 escalation submissions, got {eq.submit.call_count}'
+    assert len(eq.filed) == 4, (
+        f'Expected 4 escalation submissions, got {len(eq.filed)}'
     )
-    restart_escs = [eq.submit.call_args_list[i][0][0] for i in range(3)]
-    terminal_esc = eq.submit.call_args_list[3][0][0]
+    restart_escs = [eq.filed[i] for i in range(3)]
+    terminal_esc = eq.filed[3]
     for esc in restart_escs:
         assert esc.level == 1, f'Restart escalation should be level 1, got {esc.level}'
         assert 'merge_worker_loop_died' in esc.summary
@@ -278,8 +270,10 @@ async def test_bounded_restarts_then_terminal_escalation(
     )
 
     # 4. Supervisor halted
-    assert worker._supervisor_halted is True, 'Expected _supervisor_halted=True'
-    assert worker._supervisor_halt_reason is not None, '_supervisor_halt_reason should be set'
+    assert terminal_esc.level == 2, (
+        f'the terminal halt must be filed at level 2, got {terminal_esc.level}'
+    )
+    assert terminal_esc.detail, 'the terminal record must carry its halt reason'
 
     # 5. run() completed cleanly (no exception propagated)
     assert run_task.exception() is None, (
@@ -315,7 +309,7 @@ async def test_normal_shutdown_does_not_trigger_death_path(
     """
     # ── (A) Clean lifecycle ───────────────────────────────────────────────
     queue_a: asyncio.Queue[MergeRequest] = asyncio.Queue()
-    eq_a = _make_fake_escalation_queue()
+    eq_a = RecordingEscalations()
     worker_a = SpeculativeMergeWorker(git_ops, queue_a, escalation_queue=eq_a)
     worker_a._shutdown_timeout = 0.1
 
@@ -325,10 +319,12 @@ async def test_normal_shutdown_does_not_trigger_death_path(
     with contextlib.suppress(asyncio.CancelledError, TimeoutError):
         await asyncio.wait_for(run_task_a, timeout=2.0)
 
-    assert eq_a.submit.call_count == 0, (
-        f'(A) No escalation expected on clean stop, got {eq_a.submit.call_count}'
+    assert len(eq_a.filed) == 0, (
+        f'(A) No escalation expected on clean stop, got {len(eq_a.filed)}'
     )
-    assert worker_a._supervisor_halted is False, '(A) supervisor should not be halted'
+    assert not any(e.level == 2 for e in eq_a.filed), (
+        '(A) a clean stop must file no terminal level-2 record'
+    )
     assert run_task_a.done(), '(A) run_task should be done after stop()'
     # run() should complete with no exception (or CancelledError from outer cancel)
     if not run_task_a.cancelled():
@@ -337,7 +333,7 @@ async def test_normal_shutdown_does_not_trigger_death_path(
 
     # ── (B) Cancelled-task unit ───────────────────────────────────────────
     queue_b: asyncio.Queue[MergeRequest] = asyncio.Queue()
-    eq_b = _make_fake_escalation_queue()
+    eq_b = RecordingEscalations()
     worker_b = SpeculativeMergeWorker(git_ops, queue_b, escalation_queue=eq_b)
 
     # Build a cancelled task
@@ -352,8 +348,8 @@ async def test_normal_shutdown_does_not_trigger_death_path(
     old_verifier_task = worker_b._verifier_task
     worker_b._on_loop_task_done('verifier', cancelled_task)
 
-    assert eq_b.submit.call_count == 0, (
-        f'(B) Cancelled task must not trigger escalation, got {eq_b.submit.call_count}'
+    assert len(eq_b.filed) == 0, (
+        f'(B) Cancelled task must not trigger escalation, got {len(eq_b.filed)}'
     )
     # No new task spawned (still old value, which is None at construction time)
     assert worker_b._verifier_task is old_verifier_task, (
@@ -362,7 +358,7 @@ async def test_normal_shutdown_does_not_trigger_death_path(
 
     # ── (C) Shutdown-race unit ────────────────────────────────────────────
     queue_c: asyncio.Queue[MergeRequest] = asyncio.Queue()
-    eq_c = _make_fake_escalation_queue()
+    eq_c = RecordingEscalations()
     worker_c = SpeculativeMergeWorker(git_ops, queue_c, escalation_queue=eq_c)
     # Simulate shutdown in progress
     worker_c._running = False
@@ -378,8 +374,8 @@ async def test_normal_shutdown_does_not_trigger_death_path(
     old_merger_task = worker_c._merger_task
     worker_c._on_loop_task_done('merger', exc_task)
 
-    assert eq_c.submit.call_count == 0, (
-        f'(C) Shutdown-race exception must NOT escalate, got {eq_c.submit.call_count}'
+    assert len(eq_c.filed) == 0, (
+        f'(C) Shutdown-race exception must NOT escalate, got {len(eq_c.filed)}'
     )
     # No restart — _merger_task unchanged
     assert worker_c._merger_task is old_merger_task, (
@@ -414,7 +410,7 @@ async def test_verifier_restart_preserves_inflight_and_redispatch(
          unchanged, Future not resolved.
     """
     queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-    eq = _make_fake_escalation_queue()
+    eq = RecordingEscalations()
     worker = SpeculativeMergeWorker(git_ops, queue, escalation_queue=eq)
 
     # Build a minimal MergeRequest with a pending Future
@@ -479,8 +475,8 @@ async def test_verifier_restart_preserves_inflight_and_redispatch(
     await asyncio.sleep(0)
 
     # ── Assert 1: escalation submitted once ──────────────────────────────
-    assert eq.submit.call_count == 1, (
-        f'Expected 1 escalation (death escalation), got {eq.submit.call_count}'
+    assert len(eq.filed) == 1, (
+        f'Expected 1 escalation (death escalation), got {len(eq.filed)}'
     )
 
     # ── Assert 2: new verifier task spawned and running ───────────────────
@@ -489,15 +485,15 @@ async def test_verifier_restart_preserves_inflight_and_redispatch(
         '_verifier_task should still be running (idle stub)'
     )
 
-    # ── Assert 3: _redispatch and _inflight are unchanged ─────────────────
-    assert len(worker._redispatch) == 1, (
-        f'_redispatch should still have 1 item, got {len(worker._redispatch)}'
+    # ── Assert 3: both seeded items are still tracked, read off the public
+    #    census. snapshot() emits the redispatch park and the in-flight entry
+    #    unconditionally, so a supervisor restart that dropped either would
+    #    show up here as a missing state.
+    states = sorted(e['state'] for e in worker.snapshot()['entries'])
+    assert states == ['awaiting_host', 'verifying'], (
+        f'the seeded redispatch park and in-flight entry must both survive the '
+        f'restart, got {states}'
     )
-    assert worker._redispatch[0] is item, '_redispatch[0] must be the seeded item'
-    assert len(worker._inflight) == 1, (
-        f'_inflight should still have 1 entry, got {len(worker._inflight)}'
-    )
-    assert worker._inflight[0] is inflight_entry, '_inflight[0] must be the seeded entry'
 
     # ── Assert 4: Future not resolved by supervisor ───────────────────────
     assert not future.done(), (
@@ -540,14 +536,16 @@ async def test_restart_clock_injection_window_pruning(git_ops: GitOps) -> None:
     from unittest.mock import patch
 
     queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-    eq = _make_fake_escalation_queue()
-    worker = SpeculativeMergeWorker(git_ops, queue, escalation_queue=eq)
+    eq = RecordingEscalations()
+    clock = FakeClock(time=0.0)
+    worker = SpeculativeMergeWorker(
+        git_ops, queue, escalation_queue=eq, clock=clock,
+    )
     worker._max_loop_restarts = 2
     worker._loop_restart_window_s = 100.0
 
-    # Inject a controllable monotonic clock.
-    fake_time = 0.0
-    worker._restart_clock = lambda: fake_time
+    # The supervisor's restart clock IS the injected ClockPort:
+    # merge_queue.py:9975 binds `_restart_clock = self._clock.monotonic`.
 
     # Helper: create a task that has already failed with RuntimeError.
     async def _make_dead_task() -> asyncio.Task:  # type: ignore[type-arg]
@@ -582,44 +580,44 @@ async def test_restart_clock_injection_window_pruning(git_ops: GitOps) -> None:
 
     with patch.object(worker, '_spawn_loop', side_effect=fake_spawn):
         # Death 1 at T=0 → within-cap (times empty, 0 < 2)
-        fake_time = 0.0
+        clock.mono = 0.0
         worker._on_loop_task_done('verifier', await _make_dead_task())
 
-        assert eq.submit.call_count == 1, (
-            f'Death 1: expected 1 L1 escalation, got {eq.submit.call_count}'
+        assert len(eq.filed) == 1, (
+            f'Death 1: expected 1 L1 escalation, got {len(eq.filed)}'
         )
-        assert eq.submit.call_args_list[0][0][0].level == 1
-        assert worker._supervisor_halted is False
+        assert eq.filed[0].level == 1
+        assert not any(e.level == 2 for e in eq.filed)
 
         # Death 2 at T=10 → within-cap (len=1 < 2)
-        fake_time = 10.0
+        clock.mono = 10.0
         worker._on_loop_task_done('verifier', await _make_dead_task())
 
-        assert eq.submit.call_count == 2, (
-            f'Death 2: expected 2 L1 escalations total, got {eq.submit.call_count}'
+        assert len(eq.filed) == 2, (
+            f'Death 2: expected 2 L1 escalations total, got {len(eq.filed)}'
         )
-        assert eq.submit.call_args_list[1][0][0].level == 1
-        assert worker._supervisor_halted is False
+        assert eq.filed[1].level == 1
+        assert not any(e.level == 2 for e in eq.filed)
 
         # Confirm times are filled (without pruning, next death would be terminal).
-        assert len(worker._loop_restart_times['verifier']) == 2, (
-            'times deque should have 2 entries before advancing clock'
+        assert len([e for e in eq.filed if e.level == 1]) == 2, (
+            'two within-cap restarts must have been recorded before the clock moves'
         )
 
         # Advance clock past the window: both T=0 and T=10 are now >100s old.
-        fake_time = 200.0
+        clock.mono = 200.0
 
         # Death 3 at T=200 → pruning must clear old entries → within-cap again.
         worker._on_loop_task_done('verifier', await _make_dead_task())
 
-        assert eq.submit.call_count == 3, (
+        assert len(eq.filed) == 3, (
             f'Death 3: expected 3 L1 escalations total (pruning kept within-cap), '
-            f'got {eq.submit.call_count}'
+            f'got {len(eq.filed)}'
         )
-        assert eq.submit.call_args_list[2][0][0].level == 1, (
+        assert eq.filed[2].level == 1, (
             'Death 3 after window pruning must be L1 (within-cap), not terminal L2'
         )
-        assert worker._supervisor_halted is False, (
+        assert not any(e.level == 2 for e in eq.filed), (
             'Supervisor must not halt: old timestamps were pruned, death was within-cap'
         )
 
@@ -663,8 +661,10 @@ async def test_real_merger_crash_preserves_verifier_and_pipeline(
       4. worker._merger_task is a fresh, not-done Task (restarted by supervisor).
     """
     queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-    eq = _make_fake_escalation_queue()
-    worker = SpeculativeMergeWorker(git_ops, queue, escalation_queue=eq)
+    eq = RecordingEscalations()
+    worker = SpeculativeMergeWorker(
+        git_ops, queue, escalation_queue=eq, verifier=FakeVerifier(),
+    )
     worker._shutdown_timeout = 0.1
 
     # Patch _maybe_coalesce_waiting_singles: crash on first call, delegate afterwards.
@@ -683,51 +683,50 @@ async def test_real_merger_crash_preserves_verifier_and_pipeline(
     # Build branch+request before starting run() so we can submit after the crash.
     wt = await _make_branch_with_file(git_ops, 'crash-test', 'crash_file.py', 'x = 1\n')
 
-    with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
-        run_task = asyncio.create_task(worker.run())
+    run_task = asyncio.create_task(worker.run())
 
-        # Poll up to ~2s until run() spawns both loop tasks.
-        deadline = asyncio.get_running_loop().time() + 2.0
-        while (
-            (worker._merger_task is None or worker._verifier_task is None)
-            and asyncio.get_running_loop().time() < deadline
-        ):
-            await asyncio.sleep(0.02)
+    # Poll up to ~2s until run() spawns both loop tasks.
+    deadline = asyncio.get_running_loop().time() + 2.0
+    while (
+        (worker._merger_task is None or worker._verifier_task is None)
+        and asyncio.get_running_loop().time() < deadline
+    ):
+        await asyncio.sleep(0.02)
 
-        assert worker._merger_task is not None, 'merger_task should be set after run() starts'
-        assert worker._verifier_task is not None, 'verifier_task should be set after run() starts'
-        verifier_task_before = worker._verifier_task
+    assert worker._merger_task is not None, 'merger_task should be set after run() starts'
+    assert worker._verifier_task is not None, 'verifier_task should be set after run() starts'
+    verifier_task_before = worker._verifier_task
 
-        # Poll up to ~3s for the merger death escalation.
-        deadline = asyncio.get_running_loop().time() + 3.0
-        while eq.submit.call_count == 0 and asyncio.get_running_loop().time() < deadline:
-            await asyncio.sleep(0.02)
+    # Poll up to ~3s for the merger death escalation.
+    deadline = asyncio.get_running_loop().time() + 3.0
+    while len(eq.filed) == 0 and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.02)
 
-        # ── Assert 3: escalation emitted for merger death ─────────────────────
-        assert eq.submit.call_count >= 1, (
-            f'Expected at least 1 escalation, got {eq.submit.call_count}'
-        )
-        merger_esc = eq.submit.call_args_list[0][0][0]
-        assert merger_esc.level == 1, f'Expected level 1, got {merger_esc.level}'
-        assert merger_esc.severity == 'blocking', (
-            f'Expected severity blocking, got {merger_esc.severity!r}'
-        )
-        assert 'merge_worker_loop_died' in merger_esc.summary, (
-            f'summary missing merge_worker_loop_died: {merger_esc.summary!r}'
-        )
-        assert 'merger' in merger_esc.summary, (
-            f'summary missing "merger": {merger_esc.summary!r}'
-        )
+    # ── Assert 3: escalation emitted for merger death ─────────────────────
+    assert len(eq.filed) >= 1, (
+        f'Expected at least 1 escalation, got {len(eq.filed)}'
+    )
+    merger_esc = eq.filed[0]
+    assert merger_esc.level == 1, f'Expected level 1, got {merger_esc.level}'
+    assert merger_esc.severity == 'blocking', (
+        f'Expected severity blocking, got {merger_esc.severity!r}'
+    )
+    assert 'merge_worker_loop_died' in merger_esc.summary, (
+        f'summary missing merge_worker_loop_died: {merger_esc.summary!r}'
+    )
+    assert 'merger' in merger_esc.summary, (
+        f'summary missing "merger": {merger_esc.summary!r}'
+    )
 
-        # Give the event loop time for the supervisor to restart the merger.
-        await asyncio.sleep(0.1)
+    # Give the event loop time for the supervisor to restart the merger.
+    await asyncio.sleep(0.1)
 
-        # Submit the post-crash request.
-        req = _make_request('crash-test', 'crash-test', wt, config)
-        await queue.put(req)
+    # Submit the post-crash request.
+    req = _make_request('crash-test', 'crash-test', wt, config)
+    await queue.put(req)
 
-        # ── Assert 1: end-to-end liveness — restarted merger + surviving verifier ──
-        outcome = await asyncio.wait_for(req.result, timeout=15.0)
+    # ── Assert 1: end-to-end liveness — restarted merger + surviving verifier ──
+    outcome = await asyncio.wait_for(req.result, timeout=15.0)
 
     assert outcome.status == 'done', (
         f'Expected outcome.status="done" but got {outcome.status!r}'
@@ -787,7 +786,7 @@ async def test_clean_loop_exit_while_running_is_treated_as_death(
       4. worker._loops_finished is NOT set (not retired).
     """
     queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-    eq = _make_fake_escalation_queue()
+    eq = RecordingEscalations()
     worker = SpeculativeMergeWorker(git_ops, queue, escalation_queue=eq)
 
     # Replace _verifier_loop with a harmless idle stub so the spawned restart
@@ -818,11 +817,11 @@ async def test_clean_loop_exit_while_running_is_treated_as_death(
     await asyncio.sleep(0)
 
     # ── Assert 1: escalation submitted once with level==1 ────────────────────
-    assert eq.submit.call_count == 1, (
+    assert len(eq.filed) == 1, (
         f'Expected 1 escalation (synthetic death for clean-exit-while-running), '
-        f'got {eq.submit.call_count}'
+        f'got {len(eq.filed)}'
     )
-    esc = eq.submit.call_args[0][0]
+    esc = eq.filed[0]
     assert esc.level == 1, f'Expected level 1, got {esc.level}'
     assert 'merge_worker_loop_died' in esc.summary, (
         f'summary missing merge_worker_loop_died: {esc.summary!r}'

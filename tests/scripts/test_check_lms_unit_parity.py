@@ -847,3 +847,26 @@ def test_expected_workingdirectory_comes_from_the_committed_template_not_repo_ro
     )
     capsys.readouterr()
     assert rc_repo_root == 1
+def test_lms_reuses_the_shared_drift_and_absent():
+    """``Drift`` and ``_ABSENT`` are the SHARED objects, not local look-alikes.
+
+    IDENTITY, not equality, and the distinction is the whole point: a pasted
+    copy of a six-field frozen dataclass compares equal field-for-field with
+    the original while being a DISTINCT TYPE, so an ``==`` check on the class
+    — or on instances of it — would pass over exactly the fork this guard
+    exists to forbid. ``_ABSENT`` is worse still: two ``"<absent>"`` literals
+    may or may not be interned, so equality says nothing at all about whether
+    there is one definition or three.
+
+    The same pin the three earlier lifts carry (see
+    tests/scripts/test_check_orchestrator_unit_parity.py, which asserts this
+    shape for the parser and for ``find_dropins``). Duplicating a record inside
+    the tooling built to report silent duplication is the failure this family
+    exists to catch, one level up.
+    """
+    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
+
+    mod = _load_checker()
+
+    assert mod.Drift is systemd_unit_parity.Drift
+    assert mod._ABSENT is systemd_unit_parity._ABSENT

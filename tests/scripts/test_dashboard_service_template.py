@@ -25,7 +25,7 @@ import pytest
 # scripts/ on sys.path for exactly this. See the comment above
 # HARDCODED_SERVICE_REPO_ROOT for why this module renders through the
 # installer's own code rather than replaying the substitution.
-import render_dashboard_unit  # pyright: ignore[reportMissingImports]
+import render_systemd_unit  # pyright: ignore[reportMissingImports]
 from systemd_unit_invariants import (
     assert_restart_backoff_effective as _assert_restart_backoff_effective,
 )
@@ -97,7 +97,7 @@ HARDCODED_EXPECTED_PROJECT_ROOT_ENV_LINE = (
 # alternate machine may legitimately differ — the test is not asserting anything
 # about the runtime install environment.
 #
-# Substitution semantics: scripts/render_dashboard_unit.py::render_template,
+# Substitution semantics: scripts/render_systemd_unit.py::render_template,
 # which is the code setup-host.sh section 8 actually runs to install this unit.
 # Both sentinels are replaced globally, unanchored and literally.
 #
@@ -291,12 +291,12 @@ def test_project_root_env_var_is_pinned_in_both_unit_files() -> None:
 
     The template must carry the __REPO_ROOT__ sentinel, never a hardcoded path,
     so the installer's __REPO_ROOT__ substitution
-    (scripts/render_dashboard_unit.py::render_template) makes the installed
+    (scripts/render_systemd_unit.py::render_template) makes the installed
     value track the real checkout — the same treatment
     DASHBOARD_KNOWN_PROJECT_ROOTS' self entry already gets. NOTE the treatment
     is only the same for the SUBSTITUTION: DASHBOARD_KNOWN_PROJECT_ROOTS is
     additionally PRESERVED from the installed unit across a reinstall
-    (render_dashboard_unit.HOST_LOCAL_ENVIRONMENT), and this variable
+    (render_systemd_unit.HOST_LOCAL_ENVIRONMENT), and this variable
     deliberately is not — its value must equal the SAME copy's
     WorkingDirectory=, which the next test pins.
     """
@@ -583,7 +583,7 @@ def test_template_renders_to_hardcoded_file() -> None:
     """Rendered template must match the committed hardcoded service file verbatim.
 
     This is the canonical drift-prevention invariant, and it is made THROUGH the
-    installer's own renderer: scripts/render_dashboard_unit.py::render_template
+    installer's own renderer: scripts/render_systemd_unit.py::render_template
     is the function setup-host.sh section 8 runs to install this unit, so the
     two repo-side files are held in lockstep by the same code that renders the
     host-side one. A replayed copy of the substitution would be a third
@@ -593,7 +593,7 @@ def test_template_renders_to_hardcoded_file() -> None:
     If this test fails, the template and hardcoded file have drifted.  Re-render
     with::
 
-        python3 scripts/render_dashboard_unit.py --no-preserve \\
+        python3 scripts/render_systemd_unit.py --no-preserve \\
             --template  scripts/dashboard.service.template \\
             --repo-root /home/leo/src/dark-factory \\
             --uv-path   /home/leo/.local/bin/uv \\
@@ -614,7 +614,7 @@ def test_template_renders_to_hardcoded_file() -> None:
     rendering an INSTALLED unit; that is the clobber the renderer exists to
     prevent, and setup-host.sh does not pass it.
     """
-    rendered = render_dashboard_unit.render_template(
+    rendered = render_systemd_unit.render_template(
         TEMPLATE.read_text(encoding="utf-8"),
         repo_root=HARDCODED_SERVICE_REPO_ROOT,
         uv_path=HARDCODED_SERVICE_UV_PATH,
@@ -624,7 +624,7 @@ def test_template_renders_to_hardcoded_file() -> None:
         f"Rendered template does not match {HARDCODED}.\n"
         f"Template path: {TEMPLATE}\n"
         "The files have drifted.  Re-render with "
-        "scripts/render_dashboard_unit.py — see this test's docstring for the "
+        "scripts/render_systemd_unit.py — see this test's docstring for the "
         "exact invocation."
     )
 

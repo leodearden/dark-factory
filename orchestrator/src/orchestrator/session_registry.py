@@ -1465,13 +1465,30 @@ spelling, for the cases case/separator folding alone cannot merge (task
 3807). Applied as the LAST step of normalize_project_token, so both key and
 value must themselves already be canonical under the fold.
 
-ADMISSION RULE for a new entry -- the canonical value must be the
-``memory.project_id`` declared by a real project root's
-``dark-factory-orchestrator.yaml``. That keeps the table mechanical and
-auditable instead of a per-case judgement call, and it is the reason this
-table is deliberately NOT a config read: this module is stdlib-only with no
+ADMISSION RULE for a new entry -- TWO clauses, BOTH necessary (clause 2
+added by task 3813, which was filed to keep this rule honest):
+
+  1. The canonical value must be the ``memory.project_id`` declared by a
+     real project root's ``dark-factory-orchestrator.yaml``.
+  2. The alias must heal an ACTUAL SPLIT: after case/separator folding,
+     that project's rows must still sit in >=2 buckets. A bucket whose
+     NAME merely disagrees with the declared ``project_id``, with every
+     row already in ONE bucket, is COSMETIC and admits nothing.
+
+Together they keep the table mechanical and auditable instead of a
+per-case judgement call, and clause 1 is the reason this table is
+deliberately NOT a config read: this module is stdlib-only with no
 intra-orchestrator imports (see module docstring), so the mapping is a
 hand-maintained constant kept in sync with those configs.
+
+Clause 2 states the principle the table already embodies rather than
+adding a new one. ``df -> dark_factory`` qualifies because it healed a
+MEASURED 22/17/2 three-way split in which each partition was invisible to
+a reap scoped to either of the others -- a correctness bug. An alias that
+heals no split can only ever move rows out from under whatever reaps them
+today, which is a strictly larger risk than the naming mismatch it tidies.
+The solar-challenge entry fails clause 2 and is recorded as declined in
+PROJECT_TOKEN_ALIASES_DECLINED below.
 
 EVIDENCE for the sole seeded entry: three independent declarations name
 ``dark_factory`` as this project's identity -- ``dark-factory-orchestrator
@@ -1488,20 +1505,101 @@ entry here. It does NOT reconcile a project whose filed tokens fold to
 something OTHER than its declared ``memory.project_id``; only an alias can
 bridge that.
 
-KNOWN RESIDUAL GAP (measured 2026-08-07, 407 records):
+RESIDUAL NAMING MISMATCH -- DECIDED (task 3813): DECLINED. See
+PROJECT_TOKEN_ALIASES_DECLINED below for the evidence.
 ``/home/leo/src/solar-challenge`` declares ``my_solar_challenge``, but its
 5 OPEN decisions are filed under ``solar-challenge`` (3) and
-``solar_challenge`` (2). Folding merges those two into ONE bucket --
-strictly better than before, when a reap scoped to either missed the other
--- but the bucket is named ``solar_challenge``, so a reaper passing the
+``solar_challenge`` (2) (re-measured 2026-09-07, 748 records; unchanged
+from 2026-08-07). Folding merges those two into ONE bucket -- strictly
+better than before, when a reap scoped to either missed the other -- but
+the bucket is named ``solar_challenge``, so a reaper passing the
 config-declared ``my_solar_challenge`` matches ZERO of them. Adding
-``'solar_challenge': 'my_solar_challenge'`` would close it and the
-admission rule above already licenses it; that call is deliberately NOT
-made here because it is a cross-project behaviour change owned by its own
-filed decision task (3813). Until it lands, reap that project with a token
-that folds to ``solar_challenge`` -- and note the collapse guard is
-unaffected either way, since ``solar_challenge_platform`` is a distinct
-project root with a distinct folded token."""
+``'solar_challenge': 'my_solar_challenge'`` would rename that bucket, and
+the amended admission rule above does NOT license it: clause 2 fails,
+because folding already left every row in ONE bucket, so there is no split
+left to heal. Reap that project with a token that folds to
+``solar_challenge`` -- permanently, not "until 3813 lands" -- and note the
+collapse guard is unaffected either way, since ``solar_challenge_platform``
+is a distinct project root with a distinct folded token."""
+
+
+PROJECT_TOKEN_ALIASES_DECLINED: dict[str, tuple[str, str]] = {
+    'solar_challenge': (
+        'my_solar_challenge',
+        'No split left to heal (fold already merged 3+2 into one bucket), and '
+        'the identity question is an OPEN human gate in that project (esc-98-1, '
+        '"Do NOT auto-act").',
+    ),
+}
+"""Aliases CONSIDERED and DELIBERATELY DECLINED (task 3813), keyed
+already-folded-alias -> (already-folded declined canonical, one-line reason).
+
+WHAT THIS IS. The deliberate mirror image of PROJECT_TOKEN_ALIASES above:
+same folded-to-folded key/value invariant (pinned by a named test), so
+PROMOTING a declined entry is a one-line move between the two dicts and
+DECLINING a live one is the same move in reverse. It is read by
+``declined_project_token_hint`` and by two guard tests; it is deliberately
+NOT consulted by ``normalize_project_token``, so it costs nothing on the
+fold's hot path and every existing test of that fold is untouched. The
+in-repo precedent for encoding a deliberate exclusion next to the table it
+governs is ``fused-memory/scripts/consolidate_namespace_families.py``
+::``GRAPH_FAMILY_ALIASES``; recording it as data rather than a comment is
+what makes it checkable.
+
+THE DECISION. ``solar_challenge -> my_solar_challenge`` is DECLINED. Not
+deferred, not an oversight, not "pending a decision task" -- 3813 WAS that
+decision task, and this is its answer.
+
+THE EVIDENCE (re-measured 2026-09-07 over 748 fleet decision records:
+``solar-challenge`` 3, ``solar_challenge`` 2, ``my_solar_challenge`` ZERO,
+all 5 ``state=open`` -- identical to the 2026-08-07 measurement a month
+earlier):
+
+  - NO SPLIT REMAINS, so there is nothing for an alias to heal. Task 3807's
+    case/separator fold already merged the two filed spellings into ONE
+    bucket. Adding the alias would not MERGE anything; it would only RENAME
+    a populated bucket (5 rows) onto an empty one (0 rows), moving those
+    rows out from under whatever reaps them today. That is why the amended
+    admission rule's clause 2 exists and why this entry fails it.
+
+  - THE IDENTITY QUESTION IS AN OPEN HUMAN GATE IN THAT PROJECT, and the
+    alias would settle it from dark-factory's side. Decision record
+    ``esc-98-1`` (``state=open``, filed under ``solar_challenge``, queue
+    ``<dark-factory>/data/reconciliation/escalations``) reads: "one-way
+    policy decision -- (a) MIGRATE ~1400 orphaned 'my_solar_challenge'
+    items (876 graphiti + 524 mem0) into canonical 'solar_challenge' ...
+    or (b) ARCHIVE the 'my_solar_challenge' namespace in place. Do NOT
+    auto-act. Forward project_id-misconfig fix tracked via a separate
+    sibling task (finding 116ceed2)." That gate calls ``solar_challenge``
+    the CANONICAL token, ``my_solar_challenge`` the ORPHANED namespace, and
+    the config declaration itself a MISCONFIG whose forward fix is already
+    tracked elsewhere. Aliasing onto ``my_solar_challenge`` here would
+    resolve that gate silently, in the direction it calls "orphaned", with
+    no human sign-off.
+
+  - IN-REPO PRECEDENT for keep-separate on this exact family:
+    ``consolidate_namespace_families.py::GRAPH_FAMILY_ALIASES`` excludes the
+    solar family on the stated ground that keep-separate is the default
+    absent an explicit human decision.
+
+  - THE COLLAPSE GUARD IS UNAFFECTED either way:
+    ``solar_challenge_platform`` is a distinct project root with a distinct
+    declared ``project_id`` and folds to itself. Nothing here touches it.
+
+THE OPERATOR CONSEQUENCE. Reap and file that project with a token that
+folds to ``solar_challenge`` -- PERMANENTLY, not "until 3813 lands". The
+mismatch with its declared ``memory.project_id`` is now a decided,
+standing state, so ``write-decision`` and ``reap-decisions`` WARN when
+handed ``my_solar_challenge`` (see ``declined_project_token_hint``): the
+trap announces itself at the moment someone types the config-declared
+token, instead of returning a silent zero-row no-op that reads as "nothing
+to reap".
+
+WHAT WOULD REOPEN IT. Either ``esc-98-1`` resolving in favour of
+``my_solar_challenge`` (which would make it the canonical bucket and this
+decline wrong), or solar-challenge's config being changed to declare
+``solar_challenge`` (which would make the decline moot -- delete the entry
+and its hint together)."""
 
 
 def normalize_project_token(value: object) -> str:
@@ -1541,18 +1639,31 @@ def normalize_project_token(value: object) -> str:
     let one project's reaper close the other's decisions -- strictly worse
     than the bug being fixed. A named collapse-guard test pins that.
 
-    SCOPE: this canonicalizes ``DecisionRecord.project`` ONLY.
-    ``SessionRecord.project`` is the other half of the same fleet-global
-    project axis and is deliberately NOT normalized here -- the cockpit
-    unions the two (``known_projects`` over records + decisions, and one
-    ``project_weights`` lookup keyed on ``item.project`` for both row kinds),
-    so until the session side folds too, the picker can list one project
-    under two names and an operator-set weight keyed on the session spelling
-    will not apply to decision rows. That is a KNOWN, filed gap (task 3812),
-    not an oversight: the session population is ~39k records written on the
-    spawn path, and folding it is a strictly larger change than task 3807's
-    decision-registry fix. Do not read "canonical" here as "canonical
-    fleet-wide".
+    SCOPE: at the WRITE path, this canonicalizes ``DecisionRecord.project``
+    ONLY. ``SessionRecord.project`` is deliberately still written raw --
+    ``identity.project`` feeds ``build_session_slug`` (the record's on-disk
+    directory identity) and the stored value is parsed from
+    ``record.title``, the literal terminal title, so folding it at the spawn
+    path would churn the slug namespace and desynchronize a documented
+    mirror.
+
+    The cockpit folds BOTH record kinds at its READ boundary instead (task
+    3812), so its picker and its scorer key can no longer disagree, and the
+    fix is retroactive over every already-written record with no migration
+    run. ``cockpit/src/cockpit/registry_reader.py`` IS that boundary and its
+    module docstring is where the reasoning lives; its entry points are
+    ``::_read_record_soft`` for sessions and ``::scan_decisions`` for
+    decisions, joined by the ``priorities.yaml`` ``project_weights`` KEYS at
+    load (``cockpit/src/cockpit/priority.py::_canonical_project_weights``)
+    and the picker candidates
+    (``cockpit/src/cockpit/panes/weight_editor.py::known_projects``).
+
+    Do not read "canonical" here as "canonical fleet-wide": the on-disk
+    session records themselves are still unnormalized (they are TTL-reaped
+    by ``reap_stale_records`` rather than migrated, which is why they need
+    no ``migrate_session_project_tokens`` twin), so any OTHER consumer
+    comparing a raw ``SessionRecord.project`` must run it through this
+    function itself.
 
     Stdlib-only and fail-soft: never raises, and coerces a non-str *value*
     via ``str()`` rather than rejecting it -- ``42`` becomes ``'42'``, which
@@ -1573,6 +1684,96 @@ def normalize_project_token(value: object) -> str:
         return ''
     folded = _PROJECT_TOKEN_UNDERSCORE_RE.sub('_', raw.casefold().replace('-', '_')).strip('_')
     return PROJECT_TOKEN_ALIASES.get(folded, folded)
+
+
+def declined_project_token_hint(value: object, action: str = '') -> str | None:
+    """One-line operator warning when *value* names a DECLINED alias target
+    (task 3813). Returns None -- the overwhelmingly common case -- otherwise.
+
+    WHY THIS EXISTS. Declining the solar-challenge alias makes that project's
+    naming mismatch PERMANENT: an operator who trusts its config-declared
+    ``memory.project_id`` gets a silent zero-row no-op forever, which reads
+    exactly like "nothing to reap". Under this project's
+    loud-over-silent-degradation norm, a decision that manufactures a
+    standing silent trap is only defensible if the trap ANNOUNCES ITSELF. So
+    the recorded decline gets a live caller instead of staying documentation.
+
+    WHY IT WARNS RATHER THAN REWRITES. Rewriting the passed token to the
+    bucket that actually holds the rows would BE the cross-project behaviour
+    change task 3813 declined, smuggled in through the CLI boundary instead
+    of the alias table. Callers file under, and scope to, EXACTLY the token
+    they were given; only a log line is added. Non-blocking by construction,
+    so a watcher's filing path can never break on it -- matching the
+    fail-soft contract every helper this module hands a watch loop honours.
+
+    WHY IT KEYS ON THE DECLINED VALUE, NOT THE KEY. The trap is typing the
+    config-declared id (``my_solar_challenge``), so that is where the warning
+    must land. ``solar_challenge`` -- the token both SKILL.md files recommend
+    -- must stay SILENT, or a watcher accrues a warning every Main Loop
+    cycle and the signal degrades into noise. Because the check is gated on
+    a one-entry table it has zero false positives; it is deliberately
+    narrower than a generic "your --project matched zero records" warning,
+    which cannot distinguish a token nothing uses from a healthy project
+    with nothing open.
+
+    WHY IT IS VERB-AWARE. The two callers hit this table for OPPOSITE
+    reasons, and one message cannot be true for both. ``reap-decisions`` is
+    MATCHING, so its consequence is a zero-row no-op. ``write-decision`` is
+    CREATING, so it matches nothing by definition and a "matches no
+    decisions" line would be false the moment it is acted on -- one line
+    later the verb files a row under exactly that token. Its real
+    consequence is also the WORSE of the two and would otherwise go
+    unstated: the row lands in a bucket no documented reap scopes to (the
+    skills tell watchers to reap ``solar_challenge``), so it can never
+    auto-close, whereas a missed reap is merely repeatable. *action* selects
+    that consequence clause: ``'reap'`` and ``'file'`` are the two known
+    verbs.
+
+    An OMITTED or unrecognised *action* is not an error and is not guessed
+    at: it yields the verb-neutral core alone, which states only what the
+    decline is and where the rows live. That is fail-soft in the direction
+    that matters here -- a future caller that forgets the argument gets a
+    message that is less specific but still TRUE, never one that confidently
+    describes the wrong verb.
+
+    Folds *value* through ``normalize_project_token`` first, so case and
+    separator variants of the config-declared token (``My-Solar-Challenge``)
+    all hit, and a non-str or ``None`` *value* coerces fail-soft to a
+    matchless token or ``''`` rather than raising. Returning None costs one
+    scan of a one-entry dict. Stdlib-only, no intra-orchestrator imports
+    (see module docstring).
+    """
+    folded = normalize_project_token(value)
+    if not folded:
+        return None
+    for alias, (declined_canonical, _reason) in PROJECT_TOKEN_ALIASES_DECLINED.items():
+        if folded != declined_canonical:
+            continue
+        # Verb-neutral, and therefore true on EVERY caller's path: it states
+        # only what was declined and where the rows live, never what this
+        # caller is about to do with them.
+        core = (
+            f'--project {folded!r}: the alias {alias!r} -> {declined_canonical!r} '
+            f'was considered and DECLINED (task 3813), so that project\'s '
+            f'decisions live under {alias!r}, not {declined_canonical!r}.'
+        )
+        # Built only on a hit (rare by construction), so the cost of holding
+        # both strings here is never paid on the common None path.
+        consequence = {
+            'reap': (
+                f' This reap therefore matches ZERO of them, and its silent '
+                f'no-op reads as "nothing to reap"; re-run scoped to a token '
+                f'that folds to {alias!r}.'
+            ),
+            'file': (
+                f' This record is being FILED under {declined_canonical!r}, '
+                f'which no documented reap scopes to, so it can never '
+                f'auto-close; re-file it under a token that folds to '
+                f'{alias!r}.'
+            ),
+        }.get(action, '')
+        return f'{core}{consequence} See PROJECT_TOKEN_ALIASES_DECLINED for the evidence.'
+    return None
 
 
 def read_escalation_status(escalations_dir: Path | str, escalation_id: str) -> str | None:
@@ -1886,12 +2087,25 @@ def _pid_alive(pid: int) -> bool:
 
     Copied (not imported) from harness.py:295-317 to keep this module
     stdlib-only and self-contained (invocable as a standalone script from
-    bash with no orchestrator package import).
+    bash with no orchestrator package import). That copy's contract is
+    preserved verbatim EXCEPT in the OverflowError branch, where this one
+    deliberately diverges (task 4755): harness.py::_pid_alive and the
+    fused_memory orchestrator_detector copy it mirrors still raise there, and
+    widening them is filed as follow-up work rather than done here, because
+    neither sits on the fleet-redeploy lease's read path.
 
     - Returns False for pid <= 0 (invalid).
     - Uses os.kill(pid, 0): success -> alive; ProcessLookupError -> dead;
-      PermissionError -> alive (visible but unsignalable); other OSError ->
+      PermissionError -> alive (visible but unsignalable); other OSError, or
+      an OverflowError from a pid too large for the platform's C pid_t ->
       treated as dead.
+
+    The OverflowError case is ordinary untrusted input, not a hypothetical:
+    service_restart.lease_is_live imports this predicate to evaluate a pid
+    parsed out of JSON another process wrote, so a value no pid_t can hold
+    arrives the same way a negative one does. "Cannot name a live process" is
+    exactly the judgment the OSError branch already makes for every other
+    value the syscall refuses.
     """
     if pid <= 0:
         return False
@@ -1902,7 +2116,7 @@ def _pid_alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True
-    except OSError:
+    except (OSError, OverflowError):
         return False
 
 
@@ -3907,6 +4121,19 @@ def _run_write_decision(
             'write-decision: normalized --project %r -> %r', project, canonical_project
         )
 
+    # Advisory only (task 3813). Placed AFTER canonicalization so the hint
+    # reflects the token that will actually be STORED, and BEFORE the record
+    # is built so it fires even if a later step fails. It must not alter
+    # canonical_project, gate the filing, or change the return code.
+    # action='file' because this path CREATES rather than matches: the reap
+    # wording ("matches no decisions") would be false one line below, where
+    # a row is filed under exactly this token. The filing consequence is the
+    # worse of the two -- that row lands in a bucket no documented reap
+    # scopes to and can never auto-close -- so it is the one worth naming.
+    declined_hint = declined_project_token_hint(canonical_project, action='file')
+    if declined_hint is not None:
+        logger.warning('write-decision: %s', declined_hint)
+
     incoming = DecisionRecord(
         id=decision_id,
         project=canonical_project,
@@ -4060,6 +4287,11 @@ def _run_reap_decisions(project: str, escalations_dir: str) -> None:
        widens ACROSS projects (``solar_challenge`` vs
        ``solar_challenge_platform`` are different project roots and are
        guarded from merging), so the fail-OPEN framing below is intact.
+       A ``--project`` naming a DECLINED alias target now WARNS (task 3813,
+       see PROJECT_TOKEN_ALIASES_DECLINED), so an operator passing a
+       config-declared token that matches zero rows learns it immediately
+       instead of reading a silent no-op as "nothing to reap". Advisory
+       only: it does not change the axis, the scoping, or what gets closed.
     2. QUEUE (task 3528). An escalation id (``esc-<taskid>-<n>``) is unique
        only WITHIN one queue, and a project can run several: dark_factory
        runs ``data/escalations`` (orchestrator) and
@@ -4113,6 +4345,17 @@ def _run_reap_decisions(project: str, escalations_dir: str) -> None:
     """
     reaper_dir = normalize_escalations_dir(escalations_dir)
     reaper_project = normalize_project_token(project)
+
+    # Advisory only (task 3813). Deliberately OUTSIDE _status, so it fires
+    # ONCE per invocation rather than once per record scanned -- a watcher
+    # runs this every Main Loop cycle and a per-record line would flood its
+    # log. It must not touch reaper_project, neither scoping axis, nor what
+    # gets closed: both guards below stay fail-OPEN exactly as documented.
+    # action='reap': this path really is MATCHING, so the zero-row-no-op
+    # consequence is the true one here (contrast _run_write_decision).
+    declined_hint = declined_project_token_hint(reaper_project, action='reap')
+    if declined_hint is not None:
+        logger.warning('reap-decisions: %s', declined_hint)
 
     def _status(decision: DecisionRecord) -> str | None:
         # Axis 1: normalize the decision's OWN stored token at compare time

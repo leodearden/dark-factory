@@ -887,6 +887,295 @@ class TestStoreGC:
 
 
 # ---------------------------------------------------------------------------
+# task-4653 step-19: supersession REACHES an evicted-but-still-indexed entry,
+# so persistence must reach it too — RED until step-20 widens _persist_run's
+# scope to match _resolve_finding's.
+# ---------------------------------------------------------------------------
+
+
+class TestSupersedeAcrossEviction:
+    """A Stage-2 finding supersedes a Stage-1 finding whose entry has already
+    aged out of ``_state``.  This is the ORDINARY production shape, not a corner:
+    ``recon_report_state_ttl_seconds`` defaults to 300 while a reconciliation run
+    stays live for minutes, and ``tick()``'s own docstring describes Stage 1
+    filing a finding and completing early while Stage 2/3 + remediation keep the
+    run alive.  Stage 1's entry therefore leaves ``_state`` mid-run while
+    ``_run_finding_index`` deliberately keeps it reachable until run quiescence
+    so its findings stay citable — which is precisely the
+    later-stage-retires-an-earlier-completed-stage's-claim case that
+    ``add_finding``'s ``supersedes`` docstring calls supersession's whole purpose.
+
+    The mutation therefore lands in memory (``_resolve_finding`` reaches the
+    evicted entry) but ``_persist_run`` walks only ``_state``, so the stamp is
+    never serialised: the run's own retraction of the claim is silently lost,
+    and a restart hydrates the refuted finding back as live and actionable.
+    """
+
+    _RUN = 'evict-sup-run'
+    _S1 = 'memory_consolidator'
+    _S2 = 'task_knowledge_sync'
+
+    def _make_state(self, store, clock_holder):
+        from fused_memory.server.recon_report import ReconReportState
+
+        state = ReconReportState(
+            ttl_seconds=300,
+            clock=lambda: clock_holder[0],
+            memory_service=_WTFakeMemoryService(),
+            task_interceptor=_WTFakeTaskInterceptor(),
+            store=store,
+        )
+        state.known_projects = {'dark_factory': '/home/leo/src/dark-factory'}
+        return state
+
+    def _run_ids_in_store(self, store):
+        return {r['run_id'] for r in store.load_all()}
+
+    def _stage1_row(self, store):
+        (row,) = [r for r in store.load_all() if r['stage'] == self._S1]
+        return row
+
+    def _persisted_finding(self, store, finding_id):
+        import json
+
+        payload = json.loads(self._stage1_row(store)['entry_json'])
+        (fd,) = [f for f in payload['findings'] if f['finding_id'] == finding_id]
+        return fd
+
+    def _stage1_files_and_completes(self, state):
+        """Stage 1 files its claim at t=0 and completes; Stage 2 then opens, so
+        the run stays live and never quiesces.  Returns Stage 1's finding_id.
+        """
+        state.start_report(run_id=self._RUN, stage=self._S1, project_id='dark_factory')
+        stage1_fid = state.add_finding(
+            run_id=self._RUN, severity='moderate', category='memory_stale',
+            description='mechanism X contradicts Y', suggested_action='act',
+            actionable=True, task_id='999',
+            flag_type='memory_mechanism_contradiction',
+        )['finding_id']
+        state.complete(self._RUN, 'stage1 summary')
+        state.start_report(run_id=self._RUN, stage=self._S2, project_id='dark_factory')
+        return stage1_fid
+
+    def _evict_stage1(self, state, clock_holder, stage1_fid):
+        """Age Stage 1 past its TTL, asserting the premise this class rests on:
+        gone from ``_state``, yet still resolvable through the
+        run-quiescence-scoped finding index — so a mutation still reaches it.
+        """
+        clock_holder[0] = 301.0  # 301-0 > ttl(300) for s1; s2 is in-progress
+        assert state.tick() == 1
+        assert (self._RUN, self._S1) not in state._state
+        assert stage1_fid in state._run_finding_index[self._RUN]
+        assert self._RUN in self._run_ids_in_store(state._store)
+
+    def _supersede(self, state, stage1_fid):
+        return state.add_finding(
+            run_id=self._RUN, severity='low', category='memory_stale',
+            description='mechanism X was fixed', suggested_action='none',
+            actionable=True, task_id='999',
+            flag_type='memory_mechanism_contradiction_resolved',
+            supersedes=stage1_fid,
+        )
+
+    def test_stamp_on_an_evicted_stage_is_persisted(self, tmp_path):
+        """The stamp lands in memory AND on the evicted stage's persisted row.
+
+        ``add_finding`` must also report a plain success — the operation
+        genuinely works rather than being reported as an error, which is the
+        design decision that chose widening persistence over a new
+        failure-to-function error case.
+        """
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        store = ReconReportStore(tmp_path / 'recon_report_state.db')
+        store.open()
+        t = [0.0]
+        try:
+            state = self._make_state(store, t)
+            stage1_fid = self._stage1_files_and_completes(state)
+            self._evict_stage1(state, t, stage1_fid)
+
+            result = self._supersede(state, stage1_fid)
+            assert set(result) == {'finding_id'}, result
+            stage2_fid = result['finding_id']
+
+            resolved = state._resolve_finding(self._RUN, stage1_fid)
+            assert resolved is not None
+            _entry, target = resolved
+            assert target.superseded_by == stage2_fid  # in-memory reach is wide
+
+            assert self._persisted_finding(store, stage1_fid)['superseded_by'] == stage2_fid
+        finally:
+            store.close()
+
+    def test_stamp_on_an_evicted_stage_survives_a_restart(self, tmp_path):
+        """After a restart the retired claim stays retired: the stamp hydrates
+        back and the report projects it neutered with its forward pointer."""
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        db = tmp_path / 'recon_report_state.db'
+        store_a = ReconReportStore(db)
+        store_a.open()
+        t = [0.0]
+        try:
+            state_a = self._make_state(store_a, t)
+            stage1_fid = self._stage1_files_and_completes(state_a)
+            self._evict_stage1(state_a, t, stage1_fid)
+            stage2_fid = self._supersede(state_a, stage1_fid)['finding_id']
+        finally:
+            store_a.close()
+
+        store_b = ReconReportStore(db)
+        store_b.open()
+        try:
+            state_b = self._make_state(store_b, [0.0])
+            state_b.hydrate_from_store()
+
+            resolved = state_b._resolve_finding(self._RUN, stage1_fid)
+            assert resolved is not None, 'the stage-1 row did not hydrate'
+            _entry, target = resolved
+            assert target.superseded_by == stage2_fid
+
+            report = state_b.get_assembled_report(self._RUN, self._S1)
+            assert report is not None
+            (item,) = [
+                i for i in report['flagged_items'] if i['finding_id'] == stage1_fid
+            ]
+            assert item['superseded_by'] == stage2_fid
+            assert item['actionable'] is False
+        finally:
+            store_b.close()
+
+    def test_retracting_the_superseder_unstamps_an_evicted_target(self, tmp_path):
+        """``_purge_finding``'s back-reference sweep must reach exactly the
+        entries the stamp could — the same scope mismatch, in the sibling path.
+
+        Note the retraction can only target A, the LIVE Stage-2 superseder:
+        ``delete_finding`` rejects a finding whose owning entry is completed,
+        which is precisely why only the supersession path can strand a pointer
+        on an evicted entry.  Left dangling, B stays neutered forever and
+        skipped by remediation forever, pointing at a row that no longer
+        exists — the stale-pointer class ``_purge_finding``'s own contract says
+        it exists to prevent.
+        """
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        db = tmp_path / 'recon_report_state.db'
+        store_a = ReconReportStore(db)
+        store_a.open()
+        t = [0.0]
+        try:
+            state = self._make_state(store_a, t)
+            stage1_fid = self._stage1_files_and_completes(state)  # B
+            stage2_fid = self._supersede(state, stage1_fid)['finding_id']  # A
+            self._evict_stage1(state, t, stage1_fid)
+
+            assert state.delete_finding(self._RUN, stage2_fid) == {
+                'status': 'deleted', 'finding_id': stage2_fid,
+            }
+
+            resolved = state._resolve_finding(self._RUN, stage1_fid)
+            assert resolved is not None
+            _entry, target = resolved
+            assert target.superseded_by is None
+
+            assert self._persisted_finding(store_a, stage1_fid)['superseded_by'] is None
+        finally:
+            store_a.close()
+
+        store_b = ReconReportStore(db)
+        store_b.open()
+        try:
+            state_b = self._make_state(store_b, [0.0])
+            state_b.hydrate_from_store()
+
+            report = state_b.get_assembled_report(self._RUN, self._S1)
+            assert report is not None
+            (item,) = [
+                i for i in report['flagged_items'] if i['finding_id'] == stage1_fid
+            ]
+            assert item['superseded_by'] is None
+            assert item['actionable'] is True  # live and actionable again
+        finally:
+            store_b.close()
+
+    def test_restarted_stage_shadowing_an_evicted_twin_persists_the_live_row(
+        self, tmp_path
+    ):
+        """A same-name stage restarted after eviction must persist the LIVE row.
+
+        ``start_report``'s docstring documents this path as reachable (task
+        3988): Stage 1 completes, ``tick()`` evicts it from ``_state`` while the
+        run stays live (so ``_run_finding_index`` still holds it), and a later
+        ``start_report`` naming that same stage takes the fresh-create path.
+        Two distinct entry objects then share one ``(run_id, stage)`` — the
+        store's primary key.
+
+        Widening ``_persist_run``'s reach to the finding index made that
+        collision reachable: identity-deduping emitted a row for BOTH twins in
+        one ``executemany`` against ``ON CONFLICT(run_id, stage) DO UPDATE``, so
+        the STALE evicted twin landed last and overwrote the live stage's row.
+        Persisted state then diverged from memory and ``hydrate_from_store``
+        resurrected the dead entry while dropping every finding the live stage
+        had filed.
+        """
+        import json
+
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        db = tmp_path / 'recon_report_state.db'
+        store_a = ReconReportStore(db)
+        store_a.open()
+        t = [0.0]
+        try:
+            state = self._make_state(store_a, t)
+            stage1_fid = self._stage1_files_and_completes(state)
+            self._evict_stage1(state, t, stage1_fid)
+
+            # Stage 1 restarts under the same name, shadowing the evicted twin.
+            state.start_report(
+                run_id=self._RUN, stage=self._S1, project_id='dark_factory'
+            )
+            restarted_fid = state.add_finding(
+                run_id=self._RUN, severity='moderate', category='memory_stale',
+                description='filed by the RESTARTED stage 1',
+                suggested_action='act', actionable=True, task_id='777',
+                flag_type='memory_restarted_stage_claim',
+            )['finding_id']
+
+            # The surviving stage-1 row is the LIVE one, not the stale twin.
+            payload_fids = {
+                f['finding_id']
+                for f in json.loads(self._stage1_row(store_a)['entry_json'])['findings']
+            }
+            assert payload_fids == {restarted_fid}, (
+                'the persisted stage-1 row should hold exactly the restarted '
+                'stage\'s finding; the stale evicted twin overwrote it'
+            )
+            assert (
+                self._persisted_finding(store_a, restarted_fid)['description']
+                == 'filed by the RESTARTED stage 1'
+            )
+
+            # ...because exactly one row per (run_id, stage) is emitted at all.
+            reachable = state._reachable_run_entries(self._RUN)
+            assert len({(e.run_id, e.stage) for e in reachable}) == len(reachable)
+        finally:
+            store_a.close()
+
+        # A restart hydrates the live stage, not the resurrected dead one.
+        store_b = ReconReportStore(db)
+        store_b.open()
+        try:
+            state_b = self._make_state(store_b, [0.0])
+            state_b.hydrate_from_store()
+            assert state_b._resolve_finding(self._RUN, restarted_fid) is not None
+            assert state_b._resolve_finding(self._RUN, stage1_fid) is None
+        finally:
+            store_b.close()
+
+
+# ---------------------------------------------------------------------------
 # step-13: fresh in-process runs stay byte-identical with/without a store —
 # RED until step-14 confirms every persistence touchpoint short-circuits on
 # store=None.  (The shadow store must NEVER feed back into a live run.)
@@ -1375,3 +1664,180 @@ class TestHydrateReanchorEviction:
             ] == []
         finally:
             state_b.stop_persistence()
+
+
+# ---------------------------------------------------------------------------
+# task-4653: superseded_by is durable across stages and restarts, and needs no
+# migration — recon_report_store holds entry_json as an opaque TEXT blob.
+# ---------------------------------------------------------------------------
+
+
+class TestSupersededByPersistence:
+    """A cross-stage supersession stamp survives serialization and a restart,
+    and a legacy blob written before the field existed still hydrates.
+    """
+
+    _RUN = 'sup-run-1'
+    _S1 = 'memory_consolidator'
+    _S2 = 'task_knowledge_sync'
+
+    def _make_state(self, store):
+        from fused_memory.server.recon_report import ReconReportState
+
+        state = ReconReportState(
+            ttl_seconds=300,
+            clock=lambda: 0.0,
+            memory_service=_WTFakeMemoryService(),
+            task_interceptor=_WTFakeTaskInterceptor(),
+            store=store,
+        )
+        state.known_projects = {'dark_factory': '/home/leo/src/dark-factory'}
+        return state
+
+    def _file_cross_stage(self, state):
+        """Stage 1 files and closes; Stage 2 supersedes it.  Returns both ids."""
+        state.start_report(run_id=self._RUN, stage=self._S1, project_id='dark_factory')
+        stage1_fid = state.add_finding(
+            run_id=self._RUN, severity='moderate', category='memory_stale',
+            description='mechanism X contradicts Y', suggested_action='act',
+            actionable=True, task_id='42', flag_type='memory_mechanism_contradiction',
+        )['finding_id']
+        state.complete(self._RUN, 'stage1 summary')
+
+        state.start_report(run_id=self._RUN, stage=self._S2, project_id='dark_factory')
+        stage2_fid = state.add_finding(
+            run_id=self._RUN, severity='low', category='memory_stale',
+            description='mechanism X was fixed', suggested_action='none',
+            actionable=True, task_id='42',
+            flag_type='memory_mechanism_contradiction_resolved',
+            supersedes=stage1_fid,
+        )['finding_id']
+        return stage1_fid, stage2_fid
+
+    def _stage1_row(self, store):
+        (row,) = [r for r in store.load_all() if r['stage'] == self._S1]
+        return row
+
+    def test_cross_stage_stamp_survives_serialization(self, tmp_path):
+        """_persist_run upserts EVERY entry of the run, so the stamp written
+        onto the EARLIER stage's row is durably stored."""
+        from fused_memory.server.recon_report import _deserialize_entry
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        store = ReconReportStore(tmp_path / 'recon_report_state.db')
+        store.open()
+        try:
+            state = self._make_state(store)
+            stage1_fid, stage2_fid = self._file_cross_stage(state)
+
+            restored = _deserialize_entry(self._stage1_row(store)['entry_json'])
+            (finding,) = [f for f in restored.findings if f.finding_id == stage1_fid]
+            assert finding.superseded_by == stage2_fid
+        finally:
+            store.close()
+
+    def test_the_reverse_supersedes_edge_is_durable_too(self, tmp_path):
+        """The superseder's own row records WHAT it retired, and that must
+        survive serialization as well.
+
+        _purge_finding's fall-back reads this reverse edge to decide whether a
+        retracted superseder leaves the target still-refuted or genuinely live
+        again.  A reverse edge lost in the store would make that decision
+        silently wrong after a restart — always "genuinely live" — resurrecting
+        a refuted claim.
+        """
+        from fused_memory.server.recon_report import _deserialize_entry
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        store = ReconReportStore(tmp_path / 'recon_report_state.db')
+        store.open()
+        try:
+            state = self._make_state(store)
+            stage1_fid, stage2_fid = self._file_cross_stage(state)
+
+            (row,) = [r for r in store.load_all() if r['stage'] == self._S2]
+            restored = _deserialize_entry(row['entry_json'])
+            (superseder,) = [f for f in restored.findings if f.finding_id == stage2_fid]
+            assert superseder.supersedes == stage1_fid
+            # The target carries only the forward pointer, never the reverse one.
+            target_entry = _deserialize_entry(self._stage1_row(store)['entry_json'])
+            (target,) = [f for f in target_entry.findings if f.finding_id == stage1_fid]
+            assert target.supersedes is None
+        finally:
+            store.close()
+
+    def test_stamp_and_neuter_survive_a_restart(self, tmp_path):
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        db = tmp_path / 'recon_report_state.db'
+        store_a = ReconReportStore(db)
+        store_a.open()
+        try:
+            stage1_fid, stage2_fid = self._file_cross_stage(self._make_state(store_a))
+        finally:
+            store_a.close()
+
+        store_b = ReconReportStore(db)
+        store_b.open()
+        try:
+            state_b = self._make_state(store_b)
+            state_b.hydrate_from_store()
+
+            report = state_b.get_assembled_report(self._RUN, self._S1)
+            assert report is not None
+            (item,) = [i for i in report['flagged_items'] if i['finding_id'] == stage1_fid]
+            assert item['superseded_by'] == stage2_fid
+            assert item['actionable'] is False
+        finally:
+            store_b.close()
+
+    def test_a_legacy_blob_without_the_key_still_hydrates(self, tmp_path):
+        """Rows persisted before superseded_by existed must load with None
+        rather than raising TypeError from _Finding(**fd) — no migration."""
+        import json
+
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        db = tmp_path / 'recon_report_state.db'
+        store_a = ReconReportStore(db)
+        store_a.open()
+        try:
+            state_a = self._make_state(store_a)
+            state_a.start_report(run_id=self._RUN, stage=self._S1, project_id='dark_factory')
+            legacy_fid = state_a.add_finding(
+                run_id=self._RUN, severity='moderate', category='memory_stale',
+                description='filed before the field existed', suggested_action='act',
+                actionable=True, task_id='42', flag_type='orphaned_knowledge',
+            )['finding_id']
+
+            # Rewrite the persisted blob as a pre-task-4653 writer would have
+            # produced it: every finding dict lacking the key entirely.
+            row = self._stage1_row(store_a)
+            payload = json.loads(row['entry_json'])
+            for fd in payload['findings']:
+                del fd['superseded_by']
+            store_a.upsert_entry(
+                run_id=row['run_id'], stage=row['stage'], project_id=row['project_id'],
+                is_active=row['is_active'], entry_json=json.dumps(payload),
+                updated_at=row['updated_at'],
+            )
+        finally:
+            store_a.close()
+
+        store_b = ReconReportStore(db)
+        store_b.open()
+        try:
+            state_b = self._make_state(store_b)
+            state_b.hydrate_from_store()
+
+            resolved = state_b._resolve_finding(self._RUN, legacy_fid)
+            assert resolved is not None, 'the legacy blob did not hydrate'
+            _e, finding = resolved
+            assert finding.superseded_by is None
+            report = state_b.get_assembled_report(self._RUN, self._S1)
+            assert report is not None
+            (item,) = [i for i in report['flagged_items'] if i['finding_id'] == legacy_fid]
+            assert item['superseded_by'] is None
+            assert item['actionable'] is True
+        finally:
+            store_b.close()
