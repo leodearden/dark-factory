@@ -22,7 +22,7 @@ import ast
 import copy
 import dataclasses
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 from _fm_helpers import load_script_module
@@ -1805,6 +1805,213 @@ class TestGateLockstepOutcomesAreGraded:
     def test_an_orphan_gate_does_not_by_itself_fail_the_run(self):
         """A dangling gate predates this sweep; reporting it is the deliverable."""
         assert 'orphan_gate_topic' not in _mod.ERROR_OUTCOMES
+
+
+def _listing(project_id: str, project_root: str, *tasks: dict) -> dict:
+    """One ``get_tasks`` response in the measured live shape."""
+    return {'tasks': list(tasks), 'project_id': project_id, 'project_root': project_root}
+
+
+def _task_row(task_id: object, metadata: object) -> dict:
+    """One task as ``get_tasks`` lists it, carrying fields the census must drop."""
+    return {'id': task_id, 'title': f'task {task_id}', 'status': 'pending',
+            'dependencies': [], 'metadata': metadata}
+
+
+def _census_client(answers: dict[str, object]) -> MagicMock:
+    """A client whose ``get_tasks`` answers per root: a response, or an exception.
+
+    Answers are deep-copied, as a JSON transport would hand them over, so the
+    census can never alias the double's own state.
+    """
+    async def _call_tool(name, payload):
+        assert name == 'get_tasks', name
+        answer = answers[payload['project_root']]
+        if isinstance(answer, BaseException):
+            raise answer
+        return copy.deepcopy(answer)
+
+    client = MagicMock()
+    client.call_tool = AsyncMock(side_effect=_call_tool)
+    return client
+
+
+_GATE_META = {_mod.GATE_METADATA_KEY: {'topic': 'gate_slug'}}
+
+
+class TestConsolidationGateCensus:
+    """``census_consolidation_gates(client, roots) -> GateCensus``.
+
+    The input the lockstep never had on the live path.  Its contract is to
+    state what it could NOT see: a root that cannot be read becomes a
+    structured failure, never a silent gap that reads as "no gates here".
+    """
+
+    @pytest.mark.asyncio
+    async def test_one_unpaged_get_tasks_per_distinct_root(self):
+        client = _census_client({
+            '/df': _listing('dark_factory', '/df'),
+            '/rf': _listing('reify', '/rf'),
+        })
+
+        await _mod.census_consolidation_gates(client, ['/df', '/rf', '/df'])
+
+        assert client.call_tool.await_args_list == [
+            call('get_tasks', {'project_root': '/df'}),
+            call('get_tasks', {'project_root': '/rf'}),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_only_tasks_carrying_a_gate_block_are_kept(self):
+        client = _census_client({'/df': _listing(
+            'dark_factory', '/df',
+            _task_row(1, _GATE_META),
+            _task_row(2, {'task_kind': 'deterministic'}),
+            _task_row(3, 'not-a-dict'),
+            _task_row(4, {_mod.GATE_METADATA_KEY: 'not-a-dict'}),
+            _task_row(5, None),
+        )})
+
+        census = await _mod.census_consolidation_gates(client, ['/df'])
+
+        assert [t['id'] for t in census.tasks] == ['1']
+
+    @pytest.mark.asyncio
+    async def test_a_kept_task_carries_the_server_stamp_and_nothing_else(self):
+        """``project_id``/``project_root`` come off the RESPONSE, never the caller.
+
+        The server normalizes a worktree root to its main checkout and derives
+        the project id from that — the derivation the closure scroll runs
+        under — so recomputing either here would be a second copy free to
+        diverge.
+        """
+        block = {'topic': 'gate_slug', 'provenance': {'report_run': 'r1'}}
+        client = _census_client({'/main/.worktrees/7': _listing(
+            'dark_factory', '/main',
+            _task_row(4220, {_mod.GATE_METADATA_KEY: block, 'task_kind': 'deterministic'}),
+        )})
+
+        census = await _mod.census_consolidation_gates(client, ['/main/.worktrees/7'])
+
+        assert list(census.tasks) == [{
+            'id': '4220',
+            'project_id': 'dark_factory',
+            'project_root': '/main',
+            'metadata': {_mod.GATE_METADATA_KEY: block},
+        }]
+
+    @pytest.mark.asyncio
+    async def test_tasks_are_sorted_by_project_then_id(self):
+        client = _census_client({
+            '/rf': _listing('reify', '/rf', _task_row(20, _GATE_META), _task_row(10, _GATE_META)),
+            '/df': _listing('dark_factory', '/df', _task_row(30, _GATE_META)),
+        })
+
+        census = await _mod.census_consolidation_gates(client, ['/rf', '/df'])
+
+        assert [(t['project_id'], t['id']) for t in census.tasks] == [
+            ('dark_factory', '30'), ('reify', '10'), ('reify', '20'),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_covered_projects_are_the_projects_that_answered(self):
+        client = _census_client({
+            '/df': _listing('dark_factory', '/df'),
+            '/rf': _listing('reify', '/rf'),
+        })
+
+        census = await _mod.census_consolidation_gates(client, ['/df', '/rf'])
+
+        assert census.covered_projects == {'dark_factory', 'reify'}
+        assert list(census.failures) == []
+
+    @pytest.mark.parametrize('answer', [
+        pytest.param({'error': 'no such project root', 'error_type': 'ValidationError'},
+                     id='error-envelope'),
+        pytest.param({'tasks': {'1': {}}, 'project_id': 'ghost', 'project_root': '/bad'},
+                     id='tasks-not-a-list'),
+        pytest.param({'tasks': [], 'project_root': '/bad'}, id='no-project-id'),
+        pytest.param({'tasks': [], 'project_id': 'ghost'}, id='no-project-root'),
+        pytest.param(RuntimeError('get_tasks failed: timed out'), id='raises'),
+    ])
+    @pytest.mark.asyncio
+    async def test_a_root_that_cannot_be_read_is_a_failure_not_a_gap(self, answer):
+        client = _census_client({
+            '/bad': answer,
+            '/df': _listing('dark_factory', '/df', _task_row(1, _GATE_META)),
+        })
+
+        census = await _mod.census_consolidation_gates(client, ['/bad', '/df'])
+
+        (failure,) = census.failures
+        assert failure['reason'] == 'gate_census_incomplete'
+        assert failure['project_root'] == '/bad'
+        assert failure['error']
+        assert census.covered_projects == {'dark_factory'}
+        assert [t['id'] for t in census.tasks] == ['1']
+
+    @pytest.mark.parametrize('answer, cause', [
+        pytest.param({'error': 'no such project root', 'error_type': 'ValidationError'},
+                     'no such project root', id='error-envelope'),
+        pytest.param(RuntimeError('get_tasks failed: timed out'), 'timed out', id='raises'),
+    ])
+    @pytest.mark.asyncio
+    async def test_the_failure_carries_the_cause_it_was_given(self, answer, cause):
+        census = await _mod.census_consolidation_gates(
+            _census_client({'/bad': answer}), ['/bad'])
+
+        (failure,) = census.failures
+        assert cause in failure['error']
+
+    @pytest.mark.asyncio
+    async def test_one_project_answering_from_two_task_stores_is_ambiguous(self):
+        client = _census_client({
+            '/a': _listing('reify', '/a'),
+            '/b': _listing('reify', '/b'),
+            '/df': _listing('dark_factory', '/df'),
+        })
+
+        census = await _mod.census_consolidation_gates(client, ['/a', '/b', '/df'])
+
+        assert census.covered_projects == {'dark_factory'}
+        (failure,) = census.failures
+        assert failure['reason'] == 'gate_census_incomplete'
+        assert failure['project_id'] == 'reify'
+        assert failure['project_root'] == '/b'
+        assert '/a' in failure['error']
+
+    @pytest.mark.asyncio
+    async def test_two_roots_normalized_to_one_store_are_deduplicated(self):
+        """A worktree path and its main checkout are one task store, read twice."""
+        listing = _listing('dark_factory', '/main', _task_row(1, _GATE_META))
+        client = _census_client({'/main/.worktrees/7': listing, '/main': listing})
+
+        census = await _mod.census_consolidation_gates(
+            client, ['/main/.worktrees/7', '/main'])
+
+        assert list(census.failures) == []
+        assert census.covered_projects == {'dark_factory'}
+        assert [t['id'] for t in census.tasks] == ['1']
+
+    @pytest.mark.asyncio
+    async def test_the_census_records_the_roots_it_attempted(self):
+        client = _census_client({
+            '/df': _listing('dark_factory', '/df'),
+            '/bad': RuntimeError('down'),
+        })
+
+        census = await _mod.census_consolidation_gates(client, ['/df', '/bad', '/df'])
+
+        assert list(census.roots) == ['/df', '/bad']
+
+    def test_the_census_is_a_frozen_value(self):
+        census = _mod.GateCensus(
+            roots=('/df',), tasks=(), covered_projects=frozenset({'dark_factory'}),
+            failures=())
+
+        assert dataclasses.is_dataclass(census)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            census.tasks = ()  # type: ignore[misc]
 
 
 # ===========================================================================
