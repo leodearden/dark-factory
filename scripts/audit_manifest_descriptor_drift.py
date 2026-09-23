@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sqlite3
 import subprocess
 import sys
@@ -105,8 +106,10 @@ from shared.capability_manifest import (  # noqa: E402
 # manual-checked capability in the corpus.
 MECHANICAL_CHECK_KINDS = ("grep", "script")
 
-# The sidecar filename suffix, as `git ls-files` matches it.
-_MANIFEST_GLOB = "*.capability-manifest.yaml"
+# The sidecar filename suffix: what the stamper appends to a task's prd_path,
+# and what `git ls-files` matches.
+_MANIFEST_SUFFIX = ".capability-manifest.yaml"
+_MANIFEST_GLOB = f"*{_MANIFEST_SUFFIX}"
 
 _GIT_TIMEOUT_SECS = 30
 
@@ -177,23 +180,104 @@ def _decode_metadata(raw: object) -> dict:
     return payload
 
 
-def load_task_delivered_checks(
-    tasks_db_path: str,
-) -> tuple[set[int], dict[int, dict[str, dict]]]:
-    """Load ``(task ids, task id -> {capability name -> entry})`` from tasks.db.
+class ManifestBinding(NamedTuple):
+    """A task the stamper would try to bind to a sidecar label.
 
-    Returns BOTH the row-id set and the descriptor mapping because they answer
-    two different coverage questions that must not be conflated: a manifest
-    binding a task_id with NO ROW AT ALL is a stale/unstamped binding, while a
-    task that exists but carries no same-named ``delivered_checks`` entry is an
-    un-stamped or metadata-wiped gate. Collapsing them would misattribute 6
-    live rows to a population of 32 that a different audit already owns.
+    ``label`` is the task's ``prd_task_label``, verbatim. ``manifest`` is the
+    sidecar relpath DERIVED from its ``prd_path`` (see
+    :func:`_manifest_binding`) — the file a re-stamp would open, not a path
+    read from anywhere.
+    """
 
-    A task absent from the mapping is a COVERAGE row, never a finding: this
-    sweep reports descriptors that DISAGREE, and a missing entry is not a
-    disagreement — it is an absence, whose dominant live cause is the
+    task_id: int
+    status: str
+    label: str
+    manifest: str
+
+
+class TaskStoreScan(NamedTuple):
+    """Everything this audit reads from one tasks.db, taken in ONE scan.
+
+    ``row_ids`` and ``delivered_checks`` feed the drift direction, and they are
+    separate because they answer two different coverage questions that must not
+    be conflated: a manifest binding a task_id with NO ROW AT ALL is a
+    stale/unstamped binding, while a task that exists but carries no same-named
+    ``delivered_checks`` entry is an un-stamped or metadata-wiped gate.
+    Collapsing them would misattribute 6 live rows to a population of 32 that a
+    different audit already owns.
+
+    A task absent from ``delivered_checks`` is a COVERAGE row, never a finding:
+    the drift direction reports descriptors that DISAGREE, and a missing entry
+    is not a disagreement — it is an absence, whose dominant live cause is the
     curator-combine ``metadata`` wipe that
     ``scripts/audit_combine_gate_marker_loss.py`` (tasks 3146/3329) owns.
+
+    ``manifest_bindings`` feeds the label-binding direction: every task the
+    stamper would admit, sorted by numeric task id.
+    """
+
+    row_ids: frozenset[int]
+    delivered_checks: dict[int, dict[str, dict]]
+    manifest_bindings: tuple[ManifestBinding, ...]
+
+
+def _delivered_check_entries(metadata: dict) -> dict[str, dict]:
+    """A task's ``metadata.delivered_checks`` keyed by capability name.
+
+    An entry that is not a dict, or has no string ``name``, is dropped: it
+    names no capability, so there is nothing to pair it with.
+    """
+    checks = metadata.get("delivered_checks")
+    if not isinstance(checks, list):
+        return {}
+    return {
+        entry["name"]: entry
+        for entry in checks
+        if isinstance(entry, dict) and isinstance(entry.get("name"), str)
+    }
+
+
+def _manifest_binding(task_id: int, status: str, metadata: dict) -> ManifestBinding | None:
+    """The stamper's admission gate and sidecar derivation, in one place.
+
+    Mirrors
+    fused-memory/src/fused_memory/server/manifest_stamping.py::_stamp_capability_manifests_impl
+    step 1 exactly, so the label-binding direction's population IS the
+    stamper's. A task is admitted only when its metadata carries a non-empty
+    ``prd_path`` AND ``prd_task_label`` (the stamper's falsy gate), and its
+    sidecar is derived strictly as ``re.sub(r'\\.md$', '', prd_path)`` plus the
+    sidecar suffix. It is never read from ``metadata.capability_manifest``,
+    which the task-4590 investigation found pointing at the ``.md`` twin.
+
+    ONE DELIBERATE DIVERGENCE: a truthy NON-STRING in either key is not
+    admitted. The stamper would admit it, then fail to derive a path from a
+    non-string ``prd_path`` or never match a non-string label against the
+    sidecar's string labels — so such a row can be neither bound nor usefully
+    reported. No live row has that shape.
+    """
+    prd_path = metadata.get("prd_path")
+    label = metadata.get("prd_task_label")
+    if not prd_path or not label:
+        return None
+    if not isinstance(prd_path, str) or not isinstance(label, str):
+        return None
+    return ManifestBinding(
+        task_id=task_id,
+        status=status,
+        label=label,
+        manifest=re.sub(r"\.md$", "", prd_path) + _MANIFEST_SUFFIX,
+    )
+
+
+def load_task_store_scan(tasks_db_path: str) -> TaskStoreScan:
+    """Read everything both directions need from tasks.db, in ONE scan.
+
+    ONE SCAN, NOT ONE PER DIRECTION, for correctness rather than tidiness. The
+    store is live and in WAL mode with the orchestrator writing to it, so a
+    second connection would read a second snapshot, and the drift and
+    label-binding halves of one report could straddle a write and contradict
+    each other. Each row's metadata is decoded ONCE and feeds both
+    ``delivered_checks`` and the manifest binding.
 
     ``tag`` is pinned to ``'master'`` because that is the tag the stamper writes
     under and the only tag the live store uses; the schema permits the same
@@ -205,30 +289,39 @@ def load_task_delivered_checks(
     structurally incapable of mutating live task records even while fused-memory
     holds the same file open in WAL mode. Closed in a ``try/finally`` and never
     a ``with`` block — a sqlite3 ``with`` is a TRANSACTION, not a close.
+
+    Its own open rather than :func:`_task_db_scan.connect_ro`, deliberately:
+    that helper raises ``TaskDbUnreadable``, which is not a ``sqlite3.Error`` —
+    the only exception :func:`_task_db_scan.sweep_project_roots` catches — so
+    adopting it would turn a skipped unreadable project into an aborted sweep.
     """
     row_ids: set[int] = set()
-    by_task: dict[int, dict[str, dict]] = {}
+    delivered_checks: dict[int, dict[str, dict]] = {}
+    bindings: list[ManifestBinding] = []
     conn = sqlite3.connect(f"file:{tasks_db_path}?mode=ro", uri=True)
     try:
-        cursor = conn.execute("SELECT id, metadata FROM tasks WHERE tag = 'master'")
-        for task_id, metadata in cursor:
+        cursor = conn.execute("SELECT id, status, metadata FROM tasks WHERE tag = 'master'")
+        for task_id, status, metadata in cursor:
             try:
                 tid = int(task_id)
             except (TypeError, ValueError):
                 continue
             row_ids.add(tid)
-            checks = _decode_metadata(metadata).get("delivered_checks")
-            if not isinstance(checks, list):
-                continue
-            entries: dict[str, dict] = {}
-            for entry in checks:
-                if isinstance(entry, dict) and isinstance(entry.get("name"), str):
-                    entries[entry["name"]] = entry
+            decoded = _decode_metadata(metadata)
+            entries = _delivered_check_entries(decoded)
             if entries:
-                by_task[tid] = entries
+                delivered_checks[tid] = entries
+            binding = _manifest_binding(tid, status, decoded)
+            if binding is not None:
+                bindings.append(binding)
     finally:
         conn.close()
-    return row_ids, by_task
+    bindings.sort(key=lambda binding: binding.task_id)
+    return TaskStoreScan(
+        row_ids=frozenset(row_ids),
+        delivered_checks=delivered_checks,
+        manifest_bindings=tuple(bindings),
+    )
 
 
 class DescriptorDrift(NamedTuple):
@@ -396,7 +489,7 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
     root = str(project_root)
     manifests_root = str(manifest_root) if manifest_root is not None else root
 
-    row_ids, task_checks = load_task_delivered_checks(str(tasks_db_path(root)))
+    scan = load_task_store_scan(str(tasks_db_path(root)))
 
     try:
         relpaths = _tracked_manifest_paths(manifests_root)
@@ -452,10 +545,10 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
             except (TypeError, ValueError):
                 continue
 
-            if task_id not in row_ids:
+            if task_id not in scan.row_ids:
                 without_db_row += 1
                 continue
-            entries = task_checks.get(task_id, {})
+            entries = scan.delivered_checks.get(task_id, {})
 
             mechanical_names: set[str] = set()
             for capability in task.capabilities:
