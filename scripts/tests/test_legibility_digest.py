@@ -25,6 +25,7 @@ import json
 import logging
 import re
 
+import coder as coder_mod
 import digest as mod
 import pytest
 import yaml
@@ -2530,6 +2531,17 @@ class TestCoderJudgmentPayloadClassifier:
     )
     def test_whole_carrier_judgment_is_recognised(self, text):
         assert mod.is_coder_judgment_payload(text) is True
+
+    def test_the_reply_the_coder_prompt_prescribes_is_recognised_lockstep(self):
+        """LOCKSTEP with scripts/legibility/coder.py::build_prompt, the one
+        copy of the response schema CODER_JUDGMENT_KEYS restates. The reply
+        is read out of the prompt, never hand-built: a hand-built reply stays
+        green when that schema is renamed, and a rename is the drift this
+        pins."""
+        prompt = coder_mod.build_prompt(digest_text='', codebook_index='')
+        [prescribed_reply] = [line for line in prompt.splitlines() if line.startswith('{')]
+
+        assert mod.is_coder_judgment_payload(prescribed_reply) is True
 
     def test_prose_quoting_the_schema_inline_is_not_a_payload(self):
         # A genuine self-correction that merely MENTIONS the schema is this

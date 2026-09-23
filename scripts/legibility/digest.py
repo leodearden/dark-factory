@@ -625,7 +625,9 @@ CODER_JUDGMENT_KEYS: frozenset[str] = frozenset({'matches', 'candidates'})
 is the response schema in scripts/legibility/coder.py::build_prompt.
 Restated rather than imported: this module PRODUCES the digest coder.py
 consumes, and importing the consumer would invert that layering for two key
-names."""
+names. A lockstep test over the reply build_prompt prescribes holds the two
+in step, so renaming that schema fails a test instead of silently letting
+coder answers back into the signal counts."""
 
 _JSON_FENCE_RE = re.compile(r'\A```(?:json)?\s*\n(.*)\n```\Z', re.DOTALL)
 """One outer ```/```json fence enclosing an ENTIRE stripped carrier."""
