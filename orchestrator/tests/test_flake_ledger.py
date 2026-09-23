@@ -3766,7 +3766,7 @@ class TestOneConnectionPerCall:
 
         db_path = tmp_path / 'runs.db'
         client = _FakeTaskClient(submit_returns='task-901')
-        opened = self._count_connections(monkeypatch)
+        opened = _count_connections(monkeypatch)
         row = await open_debt(
             db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.NOW
         )

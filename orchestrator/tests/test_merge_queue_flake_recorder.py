@@ -55,7 +55,9 @@ from orchestrator.flake_ledger import (
 )
 from orchestrator.git_ops import GitOps, MergeResult
 from orchestrator.merge_gates import PostMergePyrightResult
+from orchestrator.merge_lane.ports import ProductionVerifier, VerifyPort
 from orchestrator.merge_queue import (
+    PRODUCTION_VERIFIER,
     GroupMergeRequest,
     MergeOutcome,
     QueuedBranch,
@@ -64,8 +66,6 @@ from orchestrator.merge_queue import (
     _do_train_merge,
     _run_post_merge_verify,
 )
-from orchestrator.merge_lane.ports import ProductionVerifier, VerifyPort
-from orchestrator.merge_queue import PRODUCTION_VERIFIER, _run_post_merge_verify
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import VerifyRunner, result_from_json, result_to_json
 

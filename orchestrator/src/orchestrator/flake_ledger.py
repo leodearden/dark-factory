@@ -67,9 +67,8 @@ import contextlib
 import json
 import logging
 import sqlite3
-from dataclasses import dataclass, fields, replace
 from collections.abc import Iterable
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
