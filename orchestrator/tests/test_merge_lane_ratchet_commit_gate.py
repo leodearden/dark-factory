@@ -991,6 +991,16 @@ def _hook_repo(tmp_path: Path) -> _Repo:
     """
     repo = _Repo.seeded(tmp_path)
     repo.git('switch', '--quiet', '-c', 'task/5722-gate')
+    _install_real_hooks(repo)
+    return repo
+
+
+def _install_real_hooks(repo: _Repo) -> None:
+    """Copy THIS checkout's wired files in, point git at them, and commit them.
+
+    The commit that installs them already runs them, harmlessly: it stages no
+    ratchet artifact, and it must be made off main.
+    """
     for relpath in _WIRED_FILES:
         target = repo.root / relpath
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -998,6 +1008,30 @@ def _hook_repo(tmp_path: Path) -> _Repo:
         target.chmod(0o755)
     repo.git('config', 'core.hooksPath', 'hooks')
     repo.commit_all('install the real hooks and the instrument')
+
+
+def _hook_repo_mid_merge(tmp_path: Path, upstream: dict) -> _Repo:
+    """A hooked task branch stopped mid-merge with an upstream that moved the baseline.
+
+    The upstream branch moves the baseline BEFORE any hook exists, which is the
+    hook-less route main's moves arrive by. A sentinel both branches wrote stops
+    `git merge upstream`, and it is resolved and staged here; the baseline is
+    left as git merged it. Everything stays OFF main, for `_hook_repo`'s reason.
+    """
+    repo = _Repo.seeded(tmp_path)
+    repo.git('switch', '--quiet', '-c', 'upstream')
+    repo.write_baseline(upstream)
+    (repo.root / 'conflict.txt').write_text('upstream\n', encoding='utf-8')
+    repo.commit_all('upstream: move the baseline hook-lessly')
+    repo.git('switch', '--quiet', 'main')
+    repo.git('switch', '--quiet', '-c', 'task/5792-merge')
+    (repo.root / 'conflict.txt').write_text('task\n', encoding='utf-8')
+    _install_real_hooks(repo)
+    repo.git('merge', 'upstream', check=False)
+    merge_head = repo.git('rev-parse', '-q', '--verify', 'MERGE_HEAD', check=False)
+    assert merge_head, '`git merge upstream` did not stop on the sentinel conflict'
+    (repo.root / 'conflict.txt').write_text('resolved\n', encoding='utf-8')
+    repo.stage('conflict.txt')
     return repo
 
 
@@ -1073,6 +1107,47 @@ class TestTheHookActuallyRunsTheGate:
         result = repo.attempt_commit('lower a measure')
 
         assert result.returncode == 0, result.stdout + result.stderr
+
+
+class TestTheHookAuditsTheCommitThatFinishesAConflictedMerge:
+    """`git commit` finishing a conflicted merge runs PRE-COMMIT -- pinned, not assumed.
+
+    hooks/pre-commit used to say merge commits run pre-merge-commit instead.
+    That holds for a CLEAN `git merge` only: a conflicted merge finished with
+    `git commit` -- the merge resolver's path, and esc-3620-11's -- runs this
+    hook with MERGE_HEAD set. Driven through a real `git commit` on the copied
+    hooks, so no rewording of either hook can fool it.
+    """
+
+    def test_taking_upstreams_unrecorded_move_commits_the_merge(
+        self, tmp_path: Path
+    ) -> None:
+        repo = _hook_repo_mid_merge(tmp_path, _with_a_py_lines(1005))
+        before = repo.git('rev-parse', 'HEAD')
+
+        result = repo.attempt_commit('merge upstream into the task branch')
+
+        output = result.stdout + result.stderr
+        assert result.returncode == 0, output
+        # PRE-COMMIT ran and reached the audit: no other hook prints this.
+        assert 'merge-lane ratchet audit' in output
+        assert repo.git('rev-parse', 'HEAD') != before
+        assert len(repo.git('rev-list', '--parents', '-n', '1', 'HEAD').split()) == 3
+
+    def test_keeping_heads_stale_baseline_over_an_upstream_lowering_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        # Byte-identical to HEAD, so a filter listing staged artifacts against
+        # HEAD alone never spawns the auditor and the commit lands.
+        repo = _hook_repo_mid_merge(tmp_path, _with_a_py_lines(995))
+        repo.git('checkout', 'HEAD', '--', metrics.BASELINE_RELPATH)
+        before = repo.git('rev-parse', 'HEAD')
+
+        result = repo.attempt_commit('merge upstream, keeping the stale baseline')
+
+        assert result.returncode != 0
+        assert 'a.py' in result.stdout + result.stderr
+        assert repo.git('rev-parse', 'HEAD') == before
 
 
 class TestTheWiringIsStructurallyPinned:
