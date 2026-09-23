@@ -142,11 +142,9 @@ _JUDGE_TARGET_BRANCH = 'judge-target branch'
 _BUILDER_NAME = 'build_judge_prompt'
 _WRITER_NAME = 'judge_write'
 
-#: A parameter NAME that reads as designating the attach target. Item 1's
-#: vocabulary, kept word for word (``_TARGET_NAME_RE`` there) so the two
-#: probes cannot come to disagree about what a target-named parameter is. NOT
-#: imported across: they are separate executables with separate ``--src-root``
-#: contracts, and an import would make each one's failure the other's.
+#: A parameter NAME that reads as designating the attach target: item 1's
+#: ``_TARGET_NAME_RE`` in scripts/check_write_triage_attach_target.py, copied
+#: word for word until the two probes share a helper module.
 _TARGET_NAME_RE = re.compile(r'attach|target|candidate_id', re.IGNORECASE)
 
 #: The attribute a judge-side attach target is read off the decision through.
@@ -299,7 +297,7 @@ def _import_triage(src_root: Path, extra_paths: list[Path]) -> Any:
     return module
 
 
-def _import_judge(src_root: Path) -> Any | None:
+def _import_judge_if_present(src_root: Path) -> Any | None:
     """The ref's judge module, or None. NON-FATAL, unlike :func:`_import_triage`.
 
     A src-root with no judge module, or one whose import blows up, leaves the
@@ -635,14 +633,6 @@ def _measure(module: Any) -> tuple[_Run, list[Any], Any]:
     ]
     band_canonical = getattr(call.get('decision'), 'canonical_id', None)
     return run, slate, band_canonical
-
-
-def _first_few(reasons: list[str], limit: int = 4) -> str:
-    """Bounded join. The report shares a 2000-character escalation window."""
-    shown = '; '.join(reasons[:limit])
-    if len(reasons) > limit:
-        shown += f'; …{len(reasons) - limit} more'
-    return shown
 
 
 def _swap_verdict(
@@ -1090,7 +1080,7 @@ def _probe(src_root: Path, extra_paths: list[Path], out: list[str]) -> int:
     )
     module = _import_triage(src_root, extra_paths)
     out.append(f'triage module: {getattr(module, "__file__", "<unknown>")}')
-    judge_module = _import_judge(src_root)
+    judge_module = _import_judge_if_present(src_root)
 
     measured, slate, band_canonical = _measure(module)
     slate_ids = [candidate.id for candidate in slate]
@@ -1134,7 +1124,8 @@ def _probe(src_root: Path, extra_paths: list[Path], out: list[str]) -> int:
         )
         return _pass(out, _BRANCH_SWAP)
 
-    out.append(f'spellings tried: {_first_few(attempts)}')
+    # One reason per spelling, so the count is bounded by _SPELLINGS itself.
+    out.append(f'spellings tried: {"; ".join(attempts)}')
     out.append(_FAIL_MARKER)
     out.append(
         f'      band canonical {band_canonical!r}; the judge designated '
