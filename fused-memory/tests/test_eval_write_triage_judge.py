@@ -1275,6 +1275,16 @@ class TestRunJudgeEval:
         assert provenance['distractor_count'] == 2
         assert provenance['judge_model'] == 'gpt-4o-mini'
 
+    @staticmethod
+    def _short_pool() -> list[dict]:
+        """`_corpus()`'s c1 and c2 clusters: each draws from the other's 3 records.
+
+        At ``distractors=4`` that narrows every labelled slate to 4 and every
+        control to 3 — short, but never empty. A single cluster would empty
+        the control's slate, which `EvalPlan` refuses outright.
+        """
+        return [r for r in _corpus() if r['cluster_id'] in {'c1-canon', 'c2-canon'}]
+
     def test_slate_width_provenance_is_measured_not_asserted(
         self, tmp_path: Path,
     ) -> None:
@@ -1288,20 +1298,21 @@ class TestRunJudgeEval:
         arriving by the other door — and the artifact is the operator's
         stated input at the task-3169 flip gate.
 
-        A single-cluster corpus is the concrete trigger: `_distractor_pool`
-        draws only from OTHER clusters, so it is empty and every labelled
-        slate collapses to the canonical alone.
+        A short distractor pool is the concrete trigger: `_distractor_pool`
+        draws only from OTHER clusters, so two clusters of three records
+        cannot fill a 5-wide slate.
         """
-        single = [r for r in _corpus() if r['cluster_id'] == _corpus()[0]['cluster_id']]
-        report = _run(tmp_path, corpus=single, distractors=4)
+        short = self._short_pool()
+        report = _run(tmp_path, corpus=short, distractors=4)
         provenance = report['provenance']
 
         widths = {
             len(c['candidates'])
-            for c in _mod().build_judge_cases(single, distractors=4)
+            for c in _mod().build_judge_cases(short, distractors=4)
         }
-        assert max(widths) < 5, 'precondition: this corpus cannot fill a 5-wide slate'
+        assert widths == {4, 3}, 'precondition: labelled slates 4 wide, controls 3'
         assert provenance['candidate_count'] == max(widths)
+        assert provenance['candidate_count_min'] == min(widths)
         assert provenance['candidate_count'] != 5, (
             'the report must not claim a width it never built'
         )
@@ -1312,9 +1323,8 @@ class TestRunJudgeEval:
         self, tmp_path: Path, caplog,
     ) -> None:
         """Silence here reads as "covered everything" when it did not."""
-        single = [r for r in _corpus() if r['cluster_id'] == _corpus()[0]['cluster_id']]
         with caplog.at_level(logging.WARNING):
-            _run(tmp_path, corpus=single, distractors=4)
+            _run(tmp_path, corpus=self._short_pool(), distractors=4)
         assert any(
             record.levelno >= logging.WARNING for record in caplog.records
         ), 'a narrowed slate must warn, not pass silently'
@@ -2075,8 +2085,8 @@ class TestCommittedJudgeAccuracyReportIsTraceable:
 # Option C: the per-case dump, the field-width override, the retrieved slate
 # ---------------------------------------------------------------------------
 
-def _slate(memory_id: str, *, candidates, attach_target_id, band, similarity=0.7,
-           canonical_present=True):
+def _slate(memory_id: str, *, candidates, attach_target_id, band,
+           similarity: float | None = 0.7, canonical_present=True):
     """A `eval_write_triage_retrieval.Slate`-shaped stand-in.
 
     Duck-typed rather than imported: the retrieval module reaches the live
@@ -2195,6 +2205,30 @@ class TestTheCasesDump:
         assert seen == list(range(len(seen))), (
             f'rows were buffered rather than flushed per case: {seen}'
         )
+
+    def test_a_provider_error_mid_run_keeps_every_row_already_answered(
+        self, tmp_path: Path,
+    ) -> None:
+        """Task 5277 A4: the error propagates, and cases 1..N-1 stay on disk."""
+        answers = [OUTCOME_RESTATED, OUTCOME_STORED, OUTCOME_AMENDED]
+        asked: list[str] = []
+
+        def judge_fn(case, candidates):
+            asked.append(case['memory_id'])
+            if len(asked) > len(answers):
+                raise RuntimeError('429 Too Many Requests')
+            return answers[len(asked) - 1]
+
+        with pytest.raises(RuntimeError, match='429'):
+            self._dump(tmp_path, judge=judge_fn)
+        *answered, failed = asked
+        rows = [
+            json.loads(line)
+            for line in (tmp_path / 'cases.jsonl').read_text().splitlines()
+        ]
+        assert [(r['memory_id'], r['outcome']) for r in rows] == list(
+            zip(answered, answers, strict=True),
+        ), f'the rows bought before case {len(asked)} ({failed}) raised were lost'
 
     def test_no_dump_is_written_without_a_cases_path(self, tmp_path: Path) -> None:
         _run(tmp_path)
@@ -2441,6 +2475,64 @@ class TestPlanFromSlates:
         assert _mod().CLASS_DISTRACTOR in {
             c['expected_class'] for c in plan.cases if c['canonical_alias_id']
         }, 'the control case of an aliased cluster carries the alias too'
+
+
+class TestAJudgeBandCaseIsNeverShownAnEmptySlate:
+    """Task 5277 A3: a verdict nobody gave must not be scored.
+
+    `judge_write` answers an empty slate `stored` with no provider call, and
+    `stored` is exactly what the distractor control accepts, so an eval that
+    routed such a case to the judge would count a correct answer the model
+    never produced. `EvalPlan` refuses the case where the plan is built:
+    before any spend, and before the cases file is opened.
+    """
+
+    @staticmethod
+    def _one_cluster() -> list[dict]:
+        """`_corpus()`'s c2 alone: its control has no other cluster to draw from."""
+        return [r for r in _corpus() if r['cluster_id'] == 'c2-canon']
+
+    @staticmethod
+    def _retrieved(*slates):
+        records = [
+            _rec('canon', 'canon', 'canonical'),
+            *(_rec(slate.memory_id, 'canon', 'duplicate') for slate in slates),
+        ]
+        return _mod().plan_from_slates(records, list(slates), provenance={})
+
+    def test_a_single_cluster_seeded_plan_is_refused_naming_its_control(self) -> None:
+        with pytest.raises(ValueError, match='c2-distinct') as excinfo:
+            _mod().seeded_plan(self._one_cluster(), distractors=4)
+        assert 'c2-dup-1' not in str(excinfo.value), 'only the empty slate is named'
+
+    def test_the_judge_is_never_asked_and_nothing_is_written(self, tmp_path: Path) -> None:
+        judge = _fake_judge()
+        with pytest.raises(ValueError):
+            _run(tmp_path, judge=judge, corpus=self._one_cluster(), distractors=4)
+        assert judge.calls == []
+        assert list(tmp_path.iterdir()) == []
+
+    def test_every_offending_case_is_named(self) -> None:
+        with pytest.raises(ValueError) as excinfo:
+            self._retrieved(
+                _slate('empty-one', candidates=[], attach_target_id=None, band=OUTCOME_JUDGE),
+                _slate('empty-two', candidates=[], attach_target_id=None, band=OUTCOME_JUDGE),
+            )
+        message = str(excinfo.value)
+        assert 'empty-one' in message and 'empty-two' in message, message
+
+    def test_a_judge_band_with_one_candidate_is_accepted(self) -> None:
+        plan = self._retrieved(_slate(
+            'd1', candidates=[_live('canon')], attach_target_id='canon', band=OUTCOME_JUDGE,
+        ))
+        assert [c['candidates'] for c in plan.cases] == [['canon']]
+
+    def test_a_stored_band_with_an_empty_slate_is_accepted(self) -> None:
+        """Production's own novel or degraded path, answered with no judge at all."""
+        plan = self._retrieved(_slate(
+            'd1', candidates=[], attach_target_id=None, band=OUTCOME_STORED, similarity=None,
+        ))
+        assert [c['candidates'] for c in plan.cases] == [[]]
 
 
 class TestFieldCharsOverride:
