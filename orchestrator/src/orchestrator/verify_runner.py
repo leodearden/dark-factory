@@ -1030,14 +1030,9 @@ _SSH_BASE_OPTS = [
 # git, or a worktree — so the probe is side-effect-free and cheap.
 REMOTE_LIVENESS_CMD = 'orchestrator verify-merge --help'
 
-# Prefix for remote tool invocations that a plain (non-login, non-interactive)
-# ssh shell would not otherwise find: sshd's default PATH omits the standalone
-# uv installer's ``~/.local/bin`` and its older ``~/.cargo/bin`` home, and
-# ``~/.bashrc`` returns at its interactive guard before adding either.  The
-# second host's ``/usr/local/bin/orchestrator`` wrapper exports the same two
-# directories for the dispatch; this gives the sync's ``uv`` the same
-# treatment.  ``$HOME`` is expanded by the REMOTE shell, so it must never be
-# passed through shlex.quote.
+# A plain (non-login) ssh shell gets sshd's default PATH, which omits the uv
+# installer's ~/.local/bin (and its older ~/.cargo/bin).  $HOME expands on the
+# REMOTE side, so this is never passed through shlex.quote.
 REMOTE_TOOL_PATH_PRELUDE = 'PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"'
 
 
@@ -1414,9 +1409,9 @@ class RemoteRunner:
         bb834dd42a).  Different AND the remote does not match origin ⇒ emit
         ``runner_stale`` and, serialised on the per-runner lock and only when NO
         verify is in flight (never ``git pull`` under a live verify), run ``git
-        pull --ff-only`` + ``uv sync --all-packages`` (with
-        ``REMOTE_TOOL_PATH_PRELUDE`` so the non-login ssh shell finds ``uv``)
-        on the remote DF checkout,
+        pull --ff-only`` + ``uv sync --all-packages`` on the remote DF checkout
+        (prefixed with ``REMOTE_TOOL_PATH_PRELUDE`` so the non-login ssh shell
+        finds ``uv``),
         then ASSERT the checkout is still runnable via ``REMOTE_LIVENESS_CMD``
         over ssh, emitting ``runner_synced`` (kind='df_checkout') on success.
 

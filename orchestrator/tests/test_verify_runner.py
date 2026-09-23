@@ -3,6 +3,7 @@
 import asyncio
 import dataclasses
 import json
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any, ClassVar
@@ -7683,13 +7684,20 @@ async def _stale_uv_sync_cmd(df_remote: str) -> str:
     return uv_cmds[0]
 
 
-def _run_remote_cmd_like_sshd(cmd: str, home: Path) -> int:
-    """Run *cmd* the way a non-login ssh shell would: bare sshd PATH, no rc files."""
+def _run_remote_cmd_like_sshd(cmd: str, *, home: Path, sysbin: Path) -> int:
+    """Run *cmd* as a non-login ssh shell would: only *sysbin* on PATH, no rc files."""
+    bash = shutil.which('bash') or '/bin/bash'
     proc = subprocess.run(
-        ['env', '-i', 'PATH=/usr/bin:/bin', f'HOME={home}', 'bash', '-c', cmd],
+        ['env', '-i', f'PATH={sysbin}', f'HOME={home}', bash, '-c', cmd],
         capture_output=True, text=True,
     )
     return proc.returncode
+
+
+def _write_executable(path: Path, body: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body)
+    path.chmod(0o755)
 
 
 @pytest.mark.asyncio
@@ -7699,11 +7707,7 @@ class TestRemoteRunnerSyncFindsUvOnNonLoginShell:
     ``ssh host 'cd … && uv sync --all-packages'`` runs non-login and
     non-interactive, so PATH is sshd's default and ``~/.bashrc`` returns at its
     interactive guard before adding ``~/.local/bin`` — where the standalone uv
-    installer puts the binary.  Measured on the second host: every dispatch
-    following a dark-factory main advance benched the runner with
-    ``uv sync --all-packages failed (rc=127): bash: line 1: uv: command not
-    found``.  The dispatch itself was unaffected only because its
-    ``orchestrator`` wrapper exports the same directories itself.
+    installer puts the binary.
     """
 
     async def test_uv_sync_command_puts_local_bin_on_path_before_uv(self):
@@ -7723,25 +7727,27 @@ class TestRemoteRunnerSyncFindsUvOnNonLoginShell:
     async def test_uv_sync_command_resolves_a_home_local_bin_uv_under_bare_path(
         self, tmp_path: Path,
     ):
-        """Behavioural: the built command finds ``$HOME/.local/bin/uv`` under a
-        stripped PATH, and the SAME command without the prelude does not."""
-        from orchestrator.verify_runner import REMOTE_TOOL_PATH_PRELUDE
-
+        """Behavioural: under a bare PATH the built command finds
+        ``$HOME/.local/bin/uv``, which must itself still see the inherited PATH;
+        the SAME command against a HOME with no uv fails exactly as the field did."""
+        sysbin = tmp_path / 'sysbin'
+        _write_executable(sysbin / 'inherited-tool', '#!/bin/sh\nexit 0\n')
         home = tmp_path / 'home'
-        fake_uv = home / '.local' / 'bin' / 'uv'
-        fake_uv.parent.mkdir(parents=True)
-        fake_uv.write_text('#!/bin/sh\n[ "$1 $2" = "sync --all-packages" ] || exit 3\nexit 0\n')
-        fake_uv.chmod(0o755)
+        _write_executable(
+            home / '.local' / 'bin' / 'uv',
+            '#!/bin/sh\n'
+            '[ "$1 $2" = "sync --all-packages" ] || exit 3\n'
+            'inherited-tool || exit 4\n',
+        )
+        home_without_uv = tmp_path / 'home-without-uv'
+        home_without_uv.mkdir()
         df_remote = tmp_path / 'df'
         df_remote.mkdir()
 
         cmd = await _stale_uv_sync_cmd(str(df_remote))
-        assert _run_remote_cmd_like_sshd(cmd, home) == 0, cmd
-
-        without_prelude = cmd.replace(REMOTE_TOOL_PATH_PRELUDE + ' ', '')
-        assert without_prelude != cmd
-        assert _run_remote_cmd_like_sshd(without_prelude, home) == 127, (
-            'the mutation control must fail exactly as the un-preluded sync did'
+        assert _run_remote_cmd_like_sshd(cmd, home=home, sysbin=sysbin) == 0, cmd
+        assert _run_remote_cmd_like_sshd(cmd, home=home_without_uv, sysbin=sysbin) == 127, (
+            'the control must fail as the un-preluded sync did in the field (rc=127)'
         )
 
 
