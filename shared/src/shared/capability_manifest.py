@@ -364,6 +364,9 @@ def load_capability_manifest(path: str | Path) -> CapabilityManifestDoc:
     return parse_capability_manifest(data)
 
 
+MechanicalCheckKind = Literal['grep', 'script', 'path']
+
+
 class DeliveredCheckMeta(_CheckFieldsBase):
     """A single ``metadata.delivered_checks`` entry (PRD §Contract).
 
@@ -382,7 +385,7 @@ class DeliveredCheckMeta(_CheckFieldsBase):
     """
 
     name: str = Field(min_length=1)
-    kind: Literal['grep', 'script', 'path']
+    kind: MechanicalCheckKind
 
     @model_validator(mode='after')
     def _check_fields(self) -> DeliveredCheckMeta:
@@ -399,7 +402,7 @@ class DeliveredCheckMeta(_CheckFieldsBase):
         return self
 
 
-MECHANICAL_CHECK_KINDS: tuple[str, ...] = get_args(
+MECHANICAL_CHECK_KINDS: tuple[MechanicalCheckKind, ...] = get_args(
     DeliveredCheckMeta.model_fields['kind'].annotation
 )
 """The check kinds the automated gate evaluates — everything but ``'manual'``.
@@ -414,6 +417,10 @@ the two can never drift, and adding a kind is a one-place edit.
 Deriving from :class:`DeliveredCheckMeta` and not :class:`DeliveredCheck`
 is load-bearing: the latter also carries ``'manual'``, the one kind that
 must never be copied into metadata.
+
+The element type is :data:`MechanicalCheckKind`, not ``str``, so a
+``kind in MECHANICAL_CHECK_KINDS`` test narrows a :class:`DeliveredCheck`
+``kind`` to one :class:`DeliveredCheckMeta` accepts.
 
 Consumers: ``fused-memory``'s ``manifest_stamping`` copy filter and
 ``scripts/audit_combine_gate_marker_loss.py``'s sweep, both of which

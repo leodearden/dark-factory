@@ -737,7 +737,7 @@ def _build_delivered_check_escalation(
     # Name the field the descriptor ACTUALLY has. The former grep/script
     # binary emitted a bare `pattern: None` for any third kind, into a body
     # that routes straight to a human.
-    subject_field = CHECK_SUBJECT_FIELD.get(kind, 'pattern')
+    subject_field = CHECK_SUBJECT_FIELD.get(kind or '', 'pattern')
     if subject_field != 'paths':
         # kind='path' is its own subject, and `paths:` is already emitted
         # unconditionally below — printing it twice would be its own defect.

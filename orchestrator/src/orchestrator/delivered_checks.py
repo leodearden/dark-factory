@@ -577,7 +577,7 @@ async def gate_mark_done_on_delivered_checks(
         # binary named 'script' for anything non-grep, so a path check logged
         # `script=None` — a field it does not carry, holding a value that is
         # not the problem.
-        subject_field = CHECK_SUBJECT_FIELD.get(failed_check.get('kind'), 'pattern')
+        subject_field = CHECK_SUBJECT_FIELD.get(failed_check.get('kind') or '', 'pattern')
         log.warning(
             'Delivered-checks guard [%s]: task %s delivered-check %r (%s=%r) is '
             'absent from main@%s — declared capability not present, NOT marking '
