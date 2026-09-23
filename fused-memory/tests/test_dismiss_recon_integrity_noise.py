@@ -33,7 +33,7 @@ _mod = load_script_module(SCRIPT_PATH)
 run = _mod.run
 main = _mod.main
 TARGET_CATEGORY = _mod.TARGET_CATEGORY
-_apply_exit_code = _mod._apply_exit_code
+resolve_exit_code = _mod.resolve_exit_code
 
 
 def _esc(
@@ -53,6 +53,20 @@ def _esc(
         detail=json.dumps({'category': 'systemic_pattern', 'description': 'test'}),
         timestamp=datetime.now(UTC).isoformat(),
     )
+
+
+def _resolve_answers_none_for(monkeypatch: pytest.MonkeyPatch, escalation_id: str) -> None:
+    """Make ``EscalationQueue.resolve`` give its not-found answer, None, for
+    *escalation_id* — as if that record vanished before its resolve() call.
+    Every other id resolves normally."""
+    real_resolve = EscalationQueue.resolve
+
+    def _resolve_with_one_vanish(self, requested_id, *args, **kwargs):
+        if requested_id == escalation_id:
+            return None
+        return real_resolve(self, requested_id, *args, **kwargs)
+
+    monkeypatch.setattr(EscalationQueue, 'resolve', _resolve_with_one_vanish)
 
 
 class TestRunTargetStorePreflight:
@@ -90,12 +104,12 @@ class TestRunTargetStorePreflight:
     def test_main_does_not_return_zero_for_a_missing_queue_dir(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
-        """The regression pin: ``main()`` returns 0 UNCONDITIONALLY.
+        """The regression pin: the refusal must RAISE, not report.
 
-        There is no error accounting in this script's ``main()`` at all, so a
-        refusal routed through the normal report path would exit 0 — the very
-        ``no-silent-fail-soft`` defect the guard exists to fix. It must raise
-        instead.
+        Routed through the normal report path, a missing dir reads as an empty
+        queue — nothing to dismiss, so nothing ``vanished`` — which
+        ``resolve_exit_code`` grades as a clean 0: the very
+        ``no-silent-fail-soft`` defect the guard exists to fix.
         """
         missing = tmp_path / 'data' / 'reconciliation' / 'escalations'
         monkeypatch.setattr(
@@ -170,16 +184,7 @@ class TestVanishedTargetAccounting:
         targets = [_esc(task_id=str(i)) for i in range(3)]
         for esc in targets:
             queue.submit(esc)
-
-        vanished_id = targets[0].id
-        real_resolve = EscalationQueue.resolve
-
-        def _resolve_with_one_vanish(self, escalation_id, *args, **kwargs):
-            if escalation_id == vanished_id:
-                return None
-            return real_resolve(self, escalation_id, *args, **kwargs)
-
-        monkeypatch.setattr(EscalationQueue, 'resolve', _resolve_with_one_vanish)
+        _resolve_answers_none_for(monkeypatch, targets[0].id)
 
         report = run(tmp_path, apply=True)
 
@@ -191,20 +196,62 @@ class TestVanishedTargetAccounting:
         assert report['pending_after'] == 1
 
 
-class TestApplyExitCode:
-    """_apply_exit_code(report) turns a run() report into a loud, non-zero
+class TestResolveExitCode:
+    """resolve_exit_code(report) turns a run() report into a loud, non-zero
     process exit whenever a targeted escalation vanished before resolve —
     for CI/operator wiring."""
 
     def test_clean_apply_report_exits_zero(self) -> None:
         report = {'dry_run': False, 'dismissed': 3, 'vanished': 0}
-        assert _apply_exit_code(report) == 0
+        assert resolve_exit_code(report) == 0
 
     def test_vanished_present_exits_non_zero(self) -> None:
         report = {'dry_run': False, 'dismissed': 2, 'vanished': 1}
-        assert _apply_exit_code(report) != 0
+        assert resolve_exit_code(report) != 0
 
     def test_dry_run_report_has_no_vanished_key_and_exits_zero(self) -> None:
         """Dry-run reports never populate 'vanished' — the default keeps it clean."""
         report = {'dry_run': True, 'to_dismiss': 3, 'kept': 1}
-        assert _apply_exit_code(report) == 0
+        assert resolve_exit_code(report) == 0
+
+
+class TestMainExitCode:
+    """main()'s exit status is graded off the real run() report it prints, so
+    neither a hard-coded return nor a report key drifting out of step with
+    resolve_exit_code can hide a vanished target."""
+
+    @staticmethod
+    def _main_apply(queue_dir: Path, monkeypatch: pytest.MonkeyPatch) -> int:
+        monkeypatch.setattr(
+            'sys.argv',
+            ['dismiss_recon_integrity_noise.py', '--queue-dir', str(queue_dir), '--apply'],
+        )
+        return main()
+
+    def test_clean_apply_exits_zero(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        queue = EscalationQueue(tmp_path)
+        for i in range(2):
+            queue.submit(_esc(task_id=str(i)))
+
+        assert self._main_apply(tmp_path, monkeypatch) == 0
+        assert json.loads(capsys.readouterr().out)['vanished'] == 0
+
+    def test_apply_with_a_vanished_target_exits_one(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        queue = EscalationQueue(tmp_path)
+        targets = [_esc(task_id=str(i)) for i in range(2)]
+        for esc in targets:
+            queue.submit(esc)
+        _resolve_answers_none_for(monkeypatch, targets[0].id)
+
+        assert self._main_apply(tmp_path, monkeypatch) == 1
+        assert json.loads(capsys.readouterr().out)['vanished'] == 1

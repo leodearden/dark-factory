@@ -32,7 +32,7 @@ GroupCollapse = _mod.GroupCollapse
 BackfillPlan = _mod.BackfillPlan
 RESOLVED_BY = _mod.RESOLVED_BY
 DEFAULT_NOTE = _mod.DEFAULT_NOTE
-_apply_exit_code = _mod._apply_exit_code
+resolve_exit_code = _mod.resolve_exit_code
 
 
 # ---------------------------------------------------------------------------
@@ -850,10 +850,12 @@ class TestRunTargetStorePreflight:
     def test_main_does_not_return_zero_for_a_missing_queue_dir(
         self, tmp_path: Path
     ) -> None:
-        """``main()`` returns 0 UNCONDITIONALLY, with no error accounting.
+        """The refusal must RAISE, not report.
 
-        A refusal routed through the normal report path would therefore exit 0,
-        reproducing the very defect the guard exists to fix. It must raise.
+        Routed through the normal report path, a missing dir reads as an empty
+        queue with no ``canonical_not_found`` or ``children_vanished`` count,
+        which ``resolve_exit_code`` grades as a clean 0 — reproducing the very
+        defect the guard exists to fix.
         """
         import sys as _sys  # noqa: PLC0415
 
@@ -874,11 +876,11 @@ class TestRunTargetStorePreflight:
 
 
 # ---------------------------------------------------------------------------
-# TestApplyExitCode (task 4996)
+# TestResolveExitCode (task 4996)
 # ---------------------------------------------------------------------------
 
-class TestApplyExitCode:
-    """_apply_exit_code(report) turns a run() report into a loud, non-zero
+class TestResolveExitCode:
+    """resolve_exit_code(report) turns a run() report into a loud, non-zero
     process exit whenever a group could not be fully collapsed — a
     canonical that vanished before it could be stamped, or a child that
     vanished before it could be dismissed after its canonical was already
@@ -889,23 +891,102 @@ class TestApplyExitCode:
             'dry_run': False, 'dismissed': 3, 'updated': 1,
             'canonical_not_found': 0, 'children_vanished': 0,
         }
-        assert _apply_exit_code(report) == 0
+        assert resolve_exit_code(report) == 0
 
     def test_canonical_not_found_exits_non_zero(self) -> None:
         report = {
             'dry_run': False, 'dismissed': 0, 'updated': 0,
             'canonical_not_found': 1, 'children_vanished': 0,
         }
-        assert _apply_exit_code(report) != 0
+        assert resolve_exit_code(report) != 0
 
     def test_children_vanished_exits_non_zero(self) -> None:
         report = {
             'dry_run': False, 'dismissed': 1, 'updated': 1,
             'canonical_not_found': 0, 'children_vanished': 1,
         }
-        assert _apply_exit_code(report) != 0
+        assert resolve_exit_code(report) != 0
 
     def test_dry_run_report_has_no_error_keys_and_exits_zero(self) -> None:
         """Dry-run reports never populate these keys — the default keeps it clean."""
         report = {'dry_run': True, 'groups_collapsed': 2, 'to_dismiss': 3}
-        assert _apply_exit_code(report) == 0
+        assert resolve_exit_code(report) == 0
+
+
+# ---------------------------------------------------------------------------
+# TestMainExitCode (task 4996)
+# ---------------------------------------------------------------------------
+
+class TestMainExitCode:
+    """main()'s exit status is graded off the real run() report it prints, so
+    neither a hard-coded return nor a report key drifting out of step with
+    resolve_exit_code can hide a group that was not fully collapsed."""
+
+    @staticmethod
+    def _seed_one_group(queue_dir: Path) -> list[Escalation]:
+        """Three same-fingerprint records, oldest first: ``[0]`` is the
+        canonical build_plan picks, the rest are its children."""
+        queue = EscalationQueue(queue_dir)
+        base_ts = datetime(2026, 1, 1, tzinfo=UTC)
+        group = [
+            _esc(timestamp=(base_ts + timedelta(minutes=i)).isoformat(), task_id=str(i))
+            for i in range(3)
+        ]
+        for esc in group:
+            queue.submit(esc)
+        return group
+
+    @staticmethod
+    def _unlink_after_the_planning_scan(
+        monkeypatch: pytest.MonkeyPatch, queue_dir: Path, escalation_id: str,
+    ) -> None:
+        """Delete *escalation_id*'s file right after run()'s get_pending()
+        scan — the drift window between building the plan and applying it."""
+        real_get_pending = EscalationQueue.get_pending
+
+        def _scan_then_unlink(self: EscalationQueue) -> list[Escalation]:
+            pending = real_get_pending(self)
+            (queue_dir / f'{escalation_id}.json').unlink(missing_ok=True)
+            return pending
+
+        monkeypatch.setattr(EscalationQueue, 'get_pending', _scan_then_unlink)
+
+    @staticmethod
+    def _main_apply(queue_dir: Path, monkeypatch: pytest.MonkeyPatch) -> int:
+        monkeypatch.setattr(
+            'sys.argv',
+            ['backfill_recon_escalations.py', '--queue-dir', str(queue_dir), '--apply'],
+        )
+        return _mod.main()
+
+    def test_clean_apply_exits_zero(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        self._seed_one_group(tmp_path)
+
+        assert self._main_apply(tmp_path, monkeypatch) == 0
+        report = json.loads(capsys.readouterr().out)
+        assert report['canonical_not_found'] == 0
+        assert report['children_vanished'] == 0
+
+    @pytest.mark.parametrize(
+        ('vanishing_member', 'drift_counter'),
+        [(0, 'canonical_not_found'), (2, 'children_vanished')],
+        ids=['canonical', 'child'],
+    )
+    def test_apply_with_state_drift_exits_one(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        vanishing_member: int,
+        drift_counter: str,
+    ) -> None:
+        group = self._seed_one_group(tmp_path)
+        self._unlink_after_the_planning_scan(monkeypatch, tmp_path, group[vanishing_member].id)
+
+        assert self._main_apply(tmp_path, monkeypatch) == 1
+        assert json.loads(capsys.readouterr().out)[drift_counter] == 1

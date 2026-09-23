@@ -138,18 +138,10 @@ def run(
     return report
 
 
-def _apply_exit_code(report: dict) -> int:
-    """Pure ``run`` report -> process exit code, for CI/operator wiring.
+def resolve_exit_code(report: dict) -> int:
+    """0 on a clean run, 1 when the report's ``vanished`` count is non-zero.
 
-    Non-zero whenever a targeted escalation vanished between ``get_pending()``
-    and its ``resolve()`` call (state drift) — without this, ``dismissed``
-    silently falls short of ``to_dismiss`` and the only record of the
-    shortfall is a WARNING log line the operator reading the JSON report
-    never sees (INV-11: a log is not a return value).
-
-    A dry run never sets ``vanished`` (the apply branch above is never
-    entered), so ``.get('vanished', 0)`` keeps the dry-run exit at a clean 0,
-    matching the unconditional dry-run behaviour this replaces.
+    A missing key counts as 0; a dry-run report never carries it.
     """
     return 1 if report.get('vanished', 0) > 0 else 0
 
@@ -182,7 +174,7 @@ def main() -> int:
         note=args.note,
     )
     print(json.dumps(report, indent=2, default=str))
-    return _apply_exit_code(report)
+    return resolve_exit_code(report)
 
 
 if __name__ == '__main__':

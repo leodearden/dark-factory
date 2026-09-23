@@ -266,11 +266,12 @@ def apply_plan(
       on the canonical and persists it via ``queue.submit()``.
     - Dismisses each child via ``queue.resolve(dismiss=True)``.
 
-    Returns a dict with ``dismissed`` and ``updated`` counts, plus two error
-    counters — ``canonical_not_found`` and ``children_vanished`` — for the two
-    state-drift cases below.  Neither counter includes the (unrelated,
-    intentional) "canonical already has dedupe state" skip a few lines down —
-    that is A7b's idempotency guard, not a failure.
+    Returns a dict with ``dismissed`` and ``updated`` counts plus two
+    state-drift error counters: ``canonical_not_found`` (a canonical gone
+    before it could be stamped) and ``children_vanished`` (a child gone before
+    it could be dismissed, so its stamped canonical overstates the group).  A
+    canonical that already carries dedupe state is skipped uncounted: that is
+    A7b's idempotency guard, not a failure.
     """
     dismissed = 0
     updated = 0
@@ -374,19 +375,11 @@ def run(
     return report
 
 
-def _apply_exit_code(report: dict) -> int:
-    """Pure ``run`` report -> process exit code, for CI/operator wiring.
+def resolve_exit_code(report: dict) -> int:
+    """0 on a clean run, 1 when ``canonical_not_found`` or ``children_vanished``
+    is non-zero.
 
-    Non-zero whenever a group could not be fully collapsed: a canonical that
-    vanished before it could be stamped (``canonical_not_found``), or a child
-    that vanished before it could be dismissed after its canonical was
-    already stamped with the full child count (``children_vanished`` — the
-    group is left half-collapsed).  Without this, both are only a WARNING log
-    line, never the exit code or the printed report (INV-11).
-
-    A dry run never sets either key (the apply branch above is never
-    entered), so ``.get(key, 0)`` keeps the dry-run exit at a clean 0,
-    matching the unconditional dry-run behaviour this replaces.
+    A missing key counts as 0; a dry-run report carries neither.
     """
     errors = report.get('canonical_not_found', 0) + report.get('children_vanished', 0)
     return 1 if errors > 0 else 0
@@ -429,7 +422,7 @@ def main() -> int:
         note=args.note,
     )
     print(json.dumps(report, indent=2, default=str))
-    return _apply_exit_code(report)
+    return resolve_exit_code(report)
 
 
 if __name__ == '__main__':
