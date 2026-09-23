@@ -1374,7 +1374,7 @@ def _yaml_dquote(value: Any) -> str:
     return f'"{escaped}"'
 
 
-DIGEST_INSTRUMENT_VERSION: int = 2
+DIGEST_INSTRUMENT_VERSION: int = 3
 """Which generation of this instrument produced a given digest.
 
 BUMP POLICY: increment whenever a signal detector or the gold-turn
@@ -1392,6 +1392,9 @@ keys do NOT bump it.
   2 -- the relaxed anchor+corroborator briefing filter
        (:func:`is_harness_injected_turn`) plus the genuine/designed error
        split (:func:`iter_genuine_errors`).
+  3 -- the re-ingested-content classifier (:func:`is_reingested_content`,
+       task 5685), consulted by every text-pattern detector and the
+       gold-turn filter.
 
 This answers ``plans/confusion-census-2026-07-31.md:151`` (Sec 6): the
 next census must be able to tell a pre-fix trace from a live regression.
