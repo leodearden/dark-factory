@@ -3,6 +3,7 @@
 import asyncio
 import dataclasses
 import json
+import subprocess
 from pathlib import Path
 from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -7668,6 +7669,80 @@ class TestRemoteRunnerSyncWorkspaceSafety:
         from orchestrator.verify_runner import REMOTE_LIVENESS_CMD
 
         assert REMOTE_LIVENESS_CMD == _EXPECTED_LIVENESS_CMD
+
+
+async def _stale_uv_sync_cmd(df_remote: str) -> str:
+    """The single remote ``uv sync`` command a stale-checkout sync issues."""
+    runner, calls, store = _make_sync_runner(
+        df_remote=df_remote, local_head='NEW', remote_head='OLD', post_sync_head='NEW',
+    )
+    out = await runner.sync_if_stale(event_store=store, task_id='t1')
+    assert out.synced is True
+    uv_cmds = [c for c in _ssh_cmds(calls) if 'uv sync' in c]
+    assert len(uv_cmds) == 1, f'expected exactly one uv sync, got {uv_cmds!r}'
+    return uv_cmds[0]
+
+
+def _run_remote_cmd_like_sshd(cmd: str, home: Path) -> int:
+    """Run *cmd* the way a non-login ssh shell would: bare sshd PATH, no rc files."""
+    proc = subprocess.run(
+        ['env', '-i', 'PATH=/usr/bin:/bin', f'HOME={home}', 'bash', '-c', cmd],
+        capture_output=True, text=True,
+    )
+    return proc.returncode
+
+
+@pytest.mark.asyncio
+class TestRemoteRunnerSyncFindsUvOnNonLoginShell:
+    """The INV-2 sync's ``uv`` must resolve under a plain ssh shell.
+
+    ``ssh host 'cd … && uv sync --all-packages'`` runs non-login and
+    non-interactive, so PATH is sshd's default and ``~/.bashrc`` returns at its
+    interactive guard before adding ``~/.local/bin`` — where the standalone uv
+    installer puts the binary.  Measured on the second host: every dispatch
+    following a dark-factory main advance benched the runner with
+    ``uv sync --all-packages failed (rc=127): bash: line 1: uv: command not
+    found``.  The dispatch itself was unaffected only because its
+    ``orchestrator`` wrapper exports the same directories itself.
+    """
+
+    async def test_uv_sync_command_puts_local_bin_on_path_before_uv(self):
+        from orchestrator.verify_runner import REMOTE_TOOL_PATH_PRELUDE
+
+        cmd = await _stale_uv_sync_cmd('/remote/df')
+        assert REMOTE_TOOL_PATH_PRELUDE in cmd, cmd
+        assert cmd.index(REMOTE_TOOL_PATH_PRELUDE) < cmd.index('uv sync'), (
+            f'the PATH prelude must precede the uv invocation it serves; got {cmd!r}'
+        )
+        assert '$HOME/.local/bin' in cmd, cmd
+        # $HOME expands on the REMOTE side only if it is not shell-quoted away.
+        assert "'$HOME" not in cmd and "'PATH=" not in cmd, (
+            f'the prelude must not be passed through shlex.quote; got {cmd!r}'
+        )
+
+    async def test_uv_sync_command_resolves_a_home_local_bin_uv_under_bare_path(
+        self, tmp_path: Path,
+    ):
+        """Behavioural: the built command finds ``$HOME/.local/bin/uv`` under a
+        stripped PATH, and the SAME command without the prelude does not."""
+        from orchestrator.verify_runner import REMOTE_TOOL_PATH_PRELUDE
+
+        home = tmp_path / 'home'
+        fake_uv = home / '.local' / 'bin' / 'uv'
+        fake_uv.parent.mkdir(parents=True)
+        fake_uv.write_text('#!/bin/sh\n[ "$1 $2" = "sync --all-packages" ] || exit 3\nexit 0\n')
+        fake_uv.chmod(0o755)
+        df_remote = tmp_path / 'df'
+        df_remote.mkdir()
+
+        cmd = await _stale_uv_sync_cmd(str(df_remote))
+        assert _run_remote_cmd_like_sshd(cmd, home) == 0, cmd
+
+        without_prelude = cmd.replace(REMOTE_TOOL_PATH_PRELUDE + ' ', '')
+        assert without_prelude != cmd
+        assert _run_remote_cmd_like_sshd(without_prelude, home) == 127, (
+            'the mutation control must fail exactly as the un-preluded sync did'
+        )
 
 
 # ---------------------------------------------------------------------------
