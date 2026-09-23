@@ -655,41 +655,30 @@ class TestWholeTreeGate:
             f'above, the first such caller gets a human look.'
         )
 
-    def test_the_sweep_is_not_vacuous(
-        self, tree_sites: list[WildcardMcpScopingSite]
-    ) -> None:
-        """Anti-vacuity: the ratchet above passes trivially over a green tree.
-
-        This tree IS green, so a detector that silently stopped detecting — a
-        renamed kwarg, a changed call spelling, a refactor of the match logic —
-        would leave the suite green and the protection gone. This floor is what
-        keeps it honest, and it is set AT the measured value rather than below
-        it: unlike the sibling gates, which scan for defects whose count
-        legitimately falls as fixes land, this one scans for load-bearing
-        production callers, none of which may silently vanish.
-        """
-        assert len(tree_sites) >= len(_KNOWN_SITES), (
-            f'the sweep found only {len(tree_sites)} matching call site(s); '
-            f'{len(_KNOWN_SITES)} were measured at HEAD 89e37fd6fb on 2026-09-22:\n'
-            + '\n'.join(f'  {relpath}::{qualname}'
-                        for relpath, qualname in sorted(_KNOWN_SITES))
-            + f'\n\nEither the detector stopped detecting, or a load-bearing '
-              f'caller was deleted. Neither is a reason to lower this floor.\n'
-              f'Repo root resolved to: {_REPO_ROOT}'
-        )
-
     def test_every_known_site_is_accounted_for(
         self, tree_sites: list[WildcardMcpScopingSite]
     ) -> None:
-        """A NEW matching caller is surfaced for review even when it is scoped
-        correctly, so nobody adds a sixth one without reading this gate.
+        """The sweep finds EXACTLY the known sites; this is also the gate's
+        anti-vacuity check.
+
+        The ratchet above passes trivially over this tree, which is green, so a
+        detector that silently stopped detecting — a renamed kwarg, a changed
+        call spelling, a refactor of the match logic — would leave the suite
+        green and the protection gone. Exact equality reports that as GONE. It
+        is pinned AT the measured set rather than a floor below it: unlike the
+        sibling gates, which scan for defects whose count legitimately falls as
+        fixes land, this one scans for load-bearing production callers, none of
+        which may silently vanish. In the other direction, a NEW matching
+        caller is surfaced for review even when it is scoped correctly, so
+        nobody adds a sixth one without reading this gate.
         """
         found = {(site.filename, site.qualname) for site in tree_sites}
         assert found == _KNOWN_SITES, (
             f'the matching call sites have changed.\n'
             f'  NEW (add to _KNOWN_SITES once reviewed): '
             f'{sorted(found - _KNOWN_SITES) or "none"}\n'
-            f'  GONE (a load-bearing caller vanished, or the detector broke): '
+            f'  GONE (the detector broke, or a load-bearing caller was deleted '
+            f'— find out which before removing it from _KNOWN_SITES): '
             f'{sorted(_KNOWN_SITES - found) or "none"}\n'
             f'Repo root resolved to: {_REPO_ROOT}'
         )
@@ -717,19 +706,13 @@ class TestPrefilterParity:
         self, first_party_tree: Sequence[ParsedFile]
     ) -> None:
         """A parity test alone passes vacuously if the filter keeps everything,
-        silently costing the ~10x it exists to buy. The floor below it is the
-        other direction: it cannot drop so much that the known sites vanish.
+        silently costing the ~10x it exists to buy. The other direction —
+        dropping a file that holds a site — is the parity test's to catch.
         """
         survivors = records_worth_scanning(first_party_tree)
         assert len(survivors) < len(first_party_tree), (
             f'the prefilter kept all {len(first_party_tree)} records — it is '
             f'filtering on nothing, and the scan is paying full price'
-        )
-        assert len(survivors) >= len(_KNOWN_SITES), (
-            f'only {len(survivors)} record(s) survived the prefilter; the '
-            f'{len(_KNOWN_SITES)} known sites live in '
-            f'{len({relpath for relpath, _ in _KNOWN_SITES})} files, so every '
-            f'one of those must survive'
         )
 
 
