@@ -33,6 +33,7 @@ _mod = load_script_module(SCRIPT_PATH)
 run = _mod.run
 main = _mod.main
 TARGET_CATEGORY = _mod.TARGET_CATEGORY
+_apply_exit_code = _mod._apply_exit_code
 
 
 def _esc(
@@ -146,3 +147,64 @@ class TestRunBaseline:
         assert report['pending_after'] == 1
         still_pending = EscalationQueue(tmp_path).get_pending()
         assert [e.id for e in still_pending] == [keeper.id]
+
+
+# ---------------------------------------------------------------------------
+# TestVanishedTargetAccounting (task 4996)
+# ---------------------------------------------------------------------------
+
+class TestVanishedTargetAccounting:
+    """A target that vanishes between get_pending() and resolve() must be
+    counted, not just logged — INV-11 (a log is not a return value)."""
+
+    def test_vanished_target_is_counted_and_undercounts_dismissed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """State drift: a targeted escalation vanishes *during* the apply
+        loop, between ``get_pending()`` (which built ``to_dismiss``) and this
+        specific target's own ``resolve()`` call.  ``dismissed`` must fall
+        short of ``to_dismiss`` and the shortfall must be named in the
+        report, not just a WARNING log line.
+        """
+        queue = EscalationQueue(tmp_path)
+        targets = [_esc(task_id=str(i)) for i in range(3)]
+        for esc in targets:
+            queue.submit(esc)
+
+        vanished_id = targets[0].id
+        real_resolve = EscalationQueue.resolve
+
+        def _resolve_with_one_vanish(self, escalation_id, *args, **kwargs):
+            if escalation_id == vanished_id:
+                return None
+            return real_resolve(self, escalation_id, *args, **kwargs)
+
+        monkeypatch.setattr(EscalationQueue, 'resolve', _resolve_with_one_vanish)
+
+        report = run(tmp_path, apply=True)
+
+        assert report['to_dismiss'] == 3
+        assert report['dismissed'] == 2
+        assert report['vanished'] == 1
+        # The "vanished" target's own file was never touched by resolve(), so
+        # it is still sitting in the queue, pending.
+        assert report['pending_after'] == 1
+
+
+class TestApplyExitCode:
+    """_apply_exit_code(report) turns a run() report into a loud, non-zero
+    process exit whenever a targeted escalation vanished before resolve —
+    for CI/operator wiring."""
+
+    def test_clean_apply_report_exits_zero(self) -> None:
+        report = {'dry_run': False, 'dismissed': 3, 'vanished': 0}
+        assert _apply_exit_code(report) == 0
+
+    def test_vanished_present_exits_non_zero(self) -> None:
+        report = {'dry_run': False, 'dismissed': 2, 'vanished': 1}
+        assert _apply_exit_code(report) != 0
+
+    def test_dry_run_report_has_no_vanished_key_and_exits_zero(self) -> None:
+        """Dry-run reports never populate 'vanished' — the default keeps it clean."""
+        report = {'dry_run': True, 'to_dismiss': 3, 'kept': 1}
+        assert _apply_exit_code(report) == 0

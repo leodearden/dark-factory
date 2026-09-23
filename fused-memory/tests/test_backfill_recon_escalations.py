@@ -32,6 +32,7 @@ GroupCollapse = _mod.GroupCollapse
 BackfillPlan = _mod.BackfillPlan
 RESOLVED_BY = _mod.RESOLVED_BY
 DEFAULT_NOTE = _mod.DEFAULT_NOTE
+_apply_exit_code = _mod._apply_exit_code
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +453,9 @@ class TestApplyPlan:
         # apply_plan should have skipped the group entirely.
         assert result['updated'] == 0
         assert result['dismissed'] == 0
+        # This is the deliberate A7b-idempotency skip, not an error signal.
+        assert result['canonical_not_found'] == 0
+        assert result['children_vanished'] == 0
 
         # The canonical's pre-existing dedupe state must be preserved.
         reloaded = queue.get(canonical_esc.id)
@@ -496,11 +500,57 @@ class TestApplyPlan:
         # Group was skipped; no updates or dismissals should have occurred.
         assert result['updated'] == 0
         assert result['dismissed'] == 0
+        # This is the error signal: the report must name it, not just log it.
+        assert result['canonical_not_found'] == 1
+        assert result['children_vanished'] == 0
 
         # Children should still be pending (the skip must not touch them).
         pending_ids = {e.id for e in queue.get_pending()}
         for cid in child_ids:
             assert cid in pending_ids, f'Child {cid} should still be pending'
+
+    def test_apply_counts_child_that_vanished_after_canonical_stamped(
+        self, tmp_path: Path,
+    ) -> None:
+        """apply_plan counts a child that vanishes between build_plan and its
+        own resolve() call, AFTER the canonical was already stamped.
+
+        This is the half-collapse scenario from task 4996: the canonical's
+        dedupe_count/dedupe_children reflect the FULL group size, but one
+        child was never actually archived.  The report must name the
+        shortfall via ``children_vanished`` rather than only a WARNING log.
+        """
+        queue = EscalationQueue(tmp_path)
+        base_ts = datetime(2026, 1, 1, tzinfo=UTC)
+        escs = []
+        for i in range(3):
+            ts = (base_ts + timedelta(minutes=i)).isoformat()
+            e = _esc(timestamp=ts, task_id=str(i))
+            queue.submit(e)
+            escs.append(e)
+
+        plan = build_plan(queue.get_pending())
+        assert len(plan.collapses) == 1
+        child_ids = plan.collapses[0].child_ids
+        assert len(child_ids) == 2
+
+        # Simulate state drift: one child's file disappears before apply_plan
+        # reaches it (not via resolve — just delete, so resolve() finds
+        # nothing and returns None).
+        vanished_child = child_ids[0]
+        (tmp_path / f'{vanished_child}.json').unlink()
+
+        result = apply_plan(queue, plan)
+
+        assert result['canonical_not_found'] == 0
+        assert result['children_vanished'] == 1
+        assert result['dismissed'] == 1  # the other child was dismissed fine
+
+        # The canonical is still stamped with the FULL original child count —
+        # this is the half-collapse the finding describes.
+        canonical = queue.get(plan.collapses[0].canonical_id)
+        assert canonical is not None
+        assert canonical.dedupe_count == len(child_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -821,3 +871,41 @@ class TestRunTargetStorePreflight:
         report = run(tmp_path, apply=False)
 
         assert report['pending_before'] == 0
+
+
+# ---------------------------------------------------------------------------
+# TestApplyExitCode (task 4996)
+# ---------------------------------------------------------------------------
+
+class TestApplyExitCode:
+    """_apply_exit_code(report) turns a run() report into a loud, non-zero
+    process exit whenever a group could not be fully collapsed — a
+    canonical that vanished before it could be stamped, or a child that
+    vanished before it could be dismissed after its canonical was already
+    stamped — for CI/operator wiring."""
+
+    def test_clean_apply_report_exits_zero(self) -> None:
+        report = {
+            'dry_run': False, 'dismissed': 3, 'updated': 1,
+            'canonical_not_found': 0, 'children_vanished': 0,
+        }
+        assert _apply_exit_code(report) == 0
+
+    def test_canonical_not_found_exits_non_zero(self) -> None:
+        report = {
+            'dry_run': False, 'dismissed': 0, 'updated': 0,
+            'canonical_not_found': 1, 'children_vanished': 0,
+        }
+        assert _apply_exit_code(report) != 0
+
+    def test_children_vanished_exits_non_zero(self) -> None:
+        report = {
+            'dry_run': False, 'dismissed': 1, 'updated': 1,
+            'canonical_not_found': 0, 'children_vanished': 1,
+        }
+        assert _apply_exit_code(report) != 0
+
+    def test_dry_run_report_has_no_error_keys_and_exits_zero(self) -> None:
+        """Dry-run reports never populate these keys — the default keeps it clean."""
+        report = {'dry_run': True, 'groups_collapsed': 2, 'to_dismiss': 3}
+        assert _apply_exit_code(report) == 0

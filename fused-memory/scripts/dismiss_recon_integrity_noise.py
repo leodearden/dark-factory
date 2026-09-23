@@ -123,16 +123,35 @@ def run(
 
     if apply:
         dismissed = 0
+        vanished = 0
         for esc in targets:
             result = queue.resolve(esc.id, note, dismiss=True, resolved_by=resolved_by)
             if result is None:
                 logger.warning('Escalation %s vanished before resolve; skipping', esc.id)
+                vanished += 1
             else:
                 dismissed += 1
         report['dismissed'] = dismissed
+        report['vanished'] = vanished
         report['pending_after'] = len(queue.get_pending())
 
     return report
+
+
+def _apply_exit_code(report: dict) -> int:
+    """Pure ``run`` report -> process exit code, for CI/operator wiring.
+
+    Non-zero whenever a targeted escalation vanished between ``get_pending()``
+    and its ``resolve()`` call (state drift) — without this, ``dismissed``
+    silently falls short of ``to_dismiss`` and the only record of the
+    shortfall is a WARNING log line the operator reading the JSON report
+    never sees (INV-11: a log is not a return value).
+
+    A dry run never sets ``vanished`` (the apply branch above is never
+    entered), so ``.get('vanished', 0)`` keeps the dry-run exit at a clean 0,
+    matching the unconditional dry-run behaviour this replaces.
+    """
+    return 1 if report.get('vanished', 0) > 0 else 0
 
 
 def main() -> int:
@@ -163,7 +182,7 @@ def main() -> int:
         note=args.note,
     )
     print(json.dumps(report, indent=2, default=str))
-    return 0
+    return _apply_exit_code(report)
 
 
 if __name__ == '__main__':

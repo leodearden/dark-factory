@@ -266,15 +266,22 @@ def apply_plan(
       on the canonical and persists it via ``queue.submit()``.
     - Dismisses each child via ``queue.resolve(dismiss=True)``.
 
-    Returns a dict with ``dismissed`` and ``updated`` counts.
+    Returns a dict with ``dismissed`` and ``updated`` counts, plus two error
+    counters — ``canonical_not_found`` and ``children_vanished`` — for the two
+    state-drift cases below.  Neither counter includes the (unrelated,
+    intentional) "canonical already has dedupe state" skip a few lines down —
+    that is A7b's idempotency guard, not a failure.
     """
     dismissed = 0
     updated = 0
+    canonical_not_found = 0
+    children_vanished = 0
 
     for collapse in plan.collapses:
         canonical = queue.get(collapse.canonical_id)
         if canonical is None:
             logger.warning('Canonical %s not found; skipping group', collapse.canonical_id)
+            canonical_not_found += 1
             continue
 
         # Guard: if the canonical already carries dedupe state, A7b may already
@@ -304,10 +311,16 @@ def apply_plan(
                     'get_pending and apply); skipping',
                     child_id,
                 )
+                children_vanished += 1
             else:
                 dismissed += 1
 
-    return {'dismissed': dismissed, 'updated': updated}
+    return {
+        'dismissed': dismissed,
+        'updated': updated,
+        'canonical_not_found': canonical_not_found,
+        'children_vanished': children_vanished,
+    }
 
 
 def run(
@@ -354,9 +367,29 @@ def run(
         pending_after = len(queue.get_pending())
         report['dismissed'] = result['dismissed']
         report['updated'] = result['updated']
+        report['canonical_not_found'] = result['canonical_not_found']
+        report['children_vanished'] = result['children_vanished']
         report['pending_after'] = pending_after
 
     return report
+
+
+def _apply_exit_code(report: dict) -> int:
+    """Pure ``run`` report -> process exit code, for CI/operator wiring.
+
+    Non-zero whenever a group could not be fully collapsed: a canonical that
+    vanished before it could be stamped (``canonical_not_found``), or a child
+    that vanished before it could be dismissed after its canonical was
+    already stamped with the full child count (``children_vanished`` — the
+    group is left half-collapsed).  Without this, both are only a WARNING log
+    line, never the exit code or the printed report (INV-11).
+
+    A dry run never sets either key (the apply branch above is never
+    entered), so ``.get(key, 0)`` keeps the dry-run exit at a clean 0,
+    matching the unconditional dry-run behaviour this replaces.
+    """
+    errors = report.get('canonical_not_found', 0) + report.get('children_vanished', 0)
+    return 1 if errors > 0 else 0
 
 
 def main() -> int:
@@ -396,7 +429,7 @@ def main() -> int:
         note=args.note,
     )
     print(json.dumps(report, indent=2, default=str))
-    return 0
+    return _apply_exit_code(report)
 
 
 if __name__ == '__main__':
