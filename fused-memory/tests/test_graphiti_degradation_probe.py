@@ -56,7 +56,10 @@ class TestProbeLadderIsAControlledVariable:
 
     def test_ladder_reaches_the_high_fanout_floor(self):
         """Requirement 2 — at least one probe at the fan-out size that has
-        demonstrated power to fire."""
+        demonstrated power to fire. The literal 8 is the requirement's own
+        bound, as 3 is for requirement 1, so lowering the floor cannot quietly
+        relax it."""
+        assert HIGH_FANOUT_LIMIT_FLOOR >= 8
         assert max(PROBE_LIMIT_LADDER) >= HIGH_FANOUT_LIMIT_FLOOR
 
     def test_ladder_keeps_the_limit_that_produced_the_false_negative(self):
