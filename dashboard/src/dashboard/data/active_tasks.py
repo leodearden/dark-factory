@@ -205,6 +205,18 @@ _TASKS_PER_PROJECT_BUDGET = 14.0
 # production dashboard also polling the SAME single fused-memory server every
 # 3 s, so they include real contention and are a pessimistic bound, not a
 # quiet-system best case.
+#
+# PAYLOAD AFTER TASK 5587 (PRD leaf β), measured 2026-09-23. These are sizes
+# only, not the cold-render measurement leaf ι owns. The branch's api_tasks,
+# called in-process against the live fused-memory with the production roots,
+# served 30.4 MB: 9 roots, all fresh on both halves, and 3128 active rows.
+# ACTIVE_TASKS was 15.2 MB, and the same rows again under
+# TASKS_SNAPSHOT[p].rows were another 15.2 MB, until γ3 (task 5590) retires
+# ACTIVE_TASKS. Main's live endpoint, at the same hour, served 17.4 MB
+# for 3634 rows. 506 of those rows were terminal, at 2.2 MB, so that 2.2 MB is
+# all that leaving terminal rows out of the default render saved on the wire.
+# The PRD baseline's 9.4 MB terminal-window row measures the READ (its caption:
+# the dashboard's own fetch_tasks), not the capped slice of it that shipped.
 _TASKS_TOTAL_BUDGET = 20.0
 
 # How many project roots ``collect_tasks_with_counts`` may have in flight.

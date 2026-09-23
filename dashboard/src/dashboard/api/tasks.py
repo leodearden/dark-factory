@@ -164,6 +164,13 @@ async def api_tasks(request: Request) -> JSONResponse:
     ``metadata.files``) that is retained on the wire for debugging and tooling.
     No frontend UI reads it directly — lock display routes through D.SCHEDULER.
 
+    ACTIVE_TASKS is the concatenation, in canonical root order, of every
+    ``TASKS_SNAPSHOT[p].rows.value``. They are the same row dicts, so every
+    active row crosses the wire TWICE until leaf γ3 (task 5590) moves the
+    readers onto the snapshot and deletes this key. That doubles the largest
+    part of the payload. The measured cost is recorded beside the budget it
+    spends, ``active_tasks._TASKS_TOTAL_BUDGET``.
+
     **Four distinct failure facts (plus a denominator), deliberately not
     collapsed:**
 

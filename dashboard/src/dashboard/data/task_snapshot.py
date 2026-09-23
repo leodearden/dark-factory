@@ -678,9 +678,11 @@ _TERMINAL_FETCH_WINDOW = 400
 """How many terminal (done + cancelled) rows ONE ``?terminal=`` request reads.
 
 A ceiling, and the reason one is needed: unbounded, this read pulls every done
-row in the tree — ~4000 rows / ~40 MB on dark-factory, measured 2026-09-18 as
-9.4 MB of a 16.4 MB payload. It used to be paid on EVERY render; now only the
-request that asks for terminal rows pays it, and only up to here.
+row in the tree — ~4000 rows / ~40 MB on dark-factory. Even this window
+measured 9.4 MB to READ across nine roots on 2026-09-18. The payload never
+carried all of it: the default render shipped a capped slice, 2.2 MB on
+2026-09-23. It used to be paid on EVERY render; now only the request that
+asks for terminal rows pays it, and only up to here.
 
 SELECTED BY DESCENDING TASK ID, which is the only ordering the substrate
 offers: ``SqliteTaskBackend._get_tasks_internal`` is ``ORDER BY id`` and
