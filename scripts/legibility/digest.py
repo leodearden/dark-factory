@@ -594,6 +594,32 @@ def _signal_text_sources(
     return sources
 
 
+def _dialogue_text_sources(
+    records: list[dict[str, Any]],
+    *,
+    tool_result: bool = False,
+    assistant_text: bool = False,
+    user_text: bool = False,
+) -> list[tuple[int, str]]:
+    """The carriers :func:`_signal_text_sources` yields, minus every one that
+    is re-ingested machine content (:func:`is_reingested_content`).
+
+    Two layers, two questions: :func:`_signal_text_sources` answers "which
+    native carriers exist", and this answers "which of them are this
+    session's own dialogue". Every signal detector reads this layer.
+    """
+    return [
+        (index, text)
+        for index, text in _signal_text_sources(
+            records,
+            tool_result=tool_result,
+            assistant_text=assistant_text,
+            user_text=user_text,
+        )
+        if not is_reingested_content(text)
+    ]
+
+
 CODER_JUDGMENT_KEYS: frozenset[str] = frozenset({'matches', 'candidates'})
 """The two top-level keys of a trickle-coder judgment, whose canonical source
 is the response schema in scripts/legibility/coder.py::build_prompt.
@@ -662,10 +688,13 @@ def iter_self_corrections(records: list[dict[str, Any]]) -> list[dict[str, Any]]
     test data, not a real correction) is never scanned -- restricting the
     scan to assistant 'text' blocks (see :func:`_assistant_text_blocks`)
     structurally excludes both. A same-line ``# decoy-fail`` sentinel
-    suppresses an otherwise-matching line.
+    suppresses an otherwise-matching line, and a block that is re-ingested
+    machine content as a WHOLE (a prior coder judgment quoting the digest it
+    coded, say) is dropped before the scan by :func:`_dialogue_text_sources`.
+    Block type, whole carrier and single line are three separate filters.
     """
     hits = []
-    for index, text in _signal_text_sources(records, assistant_text=True):
+    for index, text in _dialogue_text_sources(records, assistant_text=True):
         stripped = _strip_decoy_lines(text)
         lowered = stripped.lower()
         for pattern in SELF_CORRECTION_PATTERNS:
