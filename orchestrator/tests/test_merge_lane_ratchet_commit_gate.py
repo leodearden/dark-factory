@@ -32,12 +32,15 @@ rewritten ledger exited 2 with a fully green suite.
 from __future__ import annotations
 
 import copy
+import enum
 import json
 import shutil
 import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
+
+import pytest
 
 # The seed report is IMPORTED, never re-declared: a second synthetic baseline
 # would drift from the one the instrument's own unit tests pin, and the two
@@ -72,6 +75,18 @@ def _raise_lines(report: dict) -> None:
 
 def _lower_lines(report: dict) -> None:
     report['files']['a.py']['lines'] = 995
+
+
+def _with_a_py_lines(lines: int) -> dict:
+    """The seed report with a.py's `lines` at *lines* (the seed holds 1000)."""
+    return _report_with(lambda report: report['files']['a.py'].__setitem__('lines', lines))
+
+
+class _Baseline(enum.Enum):
+    """A side's baseline move that is not a report."""
+
+    #: `git rm`ed on that side -- the hook-less deletion a branch can carry.
+    REMOVED = enum.auto()
 
 
 class _Repo:
@@ -132,6 +147,49 @@ class _Repo:
         )
         assert bootstrap.returncode == 0, bootstrap.stderr
         return cls(root)
+
+    @classmethod
+    def mid_merge(
+        cls,
+        tmp_path: Path,
+        *,
+        ours: dict | _Baseline | None = None,
+        theirs: dict | _Baseline | None = None,
+        ours_ledger: dict | None = None,
+        theirs_ledger: dict | None = None,
+    ) -> _Repo:
+        """The state a merge resolver finds: `git merge main` STOPPED on a conflict.
+
+        Branch 'task' (HEAD) commits *ours*; main (MERGE_HEAD) then commits
+        *theirs* with no hooks, which is exactly main's hook-less route. A
+        sentinel file both sides wrote is what stops the merge, and it is
+        resolved and staged here. The ratchet artifacts are left exactly as git
+        merged them, for each test to stage the resolution it is about.
+        """
+        repo = cls.seeded(tmp_path)
+        repo.git('switch', '--quiet', '-c', 'task')
+        repo._commit_side('ours', ours, ours_ledger)
+        repo.git('switch', '--quiet', 'main')
+        repo._commit_side('theirs', theirs, theirs_ledger)
+        repo.git('switch', '--quiet', 'task')
+        repo.git('merge', 'main', check=False)
+        merge_head = repo.git('rev-parse', '-q', '--verify', 'MERGE_HEAD', check=False)
+        assert merge_head, '`git merge main` did not stop on the sentinel conflict'
+        repo._write('conflict.txt', 'resolved\n')
+        repo.stage('conflict.txt')
+        return repo
+
+    def _commit_side(
+        self, side: str, baseline: dict | _Baseline | None, ledger: dict | None
+    ) -> None:
+        if baseline is _Baseline.REMOVED:
+            self.git('rm', '--quiet', '--', metrics.BASELINE_RELPATH)
+        elif baseline is not None:
+            self.write_baseline(baseline)
+        if ledger is not None:
+            self.write_ledger(ledger)
+        self._write('conflict.txt', f'{side}\n')
+        self.commit_all(f'{side}: move the ratchet artifacts')
 
     def git(self, *args: str, check: bool = True) -> str:
         proc = subprocess.run(
@@ -658,6 +716,94 @@ class TestLedgerIsAppendOnlyAtTheGate:
 
         assert result.returncode == 0, result.stderr
         assert result.stdout == '' and result.stderr == ''
+
+
+class TestAConflictedMergeLedgerIsAuditedAgainstBothParents:
+    """A merge's LEDGER descends from two recorded histories, not one.
+
+    esc-3620-11: `git commit` finishing task/3620's conflicted merge with main
+    was refused for 18 "raises" that main itself had made. Measured on git 2.43:
+    a conflicted merge finished with `git commit` runs PRE-COMMIT with
+    MERGE_HEAD set -- not pre-merge-commit -- so this gate sees every merge
+    resolver's commit, and HEAD is only one of its two parents. Both parents'
+    recorded entries must survive whole, and only what the merge ITSELF
+    appends is its own.
+    """
+
+    @pytest.mark.parametrize(
+        'theirs_first', [True, False], ids=['theirs-then-ours', 'ours-then-theirs']
+    )
+    def test_both_sides_appended_entries_resolve_in_either_order(
+        self, tmp_path: Path, theirs_first: bool
+    ) -> None:
+        ours_own, theirs_own = _record([], '5722'), _record([], '3620')
+        repo = _Repo.mid_merge(
+            tmp_path,
+            ours_ledger=_ledger_with(ours_own),
+            theirs_ledger=_ledger_with(theirs_own),
+        )
+        blocks = (theirs_own, ours_own) if theirs_first else (ours_own, theirs_own)
+        repo.write_ledger(_ledger_with(*blocks))
+        repo.stage(metrics.LEDGER_RELPATH)
+
+        result = repo.gate()
+
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    def test_keeping_heads_ledger_over_merge_heads_entry_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        # NOTHING DIFFERS FROM HEAD, which is why a HEAD-only filter never
+        # audited this: the resolution kept HEAD's bytes and silently dropped
+        # the entry main recorded.
+        repo = _Repo.mid_merge(tmp_path, theirs_ledger=_ledger_with(_record([], '3620')))
+        repo.git('checkout', 'HEAD', '--', metrics.LEDGER_RELPATH)
+
+        result = repo.gate()
+
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert 'append-only' in result.stderr
+
+    def test_an_entry_merge_head_recorded_is_not_a_standing_permission(
+        self, tmp_path: Path
+    ) -> None:
+        # Main RECORDED 1005 -> 1009 without taking it. Counted as "appended
+        # vs HEAD", that record would license the merge to take the raise --
+        # the standing permission LEDGER_README forbids.
+        recorded = _ledger_with(
+            _record(
+                [
+                    metrics.Violation.rose('lines', 'a.py', 1005, 1009),
+                    metrics.Violation.rose(
+                        'total:lines', metrics.CLUSTER_TOTAL_KEY, 1205, 1209
+                    ),
+                ],
+                '3620',
+            )
+        )
+        repo = _Repo.mid_merge(
+            tmp_path, theirs=_with_a_py_lines(1005), theirs_ledger=recorded
+        )
+        repo.write_baseline(_with_a_py_lines(1009))
+        repo.stage(metrics.BASELINE_RELPATH)
+
+        result = repo.gate()
+
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert '1009' in result.stderr
+
+    def test_a_baseline_merge_head_carries_may_not_be_dropped(
+        self, tmp_path: Path
+    ) -> None:
+        # The task branch removed the baseline hook-lessly and main never
+        # touched it, so git's merge carries the deletion -- invisible against
+        # HEAD, which lacks the file too.
+        repo = _Repo.mid_merge(tmp_path, ours=_Baseline.REMOVED)
+
+        result = repo.gate()
+
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert 'delete' in result.stderr.lower()
 
 
 #: The four real files a miniature repo needs before its hooks mean anything.
