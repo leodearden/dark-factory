@@ -179,6 +179,21 @@ class TestFocusHeaderWiring:
             'shownCount is its shown array\'s length by construction.'
         )
 
+    @pytest.mark.parametrize(
+        'component, prop', [('TaskGraph', 'tasks'), ('ProjectPrdGroups', 'graphTasks')]
+    )
+    def test_group_body_renders_the_array_the_header_counts(
+        self, tasks_tab_code, component, prop
+    ):
+        """The other half of the header/body agreement: the body is fed ``groupView.shown``."""
+        assert re.search(
+            rf'<{component}\s+{prop}=\{{\s*groupView\.shown\s*\}}', tasks_tab_code
+        ), (
+            f'TasksTab does not pass groupView.shown as <{component} {prop}=...> '
+            '— the group body must render the same array whose length the header '
+            'displays as shownCount.'
+        )
+
     def test_narrowing_happens_at_exactly_one_site(self, tab_tasks_jsx_code):
         """focusSubset must not be called ANYWHERE in tab_tasks.jsx.
 
