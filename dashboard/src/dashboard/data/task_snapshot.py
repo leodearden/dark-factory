@@ -43,7 +43,7 @@ import enum
 import logging
 import os
 from collections.abc import Awaitable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from types import MappingProxyType
 from typing import Any, Generic, TypeVar
@@ -606,6 +606,41 @@ def classify(snapshot: TaskSnapshot) -> SnapshotHealth:
     if snapshot.census.state is not DatumState.FRESH:
         return SnapshotHealth.COUNT_UNKNOWN
     return SnapshotHealth.OK
+
+
+def _aged(datum: Datum[T], served_at: datetime) -> Datum[T]:
+    """*datum* as it reads at *served_at*: ``stale`` once past its freshness bound."""
+    if datum.state is not DatumState.FRESH or datum.as_of is None:
+        return datum
+    age = (served_at - datum.as_of).total_seconds()
+    if age <= datum.freshness_bound_seconds:
+        return datum
+    return replace(
+        datum,
+        state=DatumState.STALE,
+        reason=(
+            f'measured {int(age)}s before it was served, past the '
+            f'{datum.freshness_bound_seconds}s freshness bound'
+        ),
+    )
+
+
+def as_served(snapshot: TaskSnapshot, served_at: datetime) -> TaskSnapshot:
+    """*snapshot* re-read at the instant a payload carrying it is served.
+
+    A unit is stamped when it is MEASURED and shared across every render that
+    reaches the cache within its TTL, so the age a consumer sees is the unit's
+    time in the cache plus however long that consumer's own fan-out ran after
+    reading it. Past :data:`FRESHNESS_BOUND_SECONDS` a half is honestly
+    ``stale``: same value, same ``as_of``, and a reason naming its age. That
+    is a fact about the serving instant, not a producer bug, so it must not
+    reach ``validate_datum`` still claiming to be fresh.
+    """
+    return replace(
+        snapshot,
+        census=_aged(snapshot.census, served_at),
+        rows=_aged(snapshot.rows, served_at),
+    )
 
 
 async def acquire_snapshot(

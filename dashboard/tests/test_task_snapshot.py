@@ -414,6 +414,43 @@ class TestAcquireSnapshotHappyPath:
             validate_datum(snapshot.census, at_the_bound + timedelta(seconds=1))
         assert raised.value.invariant is DatumInvariant.FRESHNESS_BOUND
 
+    async def test_a_unit_served_past_its_bound_is_stale_not_a_contract_break(
+        self, project_root, dashboard_config, dummy_client
+    ):
+        """``as_served`` ages a cached unit at the instant a payload serves it.
+
+        A unit shared through the cache can be served later than its bound: it
+        sits in the cache for up to the TTL and then waits out the reading
+        render's own fan-out. That is a stale value, the same one at the same
+        ``as_of``, and it must reach the validator saying so.
+        """
+        from dashboard.data.datum import DatumState, validate_datum
+        from dashboard.data.task_snapshot import (
+            FRESHNESS_BOUND_SECONDS,
+            SnapshotHealth,
+            as_served,
+            classify,
+        )
+
+        rows, status_map = _tree()
+        canned = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
+        snapshot = await self._acquire(canned, dummy_client, dashboard_config, project_root,
+                                       now=NOW)
+
+        within = NOW + timedelta(seconds=FRESHNESS_BOUND_SECONDS)
+        assert as_served(snapshot, within) == snapshot
+
+        late = within + timedelta(seconds=5)
+        served = as_served(snapshot, late)
+        for half in (served.census, served.rows):
+            validate_datum(half, late)
+            assert half.state is DatumState.STALE
+            assert half.as_of == NOW
+            assert f'{FRESHNESS_BOUND_SECONDS}s freshness bound' in half.reason
+        assert served.census.value == snapshot.census.value
+        assert served.rows.value == snapshot.rows.value
+        assert classify(served) is SnapshotHealth.COUNT_UNKNOWN
+
     async def test_to_wire_emits_the_contract_keys_and_not_the_raw_map(
         self, project_root, dashboard_config, dummy_client
     ):

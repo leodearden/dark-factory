@@ -31,6 +31,7 @@ from dashboard.data.task_snapshot import (
     SnapshotHealth,
     TaskSnapshot,
     acquire_terminal_window,
+    as_served,
     classify,
     measured_terminal_total,
     unmeasured_snapshot,
@@ -229,30 +230,29 @@ async def api_tasks(request: Request) -> JSONResponse:
     # The one request-scoped input this handler takes. Absent is not the same
     # as empty: no parameter means no terminal read and no terminal key.
     terminal = request.query_params.get('terminal')
-    # ONE instant for the whole payload, resolved before the fan-out. Every
-    # Datum below is validated against THIS served_at rather than against
-    # whatever the clock says when each one happens to be shaped, so the
-    # freshness claims the payload makes are claims about the payload.
-    served_at = resolve_now(None)
-    # That instant must be the PRODUCER's too, not only the validator's.
-    # validate_datum deliberately refuses a NEGATIVE age under
-    # DatumInvariant.FRESHNESS_BOUND, because clamping would let a skewed
-    # producer's value render as freshly measured. A collector left to resolve
-    # its own clock reads it microseconds later and stamps every fresh datum
-    # at as_of > served_at. Measured before this was threaded: on every
-    # cache-miss render _validated turned every root into an unknown unit,
-    # routed all of them to TASKS_OFFLINE_PROJECTS, raised the global
-    # TASKS_OFFLINE flag and logged a WARNING per root. The payload then
-    # contradicted itself: ACTIVE_TASKS carried rows that TASKS_SNAPSHOT[p].rows
-    # said were never measured.
+    # TWO instants, in this order. render_at is the producer's: it stamps what
+    # this render measures and ages its rows, one clock read for all of them.
+    # served_at is resolved only AFTER the fan-out returns, and every Datum on
+    # the payload is validated against it.
+    #
+    # The order is what makes validate_datum's refusal of a NEGATIVE age hold
+    # by construction. The unit cache is shared with every other render and
+    # with the scheduler route, and a unit another request refreshed carries
+    # THAT request's instant, which can be later than this render's own
+    # render_at. But any unit this render read was stored before it read it,
+    # and so stamped before served_at. Validating against render_at instead
+    # made a healthy root read as a contract break: _validated swapped it for
+    # an unknown unit and classify listed it in TASKS_OFFLINE_PROJECTS.
     #
     # The fan-out spends TWO bounded operations per project: one `statuses`-
     # narrowed active fetch and one compact get_statuses walk, concurrent and
     # under one TTL. The third slot in task_snapshot.PER_PROJECT_MCP_CALLS is
     # the terminal window, which only the `?terminal=` request spends.
+    render_at = resolve_now(None)
     active, snapshots = await collect_tasks_with_counts(
-        http_client, config, resolve_external=True, now=served_at,
+        http_client, config, resolve_external=True, now=render_at,
     )
+    served_at = resolve_now(None)
     offline_projects: list[str] = []
     degraded_projects: list[str] = []
     count_unknown_projects: list[str] = []
@@ -263,7 +263,7 @@ async def api_tasks(request: Request) -> JSONResponse:
         SnapshotHealth.COUNT_UNKNOWN: count_unknown_projects,
     }
     for label, acquired in snapshots.items():
-        snapshot = _validated(label, acquired, served_at)
+        snapshot = _validated(label, as_served(acquired, served_at), served_at)
         wire_snapshots[label] = snapshot.to_wire()
         # SnapshotHealth.OK routes nowhere, which is the whole point: a healthy
         # root is named in no banner list.

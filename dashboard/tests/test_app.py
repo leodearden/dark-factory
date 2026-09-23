@@ -368,6 +368,72 @@ def test_a_healthy_root_is_fresh_when_the_real_collector_measures_it(client, cap
     assert broken == []
 
 
+def test_a_unit_another_render_refreshed_later_is_not_a_contract_break(client, caplog):
+    """Two renders share one unit cache, and the later-resolved one can refresh first.
+
+    Render B resolves its instant, then render A resolves a later one and
+    refreshes the root before B reaches it. B is then served A's unit, whose
+    ``as_of`` is AFTER the instant B resolved. B's ``served_at`` must still
+    postdate it: a negative age is a contract break, and it used to route a
+    healthy root to TASKS_OFFLINE_PROJECTS.
+    """
+    import logging
+    from datetime import datetime, timedelta
+
+    from test_task_snapshot import CannedMCP, _raw_row
+
+    import dashboard.data.task_snapshot as snapshot_mod
+    import dashboard.data.tasks as tasks_mod
+    from dashboard.data.utils import resolve_now
+
+    config = client.app.state.config
+    root = config.project_root
+    pairs = ((1, 'in-progress'), (2, 'pending'), (3, 'done'))
+    canned = CannedMCP(
+        rows=[_raw_row(task_id, status) for task_id, status in pairs],
+        status_map=dict(pairs),
+        status_page_size=2000,
+    )
+    instants = iter(())
+
+    def b_clock(now):
+        return next(instants, None) or resolve_now(now)
+
+    snapshot_mod._snapshot_cache_clear()
+    tasks_mod._fetch_tasks_cache_clear()
+    try:
+        with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+            render_a = client.get('/api/v2/dashboard/tasks')
+            assert render_a.status_code == 200, render_a.text
+            a_as_of = datetime.fromisoformat(
+                render_a.json()['TASKS_SNAPSHOT'][root.name]['rows']['as_of']
+            )
+            render_b = a_as_of - timedelta(seconds=1)
+            instants = iter([render_b])
+            with (
+                patch('dashboard.api.tasks.resolve_now', new=b_clock),
+                caplog.at_level(logging.WARNING),
+            ):
+                resp = client.get('/api/v2/dashboard/tasks')
+    finally:
+        snapshot_mod._snapshot_cache_clear()
+        tasks_mod._fetch_tasks_cache_clear()
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    label = root.name
+    assert body['TASKS_OFFLINE_PROJECTS'] == []
+    entry = body['TASKS_SNAPSHOT'][label]
+    assert entry['rows']['state'] == 'fresh', entry['rows']
+    assert entry['census']['state'] == 'fresh', entry['census']
+    assert datetime.fromisoformat(entry['rows']['as_of']) == a_as_of
+    assert datetime.fromisoformat(body['served_at']) >= a_as_of
+    assert not [
+        record for record in caplog.records
+        if 'this is a BUG, not an outage' in record.getMessage()
+    ]
+
+
 _TASK_ROW_KEYS = frozenset({
     'id', 'project', 'title', 'description', 'details', 'status', 'agent',
     'loops', 'attempts', 'lane', 'phase', 'lane_state', 'runtime_offline',
