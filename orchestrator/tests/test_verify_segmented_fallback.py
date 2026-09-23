@@ -290,10 +290,18 @@ class TestRunSegmentedSharedDeadline:
     by the segment count and could wedge the merge queue.
 
     This path is load-bearing, not theoretical. The committed config's own
-    measured table records five of seven segments already costing 1838.60s
-    (orchestrator alone 1366.23s), a hard lower bound because that run timed
-    out before dashboard started — so a real chain can exhaust even the raised
-    3600s ceiling mid-run.
+    measured table records five of eight segments whose sum is the fleet chain
+    floor, dominated by `orchestrator` — re-measured by task 4902 on
+    2026-08-28 — and that floor is a LOWER bound, because dashboard, sampler
+    and cockpit carry no measurement at all. So a real chain can exhaust even
+    the raised warm ceiling mid-run: 4902 recorded green orchestrator runs
+    whose cost alone approaches it, and one attempt has already consumed the
+    full budget and been logged as a false infra_timeout.
+
+    The figures are deliberately NOT copied into this docstring. They live once,
+    in MEASURED_FLEET_SEGMENT_SECS / POST_CAP_ORCHESTRATOR_GREEN_SECS in
+    tests/scripts/test_fallback_verify_config.py; a number restated here would
+    be one more copy to raise in lockstep.
 
     A segment the deadline never reached is `not_run` with ``rc=None``: the
     UNCONFLATABLE encoding. `rc=0` would read as a pass, which is precisely the
@@ -846,12 +854,21 @@ class TestSegmentsAreDashNCapped:
     single pytest command — not N times the parallelism. Silently discarding
     a cap the operator configured is the degradation; honouring it is the fix.
 
-    Blast radius on this repo is zero: ``verify_admission_pytest_n`` ships as
-    'auto', which ``apply_pytest_numprocesses`` already no-ops, and the
-    committed YAML does not override it. Only a project that deliberately set
-    a numeric cap — i.e. one currently being ignored — is affected. The last
-    two tests pin that zero, so a future change cannot start rewriting
-    commands at the default.
+    ``verify_admission_pytest_n`` still SHIPS as 'auto', which
+    ``apply_pytest_numprocesses`` already no-ops, so the blast radius at the
+    DEFAULT remains zero and the last two tests pin that — a future change
+    cannot start rewriting commands at the default.
+
+    SUPERSEDED (task 4456, 2026-08-19): this block used to add "and the
+    committed YAML does not override it". That is no longer true — this repo's
+    dark-factory-orchestrator.yaml now sets ``verify_admission_pytest_n: "8"``
+    as an interim operator cap pending task 3589. THIS MODULE is unaffected
+    regardless, for two reasons that do not depend on the deployed value: its
+    shared driver hardcodes ``verify_admission_enabled: False``, and its capped
+    tests pass ``verify_admission_pytest_n`` explicitly via
+    ``_CAPPED_OVERRIDES``. dark_factory is now itself "a project that
+    deliberately set a numeric cap", which is the case this class exists to
+    cover.
     """
 
     _CAPPED_OVERRIDES = {
@@ -1501,8 +1518,10 @@ class TestRunVerificationSegmentedAcceptance:
         removing the `&&` short-circuit — the whole point of task 3338 — makes
         budget exhaustion strictly MORE likely, because all 8 segments now
         always run where the shell previously stopped at the first red. The
-        committed config's own measured table already records five of seven
-        segments costing 1838.60s.
+        committed config's own measured table already records five of eight
+        segments whose sum is the fleet chain floor (the figure itself lives
+        once, in MEASURED_FLEET_SEGMENT_SECS in
+        tests/scripts/test_fallback_verify_config.py, not here).
 
         Synthesising `timed_out` on exhaustion would relabel this genuine red as
         an `infra_timeout` (``classify_failure`` guard 2 wins over every output

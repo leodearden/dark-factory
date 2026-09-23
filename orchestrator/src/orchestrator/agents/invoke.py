@@ -23,6 +23,7 @@ from shared.cli_invoke import (  # noqa: F401
     CAP_HIT_RESUME_PROMPT,
     CRASH_RECOVERY_RESUME_PROMPT,
     AgentResult,
+    _materialize_stdin,
     _parse_claude_output,
     _run_subprocess,
     _SubprocessResult,
@@ -523,21 +524,24 @@ def _parse_codex_output(
 
 
 def _write_codex_mcp_config(config_path: Path, mcp_config: dict) -> None:
-    """Write MCP server config as .codex/config.toml."""
+    """Write MCP server config as .codex/config.toml.
+
+    codex reads one ``[mcp_servers.<name>]`` table per server with ``command``
+    (the executable alone) and an ``args`` list, plus an optional
+    ``[mcp_servers.<name>.env]`` subtable. Keys and values are JSON-encoded,
+    which is valid TOML for strings and string arrays, so a server name with a
+    hyphen or a path with a quote cannot break the file.
+    """
     lines = []
-    servers = mcp_config.get('mcpServers', {})
-    for name, cfg in servers.items():
-        lines.append('[[mcp_servers]]')
-        lines.append(f'name = "{name}"')
-        command = cfg.get('command', '')
-        args = cfg.get('args', [])
-        full_cmd = f'{command} {" ".join(args)}'.strip()
-        lines.append(f'command = "{full_cmd}"')
+    for name, cfg in mcp_config.get('mcpServers', {}).items():
+        table = f'mcp_servers.{json.dumps(name)}'
+        lines.append(f'[{table}]')
+        lines.append(f'command = {json.dumps(cfg.get("command", ""))}')
+        lines.append(f'args = {json.dumps([str(a) for a in cfg.get("args", [])])}')
         env_vars = cfg.get('env', {})
         if env_vars:
-            lines.append('[mcp_servers.env]')
-            for k, v in env_vars.items():
-                lines.append(f'{k} = "{v}"')
+            lines.append(f'[{table}.env]')
+            lines.extend(f'{json.dumps(str(k))} = {json.dumps(str(v))}' for k, v in env_vars.items())
         lines.append('')
     config_path.write_text('\n'.join(lines))
 
@@ -1143,26 +1147,43 @@ async def _run_subprocess_local(
 ) -> _SubprocessResult:
     """Run a subprocess, log output, enforce budget timeout.
 
-    *stdin_data*, when set, is piped to the process's stdin (mirrors
+    *stdin_data*, when set, is delivered on the process's stdin (mirrors
     shared.cli_invoke._run_subprocess's stdin_data param, used by the
     codex backend to deliver instructions without a worktree file — see
     _invoke_codex). When None (gemini/pi callers), behavior is
     byte-identical to before this param existed.
+
+    Like the shared runner, the payload is pre-materialized into an unlinked
+    temp file BEFORE spawn rather than written to a pipe afterwards, so an
+    event-loop stall cannot make the child miss its stdin deadline (task 3147
+    — see shared.cli_invoke._materialize_stdin for the confirmed failure mode).
+    The helper is imported, never re-implemented, so the two runners cannot
+    drift apart.
     """
     logger.info(f'Invoking agent: backend={backend} model={model} cwd={cwd} budget=${max_budget_usd}')
     logger.info(f'Command: {" ".join(cmd[:15])}...')
 
     start_ms = int(time.monotonic() * 1000)
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        cwd=str(cwd),
-        env=env,
-        stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        start_new_session=True,
-    )
+    # Pre-materialize the payload BEFORE the child exists (task 3147); see the
+    # docstring above.  stdin_data is None must still yield stdin=None.
+    stdin_file = _materialize_stdin(stdin_data) if stdin_data is not None else None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=str(cwd),
+            env=env,
+            stdin=stdin_file,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+    finally:
+        # Close the parent's handle once the child has its own dup — this is
+        # what delivers EOF to the child.  In a `finally` so a raising
+        # create_subprocess_exec cannot leak the fd.
+        if stdin_file is not None:
+            stdin_file.close()
     # Capture pgid at spawn; start_new_session guarantees pgid == pid.
     pgid = proc.pid
 
@@ -1176,7 +1197,9 @@ async def _run_subprocess_local(
     try:
         try:
             stdout, stderr = await asyncio.wait_for(
-                proc.communicate(input=stdin_data),
+                # No `input=`: stdin was pre-materialized as a real fd before
+                # spawn (task 3147), so communicate() performs reads only.
+                proc.communicate(),
                 timeout=timeout_seconds,
             )
         except TimeoutError:

@@ -43,6 +43,7 @@ from orchestrator.merge_types import MergeRequest
 # body).  They are imported here only so TestReachBackRouting has a "naive"
 # orchestrator.merge_shadow.<name> patch target to assert is NOT what governs.
 from orchestrator.verify import run_scoped_verification  # noqa: F401
+from orchestrator.verify_categories import FailureCategory
 from orchestrator.verify_runner import (  # noqa: F401
     LocalRunner,
     VerifyRunnerPool,
@@ -51,6 +52,7 @@ from orchestrator.verify_runner import (  # noqa: F401
 
 if TYPE_CHECKING:
     from orchestrator.merge_queue import SpeculativeMergeWorker
+    from orchestrator.verify import VerifyResult
 
 logger = logging.getLogger('orchestrator.merge_queue')
 
@@ -1116,6 +1118,144 @@ def _alarm_warm_shadow_unparseable(
     escalation_queue.submit(esc)
 
 
+def _submit_coarse_shadow_divergence_escalation(
+    escalation_queue: Any,
+    merge_commit: str,
+    cold_result: VerifyResult,
+) -> None:
+    """Submit a born-at-L2 escalation for a COARSE (suite-level) warm/cold divergence.
+
+    FIX 2 (task 2886, PRD leaf δ §3.4).  A MAP-LESS warm-passed land — a
+    trivial-pass land that ran no suite, or a remote-verdict land whose verify
+    ran off the warm local ``_merge-verify`` lane, so it has NO per-test warm
+    baseline — was re-verified from scratch with a cold FULL-gate suite that
+    FAILED.  The warm merge has ALREADY LANDED, so the commit may be red on main.
+
+    Mirrors :func:`_submit_shadow_divergence_escalation`'s born-at-L2 template:
+
+    * ``severity='critical'`` (in ``BORN_AT_L2_SEVERITIES``) → born at L2
+    * ``level=2``
+    * ``agent_role='orchestrator-warm-cold-shadow'`` (``orchestrator-`` prefix →
+      harness sentinel → not downgraded by the escalation server)
+    * ``category='risk_identified'``
+    * ``task_id=_WARM_COLD_SHADOW_SENTINEL`` — SHARED dedup key with the per-test
+      shadow-divergence alarm: both are "the warm/cold shadow detective found a
+      divergence — investigate the shadow lane", so a single open alarm
+      suppresses the other (matches the per-test global-dedup rationale).
+
+    None-safe: no-op when *escalation_queue* is None.
+    Dedup: no second submission while an open alarm for the sentinel exists.
+    """
+    if escalation_queue is None:
+        return
+
+    # Dedup: don't fire again while an open/pending shadow-divergence alarm exists
+    # (shared sentinel with the per-test path — see docstring).
+    if escalation_queue.has_open_l1(_WARM_COLD_SHADOW_SENTINEL):
+        return
+
+    from escalation.models import Escalation  # local import — escalation optional dep
+
+    short_sha = merge_commit[:8]
+    summary = (
+        f'Coarse warm/cold shadow divergence on {short_sha}: cold FULL-gate '
+        f'suite FAILED on a map-less warm-passed land'
+    )
+    detail = (
+        f'Commit: {merge_commit}\n'
+        f'Cold FULL-gate suite verdict: FAIL\n'
+        f'Cold verify summary: {cold_result.summary}\n'
+        '\n'
+        'This land had NO per-test warm baseline (a trivial-pass land that ran '
+        'no suite, or a remote-verdict land whose verify ran off the warm local '
+        '_merge-verify lane), so the warm/cold shadow compare degraded to a '
+        'COARSE suite-level pass/fail comparison (FIX 2, PRD leaf δ §3.4).\n'
+        '\n'
+        'The warm merge has ALREADY LANDED via the shadow/async lane and the '
+        'from-scratch cold FULL-gate suite FAILED — this commit may be RED on '
+        'main.  Investigate the cold suite failure on the landed merge commit '
+        'and consider a rollback of main.'
+    )
+
+    esc = Escalation(
+        id=escalation_queue.make_id(_WARM_COLD_SHADOW_SENTINEL),
+        task_id=_WARM_COLD_SHADOW_SENTINEL,
+        agent_role='orchestrator-warm-cold-shadow',
+        severity='critical',
+        level=2,
+        category='risk_identified',
+        summary=summary,
+        detail=detail,
+        suggested_action=(
+            'Investigate the cold FULL-gate suite failure on the landed merge '
+            'commit; roll back main if the failure reproduces.'
+        ),
+    )
+    escalation_queue.submit(esc)
+
+
+async def _run_cold_shadow_verify_suite(
+    git_ops: GitOps,
+    req: MergeRequest,
+    merge_commit: str,
+    event_store: EventStore | None,
+) -> VerifyResult:
+    """Run a from-scratch cold FULL-GATE verify on *merge_commit*, returning the
+    suite-level :class:`~orchestrator.verify.VerifyResult`.
+
+    Mirrors :func:`_run_cold_shadow_verify` (throwaway ``_merge-<uuid>`` worktree,
+    LOCAL-only from-scratch trust-anchor, ``finally`` cleanup, reach-back deferred
+    imports resolved from :mod:`orchestrator.merge_queue`) but with the two
+    differences the COARSE map-less compare (FIX 2) requires:
+
+    * the spec is built FULL-GATE (``task_files=None`` → verify.py workspace
+      path) so a map-less trivial-pass land is NOT re-confirmed by a same-scope
+      trivial pass — the cold leg runs the COMPLETE suite and CAN diverge
+      (PRD §8δ: re-dispatching the same no-source spec trivially passes on both
+      legs and structurally cannot catch the trivial-pass class);
+    * it returns the whole :class:`VerifyResult` (suite-level ``.passed``) rather
+      than only the per-test map, because a map-less land has no per-test warm
+      baseline to diff against.
+
+    Args:
+        git_ops: Live :class:`~orchestrator.git_ops.GitOps` instance.
+        req: The :class:`MergeRequest` that just warm-landed.
+        merge_commit: The merge commit SHA to verify cold.
+        event_store: Optional event store (passed to VerifyRunnerPool; None-safe).
+
+    Returns:
+        The suite-level :class:`VerifyResult` from the cold FULL-gate dispatch.
+    """
+    # Reach-back (deferred import): mirrors _run_cold_shadow_verify — the test
+    # suite patches these pool-construction deps by string path at
+    # orchestrator.merge_queue.<name>; resolving them from merge_queue's
+    # namespace at call time keeps those patches effective.
+    import orchestrator.merge_queue as _mq
+
+    wt = await git_ops.create_throwaway_verify_worktree(merge_commit)
+    try:
+        # FULL-GATE: task_files=None → the complete workspace suite on the cold
+        # leg (verify.py workspace path).  A scoped/no-source spec would trivially
+        # pass and could not catch the trivial-pass divergence class (PRD §8δ).
+        spec = _mq.build_merge_verify_spec(req.config, req.module_configs, None)
+        # LOCAL-ONLY by design (same as _run_cold_shadow_verify): this is the
+        # from-scratch cold trust-anchor control; a remote may carry warm
+        # sccache/target warmth and defeat the from-scratch-cold guarantee.
+        pool = _mq.VerifyRunnerPool(
+            [_mq.LocalRunner(
+                wt, req.config, req.module_configs, None,
+                run_scoped=_mq.run_scoped_verification,
+                run_unscoped=_mq._run_unscoped_typechecks,
+                task_id=req.task_id,
+            )],
+            event_store=event_store,
+            task_id=req.task_id,
+        )
+        return await pool.dispatch(merge_commit, spec)
+    finally:
+        await git_ops.cleanup_merge_worktree(wt)
+
+
 async def _run_cold_shadow_verify(
     git_ops: GitOps,
     req: MergeRequest,
@@ -1422,6 +1562,168 @@ async def _run_shadow_compare(
             )
 
 
+# Cold FULL-gate failure categories where the suite NEVER BUILT — the landed
+# commit's build/compile stage failed, so verify emits build/compile errors but
+# ZERO parseable test lines (an empty per-test map).  For the map-less COARSE
+# path (the SOLE detector for trivial-pass / remote-verdict lands) this is a
+# GENUINE red-main signal, NOT a throwaway-worktree infra hiccup, so it must
+# alarm rather than be swallowed by the empty-map inconclusive guard (task 2886
+# reviewer robustness amendment — otherwise a red main whose landed commit does
+# not even compile is silently undetected for this population).  Scoped to the
+# build-STAGE categories only (a compile/CLI/tree-sitter/npm build break, where
+# zero test lines is EXPECTED); TEST_FAILURE-class categories with an empty map
+# stay inconclusive since a genuine test failure normally DOES emit parseable
+# lines and an empty map there is more likely a transport/parse hiccup.  Derived
+# from FailureCategory so a new build-stage category can't drift out of the set.
+_COARSE_BUILD_FAILURE_CATEGORIES: frozenset[str] = frozenset({
+    FailureCategory.COMPILE_ERROR.value,
+    FailureCategory.CARGO_CLI_ERROR.value,
+    FailureCategory.TREE_SITTER_GENERATE_ERROR.value,
+    FailureCategory.NPM_ERROR.value,
+})
+
+
+async def _run_coarse_shadow_compare(
+    git_ops: GitOps,
+    req: MergeRequest,
+    merge_commit: str,
+    escalation_queue: Any,
+    event_store: EventStore | None,
+) -> None:
+    """COARSE suite-level warm-vs-cold shadow compare for a MAP-LESS land.
+
+    FIX 2 (task 2886, PRD leaf δ §3.4).  Scheduled by
+    :func:`_maybe_schedule_shadow_compare` for the two populations that have NO
+    per-test warm map yet CAN diverge:
+
+    * trivial-pass lands (ran no suite → empty per-test map), and
+    * remote-verdict lands (verify ran off the warm local ``_merge-verify`` lane).
+
+    Without a per-test warm baseline there is nothing to diff per-test, so the
+    compare degrades to SUITE level.  The warm land implicitly PASSED (it landed),
+    so:
+
+    1. Run a from-scratch cold FULL-gate verify via
+       :func:`_run_cold_shadow_verify_suite` (``task_files=None`` — the cold leg
+       runs the COMPLETE suite so a trivial-pass land cannot be re-confirmed by a
+       same-scope trivial pass; PRD §8δ).
+    2. **Build-never-built FAIL** (cold produced no parseable test output but
+       FAILED with a build/compile category in
+       :data:`_COARSE_BUILD_FAILURE_CATEGORIES`): the landed commit does not
+       compile ⇒ born-at-L2 suspected-red alarm — this is a GENUINE red-main
+       signal, not an infra hiccup, and the coarse path is the SOLE detector for
+       the map-less population (task 2886 reviewer robustness amendment).
+    3. **Inconclusive** (cold produced no parseable test output and is NOT a
+       recognised build failure → OOM/transport/disk hiccup in the throwaway
+       worktree, or a cold PASS that ran nothing): no alarm, no event — mirrors
+       :func:`_run_shadow_compare`'s inconclusive guard (avoids alarming on
+       transport failure).  Logged with cold_passed + category for observability.
+    4. **cold FULL-gate FAIL** (with a parseable map) vs the warm-passed land ⇒
+       born-at-L2 suspected-red alarm via
+       :func:`_submit_coarse_shadow_divergence_escalation`.
+    5. **cold FULL-gate PASS** ⇒ emit ``verdict_parity_ok`` (``coarse=True``).
+
+    The coarse threshold (suite verdict gated by per-test parseability of the cold
+    output, rather than a per-command exit comparison) is tactical per PRD §9 open
+    question δ — the map-less populations only need a suite-level pass/fail signal.
+
+    **Exception handling**: any exception from the cold leg is logged at WARNING
+    and swallowed — a detective control must never crash or stall the merge worker
+    (it runs off the serial lane via ``asyncio.create_task``).
+
+    Args:
+        git_ops: Live :class:`~orchestrator.git_ops.GitOps` instance.
+        req: The :class:`MergeRequest` that warm-landed (provides config +
+             module_configs for the cold verify spec).
+        merge_commit: The just-landed merge commit SHA.
+        escalation_queue: Live escalation queue, or ``None`` (None-safe).
+        event_store: Optional event store for parity-ok event emission.
+    """
+    # Reach-back (deferred import): the test suite patches the cold FULL-gate leg
+    # by string path at orchestrator.merge_queue._run_cold_shadow_verify_suite.
+    # Resolving it from merge_queue's namespace at call time keeps that patch
+    # effective post-extraction (mirrors _run_shadow_compare's reach-back).
+    from orchestrator.merge_queue import _run_cold_shadow_verify_suite
+
+    try:
+        cold = await _run_cold_shadow_verify_suite(
+            git_ops, req, merge_commit, event_store
+        )
+    except Exception:
+        logger.warning(
+            'Coarse shadow compare cold leg failed for %s — swallowing exception',
+            merge_commit[:8],
+            exc_info=True,
+        )
+        return
+
+    # Inconclusive guard (mirrors _run_shadow_compare): a cold FULL-gate that
+    # produced NO parseable test output usually signals an OOM/transport/disk
+    # hiccup in the throwaway worktree, not a genuine warm-pass/cold-fail flip.
+    # The coarse threshold is "did the suite actually run?" (per-test
+    # parseability) gating the suite-level verdict; an empty parse is inconclusive
+    # (neither alarm nor parity-ok), avoiding a false-positive born-at-L2 alarm on
+    # transport/infra failure.
+    #
+    # EXCEPT the build-never-built class (task 2886 reviewer robustness
+    # amendment): a cold FULL-gate that FAILED with a build/compile category
+    # (:data:`_COARSE_BUILD_FAILURE_CATEGORIES`) legitimately emits ZERO parseable
+    # test lines because the suite never built — yet the landed commit genuinely
+    # does not compile, which IS a red main.  For the map-less population this
+    # coarse path is the SOLE detector, so that class must ALARM instead of being
+    # swallowed as an "infra hiccup".  Category-based (not an output-regex
+    # heuristic) to honour verify_categories' closed-domain classification norm.
+    cold_map = parse_per_test_results(cold.test_output or '')
+    if not cold_map:
+        cold_cat = cold.category or ''
+        if not cold.passed and cold_cat in _COARSE_BUILD_FAILURE_CATEGORIES:
+            logger.warning(
+                'Coarse shadow compare on %s: cold FULL-gate produced no '
+                'parseable test results but FAILED with a build/compile category '
+                '(%s) — the landed commit did not build; alarming as a suspected '
+                'red main (map-less coarse path is the sole detector)',
+                merge_commit[:8], cold_cat,
+            )
+            _submit_coarse_shadow_divergence_escalation(
+                escalation_queue, merge_commit, cold
+            )
+            return
+        # Genuinely inconclusive: no parseable map AND not a recognised build
+        # failure (a transport/OOM/disk hiccup, or a cold PASS that ran nothing).
+        # Log WITH cold_passed + category so the swallowed cases are observable in
+        # the merge-worker logs (the plan deliberately keeps this off event_store —
+        # a new inconclusive EventType is out of scope for this task's locks).
+        logger.warning(
+            'Coarse shadow compare inconclusive for %s: cold FULL-gate produced '
+            'no parseable test results (cold_passed=%s, category=%r; possible '
+            'OOM/transport/disk hiccup in the throwaway worktree); not alarming',
+            merge_commit[:8], cold.passed, cold_cat,
+        )
+        return
+
+    if not cold.passed:
+        # Cold FULL-gate FAIL vs the warm-passed (implicit) map-less land: the
+        # landed commit may be RED on main.  Born-at-L2 suspected-red alarm.
+        _submit_coarse_shadow_divergence_escalation(
+            escalation_queue, merge_commit, cold
+        )
+    else:
+        # Cold FULL-gate PASS → coarse parity confirmed.  Emit verdict_parity_ok
+        # with coarse=True so downstream accounting can distinguish the coarse
+        # (suite-level) parity from the per-test path.
+        if event_store is not None:
+            event_store.emit(
+                EventType.verdict_parity_ok,
+                task_id=req.task_id,
+                data={
+                    'merge_commit': merge_commit,
+                    'shadow_compare': True,
+                    'coarse': True,
+                    'cold_test_count': len(cold_map),
+                },
+            )
+
+
 async def _maybe_schedule_shadow_compare(
     worker: SpeculativeMergeWorker,
     git_ops: GitOps,
@@ -1461,17 +1763,25 @@ async def _maybe_schedule_shadow_compare(
         event_store: Optional event store for parity-ok event emission.
     """
     # Reach-back (deferred import): the existing test suite patches the
-    # spawned coroutine by string path at
-    # orchestrator.merge_queue._run_shadow_compare (this function used to
-    # live in merge_queue.py, alongside its sibling).  Resolving it
-    # dynamically from merge_queue's namespace at call time keeps those
-    # patches effective post-extraction.
-    from orchestrator.merge_queue import _run_shadow_compare
+    # spawned coroutine(s) by string path at
+    # orchestrator.merge_queue._run_shadow_compare /
+    # orchestrator.merge_queue._run_coarse_shadow_compare (these functions used
+    # to live in merge_queue.py, alongside their siblings).  Resolving them
+    # dynamically from merge_queue's namespace at call time keeps those patches
+    # effective post-extraction.
+    from orchestrator.merge_queue import (
+        _run_coarse_shadow_compare,
+        _run_shadow_compare,
+    )
 
-    # Early exits: knob off or no warm results to compare against
+    # Early exit: knob off.
+    #
+    # FIX 2 (task 2886, PRD leaf δ §3.4): the historical ``if not warm_results:
+    # return`` early-exit is intentionally GONE.  A MAP-LESS land (empty
+    # warm_results) is exactly the trivial-pass / remote-verdict population that
+    # CAN diverge, so it must be sampled — it is routed to the COARSE
+    # suite-level compare below instead of being silently skipped.
     if not req.config.git.warm_verify_shadow_compare:
-        return
-    if not warm_results:
         return
     # None-safe: _shadow_state_path is None on bare-harness workers (mirrors the
     # escalation_queue None-safety / bare-harness contract in __init__).
@@ -1516,11 +1826,21 @@ async def _maybe_schedule_shadow_compare(
 
     # Spawn the shadow compare OFF the serial lane — this call returns IMMEDIATELY
     # without awaiting the cold verify (detective/async control, PRD §10 invariant 6(b)).
-    t = asyncio.create_task(
-        _run_shadow_compare(
+    #
+    # FIX 2 branch: a land WITH a per-test warm map uses the per-test
+    # _run_shadow_compare (unchanged); a MAP-LESS land (empty warm_results —
+    # trivial-pass or remote-verdict) degrades to the COARSE suite-level
+    # _run_coarse_shadow_compare, which runs a cold FULL-gate verify and
+    # compares its suite verdict against the warm-passed (implicit) land.
+    if warm_results:
+        compare_coro = _run_shadow_compare(
             git_ops, req, merge_commit, warm_results, escalation_queue, event_store
         )
-    )
+    else:
+        compare_coro = _run_coarse_shadow_compare(
+            git_ops, req, merge_commit, escalation_queue, event_store
+        )
+    t = asyncio.create_task(compare_coro)
 
     def _discard_task(task: asyncio.Task) -> None:  # type: ignore[type-arg]
         worker._shadow_compare_tasks.discard(task)

@@ -39,8 +39,8 @@ Where the two agree, `canonical in top-5` is reporting retrieval alone on that a
 | status_quo+pin | 0.78 | 0.90 | 0.54 | 0.54 | 3.00 (n=171/236) | 3832.8 | 1.00 | 0.00 (n=12/15) | 0.00 |
 | c_peers | 0.94 | 0.97 | 0.50 | 0.50 | 3.00 (n=154/236) | 1181.3 | 0.93 | 0.00 (n=12/15) | — |
 | c_peers+pin | 0.94 | 0.97 | 0.50 | 0.50 | 3.00 (n=154/236) | 1181.3 | 0.93 | 0.00 (n=12/15) | 0.00 |
-| b_grouped | 0.86 | 0.87 | 0.97 | 0.50 | 1.00 (n=232/236) | 1196.8 | 0.93 | 0.00 (n=12/15) | — |
-| b_grouped+pin | 0.86 | 0.87 | 0.97 | 0.50 | 1.00 (n=232/236) | 1203.3 | 0.93 | 0.00 (n=12/15) | 0.06 |
+| b_grouped | 0.86 | 0.87 | 0.97 | 0.50 | 1.00 (n=232/236) | 1196.4 | 0.93 | 0.00 (n=12/15) | — |
+| b_grouped+pin | 0.86 | 0.87 | 0.97 | 0.50 | 1.00 (n=232/236) | 1202.9 | 0.93 | 0.00 (n=12/15) | 0.06 |
 
 Token counts come from the `char-proxy:4-chars-per-token` estimator (recorded because a substituted estimator would otherwise be indistinguishable from a measured one).  Guard threshold: 0.92.  Distractor slab: 300 records, identical in every arm.
 
@@ -79,6 +79,47 @@ eval-design §5 E2 names claim recall and canonical/topic discoverability as DIS
 | b_grouped+pin | topic_phrasing | 60 | 0.93 | 0.97 | 0.93 | 0.77 | 1.00 (n=58/60) |
 | b_grouped+pin | held_out | 20 | 0.85 | 0.90 | 0.85 | 0.60 | 1.00 (n=18/20) |
 
+## Regrowth deltas
+
+One near-duplicate **re-emission** was injected per topic (20 topics, 1 injection each, from `fused-memory/tests/fixtures/e2_regrowth_injection.jsonl`) into the RATIFIED write shape `c_peers`, and only the READ arm was varied: `flat`, `additive_pin`, `promoting_pin`.  Each injected record restates that topic's canonical claim in different words — the organic pattern esc-3200-3 documents — and is scored as realizing the claim it re-emits, so claim recall can move in either direction rather than only fall.
+
+Two injection modes, because the write path's best case and the case actually observed are different.  **`unstamped`** carries no `topic` key at all, which is how every reify warm-lane re-emission arrived and is therefore the mode that models reality today; **`stamped`** carries the topic a stamping write path would have set.  The gap between their deltas is the second table.
+
+Baseline is the SAME read arm over the un-injected corpus — the rankings the decision table above is built from.  Two comparisons live in this table and they are NOT equally strong.  An arm-vs-arm comparison (three rows of one mode) carries no cross-seeding noise at all: all three arms are scored from ONE set of rankings, varying only the read transform.  A baseline-vs-after delta is weaker — its two sides are two separately seeded collections (the ratified arm's, and the injected pass's own), so it carries whatever a re-seeding contributes on top of the re-emission.
+
+The control for that is in this artifact rather than argued for. The `flat` row of the stamping table below compares two separately seeded INJECTED collections whose records carry byte-identical text and differ only in a `topic` metadata key a flat read never consults — so nothing but the seeding can move it, and it reads as the re-seeding noise floor at this corpus size.  In this run it came out as exactly `0.00` on every column, so at this corpus size a second seeding moved nothing any of these metrics can see. **No threshold is asserted on any delta here** (gate G6): the probe informs gate η and task 4006's stamping campaign, it does not gate a build.
+
+| mode | read arm | claim recall@5 | claim recall@10 | canonical in top-5 (stored) | median canonical rank (stored) | canonical found (stored) | canonical in top-5 (credited) | tokens/query |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| unstamped | flat | 0.94 → 0.94 (<0.01) | 0.97 → 0.98 (<0.01) | 0.50 → 0.49 (-0.01) | 3.00 → 3.00 (0.00) | 154 → 151 (-3.00) | 0.50 → 0.49 (-0.01) | 1181.29 → 1132.01 (-49.28) |
+| unstamped | additive_pin | 0.94 → 0.94 (<0.01) | 0.97 → 0.98 (<0.01) | 0.50 → 0.49 (-0.01) | 3.00 → 3.00 (0.00) | 154 → 151 (-3.00) | 0.50 → 0.49 (-0.01) | 1181.29 → 1132.01 (-49.28) |
+| unstamped | promoting_pin | 0.98 → 0.98 (-<0.01) | 1.00 → 0.99 (-<0.01) | 0.50 → 0.49 (-0.01) | 3.00 → 3.00 (0.00) | 154 → 151 (-3.00) | 0.99 → 0.99 (0.00) | 1070.27 → 1038.05 (-32.22) |
+| stamped | flat | 0.94 → 0.94 (<0.01) | 0.97 → 0.98 (<0.01) | 0.50 → 0.49 (-0.01) | 3.00 → 3.00 (0.00) | 154 → 151 (-3.00) | 0.50 → 0.49 (-0.01) | 1181.29 → 1132.01 (-49.28) |
+| stamped | additive_pin | 0.94 → 0.94 (<0.01) | 0.97 → 0.98 (<0.01) | 0.50 → 0.49 (-0.01) | 3.00 → 3.00 (0.00) | 154 → 151 (-3.00) | 0.50 → 0.49 (-0.01) | 1181.29 → 1132.01 (-49.28) |
+| stamped | promoting_pin | 0.98 → 0.98 (-<0.01) | 1.00 → 0.99 (-<0.01) | 0.50 → 0.49 (-0.01) | 3.00 → 3.00 (0.00) | 154 → 151 (-3.00) | 0.99 → 0.99 (0.00) | 1070.27 → 1034.92 (-35.36) |
+
+As measured in THIS run, per read arm (derived from the table above, not asserted):
+
+- `flat` regrowth: one re-emission per topic moves claim recall@5 by <0.01 unstamped / <0.01 stamped, and stored canonical-in-top-5 by -0.01 unstamped / -0.01 stamped.  Stamping every re-emission is worth 0.00 on claim recall@5 and 0.00 on stored canonical-in-top-5 under this arm.
+- `additive_pin` regrowth: one re-emission per topic moves claim recall@5 by <0.01 unstamped / <0.01 stamped, and stored canonical-in-top-5 by -0.01 unstamped / -0.01 stamped.  Stamping every re-emission is worth 0.00 on claim recall@5 and 0.00 on stored canonical-in-top-5 under this arm.
+- `promoting_pin` regrowth: one re-emission per topic moves claim recall@5 by -<0.01 unstamped / -<0.01 stamped, and stored canonical-in-top-5 by -0.01 unstamped / -0.01 stamped.  Stamping every re-emission is worth 0.00 on claim recall@5 and 0.00 on stored canonical-in-top-5 under this arm.
+
+**The signal sentence.**  Under the ratified `c_peers` write shape, one unstamped re-emission per topic gains <0.01 claim recall@5 and costs 0.01 stored canonical-in-top-5 on a flat read.  4004's selected transform (`promoting_pin`) moved the two arms in opposite directions — the flat read gains <0.01 while the selected transform costs <0.01 (<0.01 against -<0.01), so there was no flat-read cost for it to absorb on claim recall@5, and does not change it (-0.01, the same cost the flat read paid) on stored canonical-in-top-5.  Stamped, the same injection gains <0.01 and costs 0.01 on a flat read.
+
+Both `canonical in top-5` columns travel together and neither can be quoted without the other.  The `(stored)` trio is the SCORED discoverability — `topic_discoverability` over the RAW store hits, before any `read_path` — so it is scored by the TRUE canonical record id and never by an aliased one, which is what makes it readable as retrieval.  The `(credited)` column is what the reader was handed AFTER the read transform ran, and under `promoting_pin` it is a PLACEMENT property: the transform injects the canonical into the window, in exactly the way `apply_grouped_read`'s record-id aliasing did under `b_grouped`.  A credited column that holds while the stored one falls means the transform is masking regrowth at read time, not that retrieval survived it.
+
+### What topic-stamping buys
+
+`stamped delta - unstamped delta`, per read arm.  This is the number task 4006's stamping campaign is owed: the unstamped delta is what one re-emission costs today, the stamped delta is what it would cost if the write path stamped every re-emission, and the difference is what the campaign buys against regrowth ON THE ARMS THAT CAN EXPRESS ONE — which is not all three of them.  Read the paragraph below before reading the table.  Sign is the underlying column's: on recall and discoverability a positive value is cost recovered, on `tokens/query` it is not.
+
+**Two of these three rows are forced to `0.00` by construction, not by measurement.**  `flat` cannot express a stamping difference at all: the two modes emit byte-identical record TEXT and differ only in a `topic` metadata key, mem0 embeds the content, and a flat read consults no metadata — a metadata-blind read arm has nothing to read the stamp with.  `additive_pin` is forced to `0.00` wherever the read window is full: the pin APPENDS its canonical and the window budget truncates it straight back off, which is the same thing `pin changed window = 0.00` reports elsewhere in this artifact.  `promoting_pin` is the only arm that can express one, and its value is bounded from ABOVE, because arm (c) stamps `topic` on every peer — so the pin usually fires from a sibling rather than from the injection's own stamp, and the probe is measuring stamping value against a 100%-stamped corpus.  That is the INVERSE of the live corpus esc-3200-3 documents, where `count_memories_by_metadata(topic=…)` returned one stamped record for the whole topic.  So a `0.00` in this table reads as "this arm could not express a difference", NOT as "stamping is worth nothing", and task 4006's campaign is not scored by this table alone.
+
+| read arm | claim recall@5 | claim recall@10 | canonical in top-5 (stored) | median canonical rank (stored) | canonical found (stored) | canonical in top-5 (credited) | tokens/query |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| flat | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 |
+| additive_pin | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 |
+| promoting_pin | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | -3.13 |
+
 ## D10 — audit-recall over the labeled fixture
 
 Replay of `audit_duplicate_memories.find_near_duplicate_memory_groups` at threshold 0.85 over α/3130's curator-labeled fixture, scored against `calibrate_write_triage.build_pair_sets`.  **No threshold is asserted on this number** (gate G6): it informs how far to trust the κ duplicate sweep, it does not gate a build.
@@ -103,6 +144,8 @@ The **paraphrase band** is the positive pairs no character-level threshold can r
 
 **Blind authoring**: single-author-blind-to-metrics, mechanized by commit ordering: the arm decomposition and query set were committed before any metric function existed in the tree.  The commits below are the audit trail, and the anti-laziness floor is claim-coverage parity (every claim id realizable in every arm), deliberately not length parity — arm (a)'s long originals versus arm (c)'s short peers differ by construction, and that difference IS the tokens/query column.
 
+**Regrowth probe — not blind-authored**: the +1-re-emission probe does not carry the blind-authoring protection the six arms above do.  That protection was mechanized by commit ordering — the arm decomposition and query set were committed before any metric function existed in the tree — and it is UNRECOVERABLE for this probe, because the metric code was already in the tree when the injection corpus was authored.  The injection fixture was committed on its own, ahead of every line of probe code, as a PARTIAL audit trail and nothing more: it fixes WHAT was injected before any delta was seen, not before the metrics were written.  Its commit is in the fixture table below.  Read the regrowth section as a disclosed non-blind measurement, not as a blind one.
+
 **Embedder**: text-embedding-3-small.
 
 | fixture | commit |
@@ -112,3 +155,4 @@ The **paraphrase band** is the positive pairs no character-level threshold can r
 | `fused-memory/tests/fixtures/e2_arm_claims.jsonl` | 55a9218a4c5809cad828db65781b1bd7389dff94 |
 | `fused-memory/tests/fixtures/e2_query_set.jsonl` | 8972e9b17c746b7ec7cc377971cbc41fc25ad3d1 |
 | `fused-memory/tests/fixtures/e2_distractor_slab.jsonl` | 6b4809ec138e8ae04c810bffbab4728b6c1d395d |
+| `fused-memory/tests/fixtures/e2_regrowth_injection.jsonl` | 302d6f3690596eb98eefe370058a4bc6698c1fe6 |

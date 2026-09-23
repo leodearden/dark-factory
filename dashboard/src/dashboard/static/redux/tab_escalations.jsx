@@ -1,17 +1,27 @@
 /* Escalations tab — read-only queue view.
  *
- * No JS test runner in this project (see scheduler_drawer.jsx comment).
- * Wiring contracts are verified via Python source-assertion tests in
- * dashboard/tests/test_tab_escalations.py.
+ * No JS test runner for .jsx in this project (see scheduler_drawer.jsx
+ * comment) — but the pure decisions lifted OUT of this file are covered
+ * by `node --test` under dashboard/tests/js/. Wiring contracts are
+ * verified via Python tests in dashboard/tests/test_tab_escalations.py.
  *
  * Load order: tabs.jsx → tab_escalations.jsx → app.jsx
  * Export:     window.DF_TABS.EscalationsTab  (additive mutation of the object
  *             created by tabs.jsx; app.jsx destructures it last)
  */
 const { useState: uS, useEffect: uE } = React;
-const { ProjectGroup, taskId } = window.DF_SHELL;
+const { ProjectGroup, Pip, taskId } = window.DF_SHELL;
 const DF = window.DF_DATA;
 const C = window.DF_CHARTS;
+const { pinningSummary } = window.DF_PINS_RECOVERY;
+// The Datum wrappers. Module scope, no fallback — see the CANONICAL note in
+// datum.js's header.
+const { plainDatum, derivedDatum } = window.DF_DATUM;
+
+// Every number this tab renders arrives on one endpoint, and the path is the
+// lookup key into DF_DATA.__receipt (data.js keys one receipt per polled
+// endpoint by its URL with the query stripped).
+const EP_ESCALATIONS = '/api/v2/dashboard/escalations';
 
 // ── Cross-tab focus helpers (module scope) ──
 //
@@ -224,9 +234,10 @@ function sliceDailyByWindow(dailyObj, cutoff) {
   return out;
 }
 
-// ── EscalationStatStrip — four-tile summary (benign rate, 6h breaches,
-//    esc/done, churn), reading the ESCALATION_ANALYTICS payload already
-//    wired into DF_DATA by the analytics tab (no duplicated computation) ──
+// ── EscalationStatStrip — five-tile summary (benign rate, 6h breaches,
+//    esc/done, churn, pinning), reading the ESCALATION_ANALYTICS payload
+//    already wired into DF_DATA by the analytics tab (no duplicated
+//    computation) ──
 
 function EscalationStatStrip({ analytics, projectFilter }) {
   const a = analytics || DF.ESCALATION_ANALYTICS;
@@ -289,6 +300,15 @@ function EscalationStatStrip({ analytics, projectFilter }) {
   }
   const breachCount = openItems.filter(item => item.breach_6h).length;
 
+  // (b2) pinning — same live open_items array, no extra payload. Truthiness,
+  // never an equality test: the backend OMITS pins_recovery when it could not
+  // compute the annotation, so `item.pins_recovery === false` would count an
+  // unclassified item as "does not pin". Unknown simply falls out of the count.
+  // That rule lives in pins_recovery.js, shared with the analytics tab's chip
+  // so the two surfaces cannot disagree, and covered by
+  // dashboard/tests/js/pins_recovery.test.mjs.
+  const { count: pinningCount, pinnedTaskCount } = pinningSummary(openItems);
+
   // (c) esc-per-done — aggregate ratio sum(filings)/sum(done) over the
   // WINDOWED rows, NOT a mean of daily ratios (undefined/biased on
   // low-volume or done==0 days). Also builds a per-date map (summed across
@@ -344,27 +364,35 @@ function EscalationStatStrip({ analytics, projectFilter }) {
     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 10, marginBottom: 10 }}>
       <C.StatTile
         label="benign rate"
-        value={benignRate != null ? `${Math.round(benignRate * 100)}%` : '—'}
+        datum={derivedDatum(benignRate, EP_ESCALATIONS, 'no classified filings in this window')}
+        format={rate => `${Math.round(rate * 100)}%`}
         hint={stampedPct != null ? `${stampedPct}% stamped` : undefined}
-        spark={benignSpark}
+        history={benignSpark}
         sparkColor={C.PALETTE.ok}
       />
       <C.StatTile
         label="6h breaches"
-        value={breachCount}
+        datum={plainDatum(breachCount, EP_ESCALATIONS)}
         hint={`of ${openItems.length} pending`}
       />
       <C.StatTile
         label="esc / done"
-        value={escPerDone != null ? escPerDone.toFixed(2) : '—'}
-        spark={epdSpark}
+        datum={derivedDatum(escPerDone, EP_ESCALATIONS, 'no tasks completed in this window')}
+        format={ratio => ratio.toFixed(2)}
+        history={epdSpark}
         sparkColor={C.PALETTE.accent}
       />
       <C.StatTile
         label="churn 24h"
-        value={churnRate != null ? `${Math.round(churnRate * 100)}%` : '—'}
-        spark={churnSpark}
+        datum={derivedDatum(churnRate, EP_ESCALATIONS, 'no filings in this window')}
+        format={rate => `${Math.round(rate * 100)}%`}
+        history={churnSpark}
         sparkColor={C.PALETTE.bad}
+      />
+      <C.StatTile
+        label="pinning"
+        datum={plainDatum(pinningCount, EP_ESCALATIONS)}
+        hint={`blocking ${pinnedTaskCount} task${pinnedTaskCount === 1 ? '' : 's'}`}
       />
     </div>
   );
@@ -566,15 +594,15 @@ function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
 
         const summary = (
           <>
-            <span className="pip" style={{ fontSize: 10 }}>{secByStatus.pending || 0} pending</span>
+            <Pip datum={plainDatum(secByStatus.pending, EP_ESCALATIONS)} label="pending" />
             {(secByLevel[1] || 0) > 0 && (
-              <span className="pip"><span className="badge warn" style={{ fontSize: 9 }}>L1 · {secByLevel[1]}</span></span>
+              <Pip datum={plainDatum(secByLevel[1], EP_ESCALATIONS)} badge="warn" format={n => `L1 · ${n}`} />
             )}
             {(secByLevel[2] || 0) > 0 && (
-              <span className="pip"><span className="badge bad" style={{ fontSize: 9 }}>L2 · {secByLevel[2]}</span></span>
+              <Pip datum={plainDatum(secByLevel[2], EP_ESCALATIONS)} badge="bad" format={n => `L2 · ${n}`} />
             )}
             {skipped.length > 0 && (
-              <span className="pip"><span className="badge bad" style={{ fontSize: 9 }}>{skipped.length} unreadable</span></span>
+              <Pip datum={plainDatum(skipped.length, EP_ESCALATIONS)} badge="bad" label="unreadable" />
             )}
             <span className="mono" style={{ color: 'var(--fg-3)', fontSize: 10 }}>{sec.kind}</span>
           </>

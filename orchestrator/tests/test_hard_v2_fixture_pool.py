@@ -210,6 +210,26 @@ class TestCandidatesBlock:
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
+# The availability summary — derived from the rows, never hand-authored
+# ---------------------------------------------------------------------------
+
+class TestMergeShaAvailability:
+    def test_availability_block_is_derived_from_the_committed_rows(
+        self, manifest: dict,
+    ) -> None:
+        # Total equality against the SHARED derivation: no number and no claim
+        # in the committed summary can disagree with the rows it summarises.
+        # Substring checks could not carry this — the shipped block said
+        # "22/41" and "17 of 41" (which do not even sum to their own stated
+        # denominator) beside rows reading referenced=20, planrate_only=19
+        # over 39 included candidates, and called the SPLIT set a MAJORITY
+        # when it is now the smaller of the two.
+        driver = _load_driver()
+        assert manifest['merge_sha_availability'] == \
+            driver.merge_sha_availability_block(manifest['candidates'])
+
+
+# ---------------------------------------------------------------------------
 # The ceilings block — derived and shown not to bind, never guessed
 # ---------------------------------------------------------------------------
 
@@ -291,7 +311,11 @@ class TestCurationMdIsGenerated:
                 f'candidate {c["project"]}/{c["task_id"]} is missing from the table'
             )
 
-    def test_records_the_split_majority_finding(self, manifest: dict) -> None:
+    def test_renders_the_availability_finding(self, manifest: dict) -> None:
+        # Round-trip only: the derived sentence reaches the human artifact.
+        # Its SEMANTICS are carried by
+        # TestMergeShaAvailability::test_availability_block_is_derived_from_the_committed_rows
+        # — substring presence could never check that the sentence is true.
         text = CURATION_MD.read_text()
         assert manifest['merge_sha_availability']['finding'] in text
 
@@ -457,6 +481,116 @@ class TestMintedPool:
         rec = next(f for f in pool if f['id'] == 'reify_task_3586')
         assert rec['provenance']['task_status'] == 'cancelled'
         assert rec['verify_outcome']['passed'] is not True
+
+
+    def test_every_fixture_declares_base_approximation(
+        self, pool: list[dict],
+    ) -> None:
+        # A readout that cannot tell a true branch point from a guess silently
+        # averages the two together. Only `merge_first_parent` (and a
+        # continuity base MEASURED equal to M^1) is the real thing; everything
+        # else must SAY it is an approximation so a readout can exclude it.
+        for f in pool:
+            prov = f['provenance']
+            flag = prov.get('base_is_approximated')
+            assert isinstance(flag, bool), \
+                f'{f["id"]}: base_is_approximated is {flag!r}, not a bool'
+            if flag:
+                assert prov.get('base_approximation_reason', '').strip(), \
+                    f'{f["id"]}: approximated with no reason'
+
+    def test_no_landed_gate_claim_rests_on_an_unmeasured_premise(
+        self, pool: list[dict],
+    ) -> None:
+        # `{source: 'landed', passed: true}` asserts "the task merged to main
+        # => its gates passed at the post commit". Every fixture making that
+        # claim must carry the MEASUREMENT that establishes it, not just the
+        # claim — the continuity path has always done so, and the referenced
+        # path must too, since a reader of the JSON cannot see how the merge
+        # was resolved.
+        for f in pool:
+            outcome = f.get('verify_outcome') or {}
+            if outcome.get('source') != 'landed':
+                continue
+            reachable = f['provenance'].get('post_commit_reachable_from_main')
+            assert reachable is True, (
+                f'{f["id"]} claims verify_outcome {outcome.get("source")!r} '
+                f'with passed={outcome.get("passed")!r} but records '
+                f'post_commit_reachable_from_main={reachable!r}'
+            )
+
+    def test_merge_derived_bases_are_not_marked_approximated(
+        self, pool: list[dict],
+    ) -> None:
+        for f in pool:
+            if f['provenance']['baseline_source'] == 'merge_first_parent':
+                assert f['provenance']['base_is_approximated'] is False, f['id']
+
+    def test_reference_unavailable_only_when_no_landing_merge_exists(
+        self, pool: list[dict],
+    ) -> None:
+        # The DEFECT-2 invariant. A fixture may only claim its reference is
+        # unavailable when no single landing merge exists under EITHER
+        # accepted subject spelling — the same check that produced the claim.
+        driver = _load_driver()
+        checked = 0
+        for f in pool:
+            if 'reference_unavailable' not in f['provenance']:
+                continue
+            root = Path(f['project_root'])
+            if not (root / '.git').exists():
+                # `continue`, NOT `pytest.skip`: skipping from inside the loop
+                # aborts the whole test at the first absent checkout and
+                # discards the assertions already made for the checkouts that
+                # ARE present — so on a machine with reify but not know-live,
+                # the reify invariant would silently stop being checked while
+                # the test reported as skipped.
+                continue
+            task_id = f['id'].split('_task_', 1)[1]
+            assert driver.find_merge_sha(root, task_id) is None, (
+                f'{f["id"]} claims reference_unavailable but a single landing '
+                f'merge resolves in {root}'
+            )
+            checked += 1
+        if checked == 0:
+            # Only now is "nothing was checkable" the honest report: no
+            # fixture's source checkout is present on this machine.
+            pytest.skip(
+                'no reference_unavailable fixture has its source checkout on '
+                'this machine, so the invariant could not be measured'
+            )
+
+    def test_task_4026_resolves_its_landing_merge(
+        self, pool: list[dict],
+    ) -> None:
+        # Acceptance criterion 3, pinned by name: reify_task_4026's landing
+        # merge is 3613bea224, spelled with a colon, and was invisible to the
+        # single-spelling matcher.
+        by_id = {f['id']: f for f in pool}
+        fixture = by_id['reify_task_4026']
+        assert 'reference_unavailable' not in fixture['provenance']
+        assert fixture.get('reference'), 'reify_task_4026 carries no reference'
+        assert fixture['provenance']['merge_sha'].startswith('3613bea224')
+        assert fixture['provenance']['baseline_source'] == 'merge_first_parent'
+        assert fixture['provenance']['base_is_approximated'] is False
+
+
+def _load_driver():
+    """Import ``scripts/mint_hard_v2_fixtures.py`` by path (not a package).
+
+    Same loader shape as ``test_mint_hard_v2_driver.py``: the pool invariants
+    below must be checked with the SAME matcher that stamped the claims, not
+    with a second copy that could drift from it.
+    """
+    import importlib.util
+    import sys
+    path = REPO_ROOT / 'scripts' / 'mint_hard_v2_fixtures.py'
+    spec = importlib.util.spec_from_file_location('mint_hard_v2_fixtures', path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def _mint_modes(manifest: dict) -> dict[str, str]:

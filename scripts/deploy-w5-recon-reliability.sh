@@ -144,8 +144,38 @@ echo -n "Waiting for recon-serving marker..."
 deadline=$((SECONDS + RECON_VERIFY_TIMEOUT))
 serving=false
 while [[ $SECONDS -lt $deadline ]]; do
-    if journalctl --user -u "$SERVICE" --since "@${restart_start}" --no-pager -q 2>/dev/null \
-            | grep -q "$RECON_MARKER"; then
+    # Verdict read from the captured JOURNAL, not from the pipeline's status.
+    # `journalctl ... | grep -q "$RECON_MARKER"` answers with the PRODUCER's
+    # status under `pipefail`, so this gate timed out on a journal that plainly
+    # CARRIED the marker -- failing a deploy whose service is in fact serving
+    # reconciliation. Two ways it happened: journalctl exiting non-zero for its
+    # own reasons after printing the marker, and SIGPIPE, because `grep -q`
+    # exits on its first match and closes the read end under a producer still
+    # streaming. Journal size is not a defence: a short journal is a low-rate
+    # flake, not a safe site.
+    #
+    # `|| true` is load-bearing, and is stated here rather than
+    # back-referenced because this script has no sibling site carrying the
+    # argument. Without it the assignment is a SIMPLE COMMAND, so `set -e`
+    # aborts the deploy the moment journalctl is unavailable, where the old
+    # pipeline merely kept polling to its own timeout. It must NOT be
+    # `|| _journal=""`, which discards a journal the producer did write and so
+    # preserves the bug, and no pipeline is reintroduced to do the match --
+    # bash's own printf can take EPIPE too, which is the same defect one step
+    # removed.
+    #
+    # THE MATCH NARROWS FROM REGEX TO LITERAL, deliberately. `grep -q` treated
+    # RECON_MARKER as a POSIX BRE; `[[ ... == *"$RECON_MARKER"* ]]` with the
+    # RHS QUOTED is a literal substring test. That is intended: this script's
+    # own header documents RECON_MARKER as a "journal substring", the default
+    # value contains no regex metacharacter so the shipped behaviour is
+    # byte-identical, and RECON_MARKER is an operator-settable env override --
+    # literal matching removes a regex-injection surface on a knob nobody
+    # documented as a regex. The QUOTING is separately load-bearing: an
+    # UNQUOTED RHS would make the marker a GLOB pattern, a third behaviour and
+    # worse than either.
+    _journal="$(journalctl --user -u "$SERVICE" --since "@${restart_start}" --no-pager -q 2>/dev/null)" || true
+    if [[ "$_journal" == *"$RECON_MARKER"* ]]; then
         serving=true
         break
     fi

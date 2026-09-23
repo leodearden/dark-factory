@@ -38,38 +38,23 @@ escaped.
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import json
+import logging
+import sqlite3
 import sys
-import types
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from _fm_helpers import load_script_module
+from _store_mutation_preflight_contract import SENTINEL, deny, neutralise_fixture
 
 from fused_memory.models import SourceStore
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'sweep_toolcall_xml_leak.py'
 
-
-def _load_module() -> types.ModuleType:
-    """Load sweep_toolcall_xml_leak.py from its file path."""
-    mod_name = 'sweep_toolcall_xml_leak'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='sweep_toolcall_xml_leak')
 
 _BODY = 'The merge worker consumes the stash stack in project_root.'
 
@@ -285,18 +270,67 @@ class TestResolveExitCode:
         success would make a silently partial sweep look complete."""
         assert _mod.resolve_exit_code(self._report(dry_run=False, truncated=True)) != 0
 
-    @pytest.mark.parametrize('flag', [
-        'content_lost_in_flight',
-        'skipped_not_mem0_routed',
-        'skipped_metadata_would_be_rejected',
-        'record_error',
-    ])
+    # Sourced from the script's own export, not re-typed, so this parametrize
+    # set cannot silently drift from what resolve_exit_code() actually acts on
+    # (task 3738; see also test_toolcall_xml_leak_sweep_artifacts.py's
+    # TestDangerFlagsBindTheProductionVocabulary, which binds the same constant).
+    @pytest.mark.parametrize('flag', _mod.HUMAN_ADJUDICATION_FLAGS)
     def test_every_per_record_failure_flag_exits_non_zero(self, flag):
         """Each of these leaves a record a human still has to adjudicate, so
         none of them may be reported as a clean sweep."""
         report = self._report(dry_run=False, records=[{'id': 'x', flag: True}])
 
         assert _mod.resolve_exit_code(report) != 0
+
+    # The parametrize above pins the CONSUMERS of HUMAN_ADJUDICATION_FLAGS; the
+    # pair below pins the PRODUCER — that resolve_exit_code() actually iterates
+    # the shared constant instead of keeping a private inline copy of the same
+    # four names. Without this, a regression that declared the constant but
+    # reverted the predicate to a hand-inlined or-chain would stay green,
+    # reinstating the very drift hazard task 3738 exists to remove.
+    #
+    # A monkeypatched synthetic fifth name is the probe rather than an
+    # inspect.getsource tripwire: the constant is looked up in module globals at
+    # call time, inside the function body, so patching the module attribute is a
+    # genuine RUNTIME observation of what the predicate reads. (Source-reading
+    # tripwires were deliberately removed from this suite as brittle —
+    # da8e5a4c96; see test_tool_errors.py, test_stages.py, test_mem0_tombstone.py,
+    # test_bulk_reset_guard.py.)
+    _SYNTHETIC_FLAG = 'synthetic_fifth_outcome'
+
+    def test_resolve_exit_code_reads_the_shared_flag_constant(self, monkeypatch):
+        """Grow HUMAN_ADJUDICATION_FLAGS by one name and the predicate must
+        honour it immediately.
+
+        An implementation that iterates the constant picks the new name up for
+        free; a hand-inlined or-chain ignores it and returns 0, which is exactly
+        the silent-green failure this test exists to catch."""
+        monkeypatch.setattr(
+            _mod,
+            'HUMAN_ADJUDICATION_FLAGS',
+            (*_mod.HUMAN_ADJUDICATION_FLAGS, self._SYNTHETIC_FLAG),
+        )
+        report = self._report(
+            dry_run=False, records=[{'id': 'x', self._SYNTHETIC_FLAG: True}]
+        )
+
+        assert _mod.resolve_exit_code(report) != 0
+
+    def test_an_unlisted_record_key_does_not_by_itself_fail_the_sweep(self):
+        """Negative control for the test above, and the reason it MEASURES the
+        constant.
+
+        With HUMAN_ADJUDICATION_FLAGS unpatched, the identical report exits 0 —
+        so the non-zero exit there came from the patched vocabulary and not from
+        a catch-all that treats any truthy record key as danger. Records legally
+        carry plenty of unrelated truthy keys (``repaired``, ``id``, ...), and
+        none of them is a human-adjudication outcome."""
+        assert self._SYNTHETIC_FLAG not in _mod.HUMAN_ADJUDICATION_FLAGS
+        report = self._report(
+            dry_run=False, records=[{'id': 'x', self._SYNTHETIC_FLAG: True}]
+        )
+
+        assert _mod.resolve_exit_code(report) == 0
 
 
 class TestBuildParser:
@@ -363,6 +397,29 @@ def _match(memory_id: str, content: str, *, payload: dict | None = None, **paylo
     }
 
 
+# The collection name a post-fix ``scan_memory_content`` reports (task 3243).
+# Realistic: ``Scope(project_id='dark_factory').mem0_collection_name('fused')``.
+_SCANNED_COLLECTION = 'fused_dark_factory'
+
+
+class _OmitKey:
+    """Type of the ``_OMIT_KEY`` sentinel below.
+
+    A dedicated class rather than a bare ``object()`` so ``_service`` can
+    annotate ``collection`` as "a collection name OR the omit sentinel". Left
+    as ``object()`` the parameter has no annotation to carry, so its type is
+    inferred from its ``str`` default and every omit-key call site is a
+    ``reportArgumentType`` error.
+    """
+
+
+# Distinguishes "the scan returned collection=''" from "the scan returned no
+# collection key at all" — the shape EVERY pre-3243 backend returned, and the
+# one whose silent ``.get(..., '')`` default put a blank field into two
+# committed live artifacts. A plain None default would collapse the two.
+_OMIT_KEY = _OmitKey()
+
+
 def _ok_response(**overrides) -> SimpleNamespace:
     """A REALISTIC successful ``MemoryService.add_memory`` response.
 
@@ -384,7 +441,13 @@ def _ok_response(**overrides) -> SimpleNamespace:
 
 
 def _service(
-    matches, *, scanned=None, truncated=False, enforce=False, enforce_kind_registry=False
+    matches,
+    *,
+    scanned=None,
+    truncated=False,
+    enforce=False,
+    enforce_kind_registry=False,
+    collection: str | _OmitKey = _SCANNED_COLLECTION,
 ) -> AsyncMock:
     """An AsyncMock ``MemoryService`` for the sweep.
 
@@ -395,6 +458,11 @@ def _service(
     silently turn every repair test into a skip. Both default to the SHIPPED
     defaults (warn-mode, kind registry not enforced), so the mock matches what a
     live sweep would actually see today.
+
+    ``collection`` defaults to a realistic name so every test here exercises
+    the POST-fix scan shape (task 3243 made ``scan_payload_text`` report the
+    collection it walked). Pass ``_OMIT_KEY`` to model the pre-fix backend that
+    returned no such key at all.
     """
     service = AsyncMock()
     service.config = SimpleNamespace(
@@ -402,15 +470,26 @@ def _service(
             enforce=enforce, enforce_kind_registry=enforce_kind_registry
         )
     )
-    service.scan_memory_content = AsyncMock(
-        return_value={
-            'matches': matches,
-            'scanned': len(matches) if scanned is None else scanned,
-            'truncated': truncated,
-        }
-    )
+    scan_result: dict[str, object] = {
+        'matches': matches,
+        'scanned': len(matches) if scanned is None else scanned,
+        'truncated': truncated,
+    }
+    if collection is not _OMIT_KEY:
+        scan_result['collection'] = collection
+    service.scan_memory_content = AsyncMock(return_value=scan_result)
     service.delete_memory = AsyncMock(return_value={'deleted': True})
     service.add_memory = AsyncMock(return_value=_ok_response())
+    # Stubbed EXPLICITLY rather than left to AsyncMock's auto-attribute, whose
+    # return value is a truthy child mock that happens to read as "the point
+    # survived". The delete-landed probe (task 3243) turns that value into an
+    # ADJUDICATION, so the tests that depend on it must assert against a stated
+    # stub. The default is the conservative one — a live point, i.e. the delete
+    # did NOT land, i.e. nothing was destroyed — so a test only sees a
+    # content-lost verdict when it deliberately arranges one.
+    service.get_memory_by_id = AsyncMock(
+        return_value={'id': 'surviving-point', 'content': _BODY, 'metadata': {}}
+    )
     return service
 
 
@@ -430,24 +509,16 @@ def _record_for(report: dict, memory_id: str) -> dict:
     return next(r for r in report['records'] if r['id'] == memory_id)
 
 
-@pytest.fixture(autouse=True)
-def _neutralise_store_mutation_preflight(monkeypatch):
-    """Keep this MOCK-unit suite independent of the REAL ``~/.mem0``.
-
-    ``run(..., apply=True)`` now runs a fail-closed capability preflight before
-    it scans (task 3686). That probe touches the real filesystem, so without
-    this fixture every ``--apply`` test would pass or fail according to whether
-    the machine running pytest happens to be able to write mem0's history
-    directory — and it genuinely cannot inside an agent sandbox, which is the
-    whole reason the guard exists. This suite is deliberately MOCK-unit (an
-    AsyncMock service, no live Qdrant), so the environment must not be an
-    input to it.
-
-    ``TestRunApplyStoreMutationPreflight`` re-rigs this per test — to refuse,
-    to record, or to pass — so the guard's own behaviour is still pinned
-    explicitly rather than assumed away.
-    """
-    monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+_neutralise = neutralise_fixture(
+    _mod,
+    note="""``run(..., apply=True)`` runs the preflight before it scans (task
+    3686 -- this is the script whose half-completed sandboxed ``--apply`` run
+    is the incident the guard exists to prevent). This suite is deliberately
+    MOCK-unit (an AsyncMock service, no live Qdrant).
+    ``TestRunApplyStoreMutationPreflight`` re-rigs this per test -- to refuse,
+    to record, or to pass -- so the guard's own behaviour is still pinned
+    explicitly rather than assumed away.""",
+)
 
 
 class TestRunDiscovery:
@@ -497,6 +568,91 @@ class TestRunDiscovery:
 
         with pytest.raises(TimeoutError):
             await _mod.run(_args(), service)
+
+
+class TestRunReportsWhichCollectionItSwept:
+    """A report that does not say WHICH collection it swept is not a
+    measurement of that collection (task 3243).
+
+    ``run`` reads ``collection`` off the scan result with a ``.get(..., '')``
+    default. That silent default is how a whole authoritative 21,089-point
+    live ``--apply`` run emitted a blank field unnoticed: the backend never
+    returned the key, and nothing anywhere said so. Two committed artifacts
+    under ``docs/toolcall-xml-leak-sweep-2026-08-05/`` still carry
+    ``"collection": ""`` as a result.
+
+    Fixing the missing key upstream closes that instance; making the
+    blankness LOUD closes the class. It stays a warning rather than a raise
+    because the sweep's overriding promise is that the report always survives
+    — for a ``content_lost_in_flight`` record it is the only copy of the
+    original text — so a cosmetic metadata gap must never be able to abort a
+    run or break a stubbed service.
+    """
+
+    @staticmethod
+    def _blank_warnings(caplog) -> list[str]:
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno >= logging.WARNING and 'collection' in str(r.msg)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_reported_collection_is_carried_verbatim_and_says_nothing(self, caplog):
+        service = _service([_match('a', _BODY)], collection='fused_dark_factory')
+
+        with caplog.at_level(logging.WARNING):
+            report = await _mod.run(_args(), service)
+
+        assert report['collection'] == 'fused_dark_factory'
+        assert self._blank_warnings(caplog) == [], caplog.text
+
+    @pytest.mark.asyncio
+    async def test_a_missing_collection_key_is_warned_about_not_swallowed(self, caplog):
+        """The pre-3243 backend shape: no ``collection`` key at all."""
+        service = _service([_match('a', _BODY)], collection=_OMIT_KEY)
+
+        with caplog.at_level(logging.WARNING):
+            report = await _mod.run(_args(), service)
+
+        warnings = self._blank_warnings(caplog)
+        assert warnings, caplog.text
+        assert any('sweep_toolcall_xml_leak' in w for w in warnings), warnings
+        # The report still survives, degraded rather than absent.
+        assert report['collection'] == ''
+
+    @pytest.mark.asyncio
+    async def test_a_blank_collection_string_is_warned_about_too(self, caplog):
+        """A key present but empty is the same unusable answer as no key —
+        this is what the two committed 2026-08-05 artifacts actually contain."""
+        service = _service([_match('a', _BODY)], collection='')
+
+        with caplog.at_level(logging.WARNING):
+            report = await _mod.run(_args(), service)
+
+        assert self._blank_warnings(caplog), caplog.text
+        assert report['collection'] == ''
+
+    @pytest.mark.asyncio
+    async def test_a_blank_collection_never_raises_so_a_stub_cannot_abort_a_run(self):
+        """The report is the only copy of a lost record's original text, so it
+        must survive a service that reports no collection at all."""
+        service = _service([_match('b', _TAIL_LEAK)], collection=_OMIT_KEY)
+
+        report = await _mod.run(_args(apply=True), service)
+
+        assert _record_for(report, 'b')['repaired'] is True
+        assert report['collection'] == ''
+
+    @pytest.mark.asyncio
+    async def test_a_blank_collection_does_not_change_the_exit_code(self):
+        """A cosmetic provenance gap is NOT a corpus-coverage failure. Only
+        truncation, manual_review, and the human-adjudication flags are."""
+        service = _service([_match('b', _TAIL_LEAK)], collection=_OMIT_KEY)
+
+        report = await _mod.run(_args(apply=True), service)
+
+        assert _mod.resolve_exit_code(report) == 0
 
 
 class TestRunDryRun:
@@ -800,6 +956,383 @@ class TestReaddPersistedPredicate:
         """The predicate is compared via ``getattr(s, 'value', s)`` so a mock or
         a plain ``'mem0'`` str reads the same as the real StrEnum member."""
         assert _mod.readd_persisted(_ok_response(stores_written=['mem0']))[0] is True
+
+
+class TestProbeDeleteLanded:
+    """``probe_delete_landed(service, project_id, memory_id) -> (bool|None, note)``.
+
+    The measured 7d073281 incident (task 3243, ``investigation.md`` §4): the
+    traceback landed INSIDE ``delete_memory`` — mem0 removes the Qdrant point
+    BEFORE writing its SQLite history — so the delete HAD landed while the
+    report said ``record_error`` / "unknown". The runbook's remedy for exactly
+    that cell is a READ-ONLY id lookup, and the runbook says the check "is not
+    optional — it is what established the delete had landed". This probe
+    automates the step the operator was already told to perform.
+
+    It MEASURES rather than infers. Sniffing the exception's type or message
+    for ``sqlite3.OperationalError`` / "readonly database" would encode mem0's
+    internal delete-then-write-history ORDERING as a string match in a repair
+    script, and would mis-attribute silently the day mem0 reorders those two
+    halves.
+
+    The verdict is deliberately THREE-valued. Collapsing "the probe could not
+    answer" into either verdict just re-creates the defect pointing the other
+    way: claiming content-lost on no evidence sends an operator to hand-restore
+    a record that is still live (producing a duplicate), and claiming the
+    delete did not land hides a real loss.
+    """
+
+    @staticmethod
+    def _probe_service(**overrides) -> AsyncMock:
+        service = _service([])
+        for name, value in overrides.items():
+            setattr(service, name, value)
+        return service
+
+    @pytest.mark.asyncio
+    async def test_a_genuine_not_found_means_the_delete_landed(self):
+        """``get_memory_by_id`` returns ``None`` ONLY on a genuine not-found —
+        it propagates a read timeout rather than collapsing it into ``None``,
+        which is the whole reason that ``None`` can be trusted as evidence."""
+        service = self._probe_service(get_memory_by_id=AsyncMock(return_value=None))
+
+        landed, note = await _mod.probe_delete_landed(service, 'dark_factory', 'm-1')
+
+        assert landed is True
+        assert note
+
+    @pytest.mark.asyncio
+    async def test_a_surviving_point_means_the_delete_did_not_land(self):
+        service = self._probe_service(
+            get_memory_by_id=AsyncMock(return_value={'id': 'm-1', 'content': _TAIL_LEAK})
+        )
+
+        landed, note = await _mod.probe_delete_landed(service, 'dark_factory', 'm-1')
+
+        assert landed is False
+        assert note
+
+    @pytest.mark.parametrize(
+        'exc', [TimeoutError('qdrant read timed out'), RuntimeError('transport exploded')]
+    )
+    @pytest.mark.asyncio
+    async def test_a_raising_probe_is_unknown_and_never_propagates(self, exc):
+        """An escaping probe would replace the caller's ORIGINAL delete error
+        with its own, destroying the very fact a human needs most."""
+        service = self._probe_service(get_memory_by_id=AsyncMock(side_effect=exc))
+
+        landed, note = await _mod.probe_delete_landed(service, 'dark_factory', 'm-1')
+
+        assert landed is None
+        assert note
+
+    @pytest.mark.asyncio
+    async def test_a_service_without_the_method_is_unknown_not_a_crash(self):
+        """Same fail-safe for a stub or an older service: unanswerable stays
+        unanswered rather than being collapsed into a verdict."""
+        service = self._probe_service()
+        del service.get_memory_by_id
+
+        landed, note = await _mod.probe_delete_landed(service, 'dark_factory', 'm-1')
+
+        assert landed is None
+        assert note
+
+    @pytest.mark.asyncio
+    async def test_the_probe_is_read_only_and_addresses_this_run_and_record(self):
+        """It runs at the worst possible moment — right after a delete raised —
+        so it must not be able to mutate anything further."""
+        service = self._probe_service(get_memory_by_id=AsyncMock(return_value=None))
+
+        await _mod.probe_delete_landed(service, 'reify', 'm-42')
+
+        service.get_memory_by_id.assert_awaited_once()
+        # Tolerant of positional or keyword calling: MemoryService's signature
+        # is (project_id, memory_id) and either spelling is correct.
+        call = service.get_memory_by_id.await_args
+        addressed = {**dict(zip(('project_id', 'memory_id'), call.args, strict=False)), **call.kwargs}
+        assert addressed == {'project_id': 'reify', 'memory_id': 'm-42'}
+        service.delete_memory.assert_not_awaited()
+        service.add_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_every_verdict_carries_a_non_empty_note(self):
+        """The note is what a human reads in the report to see HOW the verdict
+        was reached — a blank one would make the field unauditable, which is
+        the same defect as a blank ``collection``."""
+        cases = [
+            AsyncMock(return_value=None),
+            AsyncMock(return_value={'id': 'm-1'}),
+            AsyncMock(side_effect=TimeoutError('boom')),
+        ]
+        for stub in cases:
+            service = self._probe_service(get_memory_by_id=stub)
+            _, note = await _mod.probe_delete_landed(service, 'dark_factory', 'm-1')
+            assert note.strip()
+
+
+class TestRunApplyAdjudicatesARaisedDelete:
+    """A delete that RAISED while the point is actually gone is a content loss,
+    not an unknown — the measured 7d073281 regression (task 3243).
+
+    Before this, ``delete_memory`` sat OUTSIDE any ``try`` in
+    ``_repair_record``, so a raise unwound to ``run()``'s per-record catch-all
+    and became ``record_error`` — documented as "whether that record's delete
+    landed is UNKNOWN". On the real 2026-08-05 ``--apply`` the traceback was
+    INSIDE ``delete_memory`` (mem0's SQLite history write), and mem0 removes
+    the Qdrant point BEFORE that write, so the delete HAD landed: a
+    ``content_lost_in_flight`` in substance, reported as an unknown.
+
+    The exit-code contract does not move — both flags are already in
+    ``HUMAN_ADJUDICATION_FLAGS`` and both already force non-zero. This is
+    purely about what the report SAYS.
+    """
+
+    # The exact class + text the measured incident produced.
+    _READONLY_DB = sqlite3.OperationalError('attempt to write a readonly database')
+
+    @staticmethod
+    def _two_record_service(*, delete_raises, probe) -> AsyncMock:
+        """Record 'b' fails its delete; record 'c' is a healthy control that
+        must still be repaired — one bad record never shrinks the sweep."""
+        service = _service([_match('b', _DUPLICATE_LEAK), _match('c', _TAIL_LEAK)])
+        service.delete_memory = AsyncMock(side_effect=[delete_raises, {'deleted': True}])
+        service.get_memory_by_id = probe
+        return service
+
+    @pytest.mark.asyncio
+    async def test_a_raised_delete_whose_point_is_gone_is_content_lost_not_unknown(self):
+        service = self._two_record_service(
+            delete_raises=self._READONLY_DB,
+            probe=AsyncMock(return_value=None),  # the point is ABSENT
+        )
+
+        report = await _mod.run(_args(apply=True), service)
+
+        lost = _record_for(report, 'b')
+        assert lost['content_lost_in_flight'] is True
+        assert 'record_error' not in lost
+        assert lost['repaired'] is False
+        assert lost['delete_landed'] is True
+        # The report is the only surviving copy of both texts.
+        assert lost['content'] == _DUPLICATE_LEAK
+        assert lost['repaired_content'] == _BODY
+        # The ORIGINAL delete error, not the probe's verdict, is the fact a
+        # human needs to understand what happened.
+        assert 'attempt to write a readonly database' in lost['error']
+        # ...and the probe's own account reaches the REPORT beside it. The
+        # runbook (docs/mcp-toolcall-xml-leak.md) sends the operator to
+        # `delete_landed_note` for the reasoning, so a refactor that stopped
+        # storing it would silently point that instruction at a missing key.
+        assert lost['delete_landed_note'].strip()
+        assert _mod.resolve_exit_code(report) != 0
+
+    @pytest.mark.asyncio
+    async def test_a_raised_delete_whose_point_survived_stays_a_record_error(self):
+        """The control that makes the assertion above mean something: nothing
+        was destroyed, so claiming content-lost would send an operator to
+        hand-restore a record that is still live, producing a duplicate."""
+        service = self._two_record_service(
+            delete_raises=self._READONLY_DB,
+            probe=AsyncMock(return_value={'id': 'b', 'content': _DUPLICATE_LEAK}),
+        )
+
+        report = await _mod.run(_args(apply=True), service)
+
+        failed = _record_for(report, 'b')
+        assert failed['record_error'] is True
+        assert failed['delete_landed'] is False
+        assert 'content_lost_in_flight' not in failed
+        assert failed['repaired'] is False
+        assert 'attempt to write a readonly database' in failed['error']
+        # The runbook branches on `false` vs `null` and reads the reasoning out
+        # of `delete_landed_note`, so the note must reach the report itself.
+        assert failed['delete_landed_note'].strip()
+        assert _mod.resolve_exit_code(report) != 0
+
+    @pytest.mark.asyncio
+    async def test_an_unanswerable_probe_stays_a_record_error_and_keeps_the_real_error(self):
+        """``record_error`` has always meant "a human must go and check this
+        id", which is the honest label for a genuine unknown. The probe's own
+        failure must NOT displace the delete error in ``error``."""
+        service = self._two_record_service(
+            delete_raises=self._READONLY_DB,
+            probe=AsyncMock(side_effect=TimeoutError('qdrant read timed out')),
+        )
+
+        report = await _mod.run(_args(apply=True), service)
+
+        failed = _record_for(report, 'b')
+        assert failed['record_error'] is True
+        assert failed['delete_landed'] is None
+        assert 'content_lost_in_flight' not in failed
+        assert 'attempt to write a readonly database' in failed['error']
+        assert 'qdrant read timed out' not in failed['error']
+        # It does not displace `error` -- it lives BESIDE it, in the report,
+        # which is where the runbook tells the operator to read it.
+        assert 'qdrant read timed out' in failed['delete_landed_note']
+        assert _mod.resolve_exit_code(report) != 0
+
+    @pytest.mark.parametrize(
+        'probe',
+        [
+            pytest.param(AsyncMock(return_value=None), id='point-absent'),
+            pytest.param(AsyncMock(return_value={'id': 'b'}), id='point-survived'),
+            pytest.param(AsyncMock(side_effect=TimeoutError('read')), id='probe-failed'),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_the_sweep_continues_to_later_records_under_every_verdict(self, probe):
+        """Whatever the adjudication, one record's failure must never shrink
+        the sweep's coverage — the report's central safety promise."""
+        service = self._two_record_service(delete_raises=self._READONLY_DB, probe=probe)
+
+        report = await _mod.run(_args(apply=True), service)
+
+        assert _record_for(report, 'c')['repaired'] is True
+        assert report['repaired'] == 1
+
+    @pytest.mark.asyncio
+    async def test_the_probe_only_runs_when_the_delete_actually_raised(self):
+        """A clean run must not pay for an extra store read per record — and a
+        delete that RETURNED is already direct evidence that it landed."""
+        service = _service([_match('b', _TAIL_LEAK)])
+
+        report = await _mod.run(_args(apply=True), service)
+
+        assert _record_for(report, 'b')['repaired'] is True
+        service.get_memory_by_id.assert_not_awaited()
+
+
+class TestRunAttributesAnEscapeAfterALandedDelete:
+    """The second window with the same consequence: an error escaping AFTER a
+    delete that RETURNED (task 3243).
+
+    ``_repair_record`` handles a raising add and a non-persisting add, but the
+    region between ``add_memory`` RETURNING and ``readd_persisted`` rendering
+    its verdict sits outside both. An escape there leaves a delete that
+    demonstrably landed with no vouched-for replacement — and the module's own
+    doctrine already says "a non-raising add that did not persist is treated
+    IDENTICALLY to a throw". A response the sweep could not even EVALUATE
+    certainly cannot be vouched for, so it belongs in the same bucket.
+
+    ``run()``'s per-record catch-all reads one field — ``delete_landed`` — to
+    cover this window for free: no second probe, and no second classification
+    rule that could drift out of step with ``_repair_record``'s.
+    """
+
+    class _UnreadableResponse:
+        """An ``add_memory`` response whose attribute access blows up.
+
+        A NON-AttributeError, so ``getattr(response, 'memory_ids', None)``
+        PROPAGATES rather than quietly taking its default — modelling a
+        response object the sweep cannot evaluate at all.
+        """
+
+        @property
+        def memory_ids(self):
+            raise RuntimeError('response object is unreadable')
+
+    @pytest.mark.asyncio
+    async def test_an_escape_after_a_returned_delete_is_content_lost(self):
+        service = _service([_match('b', _TAIL_LEAK), _match('c', _DUPLICATE_LEAK)])
+        service.add_memory = AsyncMock(
+            side_effect=[self._UnreadableResponse(), _ok_response()]
+        )
+
+        report = await _mod.run(_args(apply=True), service)
+
+        lost = _record_for(report, 'b')
+        assert lost['delete_landed'] is True
+        assert lost['content_lost_in_flight'] is True
+        assert 'record_error' not in lost
+        assert lost['repaired'] is False
+        # The report remains the only copy of both texts.
+        assert lost['content'] == _TAIL_LEAK
+        assert lost['repaired_content'] == _BODY
+        assert 'unreadable' in lost['error']
+        assert _mod.resolve_exit_code(report) != 0
+        # And one record's failure still never shrinks the sweep.
+        assert _record_for(report, 'c')['repaired'] is True
+
+    @pytest.mark.asyncio
+    async def test_a_failure_before_the_delete_stays_a_record_error(self, monkeypatch):
+        """The negative control that stops the new rule becoming a catch-all.
+
+        Nothing was deleted, so nothing was lost. The record must carry NO
+        ``delete_landed`` key at all — absent is the honest reading when no
+        delete was ever attempted.
+        """
+        service = _service([_match('b', _TAIL_LEAK)])
+
+        def _explode(_payload):
+            raise RuntimeError('pre-flight blew up')
+
+        monkeypatch.setattr(_mod, 'routes_to_mem0', _explode)
+
+        report = await _mod.run(_args(apply=True), service)
+
+        failed = _record_for(report, 'b')
+        assert failed['record_error'] is True
+        assert 'delete_landed' not in failed
+        assert 'content_lost_in_flight' not in failed
+        # The content is untouched in the store: never deleted, never re-added.
+        service.delete_memory.assert_not_awaited()
+        service.add_memory.assert_not_awaited()
+        assert _mod.resolve_exit_code(report) != 0
+
+    @pytest.mark.asyncio
+    async def test_a_raise_after_a_completed_repair_stays_a_record_error(self, monkeypatch):
+        """The second negative control: a landed delete WITH a vouched-for
+        replacement is not a loss.
+
+        ``delete_landed: True`` is set on the happy path too, so the catch-all
+        reads BOTH fields — a record that reached ``repaired: True`` had its
+        re-add vouched for by ``readd_persisted``, and the text is live in the
+        store. Escalating it would emit ``repaired`` and
+        ``content_lost_in_flight`` on the SAME record and send an operator to
+        hand-restore text that is not lost, producing the duplicate the
+        three-valued verdict exists to prevent.
+
+        Nothing follows the ``_repair_record`` call today, so this is
+        unreachable in production; the raise is injected by wrapping
+        ``_repair_record`` itself, which is exactly the shape a later statement
+        added after that call would take.
+        """
+        service = _service([_match('b', _TAIL_LEAK)])
+        repair_record = _mod._repair_record
+
+        async def _repair_then_raise(*args, **kwargs):
+            await repair_record(*args, **kwargs)
+            raise RuntimeError('a statement after the repair blew up')
+
+        monkeypatch.setattr(_mod, '_repair_record', _repair_then_raise)
+
+        report = await _mod.run(_args(apply=True), service)
+
+        failed = _record_for(report, 'b')
+        assert failed['repaired'] is True
+        assert failed['delete_landed'] is True
+        # record_error, never a contradiction of the repair that did land.
+        assert failed['record_error'] is True
+        assert 'content_lost_in_flight' not in failed
+        assert 'a statement after the repair blew up' in failed['error']
+        assert _mod.resolve_exit_code(report) != 0
+
+    @pytest.mark.asyncio
+    async def test_a_successful_repair_records_the_landing_and_still_exits_zero(self):
+        """``delete_landed`` is EVIDENCE, not an adjudication flag. Every clean
+        repair legitimately carries it, so putting it in
+        ``HUMAN_ADJUDICATION_FLAGS`` would fail every successful ``--apply``."""
+        service = _service([_match('b', _TAIL_LEAK)])
+
+        report = await _mod.run(_args(apply=True), service)
+
+        repaired = _record_for(report, 'b')
+        assert repaired['repaired'] is True
+        assert repaired['delete_landed'] is True
+        assert 'delete_landed' not in _mod.HUMAN_ADJUDICATION_FLAGS
+        assert _mod.resolve_exit_code(report) == 0
 
 
 class TestRunApplyVerifiesPersistence:
@@ -1128,23 +1661,15 @@ class TestRunApplyStoreMutationPreflight:
     per-record probe would detect a fleet-wide condition one record too late.
     """
 
-    @staticmethod
-    def _deny(monkeypatch):
-        """Rig the preflight to refuse, as it would inside an agent sandbox."""
-        def _raise(*_args, **_kwargs):
-            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
-
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
-
     @pytest.mark.asyncio
     async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
         self, monkeypatch
     ):
         """The whole point: refuse to start rather than half-complete."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         service = _service([_match('r', _TAIL_LEAK)])
 
-        with pytest.raises(_mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'):
+        with pytest.raises(_mod.StoreMutationUnavailable, match=SENTINEL):
             await _mod.run(_args(apply=True), service)
 
         service.delete_memory.assert_not_awaited()
@@ -1156,7 +1681,7 @@ class TestRunApplyStoreMutationPreflight:
     ):
         """It aborts without even scanning -- one probe per run, not per record,
         and no wasted pagination over a corpus it was never going to repair."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         service = _service([_match('r', _TAIL_LEAK)])
 
         with pytest.raises(_mod.StoreMutationUnavailable):
@@ -1177,7 +1702,7 @@ class TestRunApplyStoreMutationPreflight:
         to reach main's container, and replace ``asyncio.run`` so ``_run_live``
         never constructs a real MemoryService.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         service = _service([_match('r', _TAIL_LEAK)])
         monkeypatch.setattr(sys, 'argv', ['sweep_toolcall_xml_leak.py', '--apply'])
         progress = _mod.new_progress()
@@ -1204,7 +1729,7 @@ class TestRunApplyStoreMutationPreflight:
         mutate. Gating it would break the module's core promise -- that the
         classification report can always be obtained safely, from anywhere.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         service = _service([_match('r', _TAIL_LEAK)])
 
         report = await _mod.run(_args(), service)

@@ -3306,3 +3306,126 @@ class TestWatcherSupervisorLoopEmptyQueueSkip:
             f'Expected the healthy-clean restart-backoff sleep (proving the rotation '
             f'actually ran, not the empty-queue skip path); got {sleep_durations}'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 4559 step-17: the empty-queue precheck must not skip digest re-evaluation
+# ---------------------------------------------------------------------------
+
+class TestDigestRunsRegardlessOfEmptyQueuePrecheck:
+    """The digest check must run on EVERY supervisor iteration, not only after
+    a rotation.
+
+    Evidence (task 4559): zero digests fired in BOTH 2026 paused windows.  The
+    EWA breaker halts fleet-wide dispatch, the L1 queue then drains, the
+    empty-queue precheck starts returning False, and its ``continue``
+    (harness.py:12354) returns to the loop top — skipping the SOLE
+    ``_maybe_write_digest`` call site (harness.py:12382).  The EWA therefore
+    can never be re-evaluated while the fleet is paused, so the breaker can
+    never observe its own recovery: a dead end.  The task-2629 comment at
+    harness.py:12334 claims the bypass "does not touch ``_maybe_write_digest``"
+    — that claim is false today, and this suite is what makes it true.
+
+    RED today for the empty-queue case; the rotation case is a regression
+    guard so the hoist cannot silently drop the original call.
+    """
+
+    @pytest.mark.asyncio
+    async def test_digest_runs_even_when_l1_queue_is_empty(self, tmp_path: Path) -> None:
+        """Precheck returns False (drained queue) -> the digest STILL runs.
+
+        This is the paused-and-drained steady state of both outages: no
+        rotation launches, so under today's code the digest never runs and
+        the tripped EWA is frozen forever.
+        """
+        h, _queue = _make_loop_harness_with_queue(tmp_path)
+        h._watcher_has_actionable_l1 = lambda: False  # type: ignore[method-assign]
+
+        digest_spy = AsyncMock()
+        h._maybe_write_digest = digest_spy  # type: ignore[method-assign]
+        rotation_spy = AsyncMock()
+        h._run_watcher_rotation = rotation_spy  # type: ignore[method-assign]
+
+        sleep_durations: list[float] = []
+
+        async def fake_sleep(duration: float) -> None:
+            sleep_durations.append(duration)
+            raise asyncio.CancelledError()
+
+        with (
+            patch('orchestrator.harness.asyncio.sleep', fake_sleep),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await h._watcher_supervisor_loop()
+
+        rotation_spy.assert_not_called()
+        assert sleep_durations == [h.config.watcher_empty_queue_poll_secs], (
+            f'Expected the empty-queue bypass path (one sleep of '
+            f'watcher_empty_queue_poll_secs={h.config.watcher_empty_queue_poll_secs}); '
+            f'got {sleep_durations}'
+        )
+        assert digest_spy.await_count == 1, (
+            f'Expected _maybe_write_digest to be awaited exactly once on the '
+            f'empty-queue bypass iteration (otherwise a paused, drained fleet can '
+            f'never re-evaluate the EWA that paused it); await_count='
+            f'{digest_spy.await_count}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_digest_still_runs_on_the_rotation_path(self, tmp_path: Path) -> None:
+        """Precheck returns True -> the digest still runs exactly once per
+        iteration (regression guard: the hoist must MOVE the call site, not
+        drop it).
+        """
+        from shared.cli_invoke import AgentResult
+
+        h, queue = _make_loop_harness_with_queue(tmp_path)
+        _submit_sample_l1(queue)
+        min_secs = h.config.watcher_misconfigured_min_rotation_secs
+
+        digest_spy = AsyncMock()
+        h._maybe_write_digest = digest_spy  # type: ignore[method-assign]
+
+        # One full healthy-clean iteration; the loop is broken at the
+        # restart-backoff sleep so exactly one iteration body executes
+        # regardless of where in that body the digest call sits.
+        monotonic_sequence = iter(
+            _build_monotonic_timestamps([min_secs + 1.0], expect_cancelled=False)
+        )
+
+        def fake_monotonic() -> float:
+            return next(monotonic_sequence)
+
+        rotation_calls = 0
+
+        async def fake_rotation() -> AgentResult:
+            nonlocal rotation_calls
+            rotation_calls += 1
+            return AgentResult(success=True, output='', timed_out=False)
+
+        sleep_durations: list[float] = []
+
+        async def recording_sleep(duration: float) -> None:
+            sleep_durations.append(duration)
+            raise asyncio.CancelledError()
+
+        h._run_watcher_rotation = fake_rotation  # type: ignore[method-assign]
+
+        with (
+            patch('orchestrator.harness.asyncio.sleep', recording_sleep),
+            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await h._watcher_supervisor_loop()
+
+        assert rotation_calls == 1, (
+            f'Expected exactly one rotation on the actionable-L1 path; got {rotation_calls}'
+        )
+        assert sleep_durations == [h.config.watcher_subprocess_restart_backoff_secs], (
+            f'Expected the healthy-clean restart-backoff sleep (proving the rotation '
+            f'actually ran, not the empty-queue skip path); got {sleep_durations}'
+        )
+        assert digest_spy.await_count == 1, (
+            f'Expected _maybe_write_digest to be awaited exactly once per supervisor '
+            f'iteration on the rotation path; await_count={digest_spy.await_count}'
+        )

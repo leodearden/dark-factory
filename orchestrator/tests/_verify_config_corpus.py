@@ -47,6 +47,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DF_CONFIG_PATH = REPO_ROOT / 'dark-factory-orchestrator.yaml'
 FM_CONFIG_PATH = REPO_ROOT / 'fused-memory' / 'orchestrator.yaml'
 SCRIPTS_CONFIG_PATH = REPO_ROOT / 'scripts' / 'orchestrator.yaml'
+DASHBOARD_CONFIG_PATH = REPO_ROOT / 'dashboard' / 'orchestrator.yaml'
 
 
 def load_config_scalar(path: Path, key: str) -> str:
@@ -159,12 +160,22 @@ def discover_lint_command_modules() -> set[str]:
 # fused-memory/orchestrator.yaml::lint_command — the only 3-segment chain
 # (two sibling checkers rather than one).
 FM_LINT_COMMAND = (
-    'uv run --project fused-memory --directory fused-memory ruff check src/ tests/'
+    'uv run --directory fused-memory ruff check src/ tests/'
     ' && python3 fused-memory/scripts/check_bare_magicmock_config.py fused-memory/tests'
     ' && python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests'
 )
 
-# cockpit/dashboard/escalation/orchestrator/sampler/shared
+# dashboard/orchestrator.yaml::lint_command — the SECOND 3-segment chain (two
+# sibling checkers rather than one), alongside FM_LINT_COMMAND above. Task 4485
+# added the module-local-TestClient checker as dashboard's second leg, which is
+# why dashboard no longer fits the 2-segment comprehension below.
+DASHBOARD_LINT_COMMAND = (
+    'uv run --directory dashboard ruff check src/ tests/'
+    ' && python3 fused-memory/scripts/check_bare_magicmock_config.py dashboard/tests'
+    ' && python3 fused-memory/scripts/check_module_local_testclient.py dashboard/tests'
+)
+
+# cockpit/escalation/orchestrator/sampler/shared
 # orchestrator.yaml::lint_command — each the same 2-segment shape, differing
 # only in the module name.
 #
@@ -177,10 +188,10 @@ FM_LINT_COMMAND = (
 # instead of replacing it.
 MODULE_LINT_COMMANDS = {
     module: (
-        f'uv run --project {module} --directory {module} ruff check src/ tests/'
+        f'uv run --directory {module} ruff check src/ tests/'
         f' && python3 fused-memory/scripts/check_bare_magicmock_config.py {module}/tests'
     )
-    for module in ('cockpit', 'dashboard', 'escalation', 'orchestrator', 'sampler', 'shared')
+    for module in ('cockpit', 'escalation', 'orchestrator', 'sampler', 'shared')
 }
 
 # scripts/orchestrator.yaml::lint_command — the lone CHAINLESS lint command: a

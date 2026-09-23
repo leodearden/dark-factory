@@ -37,6 +37,7 @@ import asyncio
 import contextlib
 import dataclasses
 import json
+import os
 import shlex
 import time
 import uuid
@@ -47,10 +48,15 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 
-from orchestrator import verify
+from orchestrator import flake_ledger, verify
 from orchestrator.config import ModuleConfig
 from orchestrator.verify import VerifyResult, _archive_merge_verify_logs
-from orchestrator.verify_cancel import HEARTBEAT_INTERVAL_SECS
+from orchestrator.verify_cancel import (
+    HEARTBEAT_INTERVAL_SECS,
+    SSH_SERVER_ALIVE_COUNT_MAX,
+    SSH_SERVER_ALIVE_INTERVAL,
+    start_stdin_heartbeat,
+)
 from orchestrator.verify_categories import FailureCategory, _assert_sentinels_disjoint
 
 if TYPE_CHECKING:
@@ -74,6 +80,7 @@ __all__ = [
     "VerifyRunnerPool",
     # INV-2 (task 2884) — contract-currency auto-sync at dispatch
     "SyncOutcome",
+    "REMOTE_LIVENESS_CMD",
     "resolve_local_df_checkout",
     "build_merge_verify_spec",
     "_module_config_from_command",
@@ -269,7 +276,44 @@ class MergeVerifySpec:
     verify_commands     : one VerifyCommand per module, scoped to task_files
     unscoped_typecheck  : the _run_unscoped_typechecks gate spec
     task_files          : files in the merge commit (None → full verify)
-    verify_env          : environment overrides (RUSTC_WRAPPER, CARGO_INCREMENTAL, …)
+    verify_env          : environment overrides (RUSTC_WRAPPER, CARGO_INCREMENTAL, …).
+                          APPLIED ONTO the consuming host's config in
+                          run_merge_verify_on_worktree (task 5496): the spec wins
+                          on conflict, host keys absent from the spec are
+                          preserved. Neither 'replace' nor 'ignore' — the spec is
+                          dispatcher-shaped, while a remote runner's own --config
+                          carries per-host local necessities no dispatcher-built
+                          spec can know (a narrower verify-only host widening its
+                          own per-host-measured timeout budgets is the live case).
+                          MERGE-DECIDING, not cosmetic: these keys SELECT TESTS,
+                          so a remote green reached under a different env is the
+                          task-2822 false-green class, not a performance detail.
+                          Path-valued keys ship VERBATIM and resolve against the
+                          REMOTE filesystem — no rewrite, no denylist, on purpose:
+                          the per-module path already ships them verbatim, and a
+                          name-based filter would put one project's vocabulary
+                          inside generic transport code and re-diverge the two
+                          paths task 5496 unified. Which keys a project sets, and
+                          why any of them is deliberately absolute, stays in that
+                          project's own dark-factory-orchestrator.yaml — its single
+                          home (INV-9), and the file to read before assuming what a
+                          key here means.
+                          Residual risk on a REMOTE dispatch is wasted wall-clock,
+                          not a false green. The measured case is the retry env
+                          from
+                          orchestrator/src/orchestrator/merge_queue.py::_build_retry_verify_env:
+                          its *_NEXTEST_FILTER_FILE_* values are dispatcher-absolute
+                          paths to UNTRACKED files that git push does not carry, so
+                          the remote finds them missing — and reify's consumer then
+                          refuses to narrow, loudly, and runs that profile FULL (an
+                          independent tree-OID guard refuses the same way on a
+                          drifted sidecar). The same dict's REIFY_RUN_ALL_MEMBER_SUBSET
+                          and REIFY_GUI_RETRY_SPECS DO narrow remotely, uncorroborated
+                          by that guard, and are sound here: the remote verifies the
+                          same pushed tree and consumes no dispatcher build artefacts.
+                          Making the filter files shippable needs merge_queue.py
+                          (outside task 5496's scope); follow-up ticket
+                          tkt_0RTNRCDNA8DDHVN6P8ZNV2JXXK.
     cold_timeout_secs   : merge_verify_cold cascade timeout
     is_merge_verify     : always True for merge-path specs (default)
     merge_verify_workspace : force-workspace profile of the merge gate (fix a,
@@ -362,14 +406,50 @@ class MergeVerifySpec:
 def result_to_dict(vr: VerifyResult) -> dict:
     """Serialise a VerifyResult to a plain dict of JSON-native types.
 
-    Uses ``dataclasses.asdict`` which recursively converts nested dataclasses
-    and preserves all field types (all VerifyResult fields are JSON-native).
+    Uses ``dataclasses.asdict``, which recursively converts nested dataclasses and
+    preserves all field types.  Every field is JSON-native EXCEPT ``flake_suppression``
+    (task 3789 ε), which is a nested ``FlakeSuppression``: ``asdict`` flattens it to a
+    dict here, and ``json.dumps`` flattens its ``StrEnum`` members to their values and
+    its tuple to an array — so this direction still needs no special handling.  The
+    asymmetry is entirely on the READ side; see :func:`result_from_dict`.
     """
     return dataclasses.asdict(vr)
 
 
 def result_from_dict(d: dict) -> VerifyResult:
-    """Reconstruct a VerifyResult from a dict (as produced by result_to_dict)."""
+    """Reconstruct a VerifyResult from a dict (as produced by result_to_dict).
+
+    Generic ``VerifyResult(**d)`` for every field but one.  ``flake_suppression`` (task
+    3789 ε) is a nested dataclass, so ``asdict``/JSON hands it back as a plain dict with
+    ``verdict``/``call_site`` as strings and ``test_ids`` as a list — passing that
+    straight through would leave the field's TYPED annotation a lie on exactly the
+    deserialized path it exists to serve.  Rebuild it first, in the same
+    ``d.get(key)`` / ``X(v) if v is not None else None`` shape
+    ``orchestrator/src/orchestrator/verify_runner.py::MergeVerifySpec.from_dict`` uses for
+    its optional nested ``global_verify_command`` — this file's established idiom for a
+    newly-added optional field.
+
+    ``flake_suppression_from_wire`` NEVER raises: a malformed sub-payload degrades to
+    ``None`` with a loud warning, because anything raising out of here becomes a
+    ``RunnerUnavailable`` in
+    ``orchestrator/src/orchestrator/verify_runner.py::RemoteRunner.run_merge_verify`` and
+    costs a whole local re-verify.
+
+    The codec's strictness is otherwise UNCHANGED — an unknown top-level key is still a
+    ``TypeError`` (pinned by test_verify_runner's characterization tests), the
+    pre-existing behaviour shared by every optional field added before this one.
+    """
+    # `isinstance` guard, not a bare `d.get`: a buggy remote can send a valid JSON
+    # LIST, and that must keep failing exactly as it does today — `VerifyResult(**d)`
+    # raising TypeError, which
+    # `orchestrator/src/orchestrator/verify_runner.py::RemoteRunner.run_merge_verify`
+    # catches — instead of a fresh
+    # AttributeError that no handler on the merge path expects.
+    if isinstance(d, dict):
+        raw = d.get('flake_suppression')
+        if raw is not None:
+            # Shallow COPY — never mutate the caller's dict, which it may still inspect.
+            d = {**d, 'flake_suppression': flake_ledger.flake_suppression_from_wire(raw)}
     return VerifyResult(**d)
 
 
@@ -507,6 +587,13 @@ async def run_merge_verify_on_worktree(
     delegates to LocalRunner.run_merge_verify (the same bundle the merge queue
     runs), providing fidelity by construction (PRD §A Invariant 1 / D2).
 
+    The reconstructed set is ALSO installed as the config's module registry
+    (task 4536), so ``config.module_configs_or_empty`` and the positionally
+    passed *module_configs* cannot disagree on this leg — whichever of the two
+    a downstream consumer happens to read (``effective_merge_module_configs``
+    reads the registry; ``run_scoped_verification`` is handed the list), it
+    sees the DISPATCHER's set rather than the remote host's own discovery walk.
+
     Args:
         merge_wt: Path to the detached worktree at the merge SHA.
         config:   OrchestratorConfig for the host project.
@@ -548,6 +635,46 @@ async def run_merge_verify_on_worktree(
         'merge_verify_workspace': spec.merge_verify_workspace,
         'merge_verify_breadth': spec.merge_verify_breadth,
     }
+    # Task 5496 — the spec's verify_env is APPLIED ONTO the reconstructed remote
+    # config: the spec wins on conflict, host keys absent from the spec are
+    # preserved. Without this the zero-module-config path (spec.verify_commands
+    # == (), e.g. reify) reconstructs no ModuleConfig at all, so spec.verify_env
+    # has NO consumer and the remote decides the merge under its own config's
+    # test-selection env — the task-2822 false-green class, since these keys
+    # select which tests run.
+    #
+    # Neither of the two simpler rules works. 'Ignore' (the pre-fix behaviour) is
+    # the defect. 'Replace' (dict(spec.verify_env)) would drop the host's own
+    # local necessities, which are by construction absent from any
+    # dispatcher-built spec: a remote runner is dispatched against its OWN
+    # --config, and a narrower verify-only host widens its per-host-measured
+    # timeout budgets there — values the dispatching workstation never measured
+    # and cannot ship, which 'replace' would silently narrow back to the
+    # workstation's. The spec is dispatcher-shaped and the host config is
+    # host-shaped; only a merge carries both.
+    #
+    # This is not a NEW rule: orchestrator/src/orchestrator/verify.py::_resolve_verify_env
+    # already computes exactly {**config.verify_env, **module_config.verify_env}
+    # on the per-module path. The merge here is therefore byte-identical there —
+    # _resolve_verify_env re-applies the same spec env from ModuleConfig.verify_env
+    # on top of it ({**{**H, **S}, **S} == {**H, **S}) — and the change simply
+    # makes the ONE existing rule uniform across both paths.
+    #
+    # Spelling constraints:
+    #  - A FRESH dict, never config.verify_env.update(...). model_copy carries
+    #    the field's VALUE over unchanged, so the copy's mapping can be the SAME
+    #    dict object as the caller's — the same hazard the task-4536 registry
+    #    comment below spells out. An in-place write would corrupt the config
+    #    cli.py loaded from disk and may still use.
+    #  - Reads effective_verify_env, the PROPERTY, mirroring the producer
+    #    (build_merge_verify_spec above) so the wire round-trip is symmetric;
+    #    writes the verify_env FIELD, because the property is read-only and
+    #    _resolve_verify_env — the sole builder of the executed env — reads the
+    #    field.
+    #  - UNCONDITIONAL. An empty spec env means "the dispatcher has no verify
+    #    env", which under this rule already leaves every host key intact, so a
+    #    guard would buy a branch with no behavioural difference.
+    config_update['verify_env'] = {**config.effective_verify_env, **spec.verify_env}
     # INV-1, task 2883 — a zero-module-config spec ships the dispatching side's
     # global full-gate commands; apply them onto the reconstructed remote config
     # so the remote runs the SAME gate as local (the module_configs=[] Site-2
@@ -558,6 +685,84 @@ async def run_merge_verify_on_worktree(
         config_update['lint_command'] = spec.global_verify_command.lint_command
         config_update['type_check_command'] = spec.global_verify_command.type_check_command
     config = config.model_copy(update=config_update)
+    # Task 4536 — the spec is authoritative for the module SET too, not just
+    # the profile above. `module_configs` (reconstructed from the wire spec a
+    # few lines up) is the DISPATCHER's set, already widened at the
+    # merge-request boundary by merge_queue._merge_boundary_module_configs
+    # before build_merge_verify_spec projected it. But
+    # `config.module_configs_or_empty` is still the REMOTE host's
+    # _discover_module_configs(config.project_root) walk, and
+    # verify_plan.effective_merge_module_configs PREFERS that registry over the
+    # passed list under merge_verify_breadth='full'. Without this line a
+    # stale/divergent/narrower remote checkout silently decides the merge: it
+    # both DROPS modules the spec named (the task-2822 false-green class — the
+    # verdict vouches for modules no gate ever ran on) and INJECTS modules the
+    # spec never named (a red attributable to a subproject the dispatching side
+    # never scoped).
+    #
+    # This makes effective_merge_module_configs' OWN documented INV-5 ordering
+    # invariant true on the remote leg: its docstring already claims the wire
+    # spec "(and hence the remote's reconstruction of it in
+    # verify_runner.run_merge_verify_on_worktree)" receives the identical set BY
+    # CONSTRUCTION. Before this line that parenthetical was aspirational.
+    #
+    # It is the natural extension of fix (a): the spec is the single source of
+    # truth for the merge-deciding profile, and the module SET is part of that
+    # profile — alongside merge_verify_workspace/merge_verify_breadth (task
+    # 2822) and the global commands (INV-1, task 2883).
+    #
+    # No conditional is needed to protect the genuinely LOCAL merge path:
+    # run_merge_verify_on_worktree is reached only from cli.py's `verify-merge`
+    # subcommand (the remote/CLI host entry), while the local path constructs
+    # LocalRunner directly in merge_queue.py — so host discovery survives there
+    # by construction.
+    #
+    # KNOWN CONSEQUENCE — reverse-dependency widening degrades to a no-op on
+    # this leg under merge_verify_breadth='scoped' (amendment, review
+    # suggestion 1). verify._reverse_dependency_module_configs (task 2607)
+    # resolves a triggered dependent's BASE ModuleConfig out of this same
+    # registry. At breadth='scoped' the installed registry is exactly the
+    # spec's set, which is exactly the set already in that call's
+    # `already_scoped` — so any dependent it would widen to is by construction
+    # absent from the registry and the lookup returns None. Previously the
+    # remote host's own walk supplied it. This is a deliberate, narrow trade:
+    # a dispatcher-authoritative registry is worth strictly more than a
+    # widening resolved from a checkout the dispatcher never vouched for (and
+    # the pre-4536 alternative was to widen using the HOST's command, which is
+    # the very infidelity this install closes). It is latent, not live —
+    # _REVERSE_TEST_DEPENDENTS maps only orchestrator→escalation; dark_factory
+    # runs breadth='full', where escalation is always already_scoped and the
+    # widening is a no-op regardless; reify registers no 'orchestrator'
+    # prefix. The real fix is to resolve the widening at the DISPATCHING
+    # boundary (beside merge_queue._merge_boundary_module_configs) so widened
+    # dependents ride the wire spec — out of scope here (merge_queue.py is not
+    # locked by this task); filed as a follow-up. The skip is no longer
+    # silent: verify._reverse_dependency_module_configs logs a warning naming
+    # the unresolvable dependent.
+    #
+    # Spelling constraints (all verified against the installed pydantic):
+    #  - DIRECT private-attribute assignment, never an entry in `config_update`.
+    #    `_module_configs` is a PrivateAttr, not a model field, so
+    #    model_copy(update=...) would write it into instance __dict__ while
+    #    __pydantic_private__ kept the stale value — it would read back only via
+    #    __dict__ shadowing, a later normal write would be silently swallowed,
+    #    and the shadow would propagate into further copies. Direct assignment
+    #    is the repo-wide blessed idiom (see config.load_config).
+    #  - REBIND the whole dict, never mutate in place. model_copy rebuilds the
+    #    __pydantic_private__ MAPPING as a fresh dict (BaseModel.__copy__), so
+    #    a rebind here cannot reach back into the source — but it carries the
+    #    VALUES over unchanged, which means the copy's `_module_configs` is
+    #    initially the SAME dict object as the caller's. Rebinding is therefore
+    #    safe; an in-place .clear()/.update() would reach through that shared
+    #    value and corrupt the CALLER's config registry — the object cli.py
+    #    loaded from disk and may still use. Pinned by
+    #    test_verify_runner.test_caller_config_registry_is_not_mutated.
+    #  - UNCONDITIONAL, including `{}` for a zero-module spec. `{}` is the
+    #    documented "discovery ran and found no subprojects" value (distinct
+    #    from the None "never ran" sentinel) — exactly the claim a zero-module
+    #    spec makes, and what routes it to the INV-1 global gate instead of the
+    #    remote host's own modules.
+    config._module_configs = {mc.prefix: mc for mc in module_configs}
 
     runner = LocalRunner(
         merge_wt,
@@ -647,7 +852,6 @@ class LocalRunner:
         task_id: str | None = None,
         archive_root: Path | None = None,
         event_store: EventStore | None = None,
-        escalation_queue: Any = None,
     ) -> None:
         """Initialise LocalRunner.
 
@@ -658,13 +862,20 @@ class LocalRunner:
         cold-shadow / drift intentionally leave this ``None`` so they are
         auto-excluded from archival without any extra deny-list logic.
 
-        *event_store* / *escalation_queue* thread the merge-flake suppression gate's
-        (PRD task α) fact-emission and storm-escalation side-effects.  Both default
-        to ``None`` — byte-identical for the CLI ``run_merge_verify_on_worktree`` /
-        remote-runner paths, which cannot reach the dispatching host's stores; only
-        the authoritative local merge path (merge_queue.py) wires them.  The gate
-        still runs when they are ``None`` (it just emits no fact and bumps no streak),
-        mirroring the optional ``archive_root`` threading above.
+        *event_store* threads the dispatching store into ``run_scoped``'s merge
+        gate, so a trivial pass emits ``trivial_pass_escalated`` (INV-1, task 2883).
+        It defaults to ``None`` — byte-identical for the CLI
+        ``run_merge_verify_on_worktree`` / remote-runner paths, which cannot reach
+        the dispatching host's store — mirroring the optional ``archive_root``
+        threading above.
+
+        There is deliberately NO *escalation_queue* (task ε).  It fed only the
+        merge-flake storm-streak bump, and that side-effect now happens on the
+        DISPATCHER, from the ``FlakeSuppression`` the returned ``VerifyResult``
+        carries — see ``verify.apply_merge_flake_suppression``.  A LocalRunner
+        runs where the WORKTREE is and cannot reach the dispatching host's queue,
+        so accepting one here only ever invited re-wiring a side-effect onto the
+        host that cannot perform it.
         """
         self._merge_wt = merge_wt
         self._config = config
@@ -675,7 +886,6 @@ class LocalRunner:
         self._task_id = task_id
         self._archive_root = archive_root
         self._event_store = event_store
-        self._escalation_queue = escalation_queue
 
     async def health(self) -> bool:
         return True
@@ -723,19 +933,22 @@ class LocalRunner:
             # isolated + serial in THIS merge worktree; if they all pass, the red
             # was a CPU-starvation flake — suppress it (returns a PASSED result)
             # so the merge proceeds INTO the unscoped gate below, rather than
-            # short-circuiting here.  On a non-confirmation the original failing
-            # result is returned unchanged (merge stays red).  Never raises
-            # (fail-closed) — merge_queue.py has no VerifyInfraError handler.
-            # Resolved via the verify module so it stays monkeypatchable.
+            # short-circuiting here.  On a non-confirmation the failing result is
+            # returned (merge stays red).  Never raises (fail-closed) —
+            # merge_queue.py has no VerifyInfraError handler.  Resolved via the
+            # verify module so it stays monkeypatchable.
+            #
+            # Task ε: the hook takes only what the OBSERVATION needs.  Its two
+            # side-effects — the merge_flake_suppressed emit and the INV-4 storm
+            # streak — now happen on the DISPATCHER, driven off the
+            # FlakeSuppression the returned result carries, because THIS code runs
+            # wherever the worktree is and on the remote path that host has no
+            # event store and a private copy of the streak counter.
             scoped = await verify.apply_merge_flake_suppression(
                 scoped,
                 worktree=self._merge_wt,
                 config=self._config,
                 module_configs=self._module_configs,
-                merge_sha=merge_sha,
-                event_store=self._event_store,
-                escalation_queue=self._escalation_queue,
-                task_id=self._task_id,
             )
             if not scoped.passed:
                 return scoped
@@ -764,6 +977,15 @@ class LocalRunner:
                 summary=summary,
                 timed_out=timed_out,
                 category=category,
+                # Task ε: carry the merge-flake observation through this FRESH
+                # result.  The scoped red WAS observed (and possibly suppressed),
+                # so the observation must still reach the dispatcher's recorder
+                # even though the unscoped gate independently failed the merge.
+                # Dropping it here would under-count the ledger and silently
+                # disarm the INV-4 streak for exactly the compound failure most
+                # likely to occur under load — and would REGRESS an emission that
+                # happened inline before the recorder was split out.
+                flake_suppression=getattr(scoped, 'flake_suppression', None),
             )
 
         return scoped
@@ -774,33 +996,38 @@ class LocalRunner:
 # ---------------------------------------------------------------------------
 
 
-# Archive timestamp format — mirrors _archive_merge_verify_logs (verify.py:827).
+# Archive timestamp format — mirrors verify.py::_archive_stamp.
 # Microsecond precision ensures uniqueness across back-to-back ENOSPC retries for
 # the same task; the format is still lexicographically sortable.
 _STDERR_ARCHIVE_TS_FMT = '%Y%m%dT%H%M%S_%fZ'
 
-# task-2362: ssh keepalive tuning. ConnectTimeout bounds only the initial TCP
-# connect, not a mid-session stall — if the TCP session goes silently dead
-# (NAT/conntrack timeout, network partition, wedged remote process producing
-# no output), an ssh child with no keepalive can block indefinitely. These
-# ServerAlive probes ride the live TCP session (independent of stdout cadence),
-# so ssh itself detects a dead peer and exits non-zero within
-# SSH_SERVER_ALIVE_INTERVAL * SSH_SERVER_ALIVE_COUNT_MAX seconds ->
-# RunnerUnavailable -> existing re-dispatch / local-fallback path (incident
-# 5111). A long-but-progressing remote verify keeps the session alive and is
-# unaffected. Values are chosen well inside the remote verify timeout budget.
-SSH_SERVER_ALIVE_INTERVAL = 15
-SSH_SERVER_ALIVE_COUNT_MAX = 4
-
 # Shared base ssh options for all four RemoteRunner ssh argv sites (health,
 # run_merge_verify dispatch, cancel_verify, probe_clean) — kept in one place
-# so the keepalive flags can't drift apart across sites.
+# so the keepalive flags can't drift apart across sites. The two keepalive
+# values themselves are imported from verify_cancel, which derives the remote
+# watchdog's deadline from them (task 4195), so the transport's dead-peer
+# verdict and the watchdog's cannot drift apart either.
 _SSH_BASE_OPTS = [
     '-o', 'BatchMode=yes',
     '-o', 'ConnectTimeout=10',
     '-o', f'ServerAliveInterval={SSH_SERVER_ALIVE_INTERVAL}',
     '-o', f'ServerAliveCountMax={SSH_SERVER_ALIVE_COUNT_MAX}',
 ]
+
+# Post-sync entry-point liveness probe (task 4539), issued by
+# RemoteRunner.sync_if_stale after a mutating sync of the remote Dark-Factory
+# CODE checkout.
+#
+# Deliberately a BARE command with NO `cd` and no absolute venv path: that is
+# exactly how run_merge_verify builds its dispatch argv (`orchestrator
+# verify-merge --sha ... --spec ...` handed straight to ssh), so the probe
+# exercises the SAME PATH resolution the real dispatch will.  A probe that cd'd
+# into the checkout, or invoked `<df_remote>/.venv/bin/orchestrator` directly,
+# could answer rc=0 while the dispatch still hit rc=127.
+#
+# `verify-merge --help` is a pure click help print — it never touches config,
+# git, or a worktree — so the probe is side-effect-free and cheap.
+REMOTE_LIVENESS_CMD = 'orchestrator verify-merge --help'
 
 
 def _sanitize_runner_name(name: str) -> str:
@@ -840,67 +1067,122 @@ async def _default_subprocess_run(
     )
 
 
+#: Ceiling on the teardown join of the stdin-heartbeat writer thread in
+#: :func:`_default_ssh_heartbeat_run`.  A WEDGE DETECTOR, not a cadence: the
+#: writer's only blocking operation is a ``threading.Event.wait`` that ``stop()``
+#: ends within one GIL switch, and its write end is non-blocking so ``os.write``
+#: can never park on a full pipe — so 5.0s is ~6x the ~0.85s worst single-gap
+#: additive scheduling delay measured at loadavg 113-178 (recorded in
+#: ``test_laptop_warm_verify_boundary.py``'s ``HeartbeatWriter`` comment) and is
+#: never reached in practice.
+#:
+#: WHO PAYS THE WAIT: not the event loop.  ``Thread.join`` is synchronous, and
+#: the coroutine that tears the writer down runs on the orchestrator's single
+#: shared loop — the loop whose 14.8-16.1s stalls are why the beat moved to a
+#: thread in the first place.  Joining inline would hand that loop a fresh
+#: self-inflicted stall of up to this bound, so the join is awaited through
+#: ``asyncio.to_thread``: a wedged writer costs its own dispatch's teardown and
+#: nothing else.
+#:
+#: Bounded at all, rather than a bare ``join()``, because an unbounded one would
+#: let a single pathological writer hold a merge-lane dispatch open forever —
+#: the failure class this protocol exists to remove, re-introduced at the other
+#: end.  Giving up is safe: the thread is ``daemon=True`` so it cannot block
+#: interpreter shutdown, and it still closes its own fd in its own ``finally``
+#: whenever it does finish, so that fd can never be closed out from under a
+#: reused descriptor.
+HEARTBEAT_STOP_JOIN_SECS: float = 5.0
+
+
 async def _default_ssh_heartbeat_run(
     argv: list[str],
     *,
     cwd: str | Path | None = None,
     heartbeat_interval: float = HEARTBEAT_INTERVAL_SECS,
+    start_heartbeat=start_stdin_heartbeat,
 ) -> tuple[int, str, str]:
     """Default ssh-dispatch subprocess helper — like :func:`_default_subprocess_run`,
     plus a stdin heartbeat (connection-death protocol, PRD §8.1).
 
-    Opens *argv* with ``stdin=PIPE`` (unlike :func:`_default_subprocess_run`,
-    whose stdin is unset/inherited) and runs a concurrent writer task that
-    sends a heartbeat newline down the child's stdin every
+    Opens *argv* on the read end of a pipe this coroutine owns (unlike
+    :func:`_default_subprocess_run`, whose stdin is unset/inherited) and beats
+    one ``verify_cancel.HEARTBEAT_TOKEN`` down the write end every
     *heartbeat_interval* seconds for the full duration of the call.  This is
     the dispatcher half of the connection-death protocol: the remote
-    verify-merge watchdog (``verify_cancel.run_stdin_watchdog``) fires if
-    heartbeats stop arriving, tying the remote build's lifetime to this ssh
-    child's lifetime.
+    verify-merge watchdog (``verify_cancel.run_stdin_watchdog``) fires if beats
+    stop arriving, tying the remote build's lifetime to this ssh child's
+    lifetime.
 
-    A heartbeat write failing with ``BrokenPipeError``/``ConnectionResetError``
-    means the child is already gone (EPIPE) — benign, since the existing
-    transport-failure handling (non-zero rc / unparseable stdout ->
-    RunnerUnavailable) already covers the dead-channel outcome.  Swallowed so
-    it never raises out of the writer nor alters the returned
-    ``(rc, stdout, stderr)``.  The writer task is cancelled once stdout/stderr
-    have been fully read and the child has exited.
+    The beat is written from a dedicated OS thread
+    (``verify_cancel.start_stdin_heartbeat``), NOT an asyncio task on this
+    coroutine's loop.  That loop is the orchestrator's single shared one —
+    scheduler, agent dispatch, merge worker, uvicorn escalation server — and a
+    producer scheduled behind its stalls stops beating for exactly as long as
+    the stall lasts, which the remote correctly reads as a dead channel.
+    Owning a raw pipe is what makes the thread possible: ``proc.stdin`` would
+    be a loop-bound ``StreamWriter`` whose ``write``/``drain`` must not be
+    called from another thread, and routing through ``call_soon_threadsafe``
+    would put the write back on the very loop whose stalls are the defect.
+
+    A failed beat never raises out of the writer nor alters the returned
+    ``(rc, stdout, stderr)``; ``verify_cancel.run_stdin_heartbeat`` names each
+    suppressed error and why it is benign.
+
+    The writer is stopped and joined before this returns, so it can never
+    outlive its dispatch; the join is bounded by
+    :data:`HEARTBEAT_STOP_JOIN_SECS` and is awaited OFF this loop (see that
+    constant: joining inline would re-create, in the teardown, exactly the
+    loop stall the beat was moved to a thread to survive).
+    *start_heartbeat* is injectable
+    (default ``verify_cancel.start_stdin_heartbeat``) so tests can observe the
+    writer's lifetime, mirroring this module's ``run`` / ``ssh_run`` /
+    ``id_factory`` seams.
 
     Deliberately does NOT use ``proc.communicate()`` (task 2309 boundary gate,
     SS9 Row 6): ``communicate()`` unconditionally calls its internal
     ``_feed_stdin(input)`` helper whenever ``self.stdin is not None`` — true
-    here since this coroutine opens with ``stdin=PIPE`` — and ``_feed_stdin``
-    closes ``proc.stdin`` right after (a no-op) write/drain, even when
-    ``input`` is ``None``.  That closes the connection-death channel within
-    milliseconds of spawn, racing the heartbeat writer above so real
+    whenever this coroutine opens with ``stdin=PIPE``, as it once did — and
+    ``_feed_stdin`` closes ``proc.stdin`` right after (a no-op) write/drain,
+    even when ``input`` is ``None``.  That closes the connection-death channel
+    within milliseconds of spawn, racing the heartbeat writer so real
     heartbeats never reach the child — confirmed via a real child that reports
     back exactly what it read from stdin (a plain ``readline()``-based check
     is fooled: EOF unblocks a blocking read the same as a real newline would,
     so it can't tell "closed" from "heartbeat delivered").  Reading the
     streams directly (mirroring ``communicate()``'s own
-    ``gather(...); await self.wait()`` shape, minus the stdin feed/close)
-    keeps ``proc.stdin`` open for the full duration instead.
+    ``gather(...); await self.wait()`` shape, minus the stdin feed/close) kept
+    the channel open for the full duration instead.
+
+    Task 4195 changed that paragraph's premise without changing its
+    conclusion: with ``stdin=<raw fd>`` ``proc.stdin`` is ``None``, so
+    ``_feed_stdin`` never fires and ``communicate()`` is technically safe here
+    again.  The direct read is retained anyway, and the record above kept,
+    because reverting to ``stdin=PIPE`` is the single edit that would silently
+    re-arm the defect — this paragraph is the only thing standing in its way.
     """
-    proc = await asyncio.create_subprocess_exec(
-        *argv,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=cwd,
-    )
-
-    async def _heartbeat() -> None:
-        assert proc.stdin is not None  # stdin=PIPE above guarantees this
-        while True:
-            await asyncio.sleep(heartbeat_interval)
-            try:
-                proc.stdin.write(b'\n')
-                await proc.stdin.drain()
-            except (BrokenPipeError, ConnectionResetError):
-                pass  # child already gone -- benign, transport-failure path handles it
-
-    heartbeat_task = asyncio.ensure_future(_heartbeat())
+    # Ordering is load-bearing.  The writer is started BEFORE the spawn so that
+    # exactly ONE owner exists for write_fd on every path: if
+    # create_subprocess_exec raises, the outer finally stops the thread, which
+    # closes the fd in its own finally, and nothing leaks.  start_stdin_heartbeat
+    # puts the write end in non-blocking mode itself, so a full pipe raises
+    # BlockingIOError in the writer (skipping one beat) instead of parking that
+    # thread forever and wedging the teardown join below.
+    read_fd, write_fd = os.pipe()
+    heartbeat = start_heartbeat(write_fd, interval=heartbeat_interval)
     try:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=read_fd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=cwd,
+            )
+        finally:
+            # The child holds its own dup.  A reader left open in the parent
+            # would stop a dead child's pipe from ever raising BrokenPipeError
+            # — the signal the writer's suppression is built around.
+            os.close(read_fd)
         # stdout=PIPE/stderr=PIPE above guarantees these are populated; an
         # explicit check (rather than a bare assert) keeps the guard live
         # under `python -O`, which strips asserts.
@@ -913,11 +1195,15 @@ async def _default_ssh_heartbeat_run(
         stdout_b, stderr_b = await asyncio.gather(stdout_r.read(), stderr_r.read())
         await proc.wait()
     finally:
-        heartbeat_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await heartbeat_task
-        if proc.stdin is not None and not proc.stdin.is_closing():
-            proc.stdin.close()
+        # The writer owns write_fd and closes it as it exits; that close is what
+        # delivers EOF to the remote's watchdog.  stop() is synchronous and
+        # instant; the join that follows is not, so it is paid on a worker
+        # thread — this coroutine's loop is the shared one (see
+        # HEARTBEAT_STOP_JOIN_SECS).  A CancelledError raised at that await
+        # during shutdown is harmless: stop() has already been signalled, the
+        # thread is daemon=True, and it closes its own fd in its own finally.
+        heartbeat.stop()
+        await asyncio.to_thread(heartbeat.thread.join, HEARTBEAT_STOP_JOIN_SECS)
 
     return (
         proc.returncode or 0,
@@ -945,7 +1231,10 @@ class SyncOutcome:
         fail-closed (PRD §3.1).
 
     ``stale`` records whether a HEAD mismatch was detected; ``synced`` whether a
-    pull+uv-sync actually completed ok.  ``local_head``/``remote_head`` carry the
+    pull+uv-sync actually completed ok AND left the remote with a working
+    ``orchestrator`` CLI (task 4539's post-sync liveness assertion — a sync can
+    exit 0 and still have destroyed the entry point).
+    ``local_head``/``remote_head`` carry the
     compared shas (for the ``runner_stale`` payload / operator triage);
     ``detail`` is a short human string.  Frozen so an outcome cannot be mutated
     after the fact.
@@ -1030,9 +1319,10 @@ class RemoteRunner:
         # _git_remote/_cwd, which are the PROJECT checkout.
         self._df_remote_checkout = df_remote_checkout
         self._df_local_checkout = df_local_checkout
-        # Per-runner lock serialising the mutating sync (pull + uv sync) so two
-        # concurrent dispatches never `git pull` the same checkout at once
-        # (PRD §3.1).  Read-only HEAD probes run outside it.
+        # Per-runner lock serialising the mutating sync (pull + `uv sync
+        # --all-packages` + the post-sync liveness probe) so two concurrent
+        # dispatches never `git pull` the same checkout at once (PRD §3.1).
+        # Read-only HEAD probes run outside it.
         self._sync_lock = asyncio.Lock()
         self._run = run if run is not None else _default_subprocess_run
         # γ: connection-death heartbeat-watchdog (PRD §8.1). The ssh dispatch is
@@ -1113,15 +1403,25 @@ class RemoteRunner:
         bb834dd42a).  Different AND the remote does not match origin ⇒ emit
         ``runner_stale`` and, serialised on the per-runner lock and only when NO
         verify is in flight (never ``git pull`` under a live verify), run ``git
-        pull --ff-only`` + ``uv sync`` on the remote DF checkout, emitting
-        ``runner_synced`` (kind='df_checkout') on success.  Success is keyed on
-        the two return codes, NOT a post-sync HEAD-equality check — the
-        dispatcher's local DF HEAD may legitimately lead origin (unpushed
-        commits), and the remote pulls from origin (design_decisions[3]).
+        pull --ff-only`` + ``uv sync --all-packages`` on the remote DF checkout,
+        then ASSERT the checkout is still runnable via ``REMOTE_LIVENESS_CMD``
+        over ssh, emitting ``runner_synced`` (kind='df_checkout') on success.
 
-        Fail-closed and never-raises: staleness with a failed pull/uv-sync, or
-        any subprocess/transport error, returns ``ok=False`` so the pool benches
-        the runner (PRD §3.1).  Not configured (no ``df_remote_checkout`` / no
+        The sync command is ``--all-packages`` and the liveness assertion exists
+        because of the same defect (task 4539): a DF checkout's root
+        pyproject.toml declares a uv WORKSPACE, in which a bare ``uv sync``
+        prunes the workspace members' console scripts — deleting the very
+        ``orchestrator`` entry point this runner then invokes over ssh — while
+        still EXITING 0.  So success is NOT keyed on the return codes alone; it
+        is keyed on the codes plus a probe that the CLI still answers.  It is
+        still not keyed on a post-sync HEAD-equality check — the dispatcher's
+        local DF HEAD may legitimately lead origin (unpushed commits), and the
+        remote pulls from origin (design_decisions[3]).
+
+        Fail-closed and never-raises: staleness with a failed pull/uv-sync, a
+        post-sync liveness probe that does not return 0, or any
+        subprocess/transport error, returns ``ok=False`` so the pool benches the
+        runner (PRD §3.1).  Not configured (no ``df_remote_checkout`` / no
         resolvable ``df_local_checkout``) returns ``configured=False, ok=True``
         and issues ZERO ssh/git calls — byte-identical to the pre-INV-2 path.
         ``event_store`` is None-safe (emit only when set), mirroring LocalRunner.
@@ -1226,15 +1526,68 @@ class RemoteRunner:
                         detail=f'git pull --ff-only failed (rc={pull_rc}): {pull_err}',
                     )
 
+                # `--all-packages`, NOT a bare `uv sync` (task 4539).  A
+                # Dark-Factory checkout's root pyproject.toml declares a uv
+                # WORKSPACE ([tool.uv.workspace].members), and in a workspace a
+                # bare `uv sync` syncs only the ROOT project's environment and
+                # PRUNES what the root does not declare — including the
+                # workspace MEMBERS' console-script entry points, among them the
+                # `orchestrator` script that run_merge_verify invokes over ssh a
+                # few lines below.  Measured on the second host: before,
+                # `.venv/bin/orchestrator` existed and the entry point answered
+                # rc=0; after a bare `uv sync` it was GONE and the ssh dispatch
+                # failed rc=127; `uv sync --all-packages` restored it.  So the
+                # sync that exists to make the remote CURRENT was instead
+                # DELETING the very CLI whose verdict it was preparing to adopt.
+                #
+                # `--all-packages` is correct for a workspace and harmless for a
+                # single-package repo (uv treats such a project as a one-member
+                # workspace), so it is issued unconditionally rather than being
+                # made a per-runner knob nobody would ever set differently.
+                # CONTRIBUTING.md already names it as the whole-repo sync, and
+                # it is the same spelling `verify_cold_preprovision_command`
+                # uses in dark-factory-orchestrator.yaml.
                 uv_rc, _, uv_err = await self._run(
                     ['ssh', *_SSH_BASE_OPTS, self._ssh_host,
-                     f'cd {shlex.quote(df_remote)} && uv sync'],
+                     f'cd {shlex.quote(df_remote)} && uv sync --all-packages'],
                 )
                 if uv_rc != 0:
                     return SyncOutcome(
                         configured=True, ok=False, stale=True, synced=False,
                         local_head=local_head, remote_head=remote_head,
-                        detail=f'uv sync failed (rc={uv_rc}): {uv_err}',
+                        detail=f'uv sync --all-packages failed (rc={uv_rc}): {uv_err}',
+                    )
+
+                # Post-sync LIVENESS assertion (task 4539).  The two return codes
+                # above are NOT sufficient evidence that the host still works: the
+                # destructive bare `uv sync` this call site used to issue exited 0
+                # while deleting the entry point.  A sync whose rc says "fine" but
+                # which left no runnable `orchestrator` must bench the runner HERE,
+                # loudly and attributably — otherwise the breakage is rediscovered
+                # one dispatch later as an rc=127 RunnerUnavailable, which is
+                # fail-safe (the pool falls back to local) but indistinguishable
+                # from ssh flakiness, so the remote host stays silently disabled.
+                #
+                # Scoped to the post-sync path: a current checkout and an
+                # in-flight skip mutate nothing, so they issue no probe and the
+                # common per-dispatch case pays zero extra ssh round-trips.
+                #
+                # Fail-closed like every other leg here, and the probe raising is
+                # caught by the outer handler as a transport error.
+                live_rc, _, live_err = await self._run(
+                    ['ssh', *_SSH_BASE_OPTS, self._ssh_host, REMOTE_LIVENESS_CMD],
+                )
+                if live_rc != 0:
+                    return SyncOutcome(
+                        configured=True, ok=False, stale=True, synced=False,
+                        local_head=local_head, remote_head=remote_head,
+                        detail=(
+                            f'post-sync liveness probe failed: '
+                            f'`{REMOTE_LIVENESS_CMD}` on {self._ssh_host!r} '
+                            f'returned rc={live_rc} — the sync left '
+                            f'{df_remote!r} without a working orchestrator CLI: '
+                            f'{live_err}'
+                        ),
                     )
 
                 # Best-effort post-sync HEAD for the runner_synced.to_head
@@ -1496,8 +1849,8 @@ class RemoteRunner:
         sibling of 1768).  Timestamp format and name sanitization mirror _archive_merge_verify_logs
         (verify.py:779-856) via _STDERR_ARCHIVE_TS_FMT and _sanitize_runner_name.
 
-        The attempt number is pinned to 1, matching the local merge path's ``attempt_id or 1``
-        default (verify.py:2529).  Microsecond-precision timestamps already guarantee filename
+        The attempt number is pinned to 1, matching the local merge path's default
+        (``verify.py::_archive_attempt_id``).  Microsecond-precision timestamps already guarantee filename
         uniqueness across back-to-back ENOSPC retries, so threading attempt_id through the call
         chain is unnecessary and would complicate the interface for no triage benefit.
 
@@ -1915,6 +2268,8 @@ class VerifyRunnerPool:
         attempt: int = 0,
         depth: int | None = None,
         speculative: bool | None = None,
+        chain_items: int = 1,
+        chain_build_ms: int | None = None,
     ) -> VerifyResult:
         """Run the verify bundle and emit a merge_verify event.
 
@@ -1929,6 +2284,45 @@ class VerifyRunnerPool:
         per-event schema branching.  Bare/legacy callers that omit both
         kwargs get ``None`` for each, which is byte-identical to pre-2340
         behaviour aside from the two extra always-present keys.
+
+        ``chain_items`` (task 3185, PRD γ decision 8) is the **count, in
+        CHAIN-ITEM units, of the items contained in the tree this verify
+        actually exercised** — the dispatching item is chain item #1 and each
+        chained successor actually built adds one.  It is deliberately
+        frontier-INDEPENDENT: a verify that chained nothing is 1 however many
+        other verifies are in flight, which is what makes ``chain_items >= 2``
+        a sound deep-verify discriminator.  It defaults to ``1``, deliberately
+        NOT to ``None`` the way ``depth``/``speculative`` do, for two
+        reasons.  (1) Semantics: a
+        count of items in a verified tree has a smallest TRUTHFUL value of
+        1 — every merge verify exercises at least the one item it was created
+        for — so there is no "absent" state to represent, and ``None`` would
+        be a lie rather than a missing signal.  (2) Contract: the PRD requires
+        the field on EVERY merge verify, and several callers thread no
+        telemetry kwargs at all (``merge_shadow.py:1254``/``:1368``); a
+        ``None`` default would emit ``chain_items: null`` for exactly those
+        and break both the contract and η1's reader
+        (``scripts/merge-deep-canary-predicate.sh``).
+
+        ``chain_build_ms`` (task 3185 amend) is the wall-clock cost of the
+        deep chain build that produced this verify's tree, in milliseconds.
+        Unlike ``chain_items`` it DOES default to ``None``, and correctly so:
+        a verify that chained nothing paid no build, so there is a genuine
+        "absent" state to represent and 0 would be a lie.  It is emitted
+        always-present-but-nullable for the same reason ``depth`` is — a
+        reader does a plain ``data.get('chain_build_ms')`` with no
+        per-event schema branching.  It exists because the build is awaited
+        INLINE on the merge worker's dispatch path, so it is a per-round
+        DISPATCH STALL (no head can be finalized or landed while it runs) that
+        must never be mistaken for verify time; η1 reads it alongside
+        drain-time.  Non-``None`` implies ``chain_items >= 2``.
+
+        ``chain_items`` SUPERSEDES ``depth`` as the honest depth signal: a
+        firing speculation probe (task 2359) relabels ``depth`` into an
+        attribution fact about a stack that was never verified, whereas
+        ``chain_items`` is derived from the tree that actually ran.  See the
+        ``merge_verify`` doc-comment in ``event_store.py`` for the full field
+        note.
 
         Fail-safe (PRD §A Invariant 2 / D5): if the selected runner raises
         RunnerUnavailable, dispatch falls back to the local runner (if
@@ -2024,6 +2418,43 @@ class VerifyRunnerPool:
                 raise
         duration_ms = round((time.monotonic() - t0) * 1000)
 
+        # Task 3789 (ε): re-stamp the carried observation's `runner`.
+        #
+        # `FlakeSuppression.runner` means WHERE the isolated re-run executed, and the
+        # discriminator can only stamp 'local' — a host-RELATIVE truth that reads as a
+        # lie once the observation crosses the wire.  THIS is the only scope that knows
+        # which runner really ran, and it knows it only HERE, after the
+        # RunnerUnavailable->local fallback above: `merge_queue` passes a `runner`
+        # argument reflecting the runner it INTENDED, so recording the correction at
+        # the recorder's call site would file a fallback verify's flakes against an
+        # innocent remote.  θ's class-3 systemic check reads this column to tell a bad
+        # HOST from a bad SUITE, so a fleet-wide 'local' would make that undecidable.
+        #
+        # A pure `dataclasses.replace` and nothing else: `dispatch` is a TRANSPORT
+        # concern, and the ledger write / event / streak bump belong to
+        # `flake_recorder` on the merge path (recording here too would double-count).
+        #
+        # BOTH objects `replace` touches are guarded, not just the inner one: the
+        # observation must be a real `FlakeSuppression` (a payload that somehow arrived
+        # as a bare dict degrades to an un-stamped observation) AND `result` must be a
+        # dataclass INSTANCE, since a runner returning a Protocol-conformant fake or a
+        # test double would otherwise raise `TypeError` out of the OUTER `replace` and
+        # into the merge path — which has no VerifyInfraError handler.  Mirrors
+        # `verify._is_attachable`: an observation is evidence ABOUT a verdict and must
+        # never be able to destroy the verdict it describes.
+        carried = getattr(result, 'flake_suppression', None)
+        if (
+            isinstance(carried, flake_ledger.FlakeSuppression)
+            and dataclasses.is_dataclass(result)
+            and not isinstance(result, type)
+        ):
+            result = dataclasses.replace(
+                result,
+                flake_suppression=dataclasses.replace(
+                    carried, runner=actual_runner.name,
+                ),
+            )
+
         if self._event_store is not None:
             self._event_store.emit(
                 EventType.merge_verify,
@@ -2036,6 +2467,11 @@ class VerifyRunnerPool:
                     'attempt': attempt,
                     'depth': depth,
                     'speculative': speculative,
+                    # task 3185 (PRD γ): 1-indexed count of items in the tree
+                    # actually verified -- always >= 1, never None. See
+                    # dispatch()'s docstring for why the default is 1.
+                    'chain_items': chain_items,
+                    'chain_build_ms': chain_build_ms,
                     # task 2837 (PRD verify-retry-failed-only D5): retry_scope +
                     # retry_subset_sizes — always-present (None for a full/legacy
                     # verify), derived from the D2 failed-only contract carried in
@@ -2407,6 +2843,17 @@ class DriftCheckResult:
     verdict:       AGREE / DIVERGE / INCONCLUSIVE.
     local_passed:  bool verdict from the local runner (None when INCONCLUSIVE).
     remote_passed: bool verdict from the remote runner (None when INCONCLUSIVE).
+    local_category:  VerifyResult.category from the local runner, defaulting to ''.
+    remote_category: VerifyResult.category from the remote runner, defaulting to ''.
+                   Both are always populated when a comparison actually happened,
+                   and both stay '' when INCONCLUSIVE (nothing was compared --
+                   `verdict` is the disambiguator, exactly as it is for
+                   local_passed/remote_passed, which stay None there even when
+                   the local arm genuinely produced a result).  '' is ALSO the
+                   ordinary value for a clean verify result carrying no sentinel
+                   category, so '' never means "missing".  A non-empty value such
+                   as 'merge_flake_suppressed' marks an arm whose verdict came
+                   from a sentinel path rather than a clean first-pass run.
     escalated:     True when a new divergence escalation was submitted.
     quarantined:   True when the remote runner was quarantined.
     """
@@ -2414,6 +2861,10 @@ class DriftCheckResult:
     verdict: DriftVerdict
     local_passed: bool | None = None
     remote_passed: bool | None = None
+    # Field order mirrors ParityRow (local_passed, remote_passed, local_category,
+    # remote_category) -- the sibling record of the same two-arm comparison.
+    local_category: str = ''
+    remote_category: str = ''
     escalated: bool = False
     quarantined: bool = False
 
@@ -2462,7 +2913,9 @@ class DriftDetector:
         """Run *merge_sha* on both runners and compare verdicts.
 
         Returns DriftCheckResult.  Side-effects:
-        - AGREE   → emit verdict_parity_ok event (None-safe).
+        - AGREE   → emit verdict_parity_ok event (None-safe), whose data carries
+          merge_sha, local_runner, remote_runner, passed, and both arms'
+          local_category / remote_category ('' for a clean, sentinel-free arm).
         - DIVERGE → dedup'd L1 escalation (None-safe) + quarantine remote.
         - INCONCLUSIVE → no side-effects.
         """
@@ -2485,6 +2938,12 @@ class DriftDetector:
 
         local_passed = local_result.passed
         remote_passed = remote_result.passed
+        # Same defensive getattr form run_verdict_parity uses: merge_drift wraps
+        # this whole check in a broad `except Exception`, so a bare .category
+        # AttributeError against an odd result object would silently kill the
+        # detective control rather than degrade one telemetry field.
+        local_category = getattr(local_result, 'category', '')
+        remote_category = getattr(remote_result, 'category', '')
 
         if local_passed == remote_passed:
             # Agree — emit verdict_parity_ok event.
@@ -2498,6 +2957,12 @@ class DriftDetector:
                         'local_runner': local.name,
                         'remote_runner': remote.name,
                         'passed': local_passed,
+                        # Emitted UNCONDITIONALLY ('' for a clean arm) so the
+                        # payload shape is uniform across every drift parity
+                        # event -- a consumer never has to tell an absent key
+                        # apart from a clean result.
+                        'local_category': local_category,
+                        'remote_category': remote_category,
                     },
                 )
             return DriftCheckResult(
@@ -2505,12 +2970,31 @@ class DriftDetector:
                 verdict=DriftVerdict.AGREE,
                 local_passed=local_passed,
                 remote_passed=remote_passed,
+                local_category=local_category,
+                remote_category=remote_category,
             )
 
         # Diverge — dedup'd escalation + quarantine.
         escalated = False
         if self._escalation_queue is not None and not self._escalation_queue.has_open_l1(_DRIFT_SENTINEL):
             from escalation.models import Escalation
+            # Explain the suppression sentinel ONLY when an arm actually carries it.
+            # The structured local_category=/remote_category= echo below stays
+            # unconditional (that is the task's always-populated contract); it is
+            # just this ~40-word operator footnote that would otherwise dilute
+            # every divergence escalation with hypothetical guidance.
+            # The literal is matched, not imported: the only cycle-safe home for a
+            # shared constant is verify.py, which this task does not own.  A rename
+            # there degrades to "footnote not shown" -- never to a lost signal, since
+            # the raw category is still echoed verbatim in the structured fields.
+            suppression_note = ''
+            if 'merge_flake_suppressed' in (local_category, remote_category):
+                suppression_note = (
+                    ' A category of "merge_flake_suppressed" on either arm means that '
+                    "arm's green came from an isolated flake-suppression rerun "
+                    '(verify.apply_merge_flake_suppression), not a clean first-pass '
+                    'run -- weigh that when deciding which host is wrong.'
+                )
             esc = Escalation(
                 id=self._escalation_queue.make_id(_DRIFT_SENTINEL),
                 task_id=_DRIFT_SENTINEL,
@@ -2524,8 +3008,11 @@ class DriftDetector:
                 ),
                 detail=(
                     f'merge_sha={merge_sha!r} local_runner={local.name!r} '
-                    f'({local_passed}) remote_runner={remote.name!r} ({remote_passed}). '
+                    f'({local_passed}, local_category={local_category!r}) '
+                    f'remote_runner={remote.name!r} '
+                    f'({remote_passed}, remote_category={remote_category!r}). '
                     f'A remote PASS / local FAIL split can land unverified code on main.'
+                    f'{suppression_note}'
                 ),
                 suggested_action='Re-prove laptop env via run_verdict_parity; call pool.clear_quarantine after parity is restored.',
             )
@@ -2540,6 +3027,8 @@ class DriftDetector:
             verdict=DriftVerdict.DIVERGE,
             local_passed=local_passed,
             remote_passed=remote_passed,
+            local_category=local_category,
+            remote_category=remote_category,
             escalated=escalated,
             quarantined=True,
         )

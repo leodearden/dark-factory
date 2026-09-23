@@ -7,44 +7,113 @@ from __future__ import annotations
 
 import inspect
 import os
+import re
+import sys
+import types
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
-from _fm_helpers import extract_cypher, extract_params, make_rebuild_detail
+from _fm_helpers import (
+    extract_cypher,
+    extract_params,
+    load_script_module,
+    make_rebuild_detail,
+)
+
+# --- lease-dir isolation (task 4775, prerequisite pre-1) -------------------
+#
+# Defined once in the sibling module so five importers cannot drift apart;
+# its docstring says why redirecting the directory is a hard boundary rather
+# than a convenience.  Autouse applies to every test in THIS module.
+from _fm_lease_dir_fixture import lease_dir_fixture  # noqa: F401
+
+CONFTEST_PATH = Path(__file__).parent / 'conftest.py'
+
+#: The config ``_isolate_fm_config`` is supposed to pin, derived HERE from this
+#: file's own location rather than read back from the conftest constant the
+#: fixture writes.  Reading the constant back would compare the pin against
+#: itself: a ``FM_CONFIG_PATH`` repointed at some other absolute file that
+#: happens to exist would satisfy that equality, and the absolute/exists
+#: assertions beside it, while silently resolving a different config.
+CANONICAL_CONFIG_PATH = Path(__file__).parent.parent / 'config' / 'config.yaml'
+
+
+def _fused_memory_conftest():
+    """The loaded fused-memory conftest, found by PATH rather than by name.
+
+    ``sys.modules['conftest']`` is shared with sibling subprojects'
+    conftests — conftest.py's own docstring says so, which is the reason
+    ``_fm_helpers.py`` exists — so keying on the name could hand back a
+    different package's module.
+
+    A type checker sees the same ambiguity, and resolves it the wrong way:
+    rooted at the REPO ROOT — which is where a scoped verify command runs
+    pyright from — a plain ``import conftest`` binds the root-level
+    ``conftest.py``, and every attribute read off it is an unknown-attribute
+    error.  Resolving by path is CWD-independent under both readings, which
+    is the very invariant the fixtures below exist to establish.
+    """
+    target = CONFTEST_PATH.resolve()
+    for module in list(sys.modules.values()):
+        path = getattr(module, '__file__', None)
+        if path and Path(path).resolve() == target:
+            return module
+    raise AssertionError(f'{CONFTEST_PATH} is not loaded')
+
 
 # ---------------------------------------------------------------------------
-# preserve_config_path fixture tests
+# _isolate_fm_config fixture tests
 # ---------------------------------------------------------------------------
 
-class TestPreserveConfigPath:
-    """preserve_config_path autouse fixture saves/restores CONFIG_PATH around each test."""
+class TestIsolateFmConfig:
+    """The autouse ``_isolate_fm_config`` pins CONFIG_PATH CWD-independently.
 
-    def test_absent_key_is_absent(self, preserve_config_path):
-        """When CONFIG_PATH is not set, the fixture doesn't interfere."""
-        # Remove CONFIG_PATH if present so we start clean
-        os.environ.pop('CONFIG_PATH', None)
-        assert os.environ.get('CONFIG_PATH') is None
+    Task 5444.  It replaced ``preserve_config_path``, which only saved and
+    restored the variable and so left resolution a function of the process
+    CWD; these tests assert the replacement's stronger guarantee instead of
+    the old one's.
+    """
 
-    def test_can_set_config_path_during_test(self, preserve_config_path):
-        """Setting CONFIG_PATH during a test is visible within the test."""
-        os.environ['CONFIG_PATH'] = '/tmp/inside_test.yaml'
-        assert os.environ['CONFIG_PATH'] == '/tmp/inside_test.yaml'
-        # Cleanup is the fixture's responsibility; we just verify it's set here
+    def test_config_path_is_pinned_to_the_canonical_absolute_config(self):
+        """CONFIG_PATH names the tracked config, by a path that exists and is absolute.
 
-    def test_fixture_accepts_pre_set_value(self, preserve_config_path):
-        """The fixture can be requested explicitly even when CONFIG_PATH was set before."""
-        os.environ['CONFIG_PATH'] = '/tmp/pre_set.yaml'
-        # Fixture should save this value on entry; test can see it
-        assert os.environ['CONFIG_PATH'] == '/tmp/pre_set.yaml'
+        Requests no fixture by name, so the pin being visible at all is what
+        observes the fixture's autouse-ness.
 
-    def test_is_autouse_so_no_explicit_request_needed(self):
-        """preserve_config_path is autouse; tests don't need to request it by name.
+        ``is_absolute`` is the load-bearing assertion: a relative path is
+        precisely the defect — ``YamlSettingsSource.__call__`` resolves it
+        against the process CWD and silently returns ``{}`` when it misses, so
+        a regression to a CWD-derived pin would still satisfy an equality
+        check run from ``fused-memory/`` and fail from anywhere else.
 
-        This test requests no fixture by name but still passes when autouse is active.
-        If the fixture is broken (e.g., raises on setup) this test will fail.
+        The equality half is sensitive to a wrong CONSTANT as well as to a
+        wrong fixture, because the expected path comes from
+        ``CANONICAL_CONFIG_PATH`` above and not from the conftest.
         """
-        # No CONFIG_PATH interaction; just confirms autouse doesn't break normal tests
-        assert True
+        pinned = os.environ['CONFIG_PATH']
+
+        assert Path(pinned).resolve() == CANONICAL_CONFIG_PATH.resolve()
+        assert Path(pinned).is_absolute()
+        assert Path(pinned).exists()
+
+    def test_a_test_local_config_path_overrides_the_pin_and_does_not_leak(self, tmp_path):
+        """The escape hatch the pin must leave open, and its boundary.
+
+        Fifteen test modules set ``CONFIG_PATH`` themselves and keep working
+        because a function-scoped ``setenv`` runs after the autouse fixture.
+        The nested ``MonkeyPatch.context()`` is what makes the restore half
+        observable in-test: an assertion in a test body cannot see the autouse
+        fixture's own teardown, and reading the value back from a later test
+        would be the cross-test coupling this fixture exists to remove.
+        """
+        local_config = tmp_path / 'local.yaml'
+
+        with pytest.MonkeyPatch.context() as local:
+            local.setenv('CONFIG_PATH', str(local_config))
+            assert os.environ['CONFIG_PATH'] == str(local_config)
+
+        assert Path(os.environ['CONFIG_PATH']).resolve() == CANONICAL_CONFIG_PATH.resolve()
 
 
 # ---------------------------------------------------------------------------
@@ -273,3 +342,254 @@ class TestMakeRebuildDetail:
             assert sig.parameters[param_name].kind == inspect.Parameter.KEYWORD_ONLY, (
                 f'{param_name} should be KEYWORD_ONLY'
             )
+
+
+# ---------------------------------------------------------------------------
+# make_graph_mock: cypher-aware dispatch (task 4340)
+# ---------------------------------------------------------------------------
+
+
+class TestMakeGraphMockCypherDispatch:
+    """make_graph_mock must dispatch on the cypher, not answer everything alike.
+
+    Task 4340 paginated two whole-graph reads. A paginated read issues a
+    single-row ``count(*)`` census probe and then a series of
+    ``SKIP n LIMIT m`` pages. A fixture that answers EVERY query with the same
+    rows would hand the census probe a page of edge rows, whose first column
+    is a uuid string — ``int('node-1')`` is unusable as a count — so every
+    existing caller would silently flip to ``complete=False`` plus a WARNING.
+
+    Patching around that per-test would leave a shared fixture that actively
+    lies about the read shape it stands in for, and the next person to
+    paginate something would rediscover the same trap.
+    """
+
+    @pytest.mark.asyncio
+    async def test_census_query_answers_with_a_single_row_count(self, make_graph_mock):
+        """A ``count(`` query gets ONE row holding the row count, never page rows."""
+        rows = [['node-1', 'e1', 'f', 'n'], ['node-2', 'e2', 'f', 'n']]
+        graph = make_graph_mock(rows)
+        result = await graph.ro_query('MATCH (n:Entity) RETURN count(*)')
+        assert result.result_set == [[2]]
+        assert len(result.result_set) == 1
+        # The census and the pages agree BY CONSTRUCTION.
+        assert result.result_set[0][0] == len(rows)
+
+    @pytest.mark.asyncio
+    async def test_a_count_column_among_others_is_not_a_census(self, make_graph_mock):
+        """The census dispatch is NARROW: only a bare `RETURN count(*)` projection.
+
+        A loose `'count(' in cypher` test also captures ordinary queries that
+        return a count as one column among several — find_duplicate_entity_nodes
+        issues `RETURN n.uuid, ..., count(e)` — and handing those a
+        single-column [[n]] row raises IndexError deep inside the method under
+        test, nowhere near the fixture.
+        """
+        rows = [['dup-uuid-1', 200, 2]]
+        graph = make_graph_mock(rows)
+        result = await graph.ro_query(
+            'MATCH (n:Entity {name: $name})-[e:RELATES_TO]-() '
+            'RETURN n.uuid, n.created_at, count(e) AS edge_count'
+        )
+        assert result.result_set == rows
+
+    @pytest.mark.asyncio
+    async def test_paged_query_answers_with_the_requested_slice(self, make_graph_mock):
+        rows = [[f'n{i}'] for i in range(10)]
+        graph = make_graph_mock(rows)
+        first = await graph.ro_query('MATCH (n) RETURN n.uuid SKIP 0 LIMIT 4')
+        second = await graph.ro_query('MATCH (n) RETURN n.uuid SKIP 4 LIMIT 4')
+        assert first.result_set == rows[0:4]
+        assert second.result_set == rows[4:8]
+
+    @pytest.mark.asyncio
+    async def test_skip_past_the_end_yields_no_rows(self, make_graph_mock):
+        """The boundary that terminates a page loop."""
+        rows = [[f'n{i}'] for i in range(10)]
+        graph = make_graph_mock(rows)
+        result = await graph.ro_query('MATCH (n) RETURN n.uuid SKIP 40 LIMIT 4')
+        assert result.result_set == []
+
+    @pytest.mark.asyncio
+    async def test_plain_query_still_answers_with_every_row(self, make_graph_mock):
+        """BACK-COMPAT: a non-paged, non-census query behaves exactly as before."""
+        rows = [['node-1', 'e1', 'f', 'n'], ['node-2', 'e2', 'f', 'n']]
+        graph = make_graph_mock(rows)
+        result = await graph.ro_query('MATCH (n:Entity)-[e:RELATES_TO]-() RETURN n.uuid')
+        assert result.result_set == rows
+
+    @pytest.mark.asyncio
+    async def test_ro_rows_and_q_rows_still_split_the_two_paths(self, make_graph_mock):
+        """BACK-COMPAT: .query stays a separate AsyncMock with its own rows."""
+        graph = make_graph_mock(ro_rows=[['ro']], q_rows=[['q']])
+        assert isinstance(graph.ro_query, AsyncMock)
+        assert isinstance(graph.query, AsyncMock)
+        assert (await graph.ro_query('MATCH (n) RETURN n')).result_set == [['ro']]
+        assert (await graph.query('MATCH (n) RETURN n')).result_set == [['q']]
+
+    @pytest.mark.asyncio
+    async def test_header_still_applies_to_every_dispatch_branch(self, make_graph_mock):
+        """BACK-COMPAT: by-name column resolution keeps working on every branch."""
+        header = [[1, 'label'], [1, 'properties']]
+        graph = make_graph_mock([['a', 'b']], header=header)
+        for cypher in (
+            'CALL db.indexes()',
+            'MATCH (n) RETURN count(*)',
+            'MATCH (n) RETURN n SKIP 0 LIMIT 5',
+        ):
+            assert (await graph.ro_query(cypher)).header == header
+
+    @pytest.mark.asyncio
+    async def test_default_rows_is_empty(self, make_graph_mock):
+        """BACK-COMPAT: make_graph_mock() with no args answers with no rows."""
+        graph = make_graph_mock()
+        assert (await graph.ro_query('MATCH (n) RETURN n')).result_set == []
+        assert (await graph.ro_query('MATCH (n) RETURN count(*)')).result_set == [[0]]
+
+
+# ---------------------------------------------------------------------------
+# The integration-lane in-use lease (task 4775)
+# ---------------------------------------------------------------------------
+
+REAPER_PATH = Path(__file__).parent.parent / 'scripts' / 'cleanup_test_collections.py'
+
+
+class TestTheIntegrationLaneLeaseFixture:
+    """One marker-keyed autouse fixture covers the whole integration lane.
+
+    Three live integration modules seed under a prefix the 6-hourly cron
+    reaps — `test_rrf_cross_store_merge.py`,
+    `test_memory_eval_retrieval_probe.py`, `test_memory_eval_staleness_sweep.py`
+    — and a future one will too.  A per-module opt-in is a thing that fourth
+    module can FORGET, and silently forgetting the guard is precisely the
+    failure this exists to prevent.
+
+    Driven here by stepping the real fixture body over a request that does
+    and does not carry the marker, rather than by marking a test in this
+    file.  Two reasons, both load-bearing: `addopts = -m 'not integration'`
+    would DESELECT a marked test, so the assertions would never run in the
+    merge lane at all; and a marked test in this module would be handed the
+    real machine-global lease directory (a conftest autouse fixture is set
+    up before a module-level one, so the pre-1 isolation would not yet have
+    applied) — writing into the very directory the live cron reads.
+    """
+
+    FIXTURE = '_integration_collection_lease'
+
+    @staticmethod
+    def _reaper():
+        return load_script_module(REAPER_PATH)
+
+    @classmethod
+    def _fixture_body(cls):
+        """The undecorated generator behind the fixture."""
+        definition = getattr(_fused_memory_conftest(), cls.FIXTURE)
+        return getattr(definition, '__wrapped__', definition)
+
+    @staticmethod
+    def _request(*, marked, nodeid='tests/test_some_module.py::test_seeds'):
+        """The two attributes of a real request the fixture reads."""
+        def _get_closest_marker(name):
+            if marked and name == 'integration':
+                return types.SimpleNamespace(name=name, args=(), kwargs={})
+            return None
+
+        node = types.SimpleNamespace(
+            nodeid=nodeid, get_closest_marker=_get_closest_marker,
+        )
+        return types.SimpleNamespace(node=node)
+
+    def test_it_is_autouse_so_a_test_never_has_to_request_it(self, request):
+        """An opt-in a future integration module can forget is the failure
+        mode this guard exists to prevent."""
+        assert self.FIXTURE in request.fixturenames
+
+    def test_a_marked_test_holds_a_live_lease_during_its_body(self, lease_dir):
+        """Liveness observed while the fixture is active — not that setup
+        ran, which would pass even if the lease were released immediately."""
+        reaper = self._reaper()
+        nodeid = 'tests/test_rrf_cross_store_merge.py::test_seeds_a_live_corpus'
+        body = self._fixture_body()(self._request(marked=True, nodeid=nodeid))
+        next(body)
+        try:
+            live = reaper.live_leases()
+        finally:
+            with pytest.raises(StopIteration):
+                next(body)
+
+        assert len(live) == 1, live
+        assert nodeid in live[0]['owner'], live[0]['owner']
+
+    def test_an_unmarked_test_takes_no_lease_and_writes_nothing(self, lease_dir):
+        """The merge lane runs under `-m 'not integration'`, so this is
+        almost every test in the suite: it must cost nothing and must never
+        hold the real cron off."""
+        reaper = self._reaper()
+        body = self._fixture_body()(self._request(marked=False))
+        next(body)
+        try:
+            live = reaper.live_leases()
+            directory_created = lease_dir.exists()
+        finally:
+            with pytest.raises(StopIteration):
+                next(body)
+
+        assert live == []
+        assert not directory_created
+
+    def test_the_lease_is_released_once_the_marked_test_completes(
+        self, lease_dir,
+    ):
+        """A lease that outlived its test would hold the cron off for the
+        rest of the pytest session."""
+        reaper = self._reaper()
+        body = self._fixture_body()(self._request(marked=True))
+        next(body)
+        assert len(reaper.live_leases()) == 1
+
+        with pytest.raises(StopIteration):
+            next(body)
+
+        assert reaper.live_leases() == []
+
+
+class TestTheLeaseDirIsolationHasOneDefinition:
+    """The fixture keeping tests out of the machine-global lease directory is
+    defined ONCE and imported by the modules that need it.
+
+    It was five verbatim copies of a ~26-line function before this guard
+    (task 4775 pre-1).  The duplication is correctness-relevant rather than
+    cosmetic: the fixture's whole job is to stop a test writing into the
+    directory the live 6-hourly cron reads, so a sixth module that copies a
+    STALE variant — or copies nothing — is exactly the silent fall-through
+    the fixture exists to prevent, and nothing about it would fail loudly.
+    """
+
+    TESTS_DIR = Path(__file__).parent
+    HOME = '_fm_lease_dir_fixture.py'
+    #: `lease_dir\w*` so a copy under either spelling is caught — the shared
+    #: definition is `lease_dir_fixture`, registered under the fixture NAME
+    #: `lease_dir`.  Spelled as a regex so this file does not match itself.
+    DEFINITION = re.compile(r'^\s*def lease_dir\w*\(', re.MULTILINE)
+
+    def test_only_the_shared_module_defines_it(self):
+        definitions = sorted(
+            path.name
+            for path in self.TESTS_DIR.glob('*.py')
+            if self.DEFINITION.search(path.read_text(encoding='utf-8'))
+        )
+
+        assert definitions == [self.HOME], (
+            f'{definitions} define the fixture themselves; import the one '
+            f'definition instead — `from _fm_lease_dir_fixture import '
+            f'lease_dir  # noqa: F401`'
+        )
+
+    def test_an_importing_module_really_gets_the_isolation(self, lease_dir):
+        """This module is one of the importers, so the redirection is
+        observable from inside it: the reaper resolves the tmp directory and
+        not the hardcoded machine-global one the live cron reads."""
+        reaper = load_script_module(REAPER_PATH)
+
+        assert reaper.lease_dir() == lease_dir
+        assert reaper.lease_dir() != reaper.DEFAULT_LEASE_DIR

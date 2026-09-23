@@ -40,5 +40,42 @@
     "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
     "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
     "escalation_refs": []
+  },
+  "context": {
+    "task": {
+      "title": "Render Task Detail pane description + details as markdown",
+      "description": "The dashboard Tasks view Task Detail pane currently renders the `description` and `details` fields as raw text. Both fields commonly contain markdown (headings, lists, bold, code spans, fenced code blocks). Render them as formatted HTML using `marked` + `DOMPurify` from the unpkg CDN (same pattern as the existing React/Babel script tags). Apply the same treatment to both fields so they look consistent.",
+      "test_strategy": "",
+      "details": "**Approach**\n\n1. Add two script tags to `dashboard/src/dashboard/static/redux/index.html` (next to the existing React/Babel CDN scripts), pinned to specific versions with SRI hashes for consistency with siblings:\n   - `marked` (https://unpkg.com/marked@... \u2014 small, mature, fast)\n   - `DOMPurify` (https://unpkg.com/dompurify@...)\n2. Bump the `?v=N` cache-buster on the JSX/CSS includes \u2014 production users hit Firefox cache hard (see memory `feedback_browser_cache_firefox`).\n3. Add a small `MarkdownText` component. Likely co-located in `tab_tasks.jsx` for now (single consumer); promote to its own file if/when reused elsewhere. Implementation:\n   ```jsx\n   function MarkdownText({ text, className }) {\n     if (!text) return null;\n     const html = DOMPurify.sanitize(marked.parse(text));\n     return <div className={className} dangerouslySetInnerHTML={{ __html: html }} />;\n   }\n   ```\n4. Replace the two `<div className=\"desc\">{...}</div>` renders in the `TaskDetail` component with `<MarkdownText text={...} className=\"desc\" />`. Keep the em-dash fallback for empty description (render the dash as plain text, not through markdown).\n5. Add CSS for the rendered elements inside `.desc` \u2014 at minimum: `h1/h2/h3` reasonable sizes (markdown headings should not blow out the panel), `code` inline styling, `pre` block styling with monospace + subtle background, `ul/ol` indent, `p` spacing. Reuse existing CSS variables (--mono, --fg-3, etc.) from `styles.css` rather than introducing new colors.\n\n**Security**\n\n`details`/`description` are authored by the orchestrator's LLM agents and human PRD writers, not by arbitrary end users \u2014 XSS risk is low. `DOMPurify.sanitize()` is belt-and-braces; configure with defaults (strips `<script>`, event handlers, `javascript:` URLs).\n\n**Verification**\n\n- Restart `dark-factory-dashboard.service` (Python change isn't needed but a uvicorn restart guarantees JSX is re-served; cache-buster bump is the actual mechanism).\n- Open the Tasks tab in a browser (Ctrl+Shift+R first to defeat Firefox cache).\n- Pick a task with a long `details` field \u2014 confirmed ~90/109 active tasks have one. T-1226 in dark-factory was the sample I inspected during exploration.\n- Verify: headings render bigger, fenced code blocks have monospace + background, lists indent properly, no raw `**bold**` or `# heading` markers visible.\n- Edge cases: empty details (no section rendered \u2014 current behavior), description containing only an em-dash fallback (renders cleanly, no `<p>\u2014</p>` weirdness).\n\n**Files expected to change**\n\n- `dashboard/src/dashboard/static/redux/index.html` (script tags + cache-buster bump)\n- `dashboard/src/dashboard/static/redux/tab_tasks.jsx` (MarkdownText component + 2 call sites)\n- `dashboard/src/dashboard/static/redux/styles.css` (rendered-markdown styling inside `.desc`)\n\n**Out of scope**\n\nMarkdown rendering elsewhere in the dashboard (Memory tab, briefings, etc.) \u2014 separate task if/when requested.",
+      "authored": false,
+      "id": "1227",
+      "record_source": {
+        "path": ".taskmaster/tasks/tasks.db",
+        "tag": "master",
+        "read_at": "2026-09-11",
+        "updated_at": "2026-05-12T00:29:26.789Z",
+        "updated_after_merge": false,
+        "run_time_title_matches": true
+      }
+    },
+    "changed_files": [
+      "dashboard/src/dashboard/static/redux/index.html",
+      "dashboard/src/dashboard/static/redux/styles.css",
+      "dashboard/src/dashboard/static/redux/tab_tasks.jsx"
+    ],
+    "base_sha": "124ab95abdbf4a51e091eab3690f33eb88ba6259",
+    "branch_sha": "46d90f6efa17de411f840546292aaccb4ae0eb37",
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "no plan.json survives for this task. Absent: .worktrees/.task-meta/<id>/plan.json; data/orchestrator/agent-transcripts/<id>/; ~/.claude/projects/-home-leo-src-dark-factory--worktrees-<id>/; runs.db events with a plan payload (design_decisions/steps); runs.db plan-phase events (other than invocation/routing/phase bookkeeping) with a payload; data/orchestrator/landed_outbox.json entry. Wider hunt (escalations archive, fleet sessions, branch commit messages, branch tree, fused-memory) found nothing for this task",
+    "verification": {
+      "merge_sha": "9c604a8a73fe3bace1144fd7bd86f168481dcf3c",
+      "merge_base_sha": "124ab95abdbf4a51e091eab3690f33eb88ba6259",
+      "diff_reproduces_from": "git diff 124ab95abd 9c604a8a73",
+      "diff_reproduces": true,
+      "merge_tree_equals_merge_commit_tree": true,
+      "changed_files_match_diff_headers": true,
+      "verified_at": "2026-09-11"
+    }
   }
 }

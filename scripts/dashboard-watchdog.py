@@ -146,9 +146,17 @@ STATE_PATH = os.environ.get(
 )
 
 #: File-backed escalation queue the storm escape writes into — the same
-#: directory dark-factory-orchestrator.yaml:116 configures as
-#: ``escalation.queue_dir``, so the record is visible to the dashboard and the
-#: escalation server without an MCP round-trip.
+#: directory dark-factory-orchestrator.yaml's ``escalation.queue_dir`` key
+#: configures, so the record is visible to the dashboard and the escalation
+#: server without an MCP round-trip. That key holds a RELATIVE path resolved
+#: against ``project_root`` (``orchestrator.harness`` joins
+#: ``Path(config.project_root) / config.escalation.queue_dir``), which is why
+#: this constant is REPO_DIR-anchored rather than a bare relative path.
+#: The coupling is pinned by tests/scripts/test_dashboard_watchdog.py::
+#: test_b6_escalation_queue_dir_matches_the_configured_escalation_queue_dir, so
+#: repointing either ``escalation.queue_dir`` or ``project_root`` fails that
+#: test instead of silently sending born-at-L2 ceiling records to a directory
+#: nothing reads.
 ESCALATION_QUEUE_DIR = os.environ.get(
     "DASHBOARD_WATCHDOG_QUEUE_DIR", os.path.join(REPO_DIR, "data", "escalations")
 )

@@ -14,16 +14,27 @@ import json
 import logging
 import time
 import types
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from escalation import server as escalation_server
+from escalation.canonical import canonical_root_cause
 from escalation.dedupe import DedupeConfig, summary_dedupe_key
 from escalation.models import Escalation
-from escalation.queue import EscalationQueue
-from escalation.server import _COMPACT_ESCALATION_FIELDS, create_server
+from escalation.queue import _MAX_AMENDMENTS, EscalationQueue
+from escalation.server import (
+    _AMENDMENT_TRUNCATION_ANCHOR_TASK_ID,
+    _AMENDMENT_TRUNCATION_STORM_THRESHOLD,
+    _AMENDMENT_TRUNCATION_STORM_WINDOW_SECONDS,
+    _COMPACT_ESCALATION_FIELDS,
+    _ROOT_CAUSE_OVERFOLD_ANCHOR_TASK_ID,
+    _ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD,
+    create_server,
+)
 
 # ---------------------------------------------------------------------------
 # Cross-package orchestrator imports — used by TestMergeStatus.
@@ -84,8 +95,9 @@ async def _info(server, **kwargs: Any) -> dict[str, Any]:
 
 async def _get_pending(server, **kwargs: Any) -> list[dict[str, Any]]:
     tool = await server.get_tool('get_pending_escalations')
-    # get_pending_escalations is a sync def, so tool.fn(...) returns directly
-    return tool.fn(**kwargs)
+    # async def as of task 3543 — it awaits a batched scheduler status read to
+    # compute each record's pins_recovery annotation.
+    return await tool.fn(**kwargs)
 
 
 async def _stamp_triage(server, **kwargs: Any) -> dict[str, Any]:
@@ -94,9 +106,21 @@ async def _stamp_triage(server, **kwargs: Any) -> dict[str, Any]:
     return tool.fn(**kwargs)
 
 
+async def _declare_pin(server, **kwargs: Any) -> dict[str, Any]:
+    tool = await server.get_tool('declare_pin')
+    # declare_pin is a sync def, so tool.fn(...) returns directly
+    return tool.fn(**kwargs)
+
+
 async def _get_task_escalations(server, **kwargs: Any) -> list[dict[str, Any]]:
     tool = await server.get_tool('get_task_escalations')
     # get_task_escalations is a sync def, so tool.fn(...) returns directly
+    return tool.fn(**kwargs)
+
+
+async def _get_escalation(server, **kwargs: Any) -> dict[str, Any]:
+    tool = await server.get_tool('get_escalation')
+    # get_escalation is a sync def, so tool.fn(...) returns directly
     return tool.fn(**kwargs)
 
 
@@ -337,14 +361,15 @@ class TestGetPendingLevelFilter:
 class TestGetPendingCompact:
     """get_pending_escalations(compact=True) returns only the triage-relevant fields."""
 
-    _COMPACT_KEYS = {
-        'id', 'task_id', 'category', 'severity', 'level', 'status',
-        'summary', 'suggested_action', 'timestamp',
-        'triaged_at', 'triaged_by', 'triage_note', 'updated_at',
-    }
-    # Heavy fields that compact mode must omit.
+    # DERIVED from the constant, never re-transcribed: a hand-copied literal here
+    # encodes the constant's VALUE instead of its NAME and silently drifts every
+    # time the projection is widened (it did — task 3997).
+    _COMPACT_KEYS = set(_COMPACT_ESCALATION_FIELDS)
+    # Heavy fields that compact mode must omit.  `members` stays here even though
+    # `member_ids` is now projected: the raw model key must never appear in a
+    # compact row, only its renamed projection.
     _HEAVY_KEYS = {
-        'detail', 'members', 'options', 'root_cause', 'train_state',
+        'detail', 'members', 'options', 'train_state',
         'workflow_state', 'worktree', 'dedupe_children', 'dedupe_fingerprint',
         'resolution',
     }
@@ -417,6 +442,105 @@ class TestGetPendingCompact:
         assert len(result) == 2, f"Expected 2 L2 rows, got {len(result)}: {result}"
         assert all(r['level'] == 2 for r in result)
         assert all(set(r.keys()) == self._COMPACT_KEYS for r in result)
+
+    # -- C1: root_cause + member_ids survive the projection (task 3997) ------
+
+    @pytest.mark.asyncio
+    async def test_compact_projection_carries_root_cause(self, tmp_path: Path):
+        """compact rows carry ``root_cause`` and ``member_ids`` (task 3997, C1).
+
+        A rotating L2 watcher must be able to answer "is this cluster already
+        promoted?" from the DRAIN ALONE — that needs the L2's ``root_cause``
+        (the dedup key ``find_pending_l2_by_root_cause`` matches on) and its
+        member ids, both of which compact mode used to drop.  ``detail`` stays
+        dropped: it is the unbounded free-text field the compact projection
+        exists to keep out of a long-running watcher's context.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed_heavy(queue, 'task-A', level=2)
+
+        result = await _get_pending(server, level=2, compact=True)
+
+        assert len(result) == 1, f'Expected 1 result, got {len(result)}: {result}'
+        row = result[0]
+        assert row['root_cause'] == 'shared root cause hypothesis', (
+            f'root_cause missing or wrong in compact row: {row}'
+        )
+        # THE load-bearing assertion.  `member_ids` is NOT a key of to_dict()
+        # (the model field is `members`), so under the `if k in d` guard that
+        # pins_recovery's absent-means-UNKNOWN contract requires, a naive
+        # tuple-widening SILENTLY DROPS it.  This assertion is what makes that
+        # silent failure loud.
+        assert row['member_ids'] == ['esc-1-1', 'esc-1-2'], (
+            f'member_ids missing or wrong in compact row: {row}'
+        )
+        assert 'detail' not in row, (
+            f'the 4000-char free-text field must stay dropped: {sorted(row)}'
+        )
+        assert 'members' not in row, (
+            f'the contract key is member_ids; the raw model key stays dropped: {sorted(row)}'
+        )
+
+        # C1's sufficiency claim (boundary B2): a rotation with ZERO session
+        # memory rebuilds `already_promoted` from the returned rows alone.
+        second = Escalation(
+            id=queue.make_id('task-B'),
+            task_id='task-B',
+            agent_role='implementer',
+            severity='blocking',
+            category='design_concern',
+            summary='second cluster',
+            detail='y' * 4000,
+            suggested_action='manual_intervention',
+            level=2,
+            members=['esc-2-1'],
+            root_cause='a different root cause hypothesis',
+        )
+        queue.submit(second)
+
+        rows = await _get_pending(server, level=2, compact=True)
+
+        assert len(rows) == 2, f'Expected both L2 rows, got {rows}'
+        already_promoted = (
+            {r['root_cause'] for r in rows}
+            | {m for r in rows for m in r['member_ids']}
+        )
+        assert already_promoted == {
+            'shared root cause hypothesis',
+            'a different root cause hypothesis',
+            'esc-1-1',
+            'esc-1-2',
+            'esc-2-1',
+        }, f'drain-alone rebuild of already_promoted is incomplete: {already_promoted}'
+
+    @pytest.mark.asyncio
+    async def test_task_escalations_compact_carries_root_cause(self, tmp_path: Path):
+        """The OTHER apply site projects the same widened set (task 3997, C1).
+
+        The two compact apply sites fail in OPPOSITE ways under a naive
+        tuple-widening: the guarded ``get_pending_escalations`` projection
+        silently drops ``member_ids``, while this UNGUARDED
+        ``get_task_escalations`` one raises KeyError.  Both need a pin.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed_heavy(queue, 'task-A', level=2)
+
+        result = await _get_task_escalations(server, task_id='task-A', compact=True)
+
+        assert len(result) == 1, f'Expected 1 result, got {result}'
+        row = result[0]
+        assert row['root_cause'] == 'shared root cause hypothesis', (
+            f'root_cause missing or wrong in compact row: {row}'
+        )
+        assert row['member_ids'] == ['esc-1-1', 'esc-1-2'], (
+            f'member_ids missing or wrong in compact row: {row}'
+        )
+        assert set(row.keys()) == set(_COMPACT_ESCALATION_FIELDS), (
+            f'compact row keys {sorted(row.keys())} != '
+            f'{sorted(_COMPACT_ESCALATION_FIELDS)}'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1850,6 +1974,33 @@ _L2_DEFAULTS: dict[str, Any] = {
 }
 
 
+def _seed_l1(
+    queue: EscalationQueue,
+    esc_id: str,
+    task_id: str,
+    severity: str = 'blocking',
+) -> Escalation:
+    """Seed a pending L1 escalation directly via queue.submit().
+
+    One shared definition for every TestPromoteToL2* class.  It was previously
+    copied per-class with identical bodies, so a change to the seeded L1 shape
+    had to be made in four places or the classes silently drifted apart.  The
+    *severity* default preserves the original cascade-test shape for callers
+    that do not care about it.
+    """
+    esc = Escalation(
+        id=esc_id,
+        task_id=task_id,
+        agent_role='steward',
+        severity=severity,
+        category='design_concern',
+        summary='L1 cluster member',
+        level=1,
+    )
+    queue.submit(esc)
+    return esc
+
+
 # ---------------------------------------------------------------------------
 # TestPromoteToL2Create: create path
 # ---------------------------------------------------------------------------
@@ -2218,7 +2369,11 @@ class TestPromoteToL2Dedup:
         # find_pending_l2_by_root_cause returns a stale id,
         # but add_members_to_l2 returns None (archived between calls).
         monkeypatch.setattr(queue, 'find_pending_l2_by_root_cause', lambda rc: 'esc-stale-id')
-        monkeypatch.setattr(queue, 'add_members_to_l2', lambda esc_id, ids: None)
+        # **kwargs so the stub tolerates the keyword-only severity_floor the real
+        # method now takes (task 3976) — this test is about the None return.
+        monkeypatch.setattr(
+            queue, 'add_members_to_l2', lambda esc_id, ids, **kwargs: None,
+        )
 
         result = await _promote_to_l2(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
@@ -2236,6 +2391,954 @@ class TestPromoteToL2Dedup:
 
 
 # ---------------------------------------------------------------------------
+# TestPromoteToL2SeverityInheritance: severity is inherited from the members
+# ---------------------------------------------------------------------------
+
+
+class TestPromoteToL2SeverityInheritance:
+    """An omitted `severity` inherits max(member severities) (task 3976).
+
+    Before this, `promote_to_l2(severity=...)` defaulted to `'blocking'`, so an
+    L2 clustering purely-informational L1s was born `blocking` and paged a
+    human.  The default was also NON-DETERMINISTIC in practice: identical
+    inputs landed at `info` or `blocking` purely on whether the LLM caller
+    happened to type the argument.
+
+    The explicit argument stays fully honoured — a cluster of individually
+    informational findings CAN be collectively blocking, and the watcher must
+    still be able to say so.
+    """
+
+    @pytest.mark.asyncio
+    async def test_lone_info_member_yields_info_l2(self, tmp_path: Path):
+        """(a) The esc-3037 regression: an info L1 must not mint a blocking L2.
+
+        Observed incident: esc-3037-1 (L0, info, architect) → esc-3037-3 (L1,
+        info, harness-orphan-reaper — severity faithfully preserved) →
+        esc-3037-4 (L2, *blocking*, escalation-watcher-auto,
+        members=['esc-3037-3'], later closed as benign).  The inflation happens
+        at the promotion seam and only there.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
+
+        result = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+        )
+
+        assert 'error' not in result, f'Unexpected error: {result}'
+        record = queue.get(result['id'])
+        assert record is not None
+        assert record.severity == 'info', (
+            f'Lone info member must yield an info L2, got {record.severity!r}'
+        )
+        assert record.level == 2, f'Expected level=2, got {record.level}'
+
+    @pytest.mark.asyncio
+    async def test_all_info_members_yield_info_l2(self, tmp_path: Path):
+        """(b) An all-info member set inherits 'info'."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_l1(queue, 'esc-l1-a', 'task-1', 'info')
+        _seed_l1(queue, 'esc-l1-b', 'task-2', 'info')
+
+        result = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-a', 'esc-l1-b']},
+        )
+
+        record = queue.get(result['id'])
+        assert record is not None
+        assert record.severity == 'info', f'Expected info, got {record.severity!r}'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'order', [['esc-l1-info', 'esc-l1-blk'], ['esc-l1-blk', 'esc-l1-info']],
+    )
+    async def test_mixed_set_takes_the_max_not_the_first(
+        self, tmp_path: Path, order: list[str],
+    ):
+        """(c) info + blocking → blocking, in BOTH member orders.
+
+        An order-dependent fold is the bug fixed in models.SEVERITY_RANK; this
+        pins it end-to-end through the tool.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
+        _seed_l1(queue, 'esc-l1-blk', 'task-2', 'blocking')
+
+        result = await _promote_to_l2(server, **{**_L2_DEFAULTS, 'member_ids': order})
+
+        record = queue.get(result['id'])
+        assert record is not None
+        assert record.severity == 'blocking', (
+            f'member_ids={order}: expected blocking, got {record.severity!r}'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'order', [['esc-l1-info', 'esc-l1-crit'], ['esc-l1-crit', 'esc-l1-info']],
+    )
+    async def test_critical_member_wins_in_both_orders(
+        self, tmp_path: Path, order: list[str],
+    ):
+        """(d) info + critical → critical, in BOTH orders.
+
+        This is the assertion that fails if the rank table is left incomplete:
+        with the old {'info': 0, 'blocking': 1}, 'critical' fell to rank 0 and
+        the ['esc-l1-info', 'esc-l1-crit'] order would have yielded 'info'.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
+        _seed_l1(queue, 'esc-l1-crit', 'task-2', 'critical')
+
+        result = await _promote_to_l2(server, **{**_L2_DEFAULTS, 'member_ids': order})
+
+        record = queue.get(result['id'])
+        assert record is not None
+        assert record.severity == 'critical', (
+            f'member_ids={order}: expected critical, got {record.severity!r}'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('explicit', ['blocking', 'critical'])
+    async def test_explicit_override_stays_upward_capable(
+        self, tmp_path: Path, explicit: str,
+    ):
+        """(e) The task's hard constraint: info members CAN be filed higher.
+
+        A cluster of individually-informational findings can be collectively
+        blocking, and the watcher's RCA must still be able to say so.  This must
+        never become a hard ban on promoting info members.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_l1(queue, 'esc-l1-a', 'task-1', 'info')
+        _seed_l1(queue, 'esc-l1-b', 'task-2', 'info')
+
+        result = await _promote_to_l2(
+            server,
+            **{
+                **_L2_DEFAULTS,
+                'member_ids': ['esc-l1-a', 'esc-l1-b'],
+                'severity': explicit,
+            },
+        )
+
+        record = queue.get(result['id'])
+        assert record is not None
+        assert record.severity == explicit, (
+            f'Explicit upward override to {explicit!r} was not honoured: '
+            f'got {record.severity!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_explicit_override_is_honoured_downward_at_mint(self, tmp_path: Path):
+        """(f) At MINT time the caller is the authority in both directions.
+
+        The monotonic floor added on the update path governs only post-mint
+        appends; a fresh L2 takes exactly what the caller asked for.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_l1(queue, 'esc-l1-blk', 'task-1', 'blocking')
+
+        result = await _promote_to_l2(
+            server,
+            **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-blk'], 'severity': 'info'},
+        )
+
+        record = queue.get(result['id'])
+        assert record is not None
+        assert record.severity == 'info', (
+            f'Explicit downward override at mint was not honoured: {record.severity!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_members_fail_safe_up_to_blocking(
+        self, tmp_path: Path, caplog,
+    ):
+        """(g) Nothing resolves → 'blocking', loudly.
+
+        Member ids are opaque strings that are never existence-checked, so a
+        promotion whose members cannot be read must not be silently dropped nor
+        silently quieted — it fails UP with a WARNING naming the ids.  This is
+        also the compatibility guarantee for the pre-existing
+        TestPromoteToL2Create/Dedup suites, which promote phantom ids
+        throughout.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        with caplog.at_level(logging.WARNING, logger='escalation.server'):
+            result = await _promote_to_l2(
+                server, **{**_L2_DEFAULTS, 'member_ids': ['esc-phantom-1']},
+            )
+
+        record = queue.get(result['id'])
+        assert record is not None
+        assert record.severity == 'blocking', (
+            f'Unresolvable member set must fail safe UP, got {record.severity!r}'
+        )
+        warned = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and 'esc-phantom-1' in r.getMessage()
+        ]
+        assert warned, (
+            'Expected a WARNING naming the unresolved member id; got: '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_out_of_vocabulary_member_severity_never_propagates(
+        self, tmp_path: Path, caplog,
+    ):
+        """A corrupt member severity must not be minted onto the L2 verbatim.
+
+        Nothing validates a record's severity on write — `Escalation` is a
+        plain dataclass and `queue.submit`/`_rewrite` are field-agnostic
+        passthroughs — so a legacy or externally-written member can carry an
+        out-of-vocabulary string.  `max_severity` ranks an unknown at 0, but
+        its `>=` tie-break would let that string WIN over a genuine `'info'`
+        sibling and be reported back through the response `severity` key,
+        breaking the tool's promise that a filed severity is in
+        KNOWN_SEVERITIES (and falling through cockpit's severity_weights).
+        """
+        from escalation.models import KNOWN_SEVERITIES
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_l1(queue, 'esc-l1-warn', 'task-1', 'warn')
+
+        with caplog.at_level(logging.WARNING, logger='escalation.server'):
+            result = await _promote_to_l2(
+                server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-warn']},
+            )
+
+        record = queue.get(result['id'])
+        assert record is not None
+        assert record.severity in KNOWN_SEVERITIES, (
+            f'A filed L2 severity must be in the vocabulary, got {record.severity!r}'
+        )
+        # Only-member is unusable → nothing usable resolved → create fails safe UP.
+        assert record.severity == 'blocking'
+        assert result['severity'] == record.severity
+        warned = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and 'esc-l1-warn' in r.getMessage()
+        ]
+        assert warned, (
+            'Expected a WARNING naming the member with the bad severity; got: '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_out_of_vocabulary_member_does_not_outrank_a_real_info_member(
+        self, tmp_path: Path,
+    ):
+        """The fold ranges over the VALID subset, so a corrupt sibling is inert.
+
+        Both member orders, because the bug this guards against is exactly the
+        order-dependent `>=` tie-break: an unknown seeded first would win the
+        fold outright.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_l1(queue, 'esc-l1-warn', 'task-1', 'warn')
+        _seed_l1(queue, 'esc-l1-info', 'task-2', 'info')
+
+        for order in (['esc-l1-warn', 'esc-l1-info'], ['esc-l1-info', 'esc-l1-warn']):
+            result = await _promote_to_l2(
+                server,
+                **{
+                    **_L2_DEFAULTS,
+                    'member_ids': order,
+                    'root_cause': f'corrupt-sibling {order[0]}',
+                },
+            )
+            record = queue.get(result['id'])
+            assert record is not None
+            assert record.severity == 'info', (
+                f'Order {order} must derive from the valid subset only, got '
+                f'{record.severity!r}'
+            )
+
+    @pytest.mark.asyncio
+    async def test_partial_resolution_derives_from_the_resolvable_subset(
+        self, tmp_path: Path, caplog,
+    ):
+        """(h) A phantom sibling must not drag a known-info set up to blocking.
+
+        Throwing away a resolvable info member because one id was unreadable
+        would reintroduce the very inflation this task removes.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
+
+        with caplog.at_level(logging.WARNING, logger='escalation.server'):
+            result = await _promote_to_l2(
+                server,
+                **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info', 'esc-phantom-2']},
+            )
+
+        record = queue.get(result['id'])
+        assert record is not None
+        assert record.severity == 'info', (
+            'Partial resolution must derive from the resolvable subset, '
+            f'got {record.severity!r}'
+        )
+        warned = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and 'esc-phantom-2' in r.getMessage()
+        ]
+        assert warned, (
+            'Expected a WARNING naming the unresolved member id; got: '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_severity_validation_still_runs_before_derivation(
+        self, tmp_path: Path,
+    ):
+        """(i) A bad explicit severity is rejected and mints NOTHING.
+
+        Guards against reordering the KNOWN_SEVERITIES gate behind the new
+        derive branch — the gate is case-sensitive and must stay ahead of every
+        queue mutation.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
+
+        result = await _promote_to_l2(
+            server,
+            **{
+                **_L2_DEFAULTS,
+                'member_ids': ['esc-l1-info'],
+                'severity': 'CRITICAL',
+            },
+        )
+
+        assert 'error' in result, f'Expected an error for CRITICAL, got: {result}'
+        pending_l2 = await _get_pending(server, level=2)
+        assert pending_l2 == [], (
+            f'A rejected severity must mint no L2; found: {pending_l2}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestPromoteToL2SeverityInResponse: the response reports what was filed
+# ---------------------------------------------------------------------------
+
+
+class TestPromoteToL2SeverityInResponse:
+    """promote_to_l2 reports the severity it ACTUALLY filed (task 3976).
+
+    A caller that omits `severity` now gets a value it did not choose, so it
+    must be able to see what it inherited — otherwise the rotation digest can
+    only report what the watcher *asked for*, which is no longer the same
+    thing.  Purely additive: the existing keys are untouched.
+    """
+
+    @pytest.mark.asyncio
+    async def test_create_response_reports_the_inherited_severity(
+        self, tmp_path: Path,
+    ):
+        """(a) An inherited severity is visible in the response and matches disk."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
+
+        result = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+        )
+
+        assert result['severity'] == 'info', (
+            f'Response must report the inherited severity, got: {result}'
+        )
+        assert result['severity'] == queue.get(result['id']).severity  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_create_response_reports_an_explicit_severity(
+        self, tmp_path: Path,
+    ):
+        """(b) An explicit severity round-trips through the response."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
+
+        result = await _promote_to_l2(
+            server,
+            **{
+                **_L2_DEFAULTS,
+                'member_ids': ['esc-l1-info'],
+                'severity': 'critical',
+            },
+        )
+
+        assert result['severity'] == 'critical', f'Got: {result}'
+        assert result['severity'] == queue.get(result['id']).severity  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_create_response_reports_the_fail_safe_severity(
+        self, tmp_path: Path,
+    ):
+        """(c) The fail-safe value is reported too — silence must stay legible."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-phantom-1']},
+        )
+
+        assert result['severity'] == 'blocking', f'Got: {result}'
+        assert result['severity'] == queue.get(result['id']).severity  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_update_response_reports_the_post_floor_severity(
+        self, tmp_path: Path,
+    ):
+        """(d) On an append the response carries the RAISED value, not the pre-append one."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
+
+        first = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+        )
+        assert first['severity'] == 'info'
+
+        _seed_l1(queue, 'esc-l1-blk', 'task-2', 'blocking')
+        second = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-blk']},
+        )
+
+        assert second['status'] == 'updated'
+        assert second['severity'] == 'blocking', (
+            f'Response must report the post-floor severity, got: {second}'
+        )
+        assert second['severity'] == queue.get(second['id']).severity  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_existing_response_keys_are_unchanged_on_both_paths(
+        self, tmp_path: Path,
+    ):
+        """(e) The added key is purely additive — no existing consumer breaks."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
+
+        created = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+        )
+        updated = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-other']},
+        )
+
+        assert created['status'] == 'created'
+        assert updated['status'] == 'updated'
+        for result in (created, updated):
+            assert {'id', 'status', 'members'} <= result.keys(), (
+                f'An existing response key went missing: {result}'
+            )
+
+
+# ---------------------------------------------------------------------------
+# TestPromoteToL2FramingPreservation: a fold keeps the framing it carried in
+# ---------------------------------------------------------------------------
+
+
+class TestPromoteToL2FramingPreservation:
+    """A fold APPENDS its incoming framing instead of discarding it (task 3997, C2).
+
+    End-to-end through the MCP tool, which is the surface the auto-watcher
+    actually calls.  Before this, every re-promote of an already-pending cluster
+    threw away the root_cause/evidence/options/summary it carried (measured:
+    336,875 characters), and the caller could not even tell: the response said
+    'updated' either way.
+    """
+
+    @pytest.mark.asyncio
+    async def test_promote_fold_preserves_and_reports_incoming_framing(
+        self, tmp_path: Path,
+    ):
+        """A second promote's framing lands in `amendments` and is REPORTED back."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        created = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
+        )
+        assert created['status'] == 'created', f'Unexpected first result: {created}'
+
+        result = await _promote_to_l2(server, **{
+            **_L2_DEFAULTS,
+            'member_ids': ['esc-l1-2'],
+            'evidence': 'SECOND-pass evidence, authored by this promote',
+            'options': ['C: a third way nobody proposed before'],
+            'summary': 'second-pass one-line hypothesis',
+        })
+
+        # (a) the pre-existing response shape is intact — 3976's `severity` key
+        # included; this must ADD to it, never regress it.
+        assert result['status'] == 'updated', f'Expected a fold, got {result}'
+        assert result['id'] == created['id']
+        assert set(result['members']) == {'esc-l1-1', 'esc-l1-2'}
+        assert result['severity'] == 'blocking', (
+            f'the post-floor severity must still be reported: {result}'
+        )
+
+        # (b) the caller LEARNS the framing landed, rather than only seeing
+        # id/status/members/severity and having to guess.
+        assert result['amendment_recorded'] is True, (
+            f'the fold recorded framing but did not report it: {result}'
+        )
+        assert result['amendments'] == 1, f'Expected 1 amendment, got {result}'
+
+        # (c) read the full record back: ORIGINAL framing intact, INCOMING
+        # framing present alongside it — nothing dropped either way.
+        record = await _get_escalation(server, escalation_id=created['id'])
+        assert record['root_cause'] == _L2_DEFAULTS['root_cause']
+        assert record['detail'] == _L2_DEFAULTS['evidence'], (
+            'the ORIGINAL evidence must survive the fold'
+        )
+        assert record['options'] == _L2_DEFAULTS['options'], (
+            'the ORIGINAL options must survive the fold'
+        )
+        amendment = record['amendments'][0]
+        assert amendment['detail'] == 'SECOND-pass evidence, authored by this promote'
+        assert amendment['options'] == ['C: a third way nobody proposed before']
+        assert amendment['summary'] == 'second-pass one-line hypothesis'
+        assert amendment['root_cause'] == _L2_DEFAULTS['root_cause']
+        assert amendment['agent_role'] == _L2_DEFAULTS['agent_role'], (
+            f'the submitting role must be attributed: {amendment}'
+        )
+
+        # (d) the zero-new-members fold — the exact case that used to return
+        # early and silently discard everything it was handed.
+        before = queue.get(created['id'])
+        assert before is not None
+        third = await _promote_to_l2(server, **{
+            **_L2_DEFAULTS,
+            'member_ids': ['esc-l1-2'],  # already a member: nothing new to add
+            'evidence': 'THIRD-pass evidence',
+            'summary': 'third-pass hypothesis',
+        })
+
+        assert third['status'] == 'updated', f'Expected a fold, got {third}'
+        assert third['amendment_recorded'] is True, (
+            f'a zero-new-member fold still carries framing worth keeping: {third}'
+        )
+        assert third['amendments'] == 2, f'Expected 2 amendments, got {third}'
+        after = queue.get(created['id'])
+        assert after is not None
+        assert after.members == before.members, 'no new member ids were added'
+        assert after.updated_at is not None and after.updated_at > (before.updated_at or ''), (
+            f'new framing is a substantive change and must bump updated_at: '
+            f'{before.updated_at!r} -> {after.updated_at!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestAmendmentTruncationStorm: truncation gets a HEARER, not just a log line
+# ---------------------------------------------------------------------------
+
+
+class TestAmendmentTruncationStorm:
+    """Repeated amendment truncation files ONE info escalation per window.
+
+    Steps 8-9 gave amendment truncation a durable per-record counter
+    (``amendments_truncated``) and a WARNING.  A log line has no audience:
+    INV-4 asks WHO hears about it at a rate/streak threshold.  ``promote_to_l2``
+    drives a ``shared.storm_counter.StormCounter`` (the canonical task-1755
+    pattern) and files one info-severity escalation when truncations burst,
+    rate-limited to one fire per window.
+
+    Dedupe is disabled here deliberately: under the stock ``DedupeConfig``
+    (infra_issue, 600 s window) a second storm record would FOLD into the
+    first, so the rate-limit assertion would pass for the wrong reason.  With
+    dedupe off, "still exactly one record" can only be StormCounter's
+    one-fire-per-window contract.
+    """
+
+    @staticmethod
+    async def _fold(server, tag: str) -> dict[str, Any]:
+        """Promote the same root_cause again — always a fold, always framing."""
+        return await _promote_to_l2(server, **{
+            **_L2_DEFAULTS,
+            'member_ids': ['esc-l1-1'],  # already a member after the first call
+            'evidence': f'fold evidence {tag}',
+            'summary': f'fold summary {tag}',
+        })
+
+    @pytest.mark.asyncio
+    async def test_repeated_truncation_files_one_info_escalation(self, tmp_path: Path):
+        """Below threshold: silent.  At threshold: one info escalation.  Above: rate-limited."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(
+            queue, dedupe_config=DedupeConfig(infra_dedupe_enabled=False),
+        )
+
+        def pending_ids() -> set[str]:
+            return {e.id for e in queue.get_pending()}
+
+        created = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
+        )
+        assert created['status'] == 'created', f'Unexpected first result: {created}'
+        l2_id = created['id']
+        known = {l2_id}
+
+        # Fill the amendment list exactly to the cap — no truncation yet, so
+        # nothing may be filed.  Bound derived from the NAME, never the value.
+        for i in range(_MAX_AMENDMENTS):
+            filled = await self._fold(server, f'fill-{i}')
+            assert filled['status'] == 'updated', f'Expected a fold, got {filled}'
+        at_cap = queue.get(l2_id)
+        assert at_cap is not None
+        assert at_cap.amendments_truncated == 0, (
+            f'filling to the cap must not truncate: {at_cap.amendments_truncated}'
+        )
+        assert pending_ids() == known, (
+            'filling to the cap is not a storm and must file nothing'
+        )
+
+        # (a) BELOW threshold — truncation is happening, but not enough of it.
+        for i in range(_AMENDMENT_TRUNCATION_STORM_THRESHOLD - 1):
+            below = await self._fold(server, f'trunc-{i}')
+            assert below['status'] == 'updated', f'Expected a fold, got {below}'
+        rec = queue.get(l2_id)
+        assert rec is not None
+        assert rec.amendments_truncated == _AMENDMENT_TRUNCATION_STORM_THRESHOLD - 1, (
+            f'expected threshold-1 truncations, got {rec.amendments_truncated}'
+        )
+        assert pending_ids() == known, (
+            f'below the threshold nothing may be filed; new ids: '
+            f'{pending_ids() - known}'
+        )
+
+        # (b) AT threshold — exactly ONE additional pending escalation.
+        crossed = await self._fold(server, 'trunc-at-threshold')
+        new_ids = pending_ids() - known
+        assert len(new_ids) == 1, (
+            f'crossing the threshold must file exactly one storm escalation, '
+            f'got {len(new_ids)}: {sorted(new_ids)}'
+        )
+        storm = queue.get(next(iter(new_ids)))
+        assert storm is not None
+        assert storm.severity == 'info', (
+            f'a storm report is a notification, not a page: {storm.severity!r}'
+        )
+        assert storm.category == 'infra_issue', (
+            f'expected an infra-class category, got {storm.category!r}'
+        )
+        blob = f'{storm.summary}\n{storm.detail}'
+        assert l2_id in blob, (
+            f'the reader must be able to attribute the burst to the truncating '
+            f'L2 {l2_id}: {blob!r}'
+        )
+        assert str(_AMENDMENT_TRUNCATION_STORM_THRESHOLD) in blob, (
+            f'the observed count must be named so the burst is legible: {blob!r}'
+        )
+        assert str(_AMENDMENT_TRUNCATION_STORM_WINDOW_SECONDS) in blob, (
+            f'the window must be named so the rate is legible: {blob!r}'
+        )
+        # The condition is SYSTEM-scoped — cap sizing, or root-cause matching
+        # over-folding — and a burst routinely spans several L2s across several
+        # tasks.  Filing it against whichever promote crossed the threshold
+        # would put an unrelated infra record on that task's
+        # get_task_escalations, and (because the helper calls _submit_or_dedupe
+        # directly, bypassing the terminal-task chokepoint) could land it
+        # PENDING on an already-terminal task.  Same synthetic-anchor discipline
+        # as markup_tripwire._ANCHOR_TASK_ID.
+        assert storm.task_id == _AMENDMENT_TRUNCATION_ANCHOR_TASK_ID, (
+            f'a system-scoped report must file under the synthetic anchor, not '
+            f'the triggering promote\'s task: {storm.task_id!r}'
+        )
+        assert storm.task_id != _L2_DEFAULTS['task_id']
+        on_triggering_task = {
+            e.id for e in queue.get_by_task(_L2_DEFAULTS['task_id'], status='pending')
+        }
+        assert storm.id not in on_triggering_task, (
+            f'the storm report must not surface on the triggering task: '
+            f'{sorted(on_triggering_task)}'
+        )
+        known |= new_ids
+
+        # (d) ADDITIVE-NEVER-FATAL — the promote that crossed the threshold
+        # still returned its normal update-path shape; the meta-escalation is a
+        # side effect that cannot fail the tool.
+        assert crossed['status'] == 'updated', f'Expected a fold, got {crossed}'
+        assert crossed['id'] == l2_id
+        assert crossed['amendment_recorded'] is True, f'framing must still land: {crossed}'
+        assert crossed['amendments'] == _MAX_AMENDMENTS, (
+            f'the list stays capped while truncating: {crossed}'
+        )
+        assert crossed['severity'] == 'blocking', f'severity must still report: {crossed}'
+        assert set(crossed['members']) == {'esc-l1-1'}, f'members must still report: {crossed}'
+
+        # (c) RATE-LIMITED — further truncations inside the same window are
+        # counted but file nothing more.
+        for i in range(_AMENDMENT_TRUNCATION_STORM_THRESHOLD + 1):
+            again = await self._fold(server, f'post-{i}')
+            assert again['status'] == 'updated', f'Expected a fold, got {again}'
+        assert pending_ids() == known, (
+            f'StormCounter fires at most once per window; extra records: '
+            f'{pending_ids() - known}'
+        )
+        drained = queue.get(l2_id)
+        assert drained is not None
+        assert drained.amendments_truncated > _AMENDMENT_TRUNCATION_STORM_THRESHOLD, (
+            'the per-record counter keeps counting even while the notification '
+            'is rate-limited (INV-8: the durable fact is on the record)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_storm_counter_is_per_server_instance(self, tmp_path: Path):
+        """A second create_server gets a FRESH counter — no cross-server bleed.
+
+        ``StormCounter`` documents its state as PROCESS-LOCAL and per-instance
+        "so no state bleeds between servers (or between tests)".  A
+        module-level counter would still be inside the first server's
+        rate-limit window here and would fire nothing.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        cfg = DedupeConfig(infra_dedupe_enabled=False)
+        server = create_server(queue, dedupe_config=cfg)
+
+        def pending_ids() -> set[str]:
+            return {e.id for e in queue.get_pending()}
+
+        created = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
+        )
+        assert created['status'] == 'created', f'Unexpected first result: {created}'
+
+        # Fill to the cap, then burst past the threshold on server #1.
+        for i in range(_MAX_AMENDMENTS + _AMENDMENT_TRUNCATION_STORM_THRESHOLD):
+            await self._fold(server, f'first-{i}')
+        known = pending_ids()
+        assert len(known) == 2, (
+            f'expected the L2 plus one storm record, got {sorted(known)}'
+        )
+
+        # Server #2 over the SAME queue: the amendment list is already at the
+        # cap, so every fold truncates.  A fresh counter fires on its own
+        # threshold-th truncation; a shared one would still be rate-limited.
+        server2 = create_server(queue, dedupe_config=cfg, startup_sweep=False)
+        for i in range(_AMENDMENT_TRUNCATION_STORM_THRESHOLD):
+            await self._fold(server2, f'second-{i}')
+
+        fresh = pending_ids() - known
+        assert len(fresh) == 1, (
+            f'a second server must carry its own counter and fire its own '
+            f'storm report; new ids: {sorted(fresh)}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestPromoteToL2SeverityFloorOnUpdate: post-mint monotonicity
+# ---------------------------------------------------------------------------
+
+
+class TestPromoteToL2SeverityFloorOnUpdate:
+    """An L2's severity is monotonically non-decreasing after mint (task 3976).
+
+    The root-cause dedup path appends members to an existing pending L2.  Now
+    that an L2 can be born `info`, that path must raise the record when the
+    incoming members justify it — otherwise the inherited default would trade
+    the old inflation for under-escalation, which is strictly worse.
+    """
+
+    @pytest.mark.asyncio
+    async def test_blocking_member_raises_an_info_l2(self, tmp_path: Path):
+        """(h) A blocking member folding into an info L2 raises it to blocking.
+
+        Without the floor this is the under-escalation regression the new
+        inherited default would otherwise introduce.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
+
+        first = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+        )
+        assert queue.get(first['id']).severity == 'info'  # type: ignore[union-attr]
+
+        _seed_l1(queue, 'esc-l1-blk', 'task-2', 'blocking')
+        second = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-blk']},
+        )
+
+        assert second['status'] == 'updated', f'Expected an append, got: {second}'
+        assert second['id'] == first['id'], 'Same root_cause must reuse the same L2'
+        record = queue.get(first['id'])
+        assert record is not None
+        assert record.severity == 'blocking', (
+            f'A blocking member must raise the L2, got {record.severity!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_info_member_never_demotes_a_blocking_l2(self, tmp_path: Path):
+        """(i) The reverse direction is a no-op — the floor only ever adds attention."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_l1(queue, 'esc-l1-blk', 'task-1', 'blocking')
+
+        first = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-blk']},
+        )
+        assert queue.get(first['id']).severity == 'blocking'  # type: ignore[union-attr]
+
+        _seed_l1(queue, 'esc-l1-info', 'task-2', 'info')
+        second = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+        )
+
+        assert second['status'] == 'updated'
+        record = queue.get(first['id'])
+        assert record is not None
+        assert record.severity == 'blocking', (
+            f'An info member must not demote the L2, got {record.severity!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_explicit_severity_raises_but_cannot_demote_post_mint(
+        self, tmp_path: Path,
+    ):
+        """(j) Explicit UP is honoured on an append; explicit DOWN is capped.
+
+        This is the one place the caller's override is capped, and deliberately
+        so: post-mint monotonicity beats the argument, so a record cannot be
+        quieted out from under a human who is already looking at it.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
+
+        first = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+        )
+        assert queue.get(first['id']).severity == 'info'  # type: ignore[union-attr]
+
+        # Explicit UP on an append: honoured.
+        _seed_l1(queue, 'esc-l1-b', 'task-2', 'info')
+        raised = await _promote_to_l2(
+            server,
+            **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-b'], 'severity': 'critical'},
+        )
+        assert raised['status'] == 'updated'
+        assert queue.get(first['id']).severity == 'critical', (  # type: ignore[union-attr]
+            'An explicit upward override on an append must be honoured'
+        )
+
+        # Explicit DOWN on an append: capped by the monotonic floor.
+        _seed_l1(queue, 'esc-l1-c', 'task-3', 'info')
+        lowered = await _promote_to_l2(
+            server,
+            **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-c'], 'severity': 'info'},
+        )
+        assert lowered['status'] == 'updated'
+        record = queue.get(first['id'])
+        assert record is not None
+        assert record.severity == 'critical', (
+            'Post-mint monotonicity must beat an explicit demotion, got '
+            f'{record.severity!r}'
+        )
+
+
+    @pytest.mark.asyncio
+    async def test_underivable_append_leaves_an_info_l2_untouched(
+        self, tmp_path: Path,
+    ):
+        """An append that derives nothing must not inflate the existing L2.
+
+        The create path fails safe UP to 'blocking' when no member yields a
+        usable severity, because it must land on something.  That rationale
+        does NOT transfer to the update path: the existing record already
+        carries a severity derived from real members, so there is nothing to
+        lose by leaving it alone — and everything to lose by inflating it.
+        Without the distinction, a triage pass with a typo'd member id (or one
+        negative-cached inside `_locate_path`'s documented staleness window)
+        silently promotes a correctly-inherited info L2 to blocking AND bumps
+        `updated_at`, re-triggering the watcher's re-assess.  That is the
+        inflation this task removes, reintroduced through a narrow door.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
+
+        first = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+        )
+        before = queue.get(first['id'])
+        assert before is not None and before.severity == 'info'
+        updated_at_before = before.updated_at
+
+        # Same root_cause → update path, with a member id that resolves to nothing.
+        appended = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-phantom-typo']},
+        )
+
+        assert appended['status'] == 'updated'
+        assert appended['id'] == first['id']
+        after = queue.get(first['id'])
+        assert after is not None
+        assert after.severity == 'info', (
+            'An underivable append must leave the L2 severity alone, got '
+            f'{after.severity!r}'
+        )
+        assert appended['severity'] == 'info'
+        # The member id IS still appended — only the severity is left alone.
+        assert 'esc-phantom-typo' in after.members
+        assert updated_at_before != after.updated_at or updated_at_before is None, (
+            'Appending a new member is a real content change and should bump '
+            'updated_at; only the severity must be untouched'
+        )
+
+    @pytest.mark.asyncio
+    async def test_underivable_no_op_append_does_not_bump_updated_at(
+        self, tmp_path: Path,
+    ):
+        """No new members AND no derivable floor → a true no-op.
+
+        This is the sharp edge of the same defect: a re-promote of an
+        already-known member set whose ids momentarily fail to resolve must not
+        manufacture a re-assess trigger for the watcher.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
+
+        first = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+        )
+        # Append a phantom id once so it is already a member...
+        await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-phantom-typo']},
+        )
+        before = queue.get(first['id'])
+        assert before is not None and before.severity == 'info'
+        updated_at_before = before.updated_at
+
+        # ...then re-promote the SAME unresolvable id: nothing to append, and
+        # nothing derivable to floor with.
+        again = await _promote_to_l2(
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-phantom-typo']},
+        )
+
+        assert again['status'] == 'updated'
+        after = queue.get(first['id'])
+        assert after is not None
+        assert after.severity == 'info'
+        assert after.updated_at == updated_at_before, (
+            'A true no-op must not bump updated_at and re-trigger re-assess'
+        )
+
+# ---------------------------------------------------------------------------
 # TestPromoteToL2Cascade: end-to-end integration through MCP tools
 # ---------------------------------------------------------------------------
 
@@ -2251,28 +3354,14 @@ class TestPromoteToL2Cascade:
     - Verify members are now resolved with the cascade attribution.
     """
 
-    def _seed_l1(self, queue: EscalationQueue, esc_id: str, task_id: str) -> Escalation:
-        """Seed a pending L1 escalation directly via queue.submit()."""
-        esc = Escalation(
-            id=esc_id,
-            task_id=task_id,
-            agent_role='steward',
-            severity='blocking',
-            category='design_concern',
-            summary='L1 cluster member',
-            level=1,
-        )
-        queue.submit(esc)
-        return esc
-
     @pytest.mark.asyncio
     async def test_members_stay_pending_after_promote(self, tmp_path: Path):
         """(c) After promote_to_l2, L1 members remain pending — not pulled to L2."""
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        self._seed_l1(queue, 'esc-l1-1', 'task-1')
-        self._seed_l1(queue, 'esc-l1-2', 'task-2')
+        _seed_l1(queue, 'esc-l1-1', 'task-1')
+        _seed_l1(queue, 'esc-l1-2', 'task-2')
 
         await _promote_to_l2(
             server,
@@ -2294,8 +3383,8 @@ class TestPromoteToL2Cascade:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        self._seed_l1(queue, 'esc-l1-1', 'task-1')
-        self._seed_l1(queue, 'esc-l1-2', 'task-2')
+        _seed_l1(queue, 'esc-l1-1', 'task-1')
+        _seed_l1(queue, 'esc-l1-2', 'task-2')
 
         l2_result = await _promote_to_l2(
             server,
@@ -2324,7 +3413,7 @@ class TestPromoteToL2Cascade:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        self._seed_l1(queue, 'esc-l1-1', 'task-1')
+        _seed_l1(queue, 'esc-l1-1', 'task-1')
         l2_result = await _promote_to_l2(
             server,
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
@@ -2344,7 +3433,7 @@ class TestPromoteToL2Cascade:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        self._seed_l1(queue, 'esc-l1-1', 'task-1')
+        _seed_l1(queue, 'esc-l1-1', 'task-1')
         l2_result = await _promote_to_l2(
             server,
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1']},
@@ -2365,8 +3454,8 @@ class TestPromoteToL2Cascade:
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
-        self._seed_l1(queue, 'esc-l1-1', 'task-1')
-        self._seed_l1(queue, 'esc-l1-2', 'task-2')
+        _seed_l1(queue, 'esc-l1-1', 'task-1')
+        _seed_l1(queue, 'esc-l1-2', 'task-2')
         l2_result = await _promote_to_l2(
             server,
             **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-1', 'esc-l1-2']},
@@ -5992,8 +7081,8 @@ class TestLevelEchoIsPresentOnEveryResponseBranch:
     escalate_blocker's docstring says "``level`` echoes the level actually
     persisted, so a caller that passed ``level=1`` can confirm it landed".  A
     caller written to that contract (``result['level'] == 1``) must not hit a
-    KeyError on any branch — least of all the degraded fail-open branch, which
-    exists precisely to survive the race where a re-read is unavailable.
+    KeyError on any branch — least of all the degraded unpersisted branch,
+    which is reached in exactly the race where a re-read is unavailable.
     """
 
     @pytest.mark.asyncio
@@ -6007,12 +7096,13 @@ class TestLevelEchoIsPresentOnEveryResponseBranch:
         assert result.get('level') == 1, f'Expected level echo on queued, got: {result}'
 
     @pytest.mark.asyncio
-    async def test_fail_open_branch_still_echoes_level(self, tmp_path: Path):
+    async def test_unpersisted_branch_still_echoes_level(self, tmp_path: Path):
         """A post-write re-read that RAISES still yields a response carrying level.
 
-        This is the degraded path the fail-open exists for: the filing must be
-        reported as queued rather than lost, and the contract-following caller
-        must still be able to read ``level``.
+        The degraded path reports ``accepted_unpersisted`` rather than laundering
+        an unconfirmed write into a 'queued' confirmation (task 5368) — but the
+        contract-following caller must still be able to read ``level``, which is
+        the invariant this test has always been about.
         """
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
@@ -6028,9 +7118,11 @@ class TestLevelEchoIsPresentOnEveryResponseBranch:
         finally:
             queue.get = real_get  # type: ignore[method-assign]
 
-        assert result.get('status') == 'queued', f'Expected fail-open queued, got: {result}'
+        assert result.get('status') == 'accepted_unpersisted', (
+            f'Expected accepted_unpersisted, got: {result}'
+        )
         assert result.get('level') == 1, (
-            f'The fail-open branch must still echo the level written, got: {result}'
+            f'The unpersisted branch must still echo the level written, got: {result}'
         )
 
     @pytest.mark.asyncio
@@ -6073,3 +7165,1860 @@ class TestLevelEchoIsPresentOnEveryResponseBranch:
         assert result.get('level') == 1, (
             f'The auto-resolve branch must echo the level too, got: {result}'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestPromoteToL2CanonicalFold: near-duplicate root causes fold (task 3998)
+# ---------------------------------------------------------------------------
+
+
+class TestPromoteToL2CanonicalFold:
+    """A re-promote spelled differently folds into the existing L2, end-to-end.
+
+    This is the user-observable signal of task 3998: `promote_to_l2` used to
+    match root causes on stripped EXACT-string equality, so 'Watcher lease
+    stolen.' and 'watcher  lease STOLEN' minted TWO L2 decision points for one
+    incident and a human triaged the same cause twice.
+    """
+
+    @pytest.mark.asyncio
+    async def test_case_whitespace_and_punctuation_variant_folds(self, tmp_path: Path):
+        """PRD boundary row B4, in full, through the MCP tool the watcher calls."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        created = await _promote_to_l2(server, **{
+            **_L2_DEFAULTS,
+            'member_ids': ['esc-l1-1'],
+            'root_cause': 'Watcher lease stolen.',
+        })
+        assert created['status'] == 'created', f'Unexpected first result: {created}'
+
+        folded = await _promote_to_l2(server, **{
+            **_L2_DEFAULTS,
+            'member_ids': ['esc-l1-2'],
+            'root_cause': 'watcher  lease STOLEN',
+        })
+
+        assert folded['status'] == 'updated', (
+            f'the near-duplicate spelling must FOLD, not mint: {folded}'
+        )
+        assert folded['id'] == created['id']
+        assert set(folded['members']) == {'esc-l1-1', 'esc-l1-2'}
+
+        pending_l2 = [e for e in queue.get_pending() if e.level == 2]
+        assert len(pending_l2) == 1, (
+            f'Expected exactly 1 pending L2, got {len(pending_l2)}: '
+            f'{[(e.id, e.root_cause) for e in pending_l2]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_fold_never_rewrites_the_records_own_root_cause(self, tmp_path: Path):
+        """The surviving record keeps its ORIGINAL, pre-canonical framing.
+
+        The canonical form is a COMPARE-TIME value, never a stored one: replacing
+        a human-readable key with a lossy machine one on the very record a human
+        triages would invert task 3997's immutable-framing ethos, and persisting
+        both would be a derived value that can silently desynchronise from the
+        function that derives it.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        created = await _promote_to_l2(server, **{
+            **_L2_DEFAULTS,
+            'member_ids': ['esc-l1-1'],
+            'root_cause': 'Watcher lease stolen.',
+        })
+        await _promote_to_l2(server, **{
+            **_L2_DEFAULTS,
+            'member_ids': ['esc-l1-2'],
+            'root_cause': 'watcher  lease STOLEN',
+        })
+
+        record = await _get_escalation(server, escalation_id=created['id'])
+        assert record['root_cause'] == 'Watcher lease stolen.', (
+            f"the fold must not rewrite the record's own framing: {record['root_cause']!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_fold_preserves_the_pre_canonical_incoming_spelling(
+        self, tmp_path: Path,
+    ):
+        """The over-fold evidence trail: the incoming spelling lands in `amendments`.
+
+        This is also what proves ``_framing_view`` was NOT canonicalised — if it
+        had been, a spelling-only difference would read as a REPEAT and be
+        suppressed, emptying the slot task 3997 built for exactly this.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        created = await _promote_to_l2(server, **{
+            **_L2_DEFAULTS,
+            'member_ids': ['esc-l1-1'],
+            'root_cause': 'Watcher lease stolen.',
+        })
+        folded = await _promote_to_l2(server, **{
+            **_L2_DEFAULTS,
+            'member_ids': ['esc-l1-2'],
+            'root_cause': 'watcher  lease STOLEN',
+        })
+
+        assert folded['amendment_recorded'] is True, (
+            f'a re-spelling IS new framing and must be recorded: {folded}'
+        )
+        record = await _get_escalation(server, escalation_id=created['id'])
+        assert record['amendments'], f'expected an amendment, got: {record}'
+        assert record['amendments'][-1]['root_cause'] == 'watcher  lease STOLEN', (
+            'the PRE-canonical incoming spelling is the evidence an over-fold '
+            f'happened and must be kept verbatim: {record["amendments"][-1]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_canonically_distinct_causes_still_mint_two_l2s(self, tmp_path: Path):
+        """The conservative direction, end-to-end.
+
+        Under DELETION semantics these two keys collapse and two distinct
+        incidents are silently absorbed into one L2 — the failure canonicalisation
+        must not introduce.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        first = await _promote_to_l2(server, **{
+            **_L2_DEFAULTS, 'member_ids': ['esc-l1-1'], 'root_cause': 'risk:3184',
+        })
+        second = await _promote_to_l2(server, **{
+            **_L2_DEFAULTS, 'member_ids': ['esc-l1-2'], 'root_cause': 'risk:318:4',
+        })
+
+        assert first['status'] == 'created'
+        assert second['status'] == 'created', (
+            f'distinct identity segments must NOT glue into one L2: {second}'
+        )
+        assert second['id'] != first['id']
+        pending_l2 = [e for e in queue.get_pending() if e.level == 2]
+        assert len(pending_l2) == 2, (
+            f'Expected 2 distinct L2s, got: {[(e.id, e.root_cause) for e in pending_l2]}'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('root_cause', ['::', '--', '  :  ', '!!! ???'])
+    async def test_root_cause_with_empty_canonical_form_is_rejected(
+        self, tmp_path: Path, root_cause: str,
+    ):
+        """Minting an unfoldable L2 is refused LOUDLY at the boundary.
+
+        These keys survive `.strip()` but canonicalise to nothing, so after
+        canonicalisation such an L2 can never be found by the dedup scan — every
+        subsequent promote would mint another one, a silent self-perpetuating
+        duplicate source, which is the exact defect class this task reduces.
+        Measured safe: 0 of the 398 distinct live root_cause keys canonicalise to
+        empty, and Unicode word characters (CJK etc.) are unaffected.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _promote_to_l2(server, **{
+            **_L2_DEFAULTS, 'member_ids': ['esc-l1-1'], 'root_cause': root_cause,
+        })
+
+        assert 'error' in result, f'Expected a typed error, got: {result}'
+        assert 'root_cause' in result['error'], (
+            f'the error must name the offending field: {result["error"]!r}'
+        )
+        assert not [e for e in queue.get_pending() if e.level == 2], (
+            'a rejected promote must mint nothing'
+        )
+
+    @pytest.mark.asyncio
+    async def test_unicode_root_cause_is_still_accepted(self, tmp_path: Path):
+        """CONTROL for the rejection above: only punctuation-only keys are refused."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _promote_to_l2(server, **{
+            **_L2_DEFAULTS, 'member_ids': ['esc-l1-1'], 'root_cause': 'ロック競合:2370',
+        })
+
+        assert result.get('status') == 'created', (
+            f'a non-Latin root_cause carries real identity and must mint: {result}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestRootCauseOverfoldReport: over-folding gets a HEARER (task 3998)
+# ---------------------------------------------------------------------------
+
+
+class TestRootCauseOverfoldReport:
+    """An L2 addressed by many DISTINCT spellings of one canonical key gets reported.
+
+    Canonicalising the root-cause match folds MORE promotes by design, so its
+    failure mode is OVER-folding: distinct causes silently merged under one
+    canonical key.  `root_cause_variants` is the durable primary fact (INV-8);
+    this is the thresholded, never-fatal NOTIFICATION layered on it (INV-4).
+
+    The existing amendment-truncation report cannot substitute: it only fires
+    once an L2 has already blown the 20-entry amendment cap, so it is deaf to an
+    over-fold at five or six distinct causes.
+
+    Dedupe is disabled in most tests here deliberately, for the same reason the
+    truncation suite disables it: under the stock infra_issue config a second
+    report would FOLD into the first and a "filed exactly once" assertion would
+    pass for the wrong reason.  The one exception is
+    `test_crossings_on_two_l2s_fold_under_the_stock_dedupe_config`, which leaves
+    the stock config in place precisely to exercise that fold as the shipped
+    behaviour it is.
+    """
+
+    @staticmethod
+    async def _fold(server, spelling: str, member: str) -> dict[str, Any]:
+        """Fold into the same canonical cluster under a DISTINCT spelling."""
+        return await _promote_to_l2(server, **{
+            **_L2_DEFAULTS,
+            'member_ids': [member],
+            'root_cause': spelling,
+            'evidence': f'evidence for {spelling}',
+            'summary': f'summary for {spelling}',
+        })
+
+    @staticmethod
+    def _spelling(i: int) -> str:
+        """Distinct spellings that all canonicalise to ONE key.
+
+        Only case and punctuation vary, so `canonical_root_cause` maps every one
+        of them onto 'watcher lease stolen' — which is precisely the over-fold
+        shape the report exists to surface.
+        """
+        return ['Watcher lease stolen', 'watcher-lease-stolen', 'WATCHER LEASE STOLEN',
+                'Watcher.Lease.Stolen', 'watcher_lease stolen'.replace('_', ':'),
+                'WATCHER-lease.STOLEN', 'watcher   lease   stolen',
+                'Watcher:Lease:Stolen'][i]
+
+    def _overfold_reports(self, queue: EscalationQueue) -> list[Escalation]:
+        return [
+            e for e in queue.get_pending()
+            if e.task_id == _ROOT_CAUSE_OVERFOLD_ANCHOR_TASK_ID
+        ]
+
+    @pytest.mark.asyncio
+    async def test_report_fires_exactly_once_at_the_threshold_crossing(
+        self, tmp_path: Path,
+    ):
+        """(a)(b)(c) Silent below; ONE report at the crossing; nothing further after."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(
+            queue, dedupe_config=DedupeConfig(infra_dedupe_enabled=False),
+        )
+
+        created = await self._fold(server, self._spelling(0), 'esc-l1-0')
+        assert created['status'] == 'created', f'Unexpected first result: {created}'
+        l2_id = created['id']
+
+        # (a) Below the threshold: nothing filed.  The record's own spelling is
+        # seeded by the first fold, so variant N is reached after N-1 folds.
+        for i in range(1, _ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD - 1):
+            folded = await self._fold(server, self._spelling(i), f'esc-l1-{i}')
+            assert folded['status'] == 'updated', f'Expected a fold, got {folded}'
+            assert self._overfold_reports(queue) == [], (
+                f'nothing may be filed below the threshold (after variant {i + 1})'
+            )
+
+        record = queue.get(l2_id)
+        assert record is not None
+        assert len(record.root_cause_variants) == (
+            _ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD - 1
+        ), f'setup wrong: {record.root_cause_variants!r}'
+
+        # (b) The fold that CROSSES files exactly one report.
+        crossing_index = _ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD - 1
+        crossed = await self._fold(
+            server, self._spelling(crossing_index), f'esc-l1-{crossing_index}',
+        )
+        assert crossed['status'] == 'updated', f'the fold must still succeed: {crossed}'
+
+        reports = self._overfold_reports(queue)
+        assert len(reports) == 1, (
+            f'expected exactly ONE report at the crossing, got {[r.id for r in reports]}'
+        )
+        report = reports[0]
+        assert report.severity == 'info', f'a notification, not a page: {report.severity!r}'
+        assert report.category == 'infra_issue', f'got {report.category!r}'
+        assert report.task_id == _ROOT_CAUSE_OVERFOLD_ANCHOR_TASK_ID, (
+            'the condition is system-scoped and must not be attributed to '
+            f"whichever promote crossed it: {report.task_id!r}"
+        )
+        # The L2 id and the count are what make the report actionable.
+        assert l2_id in report.summary or l2_id in report.detail, (
+            f'the report must name the L2: {report.summary!r} / {report.detail!r}'
+        )
+        assert str(_ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD) in (
+            report.summary + report.detail
+        ), f'the report must name the distinct count: {report.summary!r}'
+        # A causal claim must read as a hypothesis, never as fact.
+        assert 'Hypothesis:' in report.detail, (
+            f'the diagnosis must be marked as a hypothesis: {report.detail!r}'
+        )
+
+        # (c) Further folds past the threshold do NOT re-file: the crossing is
+        # once per L2, and the record's running count stays the primary fact.
+        for i in range(
+            crossing_index + 1, crossing_index + 3,
+        ):
+            more = await self._fold(server, self._spelling(i), f'esc-l1-{i}')
+            assert more['status'] == 'updated', f'Expected a fold, got {more}'
+        assert len(self._overfold_reports(queue)) == 1, (
+            'the report must fire once per L2, not once per fold past the threshold'
+        )
+
+    @staticmethod
+    def _break_the_report_path(
+        queue: EscalationQueue, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Make the over-fold report raise, without touching the fold path.
+
+        `queue.make_id` is called by the report (to mint its own record) and by
+        promote's CREATE path, but NOT by `add_members_to_l2` — so once the L2
+        exists, breaking it isolates the report exactly.  The report helper is a
+        closure over `create_server`, so there is no module attribute to patch;
+        this reaches it through the one collaborator it does not share with the
+        fold.
+        """
+        def exploding(*args: Any, **kwargs: Any) -> str:
+            raise RuntimeError('report path is broken')
+
+        monkeypatch.setattr(queue, 'make_id', exploding)
+
+    @pytest.mark.asyncio
+    async def test_report_failure_can_never_fail_the_fold(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """(d) NEVER FATAL — a raising report costs a notification, not the fold."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(
+            queue, dedupe_config=DedupeConfig(infra_dedupe_enabled=False),
+        )
+
+        created = await self._fold(server, self._spelling(0), 'esc-l1-0')
+        assert created['status'] == 'created'
+        self._break_the_report_path(queue, monkeypatch)
+
+        for i in range(1, _ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD + 1):
+            folded = await self._fold(server, self._spelling(i), f'esc-l1-{i}')
+            assert folded['status'] == 'updated', (
+                f'a broken report must not fail the fold: {folded}'
+            )
+            assert folded['id'] == created['id']
+            assert f'esc-l1-{i}' in folded['members'], (
+                f'the member must still be linked: {folded}'
+            )
+
+    @pytest.mark.asyncio
+    async def test_record_fields_are_the_primary_fact_with_reporting_suppressed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """(e) INV-8 — the counts are assertable from the RECORD, never by log-scrape."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(
+            queue, dedupe_config=DedupeConfig(infra_dedupe_enabled=False),
+        )
+
+        created = await self._fold(server, self._spelling(0), 'esc-l1-0')
+        l2_id = created['id']
+        self._break_the_report_path(queue, monkeypatch)
+
+        for i in range(1, _ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD):
+            await self._fold(server, self._spelling(i), f'esc-l1-{i}')
+
+        # The report never landed...
+        assert self._overfold_reports(queue) == [], (
+            'setup wrong: the report path was supposed to be broken'
+        )
+        # ...and the fact is STILL fully readable from the record itself.
+        record = queue.get(l2_id)
+        assert record is not None
+        distinct = (
+            len(record.root_cause_variants) + record.root_cause_variants_truncated
+        )
+        assert distinct == _ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD, (
+            'the true distinct count must be readable from the record with the '
+            f'report suppressed entirely, got {record.root_cause_variants!r}'
+        )
+        # And every spelling really is one canonical cause.
+        assert len({canonical_root_cause(v) for v in record.root_cause_variants}) == 1
+
+    @pytest.mark.asyncio
+    async def test_distinct_causes_do_not_trip_the_report(self, tmp_path: Path):
+        """CONTROL: separate L2s accumulate one variant each and file nothing.
+
+        Without this the suite could pass on a report that fires on fold VOLUME
+        rather than on distinct-spelling accumulation within one cluster.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(
+            queue, dedupe_config=DedupeConfig(infra_dedupe_enabled=False),
+        )
+
+        for i in range(_ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD + 2):
+            result = await _promote_to_l2(server, **{
+                **_L2_DEFAULTS,
+                'member_ids': [f'esc-l1-{i}'],
+                'root_cause': f'genuinely-distinct-cause:{i}',
+            })
+            assert result['status'] == 'created', f'expected distinct L2s, got {result}'
+
+        assert self._overfold_reports(queue) == [], (
+            'distinct causes in distinct L2s are not an over-fold'
+        )
+
+
+    @staticmethod
+    def _other_spelling(i: int) -> str:
+        """Spellings of a SECOND canonical key, disjoint from `_spelling`'s.
+
+        Same shape as `_spelling` — only case and punctuation vary, so all of
+        them canonicalise to 'merge lane wedged' — but no member of this family
+        canonicalises to `_spelling`'s key, so the two families drive two
+        SEPARATE L2s to the threshold.
+        """
+        return ['Merge lane wedged', 'merge-lane-wedged', 'MERGE LANE WEDGED',
+                'Merge.Lane.Wedged', 'merge:lane:wedged',
+                'MERGE-lane.WEDGED', 'merge   lane   wedged'][i]
+
+    async def _drive_one_l2_to_the_threshold(
+        self, server, spelling: Callable[[int], str], members: str,
+    ) -> str:
+        """Mint one L2 and fold it to exactly `_THRESHOLD` distinct spellings.
+
+        Returns the L2's id.  *members* namespaces the member ids so two calls
+        never contend for one L1.  The first promote seeds variant 1 from the
+        record's own root_cause, so the threshold is reached on fold
+        `_THRESHOLD - 1` — the same arithmetic
+        `test_report_fires_exactly_once_at_the_threshold_crossing` spells out.
+        """
+        created = await self._fold(server, spelling(0), f'esc-l1-{members}-0')
+        assert created['status'] == 'created', f'Unexpected first result: {created}'
+        for i in range(1, _ROOT_CAUSE_OVERFOLD_VARIANT_THRESHOLD):
+            folded = await self._fold(server, spelling(i), f'esc-l1-{members}-{i}')
+            assert folded['status'] == 'updated', f'Expected a fold, got {folded}'
+        return created['id']
+
+    @pytest.mark.asyncio
+    async def test_crossings_on_two_l2s_fold_under_the_stock_dedupe_config(
+        self, tmp_path: Path,
+    ):
+        """Fleet-wide burst control is REAL, asserted against the STOCK config.
+
+        Every other test in this class disables dedupe, so nothing exercises the
+        shipped path in which the report's own `severity='info'` /
+        `category='infra_issue'` routes through `_submit_or_dedupe`.  That left
+        `_report_root_cause_overfold`'s load-bearing docstring claim — that the
+        summary's LEADING tokens are held stable and the varying parts (the count,
+        the L2 id) placed after, so a hundred simultaneous crossings fold under
+        `summary_dedupe_key`'s first-three-token key — pinned by nothing.  An edit
+        that moved `{variants}` or `{l2_id}` to the front, or dropped 'L2
+        root-cause' from the lead, would give every crossing in a burst its own
+        record with the whole suite still green.
+
+        Asserted BEHAVIOURALLY: two DIFFERENT L2s each cross the threshold and the
+        second report folds into the first as a dedupe child.  Asserting the
+        summary's wording instead would only restate the f-string, and would still
+        pass if the key function ever changed underneath it.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        # STOCK DedupeConfig — infra_issue folding ON, exactly as shipped.
+        server = create_server(queue)
+
+        first_l2 = await self._drive_one_l2_to_the_threshold(
+            server, self._spelling, 'a',
+        )
+        reports = self._overfold_reports(queue)
+        assert len(reports) == 1, (
+            f'the first crossing must file one report, got {[r.id for r in reports]}'
+        )
+        parent = reports[0]
+        assert parent.dedupe_count == 0, f'nothing has folded yet: {parent.dedupe_count}'
+
+        second_l2 = await self._drive_one_l2_to_the_threshold(
+            server, self._other_spelling, 'b',
+        )
+        assert second_l2 != first_l2, (
+            'setup wrong: the two spelling families must drive two distinct L2s'
+        )
+
+        # The second crossing DID file — and folded, leaving one record on disk.
+        reports = self._overfold_reports(queue)
+        assert [r.id for r in reports] == [parent.id], (
+            'a fleet-wide burst of crossings must fold under one dedupe parent, '
+            f'got {[r.id for r in reports]}'
+        )
+        refreshed = queue.get(parent.id)
+        assert refreshed is not None
+        assert refreshed.dedupe_count == 1, (
+            'the second crossing must fold into the first rather than never firing '
+            f'— dedupe_count is what tells the two apart: {refreshed.dedupe_count}'
+        )
+        assert len(refreshed.dedupe_children) == 1, (
+            f'the folded child must be recorded: {refreshed.dedupe_children!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 3550: the agent filing surface stamps the filing incarnation
+# ---------------------------------------------------------------------------
+
+
+def _claimant_lookup(value: str | None, *, calls: list[str] | None = None):
+    """An async ``(task_id) -> str|None`` stand-in for the injected seam.
+
+    Mirrors how ``test_server_chokepoint.py`` injects ``task_status_lookup``.
+    """
+    async def _lookup(task_id: str) -> str | None:
+        if calls is not None:
+            calls.append(task_id)
+        return value
+
+    return _lookup
+
+
+class TestFilingClaimantIdentityStamp:
+    """``task_claimant_lookup`` stamps ``Escalation.filing_claimant_run_id``.
+
+    Task 3550.  ``escalation.pins`` Link 4 can only distinguish a live handoff
+    from a dead one when the record carries the identity of the incarnation
+    that FILED it; before this, nothing outside tests ever stamped it, so
+    every real record read as "unknown" and fell back to pinning.
+
+    The DB row's ``claimant_run_id`` is the right source because it holds the
+    identity ``TaskWorkflow``'s dispatch stamp wrote via the same
+    ``compose_claimant_run_id`` call — so an AGENT-filed escalation is stamped
+    with the identity of the incarnation that dispatched that agent,
+    byte-identical to that workflow's own filings.
+    """
+
+    _ID = 'run-1/sess-1/pid=7'
+
+    @pytest.mark.asyncio
+    async def test_blocker_filing_is_stamped(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(
+            queue,
+            task_claimant_lookup=_claimant_lookup(self._ID),
+            startup_sweep=False,
+        )
+
+        result = await _blocker(server, **_COMMON_KWARGS)
+
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.level == 0
+        assert esc.filing_claimant_run_id == self._ID
+
+    @pytest.mark.asyncio
+    async def test_info_filing_is_stamped(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(
+            queue,
+            task_claimant_lookup=_claimant_lookup(self._ID),
+            startup_sweep=False,
+        )
+
+        result = await _info(server, **_COMMON_KWARGS)
+
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.filing_claimant_run_id == self._ID
+
+    @pytest.mark.asyncio
+    async def test_lookup_is_called_with_the_filings_task_id(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        calls: list[str] = []
+        server = create_server(
+            queue,
+            task_claimant_lookup=_claimant_lookup(self._ID, calls=calls),
+            startup_sweep=False,
+        )
+
+        await _blocker(server, **_COMMON_KWARGS)
+
+        assert calls == ['task-999']
+
+    @pytest.mark.asyncio
+    async def test_no_lookup_injected_leaves_the_field_none(self, tmp_path: Path):
+        """The standalone escalation server (and every pre-3550 test) is undisturbed.
+
+        The seam is optional-with-None exactly like ``task_status_lookup``, so
+        omitting it preserves the legacy record shape.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, startup_sweep=False)
+
+        result = await _blocker(server, **_COMMON_KWARGS)
+
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.filing_claimant_run_id is None
+
+    @pytest.mark.asyncio
+    async def test_a_raising_lookup_fails_open_and_warns(
+        self, tmp_path: Path, caplog,
+    ):
+        """A broken identity lookup must never DROP a filing.
+
+        Mirrors gate 4's existing ``task_status_lookup`` fail-open. Loud, not
+        silent: the record is submitted, the field stays unknown, and a
+        WARNING names the task.
+        """
+        async def _boom(task_id: str) -> str | None:
+            raise RuntimeError('lookup exploded')
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, task_claimant_lookup=_boom, startup_sweep=False)
+
+        with caplog.at_level(logging.WARNING):
+            result = await _blocker(server, **_COMMON_KWARGS)
+
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.filing_claimant_run_id is None
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        ]
+        assert any(
+            'task_claimant_lookup' in m and 'task-999' in m for m in warnings
+        ), f'expected a WARNING naming task_claimant_lookup and the task: {warnings}'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('returned', [None, '', '   '])
+    async def test_unknown_or_blank_lookup_result_stays_none(
+        self, tmp_path: Path, returned: str | None,
+    ):
+        """Unclaimed/unknown task → ``None``, which ``pins`` fails safe to pinning.
+
+        A blank string must NOT reach ``pins._norm_id`` as a pseudo-value.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(
+            queue,
+            task_claimant_lookup=_claimant_lookup(returned),
+            startup_sweep=False,
+        )
+
+        result = await _blocker(server, **_COMMON_KWARGS)
+
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.filing_claimant_run_id is None
+
+    @pytest.mark.asyncio
+    async def test_stamp_survives_the_terminal_task_auto_resolve_exit(
+        self, tmp_path: Path,
+    ):
+        """Gate 4's ``submit_resolved`` exit still writes the identity.
+
+        The stamp is applied at the TOP of ``_chokepoint_or_submit``, above
+        every gate, so no exit path can lose it.
+        """
+        async def _status(task_id: str) -> str | None:
+            return 'done'
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(
+            queue,
+            task_status_lookup=_status,
+            task_claimant_lookup=_claimant_lookup(self._ID),
+            startup_sweep=False,
+        )
+
+        result = await _blocker(server, **_COMMON_KWARGS)
+
+        assert result['status'] == 'resolved', f'expected auto-resolve, got: {result}'
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.filing_claimant_run_id == self._ID
+
+    @pytest.mark.asyncio
+    async def test_stamp_coexists_with_the_born_at_l2_path(self, tmp_path: Path):
+        """A sentinel role is exempt from the C4/D3 downgrade, so this genuinely
+        reaches the born-at-L2 branch."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(
+            queue,
+            task_claimant_lookup=_claimant_lookup(self._ID),
+            startup_sweep=False,
+        )
+
+        result = await _blocker(
+            server, severity='critical',
+            **{**_COMMON_KWARGS, 'agent_role': 'orchestrator-watcher-supervisor'},
+        )
+
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.level == 2
+        assert esc.filing_claimant_run_id == self._ID
+
+    @pytest.mark.asyncio
+    async def test_stamp_survives_the_c4_d3_severity_downgrade(self, tmp_path: Path):
+        """A non-sentinel role's 'critical' is rewritten to 'blocking' with a
+        '[downgraded:critical]' summary suffix — and still carries the identity."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(
+            queue,
+            task_claimant_lookup=_claimant_lookup(self._ID),
+            startup_sweep=False,
+        )
+
+        result = await _blocker(server, severity='critical', **_COMMON_KWARGS)
+
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.severity == 'blocking'
+        assert '[downgraded:critical]' in esc.summary
+        assert esc.filing_claimant_run_id == self._ID
+
+    @pytest.mark.asyncio
+    async def test_level_1_re_escalation_is_stamped(self, tmp_path: Path):
+        """The steward's level=1 route is stamped too (inert for pins — Link 3
+        classifies any level != 0 as QUEUE_HANDOFF — but honest provenance)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(
+            queue,
+            task_claimant_lookup=_claimant_lookup(self._ID),
+            startup_sweep=False,
+        )
+
+        result = await _blocker(
+            server, level=1, **{**_COMMON_KWARGS, 'agent_role': 'steward'},
+        )
+
+        esc = queue.get(result['id'])
+        assert esc is not None
+        assert esc.level == 1
+        assert esc.filing_claimant_run_id == self._ID
+
+
+class TestResolveIssueSurfacesLateResolution:
+    """The MCP caller must not be told "success" when its text was captured LATE.
+
+    `resolve_issue` returns `esc.to_dict()` — a perfectly healthy-looking
+    resolved/dismissed record — on both the applied and the already-terminal
+    path.  In the esc-3902-1 race the second is the one that happened, and the
+    resolving agent was told nothing (task 4495).
+    """
+
+    LATE_TEXT = "the steward's real finding: verify never ran"
+
+    def _auto_dismissed(self, queue: EscalationQueue, esc_id: str = 'esc-3902-1') -> Escalation:
+        esc = Escalation(
+            id=esc_id,
+            task_id='3902',
+            agent_role='implementer',
+            severity='blocking',
+            category='task_failure',
+            summary='the L0 the steward was interrupted on',
+        )
+        queue.submit(esc)
+        queue.resolve(
+            esc_id, 'Auto-dismissed: steward interrupted (attempt cap)',
+            dismiss=True, resolved_by='auto-dismissed',
+        )
+        return esc
+
+    @pytest.mark.asyncio
+    async def test_late_capture_is_reported_to_the_caller(self, tmp_path: Path):
+        """(a) The return dict carries the flag AND a reason naming the dismisser."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._auto_dismissed(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id='esc-3902-1', resolution=self.LATE_TEXT,
+            resolved_by='claude-task-3902-steward',
+        )
+
+        assert result.get('late_resolution_captured') is True, (
+            f'the caller must learn its text did not apply: {result}'
+        )
+        reason = result.get('late_resolution_reason', '')
+        assert 'auto-dismissed' in reason, (
+            f'the reason must name the automated dismisser that won: {reason!r}'
+        )
+        assert 'late_resolutions' in reason, (
+            f'the reason must say WHERE the text went: {reason!r}'
+        )
+        # The record dict is still the stored record — its terminal state was
+        # NOT changed, which is exactly what the flag is warning about.
+        assert result.get('status') == 'dismissed', f'{result}'
+        assert result.get('resolution') == (
+            'Auto-dismissed: steward interrupted (attempt cap)'
+        ), f'the stored resolution must not be overwritten: {result}'
+        assert result.get('late_resolutions'), (
+            f'the captured text must be visible on the returned record: {result}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_ordinary_resolve_reports_the_flag_as_false(self, tmp_path: Path):
+        """(b) The contract is EXPLICIT: the key is always present, not absent-on-success.
+
+        An always-present key is what lets a caller write
+        `if result['late_resolution_captured']` without a `.get` default that
+        silently reads a typo'd key as "fine".
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = Escalation(
+            id='esc-3902-2', task_id='3902', agent_role='implementer',
+            severity='blocking', category='task_failure', summary='an ordinary L0',
+        )
+        queue.submit(esc)
+
+        result = await _resolve_issue(
+            server, escalation_id='esc-3902-2', resolution='really fixed it',
+            resolved_by='claude-task-3902-steward',
+        )
+
+        assert result.get('status') == 'resolved', f'{result}'
+        assert result['late_resolution_captured'] is False, (
+            f'the key must be present and False on the applied path: {result}'
+        )
+        assert 'late_resolution_reason' not in result, (
+            f'no reason belongs on a resolve that actually applied: {result}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_already_terminal_path_does_not_resurrect_the_archived_record(
+        self, tmp_path: Path,
+    ):
+        """(c) The `rec.status == 'pending'` guard still skips the pre-stamp rewrite.
+
+        `queue._rewrite` targets the queue ROOT, so running it on an archived
+        record would leave a second copy there — the orphan state
+        `TestResolveIdempotent` exists to prevent.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._auto_dismissed(queue)
+
+        await _resolve_issue(
+            server, escalation_id='esc-3902-1', resolution=self.LATE_TEXT,
+            resolved_by='claude-task-3902-steward',
+        )
+
+        assert not (queue.queue_dir / 'esc-3902-1.json').exists(), (
+            'the already-terminal path resurrected a queue-root copy'
+        )
+        archived = list((queue.queue_dir / 'archive').rglob('esc-3902-1.json'))
+        assert len(archived) == 1, f'expected exactly one archive copy: {archived}'
+
+    @pytest.mark.asyncio
+    async def test_invalid_resolution_class_still_rejects_with_nothing_persisted(
+        self, tmp_path: Path,
+    ):
+        """(d) INV-1 is unaffected: a rejected call persists nothing and captures nothing."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._auto_dismissed(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id='esc-3902-1', resolution=self.LATE_TEXT,
+            resolved_by='claude-task-3902-steward', resolution_class='not-a-class',
+        )
+
+        assert result.get('code') == 'invalid_resolution_class', f'{result}'
+        assert 'late_resolution_captured' not in result, (
+            f'a rejection is not a capture report: {result}'
+        )
+        record = queue.get('esc-3902-1')
+        assert record is not None
+        assert record.late_resolutions == [], (
+            f'a rejected call must persist NOTHING: {record.late_resolutions!r}'
+        )
+        assert record.resolution_class == 'benign', (
+            f'a rejected call must not correct the stamp either: '
+            f'{record.resolution_class!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_no_op_correction_is_not_announced_as_a_correction(
+        self, tmp_path: Path,
+    ):
+        """(e) The reason explains the CAPTURE, and claims a correction only when one happened.
+
+        `resolution_class='benign'` on a record already stamped the derived
+        'benign' re-derives the same value — nothing was corrected, so the
+        human-readable reason must not say it was, while still reporting the
+        capture that DID happen.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._auto_dismissed(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id='esc-3902-1', resolution=self.LATE_TEXT,
+            resolved_by='claude-task-3902-steward', resolution_class='benign',
+        )
+
+        assert result.get('late_resolution_captured') is True, (
+            f'the text is still a genuine late finding: {result}'
+        )
+        reason = result.get('late_resolution_reason', '')
+        assert 'late_resolutions' in reason, f'the capture is still explained: {reason!r}'
+        assert 'resolution_class was corrected' not in reason, (
+            f'no correction happened, so none may be announced: {reason!r}'
+        )
+        record = queue.get('esc-3902-1')
+        assert record is not None
+        assert record.resolution_class == 'benign', (
+            f'the stamp is unchanged: {record.resolution_class!r}'
+        )
+        assert record.late_resolutions[0]['prior_resolution_class'] is None, (
+            f'no stamp was superseded: {record.late_resolutions[0]!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 4377 — the declared-pin guard at the resolve_issue chokepoint
+# ---------------------------------------------------------------------------
+
+
+class TestResolveIssueDeclaredPinGuard:
+    """resolve_issue refuses to CLOSE a record carrying a declared pin (task 4377).
+
+    An OPEN escalation is a preservation mechanism for its subject task
+    (``orchestrator/task_ground_truth.py::_RECOVERY`` has no row for the pinned
+    shape, so it falls through to ``LEAVE``), which makes closing one a
+    state-changing act on that task even under ``action='close_only'``.
+    """
+
+    DECLARER = 'task-3546-second-deviation-notice'
+    REASON = 'mu-gate validation specimen — the evidence base'
+
+    #: Every action that CLOSES the record (i.e. archives it and flips
+    #: has_open_escalation).  `park` is deliberately absent — it keeps the
+    #: record open at L2 and never archives, so it cannot spend a pin.
+    CLOSING_ACTIONS = ('resume', 'restart', 'abandon', 'close_only')
+
+    def _seed(
+        self,
+        queue: EscalationQueue,
+        esc_id: str = 'esc-3371-2',
+        task_id: str = '3371',
+        level: int = 1,
+    ) -> Escalation:
+        esc = Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='steward',
+            severity='blocking',
+            category='design_concern',
+            summary='a load-bearing pending record',
+            level=level,
+        )
+        queue.submit(esc)
+        return esc
+
+    def _seed_declared(self, queue: EscalationQueue, **kwargs: Any) -> Escalation:
+        esc = self._seed(queue, **kwargs)
+        queue.declare_pin(esc.id, declared_by=[self.DECLARER], reason=self.REASON)
+        return esc
+
+    # --- (a) the refusal, with a message naming id / declarer / reason ---
+
+    @pytest.mark.asyncio
+    async def test_close_only_is_refused_with_a_typed_code(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_declared(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='bulk close', action='close_only',
+        )
+
+        assert result.get('code') == 'declared_pin_refused', result
+        assert 'error' in result
+
+    @pytest.mark.asyncio
+    async def test_refusal_message_names_id_declarer_and_reason(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_declared(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='bulk close', action='close_only',
+        )
+
+        message = result['error']
+        assert esc.id in message
+        assert self.DECLARER in message
+        assert self.REASON in message
+
+    # --- (b) STRUCTURED, not prose-only (INV-2) ---
+
+    @pytest.mark.asyncio
+    async def test_refusal_carries_a_structured_declared_pins_payload(self, tmp_path: Path):
+        """No consumer should have to parse the message to recover a fact the
+        emitter held in a variable."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_declared(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='bulk close', action='close_only',
+        )
+
+        assert result['declared_pins'] == [
+            {
+                'escalation_id': esc.id,
+                'declared_by': [self.DECLARER],
+                'reason': self.REASON,
+            }
+        ]
+
+    # --- (c) NOTHING IS PERSISTED on refusal (INV-1) ---
+
+    @pytest.mark.asyncio
+    async def test_refusal_persists_nothing(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_declared(queue)
+
+        await _resolve_issue(
+            server, escalation_id=esc.id, resolution='bulk close', action='close_only',
+        )
+
+        reread = queue.get(esc.id)
+        assert reread is not None
+        assert reread.status == 'pending'
+        assert reread.resolution is None
+        assert reread.resolution_action is None, (
+            'the resolution_action pre-stamp must not have run'
+        )
+        assert (queue.queue_dir / f'{esc.id}.json').exists(), 'must not be archived'
+
+    # --- (d) every CLOSING action is refused, not just close_only ---
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('action', CLOSING_ACTIONS)
+    async def test_every_closing_action_is_refused(self, tmp_path: Path, action: str):
+        """All four archive the record and flip has_open_escalation identically."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_declared(queue, esc_id=f'esc-3371-{action}')
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='closing', action=action,
+        )
+
+        assert result.get('code') == 'declared_pin_refused', f'{action}: {result}'
+        reread = queue.get(esc.id)
+        assert reread is not None
+        assert reread.status == 'pending', f'{action} must not have closed the record'
+
+    # --- (e) an UNMARKED record closes exactly as today ---
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('action', CLOSING_ACTIONS)
+    async def test_unmarked_record_closes_exactly_as_today(self, tmp_path: Path, action: str):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed(queue, esc_id=f'esc-plain-{action}')
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='closing', action=action,
+        )
+
+        assert 'code' not in result, f'{action}: unexpected refusal {result}'
+        assert result['status'] in ('resolved', 'dismissed'), result
+        assert result['resolution_action'] == action
+        assert not (queue.queue_dir / f'{esc.id}.json').exists(), 'expected it to be archived'
+
+    # --- (f) a reason with no declarer is not a marker ---
+
+    @pytest.mark.asyncio
+    async def test_reason_without_a_declarer_does_not_block(self, tmp_path: Path):
+        """The declarer list is the marker, not the prose."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed(queue)
+        rec = queue.get(esc.id)
+        assert rec is not None
+        rec.pin_declared_reason = 'I feel like this one matters'
+        queue._rewrite(esc.id, rec)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='closing', action='close_only',
+        )
+
+        assert 'code' not in result, result
+        assert result['status'] == 'dismissed'
+
+    # --- Gate PRECEDENCE: this gate runs LAST, after capability and Table B ---
+
+    @pytest.mark.asyncio
+    async def test_illegal_action_on_a_marked_record_reports_illegal_transition(
+        self, tmp_path: Path,
+    ):
+        """The docstring's "runs LAST" claim, pinned for the Table B half.
+
+        The gate sits AFTER the Table B legality gate, so a caller failing both
+        learns about the illegal action first.  Without this test a later edit
+        that hoists the gate above Table B would silently invert the documented
+        precedence with a green suite.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_declared(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='bulk close', action='bogus',
+        )
+
+        assert result.get('code') == 'illegal_transition', result
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.status == 'pending'
+        assert record.resolution_action is None, 'neither gate may pre-stamp (INV-1)'
+
+    @pytest.mark.asyncio
+    async def test_level_capped_connection_reports_level_forbidden_first(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """The "runs LAST" claim, pinned for the connection-capability half.
+
+        The capability gate reads ``get_http_headers()``, which returns ``{}``
+        for in-process ``tool.fn()`` calls — so the header is injected by
+        patching the name in ``escalation.server``.  The real ASGI path is
+        covered by ``test_capability_guard_http.py``; what is asserted here is
+        the ORDERING between that gate and this one, which is a property of
+        ``resolve_issue`` itself.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_declared(queue, esc_id='esc-3105-3', task_id='3105', level=2)
+        monkeypatch.setattr(
+            escalation_server, 'get_http_headers', lambda: {'x-escalation-levels': '0,1'},
+        )
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='bulk close', action='close_only',
+        )
+
+        assert result.get('code') == 'level_forbidden', result
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.status == 'pending'
+        assert record.resolution_action is None, 'neither gate may pre-stamp (INV-1)'
+
+    # --- the CASCADE case — the path that actually spent the specimen ---
+
+    def _homogeneous_cluster(
+        self, queue: EscalationQueue, marked: tuple[str, ...] = ('esc-3371-2',),
+        member_ids: tuple[str, ...] = ('esc-3237-1', 'esc-3371-2', 'esc-3237-3'),
+    ) -> Escalation:
+        """The 2026-08-08 incident shape: a homogeneous L2 cluster whose members
+        are indistinguishable by level/category/severity/agent_role/summary, with
+        the marker on a MEMBER — never on the head."""
+        for member_id in member_ids:
+            self._seed(queue, esc_id=member_id, task_id='3237', level=1)
+        for member_id in marked:
+            queue.declare_pin(member_id, declared_by=[self.DECLARER], reason=self.REASON)
+        l2 = Escalation(
+            id='esc-3237-5',
+            task_id='task-cluster',
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='design_concern',
+            summary='rubber-stamp cluster head, itself unmarked',
+            level=2,
+            root_cause='homogeneous cluster',
+            members=list(member_ids),
+        )
+        queue.submit(l2)
+        return l2
+
+    @pytest.mark.asyncio
+    async def test_marked_member_refuses_the_whole_cascade(self, tmp_path: Path):
+        """(a) The HEAD carries no marker; the refusal still fires."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        l2 = self._homogeneous_cluster(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=l2.id, resolution='rubber-stamp bulk close',
+            action='close_only',
+        )
+
+        assert result.get('code') == 'declared_pin_refused', result
+
+    @pytest.mark.asyncio
+    async def test_refusal_names_the_member_not_just_the_head(self, tmp_path: Path):
+        """(b) A message naming only the head leaves the closer as blind as the
+        2026-08-08 watcher was."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        l2 = self._homogeneous_cluster(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=l2.id, resolution='bulk close', action='close_only',
+        )
+
+        assert 'esc-3371-2' in result['error']
+        assert self.DECLARER in result['error']
+        assert [p['escalation_id'] for p in result['declared_pins']] == ['esc-3371-2']
+
+    @pytest.mark.asyncio
+    async def test_nothing_in_the_cluster_is_mutated(self, tmp_path: Path):
+        """(c) The assertion that distinguishes a PRE-FLIGHT gate from a refusal
+        raised mid-cascade, which would leave the head already archived."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        l2 = self._homogeneous_cluster(queue)
+
+        await _resolve_issue(
+            server, escalation_id=l2.id, resolution='bulk close', action='close_only',
+        )
+
+        for esc_id in ('esc-3237-5', 'esc-3237-1', 'esc-3371-2', 'esc-3237-3'):
+            rec = queue.get(esc_id)
+            assert rec is not None, esc_id
+            assert rec.status == 'pending', f'{esc_id} should still be pending'
+            assert rec.resolution_action is None, f'{esc_id} was pre-stamped'
+            assert (queue.queue_dir / f'{esc_id}.json').exists(), f'{esc_id} was archived'
+
+    @pytest.mark.asyncio
+    async def test_multiple_marked_members_are_all_named(self, tmp_path: Path):
+        """(d) One declared_pins entry per marked member, all of them named."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        l2 = self._homogeneous_cluster(queue, marked=('esc-3237-1', 'esc-3371-2'))
+
+        result = await _resolve_issue(
+            server, escalation_id=l2.id, resolution='bulk close', action='close_only',
+        )
+
+        assert [p['escalation_id'] for p in result['declared_pins']] == [
+            'esc-3237-1', 'esc-3371-2',
+        ]
+
+    @pytest.mark.asyncio
+    async def test_dangling_member_id_does_not_blow_up_the_gate(self, tmp_path: Path):
+        """(e) Mirrors the cascade's existing best-effort contract — a record
+        that does not exist cannot carry a marker."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed(queue, esc_id='esc-real-1', task_id='3237', level=1)
+        l2 = Escalation(
+            id='esc-l2-dangling',
+            task_id='task-cluster',
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='design_concern',
+            summary='cluster with a dangling member id',
+            level=2,
+            members=['esc-real-1', 'esc-never-existed'],
+        )
+        queue.submit(l2)
+
+        result = await _resolve_issue(
+            server, escalation_id=l2.id, resolution='bulk close', action='close_only',
+        )
+
+        assert 'code' not in result, result
+        assert result['status'] == 'dismissed'
+
+    @pytest.mark.asyncio
+    async def test_already_archived_marked_member_does_not_block(self, tmp_path: Path):
+        """(e cont.) A pin that has ALREADY been spent cannot be spent again.
+
+        ``queue.get`` falls back to the ARCHIVE, so a closed-and-archived member
+        still reads its ``pin_declared_by`` back.  But ``queue.resolve`` no-ops
+        on a non-pending record, so the cascade could not touch it — refusing
+        here would name a record the close cannot reach and would force the
+        operator who already deliberately spent that pin to re-acknowledge it on
+        every subsequent cluster operation.  A refusal that is routinely
+        spurious is what teaches a rotation to acknowledge reflexively.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        l2 = self._homogeneous_cluster(queue)
+
+        # The operator deliberately spends the pin on the member alone.
+        spend = await _resolve_issue(
+            server, escalation_id='esc-3371-2', resolution='deliberately spending it',
+            action='close_only', acknowledge_declared_pins=['esc-3371-2'],
+        )
+        assert spend['status'] == 'dismissed', spend
+        archived = queue.get('esc-3371-2')
+        assert archived is not None
+        assert archived.pin_declared_by == [self.DECLARER], (
+            'the declaration survives into the archive — which is why the gate '
+            'must filter on status rather than on the marker alone'
+        )
+
+        result = await _resolve_issue(
+            server, escalation_id=l2.id, resolution='bulk close', action='close_only',
+        )
+
+        assert 'code' not in result, result
+        assert result['status'] == 'dismissed'
+
+    @pytest.mark.asyncio
+    async def test_already_archived_marked_target_does_not_block(self, tmp_path: Path):
+        """(e cont.) The same filter applies to the TARGET, for the same reason:
+        ``queue.get`` archive-falls-back, so `rec` itself may already be closed.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_declared(queue)
+        await _resolve_issue(
+            server, escalation_id=esc.id, resolution='deliberately spending it',
+            action='close_only', acknowledge_declared_pins=[esc.id],
+        )
+
+        # A second close of the now-archived record: queue.resolve no-ops, so
+        # there is no pin left to spend and nothing to refuse.
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='again', action='close_only',
+        )
+
+        assert 'code' not in result, result
+        assert result['status'] == 'dismissed'
+
+    @pytest.mark.asyncio
+    async def test_wholly_unmarked_cluster_cascades_exactly_as_today(self, tmp_path: Path):
+        """(f) The no-regression half."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        l2 = self._homogeneous_cluster(queue, marked=())
+
+        result = await _resolve_issue(
+            server, escalation_id=l2.id, resolution='bulk close', action='close_only',
+        )
+
+        assert 'code' not in result, result
+        assert result['status'] == 'dismissed'
+        for member_id in ('esc-3237-1', 'esc-3371-2', 'esc-3237-3'):
+            rec = queue.get(member_id)
+            assert rec is not None
+            assert rec.status == 'dismissed', f'{member_id} should have cascaded'
+
+    @pytest.mark.asyncio
+    async def test_park_is_exempt_even_when_a_member_is_marked(self, tmp_path: Path):
+        """(g) The gate protects the record's OPEN status, not every resolver
+        action — park keeps it open and never archives, so it cannot spend a pin."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        l2 = self._homogeneous_cluster(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=l2.id, resolution='holding for a human', action='park',
+        )
+
+        assert 'code' not in result, result
+        assert result['status'] == 'pending', 'park keeps the record open'
+        assert result['resolution_action'] == 'park'
+        assert queue.get('esc-3371-2') is not None
+        assert (queue.queue_dir / 'esc-3371-2.json').exists(), 'the pin is untouched'
+
+    # --- the explicit acknowledgement override ---
+
+    @pytest.mark.asyncio
+    async def test_acknowledging_a_marked_head_lets_the_close_proceed(self, tmp_path: Path):
+        """(a) Naming every blocked id releases the refusal."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_declared(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='deliberately spending it',
+            action='close_only', acknowledge_declared_pins=[esc.id],
+        )
+
+        assert 'code' not in result, result
+        assert result['status'] == 'dismissed'
+        assert not (queue.queue_dir / f'{esc.id}.json').exists(), 'expected it to be archived'
+
+    @pytest.mark.asyncio
+    async def test_acknowledging_a_marked_member_lets_the_cascade_proceed(self, tmp_path: Path):
+        """(a cont.) A marked MEMBER's L2 closes and cascades to every member."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        l2 = self._homogeneous_cluster(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=l2.id, resolution='deliberately spending it',
+            action='close_only', acknowledge_declared_pins=['esc-3371-2'],
+        )
+
+        assert 'code' not in result, result
+        for member_id in ('esc-3237-1', 'esc-3371-2', 'esc-3237-3'):
+            rec = queue.get(member_id)
+            assert rec is not None
+            assert rec.status == 'dismissed', f'{member_id} should have cascaded'
+
+    @pytest.mark.asyncio
+    async def test_partial_acknowledgement_still_refuses_naming_the_remainder(
+        self, tmp_path: Path,
+    ):
+        """(b) The load-bearing half: a closer cannot blanket-wave a cluster
+        through by naming the first id the error happened to mention."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        l2 = self._homogeneous_cluster(queue, marked=('esc-3237-1', 'esc-3371-2'))
+
+        result = await _resolve_issue(
+            server, escalation_id=l2.id, resolution='bulk close',
+            action='close_only', acknowledge_declared_pins=['esc-3237-1'],
+        )
+
+        assert result.get('code') == 'declared_pin_refused', result
+        assert [p['escalation_id'] for p in result['declared_pins']] == ['esc-3371-2'], (
+            'only the UN-acknowledged remainder should be reported'
+        )
+        assert queue.get('esc-3237-5').status == 'pending'  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_acknowledging_an_unblocked_id_is_a_harmless_no_op(self, tmp_path: Path):
+        """(c) It does not change the outcome for the ids that ARE blocked."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_declared(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='bulk close',
+            action='close_only', acknowledge_declared_pins=['esc-not-in-this-cluster'],
+        )
+
+        assert result.get('code') == 'declared_pin_refused', result
+        assert [p['escalation_id'] for p in result['declared_pins']] == [esc.id]
+
+    @pytest.mark.asyncio
+    async def test_explicit_none_behaves_exactly_like_an_omitted_argument(self, tmp_path: Path):
+        """(d) The parameter is opt-in — no existing caller changes behaviour."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_declared(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='bulk close',
+            action='close_only', acknowledge_declared_pins=None,
+        )
+
+        assert result.get('code') == 'declared_pin_refused', result
+
+    @pytest.mark.asyncio
+    async def test_an_acknowledged_close_still_emits_the_queue_warning(
+        self, tmp_path: Path, caplog,
+    ):
+        """(e) An override is LOUD in the log even though it is permitted — the
+        audit trail records that a pin was deliberately spent."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_declared(queue)
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            await _resolve_issue(
+                server, escalation_id=esc.id, resolution='deliberately spending it',
+                action='close_only', acknowledge_declared_pins=[esc.id],
+            )
+
+        warnings = [
+            r.getMessage() for r in caplog.records if 'DECLARED PIN' in r.getMessage()
+        ]
+        assert len(warnings) == 1, f'Expected one audit warning, got {warnings}'
+        assert esc.id in warnings[0]
+        assert self.DECLARER in warnings[0]
+
+
+class TestDeclaredPinSurfacing:
+    """The marker is VISIBLE to a bulk closer BEFORE it acts (task 4377).
+
+    A rotating watcher drains COMPACT rows.  A marker invisible there leaves it
+    exactly as blind as the 2026-08-08 cascade was — all eleven members of
+    esc-3237-5 were indistinguishable by id, level, category, severity,
+    agent_role and summary.
+    """
+
+    DECLARER = 'task-3546-second-deviation-notice'
+    REASON = 'mu-gate validation specimen — the evidence base'
+
+    def _seed_and_declare(
+        self, queue: EscalationQueue, esc_id: str = 'esc-3371-2', declare: bool = True,
+    ) -> Escalation:
+        esc = Escalation(
+            id=esc_id,
+            task_id='3371',
+            agent_role='steward',
+            severity='blocking',
+            category='design_concern',
+            summary='a load-bearing pending record',
+            level=1,
+        )
+        queue.submit(esc)
+        if declare:
+            queue.declare_pin(esc_id, declared_by=[self.DECLARER], reason=self.REASON)
+        return esc
+
+    # --- (a) FULL mode carries both fields ---
+
+    @pytest.mark.asyncio
+    async def test_full_mode_carries_both_fields(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed_and_declare(queue)
+
+        (pending,) = await _get_pending(server)
+        (by_task,) = await _get_task_escalations(server, task_id='3371')
+
+        for row in (pending, by_task):
+            assert row['pin_declared_by'] == [self.DECLARER]
+            assert row['pin_declared_reason'] == self.REASON
+
+    # --- (b)/(c) COMPACT mode carries pin_declared_by on BOTH apply sites ---
+
+    @pytest.mark.asyncio
+    async def test_compact_pending_carries_pin_declared_by(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed_and_declare(queue)
+
+        (row,) = await _get_pending(server, compact=True)
+
+        assert row['pin_declared_by'] == [self.DECLARER]
+
+    @pytest.mark.asyncio
+    async def test_compact_task_escalations_carries_pin_declared_by(self, tmp_path: Path):
+        """Both compact tools route through _compact_escalation — one seam."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed_and_declare(queue)
+
+        (row,) = await _get_task_escalations(server, task_id='3371', compact=True)
+
+        assert row['pin_declared_by'] == [self.DECLARER]
+
+    # --- (d) the unbounded free text is NOT projected ---
+
+    @pytest.mark.asyncio
+    async def test_compact_omits_pin_declared_reason(self, tmp_path: Path):
+        """Same reason `detail` is dropped: pin_declared_by is the signal to
+        pull the full record via get_escalation."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed_and_declare(queue)
+
+        (pending,) = await _get_pending(server, compact=True)
+        (by_task,) = await _get_task_escalations(server, task_id='3371', compact=True)
+
+        assert 'pin_declared_reason' not in pending
+        assert 'pin_declared_reason' not in by_task
+
+    # --- (e) ALWAYS projected, never conditionally omitted ---
+
+    @pytest.mark.asyncio
+    async def test_unmarked_compact_row_carries_an_empty_list(self, tmp_path: Path):
+        """`_compact_escalation`'s omission contract already means 'could not be
+        computed' for pins_recovery; a second meaning for absence would be a
+        legibility trap."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        self._seed_and_declare(queue, esc_id='esc-plain-1', declare=False)
+
+        (row,) = await _get_pending(server, compact=True)
+
+        assert row['pin_declared_by'] == []
+
+    def test_the_field_is_in_the_shared_projection_constant(self):
+        """Widening the one constant is what widens BOTH compact tools."""
+        assert 'pin_declared_by' in _COMPACT_ESCALATION_FIELDS
+        assert 'pin_declared_reason' not in _COMPACT_ESCALATION_FIELDS
+
+
+# ---------------------------------------------------------------------------
+# task 4377 — the declare_pin MCP tool (the marker's writer)
+# ---------------------------------------------------------------------------
+
+
+class TestDeclarePinTool:
+    """declare_pin stamps the load-bearing marker ON the record (task 4377).
+
+    Before this tool the only way to say "something relies on this record
+    staying open" was prose somewhere else — which is exactly how esc-3371-2
+    was lost: its marker lived in a deviation notice nothing linked from, so
+    the 2026-08-08 cascade close could not see it.
+
+    In-process ``tool.fn()`` calls see empty headers, so the level-ungated
+    property is asserted here over the in-process path; the real
+    ``X-Escalation-Levels`` header path is covered by
+    ``test_capability_guard_http.py::TestTriageAnnotationUngated``, the
+    established ungated-annotation-tool precedent this tool mirrors.
+    """
+
+    DECLARER = 'task-3546-second-deviation-notice'
+    REASON = 'mu-gate validation specimen — the evidence base'
+
+    def _seed(
+        self,
+        queue: EscalationQueue,
+        esc_id: str = 'esc-3371-2',
+        task_id: str = '3371',
+        level: int = 1,
+    ) -> Escalation:
+        esc = Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='steward',
+            severity='blocking',
+            category='design_concern',
+            summary='a load-bearing pending record',
+            level=level,
+        )
+        queue.submit(esc)
+        return esc
+
+    # --- (a) stamps a pending record, returning the FULL record dict ---
+
+    @pytest.mark.asyncio
+    async def test_stamps_pending_record_and_returns_full_dict(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed(queue)
+
+        result = await _declare_pin(
+            server, escalation_id=esc.id, declared_by=[self.DECLARER], reason=self.REASON,
+        )
+
+        assert 'error' not in result, f'Unexpected error: {result}'
+        assert result['pin_declared_by'] == [self.DECLARER]
+        assert result['pin_declared_reason'] == self.REASON
+        # Full record dict, mirroring stamp_triage's return shape — not a
+        # projection: a caller gets the whole record back, unchanged elsewhere.
+        assert result['id'] == esc.id
+        assert result['status'] == 'pending'
+        assert result['level'] == 1
+
+    @pytest.mark.asyncio
+    async def test_stamp_is_visible_on_disk(self, tmp_path: Path):
+        """The write went through queue._rewrite, not just the returned copy."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed(queue)
+
+        await _declare_pin(
+            server, escalation_id=esc.id, declared_by=[self.DECLARER], reason=self.REASON,
+        )
+
+        refreshed = queue.get(esc.id)
+        assert refreshed is not None
+        assert refreshed.pin_declared_by == [self.DECLARER]
+        assert refreshed.pin_declared_reason == self.REASON
+
+    # --- (b) an empty/all-blank declared_by is a LOUD failure, not a no-op ---
+
+    @pytest.mark.asyncio
+    async def test_empty_declared_by_is_refused_with_a_typed_code(self, tmp_path: Path):
+        """A silent no-op stamp would leave the declarer believing the record is
+        protected when it is not — the exact failure class this task closes."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed(queue)
+
+        result = await _declare_pin(server, escalation_id=esc.id, declared_by=[])
+
+        assert result.get('code') == 'empty_declared_by', result
+        assert 'error' in result
+
+    @pytest.mark.asyncio
+    async def test_all_blank_declared_by_is_refused_with_a_typed_code(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed(queue)
+
+        result = await _declare_pin(
+            server, escalation_id=esc.id, declared_by=['', '   ', '\t'], reason=self.REASON,
+        )
+
+        assert result.get('code') == 'empty_declared_by', result
+
+    @pytest.mark.asyncio
+    async def test_empty_declared_by_changes_nothing_on_the_record(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed(queue)
+
+        await _declare_pin(
+            server, escalation_id=esc.id, declared_by=['  '], reason=self.REASON,
+        )
+
+        refreshed = queue.get(esc.id)
+        assert refreshed is not None
+        assert refreshed.pin_declared_by == []
+        assert refreshed.pin_declared_reason == ''
+
+    # --- a wholly-redundant re-declaration is reported TRUTHFULLY ---
+
+    @pytest.mark.asyncio
+    async def test_redundant_redeclaration_is_not_reported_as_not_found(self, tmp_path: Path):
+        """An idempotent retry must not claim the record is gone.
+
+        ``queue.declare_pin`` returns None for THREE distinct outcomes, one of
+        which is a re-declaration on a record that IS found and IS pending.
+        Borrowing the "not found or not pending" message for it is factually
+        false about the record — and an idempotent retry is the natural thing
+        for an operator or a script to do.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed(queue)
+        await _declare_pin(
+            server, escalation_id=esc.id, declared_by=[self.DECLARER], reason=self.REASON,
+        )
+
+        result = await _declare_pin(
+            server, escalation_id=esc.id, declared_by=[self.DECLARER], reason=self.REASON,
+        )
+
+        assert result.get('code') == 'already_declared', result
+        assert 'not found' not in result['error'], result['error']
+        assert self.DECLARER in result['error']
+        # The record is untouched and still protected.
+        reread = queue.get(esc.id)
+        assert reread is not None
+        assert reread.status == 'pending'
+        assert reread.pin_declared_by == [self.DECLARER]
+
+    @pytest.mark.asyncio
+    async def test_redundant_redeclaration_returns_the_declarers_structurally(
+        self, tmp_path: Path,
+    ):
+        """INV-2 — the caller recovers what the record carries without parsing."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed(queue)
+        await _declare_pin(
+            server, escalation_id=esc.id, declared_by=[self.DECLARER], reason=self.REASON,
+        )
+
+        result = await _declare_pin(server, escalation_id=esc.id, declared_by=[self.DECLARER])
+
+        assert result['pin_declared_by'] == [self.DECLARER]
+        assert result['pin_declared_reason'] == self.REASON
+
+    @pytest.mark.asyncio
+    async def test_reason_only_correction_is_reported_as_already_declared(
+        self, tmp_path: Path,
+    ):
+        """A reason cannot be corrected without a new declarer — and the caller
+        is TOLD so, rather than being told the record does not exist."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed(queue)
+        await _declare_pin(
+            server, escalation_id=esc.id, declared_by=[self.DECLARER], reason='first reason',
+        )
+
+        result = await _declare_pin(
+            server, escalation_id=esc.id, declared_by=[self.DECLARER],
+            reason='a corrected reason',
+        )
+
+        assert result.get('code') == 'already_declared', result
+        assert 'reason' in result['error'], (
+            'the message must say the rationale was not updated'
+        )
+        reread = queue.get(esc.id)
+        assert reread is not None
+        assert reread.pin_declared_reason == 'first reason', 'nothing was written'
+
+    @pytest.mark.asyncio
+    async def test_a_partially_redundant_call_still_succeeds(self, tmp_path: Path):
+        """The no-regression half: a call carrying ONE new declarer is a success,
+        not an already_declared report."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed(queue)
+        await _declare_pin(server, escalation_id=esc.id, declared_by=[self.DECLARER])
+
+        result = await _declare_pin(
+            server, escalation_id=esc.id, declared_by=[self.DECLARER, 'operator-gate'],
+        )
+
+        assert 'error' not in result, result
+        assert result['pin_declared_by'] == [self.DECLARER, 'operator-gate']
+
+    # --- (c) unknown / archived ids error rather than raising or resurrecting ---
+
+    @pytest.mark.asyncio
+    async def test_unknown_id_returns_error_naming_the_id(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _declare_pin(
+            server, escalation_id='esc-does-not-exist', declared_by=[self.DECLARER],
+        )
+
+        assert 'error' in result, f'Expected error dict, got: {result}'
+        assert 'esc-does-not-exist' in result['error']
+
+    @pytest.mark.asyncio
+    async def test_resolved_id_returns_error_and_is_not_resurrected(self, tmp_path: Path):
+        """Declaring a dependency on a closed record is meaningless — and must
+        never re-materialise it in the queue root (the Defect-2 class of bug)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed(queue)
+        queue.resolve(esc.id, 'Fixed')
+
+        result = await _declare_pin(
+            server, escalation_id=esc.id, declared_by=[self.DECLARER], reason=self.REASON,
+        )
+
+        assert 'error' in result, f'Expected error dict, got: {result}'
+        assert esc.id in result['error']
+        assert not (queue.queue_dir / f'{esc.id}.json').exists()
+
+    # --- (d) END-TO-END: the writer and the guard share one field ---
+
+    @pytest.mark.asyncio
+    async def test_declared_record_is_then_refused_by_resolve_issue(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed(queue)
+
+        await _declare_pin(
+            server, escalation_id=esc.id, declared_by=[self.DECLARER], reason=self.REASON,
+        )
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='bulk close', action='close_only',
+        )
+
+        assert result.get('code') == 'declared_pin_refused', result
+        assert result['declared_pins'] == [
+            {
+                'escalation_id': esc.id,
+                'declared_by': [self.DECLARER],
+                'reason': self.REASON,
+            }
+        ]
+
+    # --- (e) NOT level-gated (stamp_triage's stated reason) ---
+
+    @pytest.mark.asyncio
+    async def test_an_l2_record_can_be_stamped(self, tmp_path: Path):
+        """A declaration is restrictive-only — it can never widen what a
+        connection may do — so gating it would let a level-capped connection
+        observe a pin it is forbidden to declare."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed(queue, esc_id='esc-3105-3', task_id='3105', level=2)
+
+        result = await _declare_pin(
+            server, escalation_id=esc.id, declared_by=[self.DECLARER], reason=self.REASON,
+        )
+
+        assert 'error' not in result, f'Unexpected error: {result}'
+        assert result['level'] == 2
+        assert result['pin_declared_by'] == [self.DECLARER]

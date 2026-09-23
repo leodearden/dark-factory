@@ -15,17 +15,26 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import shutil
 import types
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
+from _filing_tools import call_blocker as _blocker
+from _filing_tools import call_info as _info
 
 from escalation.dedupe import DedupeConfig
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
+
+if TYPE_CHECKING:
+    # Annotation-only (PEP 563 via `from __future__ import annotations`): the
+    # runtime import stays local to each helper, mirroring every other
+    # orchestrator reference in this file.
+    from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -46,16 +55,6 @@ async def _make_lookup(status: str | None):
         return status
 
     return _lookup
-
-
-async def _blocker(server, **kwargs: Any) -> dict[str, Any]:
-    tool = await server.get_tool('escalate_blocker')
-    return await tool.fn(**kwargs)
-
-
-async def _info(server, **kwargs: Any) -> dict[str, Any]:
-    tool = await server.get_tool('escalate_info')
-    return await tool.fn(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -4012,6 +4011,461 @@ class TestBoundary9CancelRetire:
 
 
 # ---------------------------------------------------------------------------
+# Task 3103 — the already_merged fast-path must decline a DEGENERATE branch
+# ---------------------------------------------------------------------------
+
+_DEGENERATE_TIP = 'a' * 40
+
+
+class _ExplodingMetadata:
+    """A task-metadata stand-in whose ``.get`` raises.
+
+    Models a malformed task record reaching the degeneracy probe: the server
+    reads ``task.get('metadata') or {}``, which passes any truthy non-dict
+    straight through to ``branch_is_degenerate``, where ``.get`` blows up
+    INSIDE the probe rather than inside
+    ``escalation/src/escalation/git_authority.py::task_metadata``'s own
+    handler.  That is the only way to reach merge_request's outer
+    fast-path ``except`` — see
+    ``test_probe_fault_inside_the_guard_preserves_the_fast_path``.
+    """
+
+    def get(self, *_args: object, **_kwargs: object) -> object:
+        raise RuntimeError('task store returned a malformed metadata record')
+
+
+async def _run_fast_path_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    tip: str = _DEGENERATE_TIP,
+    is_ancestor_result: bool = True,
+    patch_contained: bool = False,
+    metadata: Any = None,
+    scheduler_raises: bool = False,
+    with_scheduler: bool = True,
+    worker_outcome: MergeOutcome | None = None,
+    task_id: str = '591',
+    branch: str = '591',
+    metadata_by_id: dict[str, Any] | None = None,
+    requested_ids: list[str] | None = None,
+) -> tuple[dict, asyncio.Queue, list]:
+    """Drive merge_request's submit-time fast path once.
+
+    Returns ``(result, mq, emitted_events)``.  A background worker resolves
+    the future so the fall-through path (no fast-path hit) terminates instead
+    of blocking, letting each test assert on the RESPONSE rather than on a
+    timeout.
+
+    ``worker_outcome`` is the ``MergeOutcome`` that fake worker delivers.  It
+    defaults to ``MergeOutcome('done', reason='test done')``, which is a
+    STAND-IN, not a claim about production: tests that assert on the
+    fall-through response must pass the outcome the real worker would produce
+    for their wiring, or they measure the fake instead of the code under test.
+    Tests that assert only on the fast path itself (which returns before any
+    worker runs) are unaffected by this value.
+
+    ``task_id`` / ``branch`` are the two independent merge_request parameters.
+    They default to the same value; pass differing ones (with
+    ``metadata_by_id``) to pin WHICH of them the degeneracy guard keys its
+    metadata lookup off.  ``requested_ids``, when supplied, is appended to
+    with every id ``scheduler.get_task`` is actually called with.
+    """
+    import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
+    from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+
+    class _RecordingEventStore:
+        def __init__(self) -> None:
+            self.events: list = []
+
+        def emit(self, event_type, **kwargs) -> None:  # type: ignore[override]
+            self.events.append(event_type)
+
+    recording_event_store = _RecordingEventStore()
+
+    async def _resolve_branch_sha(name: str) -> str:
+        return tip
+
+    async def _is_ancestor(ancestor: str, descendant: str) -> bool:
+        return is_ancestor_result
+
+    async def _find_inflight_merge_worktree(branch: str):
+        return None
+
+    git_ops_stub = types.SimpleNamespace(
+        resolve_branch_sha=_resolve_branch_sha,
+        is_ancestor=_is_ancestor,
+        find_inflight_merge_worktree=_find_inflight_merge_worktree,
+    )
+    harness_stub = types.SimpleNamespace(git_ops=git_ops_stub)
+    if with_scheduler:
+        async def _get_task(tid: str):
+            if requested_ids is not None:
+                requested_ids.append(tid)
+            if scheduler_raises:
+                raise RuntimeError('scheduler unreachable')
+            if metadata_by_id is not None:
+                return {'metadata': metadata_by_id.get(tid) or {}}
+            return {'metadata': metadata or {}}
+
+        harness_stub.scheduler = types.SimpleNamespace(get_task=_get_task)
+
+    async def _patch_content_contained(head, upstream, git_ops):
+        return patch_contained
+
+    monkeypatch.setattr(
+        orchestrator_merge_queue, 'patch_content_contained', _patch_content_contained,
+    )
+
+    esc_queue = EscalationQueue(tmp_path / 'esc')
+    mq: asyncio.Queue = asyncio.Queue()
+    server = create_server(
+        esc_queue,
+        merge_queue=mq,
+        orch_config=_make_orch_config(tmp_path / 'repo'),
+        event_store=recording_event_store,
+        harness=harness_stub,
+        merge_inflight_registry=_make_registry(),
+    )
+
+    async def _worker() -> None:
+        req = await mq.get()
+        req.result.set_result(
+            worker_outcome
+            if worker_outcome is not None
+            else MergeOutcome('done', reason='test done')
+        )
+        await mq.put(req)   # put it back so tests can assert the enqueue happened
+
+    worker_task = asyncio.create_task(_worker())
+    try:
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id=task_id,
+                branch=branch,
+                worktree=str(tmp_path / 'wt'),
+                description='',
+                wait_secs=100,
+            ),
+            timeout=5.0,
+        )
+    finally:
+        if not worker_task.done():
+            worker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker_task
+    return result, mq, recording_event_store.events
+
+
+@pytest.mark.asyncio
+class TestMergeRequestDegenerateBranchFastPath:
+    """merge_request's already_merged fast-path must decline a zero-commit branch.
+
+    A degenerate branch is parked at an OLD main commit, so it IS an ancestor
+    of main — the fast-path's only guard — and answering
+    ``{status:'already_merged', commit:<that foreign SHA>}`` is a phantom done
+    on a WRITE path (the runbooks treat already_merged the same as done and
+    stamp done_provenance from ``result['commit']``).
+    """
+
+    async def test_degenerate_branch_does_not_short_circuit_as_already_merged(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from orchestrator.event_store import EventType  # type: ignore[reportMissingImports]
+
+        result, mq, events = await _run_fast_path_probe(
+            tmp_path, monkeypatch, is_ancestor_result=True,
+            metadata={'branch_base_sha': _DEGENERATE_TIP},
+        )
+
+        # The guard controls SUBMIT-time behaviour only: the request is
+        # enqueued and audited instead of short-circuiting, and the parked
+        # foreign SHA never reaches the caller.  It does NOT control the final
+        # status — the worker still answers already_merged for this shape (its
+        # own ancestry short-circuit); see
+        # test_degenerate_branch_worker_path_answers_already_merged_with_no_commit.
+        assert not mq.empty(), 'Expected the request to be enqueued instead'
+        assert EventType.merge_queued in events, (
+            f'Expected a merge_queued event on the fall-through path, got: {events}'
+        )
+        assert result.get('commit') != _DEGENERATE_TIP, (
+            f'The parked foreign SHA must not be returned as a commit: {result}'
+        )
+
+    async def test_degenerate_branch_also_skips_patch_id_backstop(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The non-obvious case: the task-2945 backstop is vacuously True here.
+
+        ``patch_content_contained`` runs ``git cherry <main> <tip>`` and
+        returns True when no ``+`` lines appear — which for a ZERO-COMMIT
+        branch is true VACUOUSLY, because git emits nothing.  Gating only the
+        is_ancestor arm would leak the degenerate branch straight into the
+        backstop and still answer already_merged.  This test is the only
+        thing that catches that.
+        """
+        from orchestrator.event_store import EventType  # type: ignore[reportMissingImports]
+
+        result, mq, events = await _run_fast_path_probe(
+            tmp_path, monkeypatch, is_ancestor_result=False, patch_contained=True,
+            metadata={'branch_base_sha': _DEGENERATE_TIP},
+        )
+
+        # Submit-time facts only — the backstop was not consulted, so the
+        # request was enqueued and audited.  As above, the final status is the
+        # worker's to decide and remains a known residual.
+        assert not mq.empty(), 'Expected the request to be enqueued instead'
+        assert EventType.merge_queued in events, (
+            f'Expected a merge_queued event on the fall-through path, got: {events}'
+        )
+        assert result.get('commit') != _DEGENERATE_TIP, (
+            f'The parked foreign SHA must not be returned as a commit: {result}'
+        )
+
+    async def test_degenerate_branch_worker_path_answers_already_merged_with_no_commit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The honest end-to-end pin: the worker STILL answers already_merged.
+
+        This is the REMAINING gap, not a guarantee this task closes.  Declining
+        the submit-time fast path only redirects a degenerate branch to the
+        worker, which reaches the same verdict by its own route:
+        ``_already_merged_is_genuine`` (merge_queue.py:5455) resolves
+        ``candidate_tip`` to the same parked base and returns True at its FIRST
+        ancestry check (merge_queue.py:5515 — the single fix point), so the
+        worker emits a terminal ``MergeOutcome('already_merged')``.  Follow-up:
+        tkt_0RSHM98C6F78MW4J0SK3S29YZG.
+
+        What this task's guard DOES buy, and what this test therefore pins:
+        the response no longer fabricates a ``commit`` (the parked foreign SHA
+        that skills/unblock/SKILL.md stamps verbatim into ``done_provenance``)
+        — it is None — and the submission leaves an auditable queue record (a
+        ``request_id`` plus a ``merge_queued`` event) instead of vanishing into
+        a silent submit-time short-circuit.
+        """
+        from orchestrator.event_store import EventType  # type: ignore[reportMissingImports]
+        from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+
+        result, _, events = await _run_fast_path_probe(
+            tmp_path, monkeypatch, is_ancestor_result=True,
+            metadata={'branch_base_sha': _DEGENERATE_TIP},
+            # Models merge_queue.py:5650 — the worker's terminal outcome for
+            # exactly this wiring (no merge_sha, hence commit=None).
+            worker_outcome=MergeOutcome('already_merged'),
+        )
+
+        assert result['status'] == 'already_merged', (
+            f'The worker-side residual is already_merged, got: {result}'
+        )
+        assert result['commit'] is None, (
+            f'The worker path must not carry a fabricated commit SHA: {result}'
+        )
+        assert result['request_id'] is not None, (
+            f'The redirected submission must be an auditable queue record: {result}'
+        )
+        assert EventType.merge_queued in events, (
+            f'Expected a merge_queued event for the redirected request: {events}'
+        )
+
+    async def test_non_degenerate_ancestor_branch_still_already_merged(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The task-1629 fast-path is preserved for a real merged branch."""
+        result, mq, _ = await _run_fast_path_probe(
+            tmp_path, monkeypatch, is_ancestor_result=True,
+            metadata={'branch_base_sha': 'b' * 40},   # != tip → non-degenerate
+        )
+
+        assert result == {
+            'status': 'already_merged',
+            'commit': _DEGENERATE_TIP,
+            'reason': '',
+            'conflict_details': '',
+            'push_status': None,
+        }, f'Expected the unchanged already_merged shape, got: {result}'
+        assert mq.empty(), f'Expected no enqueue, qsize={mq.qsize()}'
+
+    async def test_rebased_branch_still_already_merged_via_patch_id(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The task-2945 backstop is preserved for a real rebased landing.
+
+        A rebased landing has commits beyond its base, so it is non-degenerate
+        by construction and the new guard never fires on it.
+        """
+        result, _, _ = await _run_fast_path_probe(
+            tmp_path, monkeypatch, is_ancestor_result=False, patch_contained=True,
+            metadata={'branch_base_sha': 'b' * 40},
+        )
+
+        assert result['status'] == 'already_merged', (
+            f'Rebased landing must still fast-path via patch-id, got: {result}'
+        )
+
+    async def test_scheduler_absent_preserves_legacy_fast_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """No .scheduler at all → metadata unavailable → guard skipped.
+
+        Pins the fail-soft direction, and guarantees the many existing
+        chokepoint tests whose harness stub is a bare
+        ``SimpleNamespace(git_ops=...)`` keep working.
+        """
+        result, mq, _ = await _run_fast_path_probe(
+            tmp_path, monkeypatch, is_ancestor_result=True, with_scheduler=False,
+        )
+
+        assert result['status'] == 'already_merged', (
+            f'A scheduler-less harness must keep the legacy fast-path: {result}'
+        )
+        assert mq.empty()
+
+    async def test_scheduler_get_task_raises_preserves_fast_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A raising get_task degrades the guard, and merge_request does not raise.
+
+        NOTE this does NOT reach merge_request's own fast-path ``except``: the
+        RuntimeError is swallowed one level deeper, inside
+        ``escalation/src/escalation/git_authority.py::task_metadata``'s
+        handler, which returns an empty ``metadata`` — so
+        the probe then runs normally and reads "no degeneracy signal".  The
+        outer handler is covered by
+        ``test_probe_fault_inside_the_guard_preserves_the_fast_path`` below.
+        """
+        result, mq, _ = await _run_fast_path_probe(
+            tmp_path, monkeypatch, is_ancestor_result=True, scheduler_raises=True,
+        )
+
+        assert isinstance(result, dict), 'merge_request must not raise'
+        assert result['status'] == 'already_merged', (
+            f'A scheduler fault must not break submission: {result}'
+        )
+        assert mq.empty()
+
+    async def test_probe_fault_inside_the_guard_preserves_the_fast_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A fault INSIDE branch_is_degenerate must not escape merge_request.
+
+        Unlike merge_status, merge_request has no enclosing fire-safe wrapper —
+        the fast path's own ``try/except`` is the only thing between a probe
+        fault and an exception propagating out of a WRITE-path MCP tool.  A
+        malformed metadata record is the reachable way to trigger it: the
+        server passes any truthy ``task['metadata']`` through verbatim, so a
+        non-dict raises on ``.get`` inside the probe, PAST
+        ``escalation/src/escalation/git_authority.py::task_metadata``'s own
+        handler.
+
+        Fail-soft direction: the fault degrades the guard (treat as
+        non-degenerate) and the legacy fast path answers, rather than the
+        submission blowing up.
+        """
+        result, mq, _ = await _run_fast_path_probe(
+            tmp_path, monkeypatch, is_ancestor_result=True,
+            metadata=_ExplodingMetadata(),
+        )
+
+        assert isinstance(result, dict), (
+            f'A probe fault must not propagate out of merge_request: {result!r}'
+        )
+        assert result['status'] == 'already_merged', (
+            f'A degraded guard must fall back to the legacy fast path: {result}'
+        )
+        assert mq.empty()
+
+    async def test_guard_keys_metadata_off_the_branch_not_the_task_id_param(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """task_id and branch are independent params; the guard must use branch.
+
+        The tip the arms test is resolved from ``branch``, so the
+        ``branch_base_sha`` it is compared against has to come from the SAME
+        branch's task.  Keying off the caller-supplied ``task_id`` instead
+        would compare task X's recorded base against task Y's tip on any
+        mismatched submission and silently disable the guard.
+
+        Wiring: task '591' (the ``task_id`` param) is recorded NON-degenerate,
+        task '777' (the branch) IS degenerate.  Reading the wrong one lets the
+        fast path answer already_merged — so the enqueue is the behavioural
+        discriminator, not just the recorded lookup id.
+        """
+        from orchestrator.event_store import EventType  # type: ignore[reportMissingImports]
+
+        requested: list[str] = []
+        result, mq, events = await _run_fast_path_probe(
+            tmp_path, monkeypatch, is_ancestor_result=True,
+            task_id='591', branch='777',
+            metadata_by_id={
+                '591': {'branch_base_sha': 'b' * 40},          # non-degenerate
+                '777': {'branch_base_sha': _DEGENERATE_TIP},   # degenerate
+            },
+            requested_ids=requested,
+        )
+
+        assert requested == ['777'], (
+            f'The guard must look up the id derived from the branch, got: {requested}'
+        )
+        assert not mq.empty(), (
+            f'The branch is degenerate, so the fast path must decline: {result}'
+        )
+        assert EventType.merge_queued in events, (
+            f'Expected a merge_queued event on the fall-through path, got: {events}'
+        )
+        assert result.get('commit') != _DEGENERATE_TIP, (
+            f'The parked foreign SHA must not be returned as a commit: {result}'
+        )
+
+    async def test_guard_probes_at_most_once_across_both_arms(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The task-metadata read is paid at most once, and the arms share it.
+
+        Task 4888 superseded the zero-read half of this contract, deliberately
+        and by its design decision 5: honouring ``metadata.merge_lane``
+        requires reading the metadata, so a submission that supplies no
+        explicit ``lane`` now pays exactly one memoized
+        ``scheduler.get_task``.  The superseded assertion rested on the
+        premise that the read could have no possible effect on a plain
+        not-yet-merged submission — true while the PROBE was its only
+        consumer, false now that the same read also resolves the lane.
+
+        The two consumers stay individually attributable.  With neither arm
+        hitting, the guard's ``_declined()`` is never awaited, so the single
+        recorded lookup can only be the lane fallback's.  With an arm hitting,
+        both consumers want the metadata and the memo is the whole reason the
+        count is one rather than two.  The remaining cell — an explicit
+        ``lane=`` skipping the fallback, so nothing reads at all — is pinned
+        in scope by ``escalation/tests/test_merge_request_lane.py``
+        ``::TestMetadataReadIsPaidAtMostOnce``
+        ``::test_explicit_lane_pays_no_metadata_read_at_all``.
+        """
+        # Neither arm hits → the probe stays off, and the lane fallback pays
+        # the one read on its own.
+        lane_only: list[str] = []
+        await _run_fast_path_probe(
+            tmp_path, monkeypatch, is_ancestor_result=False, patch_contained=False,
+            metadata={'branch_base_sha': 'b' * 40}, requested_ids=lane_only,
+        )
+        assert lane_only == ['591'], (
+            f'A plain not-yet-merged submission must consult the task store '
+            f'exactly once — the lane fallback, not the suppressed probe — '
+            f'got: {lane_only}'
+        )
+
+        # The patch-id arm hits (is_ancestor misses first) → exactly one lookup.
+        once: list[str] = []
+        await _run_fast_path_probe(
+            tmp_path, monkeypatch, is_ancestor_result=False, patch_contained=True,
+            metadata={'branch_base_sha': _DEGENERATE_TIP}, requested_ids=once,
+        )
+        assert once == ['591'], (
+            f'Both arms must share one memoized probe, got: {once}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # TestHonestResponseContract: the response reports OBSERVED state, not intent
 # (task 3236)
 # ---------------------------------------------------------------------------
@@ -4159,23 +4613,30 @@ class TestHonestResponseContract:
 
         assert result.get('level') == 2, f"No persisted level echoed: {result}"
 
-    # -- Fail-open: a bookkeeping read must never lose a filing -------------
+    # -- A bookkeeping read must never lose a filing, nor confirm one ------
 
     @pytest.mark.asyncio
-    async def test_unreadable_reread_falls_back_to_queued(self, tmp_path: Path):
-        """A re-read returning None falls back to 'queued' rather than raising."""
+    async def test_absent_reread_reports_unpersisted(self, tmp_path: Path):
+        """A re-read returning None reports 'accepted_unpersisted', not 'queued'.
+
+        The filing is never lost — the id still comes back — but an
+        unconfirmed write is no longer reported in the words that mean a
+        confirmed one (task 5368).
+        """
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
         queue.get = lambda escalation_id: None  # type: ignore[method-assign]
 
         result = await _blocker(server, **_COMMON_KWARGS)
 
-        assert result['status'] == 'queued', f'Expected fail-open queued, got: {result}'
+        assert result['status'] == 'accepted_unpersisted', (
+            f'Expected accepted_unpersisted, got: {result}'
+        )
         assert 'id' in result
 
     @pytest.mark.asyncio
-    async def test_raising_reread_falls_back_to_queued(self, tmp_path: Path):
-        """A re-read that RAISES falls back to 'queued' and does not propagate."""
+    async def test_raising_reread_reports_unpersisted(self, tmp_path: Path):
+        """A re-read that RAISES reports 'accepted_unpersisted' and does not propagate."""
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
 
@@ -4186,5 +4647,149 @@ class TestHonestResponseContract:
 
         result = await _blocker(server, **_COMMON_KWARGS)
 
-        assert result['status'] == 'queued', f'Expected fail-open queued, got: {result}'
+        assert result['status'] == 'accepted_unpersisted', (
+            f'Expected accepted_unpersisted, got: {result}'
+        )
         assert 'id' in result
+
+
+# ---------------------------------------------------------------------------
+# Task 5368 (S8-25): an unknown queue position is reported as unknown
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestPositionIsNoneWhenTheSnapshotIsUnavailable:
+    """`_nonblocking_state_response` must not fabricate a position.
+
+    Three of its four branches set `position` from something real — the index
+    the request_id was found at, or `max(0, queue_depth - 1)` for a request
+    that was just enqueued.  The fourth, where `worker.snapshot()` raises,
+    returned the `0` initialiser: the single most misleading value in the
+    range, since it is indistinguishable from a genuine front-of-queue and is
+    what an operator reads as "next to merge".
+    """
+
+    @staticmethod
+    def _raising_worker_harness():
+        def _boom():
+            raise RuntimeError('simulated merge-worker snapshot failure')
+
+        return types.SimpleNamespace(
+            _merge_worker=types.SimpleNamespace(snapshot=_boom),
+            git_ops=None,  # skip already_merged fast-path and worktree scan
+        )
+
+    @staticmethod
+    async def _submit(server, tmp_path: Path, *, branch: str = 'snap-fail'):
+        return await asyncio.wait_for(
+            _call_merge_request(
+                server,
+                task_id=branch,
+                branch=branch,
+                worktree=str(tmp_path / f'wt-{branch}'),
+                wait_secs=0,
+            ),
+            timeout=3.0,
+        )
+
+    async def test_raising_snapshot_reports_position_none(self, tmp_path: Path):
+        """(a) A snapshot that raises yields position=None, never 0."""
+        mq: asyncio.Queue = asyncio.Queue()
+        server = create_server(
+            EscalationQueue(tmp_path / 'esc'),
+            merge_queue=mq,
+            orch_config=_make_orch_config(tmp_path / 'repo'),
+            merge_inflight_registry=_make_registry(),
+            harness=self._raising_worker_harness(),
+        )
+
+        result = await self._submit(server, tmp_path)
+
+        assert result['position'] is None, (
+            'A position nobody computed must be reported as unknown, not as '
+            f'front-of-queue: {result}'
+        )
+
+    async def test_rest_of_the_shape_survives_a_raising_snapshot(self, tmp_path: Path):
+        """(b) Only `position` degrades — every other key is present and real.
+
+        `queue_depth` in particular still reports the bare `merge_queue.qsize()`
+        initialiser, which is a genuine measurement the snapshot failure does
+        not invalidate.  `position` must stay PRESENT so a caller keying on it
+        reads "unknown" rather than hitting a KeyError.
+        """
+        mq: asyncio.Queue = asyncio.Queue()
+        server = create_server(
+            EscalationQueue(tmp_path / 'esc'),
+            merge_queue=mq,
+            orch_config=_make_orch_config(tmp_path / 'repo'),
+            merge_inflight_registry=_make_registry(),
+            harness=self._raising_worker_harness(),
+        )
+
+        result = await self._submit(server, tmp_path)
+
+        for key in ('request_id', 'snapshot_tip', 'generation', 'position',
+                    'queue_depth', 'eta_seconds'):
+            assert key in result, f'Missing key {key!r}: {result}'
+        assert result['status'] == 'queued', f'Unexpected status: {result}'
+        assert result['request_id'].startswith('mr-'), f'Malformed request_id: {result}'
+        assert result['generation'] == 0, f'Unexpected generation: {result}'
+        assert result['queue_depth'] >= 1, (
+            f'queue_depth is a real measurement and must survive: {result}'
+        )
+
+    async def test_raising_snapshot_is_logged_not_swallowed(self, tmp_path: Path, caplog):
+        """(c) The failure is visible: a WARNING naming the request_id.
+
+        `except Exception: pass` left an operator with no way to learn the
+        live worker was unreachable.
+        """
+        mq: asyncio.Queue = asyncio.Queue()
+        server = create_server(
+            EscalationQueue(tmp_path / 'esc'),
+            merge_queue=mq,
+            orch_config=_make_orch_config(tmp_path / 'repo'),
+            merge_inflight_registry=_make_registry(),
+            harness=self._raising_worker_harness(),
+        )
+
+        with caplog.at_level(logging.WARNING, logger='escalation.server'):
+            result = await self._submit(server, tmp_path)
+
+        matching = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and result['request_id'] in r.getMessage()
+        ]
+        assert matching, (
+            f"Expected a WARNING naming request_id {result['request_id']!r}; got: "
+            f'{[(r.levelname, r.getMessage()) for r in caplog.records]}'
+        )
+
+    async def test_succeeding_snapshot_still_reports_an_int(self, tmp_path: Path):
+        """(d) The None is confined to the failure branch.
+
+        A live worker whose snapshot works keeps returning an int, so this
+        change cannot be mistaken for "position is now optional everywhere".
+        """
+        mq: asyncio.Queue = asyncio.Queue()
+        healthy_harness = types.SimpleNamespace(
+            _merge_worker=types.SimpleNamespace(
+                snapshot=lambda: {'entries': [], 'depth': 1, 'head_of_line': None},
+            ),
+            git_ops=None,
+        )
+        server = create_server(
+            EscalationQueue(tmp_path / 'esc'),
+            merge_queue=mq,
+            orch_config=_make_orch_config(tmp_path / 'repo'),
+            merge_inflight_registry=_make_registry(),
+            harness=healthy_harness,
+        )
+
+        result = await self._submit(server, tmp_path, branch='snap-ok')
+
+        assert isinstance(result['position'], int), (
+            f"Expected an int position from a healthy snapshot, got: {result}"
+        )

@@ -22,17 +22,6 @@ test harness is ever added, rendering-contract tests should live here.
 
 from __future__ import annotations
 
-import pytest
-from starlette.testclient import TestClient
-
-
-@pytest.fixture(scope='module')
-def _client():
-    from dashboard.app import app
-
-    with TestClient(app) as c:
-        yield c
-
 
 class TestMergeTabAssetServed:
     """Smoke-tests that the tabs.jsx static asset is served correctly."""

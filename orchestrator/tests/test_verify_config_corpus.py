@@ -32,6 +32,8 @@ from __future__ import annotations
 
 import pytest
 from _verify_config_corpus import (
+    DASHBOARD_CONFIG_PATH,
+    DASHBOARD_LINT_COMMAND,
     DF_CONFIG_PATH,
     FM_CONFIG_PATH,
     FM_LINT_COMMAND,
@@ -51,6 +53,7 @@ from _verify_config_corpus import (
 # scalar is one tuple, not another copy of the assertion.
 _ROOT_SCALAR_CASES = [
     ('FM_LINT_COMMAND', FM_LINT_COMMAND, FM_CONFIG_PATH, 'lint_command'),
+    ('DASHBOARD_LINT_COMMAND', DASHBOARD_LINT_COMMAND, DASHBOARD_CONFIG_PATH, 'lint_command'),
     ('SCRIPTS_LINT_COMMAND', SCRIPTS_LINT_COMMAND, SCRIPTS_CONFIG_PATH, 'lint_command'),
     ('ROOT_LINT_COMMAND', ROOT_LINT_COMMAND, DF_CONFIG_PATH, 'lint_command'),
     ('ROOT_TYPE_CHECK_COMMAND', ROOT_TYPE_CHECK_COMMAND, DF_CONFIG_PATH, 'type_check_command'),
@@ -84,7 +87,7 @@ class TestRootScalarsMatchLiveYaml:
 class TestModuleLintCommandsMatchLiveYaml:
     """Each per-module ``lint_command`` is byte-identical to its live YAML value.
 
-    These six share one 2-segment shape — ``uv run --project M --directory M
+    These six share one 2-segment shape — ``uv run --directory M
     ruff check src/ tests/ && python3
     fused-memory/scripts/check_bare_magicmock_config.py M/tests`` — which is
     why the corpus can generate them from the module name. ``fused-memory`` is
@@ -124,7 +127,7 @@ class TestCorpusCoversEveryLiveLintCommand:
 
     def test_discovered_modules_are_exactly_the_covered_modules(self):
         discovered = discover_lint_command_modules()
-        covered = {'fused-memory', 'scripts'} | set(MODULE_LINT_COMMANDS)
+        covered = {'fused-memory', 'scripts', 'dashboard'} | set(MODULE_LINT_COMMANDS)
 
         uncovered = discovered - covered
         assert not uncovered, (

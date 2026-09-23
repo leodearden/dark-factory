@@ -115,9 +115,23 @@ Status                Exit  Meaning and remedy
 ====================  ====  ==================================================
 
 Exit ``1`` (:data:`EXIT_RUN_FAILED`) is reserved for a run that could not
-complete at all — the store was unreachable, or the requested corpus is
-unsatisfiable. It is deliberately outside the table above so a caller can tell
-"the corpus is wrong" from "the check never ran".
+complete at all — the store was unreachable, the requested corpus is
+unsatisfiable, stdout could not be written (a downstream reader closed the
+pipe, as in ``--verify | head``; a full disk on ``> report.txt``), the manifest
+could not be written to ``--out`` (a full disk or an unwritable directory on
+the artifact path — distinct from the stdout case, which is a reader going away
+rather than the artifact failing to land), or a store defect blocked the check
+under ``--verify`` (a duplicated episode uuid or an unparseable ``created_at``
+on a live row). That last one is 1 and not 5 on purpose: the
+artifact is fine, so no verdict about it was reached at all, and the row named
+in the ``error: ...`` line is what needs fixing. Exit 1 is deliberately outside
+the table above so a caller can tell "the corpus is wrong" from "the check
+never ran".
+
+A stdout failure can strike AFTER the manifest was written, on the trailing
+``manifest: ...`` line. The exit code cannot express that, so the ``error: ...``
+line names the artifact that is on disk — read it before concluding from exit 1
+that nothing was produced.
 """
 
 from __future__ import annotations
@@ -135,6 +149,13 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+
+from shared.cli_boundary import (
+    LoudArgumentParser,
+    report_broken_pipe,
+    reset_stdout_failure_state,
+    run_cli,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -533,19 +554,22 @@ class SelectionResult:
     cell_counts: dict[tuple[str, str], int]
 
 
-def _group_by_cell(
-    population: list[EpisodeRecord],
-) -> dict[tuple[str, str], list[EpisodeRecord]]:
-    """Group *population* by stratum key, rejecting duplicate uuids.
+def _require_unique_uuids(population: list[EpisodeRecord]) -> None:
+    """Raise unless every record in *population* carries a distinct uuid.
 
-    A duplicate uuid would break the disposition accounting (one id could be
-    both selected and not-selected), so it is a loud error rather than a
-    silently deduplicated row.
+    The single home for the uniqueness rule. A duplicate uuid would break the
+    disposition accounting (one id could be both selected and not-selected),
+    so it is a loud error rather than a silently deduplicated row.
+
+    Its own function, rather than a loop inside :func:`_group_by_cell`, so the
+    rule can be applied WITHOUT the grouping. :func:`verify_manifest` needs
+    exactly this rule and nothing else, twice, and borrowing the grouper for it
+    would derive a ``stratum_key`` for every record — an ISO-8601 parse plus a
+    regex substitution each — purely to throw the grouping away. That is the
+    same redundancy :func:`_permutation_from_cells` was split out to avoid, one
+    call frame further out; see :func:`_reject_duplicate_uuids` for the caller.
     """
-    if not population:
-        raise CorpusBuildError('cannot select from an empty population')
     seen: set[str] = set()
-    cells: dict[tuple[str, str], list[EpisodeRecord]] = {}
     for record in population:
         if record.uuid in seen:
             raise CorpusBuildError(
@@ -553,6 +577,22 @@ def _group_by_cell(
                 f'disposition accounting requires unique ids'
             )
         seen.add(record.uuid)
+
+
+def _group_by_cell(
+    population: list[EpisodeRecord],
+) -> dict[tuple[str, str], list[EpisodeRecord]]:
+    """Group *population* by stratum key, rejecting duplicate uuids.
+
+    The uniqueness rule is :func:`_require_unique_uuids`, called rather than
+    re-spelled here — one home for it, and no second spelling to drift. It runs
+    first because a grouping is the first thing a duplicate would corrupt.
+    """
+    if not population:
+        raise CorpusBuildError('cannot select from an empty population')
+    _require_unique_uuids(population)
+    cells: dict[tuple[str, str], list[EpisodeRecord]] = {}
+    for record in population:
         cells.setdefault(stratum_key(record), []).append(record)
     return cells
 
@@ -1067,6 +1107,23 @@ badly are opposite situations: one says "re-run me", the other says "the
 artifact is wrong". A single non-zero for both would conflate them.
 """
 
+_WRITTEN_MANIFEST: str | None = None
+"""The manifest this run landed on disk, or ``None`` if it wrote nothing.
+
+Module state rather than a parameter because of WHERE it is read: a closed
+stdout pipe can surface at the boundary's flush
+(``shared/src/shared/cli_boundary.py::run_cli``), after :func:`main` has
+already returned, so there is no call frame left to thread it through. It exists to
+keep one specific lie out of the failure message — exit 1 means "the run could
+not complete", and an operator who reads that after the artifact was already
+written may rebuild, or treat a good artifact as absent.
+
+Reset per run by :func:`main`, alongside the shared reporter's own per-run
+state, so an in-process caller that runs the CLI twice never reports the
+previous run's path as this one's output. Read through
+:func:`_manifest_detail`, which :func:`main` installs on
+``shared/src/shared/cli_boundary.py::reset_stdout_failure_state``.
+"""
 
 @dataclass(frozen=True)
 class VerifyReport:
@@ -1212,6 +1269,52 @@ def _window_population(
     return windowed
 
 
+def _reject_duplicate_uuids(population: list[EpisodeRecord]) -> None:
+    """Raise if *population* holds the same episode uuid twice.
+
+    The second half of the same wrong-culprit pattern as
+    :func:`_window_population`, and placed beside it so a reader tracing
+    attribution finds both together. It is its own function, called from
+    OUTSIDE :func:`verify_manifest`'s manifest-attributable ``try``, because
+    the failures that clause used to cover have two different culprits:
+    :func:`select` is handed two MANIFEST values (``n`` and ``seed``) over a
+    STORE-supplied population. No manifest value can put the same node in
+    FalkorDB twice, so reporting a duplicated node as ``bad_manifest`` sends
+    the reader off to re-derive a corpus that is perfectly correct while the
+    duplicated node that actually needs deleting stays put.
+
+    The rule itself is :func:`_require_unique_uuids`, called rather than
+    re-spelled here: one home for it, and no second spelling to drift. All this
+    function adds is the attribution suffix, worded exactly as
+    :func:`_window_population` words its own, so an operator meets the same
+    sentence from either half of the pattern.
+
+    Deliberately the uniqueness rule ALONE, and not the whole of
+    :func:`_group_by_cell`, whose other two failures each belong elsewhere:
+
+    *An empty population* is, in the verify path, produced by the manifest's
+    OWN recorded window bound. It is the degenerate limit of "the window no
+    longer holds enough episodes to satisfy the recorded ``n``", which
+    :func:`allocate` already reports — correctly — as ``bad_manifest``.
+    Pre-empting it here would make the exit code discontinuous at the point a
+    shrinking window happens to reach zero. Nothing is needed to carve it out:
+    a uuid scan over an empty list is simply a no-op.
+
+    *An unplaceable* ``stratum_key`` is a store condition too, but it is one
+    :meth:`EpisodeReader.fetch_population` already rejects per row on the way
+    in, so it cannot reach here from a live graph. Borrowing the grouper to
+    cover it would buy an unreachable case at the price of a second
+    ``stratum_key`` derivation over the whole frame — see
+    :func:`_require_unique_uuids`.
+    """
+    try:
+        _require_unique_uuids(population)
+    except CorpusBuildError as exc:
+        raise CorpusBuildError(
+            f'{exc} — this is a store condition, not a defect in the manifest'
+        ) from exc
+
+
 def verify_manifest(manifest: object, population: list[EpisodeRecord]) -> VerifyReport:
     """Re-derive *manifest*'s sample from its OWN recorded criteria and compare.
 
@@ -1260,7 +1363,8 @@ def verify_manifest(manifest: object, population: list[EpisodeRecord]) -> Verify
     exits 1, "no verdict was reached". Collapsing the second into
     ``bad_manifest`` would be worse than unhelpful — it names a culprit that is
     innocent, and the reader would re-derive a perfectly good corpus while the
-    real problem stayed in the store. See :func:`_window_population`.
+    real problem stayed in the store. See :func:`_window_population` for a
+    corrupted row, and :func:`_reject_duplicate_uuids` for a duplicated one.
     """
     try:
         criteria, episodes = _read_criteria(manifest)
@@ -1268,6 +1372,18 @@ def verify_manifest(manifest: object, population: list[EpisodeRecord]) -> Verify
         return VerifyReport(status='bad_manifest', detail=str(exc))
 
     recorded_ids = [entry['uuid'] for entry in episodes]
+    # Guarded at the point `present` is BUILT, because `present` is what a
+    # duplicate corrupts: a dict comprehension silently keeps whichever row came
+    # LAST, and the hash comparison below would then hash a row the sampling
+    # frame may never have contained — a spurious hash_drift, or a real one
+    # masked, decided by nothing but the order FalkorDB returned rows in.
+    # Scoped to the manifest-named ids because those are the only uuids
+    # `present` is ever consulted for; a duplicate elsewhere cannot reach a
+    # verdict through here, and rejecting it would deny the reader an answer
+    # this function can still give. This does NOT subsume the frame check
+    # further down, which covers duplicates the manifest does not name.
+    named = set(recorded_ids)
+    _reject_duplicate_uuids([record for record in population if record.uuid in named])
     present = {record.uuid: record for record in population}
     missing = [uuid for uuid in recorded_ids if uuid not in present]
     if missing:
@@ -1302,8 +1418,20 @@ def verify_manifest(manifest: object, population: list[EpisodeRecord]) -> Verify
     # corrupted store row, and blaming the artifact for it points the reader at
     # the wrong culprit. See _window_population.
     windowed = _window_population(population, cutoff)
+    # Same reason as the comment above, for the same clause: a duplicated node
+    # is a store condition no manifest value can produce. Run over `windowed`
+    # rather than `population` — that is the frame `select` actually operates
+    # on, so this is the minimum that makes the attribution below true, and a
+    # duplicate outside the recorded window still leaves the reader a verdict.
+    # The manifest-named ids were already checked, unwindowed, above; this
+    # covers the rest of the frame, which `select` reads and that check did not.
+    _reject_duplicate_uuids(windowed)
 
     try:
+        # What still reports bad_manifest here is `allocate`'s verdict on the
+        # RECORDED n against the sampling frame — a manifest value the frame
+        # cannot satisfy. The population-integrity failures `_group_by_cell`
+        # owns were pre-run above and cannot arrive here.
         rederived = [
             record.uuid
             for record in select(windowed, criteria['n'], seed=criteria['seed']).selected
@@ -1435,7 +1563,7 @@ def _build_parser() -> argparse.ArgumentParser:
     ``--apply`` — and a test pins this flag set by EQUALITY so one cannot be
     added without a test saying so out loud.
     """
-    parser = argparse.ArgumentParser(
+    parser = LoudArgumentParser(
         # The module docstring carries RST tables that argparse's formatter
         # reflows into rubble (the memory_eval_retrieval_probe treatment); the
         # first line plus the two guarantees is what an operator needs here.
@@ -1559,6 +1687,11 @@ def _run_build(args: argparse.Namespace) -> int:
         written = write_manifest(manifest, args.out)
     except OSError as exc:
         raise CorpusBuildError(f'cannot write {args.out}: {exc}') from exc
+    # Recorded BEFORE the print that can fail on it: everything after this
+    # point is reporting, so a stdout failure from here on must not be allowed
+    # to read as "no artifact was produced". See :data:`_WRITTEN_MANIFEST`.
+    global _WRITTEN_MANIFEST  # noqa: PLW0603
+    _WRITTEN_MANIFEST = str(written)
     print(f'manifest: {written}')
     return 0
 
@@ -1651,11 +1784,34 @@ def _store_error_types() -> tuple[type[BaseException], ...]:
     return (OSError, RedisError)
 
 
+def _manifest_detail() -> str | None:
+    """The corpus-specific suffix for a stdout-failure line, or ``None``.
+
+    Installed on the shared reporter by :func:`main`. The sentence stays HERE,
+    with the caller that knows what artifact this CLI produces;
+    ``shared.cli_boundary`` supplies only the parenthesised "extra context"
+    shape. See :data:`_WRITTEN_MANIFEST` for why that context matters at all.
+    """
+    return None if _WRITTEN_MANIFEST is None else f'the manifest was written to {_WRITTEN_MANIFEST}'
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the CLI and return a process exit code."""
+    global _WRITTEN_MANIFEST  # noqa: PLW0603
+    # FIRST, before parse_args: LoudArgumentParser re-raises a failed help
+    # write from inside parse_args, so the reporter must already be armed and
+    # carrying this run's detail by then.
+    _WRITTEN_MANIFEST = None
+    reset_stdout_failure_state(detail=_manifest_detail)
     args = _build_parser().parse_args(argv)
     try:
         return _run_verify(args) if args.verify else _run_build(args)
+    except BrokenPipeError:
+        # Reports, and stops there: neutralising the process's stdout fd is the
+        # boundary's job (shared/src/shared/cli_boundary.py::_handle_broken_pipe),
+        # not something to do behind the back of a caller that asked only for
+        # an exit code — hence the report-only form.
+        return report_broken_pipe()
     except CorpusBuildError as exc:
         # A typed build/read failure, reported as a message plus a documented
         # code rather than a traceback plus exit 1-by-accident. Distinct from
@@ -1673,5 +1829,23 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_RUN_FAILED
 
 
+def _cli() -> int:
+    """Process-boundary wrapper: :func:`run_cli` around :func:`main`.
+
+    A one-line delegator by design. The rationale for everything it does —
+    why the explicit flush is not redundant with the interpreter's shutdown
+    flush, why the ``except OSError`` arm must stay below the
+    ``BrokenPipeError`` one, why ``SystemExit`` is re-raised rather than
+    normalised — lives at its new home,
+    ``shared/src/shared/cli_boundary.py::run_cli``, and is not restated here.
+
+    The NAME is kept because this module's tests drive the boundary through
+    it (``_run_cli(..., entry=_mod._cli)``); the ``__main__`` guard below
+    could call ``run_cli(main)`` directly, but that would churn the very tests
+    whose unchanged passing is the evidence this hoist preserved behaviour.
+    """
+    return run_cli(main)
+
+
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(_cli())

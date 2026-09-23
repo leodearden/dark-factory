@@ -11,42 +11,37 @@ is a plain unit test; the single I/O boundary (an injected
 """
 from __future__ import annotations
 
-import importlib.util
 import json
-import sys
-import types
+import logging
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from _fm_helpers import load_script_module
+from _store_mutation_preflight_contract import (
+    SENTINEL,
+    deny,
+    fail_closed_records,
+    neutralise_fixture,
+)
 
 from fused_memory import topic_slug as topic_slug_module
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'retro_stamp_topics.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load retro_stamp_topics.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    reflection-based decorators work correctly.
-    """
-    mod_name = 'retro_stamp_topics'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
+_mod = load_script_module(SCRIPT_PATH, mod_name='retro_stamp_topics')
 
 
-_mod = _load_module()
+_neutralise = neutralise_fixture(
+    _mod,
+    note="""``run(..., apply=True)`` runs the preflight before it scrolls (task
+    4293). This suite is deliberately MOCK-unit (an AsyncMock service, no live
+    store). ``TestRunApplyStoreMutationPreflight`` re-rigs this per test -- to
+    refuse, to record, or to pass -- so the guard's own behaviour is still
+    pinned explicitly rather than assumed away.""",
+)
 
 
 # ===========================================================================
@@ -438,7 +433,7 @@ class TestComputePatchCanonicalAndSupersedes:
 
         ``normalize_supersedes`` faithfully wraps ANY scalar, so folding this
         sentence would write ``['<prose>']`` — a one-member list whose member
-        fails ``_is_full_uuid``, turning a record that merely has a legacy
+        fails ``is_full_uuid``, turning a record that merely has a legacy
         shape into one that fails ``validate_memory_metadata`` outright.  D2
         offers the fold as a convenience; it does not license manufacturing a
         validation failure.  Leave it, name it, move on.
@@ -492,15 +487,22 @@ class TestComputePatchCanonicalAndSupersedes:
         }
 
     def test_shape_helpers_come_from_the_registry_not_a_local_copy(self):
-        """INV-5 again: the UUID predicate and the fold have one home.
+        """INV-5 again: each shape helper has one home — but not the SAME one.
 
-        Same private-helper reuse ``strip_leaked_control_keys.py`` already
-        establishes for ``_drop_reserved_control_keys``.
+        The ``supersedes`` fold is owned by ``memory_metadata``; the
+        canonical-full-UUID predicate is owned by
+        ``fused_memory.utils.validation`` (task 3132, leaf η), which
+        ``memory_metadata`` merely calls.  Pin each binding against its real
+        owner, so re-expressing either one locally fails a test instead of
+        silently forking the rule.  Same private-helper reuse
+        ``strip_leaked_control_keys.py`` already establishes for
+        ``_drop_reserved_control_keys``.
         """
         from fused_memory import memory_metadata
+        from fused_memory.utils import validation
 
         assert _mod.normalize_supersedes is memory_metadata.normalize_supersedes
-        assert _mod._is_full_uuid is memory_metadata._is_full_uuid
+        assert _mod.is_full_uuid is validation.is_full_uuid
 
 
 # ===========================================================================
@@ -1175,9 +1177,9 @@ class TestDfCuratorGateManifest:
         """
         for entry in _mod.DF_CURATOR_GATE_CLUSTERS:
             for memory_id in entry.member_memory_ids or ():
-                assert _mod._is_full_uuid(memory_id), (entry.gate_task_id, memory_id)
+                assert _mod.is_full_uuid(memory_id), (entry.gate_task_id, memory_id)
             if entry.canonical_memory_id is not None:
-                assert _mod._is_full_uuid(entry.canonical_memory_id), entry
+                assert _mod.is_full_uuid(entry.canonical_memory_id), entry
 
     def test_no_memory_id_is_claimed_by_two_gates(self):
         seen: dict[str, str] = {}
@@ -1321,9 +1323,12 @@ class TestMergePlans:
     def test_at_most_one_canonical_per_project_topic(self):
         """ε's <=1-canonical-per-topic invariant, pinned at PLAN level.
 
-        Checked before any write, because ``update_memory`` never reaches the
-        service-side uniqueness probe — so a plan that violated this would
-        reach Qdrant unchallenged.
+        Checked before any write.  ``update_memory`` does reach the
+        service-side probe as of task 3523, but that probe adjudicates one
+        write at a time against live state: it would admit the FIRST member
+        of a within-plan duplicate pair and refuse only the second, making
+        the outcome depend on iteration order.  Rejecting the pair AS a pair
+        is a plan-level property, and only this layer can see it.
         """
         targets, _ = _mod.merge_plans(
             [_plan('topic-one', canonical=C1, members=(M1,)),
@@ -1483,6 +1488,12 @@ class TestStampOne:
         assert kwargs['metadata_patch'] == {'topic': 'topic-one'}
         assert kwargs['metadata_mode'] == 'merge'
         assert kwargs['_source'] == 'retro_stamp_topics'
+        assert kwargs['agent_id'] == 'retro_stamp_topics', (
+            'a metadata_patch write routes through '
+            '_apply_memory_metadata_validation, whose census/storm keying '
+            'reads agent_id (not _source) -- an unset agent_id keys every '
+            'row from this sweep to a null agent'
+        )
         assert 'content' not in kwargs, (
             f'a content argument would re-embed the record: {kwargs}'
         )
@@ -1552,10 +1563,12 @@ class TestStampOne:
     async def test_canonical_uniqueness_is_probed_before_the_write(self):
         """The probe runs FIRST, with ε's exact filter.
 
-        ``update_memory`` never reaches
-        ``_apply_memory_metadata_validation``, so this script is the only
-        layer standing between a plan and a second ``canonical: true`` for
-        one ``(project, topic)``.  A probe issued after the write would
+        ``update_memory`` reaches ``_apply_memory_metadata_validation`` as of
+        task 3523, so this is no longer the ONLY layer standing between a
+        plan and a second ``canonical: true`` for one ``(project, topic)``.
+        It is still the strictest one: under the shipped ``enforce = false``
+        the seam warn-fails OPEN, while this script refuses.  Ordering stays
+        load-bearing either way — a probe issued after the write would
         observe the violation it was meant to prevent.
         """
         service = _service(record=_record())
@@ -2685,3 +2698,150 @@ class TestReportRenderAndCli:
         )
         assert args.json_out == '/tmp/x.json'
         assert args.md_out == '/tmp/x.md'
+
+
+# ===========================================================================
+# Tests: --apply store-mutation preflight
+# ===========================================================================
+
+class TestRunApplyStoreMutationPreflight:
+    """``--apply`` refuses to START when this process cannot write mem0's store.
+
+    Ported from ``test_sweep_toolcall_xml_leak.TestRunApplyStoreMutationPreflight``
+    (task 3686), which is the in-repo precedent for this contract.
+
+    ``run`` stamps its targets in a sequential loop through ``stamp_one``,
+    whose write sits inside a per-target ``try/except Exception`` that files
+    the failure as an ``outcome: 'error'`` row and carries on.
+    ``StoreMutationUnavailable`` subclasses ``RuntimeError``, so a probe at
+    ``stamp_one``'s own ``--apply`` gate would be swallowed by that handler:
+    ``run`` would return a normally-shaped report and a success-ish exit code
+    while every target had been attempted against a store this process cannot
+    write a history for. Only a run-wide probe ahead of the scroll bounds that.
+    """
+
+    def _service(self) -> AsyncMock:
+        """Two stampable targets, so one-probe-per-RUN is distinguishable from
+        one-probe-per-target."""
+        service = _run_service()
+        service.seed(M1, M2)
+        return service
+
+    def _gates(self) -> tuple:
+        return (
+            _gate('topic-one', members=(M1,), gate_task_id='9998'),
+            _gate('topic-two', members=(M2,), gate_task_id='9999'),
+        )
+
+    async def _run(self, service, *, apply: bool):
+        return await _mod.run(
+            service,
+            projects=('dark_factory',),
+            apply=apply,
+            calibration_rows=[],
+            registry=_registry(),
+            gate_manifest=self._gates(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
+        self, monkeypatch
+    ):
+        """The whole point: refuse to start rather than half-complete.
+
+        The refusal must PROPAGATE. Swallowed at ``stamp_one``'s gate it would
+        become N ``outcome: 'error'`` rows inside a report that otherwise looks
+        like a completed sweep.
+        """
+        deny(_mod, monkeypatch)
+        service = self._service()
+
+        with pytest.raises(
+            _mod.StoreMutationUnavailable, match=SENTINEL
+        ):
+            await self._run(service, apply=True)
+
+        service.update_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_guard_sits_before_every_backend_read(self, monkeypatch):
+        """It aborts without a single round-trip: source (1)'s canonical scroll
+        is not paid for by a run that was never going to be allowed to stamp."""
+        deny(_mod, monkeypatch)
+        service = self._service()
+
+        with pytest.raises(_mod.StoreMutationUnavailable):
+            await self._run(service, apply=True)
+
+        service.get_memories_by_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_dry_run_is_never_gated_on_write_capability(self, monkeypatch):
+        """A rehearsal withholds only the writes, so it must not require the
+        ability to write -- the report stays obtainable from anywhere, with the
+        deny still installed."""
+        deny(_mod, monkeypatch)
+        service = self._service()
+
+        report = await self._run(service, apply=False)
+
+        assert report['apply'] is False
+        assert report['outcomes'].get('would_stamp') == 2
+        service.update_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_apply_is_unchanged_when_the_preflight_passes(self, monkeypatch):
+        """Happy path: a writable environment stamps exactly as before."""
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+        service = self._service()
+
+        report = await self._run(service, apply=True)
+
+        assert report['apply'] is True
+        assert report['outcomes'].get('stamped') == 2
+        assert service.update_memory.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_the_probe_names_the_operation_being_gated(self, monkeypatch):
+        """The refusal has to be attributable in a log, so the operation string
+        identifies this script and its mutating mode -- and with TWO stampable
+        targets in the manifest it is still probed once for the RUN, not once
+        per ``stamp_one`` call."""
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            _mod, 'assert_store_mutation_allowed', lambda **kw: calls.append(kw)
+        )
+        service = self._service()
+
+        report = await self._run(service, apply=True)
+
+        assert report['outcomes'].get('stamped') == 2
+        assert len(calls) == 1, 'probed ONCE per run, not once per target'
+        assert 'retro_stamp_topics' in calls[0]['operation']
+        assert '--apply' in calls[0]['operation']
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_is_loud(self, monkeypatch, caplog):
+        """The guard site logs its own fail-closed diagnosis before raising.
+
+        Nothing downstream will: ``main`` hands ``run`` to ``asyncio.run`` with
+        no handler, so without this record the operator sees a bare traceback
+        naming an exception class and no remedy. It is emitted through a
+        logger rather than ``print`` precisely so it stays off stdout, which
+        this script reserves for its machine-read markdown/JSON report.
+        """
+        deny(_mod, monkeypatch)
+        service = self._service()
+
+        with (
+            caplog.at_level(logging.ERROR),
+            pytest.raises(_mod.StoreMutationUnavailable),
+        ):
+            await self._run(service, apply=True)
+
+        assert fail_closed_records(caplog, 'retro_stamp_topics'), (
+            'nothing else explains this traceback -- the guard site must log '
+            'the fail-closed diagnosis before raising; got: '
+            f'{[rec.getMessage() for rec in caplog.records]}'
+        )
+        service.update_memory.assert_not_awaited()

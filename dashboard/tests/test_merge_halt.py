@@ -7,36 +7,12 @@ import json
 
 import httpx
 import pytest
-
-
-def _mcp_response(inner: dict, request_id: int = 1) -> httpx.Response:
-    return httpx.Response(
-        200,
-        json={
-            'jsonrpc': '2.0',
-            'id': request_id,
-            'result': {
-                'content': [{'type': 'text', 'text': json.dumps(inner)}],
-            },
-        },
-        headers={'mcp-session-id': 'test-session-id'},
-    )
-
-
-def _init_response(request_id: int = 1) -> httpx.Response:
-    return httpx.Response(
-        200,
-        json={
-            'jsonrpc': '2.0',
-            'id': request_id,
-            'result': {
-                'protocolVersion': '2025-03-26',
-                'capabilities': {'tools': {}},
-                'serverInfo': {'name': 'test', 'version': '0.1'},
-            },
-        },
-        headers={'mcp-session-id': 'test-session-id'},
-    )
+from _dashboard_helpers import (
+    cold_session_responses,
+    mcp_init_response,
+    mcp_notify_response,
+    mcp_tool_response,
+)
 
 
 class _PerPortHandler:
@@ -69,12 +45,12 @@ class _PerPortHandler:
         method = body.get('method', '')
         request_id = body.get('id', 1)
         if method == 'initialize':
-            return _init_response(request_id)
+            return mcp_init_response(request_id)
         if method.startswith('notifications/'):
-            return httpx.Response(202, headers={'mcp-session-id': 'test-session-id'})
+            return mcp_notify_response()
         # tools/call
         inner = self.responses.get(port, {'wired': False, 'halted': False})
-        return _mcp_response(inner, request_id)
+        return mcp_tool_response(inner, request_id)
 
 
 @pytest.fixture(autouse=True)
@@ -172,17 +148,6 @@ class TestProbeOneTimeoutBudget:
     surfaces the ``timeout`` kwarg to its handler, so it cannot witness this.
     """
 
-    @staticmethod
-    def _cold_session_responses(inner: dict, url: str) -> list[httpx.Response]:
-        responses = [
-            _init_response(),
-            httpx.Response(202, headers={'mcp-session-id': 'test-session-id'}),
-            _mcp_response(inner),
-        ]
-        for resp in responses:
-            resp.request = httpx.Request('POST', f'{url.rstrip("/")}/mcp')
-        return responses
-
     async def test_budget_reaches_every_post(self):
         from unittest.mock import AsyncMock
 
@@ -190,7 +155,7 @@ class TestProbeOneTimeoutBudget:
 
         url = 'http://127.0.0.1:8100'
         mock_client = AsyncMock()
-        mock_client.post.side_effect = self._cold_session_responses(
+        mock_client.post.side_effect = cold_session_responses(
             {'wired': True, 'halted': False}, url,
         )
 

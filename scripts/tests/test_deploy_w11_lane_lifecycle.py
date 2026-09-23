@@ -3,8 +3,9 @@ against a real temp git repo standing in for `<worktree_base>` (real `git
 worktree add` lanes, so the adopt emitter's `git symbolic-ref --short -q
 HEAD` / `git rev-parse -q --verify HEAD` subprocess reads observe faithful
 git reality) and a fake `systemctl` shimmed onto PATH (observe the
-apply-mode restart delegation without a live orchestrator-dark-factory
-.service).
+apply-mode restart delegation without touching a live orchestrator unit --
+the delegation is pointed at a SYNTHETIC unit supplied via
+ORCH_RESTART_UNIT, which `exec` carries through to the delegate).
 
 Mirrors scripts/tests/test_enable_laptop_persistent_worktree.py's
 self-contained shim-setup-inside-`_run_script` pattern (callers never manage
@@ -39,16 +40,25 @@ from pathlib import Path
 
 import pytest
 
+# Importable because scripts/tests/conftest.py appends REPO_ROOT to sys.path.
+# Functions only -- importing one of that module's FIXTURES into a test module
+# would bind a module-scoped copy that shadows the conftest's session-scoped one.
+from df_pytest_isolation import assert_synthetic_units, synthetic_unit
+
 SCRIPT = Path(__file__).parent.parent / "deploy-w11-lane-lifecycle.sh"
-# A CONTRACT PIN, not a fixture input — deliberately NOT renamed to a synthetic
-# `orchestrator-fake*` name by task 3799, for the same measured reason as
-# scripts/tests/test_restart_orchestrator.py's UNIT (which carries the full
-# rationale). deploy-w11-lane-lifecycle.sh `exec`s restart-orchestrator.sh,
-# whose SERVICE constant HARDCODES "orchestrator-dark-factory.service" with no
-# env override; `_fake_systemctl` below takes no unit argument. The name flows
-# SCRIPT -> fake -> assertion, so a synthetic constant here would break
-# test_apply_restarts_orchestrator without closing anything.
-UNIT = "orchestrator-dark-factory.service"
+# SYNTHETIC (task 3950), replacing the real `orchestrator-dark-factory.service`
+# this used to be. Task 3799 left it real because both halves of its reasoning
+# held: restart-orchestrator.sh's SERVICE constant was hardcoded, and the name
+# flowed SCRIPT -> fake -> assertion. Task 3950 falsified both -- the target
+# unit is now `${ORCH_RESTART_UNIT:-...}`, and the name reaches the delegate
+# through `exec`'s environment inheritance, so `_run_script` can drive the
+# whole delegation at an inert name.
+#
+# THE PRODUCTION-DEFAULT CONTRACT this constant used to carry now lives in
+# tests/scripts/test_orchestrator_watchdog.py::test_restart_orchestrator_unit_default_matches_across_tiers
+# -- the same pointer scripts/tests/test_restart_orchestrator.py carries, so
+# the two files agree about where the real pin lives.
+UNIT = synthetic_unit("dark-factory")
 
 # orchestrator/src/orchestrator/lane_lifecycle.py:42 -- directory (a direct
 # child of worktree_base) holding every lane's durable LaneRecord.
@@ -85,8 +95,8 @@ reports ActiveState=active, simulating an unconditionally clean restart.
 restart-orchestrator.sh's OWN stale/failed-restart branches are already
 covered by test_restart_orchestrator.py -- this fake only needs the
 always-succeeds scenario to verify deploy-w11-lane-lifecycle.sh's wiring
-(that it calls restart-orchestrator.sh at all, with the right unit, AFTER
-adopt).
+(that it calls restart-orchestrator.sh at all, targeting the synthetic unit
+the fixture supplied via ORCH_RESTART_UNIT, AFTER adopt).
 """
 import json
 import os
@@ -301,7 +311,7 @@ def _read_lane_record(worktree_base, lane_name):
 # Script driver
 # ---------------------------------------------------------------------------
 
-def _run_script(worktree_base, *args, env=None):
+def _run_script(worktree_base, *args, env=None, unit=UNIT):
     """Run deploy-w11-lane-lifecycle.sh against `worktree_base` via
     subprocess.
 
@@ -316,9 +326,32 @@ def _run_script(worktree_base, *args, env=None):
     own `.lane-state/` dir, so the fake's `restart` verb can witness
     whether adopt already populated it (the step-11 ordering proof).
 
+    ORCH_RESTART_UNIT points the restart at `unit`. It is NOT consumed by
+    deploy-w11-lane-lifecycle.sh itself -- that script `exec`s
+    restart-orchestrator.sh, and `exec` preserves the environment, so the
+    variable is read by the delegate that actually calls systemctl. This is
+    therefore the PATH-shimming seam for this harness (it is also where the
+    fake is constructed), and so where the synthetic-unit guard lives rather
+    than in `_fake_systemctl`, which never sees a unit name at all.
+
+    TWO CHECKS, NOT ONE, because there are two routes to the variable and they
+    guard different properties. The pre-flight check on `unit` runs before
+    `_fake_systemctl` builds the shim, so a rejected keyword call writes
+    nothing and spawns nothing. But `env=` merges LAST (deliberately -- see
+    below), so a caller passing env={"ORCH_RESTART_UNIT": ...} bypasses the
+    keyword entirely; the second check reads the EFFECTIVE value out of
+    `full_env` immediately before the spawn, which is the only place both
+    routes have converged. Checking only the keyword would ship the guard and a
+    documented way around it.
+
     Systemctl invocations are inspectable afterward via
     `_systemctl_calls(worktree_base)`.
     """
+    # FIRST, before `_fake_systemctl` builds the shim, so a rejected call
+    # writes nothing.
+    assert_synthetic_units(
+        [unit], where="scripts/tests/test_deploy_w11_lane_lifecycle.py::_run_script"
+    )
     tmp_path = worktree_base.parent
     bin_dir, state_path = _fake_systemctl(tmp_path)
 
@@ -327,15 +360,111 @@ def _run_script(worktree_base, *args, env=None):
     full_env["FAKE_SYSTEMCTL_STATE"] = str(state_path)
     full_env["WORKTREE_DIR"] = str(worktree_base)
     full_env["FAKE_SYSTEMCTL_LANE_STATE_DIR"] = str(worktree_base / LANE_STATE_DIRNAME)
+    full_env["ORCH_RESTART_UNIT"] = unit
     full_env.setdefault("RESTART_VERIFY_TIMEOUT", "5")
+    # `env=` LAST so a per-test override still wins.
     if env:
         full_env.update(env)
+    # SECOND, on the EFFECTIVE value: `env=` can overwrite ORCH_RESTART_UNIT
+    # after the pre-flight check, and only this one sits between every route
+    # and the subprocess (and so the `exec`d delegate that calls systemctl).
+    assert_synthetic_units(
+        [full_env["ORCH_RESTART_UNIT"]],
+        where=(
+            "scripts/tests/test_deploy_w11_lane_lifecycle.py::_run_script "
+            "(effective ORCH_RESTART_UNIT, after the env= merge)"
+        ),
+    )
     return subprocess.run(
         ["bash", str(SCRIPT), *args],
         env=full_env,
         capture_output=True,
         text=True,
         timeout=30,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fixture-unit-name containment (task 3799, extended to this harness by 3950).
+# ---------------------------------------------------------------------------
+
+
+def test_run_script_rejects_a_real_unit_name(tmp_path):
+    """`_run_script` must refuse a genuinely installed unit name.
+
+    TWO COPIES, one per root: scripts/tests/ and tests/scripts/ cannot import
+    each other's test modules, so each root must prove its OWN seam validates
+    -- a green test in one says nothing about the other's. What they share is
+    the rule itself, df_pytest_isolation.assert_synthetic_units. The siblings
+    are test_fake_systemctl_rejects_a_real_unit_name (restart-all), this
+    file's twin in scripts/tests/test_restart_orchestrator.py, and
+    test_boundary_fake_systemctl_rejects_a_real_unit_name (watchdog).
+
+    THIS FILE HAS AN EXTRA HOP: deploy-w11-lane-lifecycle.sh does not call
+    systemctl itself -- it `exec`s restart-orchestrator.sh, and `exec`
+    replaces the process image while PRESERVING the environment. So
+    ORCH_RESTART_UNIT set here in `_run_script` reaches the delegate that
+    actually issues the restart, which is why the guard belongs at this seam
+    and why no knob had to be re-plumbed through the outer script.
+
+    `--check` with an EMPTY lane list so the guard is proven to fire BEFORE
+    any subprocess work: the rejection must happen at construction, not after
+    a script run.
+    """
+    worktree_base = _build_worktree_base(tmp_path, [])
+    with pytest.raises(pytest.fail.Exception) as excinfo:
+        _run_script(worktree_base, "--check", unit="orchestrator-dark-factory.service")
+    message = str(excinfo.value)
+    assert "orchestrator-dark-factory.service" in message, message
+    assert "_run_script" in message, message
+    # The write-nothing/spawn-nothing property the pre-flight placement exists
+    # FOR, asserted rather than merely claimed: were the check ever moved below
+    # `_fake_systemctl(...)` or below the spawn, the message assertions above
+    # would still pass while a real unit name had already been shimmed onto
+    # PATH. `_fake_systemctl` is the sole creator of <tmp_path>/bin here
+    # (`_build_worktree_base` makes only origin/ and worktrees/), so its
+    # absence is a direct ordering proof.
+    assert not (tmp_path / "bin").exists(), (
+        "a rejected call must build no PATH shim -- the guard belongs BEFORE "
+        "`_fake_systemctl`"
+    )
+    assert _systemctl_calls(worktree_base) == [], (
+        "a rejected call must spawn nothing; got "
+        f"{_systemctl_calls(worktree_base)!r}"
+    )
+
+
+def test_run_script_rejects_a_real_unit_name_via_env(tmp_path):
+    """The `env=` route must be guarded too, not just the `unit=` keyword.
+
+    `_run_script` merges `env=` LAST so a per-test override still wins, which
+    makes env={"ORCH_RESTART_UNIT": ...} a SANCTIONED route past the pre-flight
+    `unit` check rather than a hypothetical one. Only the effective-value
+    check, read out of `full_env` immediately before the spawn, stands between
+    it and the `exec`d delegate that actually issues the restart. The twin of
+    this test lives in scripts/tests/test_restart_orchestrator.py -- two copies
+    because the two roots cannot import each other's test modules.
+
+    The shim IS built by the time this fires (`_fake_systemctl` runs before the
+    env dict), so the property asserted is the spawn-nothing one, not the
+    write-nothing one above.
+    """
+    worktree_base = _build_worktree_base(tmp_path, [])
+    with pytest.raises(pytest.fail.Exception) as excinfo:
+        _run_script(
+            worktree_base,
+            "--check",
+            env={"ORCH_RESTART_UNIT": "orchestrator-dark-factory.service"},
+        )
+    message = str(excinfo.value)
+    assert "orchestrator-dark-factory.service" in message, message
+    assert "_run_script" in message, message
+    # Names the SECOND check specifically, so this cannot pass by accidentally
+    # tripping the pre-flight one.
+    assert "effective" in message, message
+    assert _systemctl_calls(worktree_base) == [], (
+        "a rejected call must spawn nothing; got "
+        f"{_systemctl_calls(worktree_base)!r}"
     )
 
 

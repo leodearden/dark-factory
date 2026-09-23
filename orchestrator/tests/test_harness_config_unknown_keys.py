@@ -397,7 +397,7 @@ async def test_reload_config_surfaces_ignored_keys(tmp_path: Path, monkeypatch):
     fresh = OrchestratorConfig(project_root=tmp_path)
     fresh._unknown_key_census = [ConfigUnknownKey('warm_lane_pool', 'git.warm_lane_pool')]
     fresh._ignored_key_census = [
-        ConfigIgnoredKey('cpu_governance.weights', 'allowlist'),
+        ConfigIgnoredKey('cpu_governance.weights', 'allowlist', 'read by scripts/x.sh'),
         ConfigIgnoredKey('x_custom', 'reserved_prefix'),
     ]
 
@@ -410,6 +410,14 @@ async def test_reload_config_surfaces_ignored_keys(tmp_path: Path, monkeypatch):
     assert ignored == {
         'cpu_governance.weights': 'allowlist',
         'x_custom': 'reserved_prefix',
+    }
+    # The operator's justification rides along for free via ``ik._asdict()``
+    # (task 3395) — pinned here so a future refactor of the reload report
+    # cannot silently drop the one field that makes an excused key auditable.
+    notes = {d['path']: d['note'] for d in report['ignored_config_keys']}
+    assert notes == {
+        'cpu_governance.weights': 'read by scripts/x.sh',
+        'x_custom': None,
     }
     # The live config carries the fresh ignored census too (apply_reload copies
     # only model_fields, so the PrivateAttr needs an explicit hand-off).

@@ -4,11 +4,13 @@ Covers:
   - ReconciliationConfig sandbox field defaults (S3/S4)
   - sandbox_guard.resolve_recon_sandbox_wrap shape and behaviour (S5/S6)
   - fail-closed and bwrap-fallback paths (S7/S8)
+  - config-dir containment: the INV-1 machine check (task 4003)
 """
 
 from __future__ import annotations
 
 import functools
+import logging
 import os
 import shutil
 import socket
@@ -29,6 +31,7 @@ from fused_memory.config.schema import ReconciliationConfig
 try:
     from fused_memory.reconciliation.sandbox_guard import (
         RemediationSandboxUnavailable,
+        _writable_roots,
         resolve_recon_sandbox_wrap,
     )
     _SANDBOX_GUARD_AVAILABLE = True
@@ -308,4 +311,553 @@ class TestSandboxGuardFailClosedAndBwrap:
         )
         assert call_kwargs.kwargs.get('writable_extras') == ['/e'], (
             f'writable_extras should forward ["/e"]; got {call_kwargs.kwargs}'
+        )
+
+
+@pytest.mark.skipif(not _SANDBOX_GUARD_AVAILABLE, reason='sandbox_guard not yet implemented')
+class TestConfigDirContainment:
+    """The per-run ``CLAUDE_CONFIG_DIR`` must be inside the writable set (task 4003).
+
+    INV-1 ``contracts-machine-checked``. Before this task the capability
+    envelope ("the config dir is writable") lived only in a prose comment in
+    ``landlock_exec.py`` plus an empty-by-default config list — and the mismatch
+    between comment and ruleset was discovered by failure, three weeks late.
+    These tests convert that prose into an enforced check: if a future edit
+    drops the computed grant, ``resolve_recon_sandbox_wrap`` refuses to launch
+    instead of silently producing a transcript-less stage.
+
+    Containment is asserted against the roots BOTH backends grant WITH THE SAME
+    MEANING (``<cwd>/.task`` and each existing extra — verified at
+    landlock.py:69-108 and sandbox.py:56-101), so the invariant does not depend
+    on which backend wins resolution. ``/tmp`` is pointedly absent from that
+    list: ``landlock_exec`` grants the host ``/tmp`` blanket, but
+    ``build_bwrap_command`` mounts a fresh ``--tmpfs`` over it, so "under /tmp"
+    means two different things per backend and cannot be a root.
+    """
+
+    def test_config_dir_outside_writable_set_fails_closed(self, tmp_path: Path) -> None:
+        """A config dir outside every writable root raises RemediationSandboxUnavailable.
+
+        This is the regression that would have caught the 2026-07-18 breakage on
+        day one: `<data_dir>/recon-config/claude-config-<run_id>` is neither
+        `<cwd>/.task` nor an extra, so the grant was absent and the CLI's
+        transcript writes were denied — silently.
+        """
+        orphan = Path('/var/tmp/recon-config/claude-config-x')
+        with patch(
+            'orchestrator.agents.landlock.is_landlock_available',
+            return_value=True,
+        ), pytest.raises(RemediationSandboxUnavailable) as excinfo:  # type: ignore[possibly-unbound]
+            resolve_recon_sandbox_wrap(  # type: ignore[possibly-unbound]
+                tmp_path, [], config_dir=orphan,
+            )
+
+        msg = str(excinfo.value)
+        # The operator's only signal — a bare exception here halts recon, so the
+        # message must name both the offending path and the knob to turn.
+        assert str(orphan) in msg, (
+            f'Error must name the offending config dir {str(orphan)!r}; got {msg!r}'
+        )
+        assert 'sandbox_recon_writable_extras' in msg, (
+            f'Error must name the config key an operator can act on; got {msg!r}'
+        )
+
+    def test_config_dir_inside_extras_is_accepted(self, tmp_path: Path) -> None:
+        """A config dir passed in writable_extras is accepted and actually granted."""
+        cfg = tmp_path / 'recon-config' / 'claude-config-x'
+        cfg.mkdir(parents=True)
+
+        with patch(
+            'orchestrator.agents.landlock.is_landlock_available',
+            return_value=True,
+        ):
+            wrap = resolve_recon_sandbox_wrap(  # type: ignore[possibly-unbound]
+                tmp_path, [str(cfg)], config_dir=cfg,
+            )
+            wrapped = wrap(['claude', '--print'])
+
+        assert callable(wrap), f'Expected a callable; got {wrap!r}'
+        writable_vals = [
+            wrapped[i + 1] for i, tok in enumerate(wrapped) if tok == '--writable'
+        ]
+        assert str(cfg) in writable_vals, (
+            f'Accepted config dir must actually appear in the argv grants; '
+            f'got {writable_vals!r}'
+        )
+
+    def test_config_dir_under_task_dir_is_accepted(self, tmp_path: Path) -> None:
+        """`<cwd>/.task/...` is accepted with no extras — both backends grant `.task`.
+
+        The `_writable_roots` assertion is what makes this leaf mean something:
+        acceptance alone would not distinguish "the `.task` root matched" from
+        "some other root did". Asserting the `.task` root is present AND contains
+        the config dir pins the grant this leaf is named for.
+        """
+        cfg = tmp_path / '.task' / 'claude-config-x'
+        cfg.mkdir(parents=True)
+
+        with patch(
+            'orchestrator.agents.landlock.is_landlock_available',
+            return_value=True,
+        ):
+            wrap = resolve_recon_sandbox_wrap(  # type: ignore[possibly-unbound]
+                tmp_path, [], config_dir=cfg,
+            )
+
+        assert callable(wrap), f'Expected a callable; got {wrap!r}'
+
+        task_root = os.path.realpath(str(tmp_path / '.task'))
+        roots = _writable_roots(tmp_path, [])  # type: ignore[possibly-unbound]
+        assert task_root in roots, (
+            f'`<cwd>/.task` must be one of the writable roots; got {roots!r}'
+        )
+        assert os.path.realpath(str(cfg)).startswith(task_root + os.sep), (
+            f'{cfg} must be inside the .task root {task_root}'
+        )
+
+    def test_config_dir_under_tmp_requires_an_explicit_extra(self) -> None:
+        """A /tmp config dir is NOT contained by virtue of living under /tmp.
+
+        ``landlock_exec`` grants the host ``/tmp`` blanket, but
+        ``build_bwrap_command`` mounts ``--tmpfs /tmp`` BEFORE its binds: under
+        bwrap the sandbox's ``/tmp`` is a fresh EMPTY tmpfs. A config dir there
+        that is not also bound via ``writable_extras`` therefore loses its
+        pre-spawn ``.credentials.json`` and writes its session JSONL into a tmpfs
+        the parent can never read — ``count_transcript_turns`` None forever, the
+        2026-07-18 defect reproduced exactly, while the check that exists to
+        catch it says PASS. Accepting a bare ``/tmp`` config dir would bake that
+        false pass in as a pinned expectation.
+
+        The extras grant is what both backends honour identically (bwrap binds it
+        over the tmpfs), so the same dir named as an extra IS accepted — which is
+        what ``run_stage_via_cli`` always does.
+        """
+        cfg = Path(tempfile.mkdtemp(prefix='recon-cfg-', dir='/tmp'))
+        try:
+            with patch(
+                'orchestrator.agents.landlock.is_landlock_available',
+                return_value=True,
+            ):
+                with pytest.raises(RemediationSandboxUnavailable):  # type: ignore[possibly-unbound]
+                    resolve_recon_sandbox_wrap(  # type: ignore[possibly-unbound]
+                        cfg, [], config_dir=cfg,
+                    )
+
+                wrap = resolve_recon_sandbox_wrap(  # type: ignore[possibly-unbound]
+                    cfg, [str(cfg)], config_dir=cfg,
+                )
+
+            assert callable(wrap), f'Expected a callable; got {wrap!r}'
+            wrapped = wrap(['claude', '--print'])
+            writable_vals = [
+                wrapped[i + 1] for i, tok in enumerate(wrapped) if tok == '--writable'
+            ]
+            assert str(cfg) in writable_vals, (
+                f'The config dir must be granted via extras, not via a /tmp '
+                f'blanket; got {writable_vals!r}'
+            )
+        finally:
+            shutil.rmtree(cfg, ignore_errors=True)
+
+    def test_task_root_counts_even_when_it_does_not_exist_yet(self, tmp_path: Path) -> None:
+        """`<cwd>/.task` is a root whether or not it exists — the backends create it.
+
+        The existence filter is correct for EXTRAS (``landlock_exec._add_path``
+        silently skips a missing path; ``build_bwrap_command`` warns and skips)
+        but wrong for ``.task``: both backends ``os.makedirs(..., exist_ok=True)``
+        it immediately before granting it, so a not-yet-created ``.task`` is not a
+        vacuous grant. Filtering it out would fail-CLOSED on a fresh cwd — and
+        because ``run_stage_via_cli`` treats ``RemediationSandboxUnavailable`` as
+        fatal, EVERY reconciliation stage would return an error StageResult.
+        Relocating the recon config dir under ``<cwd>/.task/`` is the alternative
+        the PRD's open question 5 names, so this is a live foot-gun, not a
+        hypothetical.
+        """
+        fresh_cwd = tmp_path / 'never-initialised'
+        fresh_cwd.mkdir()
+        cfg = fresh_cwd / '.task' / 'claude-config-x'
+        assert not cfg.parent.exists(), 'precondition: .task must not exist yet'
+
+        task_root = os.path.realpath(str(cfg.parent))
+        roots = _writable_roots(fresh_cwd, [])  # type: ignore[possibly-unbound]
+        assert task_root in roots, (
+            f'`<cwd>/.task` must be a writable root even before it is created; '
+            f'got {roots!r}'
+        )
+
+        with patch(
+            'orchestrator.agents.landlock.is_landlock_available',
+            return_value=True,
+        ):
+            wrap = resolve_recon_sandbox_wrap(  # type: ignore[possibly-unbound]
+                fresh_cwd, [], config_dir=cfg,
+            )
+
+        assert callable(wrap), f'Expected a callable; got {wrap!r}'
+
+    def test_config_dir_none_skips_check(self, tmp_path: Path) -> None:
+        """config_dir=None returns a wrap and never raises (back-compat).
+
+        The generic/non-recon call sites pass no config dir; they must keep
+        today's behaviour exactly.
+        """
+        with patch(
+            'orchestrator.agents.landlock.is_landlock_available',
+            return_value=True,
+        ):
+            wrap = resolve_recon_sandbox_wrap(tmp_path, [])  # type: ignore[possibly-unbound]
+
+        assert callable(wrap), f'Expected a callable; got {wrap!r}'
+
+    def test_extra_that_does_not_exist_does_not_satisfy_containment(
+        self, tmp_path: Path,
+    ) -> None:
+        """A grant naming a non-existent dir is vacuous, so it must not satisfy the check.
+
+        ``landlock_exec._add_path`` returns SILENTLY for a path that does not
+        exist — no rule is added and no error is raised. A containment check
+        that trusted such an extra would pass while the write still failed at
+        runtime, reproducing the exact silent-degrade class this check exists to
+        end.
+        """
+        # NOT under tmp_path: a ghost root there would sit under the `.task` root
+        # only if it were spelled `<cwd>/.task/...`, but keeping it wholly outside
+        # every root makes the leaf independent of that detail. Nothing is ever
+        # created here, so no /var/tmp write permission is required.
+        ghost_root = Path(f'/var/tmp/df-4003-never-created-{uuid.uuid4().hex}')
+        cfg = ghost_root / 'claude-config-x'
+        assert not ghost_root.exists(), 'precondition: the root must not exist on disk'
+
+        with patch(
+            'orchestrator.agents.landlock.is_landlock_available',
+            return_value=True,
+        ), pytest.raises(RemediationSandboxUnavailable):  # type: ignore[possibly-unbound]
+            resolve_recon_sandbox_wrap(  # type: ignore[possibly-unbound]
+                tmp_path, [str(ghost_root)], config_dir=cfg,
+            )
+
+    @pytest.mark.skipif(
+        not is_landlock_available(),
+        reason='landlock not supported on this kernel',
+    )
+    @pytest.mark.skipif(_skip_var_tmp(), reason=_VAR_TMP_SKIP_REASON)
+    def test_enforcement_per_run_config_dir_writable_sibling_denied(self) -> None:
+        """Real kernel: this run's config dir is writable, a sibling run's is NOT.
+
+        The credential-isolation invariant proved against an actual Landlock
+        ruleset rather than an argv shape. /var/tmp (not /tmp) is mandatory —
+        /tmp is blanket-writable in both backends, which would make the
+        sibling-denied half of this test vacuous.
+
+        The denial probes must be genuine CONTENT writes. ``touch`` on a file
+        that already exists is NOT one: coreutils falls back to ``utimensat()``
+        when the ``open(O_WRONLY)`` is refused, and Landlock has no access right
+        governing timestamps at all — its FS bits cover EXECUTE / WRITE_FILE /
+        READ_FILE / READ_DIR / REMOVE_* / MAKE_* / REFER / TRUNCATE / IOCTL_DEV
+        and nothing else. A ``touch``-the-credentials probe therefore succeeds
+        under *every* ruleset, including a correct one, and pins nothing.
+        """
+        base = Path(tempfile.mkdtemp(prefix='recon-cfgdir-test-', dir='/var/tmp'))
+        try:
+            repo = base / 'repo'
+            repo.mkdir()
+            cfg_base = base / 'recon-config'
+            mine = cfg_base / 'claude-config-mine'
+            other = cfg_base / 'claude-config-other'
+            mine.mkdir(parents=True)
+            other.mkdir(parents=True)
+            # A real credential file in the sibling: what must stay unwritable.
+            (other / '.credentials.json').write_text('{"token": "sibling"}')
+
+            inner = [
+                '/bin/sh', '-c',
+                (
+                    # `mine` half: s.jsonl does NOT exist yet, so this is a real
+                    # O_CREAT (MAKE_REG), the same right the CLI needs to lay
+                    # down its session transcript.
+                    f'mkdir -p {mine}/projects && touch {mine}/projects/s.jsonl '
+                    f'&& echo mine_ok; '
+                    # Overwriting the bytes (WRITE_FILE|TRUNCATE) — the exact
+                    # capability that must not exist. See the docstring for why
+                    # this is not spelled `touch`.
+                    f'echo stolen > {other}/.credentials.json 2>/dev/null '
+                    f'|| echo sibling_write_denied; '
+                    # And no NEW file in a sibling's dir either (MAKE_REG).
+                    f'touch {other}/planted 2>/dev/null || echo sibling_create_denied'
+                ),
+            ]
+            wrap = resolve_recon_sandbox_wrap(  # type: ignore[possibly-unbound]
+                repo, [str(mine)], config_dir=mine,
+            )
+            result = subprocess.run(
+                wrap(inner), capture_output=True, text=True, timeout=15,
+            )
+
+            assert (mine / 'projects' / 's.jsonl').exists(), (
+                f'This run\'s config dir must be writable — that transcript write '
+                f'is the whole point. stdout={result.stdout!r} stderr={result.stderr!r}'
+            )
+            assert 'mine_ok' in result.stdout, f'stdout={result.stdout!r}'
+            assert 'sibling_write_denied' in result.stdout, (
+                f'A sibling run\'s .credentials.json must stay read-only. '
+                f'stdout={result.stdout!r} stderr={result.stderr!r}'
+            )
+            assert 'sibling_create_denied' in result.stdout, (
+                f'A sibling run\'s config dir must not accept new files. '
+                f'stdout={result.stdout!r} stderr={result.stderr!r}'
+            )
+            # The ground truth behind both probes: the credential bytes are intact.
+            assert (other / '.credentials.json').read_text() == '{"token": "sibling"}', (
+                'A sibling run\'s OAuth credentials were modified through the '
+                'sandbox — the credential-isolation invariant is broken.'
+            )
+            assert not (other / 'planted').exists(), (
+                'A file was created inside a sibling run\'s config dir.'
+            )
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+
+@pytest.mark.skipif(not _SANDBOX_GUARD_AVAILABLE, reason='sandbox_guard not yet implemented')
+class TestRelativePathContainment:
+    """Containment is undecidable for a RELATIVE path — refuse it (task 4592).
+
+    Every ``os.path.realpath`` in the module under test runs in the PARENT's cwd,
+    but the two things the verdict is about — ``CLAUDE_CONFIG_DIR`` and the
+    ``--writable`` grant tokens — are resolved in the CHILD's. So a relative
+    string names one directory to the verifier and a different one to the
+    grantor, and the check would report PASS while the kernel denies every
+    session-JSONL write: ``count_transcript_turns`` None forever, the liveness
+    watchdog inert, every cap-retry force-freshing instead of resuming. That is
+    the 2026-07-18 -> 2026-08-11 silent-transcript-loss defect the fail-closed
+    check (task 4003) exists to make impossible, re-entering through the
+    relative-path door.
+
+    Full mechanism and deployment story (which cwd comes from where, and why the
+    two agree in production today): ``fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py::recon_config_base_dir``.
+    """
+
+    def test_relative_config_dir_fails_closed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A relative config_dir raises instead of resolving against the parent's cwd.
+
+        Constructs the exact FALSE PASS: ``_writable_roots`` realpaths ``'relcfg'``
+        to ``<parent_cwd>/relcfg`` and ``_assert_config_dir_writable`` realpaths the
+        config dir to the same string, so containment passes — while the child,
+        spawned with ``cwd=child_root``, would resolve ``CLAUDE_CONFIG_DIR='relcfg'``
+        to ``<child_root>/relcfg``, a directory nothing ever granted.
+        """
+        parent_cwd = tmp_path / 'parent'
+        child_root = tmp_path / 'child'
+        parent_cwd.mkdir()
+        child_root.mkdir()
+        (parent_cwd / 'relcfg').mkdir()
+
+        monkeypatch.chdir(parent_cwd)
+        with patch(
+            'orchestrator.agents.landlock.is_landlock_available',
+            return_value=True,
+        ), pytest.raises(RemediationSandboxUnavailable) as excinfo:  # type: ignore[possibly-unbound]
+            resolve_recon_sandbox_wrap(  # type: ignore[possibly-unbound]
+                child_root, ['relcfg'], config_dir=Path('relcfg'),
+            )
+
+        msg = str(excinfo.value)
+        # The operator's only signal — a raise here halts every recon stage, so
+        # the message must be actionable, not a bare refusal.
+        assert 'relcfg' in msg, (
+            f'Error must name the offending config dir; got {msg!r}'
+        )
+        assert 'absolute' in msg.lower(), (
+            f'Error must say the path has to be absolute — that is the remedy; '
+            f'got {msg!r}'
+        )
+
+    def test_absolute_config_dir_verdict_is_cwd_independent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The positive half: an absolute verdict does not depend on where the parent stands.
+
+        Must stay green for the whole task — the refusal above is scoped to
+        RELATIVITY, not a blanket narrowing of what counts as contained.
+        """
+        parent_cwd = tmp_path / 'parent'
+        child_root = tmp_path / 'child'
+        parent_cwd.mkdir()
+        child_root.mkdir()
+        cfg = parent_cwd / 'relcfg'
+        cfg.mkdir()
+
+        for standing_in in (parent_cwd, child_root):
+            monkeypatch.chdir(standing_in)
+            with patch(
+                'orchestrator.agents.landlock.is_landlock_available',
+                return_value=True,
+            ):
+                wrap = resolve_recon_sandbox_wrap(  # type: ignore[possibly-unbound]
+                    child_root, [str(cfg)], config_dir=cfg,
+                )
+            assert callable(wrap), (
+                f'An absolute config dir must be accepted from any parent cwd; '
+                f'refused while standing in {standing_in}'
+            )
+
+    def test_relative_writable_extra_is_not_a_writable_root(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Face B: a relative EXTRA must not satisfy containment either.
+
+        This survives the config-dir fix and reproduces the identical false PASS.
+        ``_writable_roots`` computes each root with ``os.path.realpath`` in the
+        PARENT's cwd, but the resulting ``--writable <path>`` token is consumed by
+        ``landlock-exec`` / ``bwrap`` inside the wrapped argv, which
+        ``shared/src/shared/cli_invoke.py::_run_subprocess`` spawns with
+        ``cwd=str(cwd)`` — the CHILD's cwd. So a relative extra grants a DIFFERENT
+        directory than the one this function verified: a vacuous grant, the same
+        class as the existing "extra that does not exist" filter and rejected for
+        the same reason.
+        """
+        parent_cwd = tmp_path / 'parent'
+        parent_cwd.mkdir()
+        (parent_cwd / 'relextra').mkdir()
+
+        monkeypatch.chdir(parent_cwd)
+        roots = _writable_roots(tmp_path / 'child', ['relextra'])  # type: ignore[possibly-unbound]
+
+        assert os.path.realpath(str(parent_cwd / 'relextra')) not in roots, (
+            f'A relative extra must not become a writable root — the parent '
+            f'resolved it here, but the child would resolve it under its own '
+            f'cwd; got {roots!r}'
+        )
+        # Control: the unconditional `<cwd>/.task` root is untouched by the filter.
+        assert os.path.realpath(str(tmp_path / 'child' / '.task')) in roots, (
+            f'`<cwd>/.task` must remain a writable root; got {roots!r}'
+        )
+
+    def test_absolute_config_dir_inside_a_relative_extra_fails_closed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The end-to-end consequence: a perfectly ABSOLUTE config dir is not saved
+        by living under a relative extra.
+
+        Step 4's assertion is satisfied (the config dir is absolute), so this leaf
+        isolates Face B exactly: the ONLY thing standing between the config dir
+        and containment is the relative extra it sits under. That extra is not
+        counted as a writable root, so containment fails and
+        ``resolve_recon_sandbox_wrap`` raises.
+
+        Failing closed here is the point. The alternative — counting the extra —
+        would have the parent judge the config dir contained by a root the child
+        never actually grants, so every CLI write would be denied while the
+        fail-closed check reported PASS.
+        """
+        parent_cwd = tmp_path / 'parent'
+        parent_cwd.mkdir()
+        config_dir = parent_cwd / 'relextra' / 'claude-config-x'
+        config_dir.mkdir(parents=True)
+
+        monkeypatch.chdir(parent_cwd)
+        with patch(
+            'orchestrator.agents.landlock.is_landlock_available',
+            return_value=True,
+        ), pytest.raises(RemediationSandboxUnavailable):  # type: ignore[possibly-unbound]
+            resolve_recon_sandbox_wrap(  # type: ignore[possibly-unbound]
+                tmp_path / 'child', ['relextra'], config_dir=config_dir,
+            )
+
+    def test_relative_writable_extra_is_logged(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Dropping an operator-configured grant must be LOUD.
+
+        Silently discarding it is exactly the fail-soft this module was written to
+        end — its own docstring says "a comment claiming the dir was writable
+        existed the entire time; only a check can hold an invariant a comment
+        cannot". An operator who configured sandbox_recon_writable_extras and got
+        no grant needs to be told which entry was dropped and why.
+        """
+        parent_cwd = tmp_path / 'parent'
+        parent_cwd.mkdir()
+        (parent_cwd / 'relextra').mkdir()
+
+        monkeypatch.chdir(parent_cwd)
+        with caplog.at_level(
+            logging.WARNING, logger='fused_memory.reconciliation.sandbox_guard',
+        ):
+            _writable_roots(tmp_path / 'child', ['relextra'])  # type: ignore[possibly-unbound]
+
+        assert any('relextra' in rec.getMessage() for rec in caplog.records), (
+            f'Dropping a relative extra must emit a warning naming it; got '
+            f'{[rec.getMessage() for rec in caplog.records]!r}'
+        )
+
+    def test_a_relative_extra_is_dropped_from_the_grant_not_only_the_verdict(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The verification set and the grant set must not disagree.
+
+        ``_writable_roots`` refusing to COUNT a relative extra is only half the
+        invariant. ``resolve_recon_sandbox_wrap`` also builds the argv, and
+        ``build_landlock_command`` appends each extra VERBATIM — it does no
+        parent-side resolution — so forwarding the unfiltered list would still
+        emit a ``--writable relextra`` token that ``landlock-exec`` honours,
+        resolved in the CHILD's frame. The parent would then be deliberately
+        blind to a grant the child does make, and the drop warning would be a
+        lie about what happened.
+
+        Asserts on the real argv rather than a patched builder: the token is the
+        artefact that actually crosses the process boundary.
+        """
+        parent_cwd = tmp_path / 'parent'
+        child_root = tmp_path / 'child'
+        parent_cwd.mkdir()
+        child_root.mkdir()
+        (parent_cwd / 'relextra').mkdir()
+        absextra = tmp_path / 'absextra'
+        absextra.mkdir()
+
+        monkeypatch.chdir(parent_cwd)
+        with patch(
+            'orchestrator.agents.landlock.is_landlock_available',
+            return_value=True,
+        ):
+            wrap = resolve_recon_sandbox_wrap(  # type: ignore[possibly-unbound]
+                child_root, ['relextra', str(absextra)],
+            )
+        wrapped = wrap(['claude', '--print'])
+
+        writable_vals = [
+            wrapped[i + 1] for i, tok in enumerate(wrapped) if tok == '--writable'
+        ]
+        assert 'relextra' not in writable_vals, (
+            f'A relative extra must not reach the backend as a --writable token '
+            f'— landlock-exec would resolve it in the child frame, granting a '
+            f'directory the parent never verified; got {writable_vals!r}'
+        )
+        # Control: the absolute sibling is still granted, so the filter is
+        # scoped to relativity and did not narrow the grant wholesale.
+        assert str(absextra) in writable_vals, (
+            f'An absolute extra must still be granted; got {writable_vals!r}'
+        )
+
+    def test_absolute_extra_is_still_a_writable_root(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Control: the new filter is scoped to relativity, not a blanket narrowing.
+
+        An existing ABSOLUTE extra still becomes a root — including from a parent
+        cwd that has nothing to do with it.
+        """
+        parent_cwd = tmp_path / 'parent'
+        parent_cwd.mkdir()
+        extra = tmp_path / 'absextra'
+        extra.mkdir()
+
+        monkeypatch.chdir(parent_cwd)
+        roots = _writable_roots(tmp_path / 'child', [str(extra)])  # type: ignore[possibly-unbound]
+
+        assert os.path.realpath(str(extra)) in roots, (
+            f'An existing absolute extra must remain a writable root; got {roots!r}'
         )

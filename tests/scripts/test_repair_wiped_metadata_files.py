@@ -32,13 +32,24 @@ import subprocess
 import sys
 from pathlib import Path
 
-# Both modules live in <repo>/scripts, which tests/scripts/conftest.py puts on
-# sys.path at collection time. As of task 3456, scripts/ and scripts/legibility/
-# are ALSO listed in [tool.pyright] extraPaths in the root pyproject.toml — a
-# precondition for the `scripts` module's own declared type gate — so these
-# imports resolve statically too and need no ignore. This comment previously
-# asserted the opposite ("deliberately absent from extraPaths"); 3456 falsified
-# it. Same correction in tests/scripts/test_migrate_metadata_modules_to_files.py.
+# All three modules live in <repo>/scripts, which tests/scripts/conftest.py puts
+# on sys.path at collection time. As of task 3456, scripts/ and
+# scripts/legibility/ are ALSO listed in [tool.pyright] extraPaths in the root
+# pyproject.toml — a precondition for the `scripts` module's own declared type
+# gate — so these imports resolve statically too and need no ignore. This comment
+# previously asserted the opposite ("deliberately absent from extraPaths"); 3456
+# falsified it. Same correction in
+# tests/scripts/test_migrate_metadata_modules_to_files.py.
+#
+# _task_db_scan is imported by the TEST only, never by
+# repair_wiped_metadata_files.py itself — see the lockstep guard at the bottom of
+# this file for why that asymmetry is deliberate.
+from _task_db_scan import (
+    AUDIT_EXIT_FINDINGS,
+    AUDIT_EXIT_NO_ROOT,
+    AUDIT_EXIT_NOTHING_AUDITED,
+    AUDIT_EXIT_OK,
+)
 from audit_wiped_metadata_files import (
     CLEAN_MERGE_SHA,
     CONFIRMED_NULL_SHA_DONE_PATH,
@@ -470,13 +481,16 @@ def test_classify_live_task_agrees_with_the_audit_on_a_whitespace_only_entry():
 #
 # `ok` mirrors fused_memory.middleware.task_interceptor.
 # interceptor_write_succeeded (fused-memory/src/fused_memory/middleware/
-# task_interceptor.py:5829-5868) — see classify_reply's own docstring
-# (scripts/repair_wiped_metadata_files.py) for why this is a transcribed
-# mirror, not an import, and for the full rule. The canonical predicate's own
-# contract is independently pinned at fused-memory/tests/test_task_interceptor.py:
-# 10863+ ("task-1184: interceptor_write_succeeded helper contract") —
-# auditing one copy for drift means reading both, since neither can change
-# silently without its OWN table going red.
+# task_interceptor.py:5829-5868) — but NOT by transcribing it. As of task 4608
+# classify_reply DELEGATES the whole `ok` decision to
+# scripts/migrate_metadata_modules_to_files.py::write_failure_reason and only
+# wraps the returned `str | None` in a ReplyVerdict; see classify_reply's own
+# docstring for why delegation runs in that direction. The canonical predicate
+# both descend from is still not importable from a scripts/ runtime context,
+# and its own contract is independently pinned at
+# fused-memory/tests/test_task_interceptor.py:10863+ ("task-1184:
+# interceptor_write_succeeded helper contract") — auditing for drift means
+# reading it too, since it can change without this table going red.
 #
 # `answered` is the second axis `interceptor_write_succeeded` has no need of:
 # whether the server explained ITSELF (an explicit error/success:False
@@ -489,12 +503,39 @@ def test_classify_live_task_agrees_with_the_audit_on_a_whitespace_only_entry():
 
 def test_classify_reply_truth_table():
     """One table, both axes, so `ok` and `answered` are read off one place."""
+    from migrate_metadata_modules_to_files import (
+        MCP_IS_ERROR_KEY,
+        RAW_REPLY_KEY,
+    )
+
     # Not a dict at all -> unanswered, non-empty detail naming what arrived.
     for reply in (None, "ok", []):
         verdict = classify_reply(reply)
         assert verdict.ok is False, reply
         assert verdict.answered is False, reply
         assert verdict.detail, reply
+
+    # The detail for a non-dict names the type and carries the VALUE UNQUOTED
+    # for a str. That wording was CHOSEN, not overlooked: delegating the
+    # not-a-dict branch routes through migrate's `_clip`, which returns a `str`
+    # as-is and only `repr`s non-strings, where the deleted transcription
+    # applied `repr` unconditionally ("... str: 'boom'"). Nothing parses this
+    # detail, and unquoted reads better for an operator staring at a
+    # stringified error page. Pinned so the next reader sees it was decided.
+    #
+    # BY COMPONENT, NOT BY WHOLE STRING, deliberately. The prose belongs to
+    # migrate's `_clip`; asserting it verbatim from this side would recreate —
+    # in a test — the exact message-wording coupling classify_reply's docstring
+    # refuses to take on in code, so a reword made entirely in the sibling file
+    # would turn THIS file red. The three clauses below are the decision itself:
+    # the type is named, the value survives, and it is NOT `repr`-quoted. The
+    # exact wording is pinned once where `_clip` lives, at tests/scripts/
+    # test_migrate_metadata_modules_to_files.py::
+    # test_clip_passes_a_str_through_unquoted_and_reprs_everything_else.
+    detail = classify_reply("boom").detail or ""
+    assert "str" in detail
+    assert "boom" in detail
+    assert "'boom'" not in detail
 
     # Empty dict -> unanswered, non-empty detail naming the emptiness: `{}`
     # carries no positive write signal and must not be read as success.
@@ -543,6 +584,80 @@ def test_classify_reply_truth_table():
         assert verdict.ok is True, reply
         assert verdict.answered is True, reply
         assert verdict.detail is None, reply
+
+    # THE TWO TRANSPORT-STAMPED SHAPES, closed by task 4608's delegation. Both
+    # are NON-EMPTY dicts with no `error` and no `success` key, so the deleted
+    # transcription fell straight through to its ok branch and reported each as
+    # a REPAIR THAT NEVER HAPPENED — in a script that writes live task
+    # metadata. `answered is False` because a transport stamp is not the server
+    # explaining ITSELF: `_raw` is by construction a reply this script could not
+    # read as structured JSON, and `_mcp_is_error` is the ENVELOPE's flag rather
+    # than the tool body's verdict. The keys are IMPORTED, never re-spelled as
+    # `'_raw'` / `'_mcp_is_error'` literals — a transcribed literal would keep
+    # passing if migrate renamed a key, reintroducing at the test layer the very
+    # drift class this task removes from the source.
+    for reply in (
+        {RAW_REPLY_KEY: "Error calling tool update_task: boom"},
+        {MCP_IS_ERROR_KEY: True, "id": "9"},
+    ):
+        verdict = classify_reply(reply)
+        assert verdict.ok is False, reply
+        assert verdict.answered is False, reply
+        assert verdict.detail, reply
+
+
+def test_classify_reply_delegates_to_the_migrations_predicate_rather_than_restating_it(
+    monkeypatch,
+):
+    """THE STRUCTURAL GUARD: one implementation, not two that currently agree.
+
+    The truth table above pins WHAT classify_reply decides; a faithful
+    re-transcription of write_failure_reason's cascade would satisfy every row
+    of it. That is exactly the state task 4608 removed and exactly the state it
+    must stay out of: the copy drifted once already, missing both transport
+    checks for the whole life of task 4528's fix.
+
+    So this pins WHERE the decision is made, by substitution — the same
+    can-not-be-satisfied-by-a-copy shape as
+    ``test_repair_client_does_not_restate_the_parents_handshake`` below, one
+    level down. Method identity is unavailable for a module-level function
+    reached through a caller, so the equivalent handle is monkeypatching the
+    attribute on the migrate module and checking that classify_reply FOLLOWS
+    it. This works because the import is function-scoped: ``from X import Y``
+    inside the body re-reads the attribute off the module object on every call.
+    A module-level import would bind the name once and silently make this test
+    vacuous, which is why the source keeps the import where it is.
+
+    Asserted in BOTH directions, so neither an unconditional pre-check nor an
+    unconditional post-check can pass: a substitute that FAILS an ordinary
+    success shape must be obeyed, and a substitute that PASSES `{}` — a shape
+    every copy of this cascade rejects — must be obeyed too.
+    """
+    import migrate_metadata_modules_to_files as migrate_mod
+
+    guidance = (
+        "classify_reply stopped routing this shape through "
+        "migrate_metadata_modules_to_files.write_failure_reason. If splitting "
+        "them is deliberate and justified, DELETE THIS TEST in the same commit "
+        "and say why in the message — do NOT satisfy it by re-transcribing the "
+        "cascade into classify_reply, which is the exact silent-drift copy "
+        "task 4608 removed (it had already lost both transport-stamped checks). "
+        "The truth table above stays either way; it is what catches a copy that "
+        "has drifted, but only AFTER it drifts."
+    )
+
+    sentinel = "the delegate said no"
+    monkeypatch.setattr(
+        migrate_mod, "write_failure_reason", lambda reply: sentinel,
+    )
+    verdict = classify_reply({"id": "9", "status": "done"})
+    assert verdict.ok is False, guidance
+    assert verdict.detail == sentinel, guidance
+
+    monkeypatch.setattr(migrate_mod, "write_failure_reason", lambda reply: None)
+    verdict = classify_reply({})
+    assert verdict.ok is True, guidance
+    assert verdict.detail is None, guidance
 
 
 # ---------------------------------------------------------------------------
@@ -614,11 +729,12 @@ def test_repair_one_issues_exactly_one_merge_mode_update_task():
 
 
 def test_repair_one_never_uses_replace_or_append_mode():
-    """(b) replace is the primitive that CAUSED this wipe class: _execute_combine
-    (task_interceptor.py:1850) writes a 3-key blob in replace mode and
-    _merge_metadata (sqlite_task_backend.py:3301) returns `incoming` verbatim for
-    that mode, deleting every untouched key. A repair must not use the wiper's
-    own primitive."""
+    """(b) replace was the primitive that CAUSED this wipe class: _execute_combine
+    (task_interceptor.py) used to write a 3-key blob in replace mode, and
+    _merge_metadata (sqlite_task_backend.py) returns `incoming` verbatim for
+    that mode, deleting every untouched key. Task 3446 switched _execute_combine
+    to metadata_mode='merge', closing that hole, but this repair must still never
+    use the wiper's own primitive."""
     client = _FakeClient()
 
     asyncio.run(repair_one(client, _ROOT, _candidate(1), now_iso=_NOW))
@@ -682,6 +798,34 @@ def test_repair_one_treats_an_empty_reply_as_failed():
 
     assert result.disposition == FAILED
     assert result.detail
+
+
+def test_repair_one_treats_a_transport_stamped_reply_as_failed():
+    """The closed hole on the WRITE path, asserted as a DISPOSITION.
+
+    Both shapes are NON-EMPTY dicts carrying neither `error` nor `success`, so
+    the transcribed twin classify_reply used to be fell straight through to its
+    ok branch and this function returned REPAIR — a repair reported against a
+    reply the transport could not even read, in a script that writes live task
+    metadata. Task 4608's delegation closed it; this pins the outcome an
+    operator actually reads, one level above the truth table.
+
+    The keys are IMPORTED, never re-spelled as `'_raw'` / `'_mcp_is_error'`
+    literals: a transcribed literal would keep passing if the migrate module
+    renamed the marker it stamps.
+    """
+    from migrate_metadata_modules_to_files import MCP_IS_ERROR_KEY, RAW_REPLY_KEY
+
+    for payload in (
+        {RAW_REPLY_KEY: "Error calling tool update_task: boom"},
+        {MCP_IS_ERROR_KEY: True, "id": "2464"},
+    ):
+        client = _FakeClient(returns=payload)
+
+        result = asyncio.run(repair_one(client, _ROOT, _candidate(5), now_iso=_NOW))
+
+        assert result.disposition == FAILED, payload
+        assert result.detail, payload
 
 
 def test_repair_one_accepts_a_plain_success_shape():
@@ -1268,6 +1412,49 @@ def test_repair_project_reports_an_unanswered_live_reread_as_failed_live_read(tm
     assert [name for name, _ in client.calls] == ["get_task"]
 
 
+def test_repair_project_reports_a_transport_stamped_live_reread_as_failed_live_read(
+    tmp_path,
+):
+    """THE HOLE TASK 4608 CLOSED, ASSERTED WHERE IT ACTUALLY BIT.
+
+    Both shapes are NON-EMPTY dicts carrying neither `error` nor `success`, so
+    before the delegation `classify_reply` called them ok and the reply flowed
+    straight on into `classify_live_task(_unwrap_task(live), candidate)` —
+    where, having no `status` key, it was judged as though the server had
+    answered. A run could therefore file a benign skip, or attempt a WRITE,
+    against a reply the transport could not read at all.
+
+    The truth table above pins the VERDICT; this pins the DISPOSITION, which is
+    what the summary prints and what the exit code is derived from. They are
+    not the same guard: a refactor of the `if not verdict.ok:` arm, or of
+    `_unwrap_task`, could regress this end-to-end behaviour with every unit
+    test still green.
+
+    `get_task` is asserted to be the ONLY call: an unreadable re-read must stop
+    the candidate before the write, not merely relabel it afterwards. Distinct
+    project names per iteration because `_wiped_project` builds a real tree.
+
+    The keys are IMPORTED, never re-spelled — same reason as the truth table's.
+    """
+    from migrate_metadata_modules_to_files import MCP_IS_ERROR_KEY, RAW_REPLY_KEY
+
+    replies = (
+        {RAW_REPLY_KEY: "Error calling tool get_task: boom"},
+        {MCP_IS_ERROR_KEY: True, "id": "9"},
+    )
+    for index, reply in enumerate(replies):
+        root = _wiped_project(tmp_path, name=f"proj{index}")
+        client = _FakeClient(returns=reply)
+
+        result = asyncio.run(
+            repair_project(client, str(root), apply=True, now_iso=_NOW)
+        )
+
+        assert [o.disposition for o in result.outcomes] == [FAILED_LIVE_READ], reply
+        assert [name for name, _ in client.calls] == ["get_task"], reply
+        assert result.outcomes[0].detail, reply
+
+
 def test_repair_project_still_skips_a_genuinely_missing_task_as_skip_missing(tmp_path):
     """REGRESSION GUARD, not a new behaviour. Reuses the exact payload from
     test_repair_project_reports_the_servers_own_reason_for_a_missing_task
@@ -1660,6 +1847,67 @@ def test_exit_write_failed_outranks_exit_live_read_failed(tmp_path, monkeypatch)
 
     assert exit_code == EXIT_WRITE_FAILED
     assert exit_code != EXIT_LIVE_READ_FAILED
+
+
+# ---------------------------------------------------------------------------
+# Lockstep guard for the task-3817 decision that this script keeps its own
+# EXIT_* ladder instead of adopting _task_db_scan.run_audit_cli — rationale in
+# _task_db_scan.py's module docstring. The shared constants are IMPORTED below,
+# never re-spelled as 0/1/2/3 literals, or the guard would drift exactly as the
+# thing it guards against.
+# ---------------------------------------------------------------------------
+
+
+def test_exit_codes_stay_in_lockstep_with_the_shared_audit_ladder():
+    """The four shared codes must keep the SAME integers as Tier 3's.
+
+    Task 3817 decided repair_wiped_metadata_files.py keeps its own copy of the
+    ladder that _task_db_scan.py's AUDIT_EXIT_* constants own. The two copies
+    were kept numerically aligned BY CONVENTION — nothing in the repo reads an
+    exit code from both tools today — and this test is what freezes that
+    convention, since a hand-maintained alignment nothing checks agrees only by
+    luck. Renumbering a copy deliberately is allowed; it must edit this test
+    rather than drift past it unnoticed.
+    """
+    assert EXIT_OK == AUDIT_EXIT_OK
+    assert EXIT_WRITE_FAILED == AUDIT_EXIT_FINDINGS
+    assert EXIT_NO_ROOT == AUDIT_EXIT_NO_ROOT
+    assert EXIT_NOTHING_SCANNED == AUDIT_EXIT_NOTHING_AUDITED
+
+
+def test_exit_server_unreachable_is_this_scripts_own_extension():
+    """4 is this script's own code, with no Tier-3 counterpart.
+
+    Tier 3 has no fifth code, so EXIT_SERVER_UNREACHABLE cannot be checked for
+    lockstep; pinning the literal records that the value is this script's to
+    choose. Non-collision with the Tier-3 codes needs no assertion here — it is
+    already implied: the lockstep test above proves the four AUDIT_EXIT_* values
+    ARE this script's first four codes, and
+    test_repair_exit_constants_are_pairwise_distinct proves 4 differs from all
+    four of those.
+    """
+    assert EXIT_SERVER_UNREACHABLE == 4
+
+
+def test_repair_exit_constants_are_pairwise_distinct():
+    """Each code denotes EXACTLY ONE outcome — mirroring the shared module's own
+    test_audit_exit_constants_are_pairwise_distinct in
+    scripts/tests/test_task_db_scan.py.
+
+    Collapsing any pair is the silent fail-soft docs/legibility/
+    design-invariants.md forbids: folding 3 into 0 reports "examined nothing at
+    all" as a clean sweep, and folding 4 into 1 sends an operator hunting for a
+    rejected write that was never attempted.
+    """
+    codes = [
+        EXIT_OK,
+        EXIT_WRITE_FAILED,
+        EXIT_NO_ROOT,
+        EXIT_NOTHING_SCANNED,
+        EXIT_SERVER_UNREACHABLE,
+        EXIT_LIVE_READ_FAILED,
+    ]
+    assert len(set(codes)) == len(codes), codes
 
 
 def test_make_client_is_attributable_to_this_repair_not_the_migration():

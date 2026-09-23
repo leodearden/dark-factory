@@ -1,0 +1,692 @@
+{
+  "sweep": "manifest-stamp-coverage-audit",
+  "task_id": "4590",
+  "question": "Did the invalid-sidecar window silently skip commit_planning's task_id stamping (item a) or its mechanical delivered_checks copy (item b) for any producer task under plans/toolcall-markup-containment-prd.md, leaving something to hand-backfill (item c)?",
+  "answer": "NO. The backfill set is EMPTY. 11/11 labels stamped; 11/11 delivered_checks name sets match.",
+  "window": {
+    "confirmed": true,
+    "opened_at": "2026-08-19T18:39:55+01:00",
+    "opened_by_commit": "965f3206eb2fc0f6291c08ae79e3f0d64914a409",
+    "opened_by_subject": "docs(markup-prd): split gamma three ways; correct the substrate row it passed green on",
+    "opened_because": "that commit added 5 capability rows with `verdict: OPEN` to the sidecar while CapabilityManifestDoc.verdict was still Literal['PASS','FAIL']",
+    "verdict_open_rows_added_at_open": 5,
+    "verdict_open_rows_present_now": 5,
+    "closed_at": "2026-08-20T15:40:21+01:00",
+    "closed_by_commit": "5f185fdf00aa9f145a583b83aa9538346a91877f",
+    "closed_by_subject": "Merge task/4471 into main",
+    "verdict_literal_before_close": "Literal['PASS', 'FAIL']",
+    "verdict_literal_after_close": "Literal['PASS', 'FAIL', 'OPEN']",
+    "close_commit_touched_sidecar": false,
+    "close_commit_files": [
+      "plans/capability-delivered-checks-prd.md",
+      "shared/src/shared/capability_manifest.py",
+      "shared/tests/test_capability_manifest.py"
+    ],
+    "independent_corroboration": "task 4457's dry_run_proposals record the pydantic failure verbatim at merge-verify on 2026-08-20, naming the same 5 OPEN rows and the same Literal['PASS','FAIL'] schema"
+  },
+  "note_on_measurement_epoch": "MEASUREMENT EPOCH. `labels` and `findings` below are the PRE-remediation measurement (2026-08-28T22:40:37Z) — that is what the audit found, and it is preserved verbatim so the finding stays verifiable. They are NOT the current state of the task store. The three `findings.prd_task_label_mismatches` rows were repaired by this same task at 2026-08-28T22:54:52Z; each is stamped `remediated_by_this_task: true`, and `labels` still shows their pre-remediation `prd_task_label` / `label_matches_prd_task_label: false`. For what is live now, read `remediation` — every other finding here is unchanged by it.",
+  "labels": [
+    {
+      "label": "α",
+      "task_id": "3688",
+      "task_status": "done",
+      "prd_task_label": "α",
+      "sidecar_mechanical_check_names": [
+        "detector-and-repairer-module-exists",
+        "fixture-corpus-committed-with-expected-outcomes",
+        "single-literal-source-inv5"
+      ],
+      "task_delivered_check_names": [
+        "detector-and-repairer-module-exists",
+        "fixture-corpus-committed-with-expected-outcomes",
+        "single-literal-source-inv5"
+      ],
+      "name_sets_equal": true,
+      "label_matches_prd_task_label": true
+    },
+    {
+      "label": "β",
+      "task_id": "3689",
+      "task_status": "done",
+      "prd_task_label": "β",
+      "sidecar_mechanical_check_names": [
+        "repair-policy-declared-enum-inv1",
+        "markup-detected-structured-fact-inv2",
+        "exempt-tools-declared-at-registration-inv1"
+      ],
+      "task_delivered_check_names": [
+        "repair-policy-declared-enum-inv1",
+        "markup-detected-structured-fact-inv2",
+        "exempt-tools-declared-at-registration-inv1"
+      ],
+      "name_sets_equal": true,
+      "label_matches_prd_task_label": true
+    },
+    {
+      "label": "γ1",
+      "task_id": "3690",
+      "task_status": "done",
+      "prd_task_label": "gamma-1",
+      "sidecar_mechanical_check_names": [
+        "middleware-registered-on-forward-repair-pair",
+        "list-typed-evidence-recovery-pinned"
+      ],
+      "task_delivered_check_names": [
+        "middleware-registered-on-forward-repair-pair",
+        "list-typed-evidence-recovery-pinned"
+      ],
+      "name_sets_equal": true,
+      "label_matches_prd_task_label": false
+    },
+    {
+      "label": "γ2",
+      "task_id": "4457",
+      "task_status": "done",
+      "prd_task_label": "gamma-2",
+      "sidecar_mechanical_check_names": [
+        "middleware-registered-on-plan-tools"
+      ],
+      "task_delivered_check_names": [
+        "middleware-registered-on-plan-tools"
+      ],
+      "name_sets_equal": true,
+      "label_matches_prd_task_label": false
+    },
+    {
+      "label": "γ3",
+      "task_id": "4458",
+      "task_status": "done",
+      "prd_task_label": "gamma-3",
+      "sidecar_mechanical_check_names": [
+        "ungated-write-tools-now-covered",
+        "inline-markup-gate-call-sites-retired-inv5"
+      ],
+      "task_delivered_check_names": [
+        "inline-markup-gate-call-sites-retired-inv5",
+        "ungated-write-tools-now-covered"
+      ],
+      "name_sets_equal": true,
+      "label_matches_prd_task_label": false
+    },
+    {
+      "label": "δ",
+      "task_id": "3691",
+      "task_status": "done",
+      "prd_task_label": "δ",
+      "sidecar_mechanical_check_names": [
+        "sweep-script-exists",
+        "atomic-temp-verify-replace-c3",
+        "committed-evidence-file-survives-the-sweep"
+      ],
+      "task_delivered_check_names": [
+        "sweep-script-exists",
+        "atomic-temp-verify-replace-c3",
+        "committed-evidence-file-survives-the-sweep"
+      ],
+      "name_sets_equal": true,
+      "label_matches_prd_task_label": true
+    },
+    {
+      "label": "ε",
+      "task_id": "3692",
+      "task_status": "done",
+      "prd_task_label": "ε",
+      "sidecar_mechanical_check_names": [
+        "plan-tools-read-path-hooked",
+        "atomic-write-back-under-concurrency-c3"
+      ],
+      "task_delivered_check_names": [
+        "plan-tools-read-path-hooked",
+        "atomic-write-back-under-concurrency-c3"
+      ],
+      "name_sets_equal": true,
+      "label_matches_prd_task_label": true
+    },
+    {
+      "label": "ζ",
+      "task_id": "3693",
+      "task_status": "done",
+      "prd_task_label": "ζ",
+      "sidecar_mechanical_check_names": [
+        "incorrect-early-termination-claim-is-present",
+        "over-consumption-direction-stated"
+      ],
+      "task_delivered_check_names": [
+        "incorrect-early-termination-claim-is-present",
+        "over-consumption-direction-stated"
+      ],
+      "name_sets_equal": true,
+      "label_matches_prd_task_label": true
+    },
+    {
+      "label": "η",
+      "task_id": "3697",
+      "task_status": "done",
+      "prd_task_label": "η",
+      "sidecar_mechanical_check_names": [
+        "allow-mcp-markup-documented-as-the-correct-move"
+      ],
+      "task_delivered_check_names": [
+        "allow-mcp-markup-documented-as-the-correct-move"
+      ],
+      "name_sets_equal": true,
+      "label_matches_prd_task_label": true
+    },
+    {
+      "label": "θ",
+      "task_id": "3695",
+      "task_status": "done",
+      "prd_task_label": "θ",
+      "sidecar_mechanical_check_names": [
+        "specimen-backed-report-committed"
+      ],
+      "task_delivered_check_names": [
+        "specimen-backed-report-committed"
+      ],
+      "name_sets_equal": true,
+      "label_matches_prd_task_label": true
+    },
+    {
+      "label": "ι",
+      "task_id": "3696",
+      "task_status": "done",
+      "prd_task_label": "ι",
+      "sidecar_mechanical_check_names": [
+        "owning-prd-still-names-3083-as-pending",
+        "superseding-mechanism-has-landed"
+      ],
+      "task_delivered_check_names": [
+        "owning-prd-still-names-3083-as-pending",
+        "superseding-mechanism-has-landed"
+      ],
+      "name_sets_equal": true,
+      "label_matches_prd_task_label": true
+    }
+  ],
+  "findings": {
+    "unstamped_labels": [],
+    "missing_delivered_checks": [],
+    "note_on_findings": "PRE-remediation. `prd_task_label_mismatches` below was true at measurement time and has since been repaired by this task — see `remediation`. `unstamped_labels` and `missing_delivered_checks` are empty findings and are unaffected; `field_level_divergences` is still live and deferred to task 4545.",
+    "prd_task_label_mismatches": [
+      {
+        "task_id": "3690",
+        "sidecar_label": "γ1",
+        "task_prd_task_label": "gamma-1",
+        "task_status": "done",
+        "remediated_by_this_task": true,
+        "prd_task_label_after_remediation": "γ1",
+        "consequence": "AT MEASUREMENT TIME (pre-remediation): manifest_stamping step 4 keys label_to_task_id on prd_task_label and matches it against entry['label'], so this task matched NO sidecar entry — a future commit_planning over it would have stamped nothing, copied nothing, and buried it in report['missing_labels']. REPAIRED by this task: prd_task_label was realigned to the sidecar spelling, so it now matches. See `remediation`."
+      },
+      {
+        "task_id": "4457",
+        "sidecar_label": "γ2",
+        "task_prd_task_label": "gamma-2",
+        "task_status": "done",
+        "remediated_by_this_task": true,
+        "prd_task_label_after_remediation": "γ2",
+        "consequence": "AT MEASUREMENT TIME (pre-remediation): manifest_stamping step 4 keys label_to_task_id on prd_task_label and matches it against entry['label'], so this task matched NO sidecar entry — a future commit_planning over it would have stamped nothing, copied nothing, and buried it in report['missing_labels']. REPAIRED by this task: prd_task_label was realigned to the sidecar spelling, so it now matches. See `remediation`."
+      },
+      {
+        "task_id": "4458",
+        "sidecar_label": "γ3",
+        "task_prd_task_label": "gamma-3",
+        "task_status": "done",
+        "remediated_by_this_task": true,
+        "prd_task_label_after_remediation": "γ3",
+        "consequence": "AT MEASUREMENT TIME (pre-remediation): manifest_stamping step 4 keys label_to_task_id on prd_task_label and matches it against entry['label'], so this task matched NO sidecar entry — a future commit_planning over it would have stamped nothing, copied nothing, and buried it in report['missing_labels']. REPAIRED by this task: prd_task_label was realigned to the sidecar spelling, so it now matches. See `remediation`."
+      }
+    ],
+    "field_level_divergences": [
+      {
+        "label": "δ",
+        "task_id": "3691",
+        "check": "committed-evidence-file-survives-the-sweep",
+        "field": "pattern",
+        "owner": "task 4545 (item 2 of its measured 8-descriptor drift set)",
+        "deferred": true,
+        "NOTE": "Both pattern literals are DELIBERATELY not quoted here. Writing the raw toolcall envelope sentinel into a tracked file forces the authoring agent to emit it inside its own tool call, reproducing the leak this PRD exists to contain. Recorded as measured properties instead, which a third party can reproduce without quoting either value.",
+        "sidecar_pattern_kind": "raw INVOKE_CLOSER sentinel",
+        "task_pattern_kind": "bracket-free CANONICAL_OPENER_PREFIX form",
+        "sidecar_pattern_measured": {
+          "length": 9,
+          "has_angle_bracket": true,
+          "has_slash": true,
+          "sha256_prefix8": "bf958f1e"
+        },
+        "task_pattern_measured": {
+          "length": 15,
+          "has_angle_bracket": false,
+          "has_slash": false,
+          "sha256_prefix8": "e8eca467"
+        },
+        "corrected_side": "task (per task 4545's own finding)"
+      }
+    ]
+  },
+  "corpus_unmatched_labels": {
+    "tracked_sidecar_count": 53,
+    "manifest_bearing_task_count": 808,
+    "unmatched_label_count": 24,
+    "in_scope_here": 3,
+    "out_of_scope_deferred_to_followup": 21,
+    "followup_task_id": "4907",
+    "followup_ticket_id": "tkt_0RT0D6M68VMRA0X45GXQXNW9YH",
+    "followup_note": "The 21 out-of-scope rows were filed as ticket tkt_0RT0D6M68VMRA0X45GXQXNW9YH, which the curator materialized as TASK 4907 (pending, priority low, metadata.spawned_from='4590', escalation_id='agent-followup-4590'). Task 4907 is the durable handle — cite it, not the ticket id: a ticket row is a transient curator artifact and `list_tickets` defaults to a 7-day window.",
+    "rows": [
+      {
+        "task_id": "2464",
+        "prd_task_label": "α",
+        "task_status": "done",
+        "derived_sidecar": "plans/eval-framework-revival-prd.capability-manifest.yaml",
+        "sidecar_declared_labels": [
+          "π",
+          "ρ",
+          "σ",
+          "υ",
+          "φ"
+        ]
+      },
+      {
+        "task_id": "2466",
+        "prd_task_label": "β",
+        "task_status": "done",
+        "derived_sidecar": "plans/eval-framework-revival-prd.capability-manifest.yaml",
+        "sidecar_declared_labels": [
+          "π",
+          "ρ",
+          "σ",
+          "υ",
+          "φ"
+        ]
+      },
+      {
+        "task_id": "2469",
+        "prd_task_label": "γ",
+        "task_status": "done",
+        "derived_sidecar": "plans/eval-framework-revival-prd.capability-manifest.yaml",
+        "sidecar_declared_labels": [
+          "π",
+          "ρ",
+          "σ",
+          "υ",
+          "φ"
+        ]
+      },
+      {
+        "task_id": "2470",
+        "prd_task_label": "δ",
+        "task_status": "done",
+        "derived_sidecar": "plans/eval-framework-revival-prd.capability-manifest.yaml",
+        "sidecar_declared_labels": [
+          "π",
+          "ρ",
+          "σ",
+          "υ",
+          "φ"
+        ]
+      },
+      {
+        "task_id": "2471",
+        "prd_task_label": "ε",
+        "task_status": "done",
+        "derived_sidecar": "plans/eval-framework-revival-prd.capability-manifest.yaml",
+        "sidecar_declared_labels": [
+          "π",
+          "ρ",
+          "σ",
+          "υ",
+          "φ"
+        ]
+      },
+      {
+        "task_id": "2472",
+        "prd_task_label": "ι",
+        "task_status": "done",
+        "derived_sidecar": "plans/eval-framework-revival-prd.capability-manifest.yaml",
+        "sidecar_declared_labels": [
+          "π",
+          "ρ",
+          "σ",
+          "υ",
+          "φ"
+        ]
+      },
+      {
+        "task_id": "2473",
+        "prd_task_label": "ζ",
+        "task_status": "done",
+        "derived_sidecar": "plans/eval-framework-revival-prd.capability-manifest.yaml",
+        "sidecar_declared_labels": [
+          "π",
+          "ρ",
+          "σ",
+          "υ",
+          "φ"
+        ]
+      },
+      {
+        "task_id": "2474",
+        "prd_task_label": "η",
+        "task_status": "done",
+        "derived_sidecar": "plans/eval-framework-revival-prd.capability-manifest.yaml",
+        "sidecar_declared_labels": [
+          "π",
+          "ρ",
+          "σ",
+          "υ",
+          "φ"
+        ]
+      },
+      {
+        "task_id": "2475",
+        "prd_task_label": "θ",
+        "task_status": "done",
+        "derived_sidecar": "plans/eval-framework-revival-prd.capability-manifest.yaml",
+        "sidecar_declared_labels": [
+          "π",
+          "ρ",
+          "σ",
+          "υ",
+          "φ"
+        ]
+      },
+      {
+        "task_id": "2476",
+        "prd_task_label": "κ",
+        "task_status": "done",
+        "derived_sidecar": "plans/eval-framework-revival-prd.capability-manifest.yaml",
+        "sidecar_declared_labels": [
+          "π",
+          "ρ",
+          "σ",
+          "υ",
+          "φ"
+        ]
+      },
+      {
+        "task_id": "2477",
+        "prd_task_label": "λ",
+        "task_status": "done",
+        "derived_sidecar": "plans/eval-framework-revival-prd.capability-manifest.yaml",
+        "sidecar_declared_labels": [
+          "π",
+          "ρ",
+          "σ",
+          "υ",
+          "φ"
+        ]
+      },
+      {
+        "task_id": "2478",
+        "prd_task_label": "μ",
+        "task_status": "done",
+        "derived_sidecar": "plans/eval-framework-revival-prd.capability-manifest.yaml",
+        "sidecar_declared_labels": [
+          "π",
+          "ρ",
+          "σ",
+          "υ",
+          "φ"
+        ]
+      },
+      {
+        "task_id": "2479",
+        "prd_task_label": "ν",
+        "task_status": "done",
+        "derived_sidecar": "plans/eval-framework-revival-prd.capability-manifest.yaml",
+        "sidecar_declared_labels": [
+          "π",
+          "ρ",
+          "σ",
+          "υ",
+          "φ"
+        ]
+      },
+      {
+        "task_id": "2480",
+        "prd_task_label": "ξ",
+        "task_status": "done",
+        "derived_sidecar": "plans/eval-framework-revival-prd.capability-manifest.yaml",
+        "sidecar_declared_labels": [
+          "π",
+          "ρ",
+          "σ",
+          "υ",
+          "φ"
+        ]
+      },
+      {
+        "task_id": "2674",
+        "prd_task_label": "α",
+        "task_status": "done",
+        "derived_sidecar": "plans/found-on-main-provenance-integrity-prd.capability-manifest.yaml",
+        "sidecar_declared_labels": [
+          "γ",
+          "ε",
+          "ζ",
+          "η",
+          "κ",
+          "θ"
+        ]
+      },
+      {
+        "task_id": "2675",
+        "prd_task_label": "δ",
+        "task_status": "done",
+        "derived_sidecar": "plans/found-on-main-provenance-integrity-prd.capability-manifest.yaml",
+        "sidecar_declared_labels": [
+          "γ",
+          "ε",
+          "ζ",
+          "η",
+          "κ",
+          "θ"
+        ]
+      },
+      {
+        "task_id": "2676",
+        "prd_task_label": "ι",
+        "task_status": "done",
+        "derived_sidecar": "plans/found-on-main-provenance-integrity-prd.capability-manifest.yaml",
+        "sidecar_declared_labels": [
+          "γ",
+          "ε",
+          "ζ",
+          "η",
+          "κ",
+          "θ"
+        ]
+      },
+      {
+        "task_id": "2677",
+        "prd_task_label": "β",
+        "task_status": "done",
+        "derived_sidecar": "plans/found-on-main-provenance-integrity-prd.capability-manifest.yaml",
+        "sidecar_declared_labels": [
+          "γ",
+          "ε",
+          "ζ",
+          "η",
+          "κ",
+          "θ"
+        ]
+      },
+      {
+        "task_id": "2825",
+        "prd_task_label": "ο",
+        "task_status": "done",
+        "derived_sidecar": "plans/eval-framework-revival-prd.capability-manifest.yaml",
+        "sidecar_declared_labels": [
+          "π",
+          "ρ",
+          "σ",
+          "υ",
+          "φ"
+        ]
+      },
+      {
+        "task_id": "3289",
+        "prd_task_label": "restore-gate",
+        "task_status": "done",
+        "derived_sidecar": "plans/dashboard-availability-prd.capability-manifest.yaml",
+        "sidecar_declared_labels": [
+          "α",
+          "β",
+          "γ",
+          "δ",
+          "ε",
+          "ζ",
+          "η",
+          "θ"
+        ]
+      },
+      {
+        "task_id": "3690",
+        "prd_task_label": "gamma-1",
+        "task_status": "done",
+        "derived_sidecar": "plans/toolcall-markup-containment-prd.capability-manifest.yaml",
+        "sidecar_declared_labels": [
+          "α",
+          "β",
+          "γ1",
+          "γ2",
+          "γ3",
+          "δ",
+          "ε",
+          "ζ",
+          "η",
+          "θ",
+          "ι"
+        ]
+      },
+      {
+        "task_id": "4172",
+        "prd_task_label": "kappa-followup",
+        "task_status": "pending",
+        "derived_sidecar": "plans/task-escalation-state-graph-prd.capability-manifest.yaml",
+        "sidecar_declared_labels": [
+          "α",
+          "η0",
+          "β",
+          "γ1",
+          "γ2",
+          "γ3",
+          "δ",
+          "ζ",
+          "η",
+          "θ",
+          "ι",
+          "κ",
+          "λ",
+          "μ"
+        ]
+      },
+      {
+        "task_id": "4457",
+        "prd_task_label": "gamma-2",
+        "task_status": "done",
+        "derived_sidecar": "plans/toolcall-markup-containment-prd.capability-manifest.yaml",
+        "sidecar_declared_labels": [
+          "α",
+          "β",
+          "γ1",
+          "γ2",
+          "γ3",
+          "δ",
+          "ε",
+          "ζ",
+          "η",
+          "θ",
+          "ι"
+        ]
+      },
+      {
+        "task_id": "4458",
+        "prd_task_label": "gamma-3",
+        "task_status": "done",
+        "derived_sidecar": "plans/toolcall-markup-containment-prd.capability-manifest.yaml",
+        "sidecar_declared_labels": [
+          "α",
+          "β",
+          "γ1",
+          "γ2",
+          "γ3",
+          "δ",
+          "ε",
+          "ζ",
+          "η",
+          "θ",
+          "ι"
+        ]
+      }
+    ]
+  },
+  "remediation": {
+    "applied_at": "2026-08-28T22:54:52Z",
+    "what": "Realigned metadata.prd_task_label to the sidecar's own label spelling on the three transliterated tasks.",
+    "direction": "tasks -> sidecar (the sidecar is owned by in-flight task 4545; the Greek form is the convention)",
+    "procedure": "three mcp__fused-memory__update_task calls passing ONLY {'prd_task_label': '<greek>'}, inheriting the default shallow last-write-wins metadata merge ({**existing, **incoming}). The whole metadata blob was deliberately NOT sent back — this repo has a documented class of whole-blob writers clobbering sibling keys (tasks 3260, 3933, 4507).",
+    "changes": [
+      {
+        "task_id": "3690",
+        "prd_task_label_before": "gamma-1",
+        "prd_task_label_after": "γ1",
+        "task_status": "done",
+        "metadata_key_count_before": 21,
+        "metadata_key_count_after": 21,
+        "keys_changed": [
+          "prd_task_label"
+        ],
+        "delivered_checks_byte_identical": true,
+        "prd_path_byte_identical": true
+      },
+      {
+        "task_id": "4457",
+        "prd_task_label_before": "gamma-2",
+        "prd_task_label_after": "γ2",
+        "task_status": "done",
+        "metadata_key_count_before": 21,
+        "metadata_key_count_after": 21,
+        "keys_changed": [
+          "prd_task_label"
+        ],
+        "delivered_checks_byte_identical": true,
+        "prd_path_byte_identical": true
+      },
+      {
+        "task_id": "4458",
+        "prd_task_label_before": "gamma-3",
+        "prd_task_label_after": "γ3",
+        "task_status": "done",
+        "metadata_key_count_before": 20,
+        "metadata_key_count_after": 20,
+        "keys_changed": [
+          "prd_task_label"
+        ],
+        "delivered_checks_byte_identical": true,
+        "prd_path_byte_identical": true
+      }
+    ],
+    "verification": {
+      "method": "re-read all three records after the writes and byte-compared every metadata key against the pre-write capture, then re-ran the corpus-wide label sweep",
+      "sibling_keys_clobbered": 0,
+      "keys_changed_across_all_three": [
+        "prd_task_label"
+      ],
+      "corpus_unmatched_labels_before": 24,
+      "corpus_unmatched_labels_after": 21,
+      "expected_delta": -3,
+      "observed_delta": -3,
+      "rows_cleared": [
+        "3690",
+        "4457",
+        "4458"
+      ],
+      "rows_newly_appeared": [],
+      "this_sidecar_label_mismatches_after": 0,
+      "unrelated_findings_unchanged": "unstamped_labels still []; missing_delivered_checks still []; the single delta/3691 pattern divergence is unchanged and still deferred to task 4545"
+    },
+    "safety_basis": "prd_task_label is provenance-only, and has exactly ONE behavioural consumer: fused-memory/src/fused_memory/server/manifest_stamping.py, which keys label_to_task_id on it. MEASURED by grep across every tracked *.py, the only OTHER reader is scripts/audit_combine_gate_marker_loss.py, which lists it in _PROVENANCE_KEYS and builds its manifest-sourced `expected` dict as {'prd_task_label': expectation.label} — i.e. it is a read-only provenance audit that compares the TASK-side label against the SIDECAR's, and makes no dispatch decision. Realigning the task side to the sidecar can therefore only increase its agreement. Nothing else re-reads the key to make a decision about a completed task, which is why realigning it is safe even though all three tasks are already done.",
+    "note_on_corpus_rows": "corpus_unmatched_labels above records the PRE-remediation measurement (24 rows), which is the audit's finding. Post-remediation the same sweep returns 21; the 3 rows for this sidecar are cleared. The remaining 21 are out of scope and filed as task 4907 (ticket tkt_0RT0D6M68VMRA0X45GXQXNW9YH)."
+  }
+}

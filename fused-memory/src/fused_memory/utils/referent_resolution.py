@@ -53,6 +53,7 @@ canonical_labels whose shape it copies.
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Literal, get_args
 
@@ -214,6 +215,45 @@ def _local_project(group_id: str) -> str:
         return canonicalize_project_id(group_id)
     except PathShapedProjectIdError:
         return ''
+
+
+def local_referent(referent: Referent, *, group_id: str) -> Referent:
+    """Apply the self-qualified reclassification to an already-parsed referent.
+
+    PUBLIC, unlike its :func:`_local_project` collaborator, because the rule has
+    a FOURTH consumer outside this module: the verification sub-pass
+    (``memory_service._verify_episode_referents``, PRD leaf ζ) parses edge
+    ENDPOINT NODE NAMES with :func:`~fused_memory.utils.canonical_labels.parse_node_name`
+    and compares the result against referents that came through this module. A
+    bare parse keeps the qualifier, so in group ``'dark_factory'`` an endpoint
+    node named ``'dark_factory:3127'`` parsed to
+    ``Referent(number='3127', project_id='dark_factory')`` while
+    :func:`~fused_memory.utils.canonical_labels.scan_content` and
+    :func:`resolve_referents` both answered the LOCAL
+    ``Referent(number='3127')`` for the identical spelling — so the endpoint
+    compared unequal to the very referent the write declared itself to be
+    about, and ζ emitted a repair instruction for a correctly-attached edge.
+
+    That is the exact source-invariance break this module's docstring forbids —
+    "a given spelling denotes the same node whichever source happens to win" —
+    so the remedy is a shared callable rather than a fourth inline copy of
+    ``project_id == local``. Exporting it keeps the rule at ONE site per INV-5,
+    which is the same reasoning that produced :func:`_local_project` after the
+    metadata path was found to have skipped the rule entirely.
+
+    Returns *referent* UNCHANGED when it is already own-project, when
+    *group_id* names no canonical project (the ``''`` sentinel — see
+    :func:`_local_project`, and note that keeping a foreign referent foreign is
+    strictly safer than collapsing it onto an untrustworthy local id), or when
+    the qualifier names a genuinely different project.
+    """
+    local = _local_project(group_id)
+    if referent.project_id and local and referent.project_id == local:
+        # Rebuilt through the constructor rather than dataclasses.replace, so
+        # the frozen vocabulary type's __post_init__ validation runs on the
+        # reclassified value too.
+        return Referent(kind=referent.kind, number=referent.number)
+    return referent
 
 
 def _conflicting_referents(declared: ReferentSet, scan: LabelScan) -> ReferentSet:
@@ -576,17 +616,11 @@ def _metadata_referents(metadata: dict | None, *, group_id: str) -> ReferentSet:
         # needs canonicalizing here — do not add a second canonicalize of the
         # parsed side.
         #
-        # The `referent.project_id and local` guard is what keeps a foreign
-        # referent foreign when group_id is path-shaped; :func:`_local_project`
-        # explains the '' sentinel it guards against. Same guard, same reason,
-        # as on the declared path.
-        local = _local_project(group_id)
-        if referent.project_id and local and referent.project_id == local:
-            # Rebuilt through the constructor rather than dataclasses.replace,
-            # so the frozen vocabulary type's __post_init__ validation runs on
-            # the reclassified value too.
-            referent = Referent(kind=referent.kind, number=referent.number)
-        return (referent,)
+        # Through :func:`local_referent`, which is THE site for the rule — the
+        # same guard, and the same reason, as on the declared path. ζ's
+        # endpoint-name path reads it too, so a change here cannot leave that
+        # consumer comparing against a differently-classified referent.
+        return (local_referent(referent, group_id=group_id),)
 
     # Exactly ONE shape of our own: the bare digit run that metadata.task_id
     # actually carries, and the one parse_node_name is anchored to refuse.
@@ -603,6 +637,7 @@ def resolve_referents(
     metadata: dict | None,
     content: str | None,
     group_id: str,
+    known_project_ids: Collection[str] | None = None,
 ) -> ReferentResolution:
     """Resolve which referents one write is about, and from which source.
 
@@ -633,18 +668,35 @@ def resolve_referents(
         group_id: The group the content belongs to (= the local project_id).
             Must be a str; there is no "no group" for a write. A non-str
             RAISES.
+        known_project_ids: Optional registry of known project ids, forwarded
+            verbatim to the single ``scan_content`` call below (any
+            collection; a ``{project_id: project_root}`` mapping works, since
+            iterating it yields its keys). Absent, empty, or wholly unusable,
+            the scan stays PERMISSIVE — that fallback belongs to
+            ``_canonical_allowlist`` and is not re-checked here. Populated, it
+            drops FOREIGN referents naming a project outside it, so a junk
+            qualifier ('localhost:6379', 'INFO:1234') stops minting one.
+            Narrowing is STRICTLY SUBTRACTIVE by the guarantee ``scan_content``
+            states: a dropped candidate keeps the ambiguity contest it created,
+            so this can only ever remove a referent, never add one.
 
     Raises:
         InputValidationError: On a malformed ``declared`` entry (see
             :func:`_declared_referents`), or on a non-str ``group_id`` /
             ``content``.
 
-    These are the PRD's exact four parameters and no more. In particular there
-    is deliberately no ``known_project_ids``: ``scan_content`` is called in its
-    documented PERMISSIVE mode, and threading a live project registry is a
-    wiring concern belonging to the leaf that owns the wiring (δ/ε). Adding an
-    unspecified fifth parameter here would fork, mid-batch, the signature those
-    siblings are being written against.
+    ``known_project_ids`` was deliberately ABSENT for the PRD's δ/ε batch,
+    which deferred it to "the leaf that owns the wiring". No leaf's decomposed
+    scope ever contained it, so the deferral orphaned the wiring; task 5262
+    closes it. The parameter is OPTIONAL and permissive-by-default precisely so
+    the four-parameter callers those siblings were written against still read
+    identically.
+
+    NOT every caller acquires a registry. ``server/entities_gate.py``'s call
+    stays at the permissive default on purpose: it holds no registry, and the
+    gate rejects on CONFLICT, never on absence — so narrowing it would only
+    drop junk-qualified conflicts it currently catches, with nothing gained.
+    That is a deliberate non-change, not wiring left half-finished.
     """
     # group_id and content are STRUCTURAL inputs the caller resolves for itself
     # (models.scope.resolve_project_id for the group, the write body for the
@@ -694,7 +746,7 @@ def resolve_referents(
     # `content or ''` only narrows the tolerated None to the empty body
     # scan_content is typed for; that call already short-circuits falsy content
     # to an empty scan, so this changes no behaviour for '' either.
-    scan = scan_content(content or '', group_id=group_id)
+    scan = scan_content(content or '', group_id=group_id, known_project_ids=known_project_ids)
 
     # `.ambiguous` is the scan's verbatim answer on every path. Ambiguous
     # referents are recorded, never guessed, and never promoted into

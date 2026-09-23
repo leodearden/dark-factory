@@ -60,6 +60,7 @@ import json
 import shlex
 import shutil
 import subprocess
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -77,6 +78,7 @@ import pytest
 # fixtures; test_golden_diffs_match_test_verify_plan_source() near the end of
 # the plan-golden section turns that copy's silent-drift risk into a loud
 # test failure instead.
+from _merge_lane_fakes import FakeVerifier, VerifyScript
 from test_dry_run_unblock import _make_agent_result, _RecordingScheduler
 from test_verify_plan import (
     DATA_MODULE_DIFF as _SRC_DATA_MODULE_DIFF,
@@ -91,6 +93,7 @@ from test_verify_plan import (
 from orchestrator import verify
 from orchestrator.b3_gate import ABORT, FRESH, POST_MERGE_RED_MAIN_REASON_PREFIX, check_proposal
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
+from orchestrator.dry_run_unblock import run_dry_run_unblock
 from orchestrator.git_ops import PROTECTED_PREFIXES, GitOps, WorktreeKind, _run
 from orchestrator.merge_queue import (
     MergeRequest,
@@ -209,8 +212,10 @@ def _make_req(
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# The real orchestrator/orchestrator.yaml pytest test_command (uv `--directory`
-# form) — drives the scenario-1b producer<->runner scoped drive. NOT used for
+# The orchestrator/orchestrator.yaml pytest test_command in its pre-task-3830
+# PAIRED spelling (the live config now carries `--directory orchestrator`
+# alone; the pairing is kept here because uv still accepts it and this drives
+# the parser's both-flags path) (uv `--directory` form) — drives the scenario-1b producer<->runner scoped drive. NOT used for
 # the strict round-trip assertion in scenario 1a: render() normalises a
 # `--directory` flag into a leading `cd <dir> &&`, which is argv-equivalent in
 # *effect* but not shlex-list-equal to the original (one extra `&&` token) —
@@ -748,6 +753,19 @@ class TestCheckRunTimeoutConsistency:
 #               coverage gap + B4); Boundary-test sketch row 9 ──────────────
 
 
+class _RealInvestigationVerifier(FakeVerifier):
+    """FakeVerifier that still runs the REAL dry-run investigation.
+
+    Stock FakeVerifier RECORDS an investigation instead of running it, which
+    would silently vacate this scenario's proposal assertions: the whole point
+    here is that run_dry_run_unblock really executes against the real
+    worktree, with only invoke_agent faked at the agent edge.
+    """
+
+    def dry_run_unblock(self, **investigation):
+        return run_dry_run_unblock(**investigation)
+
+
 class TestMergeVerifyBlockProducesGateableProposal:
     """Scenario 9 — GOLDEN: a merge-verify RED (generic task-fault, non-timeout)
 
@@ -809,10 +827,6 @@ class TestMergeVerifyBlockProducesGateableProposal:
             reqs.append(req)
             with (
                 patch(
-                    'orchestrator.merge_queue.run_scoped_verification',
-                    new=AsyncMock(return_value=compile_error_result),
-                ),
-                patch(
                     'orchestrator.merge_queue.verify_failure_is_preexisting_on_main',
                     new=AsyncMock(return_value=(False, '')),
                 ),
@@ -840,6 +854,9 @@ class TestMergeVerifyBlockProducesGateableProposal:
                     max_enospc=1,
                     dry_run_handles=handles,
                     event_store=MagicMock(),
+                    verifier=_RealInvestigationVerifier(
+                        default=VerifyScript(result=compile_error_result),
+                    ),
                 )
                 # Drain the fire-and-forget investigation (real
                 # run_dry_run_unblock, real git subprocess calls against
@@ -857,9 +874,13 @@ class TestMergeVerifyBlockProducesGateableProposal:
         assert outcome is not None
         assert outcome.status == 'blocked'
 
-        proposals = scheduler._meta.get('dry_run_proposals', [])
-        assert proposals, 'Expected a dry_run_proposals entry to be written'
-        entry = proposals[-1]
+        proposal_writes = [
+            call['metadata']['dry_run_proposals']
+            for call in scheduler.update_task_calls
+            if 'dry_run_proposals' in call['metadata']
+        ]
+        assert proposal_writes, 'Expected a dry_run_proposals entry to be written'
+        entry = proposal_writes[-1][-1]
         assert entry['block_class'] == BlockClass.MERGE_VERIFY_RED, (
             f"Expected block_class=MERGE_VERIFY_RED; got {entry.get('block_class')!r}"
         )
@@ -875,7 +896,7 @@ class TestMergeVerifyBlockProducesGateableProposal:
 
         verdict = check_proposal(
             entry, worktree=str(req.worktree), category='task_failure',
-            run_git=_fake_run_git,
+            run_git=_fake_run_git, now=datetime.now(UTC),
         )
         assert verdict['verdict'] != ABORT, (
             f'Expected a non-ABORT (gateable) verdict; got {verdict!r}'
@@ -996,6 +1017,7 @@ class TestB3GateProposalRouting:
         }
         verdict = check_proposal(
             entry, worktree='/tmp', category=None, run_git=_fake_git_fresh,
+            now=datetime.fromisoformat(self._INVESTIGATED_AT),
         )
         assert verdict['verdict'] == FRESH, (
             f'status-key presence must not abort the typed path, got {verdict!r}'

@@ -111,16 +111,44 @@ def _parse_ts(raw: Any) -> float | None:
 
 
 def _clean_modules(modules: Iterable[str]) -> list[str]:
-    """Non-empty string module keys, in order — the live feed's input guard."""
-    return [m for m in modules if isinstance(m, str) and m]
+    """Non-empty string module keys, DE-DUPLICATED, in first-seen order.
+
+    The one element-level guard for both feeds.  De-duplication is not cosmetic:
+    ``_apply_acquire`` treats a module it has already opened as a DOUBLE-ACQUIRE
+    and force-closes the prior span, so a payload naming the same module twice
+    would yield a phantom zero-duration ``truncated`` span — fabricating a
+    censoring signal on what is actually a clean pair.  ``files_to_modules``
+    de-duplicates upstream today, so this is defence against a payload
+    reconstructed from JSON rather than a live defect.
+
+    Filtering precedes hashing deliberately: ``modules`` comes off a JSON
+    payload and may carry unhashable junk (a nested list), which would make
+    ``dict.fromkeys`` raise instead of dropping it.
+    """
+    return list(dict.fromkeys(m for m in modules if isinstance(m, str) and m))
 
 
-def _modules_of(row: dict) -> list[str]:
-    """Module list from a lock event's ``data`` payload.
+def modules_of(row: dict) -> list[str]:
+    """THE rule for "which modules does this lock/skip event name" (INV-5).
 
-    Both lock event payloads carry ``data['modules']`` as a list; the
-    single-string coercion mirrors analyze_modules.py:135-136, which has to
-    tolerate the same field defensively.
+    Public because there is more than one consumer: :func:`iter_hold_spans`
+    reads it for span pairing, and ``analyze_modules`` reads it directly for
+    its per-module dispatch/skip counters, which spans do not supply.  One
+    shared helper rather than a second copy of the coercion in the CLI —
+    duplicating it is what INV-5 exists to forbid.
+
+    ``data['modules']`` is written by ``Scheduler._emit_lock_event``
+    (scheduler.py:8169) and the skip path (scheduler.py:4932-4941) as a list of
+    already-depth-coarsened module keys.  Everything below that is defence
+    against a payload reconstructed from JSON: a bare string is COERCED (it is
+    unambiguous about which single module it names, so dropping it would throw
+    away a real hold), while an unusable shape yields ``[]`` rather than a
+    phantom key.
+
+    The element-level filtering and de-duplication are delegated to
+    :func:`_clean_modules` rather than re-inlined, so the durable seed, the live
+    feed and the CLI cannot disagree about what a module list contains — the
+    same INV-5 reason this function is public at all.
     """
     data = row.get('data') or {}
     if not isinstance(data, dict):
@@ -130,7 +158,7 @@ def _modules_of(row: dict) -> list[str]:
         modules = [modules]
     if not isinstance(modules, list):
         return []
-    return [m for m in modules if isinstance(m, str) and m]
+    return _clean_modules(modules)
 
 
 #: One open hold per (task_id, module) -> its start, in POSIX seconds.  Both the
@@ -167,7 +195,8 @@ def _apply_release(
     release for the modules a plan refinement narrowed away while the task keeps
     holding the rest (scheduler.py:6954-6959).  A release with no open span is
     an orphan (3,594 DF / 5,780 reify in the measured trace) and is skipped —
-    the ``if task_id in open_acquires`` guard from analyze_modules.py:145.
+    a rule inherited from ``analyze_modules``' own pairing loop, which task 3869
+    then deleted by converging that CLI onto this helper.
     """
     for module in modules:
         start = open_spans.pop((task_id, module), None)
@@ -192,9 +221,9 @@ def iter_hold_spans(rows: Iterable[dict]) -> Iterator[HoldSpan]:
     predictor anyway.
 
     A release with no open span is an ORPHAN-RELEASE (3,594 DF / 5,780 reify
-    in the measured trace) and is silently ignored — the
-    ``if task_id in open_acquires`` guard from analyze_modules.py:145 carried
-    over verbatim.
+    in the measured trace) and is silently ignored.  ``analyze_modules`` used
+    to guard this in its own pairing loop; task 3869 pointed that CLI here
+    instead, so the rule now lives in one place.
 
     ERA BOUNDARIES close every still-open span at the boundary timestamp and
     mark it ``truncated``.  The span is *counted*, not discarded:
@@ -282,9 +311,9 @@ def iter_hold_spans(rows: Iterable[dict]) -> Iterator[HoldSpan]:
         # The acquire/release rules themselves live in the two module-level
         # helpers, shared verbatim with HoldHistory's live feed (INV-5).
         if event_type == _ACQUIRED:
-            yield from _apply_acquire(open_spans, task_id, _modules_of(r), at)
+            yield from _apply_acquire(open_spans, task_id, modules_of(r), at)
         else:
-            yield from _apply_release(open_spans, task_id, _modules_of(r), at)
+            yield from _apply_release(open_spans, task_id, modules_of(r), at)
 
     if open_spans:
         # END OF STREAM.  Unlike an era boundary, nothing here observed an end
@@ -631,6 +660,44 @@ class HoldHistory:
         wanted = str(task_id)
         return [module for (tid, module) in self._open if tid == wanted]
 
+    def _sweep_stale_open(
+        self, task_id: str, now: float
+    ) -> tuple[list[str], list[tuple[str, float]]]:
+        """Drop *task_id*'s open holds whose OWN start is older than the ceiling.
+
+        Returns ``(dropped, surviving)``: the module names swept, OLDEST FIRST,
+        and the ``(module, start)`` pairs left behind in acquire order.  Both
+        come out of the SINGLE pass over ``_open`` this method already makes —
+        ``_open`` holds every task's spans, and :meth:`predicted_remaining` is
+        the inner term of the scheduler's per-holder loop, so re-scanning it for
+        the survivors' starts and modules would triple that walk for nothing.
+
+        Per-KEY, deliberately not per-task: the ceiling asks "is THIS hold
+        bookkeeping residue?", which is a fact about one hold, and generalising
+        it to the whole task took live sibling holds down with the phantom.
+        :meth:`forget` answers the different question ("drop everything this
+        task holds") for its one caller, ``Scheduler.release``, and stays
+        all-or-nothing.
+
+        Staleness is monotone in ``start``, so the swept set is always exactly
+        the oldest prefix of the task's holds — the sweep cannot strand a
+        newer-but-stale entry.  Sorted rather than left in dict order so the
+        operator-facing log names them in a meaningful order.
+        """
+        stale: list[tuple[float, tuple[str, str]]] = []
+        surviving: list[tuple[str, float]] = []
+        for key, start in self._open.items():
+            if key[0] != task_id:
+                continue
+            if (now - start) > self._stale_open_secs:
+                stale.append((start, key))
+            else:
+                surviving.append((key[1], start))
+        stale.sort()
+        for _start, key in stale:
+            del self._open[key]
+        return [module for _start, (_tid, module) in stale], surviving
+
     def predicted_remaining(self, task_id: str, *, now: float) -> float | None:
         """Seconds *task_id* is predicted to keep holding its locks, or None.
 
@@ -651,29 +718,45 @@ class HoldHistory:
 
         STALENESS BACKSTOP.  An open hold older than ``stale_open_secs`` (24h by
         default, far beyond any real hold) is residue from a release that never
-        reached the live feed, not a running hold.  It is dropped and the answer
-        is None — because the alternative is the permanent 0.0 described above,
-        an actionable claim about a task that is not holding anything.  The
-        deterministic fix is :meth:`forget` on release; this catches the case
-        where that call never happens either.  Deliberately an ABSOLUTE ceiling
-        and not a multiple of the prediction: a hold running 10x its module's
-        median is exactly the overdue holder this method exists to surface, and
-        a relative ceiling would silence it.
+        reached the live feed, not a running hold.  Such holds are dropped —
+        because the alternative is the permanent 0.0 described above, an
+        actionable claim about a task that is not holding anything.
+
+        The sweep is PER-HOLD (:meth:`_sweep_stale_open`): only the entries past
+        the ceiling go, a live sibling hold SURVIVES and is still answered for,
+        and the answer is None only when nothing survives.  Dropping the whole
+        task instead cost twice over — no prediction for a task that really was
+        holding, and, with the live hold's open span gone, its real
+        ``lock_released`` reached ``_apply_release`` as an orphan and recorded
+        nothing, so a hold the feed observed end to end never became a sample.
+
+        The deterministic fix is :meth:`forget` on release; this catches the
+        case where that call never happens either.  Deliberately an ABSOLUTE
+        ceiling and not a multiple of the prediction: a hold running 10x its
+        module's median is exactly the overdue holder this method exists to
+        surface, and a relative ceiling would silence it.
         """
         wanted = str(task_id)
-        starts = [start for (tid, _module), start in self._open.items() if tid == wanted]
-        if not starts:
-            return None
-        elapsed = float(now) - min(starts)
-        if elapsed > self._stale_open_secs:
+        now_f = float(now)
+        dropped, surviving = self._sweep_stale_open(wanted, now_f)
+        if dropped:
+            # Names ONLY the swept modules and counts the survivors: an operator
+            # must not mistake a live hold for a consumed one, and the outcome is
+            # no longer knowable in advance, so the message asserts neither.
+            # Still a WARNING even when the prediction survives — a hold that
+            # reached the ceiling is a missed release however the call resolves.
+            # Fires ONCE per missed release, not once per call: the sweep really
+            # deletes the keys, so the next call for this task finds nothing
+            # stale and stays quiet.
             logger.warning(
-                'hold_history: task %s has open hold(s) %.0fs old (> %.0fs) — '
-                'treating as a missed release and dropping them; no prediction',
-                wanted, elapsed, self._stale_open_secs,
+                'hold_history: task %s — dropped %d open hold(s) older than %.0fs as missed '
+                'release(s): %s; %d open hold(s) remain',
+                wanted, len(dropped), self._stale_open_secs, dropped, len(surviving),
             )
-            self.forget(wanted)
+        if not surviving:
             return None
-        predicted = self.predicted_hold(self.open_modules(wanted))
+        elapsed = now_f - min(start for _module, start in surviving)
+        predicted = self.predicted_hold([module for module, _start in surviving])
         if predicted is None:
             return None
         return max(0.0, predicted - elapsed)

@@ -52,6 +52,176 @@ def _format_commit_bullets(commits: list[dict], limit: int | None = None) -> str
         )
     return '\n'.join(lines)
 
+DELIVERED_CHECK_BULLET_LIMIT = 20
+"""Max delivered-check bullets rendered in one briefing section (task 5359).
+
+Bounds the capability-gate section, whose source — a task's author-supplied
+``metadata.delivered_checks`` — carries no length ceiling of its own, and whose
+per-entry cost is unbounded too: a ``grep`` descriptor's ``pattern`` is an
+arbitrary regex. Without a cap the section grows with the author's list in
+EVERY architect/simple_task dispatch of that task. As with
+``COMMIT_BULLET_LIMIT``, the truncation is rendered VISIBLY so the agent knows
+the list is partial and can read the rest from the task record itself.
+"""
+
+_DELIVERED_CHECK_FIELDS_BY_KIND = {
+    'grep': ('pattern', 'expect', 'paths'),
+    'script': ('script', 'args', 'timeout_secs'),
+}
+"""Descriptor fields to render per ``kind``, mirroring
+``shared.capability_manifest.DeliveredCheckMeta``'s mutually exclusive
+grep/script slices. Single source for BOTH the recognised-kind bullet and the
+unrecognised-kind fallback (which renders whichever of the union is present),
+so the two paths cannot drift. ``test_briefing.py`` pins the union against the
+live model's ``model_fields``, so a field added to ``_CheckFieldsBase`` and not
+added here fails there rather than vanishing silently from every prompt.
+"""
+
+_DELIVERED_CHECK_LIST_FIELDS = {'paths': 'whole tree', 'args': 'none'}
+"""List-valued descriptor fields, mapped to what an EMPTY list means to the
+runner — ``paths: []`` greps the whole tree, ``args: []`` passes none. Rendering
+the meaning rather than a bare ``[]`` keeps the bullet readable for an agent.
+"""
+
+
+def _format_delivered_checks(checks: object) -> str:
+    """Render a task's ``metadata.delivered_checks`` as an agent-readable block.
+
+    Returns '' for a falsy input so ``BriefingAssembler._format_task`` can omit
+    the whole section on the common path (most tasks declare no capability).
+
+    One bullet per descriptor, field-labelled so the rendered text names every
+    field of :class:`shared.capability_manifest.DeliveredCheckMeta` — a field
+    added to that model must not vanish silently from the prompt, which
+    ``test_briefing.py::TestFormatDeliveredChecks`` pins against the live
+    schema. Output is capped at ``DELIVERED_CHECK_BULLET_LIMIT`` with a visible
+    "…and N more" line, the never-silent-truncation convention
+    :func:`_format_commit_bullets` documents.
+
+    ``metadata`` is persisted, untyped data and ``_format_task`` runs on every
+    dispatch, so this fails OPEN the way
+    ``BriefingAssembler._format_prior_proposal`` does for ``files_referenced``:
+    a bare dict is accepted as a one-element list (a shape ``parse_metadata``
+    accepts, so a real task can carry one), ``paths``/``args`` elements are
+    ``str()``-coerced, and an entry whose ``kind`` is missing or unrecognised
+    degrades to a VISIBLE partial bullet rather than being dropped — dropping it
+    would reproduce this section's own reason for existing one level down, since
+    an unseen check still blocks mark-done. An element that is not a dict at all
+    cannot be given a bullet, so it is COUNTED visibly instead and the section is
+    still emitted: ``parse_metadata`` preserves a wrong-shaped slice with only a
+    ``SchemaWarning``, ``run_delivered_check`` maps such an entry to ERRORED, and
+    the gate turns that into a withheld mark-done — so returning '' would block a
+    task from ever stamping done while showing its agent no gate at all. '' is
+    reserved for a value that is neither a dict nor a list/tuple, i.e. genuinely
+    nothing to show.
+
+    The gate's own arming is CONDITIONAL (``delivered_checks.enabled``,
+    green-tier hot-reloadable), and this renderer is pure with no view of
+    config — so the block states the mechanical claim conditionally rather than
+    asserting a gate that may be disarmed at dispatch time. The directive is
+    unconditional either way: the descriptors are the acceptance contract the
+    task was filed under, armed gate or not.
+
+    The block carries its OWN reading directive rather than relying on the six
+    consuming prompt bodies to explain it — the same co-location precedent
+    ``_format_prior_proposal`` follows with its verify-before-reuse line. The
+    directive is load-bearing: ``docs/task-authoring.md`` §3.3 records that a
+    symbol-name grep "is satisfiable by prose — a comment, a docstring, or a
+    variable named after the thing", so handing an agent the literal pattern is
+    a teach-to-the-test hazard unless the same text tells it that matching the
+    pattern without delivering the behaviour is a defect.
+    """
+    if not checks:
+        return ''
+    if isinstance(checks, dict):
+        checks = [checks]
+    if not isinstance(checks, (list, tuple)):
+        return ''
+
+    entries = [check for check in checks if isinstance(check, dict)]
+    dropped = len(checks) - len(entries)
+
+    shown = entries[:DELIVERED_CHECK_BULLET_LIMIT]
+    lines = [_delivered_check_bullet(check) for check in shown]
+    hidden = len(entries) - len(shown)
+    if hidden > 0:
+        lines.append(
+            f'- …and {hidden} more declared check(s) (not shown — read the full '
+            f'list from this task\'s `metadata.delivered_checks`)'
+        )
+    if dropped > 0:
+        noun = 'entry' if dropped == 1 else 'entries'
+        lines.append(
+            f'- ⚠ {dropped} malformed {noun} on this task\'s '
+            f'`metadata.delivered_checks` could not be rendered here — still '
+            f'evaluated by the gate, so read the raw list from the task record.'
+        )
+    bullets = '\n'.join(lines)
+
+    return f"""\
+## Declared Capability Gate (metadata.delivered_checks)
+
+When the capability gate is enabled (the `delivered_checks.enabled` config leaf,
+which an operator can hot-reload), this task's OWN mark-done is gated on the
+capability checks below — not only its dependents'
+(`orchestrator/src/orchestrator/delivered_checks.py::gate_mark_done_on_delivered_checks`).
+
+{bullets}
+
+After this task lands, a `grep` check is re-run with `git grep -E` against the
+COMMITTED `main` tree and a `script` check against the working checkout. Under
+that gate a FAILED check blocks mark-done; on the dependency path it also fires
+an escalation routed straight at a human. Treat the checks as binding whether or
+not the gate is armed on this fleet: they are the acceptance contract this task
+was filed under.
+
+Deliver the BEHAVIOUR each capability names. Satisfying a pattern with a comment, a
+docstring, or a variable named after the thing is a defect, not a pass. If a
+descriptor cannot be satisfied by the work this task should do, escalate it
+(`escalate_blocker(category='design_concern')`) rather than writing the string to
+make the check match. The descriptor contract lives in `docs/task-authoring.md` §3.3
+— read it there rather than inferring it from these bullets.
+"""
+
+
+def _delivered_check_bullet(check: dict) -> str:
+    """Render one delivered-check descriptor as a single field-labelled bullet.
+
+    An unrecognised or missing ``kind`` renders whichever descriptor fields are
+    present, flagged UNRECOGNISED so the malformation is visible to whoever
+    reads the prompt and the agent can ask rather than guess.
+    """
+    kind = check.get('kind')
+    fields = [f'kind: `{kind}`']
+    if kind in _DELIVERED_CHECK_FIELDS_BY_KIND:
+        fields += [
+            _delivered_check_field(check, name)
+            for name in _DELIVERED_CHECK_FIELDS_BY_KIND[kind]
+        ]
+    else:
+        fields.append('UNRECOGNISED descriptor, shown as-is')
+        fields += [
+            _delivered_check_field(check, name)
+            for group in _DELIVERED_CHECK_FIELDS_BY_KIND.values()
+            for name in group
+            if name in check
+        ]
+    return f'- name: `{check.get("name")}` — ' + ', '.join(fields)
+
+
+def _delivered_check_field(check: dict, name: str) -> str:
+    """Render one descriptor field as ``name: value``, coercing defensively."""
+    value = check.get(name)
+    if name not in _DELIVERED_CHECK_LIST_FIELDS:
+        return f'{name}: `{value}`'
+    if value is None:
+        items: list = []
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        items = [value]
+    return f'{name}: {", ".join(str(v) for v in items) or _DELIVERED_CHECK_LIST_FIELDS[name]}'
+
 
 FOREIGN_PROJECT_TAG_KEYS = ('src_project', 'project_id', 'group_id', 'project')
 """Metadata keys, in precedence order, that name a memory result's owning project.
@@ -65,6 +235,26 @@ co-present ``project_id``/``group_id`` on the same entry. ``dst_project`` is
 deliberately ABSENT from this tuple: consulting it would falsely certify a
 rehomed foreign fact as local, since it names where the fact was relocated
 TO, not where it came from.
+"""
+
+
+GROUPED_CHILD_KEYS = ('amendments', 'matched_children')
+"""The keys under which fused-memory nests CHILD bodies inside a kept result.
+
+``fused_memory.server.grouped_read.group_search_results`` collapses an
+amendment/sighting hit into its parent and hangs the child data off the
+surviving parent entry at ``entry['grouped']``: truncated bodies under
+``amendments`` (bounded digests) and FULL bodies under ``matched_children``
+(``MATCHED_CHILDREN_KEY`` — where a swallowed matched child is pinned so its
+text stays reachable). Both render verbatim into the ``# Context`` block, so
+both must be walked.
+
+``grouped['parent']`` is deliberately ABSENT from this tuple: it is produced
+only by ``group_memory_document``, which serves the ``get_memory_by_id`` tool,
+and this module never calls that tool (verified — briefing.py contains no
+``get_memory_by_id`` reference; its only memory-tool call is ``search``, in
+:meth:`BriefingAssembler._mcp_search`). A branch for it would be unreachable
+code.
 """
 
 
@@ -110,7 +300,120 @@ def _result_project(entry: dict) -> tuple[str, str] | None:
     return None
 
 
-def filter_foreign_project_results(payload_text: str, project_id: str) -> tuple[str, int]:
+def _foreign_tag(entry: dict, target: str) -> tuple[str, str] | None:
+    """The ``(key, value)`` of *entry*'s project tag when it names a FOREIGN project.
+
+    THE single spelling of the drop decision, shared by the top-level result
+    loop in :func:`filter_foreign_project_results` and the nested-child loop in
+    :func:`_filter_grouped_children`. The whole value of the descent is that a
+    nested child is judged by the SAME rule as a top-level result; two
+    independent copies of "read the tag, canonicalise, compare" would be
+    exactly the silent-divergence class this module otherwise works hard to
+    prevent — a later change to the comparison (a project whitelist, an
+    allow-empty-tag rule) applied to only one site would leave the other
+    quietly stricter, and a nested-only divergence surfaces as ``dropped == 0``,
+    indistinguishable from "nothing foreign found".
+
+    ``target`` must ALREADY be canonicalised by :func:`_canonical_project`: it
+    is loop-invariant, so it is normalised once by the caller rather than once
+    per entry.
+
+    Returns ``None`` — i.e. KEEP — both when the entry carries no readable tag
+    (the deliberate keep-untagged policy documented on
+    :func:`filter_foreign_project_results`) and when its tag canonicalises
+    equal to ``target``. The two are not distinguished here because neither
+    caller acts on the difference; each only needs to know whether to drop.
+
+    The firing key rides along with the value so a caller can log WHICH key
+    fired and WHAT it said, and so diagnose a false-positive filter from the
+    logs alone.
+    """
+    match = _result_project(entry)
+    if match is None:
+        return None
+    key, tag = match
+    if _canonical_project(tag) == target:
+        return None
+    return key, tag
+
+
+def _filter_grouped_children(entry: dict, target: str) -> int:
+    """Drop cross-project CHILD entries nested inside a KEPT result's block.
+
+    Walks :data:`GROUPED_CHILD_KEYS` inside ``entry['grouped']`` and applies
+    the SAME rule the top-level loop applies — literally the same predicate,
+    :func:`_foreign_tag`, so the ``src_project`` precedence order, the
+    canonicalisation and the keep-untagged policy exist in ONE place and
+    cannot drift apart between the two call sites. Returns the number of
+    nested entries dropped, which the caller reports SEPARATELY from its own
+    top-level drops — see :func:`filter_foreign_project_results`.
+
+    SURGICAL. Only the child LISTS are rewritten, and only when something was
+    actually dropped. ``amendment_count`` / ``sighting_count`` are NEVER
+    recomputed: they are the EXACT values ``_read_grouped_document``
+    (``fused_memory/server/grouped_read.py``:292-327) got from
+    ``count_memories_by_metadata``, deliberately independent of what the
+    bounded digest list happens to contain — the block already reports a
+    short list via ``truncated`` rather than by shrinking the count. A
+    briefing that "fixed" the apparent inconsistency between a shortened list
+    and its count would be fabricating a number the store never returned.
+    ``truncated``, ``children_unavailable`` and every other ``grouped`` key
+    are likewise left exactly as the server sent them.
+
+    FAILS OPEN, like the rest of this module: a ``grouped`` value or a child
+    collection of an unexpected TYPE is left untouched (and logged at WARNING,
+    since a shape surprise means the safeguard did not run on that entry)
+    rather than raising, and a nested entry that is not a dict is KEPT — the
+    same treatment the top-level loop gives a stray non-dict result.
+    """
+    grouped = entry.get('grouped')
+    if grouped is None:
+        # The overwhelmingly common shape: a canonical with no child records
+        # gets no grouped block at all.
+        return 0
+    if not isinstance(grouped, dict):
+        logger.warning(
+            f'filter_foreign_project_results: entry {entry.get("id")!r} has a '
+            f"'grouped' value of type {type(grouped).__name__}, not a dict; "
+            'nested children left unfiltered'
+        )
+        return 0
+    dropped = 0
+    for key in GROUPED_CHILD_KEYS:
+        children = grouped.get(key)
+        if children is None:
+            continue
+        if not isinstance(children, list):
+            logger.warning(
+                f'filter_foreign_project_results: entry {entry.get("id")!r} has '
+                f'grouped[{key!r}] of type {type(children).__name__}, not a list; '
+                'left unfiltered'
+            )
+            continue
+        kept = []
+        for child in children:
+            # A non-dict nested entry is unclassifiable, not foreign — kept,
+            # exactly as an untagged child is. (``_result_project``, reached
+            # through ``_foreign_tag``, already tolerates a non-dict
+            # ``metadata`` on a well-formed one.)
+            if isinstance(child, dict) and (foreign := _foreign_tag(child, target)) is not None:
+                tag_key, tag = foreign
+                dropped += 1
+                logger.debug(
+                    f'filter_foreign_project_results: dropped nested '
+                    f'{child.get("id")!r} under {entry.get("id")!r} '
+                    f'({tag_key}={tag!r})'
+                )
+                continue
+            kept.append(child)
+        if len(kept) != len(children):
+            grouped[key] = kept
+    return dropped
+
+
+def filter_foreign_project_results(
+    payload_text: str, project_id: str
+) -> tuple[str, int, int]:
     """Drop cross-project results from a fused-memory ``search`` JSON payload.
 
     ``payload_text`` is the JSON-serialised ``{'results': [...]}`` dict that
@@ -122,6 +425,28 @@ def filter_foreign_project_results(payload_text: str, project_id: str) -> tuple[
     and kept otherwise — including when ``metadata`` is missing, empty, or
     not a dict.
 
+    GROUPED CHILDREN (task 4008). Reading only each result's TOP-LEVEL tag is
+    not enough: ``fused_memory.server.grouped_read.group_search_results``
+    nests child bodies inside a KEPT parent's entry (see
+    :data:`GROUPED_CHILD_KEYS`), and ``_get_memory_context`` appends this
+    payload verbatim, so a mis-tagged child hanging off a correctly-tagged
+    canonical would render as raw JSON in the agent's ``# Context`` block
+    having bypassed the safeguard entirely. :func:`_filter_grouped_children`
+    therefore descends into every KEPT entry and applies the same rule
+    (:func:`_foreign_tag`) to its children. This depends on grouped_read.py's
+    ``_origin_tags`` projection actually emitting ``metadata`` on nested
+    entries — without it every nested entry is untagged and the descent is a
+    safeguard that never fires.
+
+    Nested drops are returned SEPARATELY from top-level drops rather than
+    summed into one number. A dropped child is not a dropped result: the two
+    have different blast radii (a dropped result removes a whole recalled
+    fact; a dropped child only shortens a kept fact's amendment list), and
+    ``_get_memory_context`` renders these counts to an operator as the ONLY
+    signal that a leak was blocked, so the arithmetic has to say which kind
+    happened. Both still gate the no-op fast path below, so a nested-only
+    drop can never be swallowed by it.
+
     Untagged results are deliberately kept rather than dropped: every
     Graphiti-sourced result has ``metadata == {}`` today (verified at
     ``fused-memory/src/fused_memory/services/memory_service.py:3332-3407``,
@@ -129,12 +454,15 @@ def filter_foreign_project_results(payload_text: str, project_id: str) -> tuple[
     dropping untagged results would empty the ``# Context`` block for most
     queries. Only Mem0-sourced results can carry a project tag today.
 
-    Returns the re-serialised payload — sibling top-level keys such as
+    Returns ``(payload_text, dropped, nested_dropped)``: the re-serialised
+    payload — sibling top-level keys such as
     ``degraded``/``failed_stores``/``failed_store_diagnostics`` are preserved
-    verbatim — and the number of results dropped. Returns ``('', dropped)``
-    when nothing survives, so the existing ``if section:`` guards in
-    ``_get_memory_context`` skip an all-foreign section the same way they
-    skip an empty one.
+    verbatim — then the number of top-level RESULTS dropped, then the number
+    of nested CHILDREN dropped from inside results that survived. Returns
+    ``('', dropped, nested_dropped)`` when nothing survives, so the existing
+    ``if section:`` guards in ``_get_memory_context`` skip an all-foreign
+    section the same way they skip an empty one. (``nested_dropped`` is
+    necessarily 0 in that case: a dropped parent is never descended into.)
 
     When nothing is dropped (the common case — see above), ``payload_text``
     is returned unchanged rather than re-serialised: this preserves the
@@ -146,7 +474,7 @@ def filter_foreign_project_results(payload_text: str, project_id: str) -> tuple[
 
     Fails OPEN on a malformed payload — non-JSON text, JSON that is not an
     object, or a missing/non-list ``results`` — returning ``(payload_text,
-    0)`` unchanged and logging a WARNING. Blanking the ``# Context`` block on
+    0, 0)`` unchanged and logging a WARNING. Blanking the ``# Context`` block on
     a serialisation surprise would be a silent capability loss across every
     prompt builder; preserving today's (unfiltered) behaviour with a loud
     warning is the safer failure direction. A stray non-dict entry, or a
@@ -157,14 +485,14 @@ def filter_foreign_project_results(payload_text: str, project_id: str) -> tuple[
         payload = json.loads(payload_text)
     except (json.JSONDecodeError, TypeError, ValueError) as e:
         logger.warning(f'filter_foreign_project_results: payload is not valid JSON ({e}); keeping unfiltered')
-        return payload_text, 0
+        return payload_text, 0, 0
 
     if not isinstance(payload, dict):
         logger.warning(
             f'filter_foreign_project_results: payload is a {type(payload).__name__}, '
             'not a JSON object; keeping unfiltered'
         )
-        return payload_text, 0
+        return payload_text, 0, 0
 
     results = payload.get('results')
     if not isinstance(results, list):
@@ -172,40 +500,44 @@ def filter_foreign_project_results(payload_text: str, project_id: str) -> tuple[
             f"filter_foreign_project_results: payload['results'] is a "
             f'{type(results).__name__}, not a list; keeping unfiltered'
         )
-        return payload_text, 0
+        return payload_text, 0, 0
 
     target = _canonical_project(project_id)
     kept = []
     dropped = 0
+    nested_dropped = 0
     for entry in results:
         if not isinstance(entry, dict):
             kept.append(entry)
             continue
-        match = _result_project(entry)
-        if match is not None:
-            key, tag = match
-            if _canonical_project(tag) != target:
-                dropped += 1
-                logger.debug(
-                    f'filter_foreign_project_results: dropped {entry.get("id")!r} '
-                    f'({key}={tag!r})'
-                )
-                continue
+        if (foreign := _foreign_tag(entry, target)) is not None:
+            key, tag = foreign
+            dropped += 1
+            logger.debug(
+                f'filter_foreign_project_results: dropped {entry.get("id")!r} '
+                f'({key}={tag!r})'
+            )
+            continue
+        # Only for a KEPT entry: a dropped parent takes its whole subtree with
+        # it, so descending into one would double-count what is already gone.
+        nested_dropped += _filter_grouped_children(entry, target)
         kept.append(entry)
 
     if not kept:
-        return '', dropped
+        return '', dropped, nested_dropped
 
-    if dropped == 0:
+    if dropped == 0 and nested_dropped == 0:
         # No-op: nothing was filtered, so avoid re-serialising a payload
         # that is byte-for-byte unchanged — this is the overwhelmingly
         # common case, since every Graphiti-sourced result is untagged
-        # today and the filter never fires on it.
-        return payload_text, 0
+        # today and the filter never fires on it. Gated on BOTH counters:
+        # a nested-only drop mutated a child list in place, so returning
+        # the original text here would silently un-drop it.
+        return payload_text, 0, 0
 
     payload = dict(payload)
     payload['results'] = kept
-    return json.dumps(payload, indent=2, ensure_ascii=False), dropped
+    return json.dumps(payload, indent=2, ensure_ascii=False), dropped, nested_dropped
 
 
 MEMORY_CONTEXT_CAVEAT = (
@@ -709,35 +1041,26 @@ suggestions-only on this exact tree — call
     async def build_implementer_prompt(
         self,
         plan: dict,
-        iteration_log: list[dict],
         context: str | None = None,
         rebase_notice: dict | None = None,
         task_id: str | None = None,
         wip_notice: list[dict] | None = None,
     ) -> str:
-        """Build prompt for the implementer agent."""
+        """Build prompt for the implementer agent.
+
+        Renders NO plan progress and NO iteration history (tasks 5728, 5744):
+        plan.json and iterations.jsonl are their single homes, and the Session
+        Startup Protocol below mandates reading both. A copy frozen into this
+        string is the one that can lie, because the retry ladder replays an
+        assembled prompt verbatim into a fresh session
+        (shared/src/shared/cli_invoke.py::_reset_for_fresh_retry). Pinned by
+        orchestrator/tests/test_briefing_progress_spot.py.
+        """
         effective_tid = task_id or plan.get('task_id')
         if context is None:
             context = await self._get_memory_context(effective_tid)
 
         identity = self._agent_identity(effective_tid, 'implementer')
-
-        completed = [s for s in plan.get('steps', []) if isinstance(s, dict) and s.get('status') == 'done']
-        pending = [s for s in plan.get('steps', []) if isinstance(s, dict) and s.get('status') == 'pending']
-        pre_completed = [s for s in plan.get('prerequisites', []) if isinstance(s, dict) and s.get('status') == 'done']
-        pre_pending = [s for s in plan.get('prerequisites', []) if isinstance(s, dict) and s.get('status') == 'pending']
-
-        log_summary = ''
-        if iteration_log:
-            recent = iteration_log[-3:]
-            log_lines = []
-            for entry in recent:
-                log_lines.append(
-                    f"- Iteration {entry.get('iteration', '?')}: "
-                    f"completed {entry.get('steps_completed', [])}, "
-                    f"summary: {entry.get('summary', 'N/A')}"
-                )
-            log_summary = "## Recent Iterations\n\n" + '\n'.join(log_lines)
 
         rebase_section = ''
         if rebase_notice:
@@ -792,12 +1115,6 @@ Before writing any new code:
 **Task:** {plan.get('title', 'Unknown')}
 **Analysis:** {plan.get('analysis', 'N/A')}
 
-## Progress
-
-- Prerequisites: {len(pre_completed)} done, {len(pre_pending)} pending
-- Steps: {len(completed)} done, {len(pending)} pending
-
-{log_summary}
 {rebase_section}
 {wip_section}
 # Session Startup Protocol
@@ -832,7 +1149,6 @@ Execute the next pending steps in TDD order. Commit after each step. Call `mark_
     async def build_amender_prompt(
         self,
         plan: dict,
-        iteration_log: list[dict],
         suggestions: list[dict],
         locked_modules: list[str],
         context: str | None = None,
@@ -844,24 +1160,27 @@ Execute the next pending steps in TDD order. Commit after each step. Call `mark_
         ``suggestions`` is the pre-filtered in-scope list (already restricted
         to files inside ``locked_modules``). ``locked_modules`` is listed in
         the prompt so the agent can self-check scope before editing.
+
+        The Scope Discipline block must stay true at EVERY ``lock_depth`` this
+        orchestrator dispatches under, because one prompt string serves every
+        project. Its original wording ("creating new files inside them is
+        allowed") was authored against a package-shaped depth, where a module
+        was a directory a new file could sit inside. At a file-granular depth
+        the entries above ARE single files, so "inside them" is unsatisfiable
+        and a created path is necessarily outside the list — which is expected
+        and is not a scope violation (esc-3147-7, ruled 2026-08-24: act, then
+        auto-widen). Phrase the rules around the EDIT/CREATE distinction, which
+        holds at any depth, never around containment in a "module".
+
+        Renders NO iteration history (task 5744), for the same reason as
+        :meth:`build_implementer_prompt`: iterations.jsonl is its single home
+        and the Action section below mandates reading it.
         """
         effective_tid = task_id or plan.get('task_id')
         if context is None:
             context = await self._get_memory_context(effective_tid)
 
         identity = self._agent_identity(effective_tid, 'implementer')
-
-        log_summary = ''
-        if iteration_log:
-            recent = iteration_log[-3:]
-            log_lines = []
-            for entry in recent:
-                log_lines.append(
-                    f"- Iteration {entry.get('iteration', '?')} "
-                    f"[{entry.get('agent', '?')}]: "
-                    f"{entry.get('summary', 'N/A')}"
-                )
-            log_summary = "## Recent Iterations\n\n" + '\n'.join(log_lines)
 
         modules_list = '\n'.join(f'- `{m}`' for m in sorted(locked_modules))
 
@@ -901,20 +1220,22 @@ expanding the task's concurrency footprint.
 **Task:** {plan.get('title', 'Unknown')}
 **Analysis:** {plan.get('analysis', 'N/A')}
 
-{log_summary}
-
 ## Scope Discipline
 
 This task holds locks for the following modules:
 
 {modules_list}
 
-1. Work ONLY inside these locked modules. Creating new files inside them is
-   allowed; editing files outside them is NOT.
+1. Do NOT edit an existing file that is not covered above. CREATING a new
+   file IS allowed, and is the right move when a suggestion calls for one
+   (say, extracting a shared test helper): a path that did not exist cannot
+   collide with another task's concurrent edits. Where the entries above are
+   themselves single files, a new file is necessarily outside that list —
+   that is expected, and not something to escalate.
 2. Do NOT modify the plan — it is durable at
    `<worktree_base>/.task-meta/<worktree-name>/plan.json` (the lane
    `.task/plan.json` is a symlink into it) and frozen for this pass.
-3. If a suggestion requires touching a file outside the locked modules,
+3. If a suggestion requires EDITING an existing file not covered above,
    skip it and note the reason in your commit message — it will be
    re-surfaced by the next review cycle or escalated as a follow-up task.
 4. Prefix amendment commit messages with `amend:` so they're distinguishable
@@ -1212,7 +1533,7 @@ from where the previous agent left off.
 # Action
 
 1. Understand the escalation and the task context.
-2. Check whether this task's branch is already merged to main (`git merge-base --is-ancestor HEAD main` from the worktree, or `git log --oneline main | head -20`). If the branch is already on main, set the task status to `done` via fused-memory's `set_task_status` tool — **`done_provenance` must always include `kind`**: pass `done_provenance={{"kind": "found_on_main", "commit": "<landing-sha-on-main>", "note": "<one-sentence explanation>"}}` (both `commit` and `note` are required for this kind — there is no commit-less fallback), e.g. note "covered by sibling task" or "already merged prior to this session". If there is no distinct merge commit to cite (e.g. a fast-forward merge), use the branch's own tip commit SHA as `commit` — after a fast-forward that SHA becomes `main`'s HEAD directly — and say so in `note` (e.g. "fast-forward merge, no separate merge commit"). If the landing commit came from this session calling `merge_request`, use `done_provenance={{"kind": "merged", "commit": "<merge-sha>"}}` instead. Then call `resolve_issue` explaining the task was already merged. Do NOT attempt to fix code or re-merge.
+2. Check whether this task's branch is already merged to main (`git merge-base --is-ancestor HEAD main` from the worktree; `git log --oneline main | head -20` is a sanity glance ONLY — never read a sha off it for `done_provenance`, per `skills/_shared/deriving-landed-sha.md`'s "never from HEAD or an eyeballed listing" rule). If the branch is already on main, set the task status to `done` via fused-memory's `set_task_status` tool — **`done_provenance` must always include `kind`**: pass `done_provenance={{"kind": "found_on_main", "commit": "<landing-sha-on-main>", "note": "<one-sentence explanation>"}}` (both `commit` and `note` are required for this kind — there is no commit-less fallback), e.g. note "covered by sibling task" or "already merged prior to this session". If there is no distinct merge commit to cite (e.g. a fast-forward merge, or work covered by a sibling task), do **not** use the branch's own tip commit SHA — `git merge-base --is-ancestor` passes trivially for a branch that never advanced, whose tip is `main`'s own OLD base commit and carries none of this task's work. Cite instead the commit on `main` that actually carries or cites the work (this branch's own commit whose subject cites the task, or the sibling's landing commit), and record the branch tip in `note` (e.g. "landing confirmed by task citation on main; no separate merge commit (branch tip <tip-sha>)"). Derive that sha with the citation gate — `git log main --extended-regexp --format='%H %s' --grep='^(merge|impl|amend|fix|test|feat|chore|docs|refactor|style|build)(\\(\\b<TASK_ID>\\b[):]|.*\\btask/<TASK_ID>\\b)|^Merge task/<TASK_ID> into |\\(#?<TASK_ID>\\)|\\(task <TASK_ID>\\)'` — walking the rows most-recent-first and taking the first whose **subject** (the `%s` field) cites the task: `--grep` matches the whole message, so a body line can match spuriously. Prefer, among the rows that qualify, one whose diff touches this task's declared `metadata.files`. `skills/_shared/deriving-landed-sha.md`'s step-4 citation gate is the full ladder, including the case where NO row cites the task — that is a phantom branch, not a landing, so do not stamp anything and report it as not-landed instead. `escalation/src/escalation/server.py::_found_on_main_response` resolves the same question the same way — task 3103 changed its live-branch path from the branch tip to the citation commit for exactly this reason. If the landing commit came from this session calling `merge_request`, use `done_provenance={{"kind": "merged", "commit": "<merge-sha>"}}` instead. Then call `resolve_issue` explaining the task was already merged. Do NOT attempt to fix code or re-merge.
 3. Read the relevant code.
 4. Handle the escalation — fix the issue, or triage suggestions.
 5. Run tests to verify any code changes.
@@ -1258,37 +1579,42 @@ Handle this escalation, then call `resolve_issue` with a summary.
         """Call fused-memory search for project context."""
         recalled_sections: list[str] = []
         foreign_dropped = 0
+        nested_dropped = 0
         queries_fired = 0
         memory_unavailable = False
 
         try:
             # Project overview
-            overview, dropped = await self._scoped_search('project overview architecture goals')
+            overview, dropped, nested = await self._scoped_search('project overview architecture goals')
             foreign_dropped += dropped
+            nested_dropped += nested
             queries_fired += 1
             if overview:
                 recalled_sections.append(f'## Project Context\n\n{overview}')
 
             # Conventions
-            conventions, dropped = await self._scoped_search('coding conventions and project norms')
+            conventions, dropped, nested = await self._scoped_search('coding conventions and project norms')
             foreign_dropped += dropped
+            nested_dropped += nested
             queries_fired += 1
             if conventions:
                 recalled_sections.append(f'## Conventions\n\n{conventions}')
 
             # Recent decisions
-            decisions, dropped = await self._scoped_search('recent decisions and rationale')
+            decisions, dropped, nested = await self._scoped_search('recent decisions and rationale')
             foreign_dropped += dropped
+            nested_dropped += nested
             queries_fired += 1
             if decisions:
                 recalled_sections.append(f'## Recent Decisions\n\n{decisions}')
 
             # Task-specific context
             if task_id:
-                task_ctx, dropped = await self._scoped_search(
+                task_ctx, dropped, nested = await self._scoped_search(
                     f'task {task_id} context and related decisions'
                 )
                 foreign_dropped += dropped
+                nested_dropped += nested
                 queries_fired += 1
                 if task_ctx:
                     recalled_sections.append(f'## Task Context\n\n{task_ctx}')
@@ -1306,11 +1632,24 @@ Handle this escalation, then call `resolve_issue` with a summary.
         # queries can all match one distinct foreign memory), so the note
         # names both numbers rather than implying `foreign_dropped` distinct
         # facts were found.
+        #
+        # Top-level and NESTED drops are named as separate quantities (task
+        # 4008 amendment). A nested drop removed an amendment digest or a
+        # pinned body from INSIDE a result that survived — it did not vacate
+        # a result slot — so folding the two into one "result slot(s)" figure
+        # would show an operator a number that does not match what they can
+        # see in the block. This note is the only signal a human gets that a
+        # leak was blocked; its arithmetic has to be legible.
         drop_note = ''
-        if foreign_dropped > 0:
+        if foreign_dropped > 0 or nested_dropped > 0:
             query_word = 'query' if queries_fired == 1 else 'queries'
+            counted = []
+            if foreign_dropped > 0:
+                counted.append(f'{foreign_dropped} memory result slot(s)')
+            if nested_dropped > 0:
+                counted.append(f'{nested_dropped} nested memory record(s)')
             drop_note = (
-                f'{foreign_dropped} memory result slot(s) across {queries_fired} '
+                f'{" and ".join(counted)} across {queries_fired} '
                 f'{query_word} were tagged to another project and filtered out'
             )
             logger.info(
@@ -1349,15 +1688,16 @@ Handle this escalation, then call `resolve_issue` with a summary.
 
         return '# Context\n\n' + caveat + '\n\n' + '\n\n---\n\n'.join(rendered_sections)
 
-    async def _scoped_search(self, query: str) -> tuple[str | None, int]:
+    async def _scoped_search(self, query: str) -> tuple[str | None, int, int]:
         """Search fused-memory and drop cross-project results from the reply.
 
         Thin wrapper over the UNCHANGED :meth:`_mcp_search` — never touches
         which queries fire or their ``limit`` (task 3253 owns that
         adjudication) — that applies :func:`filter_foreign_project_results`
         to the raw text before it reaches :meth:`_get_memory_context`.
-        Returns ``(None, 0)`` when the underlying search itself returned
-        nothing (nothing to filter).
+        Returns the filter's ``(text, dropped, nested_dropped)`` triple
+        verbatim, or ``(None, 0, 0)`` when the underlying search itself
+        returned nothing (nothing to filter).
 
         Assumes :meth:`_mcp_search` answers with a single JSON document: it
         joins every MCP response text block with ``'\\n'`` before returning
@@ -1370,7 +1710,7 @@ Handle this escalation, then call `resolve_issue` with a summary.
         """
         raw = await self._mcp_search(query)
         if not raw:
-            return None, 0
+            return None, 0, 0
         return filter_foreign_project_results(raw, self.project_id)
 
     async def _mcp_search(self, query: str) -> str | None:
@@ -1475,7 +1815,33 @@ A prior block-time investigation concluded the following; verify against the cur
                 ``build_architect_prompt`` to anti-anchor the first plan
                 derivation (C-A1): the architect must derive its own file
                 footprint rather than echoing the queue-time metadata guess.
+
+        Appends the task's own ``metadata.delivered_checks`` as a capability-gate
+        section via :func:`_format_delivered_checks` (task 5359) — the gate
+        ``orchestrator/src/orchestrator/delivered_checks.py::gate_mark_done_on_delivered_checks``
+        applies to THIS task's mark-done, not only to its dependents, so an agent
+        that cannot see it is measured against a contract it was never shown.
+        Deliberately NOT suppressed by ``include_files=False``: C-A1 hides a
+        queue-time GUESS, whereas this is an authored acceptance contract the
+        first derivation must plan against.
+
+        That exemption knowingly covers a grep descriptor's ``paths``, which IS
+        a file footprint and so does overlap C-A1's subject — the overlap was
+        noticed, not missed. The two differ in what they BIND. ``metadata.files``
+        binds nothing: the architect is told to derive its own footprint, so
+        echoing the guess only anchors it. ``paths`` binds the capability: it is
+        the scope ``git grep -E`` will actually search at mark-done, so an
+        architect that plans the behaviour into a directory ``paths`` does not
+        name has failed a check it was never shown. Hiding it would hand the
+        first derivation a contract it cannot evaluate while still blocking the
+        task on it — strictly the failure this section exists to cure. The
+        residual anchoring cost (``paths`` does convey a location) is accepted
+        as the cheaper half of that trade.
+
+        The descriptor contract itself lives in ``docs/task-authoring.md`` §3.3
+        — pointed at, never restated (INV-9).
         """
+        metadata = task.get('metadata') or {}
         lines = []
         if task.get('id'):
             lines.append(f'**ID:** {task["id"]}')
@@ -1485,10 +1851,12 @@ A prior block-time investigation concluded the following; verify against the cur
             lines.append(f'**Description:** {task["description"]}')
         if task.get('details'):
             lines.append(f'**Details:** {task["details"]}')
-        if include_files and task.get('metadata', {}).get('files'):
-            lines.append(f'**Files:** {", ".join(task["metadata"]["files"])}')
+        if include_files and metadata.get('files'):
+            lines.append(f'**Files:** {", ".join(metadata["files"])}')
         deps = task.get('dependencies', [])
         if deps:
             dep_ids = [str(d.get('id', d)) if isinstance(d, dict) else str(d) for d in deps]
             lines.append(f'**Dependencies:** {", ".join(dep_ids)}')
-        return '\n'.join(lines) if lines else json.dumps(task, indent=2)
+        body = '\n'.join(lines) if lines else json.dumps(task, indent=2)
+        checks_block = _format_delivered_checks(metadata.get('delivered_checks'))
+        return f'{body}\n\n{checks_block}' if checks_block else body

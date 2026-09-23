@@ -99,13 +99,6 @@ ALLOWLIST_ENTRIES: list[tuple[str, str, str, str]] = [
         "dict (dashboard display only, not on critical path)",
     ),
     (
-        "fused-memory/src/fused_memory/reconciliation/flag_dedup.py",
-        "filter_terminal_metadata_flags._safe_get_task",
-        "673e1da28bdc",
-        "debug-logged fail-safe with exc context: task-lookup error preserves "
-        "reconciliation flag in-place (explicit fail-safe comment in code)",
-    ),
-    (
         "orchestrator/src/orchestrator/agents/briefing.py",
         "BriefingAssembler._mcp_search",
         "9c9af4cd3b98",

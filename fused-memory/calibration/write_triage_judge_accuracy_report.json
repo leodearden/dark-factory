@@ -1,0 +1,80 @@
+{
+  "per_class": {
+    "duplicate": {
+      "n": 75,
+      "correct": 41,
+      "accuracy": 0.5467
+    },
+    "distinct": {
+      "n": 3,
+      "correct": 1,
+      "accuracy": 0.3333
+    },
+    "pseudo_contradiction": {
+      "n": 6,
+      "correct": 5,
+      "accuracy": 0.8333
+    },
+    "distractor": {
+      "n": 18,
+      "correct": 18,
+      "accuracy": 1.0
+    }
+  },
+  "confusion": {
+    "duplicate": {
+      "amended": 40,
+      "contested": 7,
+      "restated": 1,
+      "stored": 27
+    },
+    "distinct": {
+      "amended": 2,
+      "contested": 0,
+      "restated": 0,
+      "stored": 1
+    },
+    "pseudo_contradiction": {
+      "amended": 3,
+      "contested": 1,
+      "restated": 0,
+      "stored": 2
+    },
+    "distractor": {
+      "amended": 0,
+      "contested": 0,
+      "restated": 0,
+      "stored": 18
+    }
+  },
+  "duplicate_outcome_split": {
+    "restated": 1,
+    "amended": 40
+  },
+  "false_contested": 8,
+  "contested_ground_truth": {
+    "available": false,
+    "reason": "no_positive_contested_labels: the fixture carries 6 pseudo_contradiction records, every one curator-adjudicated NOT a contradiction, and 0 records labelled as a genuine contradiction. Contested recall and precision are therefore unmeasurable against this corpus; only the false-positive count below is a measurement."
+  },
+  "caveats": [
+    "No accuracy floor is asserted anywhere in this script or its tests (PRD D10). This artifact is evidence for a human decision, not a gate.",
+    "false_contested counts EVERY contested verdict, and every one of them is a false positive \u2014 see contested_ground_truth. A judge structurally incapable of ever answering `contested` would score identically to a perfect one here, so a low number is not evidence that the contradiction detector works.",
+    "The duplicate class accepts BOTH `restated` and `amended`, because the curator's labels do not separate a verbatim restatement from a rediscovery carrying a novel fragment. The split between them is reported as a distribution and is not scored as error.",
+    "The distractor class is a control this script constructs, not a curator label: one case per cluster whose slate carries no correct attach target at all. It is what distinguishes a judge that classifies from a judge that attaches to whatever it is shown.",
+    "Every accuracy here is measured over the WHOLE labelled corpus, not over the [t_low, t_high) middle band the production judge is actually responsible for. `build_judge_cases` emits a case for every non-canonical record and `run_judge_eval` calls the judge on each one directly \u2014 `decide_band`, `t_high` and `t_low` never enter the picture, and the band decision handed to `judge_write` is SYNTHESIZED as a middle-band one. So these figures include records that in production are answered deterministically without the judge ever seeing them, and whether the middle band alone would score higher or lower is not measured here. Filtering the cases to the band would need real per-record similarities and is deliberately not done."
+  ],
+  "provenance": {
+    "fixture_path": "tests/fixtures/write_triage_calibration.jsonl",
+    "judge_provider": "openai",
+    "judge_model": "gpt-4o-mini",
+    "limit": null,
+    "judge_candidate_count": 5,
+    "judge_enabled": true,
+    "record_count": 104,
+    "case_count": 102,
+    "candidate_count": 5,
+    "candidate_count_min": 5,
+    "distractor_count_requested": 4,
+    "distractor_count": 4
+  }
+}

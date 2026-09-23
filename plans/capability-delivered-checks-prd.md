@@ -165,10 +165,19 @@ tasks:
   - label: "α"                  # matches metadata.prd_task_label
     task_id: null               # int | null; stamped by commit_planning — never author-supplied
     title: "…"                  # human aid, not load-bearing
+    note: "…"                   # OPTIONAL durable task-level provenance (why a label was
+                                # split/renamed/re-homed). MUST NOT be a YAML comment:
+                                # commit_planning's stamp rewrites this file with
+                                # yaml.safe_dump and discards every comment in it.
     capabilities:
       - name: "kebab-case-capability-name"
         binding: "capability→producer (wired) — grep:shared/src/shared/task_metadata.py register_metadata_submodel"
-        verdict: PASS           # authoring-time G3/G6 verdict; PASS required to queue
+        verdict: PASS           # authoring-time G3/G6 verdict — PASS | FAIL | OPEN.
+                                # PASS = binding held at authoring time; PASS required to queue.
+                                # FAIL = capability measured ABSENT — blocks queueing until resolved.
+                                # OPEN = binding deliberately undecided, the decision homed in THIS
+                                #        leaf as its own work product; does not block queueing, and
+                                #        must never be read as a green G3 binding.
         delivered_check:        # OPTIONAL — omit or kind: manual to exclude from the gate
           kind: grep            # grep | script | manual
           pattern: "register_metadata_submodel\\('delivered_checks'"   # ERE, git-grep -E
@@ -181,7 +190,9 @@ tasks:
 ```
 
 Validation (α, enforced by the shared loader): `label` non-empty and unique
-per doc; `task_id` int|null; `kind` ∈ {grep, script, manual}; `grep` requires
+per doc; `task_id` int|null; `note` optional free text (task-level provenance);
+`verdict` ∈ {PASS, FAIL, OPEN} — a closed vocabulary, so anything else is
+rejected; `kind` ∈ {grep, script, manual}; `grep` requires
 `pattern` + `expect`, forbids `script`; `script` requires `script` +
 `timeout_secs`, forbids `pattern`/`expect`; `manual` forbids all check fields.
 Malformed docs → structured `ValidationError` naming the entry.

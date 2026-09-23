@@ -12,8 +12,8 @@ sibling stays permanently (``_run_unscoped_typechecks``, the module-level
 ``_build_remote_runners`` legacy-pool builder) or is monkeypatched by the
 existing test suite via the string path ``orchestrator.merge_queue.<name>``
 (``run_scoped_verification``, ``build_merge_verify_spec``, ``LocalRunner``,
-``VerifyRunnerPool``, ``_derive_task_files_from_git``, ``_run_drift_check``)
-— resolves it through a function-local (deferred) import from
+``VerifyRunnerPool``, ``_run_drift_check``) — resolves it through a
+function-local (deferred) import from
 :mod:`orchestrator.merge_queue` rather than a direct intra-module reference.
 This mirrors the ``_main_health_fingerprint`` convention in
 ``merge_queue.py`` and keeps this module free of any top-level import of
@@ -30,7 +30,11 @@ independent sibling detectives, not caller/callee.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import json
 import logging
+from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from orchestrator.event_store import EventStore
@@ -42,9 +46,9 @@ from orchestrator.merge_types import MergeRequest
 # resident binding (see its body).  Imported here only so TestReachBackRouting
 # has a "naive" orchestrator.merge_drift.run_scoped_verification patch target
 # to assert is NOT what governs.  _derive_task_files_from_git is deliberately
-# NOT imported here: unlike run_scoped_verification, nothing needs to prove a
-# merge_drift-local patch is inert for it, and _run_drift_check reaches back
-# to orchestrator.merge_queue for it exclusively (see its body).
+# NOT imported here and (as of task 2886 fix 1b) is no longer referenced by
+# _run_drift_check at all: the drift spec is now full-gate (task_files=None),
+# so the drift path performs no dispatching-host scope derivation.
 from orchestrator.verify import run_scoped_verification  # noqa: F401
 
 # LocalRunner / VerifyRunnerPool / build_merge_verify_spec: same reasoning —
@@ -62,6 +66,79 @@ if TYPE_CHECKING:
     from orchestrator.merge_queue import SpeculativeMergeWorker
 
 logger = logging.getLogger('orchestrator.merge_queue')
+
+
+# ---------------------------------------------------------------------------
+# Lever-C drift-check cadence persistence (task 2886 fix 1a)
+#
+# EXACT mirror of merge_shadow's ShadowCompareState +
+# _load_shadow_compare_state / _save_shadow_compare_state.  The drift-check
+# land counter was a worker-level in-memory int (``worker._drift_land_count``)
+# that the ~8h fleet redeploy resets to 0 before it ever reaches
+# ``verify_drift_check_every_n_lands`` (default 20) — which is exactly why the
+# drift check has NEVER fired in any runs.db.  Persisting the counter to
+# ``project_root/data/orchestrator/drift_check_state.json`` makes the cadence
+# survive restarts.  The runner quarantine set is deliberately NOT persisted:
+# the dedup'd open L1 verify_drift_divergence escalation is the cross-restart
+# guard (see merge_queue.py SpeculativeMergeWorker.__init__ RESTART RE-TRUST
+# WINDOW note).
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DriftCheckState:
+    """Persisted cadence state for the Lever-C drift check.
+
+    Stored as JSON at
+    ``config.project_root/data/orchestrator/drift_check_state.json`` so the
+    drift-check cadence survives orchestrator restarts (the ~8h fleet redeploy
+    otherwise resets the in-memory ``worker._drift_land_count`` before it ever
+    reaches ``verify_drift_check_every_n_lands``).
+
+    Fields:
+        land_count: Count of successful ('done') lands observed so far.  The
+            drift check fires when
+            ``land_count % verify_drift_check_every_n_lands == 0``.  Additive
+            across the worker lifetime (never reset), mirroring the in-memory
+            ``worker._drift_land_count`` it supersedes.
+    """
+
+    land_count: int = 0
+
+
+def _load_drift_check_state(path: Path) -> DriftCheckState:
+    """Load the drift-check cadence state from a JSON file.
+
+    Fail-safe: returns a default ``DriftCheckState()`` on any error (file not
+    found, unreadable, unparseable JSON, or missing/wrong-typed keys) so the
+    orchestrator never fails to start due to a corrupt state file.  Exact
+    mirror of :func:`orchestrator.merge_shadow._load_shadow_compare_state`.
+
+    Args:
+        path: Path to the JSON state file (typically
+            ``config.project_root/data/orchestrator/drift_check_state.json``).
+
+    Returns:
+        The persisted state, or ``DriftCheckState(0)`` on any failure.
+    """
+    try:
+        data = json.loads(path.read_text())
+        return DriftCheckState(land_count=int(data['land_count']))
+    except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return DriftCheckState()
+
+
+def _save_drift_check_state(path: Path, state: DriftCheckState) -> None:
+    """Persist the drift-check cadence state to a JSON file.
+
+    Creates parent directories as needed.  Exact mirror of
+    :func:`orchestrator.merge_shadow._save_shadow_compare_state`.
+
+    Args:
+        path: Destination path for the JSON state file.
+        state: The :class:`DriftCheckState` to serialise.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(dataclasses.asdict(state)))
 
 
 async def _run_drift_check(
@@ -116,14 +193,12 @@ async def _run_drift_check(
     # LocalRunner / run_scoped_verification also have a module-level "naive"
     # import above (kept solely as a TestReachBackRouting patch target); a
     # `from ... import` reach-back would shadow-and-thus-dead-code that
-    # naive import, which ruff flags (F811).  _derive_task_files_from_git has
-    # no merge_drift-local "naive" import at all (there is nothing to prove
-    # inert) but is reached back to for the same reason as the others:
-    # merge_queue.py imports it at module level from orchestrator.verify and
-    # the test suite patches it on that namespace.  _run_unscoped_typechecks
-    # and _build_remote_runners have no merge_drift-local copy at all (both
-    # stay permanently in merge_queue.py) but are accessed the same way for
-    # consistency.
+    # naive import, which ruff flags (F811).  _run_unscoped_typechecks and
+    # _build_remote_runners have no merge_drift-local copy at all (both stay
+    # permanently in merge_queue.py) but are accessed the same way for
+    # consistency.  (Task 2886 fix 1b dropped the _derive_task_files_from_git
+    # reach-back: the drift spec is now full-gate, task_files=None, so no
+    # dispatching-host scope derivation happens on this path.)
     import orchestrator.merge_queue as _mq
 
     # wt is initialised before the try so the finally guard (`if wt is not None`)
@@ -176,13 +251,19 @@ async def _run_drift_check(
         # local_lease/remote_lease releases stay in the finally untouched:
         # those are host-SLOT leases, orthogonal to this lane flock.
         async with git_ops.merge_verify_lease(lane_dir=wt):
-            task_files_tuple = tuple(req.task_files) if req.task_files is not None else None
-            # Derive task_files on the dispatching host (fresh main) when not supplied
-            # and Lever C is on — mirrors the same gate in _run_post_merge_verify.
-            if task_files_tuple is None and req.config.enabled_verify_runners:
-                derived = await _mq._derive_task_files_from_git(wt, req.config)
-                if derived:
-                    task_files_tuple = tuple(derived)
+            # FULL-GATE drift spec (task 2886 fix 1b, PRD §8δ): the drift check
+            # re-dispatches this spec to BOTH the local trust-anchor and the
+            # eligible remote and alarms on divergence.  Re-dispatching the SAME
+            # scoped/no-source spec that produced a trivial pass would trivially
+            # pass on both hosts and structurally cannot catch the trivial-pass
+            # divergence class.  Forcing task_files=None runs the complete
+            # workspace gate (verify.py task_files=None path) on both hosts so a
+            # genuine divergence is observable.  This deliberately does NOT
+            # derive/scope task_files (unlike _run_post_merge_verify's serial-lane
+            # dispatching-host derivation) — the derivation gate is intentionally
+            # dropped here.  task_files_tuple stays None so BOTH the spec and the
+            # LocalRunner below run the whole suite.
+            task_files_tuple = None
             spec = _mq.build_merge_verify_spec(req.config, req.module_configs, task_files_tuple)
 
             if allocator is not None:
@@ -311,8 +392,34 @@ async def _maybe_run_drift_check(
         # instead of raising ZeroDivisionError on every land.  Mirrors the
         # every_n > 0 guard in _safety_valve_due (merge_liveness.py).
         return
-    worker._drift_land_count += 1
-    if worker._drift_land_count % every_n == 0:
+
+    # Cadence counter (task 2886 fix 1a): use the PERSISTED DriftCheckState when
+    # worker._drift_state_path is wired so the count survives the ~8h fleet
+    # redeploy (the in-memory counter reset before ever reaching every_n is why
+    # the drift check had NEVER fired).  Fall back to the in-memory
+    # worker._drift_land_count on bare-harness workers where _drift_state_path
+    # is None — mirrors _maybe_schedule_shadow_compare's _shadow_state_path
+    # None-safety.  DriftCheckState / _load / _save are referenced module-local
+    # (not reached back) exactly like _maybe_schedule_shadow_compare references
+    # ShadowCompareState / _load / _save; only the spawned _run_drift_check
+    # coroutine is monkeypatched by tests and therefore reached back below.
+    if worker._drift_state_path is None:
+        worker._drift_land_count += 1
+        count = worker._drift_land_count
+    else:
+        state = _load_drift_check_state(worker._drift_state_path)
+        count = state.land_count + 1
+        # Persist on BOTH the fire and no-fire paths so every land is counted
+        # (the counter is additive across the worker lifetime — never reset —
+        # mirroring the in-memory _drift_land_count it supersedes).
+        _save_drift_check_state(
+            worker._drift_state_path, DriftCheckState(land_count=count)
+        )
+        # Keep the in-memory mirror in lockstep for observability / back-compat
+        # (existing tests and log lines still read worker._drift_land_count).
+        worker._drift_land_count = count
+
+    if count % every_n == 0:
         _coro = _run_drift_check(
             git_ops, req, merge_commit,
             worker._escalation_queue, worker._event_store,

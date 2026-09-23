@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "protocol": {
     "blind_authoring": "single-author-blind-to-metrics, mechanized by commit ordering: the arm decomposition and query set were committed before any metric function existed in the tree",
     "fixtures": [
@@ -22,6 +22,10 @@
       {
         "path": "fused-memory/tests/fixtures/e2_distractor_slab.jsonl",
         "commit": "6b4809ec138e8ae04c810bffbab4728b6c1d395d"
+      },
+      {
+        "path": "fused-memory/tests/fixtures/e2_regrowth_injection.jsonl",
+        "commit": "302d6f3690596eb98eefe370058a4bc6698c1fe6"
       }
     ],
     "token_estimator": "char-proxy:4-chars-per-token",
@@ -35,11 +39,16 @@
     "clusters_measured": 20,
     "queries_measured": 236,
     "guard_probes_measured": 15,
+    "regrowth_probed": true,
+    "regrowth_injections_measured": 20,
     "collections": [
       "_test_e2_bakeoff_e2_bakeoff_b_grouped_main",
       "_test_e2_bakeoff_e2_bakeoff_c_peers_main",
+      "_test_e2_bakeoff_e2_bakeoff_c_peers_regrowth_stamped_main",
+      "_test_e2_bakeoff_e2_bakeoff_c_peers_regrowth_unstamped_main",
       "_test_e2_bakeoff_e2_bakeoff_status_quo_main"
-    ]
+    ],
+    "replayed_from": null
   },
   "arms": {
     "status_quo": {
@@ -467,7 +476,7 @@
         }
       },
       "tokens_per_query": {
-        "mean": 1196.7796610169491,
+        "mean": 1196.4110169491526,
         "estimator": "char-proxy:4-chars-per-token",
         "window": 10
       },
@@ -555,7 +564,7 @@
         }
       },
       "tokens_per_query": {
-        "mean": 1203.2966101694915,
+        "mean": 1202.927966101695,
         "estimator": "char-proxy:4-chars-per-token",
         "window": 10
       },
@@ -627,5 +636,198 @@
         "max_ratio": 0.36446370530877575
       }
     ]
+  },
+  "regrowth": {
+    "shape": "c_peers",
+    "read_arms": [
+      "flat",
+      "additive_pin",
+      "promoting_pin"
+    ],
+    "modes": [
+      "unstamped",
+      "stamped"
+    ],
+    "topics_injected": 20,
+    "injections_per_topic": 1,
+    "injection_fixture": "fused-memory/tests/fixtures/e2_regrowth_injection.jsonl",
+    "baseline": {
+      "flat": {
+        "claim_recall.at_5": 0.9364406779661016,
+        "claim_recall.at_10": 0.9745762711864406,
+        "discoverability.stored_canonical_in_top_5_rate": 0.5042372881355932,
+        "discoverability.stored_canonical_median_rank": 3.0,
+        "discoverability.stored_canonical_found_count": 154,
+        "discoverability.canonical_in_top_5_rate": 0.5042372881355932,
+        "tokens_per_query.mean": 1181.2881355932204
+      },
+      "additive_pin": {
+        "claim_recall.at_5": 0.9364406779661016,
+        "claim_recall.at_10": 0.9745762711864406,
+        "discoverability.stored_canonical_in_top_5_rate": 0.5042372881355932,
+        "discoverability.stored_canonical_median_rank": 3.0,
+        "discoverability.stored_canonical_found_count": 154,
+        "discoverability.canonical_in_top_5_rate": 0.5042372881355932,
+        "tokens_per_query.mean": 1181.2881355932204
+      },
+      "promoting_pin": {
+        "claim_recall.at_5": 0.9830508474576272,
+        "claim_recall.at_10": 0.9957627118644068,
+        "discoverability.stored_canonical_in_top_5_rate": 0.5042372881355932,
+        "discoverability.stored_canonical_median_rank": 3.0,
+        "discoverability.stored_canonical_found_count": 154,
+        "discoverability.canonical_in_top_5_rate": 0.9915254237288136,
+        "tokens_per_query.mean": 1070.2711864406779
+      }
+    },
+    "after": {
+      "unstamped": {
+        "flat": {
+          "claim_recall.at_5": 0.940677966101695,
+          "claim_recall.at_10": 0.9788135593220338,
+          "discoverability.stored_canonical_in_top_5_rate": 0.4915254237288136,
+          "discoverability.stored_canonical_median_rank": 3.0,
+          "discoverability.stored_canonical_found_count": 151,
+          "discoverability.canonical_in_top_5_rate": 0.4915254237288136,
+          "tokens_per_query.mean": 1132.0127118644068
+        },
+        "additive_pin": {
+          "claim_recall.at_5": 0.940677966101695,
+          "claim_recall.at_10": 0.9788135593220338,
+          "discoverability.stored_canonical_in_top_5_rate": 0.4915254237288136,
+          "discoverability.stored_canonical_median_rank": 3.0,
+          "discoverability.stored_canonical_found_count": 151,
+          "discoverability.canonical_in_top_5_rate": 0.4915254237288136,
+          "tokens_per_query.mean": 1132.0127118644068
+        },
+        "promoting_pin": {
+          "claim_recall.at_5": 0.9788135593220338,
+          "claim_recall.at_10": 0.9915254237288136,
+          "discoverability.stored_canonical_in_top_5_rate": 0.4915254237288136,
+          "discoverability.stored_canonical_median_rank": 3.0,
+          "discoverability.stored_canonical_found_count": 151,
+          "discoverability.canonical_in_top_5_rate": 0.9915254237288136,
+          "tokens_per_query.mean": 1038.0466101694915
+        }
+      },
+      "stamped": {
+        "flat": {
+          "claim_recall.at_5": 0.940677966101695,
+          "claim_recall.at_10": 0.9788135593220338,
+          "discoverability.stored_canonical_in_top_5_rate": 0.4915254237288136,
+          "discoverability.stored_canonical_median_rank": 3.0,
+          "discoverability.stored_canonical_found_count": 151,
+          "discoverability.canonical_in_top_5_rate": 0.4915254237288136,
+          "tokens_per_query.mean": 1132.0127118644068
+        },
+        "additive_pin": {
+          "claim_recall.at_5": 0.940677966101695,
+          "claim_recall.at_10": 0.9788135593220338,
+          "discoverability.stored_canonical_in_top_5_rate": 0.4915254237288136,
+          "discoverability.stored_canonical_median_rank": 3.0,
+          "discoverability.stored_canonical_found_count": 151,
+          "discoverability.canonical_in_top_5_rate": 0.4915254237288136,
+          "tokens_per_query.mean": 1132.0127118644068
+        },
+        "promoting_pin": {
+          "claim_recall.at_5": 0.9788135593220338,
+          "claim_recall.at_10": 0.9915254237288136,
+          "discoverability.stored_canonical_in_top_5_rate": 0.4915254237288136,
+          "discoverability.stored_canonical_median_rank": 3.0,
+          "discoverability.stored_canonical_found_count": 151,
+          "discoverability.canonical_in_top_5_rate": 0.9915254237288136,
+          "tokens_per_query.mean": 1034.915254237288
+        }
+      }
+    },
+    "deltas": {
+      "unstamped": {
+        "flat": {
+          "claim_recall.at_5": 0.00423728813559332,
+          "claim_recall.at_10": 0.004237288135593209,
+          "discoverability.stored_canonical_in_top_5_rate": -0.012711864406779627,
+          "discoverability.stored_canonical_median_rank": 0.0,
+          "discoverability.stored_canonical_found_count": -3.0,
+          "discoverability.canonical_in_top_5_rate": -0.012711864406779627,
+          "tokens_per_query.mean": -49.27542372881362
+        },
+        "additive_pin": {
+          "claim_recall.at_5": 0.00423728813559332,
+          "claim_recall.at_10": 0.004237288135593209,
+          "discoverability.stored_canonical_in_top_5_rate": -0.012711864406779627,
+          "discoverability.stored_canonical_median_rank": 0.0,
+          "discoverability.stored_canonical_found_count": -3.0,
+          "discoverability.canonical_in_top_5_rate": -0.012711864406779627,
+          "tokens_per_query.mean": -49.27542372881362
+        },
+        "promoting_pin": {
+          "claim_recall.at_5": -0.00423728813559332,
+          "claim_recall.at_10": -0.004237288135593209,
+          "discoverability.stored_canonical_in_top_5_rate": -0.012711864406779627,
+          "discoverability.stored_canonical_median_rank": 0.0,
+          "discoverability.stored_canonical_found_count": -3.0,
+          "discoverability.canonical_in_top_5_rate": 0.0,
+          "tokens_per_query.mean": -32.22457627118638
+        }
+      },
+      "stamped": {
+        "flat": {
+          "claim_recall.at_5": 0.00423728813559332,
+          "claim_recall.at_10": 0.004237288135593209,
+          "discoverability.stored_canonical_in_top_5_rate": -0.012711864406779627,
+          "discoverability.stored_canonical_median_rank": 0.0,
+          "discoverability.stored_canonical_found_count": -3.0,
+          "discoverability.canonical_in_top_5_rate": -0.012711864406779627,
+          "tokens_per_query.mean": -49.27542372881362
+        },
+        "additive_pin": {
+          "claim_recall.at_5": 0.00423728813559332,
+          "claim_recall.at_10": 0.004237288135593209,
+          "discoverability.stored_canonical_in_top_5_rate": -0.012711864406779627,
+          "discoverability.stored_canonical_median_rank": 0.0,
+          "discoverability.stored_canonical_found_count": -3.0,
+          "discoverability.canonical_in_top_5_rate": -0.012711864406779627,
+          "tokens_per_query.mean": -49.27542372881362
+        },
+        "promoting_pin": {
+          "claim_recall.at_5": -0.00423728813559332,
+          "claim_recall.at_10": -0.004237288135593209,
+          "discoverability.stored_canonical_in_top_5_rate": -0.012711864406779627,
+          "discoverability.stored_canonical_median_rank": 0.0,
+          "discoverability.stored_canonical_found_count": -3.0,
+          "discoverability.canonical_in_top_5_rate": 0.0,
+          "tokens_per_query.mean": -35.355932203389784
+        }
+      }
+    },
+    "stamping_value": {
+      "flat": {
+        "claim_recall.at_5": 0.0,
+        "claim_recall.at_10": 0.0,
+        "discoverability.stored_canonical_in_top_5_rate": 0.0,
+        "discoverability.stored_canonical_median_rank": 0.0,
+        "discoverability.stored_canonical_found_count": 0.0,
+        "discoverability.canonical_in_top_5_rate": 0.0,
+        "tokens_per_query.mean": 0.0
+      },
+      "additive_pin": {
+        "claim_recall.at_5": 0.0,
+        "claim_recall.at_10": 0.0,
+        "discoverability.stored_canonical_in_top_5_rate": 0.0,
+        "discoverability.stored_canonical_median_rank": 0.0,
+        "discoverability.stored_canonical_found_count": 0.0,
+        "discoverability.canonical_in_top_5_rate": 0.0,
+        "tokens_per_query.mean": 0.0
+      },
+      "promoting_pin": {
+        "claim_recall.at_5": 0.0,
+        "claim_recall.at_10": 0.0,
+        "discoverability.stored_canonical_in_top_5_rate": 0.0,
+        "discoverability.stored_canonical_median_rank": 0.0,
+        "discoverability.stored_canonical_found_count": 0.0,
+        "discoverability.canonical_in_top_5_rate": 0.0,
+        "tokens_per_query.mean": -3.1313559322034052
+      }
+    }
   }
 }

@@ -21,11 +21,23 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-from _orch_helpers import pydantic_spec
+import pytest
+from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT, pydantic_spec
 
 import orchestrator
 from orchestrator.config import OrchestratorConfig
 from orchestrator.workflow import TaskWorkflow, build_workflow
+
+# test_single_taskworkflow_construction_point scans every *.py under
+# orchestrator/src via _orchestrator_src_root().rglob('*.py') -- the same
+# helper test_eval_boundary_suite.py imports from here, so one slow tree walk
+# is billed to two modules. Not individually reproduced under load; marked
+# because it is structurally identical to the three members that crashed.
+# WHY 300s, the thread-mode os._exit() cost model it clears, and the guard that
+# ENFORCES this mark rather than trusting it to be sprinkled: see
+# WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py, and
+# test_whole_tree_scan_timeout_guard.py (task 4215).
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def test_build_workflow_forwards_params():
@@ -57,6 +69,7 @@ def test_build_workflow_forwards_params():
     initial_plan: Any = object()
     usage_gate: Any = object()
     escalation_queue: Any = object()
+    resume_outcome_sink: Any = object()
 
     wf = build_workflow(
         assignment=assignment,
@@ -70,6 +83,7 @@ def test_build_workflow_forwards_params():
         initial_plan=initial_plan,
         event_store=event_store,
         cost_store=cost_store,
+        resume_outcome_sink=resume_outcome_sink,
     )
 
     assert isinstance(wf, TaskWorkflow)
@@ -86,6 +100,7 @@ def test_build_workflow_forwards_params():
     assert wf.initial_plan is initial_plan
     assert wf.usage_gate is usage_gate
     assert wf.escalation_queue is escalation_queue
+    assert wf.resume_outcome_sink is resume_outcome_sink
 
 
 # Every ``build_workflow`` parameter, in ``TaskWorkflow.__init__`` order. The
@@ -100,6 +115,7 @@ _BUILD_WORKFLOW_PARAMS = (
     'escalation_queue', 'escalation_event', 'usage_gate', 'initial_plan',
     'steward_factory', 'merge_queue', 'merge_worker', 'merge_inflight_registry',
     'event_store', 'cost_store', 'cancel_event', 'resume_session_id', 'run_id',
+    'resume_outcome_sink',
 )
 
 

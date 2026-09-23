@@ -8,14 +8,15 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+import _hold_history_fixtures as F
 import pytest
 
 from orchestrator.analyze_modules import (
     ModuleStats,
-    _first_component,
     _iter_events,
     _parse_since,
     aggregate,
+    main,
     render_json,
     render_table,
     suggest_max_per_module,
@@ -28,11 +29,26 @@ def event_store(tmp_path: Path) -> EventStore:
     return EventStore(tmp_path / 'runs.db', run_id='test')
 
 
-def test_first_component_strips_and_splits():
-    assert _first_component('autopilot/analyze/asr') == 'autopilot'
-    assert _first_component('/crates/foo/src') == 'crates'
-    assert _first_component('bare') == 'bare'
-    assert _first_component('') == ''
+#: ``since`` that admits every fixed 2026-08-01 fixture timestamp.
+_BEFORE_TRACE = F.BASE_TS - timedelta(seconds=1)
+
+
+def _trace_db(tmp_path: Path, rows: list[dict] | None = None, name: str = 'trace.db') -> Path:
+    """A real ``runs.db`` carrying *rows* (default: the canonical 21-row trace).
+
+    ``EventStore.__init__`` only creates the schema, so the fixture's explicit
+    ids cannot collide with anything.  ``EventStore.emit`` cannot stand in:
+    it stamps its own wall-clock timestamp and its own ``run_id``, and this
+    trace needs fixed offsets and TWO run ids.
+    """
+    store = EventStore(tmp_path / name, run_id=F.RUN_A)
+    F.write_trace(store, rows=rows)
+    return store.db_path
+
+
+@pytest.fixture
+def canonical_trace_db(tmp_path: Path) -> Path:
+    return _trace_db(tmp_path, name='canonical.db')
 
 
 def test_parse_since_duration_shorthand():
@@ -46,6 +62,19 @@ def test_parse_since_invalid_raises():
     import argparse
     with pytest.raises(argparse.ArgumentTypeError):
         _parse_since('nonsense')
+
+
+# ===========================================================================
+# The grouping key — the depth-coarsened lock module, verbatim
+# ===========================================================================
+#
+# `max_per_module` is enforced in `ModuleLockTable._limit_for`
+# (scheduler.py:1505-1517) under `normalize_lock(module, lock_depth)` — the
+# FULL depth-`lock_depth` path — and `module_overrides` is read under that same
+# key.  No first-path-component key exists anywhere in the lock layer, so a
+# `suggest` column published under one names something the enforcement layer
+# never consults.  These tests pin the key space the CLI's whole reason to
+# exist depends on.
 
 
 def test_aggregate_counts_dispatches_and_skips(tmp_path: Path, event_store: EventStore):
@@ -71,10 +100,272 @@ def test_aggregate_counts_dispatches_and_skips(tmp_path: Path, event_store: Even
     )
     from datetime import UTC, datetime, timedelta
     stats = aggregate(event_store.db_path, datetime.now(UTC) - timedelta(days=1))
-    assert 'crates' in stats
-    assert stats['crates'].dispatches == 1
-    assert stats['crates'].skipped_waiting == 2
-    assert stats['crates'].conflict_rate() == pytest.approx(2.0)
+    assert 'crates/foo/src' in stats
+    assert 'crates' not in stats, 'the first path component is not a lock key'
+    assert stats['crates/foo/src'].dispatches == 1
+    assert stats['crates/foo/src'].skipped_waiting == 2
+    assert stats['crates/foo/src'].conflict_rate() == pytest.approx(2.0)
+
+
+def test_aggregate_keeps_sibling_modules_under_one_parent_distinct(event_store: EventStore):
+    """Two modules sharing a parent are two lock keys, not one.
+
+    `ModuleLockTable` limits `orchestrator/src` and `orchestrator/tests`
+    independently, so rolling them into an `orchestrator` row would report a
+    contention figure for a key no override can address.
+    """
+    event_store.emit(
+        EventType.lock_acquired,
+        task_id='1',
+        data={'modules': ['orchestrator/src', 'orchestrator/tests']},
+    )
+
+    from datetime import UTC, datetime, timedelta
+    stats = aggregate(event_store.db_path, datetime.now(UTC) - timedelta(days=1))
+
+    assert sorted(stats) == ['orchestrator/src', 'orchestrator/tests']
+    assert stats['orchestrator/src'].dispatches == 1
+    assert stats['orchestrator/tests'].dispatches == 1
+
+
+def test_aggregate_counts_a_repeated_module_once_per_event(event_store: EventStore):
+    """One event is one dispatch for a module however many times it names it.
+
+    The HOLD path has to agree, and only does because ``modules_of``
+    de-duplicates for both consumers: otherwise the second ``shared/src``
+    reads as a double-acquire against the span the first just opened, and this
+    clean 60s pair reports two samples (a phantom 0.0s truncated one plus the
+    real one) for an average of 30s.
+    """
+    event_store.emit(
+        EventType.lock_acquired,
+        task_id='1',
+        data={'modules': ['shared/src', 'shared/src']},
+    )
+    event_store.emit(
+        EventType.lock_released,
+        task_id='1',
+        data={'modules': ['shared/src']},
+    )
+
+    from datetime import UTC, datetime, timedelta
+    stats = aggregate(event_store.db_path, datetime.now(UTC) - timedelta(days=1))
+
+    assert stats['shared/src'].dispatches == 1
+    assert stats['shared/src'].hold_samples == 1
+    assert stats['shared/src'].truncated_holds == 0
+
+
+# ===========================================================================
+# Hold accounting comes from hold_history.iter_hold_spans (PRD INV-5)
+# ===========================================================================
+#
+# Every expected duration below is the hand-computed literal in
+# ``_hold_history_fixtures`` -- nothing is read back out of the code under
+# test.  The canonical trace covers all four residue classes named in
+# PARKING_MODEL_REPORT.md:100-104, and the CLI's own pairing loop got three of
+# them wrong: it closed no span at an era boundary, LOST the first hold of a
+# double-acquire to a dict overwrite, and keyed its open slot per (module-key,
+# task) so a partial release closed spans it never named.
+
+
+def test_aggregate_hold_stats_match_the_hand_computed_trace(canonical_trace_db: Path):
+    """The whole oracle at once: samples, totals and means for all three modules."""
+    stats = aggregate(canonical_trace_db, _BEFORE_TRACE)
+
+    assert stats['orchestrator/src'].hold_samples == 5
+    assert stats['orchestrator/src'].total_hold_secs == pytest.approx(520.0)
+    assert stats['orchestrator/src'].avg_hold_secs() == pytest.approx(104.0)
+
+    assert stats['shared/src'].hold_samples == 3
+    assert stats['shared/src'].total_hold_secs == pytest.approx(360.0)
+    assert stats['shared/src'].avg_hold_secs() == pytest.approx(120.0)
+
+    assert stats['fused-memory/src'].hold_samples == 3
+    assert stats['fused-memory/src'].total_hold_secs == pytest.approx(600.0)
+    assert stats['fused-memory/src'].avg_hold_secs() == pytest.approx(200.0)
+
+
+def test_aggregate_counts_dispatches_across_the_whole_trace(canonical_trace_db: Path):
+    """Dispatches are per lock_acquired event, independent of how it closes."""
+    stats = aggregate(canonical_trace_db, _BEFORE_TRACE)
+
+    assert stats['orchestrator/src'].dispatches == 6
+    assert stats['shared/src'].dispatches == 3
+    assert stats['fused-memory/src'].dispatches == 3
+
+
+def test_aggregate_reports_truncated_holds_per_module(canonical_trace_db: Path):
+    """Era- and double-acquire-closed spans are right-censored LOWER BOUNDS.
+
+    They are counted -- PARKING_MODEL_REPORT.md:102, "the lock did block
+    others until then" -- but blending them into `avg_hold_s` with no way to
+    tell would trade one silent distortion for another.
+    """
+    stats = aggregate(canonical_trace_db, _BEFORE_TRACE)
+
+    # One per module, matching F.EXPECTED_TRUNCATED_SPANS.
+    assert {m: stats[m].truncated_holds for m in F.EXPECTED_SAMPLES} == {
+        'orchestrator/src': 1,
+        'shared/src': 1,
+        'fused-memory/src': 1,
+    }
+    assert stats['orchestrator/src'].truncated_fraction() == pytest.approx(1 / 5)
+
+
+# --- the two era-boundary sources, one named test each ---------------------
+
+
+def test_a_service_restart_row_closes_the_hold_it_interrupted(tmp_path: Path):
+    """Era boundary #1.  T5 acquires at 800 and the process is restarted at
+    1000; today's loop drops the hold entirely because no release ever
+    arrives."""
+    db = _trace_db(tmp_path, rows=[
+        F.acquire(10, 800, 'T5', ['fused-memory/src']),
+        F.service_restart(11, 1000),
+    ])
+
+    stats = aggregate(db, _BEFORE_TRACE)
+
+    assert stats['fused-memory/src'].hold_samples == 1
+    assert stats['fused-memory/src'].total_hold_secs == pytest.approx(200.0)
+    assert stats['fused-memory/src'].truncated_holds == 1
+    # The restart row's task_id is the TRIGGER task, not a lock holder, so it
+    # opens no span and contributes no key of its own.
+    assert list(stats) == ['fused-memory/src'], 'the restart names no module of its own'
+
+
+def test_a_run_transition_closes_at_the_previous_rows_timestamp(tmp_path: Path):
+    """Era boundary #2, and the timestamp it closes at is the point.
+
+    T7 holds shared/src from 1300; run-a's last row is at 1400 and run-b opens
+    at 1500.  Closing at 1500 would charge the whole inter-run gap -- however
+    many days of it in production -- to a hold nobody observed.
+    """
+    db = _trace_db(tmp_path, rows=[
+        F.acquire(14, 1300, 'T7', ['shared/src']),
+        F.acquire(15, 1360, 'T8', ['orchestrator/src']),
+        F.release(16, 1400, 'T8', ['orchestrator/src']),
+        F.acquire(17, 1500, 'T9', ['shared/src'], run_id=F.RUN_B),
+    ])
+
+    stats = aggregate(db, _BEFORE_TRACE)
+
+    assert stats['shared/src'].hold_samples == 1
+    assert stats['shared/src'].total_hold_secs == pytest.approx(100.0), \
+        'closed at 1400 (last evidence of the hold), not at 1500'
+    assert stats['shared/src'].truncated_holds == 1
+
+
+def test_an_uninteresting_row_between_runs_does_not_move_the_boundary(tmp_path: Path):
+    """`aggregate` hands `iter_hold_spans` rows it selected for its OWN counters.
+
+    A `task_skipped` row is one of them, and the run-transition boundary closes
+    at "the previous row's timestamp" -- so if the span helper updated `prev_at`
+    before checking its interesting set, a skip landing in the gap between two
+    runs would silently move every truncated duration in the report.  Nothing
+    in this module would notice: the ordering lives in hold_history.
+
+    Same trace as the test above, plus a skip at 1450 in the gap.  The answer
+    must not move off 100.0s.
+    """
+    db = _trace_db(tmp_path, rows=[
+        F.acquire(14, 1300, 'T7', ['shared/src']),
+        F.acquire(15, 1360, 'T8', ['orchestrator/src']),
+        F.release(16, 1400, 'T8', ['orchestrator/src']),
+        # In the gap, and still run-a: 1450 would be the close timestamp if the
+        # helper let an uninteresting row carry `prev_at` forward.
+        F.row(17, 1450, 'task_skipped', task_id='T9',
+              run_id=F.RUN_A, data={'modules': ['shared/src']}),
+        F.acquire(18, 1500, 'T9', ['shared/src'], run_id=F.RUN_B),
+    ])
+
+    stats = aggregate(db, _BEFORE_TRACE)
+
+    assert stats['shared/src'].total_hold_secs == pytest.approx(100.0), \
+        'the skip in the gap must not become the close timestamp (that would be 150.0)'
+    assert stats['shared/src'].truncated_holds == 1
+    # ...and it still counts for what it IS.
+    assert stats['shared/src'].skipped_waiting == 1
+
+
+def test_merge_attempt_rows_are_not_selected(tmp_path: Path):
+    """Nothing downstream reads them -- not the counters, not the span helper --
+    so they are filtered at the SQL rather than materialized and discarded."""
+    db = _trace_db(tmp_path, rows=[
+        F.acquire(1, 0, 'T1', ['orchestrator/src']),
+        F.row(2, 30, 'merge_attempt', task_id='T1',
+              run_id=F.RUN_A, data={'modules': ['orchestrator/src']}),
+        F.release(3, 60, 'T1', ['orchestrator/src']),
+    ])
+
+    rows = list(_iter_events(db, _BEFORE_TRACE))
+
+    assert [r['event_type'] for r in rows] == ['lock_acquired', 'lock_released']
+
+
+def test_a_double_acquire_keeps_the_hold_it_force_closes(tmp_path: Path):
+    """T4 acquires at 400 and again at 580 without releasing.
+
+    The old `open_acquires[task_id] = start` OVERWROTE the first start, so the
+    180s hold vanished and only the 120s tail was ever counted.
+    """
+    db = _trace_db(tmp_path, rows=[
+        F.acquire(7, 400, 'T4', ['orchestrator/src']),
+        F.acquire(8, 580, 'T4', ['orchestrator/src']),
+        F.release(9, 700, 'T4', ['orchestrator/src']),
+    ])
+
+    stats = aggregate(db, _BEFORE_TRACE)
+
+    assert stats['orchestrator/src'].hold_samples == 2
+    assert stats['orchestrator/src'].total_hold_secs == pytest.approx(300.0), '180 + 120'
+    assert stats['orchestrator/src'].truncated_holds == 1
+
+
+# --- the two refusals that must SURVIVE the convergence --------------------
+
+
+def test_an_orphan_release_contributes_no_hold(tmp_path: Path):
+    """A release with no open span (3,594 DF / 5,780 reify in the measured
+    trace) is skipped, not paired with whatever came before it."""
+    db = _trace_db(tmp_path, rows=[
+        F.acquire(1, 0, 'T1', ['orchestrator/src']),
+        F.release(2, 60, 'T1', ['orchestrator/src']),
+        F.release(3, 350, 'T3', ['orchestrator/src']),   # ORPHAN
+    ])
+
+    stats = aggregate(db, _BEFORE_TRACE)
+
+    assert stats['orchestrator/src'].hold_samples == 1
+    assert stats['orchestrator/src'].total_hold_secs == pytest.approx(60.0)
+    assert stats['orchestrator/src'].truncated_holds == 0
+
+
+def test_a_hold_still_open_at_the_end_of_the_window_is_dropped(tmp_path: Path):
+    """Unlike an era boundary, nothing here observed an end.  Closing at "now"
+    would invent a duration, so the span is dropped -- while the acquire still
+    counts as a dispatch, because it really did happen."""
+    db = _trace_db(tmp_path, rows=[
+        F.acquire(1, 0, 'T1', ['orchestrator/src']),
+        F.release(2, 60, 'T1', ['orchestrator/src']),
+        F.acquire(3, 100, 'T10', ['orchestrator/src']),   # open at end of stream
+    ])
+
+    stats = aggregate(db, _BEFORE_TRACE)
+
+    assert stats['orchestrator/src'].dispatches == 2
+    assert stats['orchestrator/src'].hold_samples == 1
+    assert stats['orchestrator/src'].total_hold_secs == pytest.approx(60.0)
+
+
+def test_the_canonical_trace_drops_its_end_of_stream_hold(canonical_trace_db: Path):
+    """T10's acquire at id 19 is the 6th orchestrator/src dispatch and the 5th
+    -- not 6th -- sample."""
+    stats = aggregate(canonical_trace_db, _BEFORE_TRACE)
+
+    assert stats['orchestrator/src'].dispatches == 6
+    assert stats['orchestrator/src'].hold_samples == 5
 
 
 def test_aggregate_ignores_events_before_since(tmp_path: Path, event_store: EventStore):
@@ -96,6 +387,97 @@ def test_suggest_max_per_module_tiers():
     assert suggest_max_per_module(ModuleStats(dispatches=100, skipped_waiting=0)) == 4
 
 
+# ===========================================================================
+# The SKIP-ONLY module — a row the new key space makes reachable
+# ===========================================================================
+#
+# Under the old first-path-component key, a skip on `orchestrator/tests`
+# collapsed onto the same row as an acquire on `orchestrator/src`, so the
+# dispatch denominator was almost never zero.  Keying by the lock module
+# removes that accidental cover: a module that only ever appears in
+# `task_skipped` payloads within the window is now its own row, with
+# `conflict_rate() == 0.0` -- indistinguishable, by that number alone, from a
+# genuinely idle module.  Default `--min-dispatches 0` shows these rows.
+
+
+def test_a_skip_only_module_is_not_advised_to_raise_its_limit():
+    """Nothing got through it all window, so `suggest` must not read 'idle'.
+
+    The bare ladder falls through to 4 here, because `conflict_rate()` answers
+    0.00 on a zero denominator exactly as it does for a quiet module.
+    """
+    skip_only = ModuleStats(dispatches=0, skipped_waiting=5)
+
+    assert skip_only.is_skip_only() is True
+    assert suggest_max_per_module(skip_only) == 1, 'serialize, not "raise the limit"'
+
+    # A module with no evidence at all is NOT skip-only: nothing was measured,
+    # so the default stands rather than a spurious "serialize this".
+    assert ModuleStats().is_skip_only() is False
+    assert suggest_max_per_module(ModuleStats()) == 4
+
+
+def test_render_table_marks_a_skip_only_conflict_as_not_available():
+    """0.00 in a column a human reads as a measurement would say 'idle'."""
+    table = render_table({'orchestrator/tests': ModuleStats(dispatches=0, skipped_waiting=5)})
+
+    row = table.splitlines()[1]
+
+    assert 'n/a' in row
+    assert '0.00' not in row, 'the ratio is undefined here, not zero'
+    assert row.split()[-1] == '1', 'and the advice is to serialize'
+
+
+def test_render_table_sorts_a_skip_only_module_above_a_finite_rate():
+    """Descending contention: "nothing got through" outranks any finite ratio.
+
+    Sorting on the 0.00 placeholder would bury the most serialized row at the
+    BOTTOM of the table, where an operator scanning from the top never reads it.
+    """
+    table = render_table({
+        'hot/src': ModuleStats(dispatches=5, skipped_waiting=20),   # rate 4.00
+        'blocked/src': ModuleStats(dispatches=0, skipped_waiting=2),
+        'idle/src': ModuleStats(dispatches=10, skipped_waiting=0),
+    })
+
+    labels = [line.split()[0] for line in table.splitlines()[1:]]
+    assert labels == ['blocked/src', 'hot/src', 'idle/src']
+
+
+def test_aggregate_reports_a_module_that_is_only_ever_skipped(event_store: EventStore):
+    """End to end: a task repeatedly skipped on a module it never acquires."""
+    for _ in range(3):
+        event_store.emit(
+            EventType.task_skipped,
+            task_id='1',
+            data={'modules': ['orchestrator/tests']},
+        )
+    event_store.emit(
+        EventType.lock_acquired,
+        task_id='2',
+        data={'modules': ['orchestrator/src']},
+    )
+
+    from datetime import UTC, datetime, timedelta
+    stats = aggregate(event_store.db_path, datetime.now(UTC) - timedelta(days=1))
+
+    assert stats['orchestrator/tests'].dispatches == 0
+    assert stats['orchestrator/tests'].skipped_waiting == 3
+    assert stats['orchestrator/tests'].is_skip_only() is True
+    # The sibling that DID get through is a separate row -- the collapse that
+    # used to hide the zero denominator no longer happens.
+    assert stats['orchestrator/src'].is_skip_only() is False
+
+    payload = json.loads(render_json(stats))
+    assert payload['orchestrator/tests']['suggested_max_per_module'] == 1
+    # `conflict_rate` stays a plain float so --json remains spec-valid and
+    # arithmetic-safe; the raw counts beside it are what make it derivable
+    # that the ratio is undefined rather than measured.
+    assert payload['orchestrator/tests']['conflict_rate'] == 0.0
+    assert payload['orchestrator/tests']['dispatches'] == 0
+    assert payload['orchestrator/tests']['skipped_waiting'] == 3
+
+
 def test_render_table_orders_by_conflict_desc():
     stats = {
         'low': ModuleStats(dispatches=10, skipped_waiting=0),
@@ -113,14 +495,84 @@ def test_render_json_is_machine_readable():
     # swapped input would be (7, 4) → ratio 4/7 ≈ 0.57 → still suggest 2,
     # so the conflict_rate assertion does the distinguishing.
     stats = {
-        'crates': ModuleStats(dispatches=4, skipped_waiting=7),
+        'crates/foo/src': ModuleStats(
+            dispatches=4, skipped_waiting=7,
+            total_hold_secs=300.0, hold_samples=3, truncated_holds=2,
+        ),
     }
     payload = json.loads(render_json(stats))
-    assert payload['crates']['dispatches'] == 4
-    assert payload['crates']['skipped_waiting'] == 7
+    assert payload['crates/foo/src']['dispatches'] == 4
+    assert payload['crates/foo/src']['skipped_waiting'] == 7
     # conflict = 7/4 = 1.75 (>= 0.5 but < 2.0) → suggest 2.
-    assert payload['crates']['conflict_rate'] == 1.75
-    assert payload['crates']['suggested_max_per_module'] == 2
+    assert payload['crates/foo/src']['conflict_rate'] == 1.75
+    assert payload['crates/foo/src']['suggested_max_per_module'] == 2
+    assert payload['crates/foo/src']['avg_hold_secs'] == 100.0
+    # Two of the three samples are censored lower bounds — a consumer reading
+    # avg_hold_secs alone cannot tell, so the count travels with it...
+    assert payload['crates/foo/src']['truncated_holds'] == 2
+    # ...and so does its DENOMINATOR, without which the count says nothing:
+    # trunc 2 means something different out of 3 samples than out of 300.
+    assert payload['crates/foo/src']['hold_samples'] == 3
+    assert payload['crates/foo/src']['truncated_fraction'] == 0.6667
+
+
+def test_render_json_reports_zero_censoring_with_no_samples():
+    """A module with no hold spans reports 0.0, not a crash or a null.
+
+    `truncated_fraction` must survive the empty case in the renderer, since
+    every skip-only module in a window hits it.
+    """
+    payload = json.loads(render_json({'quiet/src': ModuleStats(dispatches=2)}))
+
+    assert payload['quiet/src']['hold_samples'] == 0
+    assert payload['quiet/src']['truncated_fraction'] == 0.0
+    assert payload['quiet/src']['avg_hold_secs'] == 0.0
+
+
+# --- the table must not collapse two distinct lock keys into one row -------
+
+#: Two REAL sibling paths in this repo that are distinct lock keys and share a
+#: 32-character prefix ('fused-memory/src/fused_memory/re').  The old 32-column
+#: truncation rendered both as the same label — a defect the first-path-
+#: component key space hid, because it never produced a key this long.
+_LONG_KEY = 'fused-memory/src/fused_memory/reconciliation'
+_LONGER_KEY = 'fused-memory/src/fused_memory/reconciliation/prompts'
+
+
+def test_render_table_prints_a_long_lock_module_in_full():
+    assert _LONG_KEY[:32] == _LONGER_KEY[:32], 'the fixture must actually collide at 32'
+
+    table = render_table({
+        _LONG_KEY: ModuleStats(dispatches=10, skipped_waiting=2),
+        _LONGER_KEY: ModuleStats(dispatches=4, skipped_waiting=8),
+    })
+
+    assert _LONG_KEY in table
+    assert _LONGER_KEY in table
+    labels = [line.split()[0] for line in table.splitlines()[1:]]
+    assert sorted(labels) == sorted([_LONG_KEY, _LONGER_KEY]), \
+        'each lock key needs its own distinguishable row'
+
+
+def test_render_table_reports_truncated_holds_against_their_denominator():
+    """The censoring is visible in the human surface too, not just --json —
+    and so is the sample count it is a censoring OF.  A bare `trunc 2` next to
+    `avg_hold_s 100.0` reads completely differently at 4 samples than at 400,
+    and the operator has no other column to tell them apart.
+    """
+    table = render_table({
+        'orchestrator/src': ModuleStats(
+            dispatches=5, skipped_waiting=1,
+            total_hold_secs=400.0, hold_samples=4, truncated_holds=2,
+        ),
+    })
+
+    header, row = table.splitlines()
+    assert 'samples' in header
+    assert 'trunc' in header
+    # Four distinct values, so no permutation of these columns can pass:
+    # avg 400/4 = 100.0; samples 4; trunc 2; conflict 1/5 = 0.2 → suggest 3.
+    assert row.split()[-4:] == ['100.0', '4', '2', '3']
 
 
 def test_iter_events_opens_runs_db_read_only(event_store: EventStore) -> None:
@@ -164,5 +616,117 @@ def test_iter_events_opens_runs_db_read_only(event_store: EventStore) -> None:
 
     # Reads still work — seeded event is returned.
     assert len(rows) == 1
-    _ts, event_type, _task_id, _data = rows[0]
-    assert event_type == 'lock_acquired'
+    assert rows[0]['event_type'] == 'lock_acquired'
+
+
+# ===========================================================================
+# _iter_events row shape — the contract that lets iter_hold_spans consume it
+# ===========================================================================
+#
+# The CLI keeps its own read (``fetch_events_by_type_all_runs`` has no ``since``
+# predicate and returns one list per type), so the rows it yields must be
+# shaped like the ones that fetch returns or ``iter_hold_spans`` cannot read
+# them.  Every key below is one the span helper actually reads: drop ``run_id``
+# and the run-transition era boundary goes silent; drop ``service_restart`` at
+# the SQL level and the restart boundary never arrives at all.
+
+
+def test_iter_events_yields_event_store_shaped_dicts(tmp_path: Path, event_store: EventStore):
+    """Rows carry exactly the columns iter_hold_spans reads, in ``id`` order."""
+    F.write_trace(event_store, rows=[
+        F.acquire(1, 0, 'T1', ['orchestrator/src'], run_id='run-a'),
+        F.release(2, 60, 'T1', ['orchestrator/src'], run_id='run-a'),
+        F.row(3, 90, 'task_skipped', task_id='T2',
+              run_id='run-a', data={'modules': ['orchestrator/src']}),
+        F.service_restart(4, 120, run_id='run-a'),
+    ])
+
+    rows = list(_iter_events(event_store.db_path, F.BASE_TS - timedelta(seconds=1)))
+
+    assert [r['id'] for r in rows] == [1, 2, 3, 4], 'ascending id order is required'
+    assert [r['event_type'] for r in rows] == [
+        'lock_acquired', 'lock_released', 'task_skipped', 'service_restart',
+    ], 'service_restart must survive the SQL filter — it is an era boundary'
+    for r in rows:
+        assert set(r) == {'id', 'timestamp', 'run_id', 'task_id', 'event_type', 'data'}
+        assert r['run_id'] == 'run-a', 'run_id carries the store value, not None'
+        assert isinstance(r['data'], dict), 'data is already JSON-decoded'
+    assert rows[0]['task_id'] == 'T1'
+    assert rows[0]['data']['modules'] == ['orchestrator/src']
+    assert rows[0]['timestamp'] == F.ts(0)
+
+
+def test_iter_events_tolerates_malformed_data(event_store: EventStore):
+    """A payload that is not JSON costs its own ``data``, not the row."""
+    conn = sqlite3.connect(str(event_store.db_path))
+    try:
+        conn.execute(
+            'INSERT INTO events (id, timestamp, run_id, task_id, event_type, data) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            (1, F.ts(0), 'run-a', 'T1', 'lock_acquired', 'not-json{'),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    rows = list(_iter_events(event_store.db_path, F.BASE_TS - timedelta(seconds=1)))
+
+    assert len(rows) == 1
+    assert rows[0]['data'] == {}
+    assert rows[0]['event_type'] == 'lock_acquired'
+
+
+# ===========================================================================
+# main() — the CLI interface, which this task does NOT change
+# ===========================================================================
+#
+# The key space and every per-key number move; --since, --json and
+# --min-dispatches must not.  End to end over a real runs.db so the whole
+# path (read -> aggregate -> render -> exit code) is covered at once.
+
+
+def test_main_json_reports_the_full_lock_modules(canonical_trace_db: Path, capsys):
+    assert main([str(canonical_trace_db), '--json', '--since', '2026-07-01']) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+
+    assert sorted(payload) == ['fused-memory/src', 'orchestrator/src', 'shared/src']
+    assert not {'fused-memory', 'orchestrator', 'shared'} & set(payload), \
+        'no bare first-path-component keys survive'
+    assert payload['orchestrator/src']['dispatches'] == 6
+    assert payload['orchestrator/src']['avg_hold_secs'] == 104.0
+    assert payload['orchestrator/src']['truncated_holds'] == 1
+
+
+def test_main_min_dispatches_still_filters(canonical_trace_db: Path, capsys):
+    assert main([
+        str(canonical_trace_db), '--json', '--since', '2026-07-01',
+        '--min-dispatches', '4',
+    ]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+
+    # orchestrator/src has 6; the other two have 3 each.
+    assert list(payload) == ['orchestrator/src']
+
+
+def test_main_reports_an_empty_window_without_failing(canonical_trace_db: Path, capsys):
+    """An empty window is a fact about the window, not an error."""
+    assert main([str(canonical_trace_db), '--since', '2026-09-01']) == 0
+
+    captured = capsys.readouterr()
+    assert '(no module events in window)' in captured.err
+    assert captured.out == ''
+
+
+def test_main_table_mode_prints_the_full_lock_modules(canonical_trace_db: Path, capsys):
+    assert main([str(canonical_trace_db), '--since', '2026-07-01']) == 0
+
+    out = capsys.readouterr().out
+    assert 'orchestrator/src' in out
+    assert 'fused-memory/src' in out
+
+
+def test_main_returns_2_for_a_missing_db(tmp_path: Path, capsys):
+    assert main([str(tmp_path / 'nope.db')]) == 2
+    assert 'runs.db not found' in capsys.readouterr().err

@@ -36,16 +36,40 @@ on its MEASURED branch, where it is what stops a real 0 — ``height: 0%``, whic
 paints nothing — from rendering exactly like a hole.  What was wrong was
 flooring the slot rather than the measurement.)
 
+THE LAST ONE IN THE FILE (task 3681) — ``HBarChart`` is the row-shaped
+primitive: its input is rows of OBJECTS behind a ``valueKey``/``labelKey``
+indirection rather than a bare values array, and its PRIMARY value was never
+guarded at all even though its segments were scrubbed with the same
+``(r[s.key] || 0)`` hole-as-zero conflation banned for StackedAreaChart above.
+It carried one failure the other five did not: the raw value went straight into
+the CALLER's formatter (``formatVal(r[valueKey])``), and both live call sites
+pass ``v => `$${v.toFixed(2)}``` (tabs.jsx), so a row missing the key would
+throw a TypeError DURING RENDER and take the whole Costs tab down rather than
+one bar.  That is what the component's CONTRACT permits — it reads rows through
+a caller-supplied ``valueKey`` — and NOT an observed outage: today's
+``shape_costs`` (redux_api.py:536, :566) emits an explicit ``total`` on every
+by_project and by_role row, so no live payload reaches it.  The probes below
+ban the arithmetic anyway, for the reason the rest of this file exists: a
+primitive that cannot say "not measured" is one payload change away from
+saying something false, and here it would say it by throwing.  It now projects
+its rows to a values array at the
+call site and reuses ``plottableMax`` + ``barFractions`` unchanged, and the SAME
+fraction-is-null decision drives both the absent bar and the em-dash in the
+value cell, so a row's text and its bar can never disagree about whether it was
+measured.
+
 WHY THE PROBES ARE PER COMPONENT — the components' folds differ textually
 (LineChart's poisoning fold is ``Math.max(...all``, BarChart's is
-``Math.max(...values``, StackedAreaChart's is ``Math.max(...totals``), so a
-single module-level probe tuple could not express what each component must no
-longer contain.  Each entry in ``_CONTRACTS`` therefore carries its own probe
+``Math.max(...values``, StackedAreaChart's is ``Math.max(...totals``, and
+HBarChart's is ``Math.max(...rows.map`` — it folded over the ROWS, projecting
+each one's value inside the fold, so it does not share a single character of
+its spread with the other four), so a single module-level probe tuple could not
+express what each component must no longer contain.  Each entry in ``_CONTRACTS`` therefore carries its own probe
 set, its own required builders, and — via ``_PRE_FIX_BODIES`` — its own
 verbatim pre-fix body for the negative control at the bottom.
 
 WHY THE PROBES SEE CODE ONLY — every probe here is a plain substring/regex
-search, so ``_component_body`` blanks comments (``_strip_comments``) before any
+search, so ``_component_body`` blanks comments (``strip_js_comments``) before any
 of them run, and the negative control strips its frozen pre-fix bodies
 identically.  Without that, a maintainer documenting the defect they just fixed,
 in the component they just fixed, gets a CI failure whose message says the
@@ -60,7 +84,7 @@ import re
 from dataclasses import dataclass
 
 import pytest
-from starlette.testclient import TestClient
+from _dashboard_helpers import extract_function_body, strip_js_comments
 
 
 @dataclass(frozen=True)
@@ -189,6 +213,43 @@ _HIST_BAR_BANNED = (
     # the pre-fix body by its own control.
 )
 
+_HBAR_CHART_BANNED = (
+    (
+        'Math.max(...rows.map',
+        'folds the axis maximum over the RAW row values, so ONE row missing '
+        'the key poisons max to NaN and EVERY row width becomes "NaN%" — an '
+        'invalid CSS length, so all the bars vanish silently, not just the '
+        'missing one',
+    ),
+    (
+        '(r[valueKey] / max) * 100',
+        'scales the raw primary value directly, so a null/missing row becomes '
+        'a zero-width bar indistinguishable from a measured zero',
+    ),
+    (
+        'r[s.key] || 0',
+        'scrubs a MISSING segment to a measured zero — the same scrub banned '
+        'for StackedAreaChart, in the last primitive still carrying it',
+    ),
+    # The worse half of this component's defect, and the one no other primitive
+    # had: the raw value went into the CALLER's formatter, so a hole would not
+    # merely render wrong, it would throw.
+    (
+        'formatVal(r[valueKey])',
+        "hands the RAW primary value to the caller's formatter — BOTH live "
+        'call sites pass ``v => `$${v.toFixed(2)}``` (both <HBC> tags in '
+        'tabs.jsx::CostsTab), so a row lacking the key throws a TypeError DURING '
+        'RENDER and takes out the whole Costs tab, not just one row. Rows '
+        'lacking the key are what this component\'s contract permits (it '
+        'reads them through a caller-supplied valueKey), not what the API '
+        'emits today — redux_api.py always supplies `total`',
+    ),
+    (
+        'formatVal(r[s.key]',
+        'same, for a segment',
+    ),
+)
+
 _CONTRACTS: dict[str, _Contract] = {
     'Sparkline': _Contract(builders=('sparkSmoothPaths',), banned=_SPARKLINE_BANNED),
     'StepSpark': _Contract(builders=('sparkStepPaths',), banned=_SPARKLINE_BANNED),
@@ -218,6 +279,15 @@ _CONTRACTS: dict[str, _Contract] = {
         builders=('plottableMax', 'barFractions'),
         banned=_HIST_BAR_BANNED,
     ),
+    # HBarChart takes rows of OBJECTS, so it projects them to a values array at
+    # the call site (`rows.map(r => r[valueKey])`) and then uses the SAME pair
+    # the other two bar primitives do — no key-projecting export of its own.
+    # It calls barFractions TWICE by design: once for the primary values and
+    # once per row for that row's segments, both scaled against the same max.
+    'HBarChart': _Contract(
+        builders=('plottableMax', 'barFractions'),
+        banned=_HBAR_CHART_BANNED,
+    ),
 }
 
 _DELEGATING_COMPONENTS = tuple(_CONTRACTS)
@@ -232,124 +302,6 @@ _DELEGATING_COMPONENTS = tuple(_CONTRACTS)
 _WHOLE_COMPONENT_GUARD_COMPONENTS = ('Sparkline', 'StepSpark')
 
 
-@pytest.fixture(scope='module')
-def _client():
-    from dashboard.app import app
-
-    with TestClient(app) as c:
-        yield c
-
-
-@pytest.fixture(scope='module')
-def charts_jsx(_client) -> str:
-    return _client.get('/static/redux/charts.jsx').text
-
-
-def _extract_function_body(src: str, fn_name: str) -> str:
-    """Return the body block of a ``function <fn_name>(`` declaration, braces included.
-
-    Copied from test_tab_escalation_analytics.py.  Paren-depth walks past the
-    parameter list before looking for the body's opening ``{`` — these
-    components take a destructured parameter (``function Sparkline({ values,
-    ... }) {``) whose own ``{``/``}`` pair sits INSIDE the parameter list, so
-    naively taking the first ``{`` after the opening ``(`` would return just
-    the destructuring pattern instead of the function body.
-    """
-    m = re.search(rf'\bfunction\s+{re.escape(fn_name)}\s*\(', src)
-    if m is None:
-        return ''
-    paren_depth = 1
-    i = m.end()
-    while i < len(src) and paren_depth > 0:
-        if src[i] == '(':
-            paren_depth += 1
-        elif src[i] == ')':
-            paren_depth -= 1
-        i += 1
-    if paren_depth != 0:
-        return ''
-    start = src.find('{', i)
-    if start == -1:
-        return ''
-    depth = 0
-    for j in range(start, len(src)):
-        c = src[j]
-        if c == '{':
-            depth += 1
-        elif c == '}':
-            depth -= 1
-            if depth == 0:
-                return src[start : j + 1]
-    return ''
-
-
-def _strip_comments(src: str) -> str:
-    """Return ``src`` with every JS/JSX comment blanked, string literals intact.
-
-    EVERY probe in this file is a plain substring/regex search, so without this
-    they also match PROSE.  That coupling deformed the production source once
-    already: charts.jsx carried a comment whose content was an apology for what
-    it could not say, because naming the very expression the component had just
-    stopped using would fail CI with a message claiming the component "still
-    contains hole-blind scale/path arithmetic" — pointing at a comment.  A
-    comment is exactly where that expression SHOULD be quotable, so the probes
-    are scoped to code and the comment now names ``(st.values[i] || 0)``
-    directly.
-
-    Quote-aware rather than a bare regex: blanking from a ``//`` inside a string
-    literal (a URL, say) to end-of-line would delete real CODE, and an absence
-    assertion over deleted code is a permanent false GREEN — the exact failure
-    mode the negative control at the bottom of this file exists to prevent.
-    Each comment is replaced by a single space rather than removed outright, so
-    two previously separated tokens can never be spliced into a new match.
-
-    Deliberately not a full JS lexer: a regex literal containing ``//``, or a
-    quote nested inside a template's ``${...}``, would confuse it.  Neither
-    occurs in these component bodies, and the negative control would catch the
-    silent-GREEN direction if one ever did.
-    """
-    out: list[str] = []
-    quote: str | None = None
-    i, n = 0, len(src)
-
-    while i < n:
-        ch = src[i]
-
-        if quote is not None:
-            out.append(ch)
-            if ch == '\\' and i + 1 < n:  # an escaped char cannot close the string
-                out.append(src[i + 1])
-                i += 2
-                continue
-            if ch == quote:
-                quote = None
-            i += 1
-            continue
-
-        if ch in '\'"`':
-            quote = ch
-            out.append(ch)
-            i += 1
-            continue
-
-        if ch == '/' and src[i : i + 2] == '//':
-            end = src.find('\n', i)
-            out.append(' ')
-            i = n if end == -1 else end
-            continue
-
-        if ch == '/' and src[i : i + 2] == '/*':
-            end = src.find('*/', i + 2)
-            out.append(' ')
-            i = n if end == -1 else end + 2
-            continue
-
-        out.append(ch)
-        i += 1
-
-    return ''.join(out)
-
-
 def _banned_arithmetic_hits(body: str, banned: tuple[tuple[str, str], ...]) -> list[str]:
     """Return the probes from ``banned`` that are present in ``body``.
 
@@ -360,23 +312,16 @@ def _banned_arithmetic_hits(body: str, banned: tuple[tuple[str, str], ...]) -> l
     return [probe for probe, _ in banned if probe in body]
 
 
-def _component_body(charts_jsx: str, name: str) -> str:
-    """The named component's body, with comments blanked (see ``_strip_comments``).
+def _component_body(charts_jsx_body: str, name: str) -> str:
+    """The named component's body, with comments blanked (see ``strip_js_comments``).
 
     Every caller here asks a question about CODE — "does this component still
     scale raw samples itself", "does it actually call this builder" — so the
     single choke point strips prose once rather than leaving each probe to
     accidentally match a comment.
     """
-    body = _extract_function_body(charts_jsx, name)
-    assert body, (
-        f'Could not locate the `function {name}(` body in charts.jsx — either '
-        f'the component was removed/renamed, or it was rewritten as an arrow '
-        f'function/class method, which _extract_function_body does not match. '
-        f'This test cannot silently skip: without a body to inspect it proves '
-        f'nothing.'
-    )
-    return _strip_comments(body)
+    body = extract_function_body(charts_jsx_body, name)
+    return strip_js_comments(body)
 
 
 # ---------------------------------------------------------------------------
@@ -384,7 +329,7 @@ def _component_body(charts_jsx: str, name: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def test_charts_jsx_destructures_the_builders_at_module_top_level(charts_jsx: str) -> None:
+def test_charts_jsx_destructures_the_builders_at_module_top_level(charts_jsx_body: str) -> None:
     """charts.jsx reads window.DF_SPARK_PATH once, at load, above the first function.
 
     Destructuring (rather than an object read or a ``|| {}`` fallback) is
@@ -394,7 +339,7 @@ def test_charts_jsx_destructures_the_builders_at_module_top_level(charts_jsx: st
     test_index_html.py documents for DF_GRAPH_LAYOUT / DF_RUNTIME_FMT /
     DF_ORCH_FILTER, and the project's loud-over-silent-degradation norm.
     """
-    m = re.search(r'window\.DF_SPARK_PATH', charts_jsx)
+    m = re.search(r'window\.DF_SPARK_PATH', charts_jsx_body)
     assert m is not None, (
         'charts.jsx does not reference `window.DF_SPARK_PATH` — the chart '
         'scale/path math lives in /static/redux/spark_path.js (tasks 3436, '
@@ -402,7 +347,7 @@ def test_charts_jsx_destructures_the_builders_at_module_top_level(charts_jsx: st
     )
 
     destructure = re.search(
-        r'const\s*\{[^}]*\}\s*=\s*window\.DF_SPARK_PATH\s*;', charts_jsx
+        r'const\s*\{[^}]*\}\s*=\s*window\.DF_SPARK_PATH\s*;', charts_jsx_body
     )
     assert destructure is not None, (
         'charts.jsx references window.DF_SPARK_PATH but does not DESTRUCTURE '
@@ -412,7 +357,7 @@ def test_charts_jsx_destructures_the_builders_at_module_top_level(charts_jsx: st
         'nothing. The destructure throws at load, loudly.'
     )
 
-    first_function = charts_jsx.find('function ')
+    first_function = charts_jsx_body.find('function ')
     assert first_function != -1, 'charts.jsx contains no `function ` declaration at all.'
     assert destructure.start() < first_function, (
         'the window.DF_SPARK_PATH destructure sits BELOW the first function '
@@ -431,7 +376,7 @@ def test_charts_jsx_destructures_the_builders_at_module_top_level(charts_jsx: st
 
 @pytest.mark.parametrize('name', _DELEGATING_COMPONENTS)
 def test_component_no_longer_carries_the_defective_arithmetic(
-    charts_jsx: str, name: str
+    charts_jsx_body: str, name: str
 ) -> None:
     """No primitive may still scale raw samples itself.
 
@@ -440,7 +385,7 @@ def test_component_no_longer_carries_the_defective_arithmetic(
     defect on whichever path actually renders.
     """
     contract = _CONTRACTS[name]
-    body = _component_body(charts_jsx, name)
+    body = _component_body(charts_jsx_body, name)
     hits = _banned_arithmetic_hits(body, contract.banned)
 
     assert not hits, (
@@ -454,7 +399,7 @@ def test_component_no_longer_carries_the_defective_arithmetic(
 
 
 @pytest.mark.parametrize('name', _DELEGATING_COMPONENTS)
-def test_component_calls_all_of_its_required_builders(charts_jsx: str, name: str) -> None:
+def test_component_calls_all_of_its_required_builders(charts_jsx_body: str, name: str) -> None:
     """Every builder a component is supposed to delegate to is actually called.
 
     Binding a builder in the destructure but never calling it would leave the
@@ -462,7 +407,7 @@ def test_component_calls_all_of_its_required_builders(charts_jsx: str, name: str
     satisfied by ANY rewrite, including a wrong one.
     """
     contract = _CONTRACTS[name]
-    body = _component_body(charts_jsx, name)
+    body = _component_body(charts_jsx_body, name)
 
     for builder in contract.builders:
         assert re.search(rf'\b{re.escape(builder)}\s*\(', body), (
@@ -473,9 +418,9 @@ def test_component_calls_all_of_its_required_builders(charts_jsx: str, name: str
 
 
 @pytest.mark.parametrize('name', _WHOLE_COMPONENT_GUARD_COMPONENTS)
-def test_component_delegates_to_its_builder_exactly_once(charts_jsx: str, name: str) -> None:
+def test_component_delegates_to_its_builder_exactly_once(charts_jsx_body: str, name: str) -> None:
     """Each sparkline primitive calls its own builder, once."""
-    body = _component_body(charts_jsx, name)
+    body = _component_body(charts_jsx_body, name)
     builder = _CONTRACTS[name].builders[0]
 
     calls = len(re.findall(rf'\b{re.escape(builder)}\s*\(', body))
@@ -495,7 +440,7 @@ def test_component_delegates_to_its_builder_exactly_once(charts_jsx: str, name: 
 
 @pytest.mark.parametrize('name', _WHOLE_COMPONENT_GUARD_COMPONENTS)
 def test_component_renders_nothing_when_the_builder_yields_no_line(
-    charts_jsx: str, name: str
+    charts_jsx_body: str, name: str
 ) -> None:
     """An all-hole series must draw nothing, not a synthetic floor line.
 
@@ -515,7 +460,7 @@ def test_component_renders_nothing_when_the_builder_yields_no_line(
     destructured ``line``) rather than by exact wording, so a reworded guard
     does not fail this test spuriously.
     """
-    body = _component_body(charts_jsx, name)
+    body = _component_body(charts_jsx_body, name)
 
     assert re.search(r'\bline\b', body), (
         f'{name} does not reference a `line` binding — it should destructure '
@@ -575,7 +520,7 @@ def _hole_and_measured_style_branches(body: str) -> tuple[str, str] | None:
     return hole, measured
 
 
-def test_hist_bar_draws_nothing_for_a_hole_but_floors_a_measurement(charts_jsx: str) -> None:
+def test_hist_bar_draws_nothing_for_a_hole_but_floors_a_measurement(charts_jsx_body: str) -> None:
     """A hole and a measured zero must not render identically.
 
     Two failures are possible here and they pull in opposite directions.  The
@@ -590,7 +535,7 @@ def test_hist_bar_draws_nothing_for_a_hole_but_floors_a_measurement(charts_jsx: 
     branch-shaped, which is why it is asserted structurally rather than by a
     substring probe (see the note in ``_HIST_BAR_BANNED``).
     """
-    body = _component_body(charts_jsx, 'HistBar')
+    body = _component_body(charts_jsx_body, 'HistBar')
     branches = _hole_and_measured_style_branches(body)
 
     assert branches is not None, (
@@ -630,7 +575,7 @@ def test_hist_bar_branch_contract_fails_on_pre_fix_source() -> None:
     started returning branches for that body, the contract above would be
     asserting something the defect also satisfies.
     """
-    body = _strip_comments(_PRE_FIX_HIST_BAR)
+    body = strip_js_comments(_PRE_FIX_HIST_BAR)
 
     assert _hole_and_measured_style_branches(body) is None, (
         'the pre-fix HistBar body parsed as having a hole/measured style split. '
@@ -641,8 +586,144 @@ def test_hist_bar_branch_contract_fails_on_pre_fix_source() -> None:
     assert 'minHeight: 1' in body, 'the pre-fix floor is still in the frozen control body'
 
 
+_WIDTH_TEMPLATE_RE = re.compile(r'width:\s*`([^`]*)`')
+_IDENTIFIER_RE = re.compile(r'[A-Za-z_$][\w$]*')
+
+
+def _width_expression_sources(body: str) -> list[tuple[str, str]]:
+    """Each ``width: `...`` template paired with the code its value traces back to.
+
+    A width template rarely inlines its own arithmetic — it interpolates a
+    binding — so the template alone cannot answer "where did this number come
+    from".  Every bare identifier in it is therefore resolved ONE level, to its
+    ``const <name> = ...;`` declaration in the same body, and the template plus
+    those right-hand sides is what gets probed.
+
+    Deliberately one level and NOT transitive.  HBarChart's segment fractions
+    legitimately come from ``barFractions(segments.map(s => r[s.key]), max)``,
+    which mentions ``r[`` because PROJECTING the rows into the helper is the
+    sanctioned shape — chasing that second hop would flag the fix itself.  What
+    must not happen is a width computed by arithmetic ON a row lookup
+    (``const w = (r[valueKey] / max) * 100``), and one hop is exactly the
+    distance that separates the two.
+    """
+    sources: list[tuple[str, str]] = []
+    for m in _WIDTH_TEMPLATE_RE.finditer(body):
+        template = m.group(1)
+        traced = [template]
+        for ident in sorted(set(_IDENTIFIER_RE.findall(template))):
+            decl = re.search(rf'\bconst\s+{re.escape(ident)}\s*=\s*([^;]*);', body)
+            if decl is not None:
+                traced.append(decl.group(1))
+        sources.append((template, ' '.join(traced)))
+    return sources
+
+
+def _hbar_hole_contract_violations(body: str) -> list[str]:
+    """What HBarChart still gets wrong about a row that holds no measurement.
+
+    Each violation is tagged with its KIND (``em-dash``/``width``/``branch``) so
+    the negative control below can assert that all three checks fire on the real
+    pre-fix defect, independently of how many widths happen to violate one.
+
+    Applied identically to the live source and to the frozen pre-fix body — the
+    two-function shape ``_hole_and_measured_style_branches`` /
+    ``test_hist_bar_branch_contract_fails_on_pre_fix_source`` already sets.
+    ``body`` must already be comment-stripped.
+    """
+    violations: list[str] = []
+
+    # 1. A hole needs SOMETHING to render, because what it must not do is reach
+    #    the caller's formatter.  Either spelling of the dashboard's
+    #    no-synthetic-data placeholder counts: the repo genuinely writes both
+    #    (memory_evals_fmt.js escapes it, shell.jsx and the scheduler tabs use
+    #    the raw character), and normalising that split is a separate,
+    #    repo-wide decision this contract must not take by accident.
+    if '—' not in body and '\\u2014' not in body:
+        violations.append(
+            'em-dash: HBarChart renders no em-dash placeholder anywhere, so a '
+            'row with no measurement has nothing to show but the result of '
+            'calling formatVal on a hole. Both live call sites pass '
+            '`v => `$${v.toFixed(2)}``, which throws a TypeError on undefined '
+            '— during render, so the whole Costs tab goes down rather than '
+            'one row.'
+        )
+
+    # 2. A width must come from a fraction, never from arithmetic on a raw row
+    #    lookup — that arithmetic is what has no way to say "not measured".
+    for template, traced in _width_expression_sources(body):
+        if 'r[' in traced:
+            violations.append(
+                f'width: the width `{template}` traces back to a raw row '
+                f'lookup ({traced.strip()}). Every width must come from a '
+                f'barFractions fraction, which is `null` at a hole; raw '
+                f'`r[...]` arithmetic can only ever produce a number, and '
+                f'there is no number that means "no measurement here".'
+            )
+
+    # 3. The hole decision must be a visible BRANCH rather than falling out of
+    #    coercion, so the bar and the value cell demonstrably make the same one.
+    if re.search(r'[!=]==\s*null', body) is None:
+        violations.append(
+            'branch: HBarChart never compares anything to `null`, so nothing '
+            'in it decides explicitly whether a row was measured. The absent '
+            'bar and the em-dash must both be branches off the same '
+            'barFractions null, or the row\'s text and its bar can disagree '
+            'about whether a measurement exists.'
+        )
+
+    return violations
+
+
+def test_hbar_chart_renders_a_hole_as_an_em_dash_rather_than_throwing(
+    charts_jsx_body: str,
+) -> None:
+    """A row with no measurement must degrade, not throw.
+
+    The load-bearing part is NOT the placeholder — it is that ``formatVal`` is
+    never INVOKED on a hole.  Both live call sites pass
+    ``v => `$${v.toFixed(2)}```, so calling it on ``undefined`` throws a
+    TypeError during render and takes the entire tab down.  A blank bar
+    degrades; a throw does not.  (A hole is what this component's contract
+    permits rather than what the API emits: ``shape_costs`` supplies ``total``
+    on every row today.  The guard is for the contract, which is the only
+    thing this component can actually see.)  So it needs a placeholder to
+    render instead,
+    every width has to come from a fraction rather than from raw row
+    arithmetic, and the hole has to be an explicit branch off the SAME
+    ``barFractions`` null the bar already uses — one hole decision per row means
+    the row's text and its bar can never disagree about whether it was measured.
+    """
+    body = _component_body(charts_jsx_body, 'HBarChart')
+    violations = _hbar_hole_contract_violations(body)
+
+    assert not violations, 'HBarChart still mishandles a row with no measurement:\n' + '\n'.join(
+        f'  - {v}' for v in violations
+    )
+
+
+def test_hbar_chart_hole_contract_fails_on_pre_fix_source() -> None:
+    """The negative control for the assertion above.
+
+    All three checks must fire on a verbatim copy of the pre-fix body.  If any
+    one of them did not, the contract above would be satisfied by the defect
+    itself and would be a permanent false GREEN — the same failure mode
+    test_hist_bar_branch_contract_fails_on_pre_fix_source guards for HistBar.
+    """
+    violations = _hbar_hole_contract_violations(strip_js_comments(_PRE_FIX_HBAR_CHART))
+    kinds = {v.split(':', 1)[0] for v in violations}
+
+    assert kinds == {'em-dash', 'width', 'branch'}, (
+        f'the HBarChart hole contract did NOT fire every check on a verbatim '
+        f'copy of its pre-fix body — only {sorted(kinds)} fired, out of '
+        f'em-dash/width/branch. A check that cannot detect the real defect '
+        f'makes test_hbar_chart_renders_a_hole_as_an_em_dash_rather_than_'
+        f'throwing a permanent false GREEN.'
+    )
+
+
 @pytest.mark.parametrize('name', _DELEGATING_COMPONENTS)
-def test_component_still_exists_and_is_still_exported(charts_jsx: str, name: str) -> None:
+def test_component_still_exists_and_is_still_exported(charts_jsx_body: str, name: str) -> None:
     """Every pinned primitive survives the rewrite and stays on window.DF_CHARTS.
 
     Restated here (test_tab_curator.py already holds it for StepSpark) so this
@@ -650,11 +731,11 @@ def test_component_still_exists_and_is_still_exported(charts_jsx: str, name: str
     every other assertion in this module is about the ABSENCE of something, and
     absence is trivially satisfied by a deleted component.
     """
-    assert f'function {name}(' in charts_jsx, (
+    assert f'function {name}(' in charts_jsx_body, (
         f'charts.jsx no longer defines `function {name}(`.'
     )
 
-    parts = charts_jsx.split('window.DF_CHARTS')
+    parts = charts_jsx_body.split('window.DF_CHARTS')
     assert len(parts) > 1, 'charts.jsx has no `window.DF_CHARTS` export block.'
     assert name in parts[1], (
         f'{name} is not registered in the `window.DF_CHARTS = {{ ... }}` export '
@@ -861,12 +942,54 @@ _PRE_FIX_HIST_BAR = """{
   );
 }"""
 
+_PRE_FIX_HBAR_CHART = """{
+  // rows: [{ label, total, ...segments? }]; segments: [{ key, color, label }]
+  const max = Math.max(...rows.map(r => r[valueKey]), 1);
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      {rows.map((r, i) => {
+        const w = (r[valueKey] / max) * 100;
+        if (segments) {
+          let cum = 0;
+          return (
+            <div key={i}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 3 }}>
+                <span style={{ color: 'var(--fg-1)' }}>{r[labelKey]}</span>
+                <span className="mono" style={{ color: 'var(--fg-2)' }}>{formatVal(r[valueKey])}</span>
+              </div>
+              <div style={{ display: 'flex', height: 14, background: 'var(--bg-2)', borderRadius: 3, overflow: 'hidden' }}>
+                {segments.map(s => {
+                  const segW = ((r[s.key] || 0) / max) * 100;
+                  cum += segW;
+                  return <div key={s.key} title={`${s.label}: ${formatVal(r[s.key] || 0)}`} style={{ width: `${segW}%`, background: s.color }} />;
+                })}
+              </div>
+            </div>
+          );
+        }
+        return (
+          <div key={i}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 3 }}>
+              <span style={{ color: 'var(--fg-1)' }}>{r[labelKey]}</span>
+              <span className="mono" style={{ color: 'var(--fg-2)' }}>{formatVal(r[valueKey])}</span>
+            </div>
+            <div style={{ height: 6, background: 'var(--bg-2)', borderRadius: 3, overflow: 'hidden' }}>
+              <div style={{ width: `${w}%`, height: '100%', background: PALETTE.accent }} />
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}"""
+
 _PRE_FIX_BODIES: dict[str, str] = {
     'Sparkline': _PRE_FIX_SPARKLINE,
     'LineChart': _PRE_FIX_LINE_CHART,
     'StackedAreaChart': _PRE_FIX_STACKED_AREA,
     'BarChart': _PRE_FIX_BAR_CHART,
     'HistBar': _PRE_FIX_HIST_BAR,
+    'HBarChart': _PRE_FIX_HBAR_CHART,
 }
 
 
@@ -883,7 +1006,7 @@ def test_banned_arithmetic_probes_actually_fire_on_pre_fix_source(name: str) -> 
     # Stripped exactly as the live source is, so this control proves the probes
     # fire on the pre-fix CODE — not on the `// build cumulative stacks` prose
     # that came with it, and not on a treatment the live side never gets.
-    hits = _banned_arithmetic_hits(_strip_comments(_PRE_FIX_BODIES[name]), banned)
+    hits = _banned_arithmetic_hits(strip_js_comments(_PRE_FIX_BODIES[name]), banned)
 
     assert sorted(hits) == sorted(probe for probe, _ in banned), (
         f'the banned-arithmetic probes for {name} did NOT all fire on a '
@@ -903,22 +1026,22 @@ def test_strip_comments_removes_prose_without_touching_code_or_strings() -> None
     end-of-line — it would delete real code, and an absence assertion over
     deleted code is a permanent false GREEN.
     """
-    prose = _strip_comments('const a = 1; // st.values[i] || 0 is the old scrub\nconst b = 2;')
+    prose = strip_js_comments('const a = 1; // st.values[i] || 0 is the old scrub\nconst b = 2;')
     assert 'st.values[i] || 0' not in prose, 'a line comment must not be probed'
     assert 'const a = 1;' in prose and 'const b = 2;' in prose, 'code either side survives'
 
-    block = _strip_comments('const a = 1; /* Math.max(...values, 1) */ const b = 2;')
+    block = strip_js_comments('const a = 1; /* Math.max(...values, 1) */ const b = 2;')
     assert 'Math.max(...values' not in block, 'a block comment must not be probed'
     assert 'const a = 1;' in block and 'const b = 2;' in block
 
-    jsx = _strip_comments('<g>{/* (v / max) * 100 */}<rect /></g>')
+    jsx = strip_js_comments('<g>{/* (v / max) * 100 */}<rect /></g>')
     assert '(v / max) * 100' not in jsx, 'a JSX comment must not be probed'
     assert '<rect />' in jsx
 
     # The over-reach direction: a `//` inside a string is NOT a comment, so
     # nothing after it may be blanked.
     for literal in ('"https://x/y"', "'https://x/y'", '`https://x/y`'):
-        kept = _strip_comments(f'const u = {literal}; const h = (v / max) * chartH;')
+        kept = strip_js_comments(f'const u = {literal}; const h = (v / max) * chartH;')
         assert '(v / max) * chartH' in kept, (
             f'a `//` inside the string literal {literal} was treated as a comment, '
             f'blanking the code after it — that silently disarms every probe on '
@@ -926,10 +1049,10 @@ def test_strip_comments_removes_prose_without_touching_code_or_strings() -> None
         )
 
     # Two tokens separated only by a comment must not be spliced into a match.
-    assert 'ab' not in _strip_comments('a/* */b')
+    assert 'ab' not in strip_js_comments('a/* */b')
 
 
-def test_prose_quoting_the_defect_does_not_trip_its_own_probe(charts_jsx: str) -> None:
+def test_prose_quoting_the_defect_does_not_trip_its_own_probe(charts_jsx_body: str) -> None:
     """A comment may name the expression the component stopped using.
 
     This is the contract that lets charts.jsx's StackedAreaChart comment say
@@ -937,7 +1060,7 @@ def test_prose_quoting_the_defect_does_not_trip_its_own_probe(charts_jsx: str) -
     to.  Asserted against a synthetic body AND against the real one, so it holds
     even if that comment is later reworded.
     """
-    synthetic = _strip_comments(
+    synthetic = strip_js_comments(
         '{\n'
         '  // The cumulative folds used to scrub every sample through\n'
         '  // `(st.values[i] || 0)`, and the axis through `Math.max(...totals, 1)`.\n'
@@ -951,7 +1074,7 @@ def test_prose_quoting_the_defect_does_not_trip_its_own_probe(charts_jsx: str) -
     )
     assert 'stackedAreaPaths(stacks, geom)' in synthetic, 'the code around it survives'
 
-    body = _component_body(charts_jsx, 'StackedAreaChart')
+    body = _component_body(charts_jsx_body, 'StackedAreaChart')
     assert 'stackedAreaPaths' in body, 'the delegation is still visible after stripping'
 
 

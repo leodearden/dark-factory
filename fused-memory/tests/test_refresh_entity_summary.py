@@ -67,7 +67,16 @@ class TestResolveEntityByName:
     async def test_raises_ambiguous_error_when_multiple_match(
         self, mock_config, make_backend, make_graph_mock
     ):
-        """Raises AmbiguousEntityError when multiple entities share the same name."""
+        """Raises AmbiguousEntityError when multiple entities share the same name.
+
+        Also pins the class's structured-field invariant AT THIS RAISE SITE.
+        The invariant spans both sites by design — a consumer keys off
+        .name/.group_id/.uuids without parsing the message — so checking it at
+        only one of them would let this one drift while the class docstring
+        still named it. The sibling pin is
+        test_write_time_identity.py::TestEnsureEntityNodeNoMerge::
+        test_refusal_carries_structured_name_group_and_uuids.
+        """
         backend = make_backend(mock_config)
         rows = [['uuid-1', 'Alice'], ['uuid-2', 'Alice']]
         graph = make_graph_mock(rows)
@@ -77,6 +86,13 @@ class TestResolveEntityByName:
         # Error message should include both UUIDs so callers can disambiguate
         assert 'uuid-1' in str(exc_info.value)
         assert 'uuid-2' in str(exc_info.value)
+        # ... and the same facts as DATA, so nothing downstream parses that
+        # message. group_id is the CANONICALIZED one the method actually
+        # queried, not the raw argument.
+        assert exc_info.value.name == 'Alice'
+        assert exc_info.value.group_id == 'test'
+        assert exc_info.value.uuids == ('uuid-1', 'uuid-2')
+        assert isinstance(exc_info.value.uuids, tuple)
 
     @pytest.mark.asyncio
     async def test_raises_when_not_initialized(self, mock_config):
@@ -409,9 +425,15 @@ class TestGetAllValidEdges:
         graph = make_graph_mock([])
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.get_all_valid_edges(group_id='test')
-        call_args = graph.ro_query.call_args
-        assert call_args is not None, "graph.ro_query was not called"
-        cypher = extract_cypher(call_args)
+        # The read is paginated (task 4340), so `call_args` is only the LAST
+        # call — read the SKIP/LIMIT page query explicitly instead.
+        pages = [
+            extract_cypher(c)
+            for c in graph.ro_query.call_args_list
+            if 'SKIP' in extract_cypher(c)
+        ]
+        assert pages, f'no page query issued: {graph.ro_query.call_args_list}'
+        cypher = pages[0]
         # The whole point of W6-zeta (task 2213): drop the WITH DISTINCT idiom.
         assert 'WITH DISTINCT' not in cypher, (
             f'Cypher must NOT use WITH DISTINCT — dedup is (n.uuid, e.uuid)-keyed in Python: {cypher}'
@@ -435,7 +457,11 @@ class TestGetAllValidEdges:
         graph = make_graph_mock([])
         backend._driver._get_graph = MagicMock(return_value=graph)
         await backend.get_all_valid_edges(group_id='test')
-        graph.ro_query.assert_awaited_once()
+        # Paginated (task 4340): a census probe plus N pages, so "exactly one
+        # query" no longer describes the shape. The load-bearing half of the
+        # original assertion — every query stays on the read-only path — is
+        # what this test is named for and is kept.
+        assert graph.ro_query.await_count >= 1
         graph.query.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -477,19 +503,52 @@ class TestGetAllValidEdges:
             await backend.get_all_valid_edges(group_id='test')
 
     @pytest.mark.asyncio
-    async def test_none_result_set_returns_empty_dict(self, mock_config, make_backend, make_graph_mock):
-        """result_set=None from the driver is treated as empty — returns {}."""
+    async def test_none_result_set_returns_empty_dict(self, mock_config, make_backend):
+        """result_set=None from the driver is treated as empty — returns {}.
+
+        Defensive-coding pin: the read path uses ``result.result_set or []``
+        (in ``_census_count`` and in the ``_paged_ro_query`` page loop) to
+        tolerate a driver that returns None where an empty list is expected.
+        Without the guard, ``list(None)`` raises ``TypeError``, so this test
+        fails loudly rather than merely returning something different.
+
+        WHY A LOCAL DOUBLE AND NOT ``make_graph_mock`` (task 4340 amendment).
+        This test used to do ``graph.ro_query.return_value.result_set = None``
+        on a ``make_graph_mock`` graph.  That fixture now drives ``ro_query``
+        with a ``side_effect`` callable so it can answer per-cypher, and
+        ``unittest.mock`` IGNORES ``return_value`` entirely once a
+        ``side_effect`` callable returns a non-DEFAULT value — so the override
+        was a silent no-op.  The test kept passing only because
+        ``make_graph_mock([])`` yields empty rows; it would have passed
+        identically with the guard deleted.  Do not "simplify" this back to
+        the shared fixture without giving that fixture an explicit
+        None-result-set knob.
+        """
+        class _NoneResult:
+            result_set = None
+            header: list = []
+
+        class _NoneResultGraph:
+            """Answers EVERY query with result_set=None — census and pages alike."""
+
+            def __init__(self):
+                self.queries: list[str] = []
+
+            async def ro_query(self, cypher, params=None):
+                self.queries.append(cypher)
+                return _NoneResult()
+
+            async def query(self, cypher, params=None):  # pragma: no cover
+                raise AssertionError('read paths must use ro_query, never query')
+
         backend = make_backend(mock_config)
-        graph = make_graph_mock([])
-        # Defensive-coding pin: get_all_valid_edges() uses `result.result_set or []`
-        # to tolerate a driver that returns None instead of an empty list — this
-        # test exercises that guard.
-        # Override the awaited return value to have result_set=None, simulating
-        # a driver that returns None instead of an empty list.
-        graph.ro_query.return_value.result_set = None
+        graph = _NoneResultGraph()
         backend._driver._get_graph = MagicMock(return_value=graph)
         result = await backend.get_all_valid_edges(group_id='test')
         assert result == {}
+        # The guard was really reached: a query was issued and its None
+        # result_set was coerced, rather than the read short-circuiting.
+        assert graph.queries
 
     @pytest.mark.asyncio
     async def test_rows_sharing_uuid_pair_collapse_to_one(self, mock_config, make_backend, make_graph_mock):

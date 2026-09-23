@@ -6,14 +6,25 @@ Task 3473. ``verify_command_timeout_secs`` is a PER-COMMAND budget, and
 of every other module's and of the repo root's. A module that declares none
 does NOT get something "inherit-ish": per ``verify._resolve_verify_timeout``'s
 cascade it is a hard fall-through to ``config.verify_command_timeout_secs``,
-the whole-fleet ceiling (3600s warm). Declaring is the only way to narrow.
+the whole-fleet ceiling — an OPERATOR-TUNABLE value (3600s warm when this guard
+was written; raised since, see ``RULED_INTERIM_BUDGET_EXCEPTIONS``) sized for
+nine subprojects chained into ONE shell command. Declaring is the only way to
+narrow.
 
 Before this task, seven of nine discovered module configs declared nothing, so
 a hang in any of them surfaced only after the whole-fleet ceiling — about an
 hour rather than the minutes the root yaml's own "tight timeouts surface hangs"
-intent claims. This guard closes six of those seven and REPORTS the remaining
-one (``orchestrator``, task 3353) through ``MODULE_BUDGET_EXCLUSIONS`` rather
-than hiding it.
+intent claims. This guard closed six of those seven directly and REPORTED the
+seventh (``orchestrator``, task 3353) through ``MODULE_BUDGET_EXCLUSIONS``
+rather than hiding it.
+
+THAT LAST GAP IS NOW CLOSED (task 5422). ``orchestrator`` declares its own
+budget, ``MODULE_BUDGET_EXCLUSIONS`` is EMPTY, and every discovered module
+config declares a warm budget — so this guard's advertised reach and its real
+reach are the same again, which is the property the SCOPE note below insists
+on. Orchestrator's budget is the one that deliberately does NOT narrow below
+the fleet ceiling — it sits AT OR ABOVE it, and which of the two it is today is
+the operator's doing; see ``RULED_INTERIM_BUDGET_EXCEPTIONS``.
 
 GENERALISED FROM, not imported from, two sibling guards:
 ``tests/scripts/test_scripts_module_config.py::
@@ -23,12 +34,59 @@ test_tests_scripts_module_carries_its_own_tight_verify_budget`` (task 3350).
 Their scalar ``MEASURED_SUITE_WORST_SECS`` / ``MIN_MODULE_BUDGET_SECS`` pair is
 promoted here to per-module tables and the single test to a parametrization.
 
-HELPERS ARE COPIED, NOT IMPORTED, deliberately. A test file importing a sibling
-test file couples two guards that must be able to fail independently, and
-``_root_config`` in particular carries a load-bearing ``ORCH_CONFIG_PATH``
+CORRECTED IN PLACE (task 4320), never silently rewritten. This header used to
+read: "HELPERS ARE COPIED, NOT IMPORTED, deliberately. A test file importing a
+sibling test file couples two guards that must be able to fail independently,
+and ``_root_config`` in particular carries a load-bearing ``ORCH_CONFIG_PATH``
 anchor whose absence silently collapses every config value to pydantic
 defaults — it must be visibly present in the file that depends on it rather
-than inherited from a neighbour.
+than inherited from a neighbour."
+
+BOTH HALVES OF THAT ARE NOW FALSE, and they were false in different ways.
+
+The FIRST half over-generalised a sound argument. What the argument actually
+supports is narrower: a test file must not import a SIBLING TEST FILE, because
+that couples two guards which have to be able to fail independently and lets a
+regression in one silence the other. It does not reach a shared NON-TEST
+module, and it never reached ``conftest.py`` — pytest's idiomatic home for
+exactly this. Generalised to "helpers are copied", it licensed the triplication
+task 4320 removed: three verbatim ``_root_config`` helpers, three verbatim
+``_discovered`` helpers, three byte-identical ``_executed_for_touched`` bodies
+and three spellings of one budget derivation, none of which any mechanism could
+see drift between. This file now imports ``min_budget``,
+``FAMILY_PUBLISHER_PATHS``, ``FAMILY_READER_PATH`` and ``published_pairs`` from
+``module_budget_family`` — a non-test sibling, on the ``setup_host_sections`` /
+``systemd_unit_invariants`` precedent already established in this directory —
+and takes its setup from the ``root_config`` / ``discover_module_configs`` /
+``executed_for_touched`` fixtures in ``tests/scripts/conftest.py``. Every guard
+in the family still fails entirely on its own.
+
+The SECOND half named the wrong remedy for a real hazard. The
+``ORCH_CONFIG_PATH`` anchor IS load-bearing exactly as described, and its
+absence does silently collapse every config value to the pydantic defaults. But
+VISIBILITY was never what enforced it — three copies is three places for the
+anchor to be dropped from, and one of them had already been drafted without it.
+It now lives once, as the ``root_config`` fixture in ``tests/scripts/
+conftest.py``, where it is stronger than a copied helper in two ways: fixture
+setup runs BEFORE the test body, so the anchor-then-poison ordering two guards
+in this family depend on is structural rather than a comment; and
+``test_root_config_fixture_anchors_this_worktrees_own_yaml`` below pins the
+behaviour the move had to preserve, which no copy ever did. The two remaining
+copied helpers — ``_discovered`` and ``_executed_for_touched`` — followed it
+there in the same task's amendment pass, for the same reason and to the same
+place; note that ``discover_module_configs`` is a CALLABLE rather than a
+pre-built dict precisely so the anti-ambient guards keep reading the production
+walk AFTER they poison the environment.
+
+READING A SIBLING IS NOT IMPORTING IT, and this file now does the former on
+purpose. ``published_pairs`` ``ast``-parses each publisher's SOURCE rather than
+importing it, because importing would hand back only the already-evaluated
+``MIN_MODULE_BUDGET_SECS`` int — which is precisely what cannot tell a
+derivation from a literal that happens to agree with it today. So the
+"GENERALISED FROM, not imported from" framing above still holds literally, and
+is now also load-bearing in a second sense: no publisher is imported, no
+publisher imports this file, and the coupling runs only through source text
+this guard reads and can report on by name.
 
 PLACEMENT. ``tests/scripts/`` rather than a per-module ``tests/`` dir, and NOT
 appended to ``test_fallback_verify_config.py``. That file is listed in task
@@ -45,22 +103,27 @@ pin is worse than no pin because it reads as authoritative.
 """
 from __future__ import annotations
 
+import ast
+import os
 import pathlib
+import textwrap
+from collections.abc import Callable
+from typing import NamedTuple
 
 import pytest
-from orchestrator.config import OrchestratorConfig, _discover_module_configs
+import yaml
+from module_budget_family import (
+    FAMILY_PUBLISHER_PATHS,
+    FAMILY_READER_PATH,
+    census_budget_floor,
+    min_budget,
+    published_pairs,
+)
+from orchestrator.config import ModuleConfig, OrchestratorConfig
 
-from orchestrator import verify, verify_plan
+from orchestrator import verify
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
-
-# This worktree's own top-level orchestrator config. ``dark-factory-orchestrator
-# .yaml`` is the canonical, REQUIRED filename for a project's top-level config;
-# the legacy spellings are a discovery fallback for unmigrated projects, not a
-# choice this repo has. Anchored to REPO_ROOT rather than taken from the ambient
-# ORCH_CONFIG_PATH, for the reason ``_root_config``'s docstring records at length.
-DF_CONFIG_PATH = REPO_ROOT / 'dark-factory-orchestrator.yaml'
-
 
 # MEASURED wall-clock, in seconds: the WORST run of each module's own VERBATIM
 # test_command, copied byte-for-byte out of that module's orchestrator.yaml.
@@ -71,7 +134,7 @@ DF_CONFIG_PATH = REPO_ROOT / 'dark-factory-orchestrator.yaml'
 # PER-MODULE VERIFY BUDGET block, and is the SINGLE durable home for those
 # numbers; .task/measurements.md holds the raw sweep log but is worktree-local
 # scratch and does not survive. Only the scalar W is duplicated here, and only
-# because the guard computes ``_min_budget(W)`` from it — which is exactly why
+# because the guard computes ``min_budget(W)`` from it — which is exactly why
 # every one of those yaml blocks carries a RAISE-TOGETHER rule naming its entry
 # in this table. Reproducing the per-run tables here as well would create a
 # THIRD copy to raise in lockstep, which is the drift this file already declines
@@ -129,7 +192,7 @@ DF_CONFIG_PATH = REPO_ROOT / 'dark-factory-orchestrator.yaml'
 #                 driver collision); nothing here is sized from it.
 #
 #   sampler       MAKES ASSERTION (b)'s DEGENERACY CONCRETE, so it is stated
-#                 here as well as in the test docstring: `_min_budget(22.49)` ==
+#                 here as well as in the test docstring: `min_budget(22.49)` ==
 #                 `(int(44.98) // 100) * 100` == 0, so (b) asserts `budget >= 0`
 #                 for sampler — literally unfalsifiable. What carries this module
 #                 is (a) declared-at-all, (c) strictly-below-root, (d) honoured
@@ -137,20 +200,317 @@ DF_CONFIG_PATH = REPO_ROOT / 'dark-factory-orchestrator.yaml'
 #                 and (f) the cold fall-through. Do not infer a measurement floor
 #                 here that does not exist.
 #
-# ONE METHODOLOGICAL LIMIT ON THE WHOLE TABLE. The concurrent arm of the sweep
-# was a 6-WAY wave (the six modules this task closed). Production's
-# ``verify.run_full_verification`` gathers over EVERY registered module config —
-# nine today, including the dominant `orchestrator` segment — so the measured
-# wave is a LOWER BOUND on the fully-concurrent cost, not a reproduction of it.
-# See the same note in each yaml's provenance block for what bounds the gap.
+#   shared        W was RE-MEASURED by task 5131 under a real NINE-WAY gather
+#                 at base 1b3c50e98f, so unlike the other entries drawn from
+#                 the task-3473 sweep it is NOT from the 5a7770d239 epoch. Collection grew 3243 ->
+#                 4802 (+48%) over that epoch, but the worst-run wall clock
+#                 grew only ~35.5% (219.08s -> 296.88s) — LESS than the count
+#                 ratio predicts. Do NOT scale this figure by a test-count
+#                 ratio next time it goes stale — RE-MEASURE instead. That
+#                 same +48% growth also makes
+#                 MEASURED_FLEET_SEGMENT_SECS['shared'] = 120.21 in
+#                 test_fallback_verify_config.py (n=1, 2026-07-31, task 3062)
+#                 known-stale by the same evidence — a DIFFERENT command
+#                 feeding a DIFFERENT floor (task 4902 precedent keeps the
+#                 two tables separate homes), so it is not corrected here;
+#                 filed as a follow-up re-measure (tkt_0RTA9W8FEYMNAC7RQ4Y0QR857R)
+#                 instead.
+#
+#   orchestrator  NOT SIZED LIKE ANY OTHER ENTRY HERE, in two ways, both
+#                 deliberate.
+#                 (i) Its presence does not gate a min_budget(worst) floor —
+#                 see RULED_INTERIM_BUDGET_EXCEPTIONS below, which is where its
+#                 budget is actually justified. What this figure DOES gate is
+#                 the ruled-exception branch's own measurement floor: that
+#                 branch asserts the declared budget clears W (7200 > 4626.17
+#                 today), so the number here is load-bearing rather than
+#                 decorative. Since D17 it is no longer the BINDING floor
+#                 there — census_budget_floor(W) = 7000 is, and is asserted
+#                 alongside it; the dict entry below records why refreshing W
+#                 DOWNWARD nonetheless leaves that branch strictly stronger.
+#                 (ii) IT IS REGIME-SCOPED, WHILE THE OTHER SIX ARE ALL-TIME
+#                 WORST-OBSERVED. This table's worst-RUN rule, applied
+#                 literally here, would take the largest run ever observed —
+#                 5288.0, which this table carried until 2026-09-14. That
+#                 figure and the 4991 still readable on disk both belong to
+#                 the retired 3-slot / 3600-ceiling regime, and D17 sizes
+#                 under the PREVAILING config, so W here is the worst GREEN
+#                 full-suite run WITHIN that regime. A DIFFERENT rule from the
+#                 other six, named here so the divergence reads as a decision
+#                 rather than an arithmetic slip.
+#                 ORCHESTRATOR_BUDGET_CENSUS.regime / regime_since carry the
+#                 scope, and its comment block lists all three regimes found.
+#                 THE CORPUS IS EPHEMERAL, which bounds what any re-measure
+#                 can recover: it is `.worktrees/*/.task/verify/*.summary.json`
+#                 and worktrees are reset. MEASURED 2026-09-16 — re-running
+#                 the census command below over the RETIRED regime's own
+#                 window reports max=4991, not the 5288.0 the 09-08 amendment
+#                 read from that same window (n=24 today vs n=26 then; p50
+#                 3090 unchanged). So an all-time worst cannot be recovered by
+#                 re-running the census, and a figure that drops between two
+#                 runs means records aged out, NOT that the suite got faster.
+#                 PROVENANCE — REFRESHED 2026-09-14 from
+#                 ORCHESTRATOR_BUDGET_CENSUS, superseding the 5288.0 this
+#                 table carried from esc-4211-6's 2026-09-08 fold amendment.
+#                 RE-MEASURE BY REPEATING
+#                 ``ORCHESTRATOR_BUDGET_CENSUS.census_command`` and replacing
+#                 that whole record — NOT by repeating the fold amendment's
+#                 hand-run census, which D17 superseded — so the next figure is
+#                 a repeat rather than a re-derivation. That record is the
+#                 single home for the method; nothing of it is restated here.
+#                 Its window is LATER than, and its max LARGER than, the
+#                 864.83-3310.50s post-cap spread (2026-08-22..08-28) task 4902
+#                 recorded in tests/scripts/test_fallback_verify_config.py's
+#                 POST_CAP_ORCHESTRATOR_GREEN_SECS (a different table, kept a
+#                 separate home per that file's own RAISE-TOGETHER rule).
+#                 Kept here rather than omitted so assertions (a)/(d)/(e)/(f)
+#                 below are exercised for this module like every other — only
+#                 (b) and (c) are excepted.
+#
+# ONE METHODOLOGICAL LIMIT ON THE WHOLE TABLE, save two entries. The concurrent
+# arm of the sweep was a 6-WAY wave (the six modules this task closed) for
+# every entry EXCEPT `shared`, whose W was RE-MEASURED under a real NINE-WAY
+# gather (task 5131, see its entry above) — production's own gather width.
+# Production's ``verify.run_full_verification`` gathers over EVERY registered
+# module config — nine today, including the dominant `orchestrator` segment —
+# so for the five 6-way entries the measured wave remains a LOWER BOUND on the
+# fully-concurrent cost, not a reproduction of it. See the same note in each
+# of those five yamls' provenance blocks for what bounds the gap; shared's own
+# provenance block records the nine-way gather directly, so no such note
+# applies there. Nor does it apply to `orchestrator`, whose figure did not come
+# from that sweep AT ALL — it is a fleet census of production verify runs (see
+# its entry above), so the 6-way/9-way distinction is simply not the axis its
+# error bar lies on.
 MEASURED_MODULE_SUITE_WORST_SECS: dict[str, float] = {
-    'shared': 219.08,
+    'shared': 296.88,
     'escalation': 354.56,
     'fused-memory': 439.80,
     'dashboard': 653.54,
     'sampler': 22.49,
     'cockpit': 130.50,
+    # REFRESHED 2026-09-14 from ORCHESTRATOR_BUDGET_CENSUS (5288.0 was a
+    # RETIRED-REGIME figure — D17 orders the refresh). This is the prevailing
+    # regime's worst GREEN full-suite run.
+    #
+    # REFRESHING THIS DOWNWARD DOES NOT WEAKEN THE GUARD, and a reviewer
+    # diffing plan against code should not read a lowered measurement as a
+    # loosened check. W stops being the only floor in the excepted branch:
+    # census_budget_floor(4626.17) = 7000 now EXCEEDS this figure and is the
+    # BINDING floor, asserted alongside the surviving `budget > worst`. Net
+    # strength strictly increases — before, the excepted branch's only real
+    # floor was a single frozen number that could not detect its own
+    # staleness; now it is a derivation over a dated, regime-scoped,
+    # reproducible census that names the command to repeat.
+    'orchestrator': 4626.166946739017,
 }
+
+# Single, EXPLICIT, documented exception to assertions (b) and (c) below —
+# not a loophole for weakening them generally. Modelled on
+# MODULE_BUDGET_EXCLUSIONS: a dict keyed by prefix so the justification lives
+# AT THE DEFINITION SITE next to the module it excuses.
+#
+# `orchestrator` is RULED BY LEO (esc-4211-6, 2026-09-07 option B, unstuck
+# 2026-09-11 option C, recorded on task 3353; split out as task 5422) to
+# carry a per-module budget of 7200s, which deliberately does NOT narrow
+# below the repo-root whole-fleet ceiling — the opposite of every other
+# module's per-module budget. That is the remedy for false infra_timeouts
+# on healthy branches (green runs have reached ~5288s, past the 3600s
+# ceiling in force when the ruling was made), so assertion (c) — strictly
+# below the fleet ceiling — cannot be satisfied here without re-creating
+# the defect the ruling exists to remove. Assertion (b) would also reject
+# it: min_budget(5288.0) demands ~10500s, sizing against an unsharded,
+# still-growing suite — exactly the moving-target problem
+# MODULE_BUDGET_EXCLUSIONS declined to chase while task 3353 owned it.
+#
+# AT the ceiling or ABOVE it is the OPERATOR's choice, not this module's,
+# which is why the excepted branch below compares with `>=` and not `>`.
+# The ruling set 7200 against a 3600s fleet ceiling; commit 36c4c71eb4
+# (Leo, 2026-09-12) then raised the FLEET ceiling 3600 -> 7200 as a stopgap
+# — dark-factory-orchestrator.yaml says in as many words that "7200 is the
+# figure already ruled as task 3353 scope B" — so the two coincide TODAY.
+# That same operator note carries the revert condition, "when ... the
+# module declares its own budget, put these back to 3600/5400", which is
+# this very declaration, after which they separate again. A `>` here is
+# red today and a `==` red after the revert; `>=` is the relation the
+# RULING implies in both worlds, and it is the ruling this dict excepts
+# against. Same lesson as commit e9d1055ed8: a guard must not pin an
+# operator-tunable live yaml value.
+#
+# NOW D-DERIVED (Leo's ruling D17, 2026-09-14, task 3353 scope D'). It was an
+# operator estimate under D16' — ~1.6x headroom over a ~4400s extrapolation
+# from task 4176's contended run, not a distribution. It is now a DERIVATION
+# over a dated, regime-scoped census: see ORCHESTRATOR_BUDGET_CENSUS, whose
+# verbatim command is the way to repeat it. This exception's NUMBER is still
+# expected to change as the census is re-measured, not this exception's
+# EXISTENCE — which is why it stays keyed on the module rather than on today's
+# figure.
+#
+# WHAT THE EXCEPTION DOES NOT BUY. It drops (b)'s ~2x min_budget MULTIPLE,
+# not the measurement floor underneath it — and since D17 it does not even buy
+# a bare fleet-ceiling check. The excepted branch asserts the declared budget
+# is at or above max(census_budget_floor(census max), fleet ceiling) AND still
+# clears MEASURED_MODULE_SUITE_WORST_SECS[prefix] — so this dict cannot be used
+# to park a budget inside the band where green runs have already been observed
+# to land, which is the failure mode the ruling exists to remove and the one an
+# "except (b) and (c) entirely" reading would silently re-open.
+#
+# WHY `>=` AND NOT `>` against the fleet ceiling, unchanged from D16': commit
+# 36c4c71eb4 raised that ceiling onto this module's ruled figure as a stopgap
+# and recorded the condition for putting it back. The two are expected to
+# separate again, and the module keeps its ruled figure through that revert
+# rather than falling back with the ceiling — so the comparison must admit
+# equality while they coincide.
+#
+# Do NOT widen this dict for any other module: every other declared budget
+# still narrows below the fleet ceiling and is still held to (b) and (c) in
+# full.
+RULED_INTERIM_BUDGET_EXCEPTIONS: dict[str, str] = {
+    'orchestrator': (
+        "esc-4211-6 (2026-09-07 option B / 2026-09-11 option C), Leo's ruling "
+        "D16' (2026-09-08), refined by ruling D17 (2026-09-14, task 3353 "
+        "scope D'): verify_command_timeout_secs=7200 is a deliberate, "
+        'documented exception to assertions (b) and (c) — a budget that does '
+        'not narrow below the fleet ceiling, to stop false infra_timeouts on '
+        'a suite whose green runs already exceed the 3600s ceiling the ruling '
+        'was made against. It is NO LONGER a bare estimate: the floor holding '
+        'it up is max(census_budget_floor(ORCHESTRATOR_BUDGET_CENSUS.'
+        'max_secs), fleet ceiling), derived from a dated, regime-scoped '
+        'census whose repeat command is recorded at that constant.'
+    ),
+}
+
+# D17's HARD CONSTRAINT (Leo, 2026-09-14). A census-derived floor above this
+# figure is a FINDING, never a silent raise: commit 36c4c71eb4 raised the fleet
+# ceiling 3600 -> 7200 as a STOPGAP and recorded that "the next raise should be
+# refused". So if the derivation below ever demands more than this, the answer
+# is to escalate and trim the suite (tasks 4600 / 5412 / 5280 own that half of
+# scope D), not to move the number.
+CENSUS_FLOOR_REFUSAL_CEILING = 7200
+
+
+class BudgetCensus(NamedTuple):
+    """One module's verify-duration census, frozen with its own provenance.
+
+    THE POINT OF THE SHAPE. The prose entry in
+    ``RULED_INTERIM_BUDGET_EXCEPTIONS`` could say "7200 is an operator
+    estimate" and nothing could check it. These fields are asserted against, so
+    the excepted branch stops asserting prose and starts asserting a
+    DERIVATION.
+
+    ``census_command`` and ``measured_at`` are not decoration: they are what
+    make the next figure a REPEAT rather than a re-derivation, which is exactly
+    what ``MEASURED_MODULE_SUITE_WORST_SECS``' own provenance block demands.
+    Re-measure by re-running that command, and replace the whole record.
+
+    ``regime``/``regime_since`` exist because a bare trailing window is WRONG
+    here, and provably so. A 14-day window from 2026-09-14 reaches back to
+    08-31 and straddles the retired 3-slot / 3600-ceiling regime, whose max was
+    4991s -> a floor of 7500, which trips the refusal ceiling above on evidence
+    from a configuration that no longer exists. D17's rule says "under the
+    PREVAILING config", so the window is
+    ``intersection(trailing-14d, prevailing regime)`` and the assertion
+    ``window_start >= regime_since`` holds it there. That assertion goes INERT
+    on its own once 14 days of prevailing-regime data exist, which is the point
+    — it narrows the window only while narrowing is needed, and says why.
+    """
+
+    window_start: str
+    window_end: str
+    regime: str
+    regime_since: str
+    n: int
+    p50: float
+    p90: float
+    max_secs: float
+    timed_out: int
+    census_command: str
+    measured_at: str
+
+
+# MEASURED 2026-09-14 by the verbatim command below, over the PREVAILING
+# config regime. RE-MEASURE BY REPEATING THAT COMMAND and replacing this whole
+# record, so the next figure is a repeat rather than a re-derivation.
+#
+# THE THREE REGIMES THE CENSUS FOUND, which is why this one is scoped:
+#   pre-2026-09-03          n=26  p50=1551  p90=2385  max=3225   t/o=1   floor 4900
+#   09-03 .. 09-12T08       n=26  p50=3090  p90=4223  max=4991   t/o=14  floor 7500
+#   since 09-12T08 (THIS)   n=14  p50=3275  p90=3685  max=4626   t/o=0   floor 7000
+# The middle regime corroborates the segmentation on its own evidence: 14
+# timeouts against this regime's 0, which is the distress commit 36c4c71eb4
+# relieved by raising the ceiling 3600 -> 7200.
+#
+# DIVERGENCE FROM D17's STATED FIGURES, recorded rather than smoothed over.
+# The ruling expected max=3753 -> floor 5700. Measured max is 4626 -> floor
+# 7000, because a green run landed at 2026-09-14T09:35 (task 3541) after the
+# ruling was written, making 3753 the second-highest. n/p50/p90 all match the
+# ruling's shape. Consequence filed as esc-3353-15: headroom against the
+# refusal ceiling is 174s of floor (7000 vs 7200), i.e. a single green run
+# above 4800s trips assertion (3) above. That is the ruling's INTENDED
+# behaviour — the finding surfaces instead of the budget silently rising — so
+# when it fires, read it as the escalate branch working.
+#
+# EVERY IN-WINDOW RUN IS UNSTAMPED. Deliverable 1 of this task adds the host
+# load stamp; it had not merged when this was measured, so all 14 records
+# carry no load reading and the census's load bands are all empty. The figures
+# here are therefore durations under UNKNOWN host load — which is precisely the
+# gap D1 closes for the next re-measure.
+ORCHESTRATOR_BUDGET_CENSUS = BudgetCensus(
+    window_start='2026-09-12T08:00:00+00:00',
+    window_end='2026-09-15T00:00:00+00:00',
+    regime='prevailing config since the 3600 -> 7200 fleet-ceiling raise',
+    regime_since='2026-09-12T08:00:00+00:00',
+    n=14,
+    p50=3274.9211449669992,
+    p90=3684.5928532374005,
+    max_secs=4626.166946739017,
+    timed_out=0,
+    census_command=(
+        'uv run --project shared python scripts/verify_budget_census.py '
+        '--root /home/leo/src/dark-factory --module orchestrator '
+        '--label test --role task '
+        '--window 2026-09-12T08:00:00+00:00..2026-09-15T00:00:00+00:00'
+    ),
+    measured_at='2026-09-14',
+)
+
+# Keyed by prefix, like every other justification dict here, so the
+# parametrized branch below stays total rather than special-casing one name.
+RULED_BUDGET_CENSUS: dict[str, BudgetCensus] = {
+    'orchestrator': ORCHESTRATOR_BUDGET_CENSUS,
+}
+
+
+# RULED_COLD_BUDGET_DECLARATIONS: keyed by prefix so the justification lives at
+# the definition site, exactly like RULED_INTERIM_BUDGET_EXCEPTIONS above and
+# MODULE_BUDGET_EXCLUSIONS below. A module listed here DECLARES its own
+# verify_cold_command_timeout_secs; every module NOT listed keeps assertion
+# (f)'s fall-through contract in full.
+#
+# Do NOT widen this dict to silence a surprising (f) failure. (f) exists to
+# make ONE misreading un-silent — that an unset cold knob "inherits" the warm
+# value — and for the six modules task 3473 closed, the fall-through IS the
+# intended behaviour. Adding a prefix here to make a red go green would retire
+# that guard for a module that never wanted a cold budget.
+RULED_COLD_BUDGET_DECLARATIONS: dict[str, str] = {
+    'orchestrator': (
+        "ruling D17 (2026-09-14, task 3353 scope D'): "
+        'verify_cold_command_timeout_secs=10800 is a ruled, INTERIM per-module '
+        'cold budget. INTERIM because there is no cold distribution to derive '
+        'from — a summary.json carries no is-cold flag and the attempt-number '
+        'inference cannot tell a cold first verify from a warm re-verify of a '
+        'reset worktree, which scripts/verify_budget_census.py reports as an '
+        'explicit cold_separable=false finding rather than guessing. BASIS: '
+        'the census-derived warm figure (7200) plus the cold preprovision cost '
+        'this lane additionally pays, allotted at the fleet\'s own current '
+        'cold allowance. DECLARED RATHER THAN LEFT TO FALL THROUGH because '
+        "commit 36c4c71eb4's stated revert condition would return the cold "
+        'ceiling to 5400 — BELOW this module\'s warm budget, on a strictly '
+        'costlier path, which is the state in which the cold false-timeout '
+        'hazard was live. A module declaration survives that revert; a '
+        'fall-through does not.'
+    ),
+}
+
 
 # One real tracked file under each module prefix, used to drive the production
 # plan->execution bridge in assertion (e). Deliberately a PRODUCTION file rather
@@ -164,116 +524,16 @@ SAMPLE_TOUCHED_FILE: dict[str, str] = {
     'dashboard': 'dashboard/src/dashboard/__init__.py',
     'sampler': 'sampler/src/sampler/__init__.py',
     'cockpit': 'cockpit/src/cockpit/__init__.py',
+    'orchestrator': 'orchestrator/src/orchestrator/__init__.py',
 }
-
-
-def _min_budget(worst: float) -> int:
-    """~2x the worst measured run, rounded DOWN to the nearest 100s.
-
-    The EXACT expression task 3458 uses for
-    ``test_scripts_module_config.MIN_MODULE_BUDGET_SECS``, reused verbatim so
-    the two guards cannot silently drift in SHAPE. DERIVED from the
-    measurement rather than hand-set, because that exact pair has already
-    rotted once undetected: the tests/scripts sibling still hard-codes its
-    floor against a 127.0s worst run while its own yaml has since recorded
-    233.50s, and nothing caught it.
-
-    DEGENERATES TO ZERO for cheap suites — see the parametrized test's
-    docstring, where the consequence is spelled out rather than left for a
-    reader to discover.
-    """
-    return (int(2 * worst) // 100) * 100
-
-
-def _discovered() -> dict:
-    """Every module config the PRODUCTION walk registers, keyed by repo-relative prefix.
-
-    Delegates to ``config._discover_module_configs`` rather than globbing
-    ``**/orchestrator.yaml``. A hand-rolled glob run from the main checkout
-    would descend ``.worktrees/`` and ``.venv/``, and would remain free to
-    drift from what the orchestrator actually registers; delegating inherits
-    the production pruning of ``.worktrees``, ``.venv``, ``node_modules``,
-    ``build``, ``target``, ``.claude`` and nested ``.git`` checkouts, and
-    covers configs at ANY depth (``tests/scripts``, not just depth-1 names).
-    """
-    return _discover_module_configs(REPO_ROOT)
-
-
-def _root_config(monkeypatch: pytest.MonkeyPatch) -> OrchestratorConfig:
-    """Load the repo-root config through the PRODUCTION loader, anchored at DF_CONFIG_PATH.
-
-    ANCHORING ``ORCH_CONFIG_PATH`` IS LOAD-BEARING, not hygiene. ``project_root``
-    is only a model FIELD and selects nothing:
-    ``OrchestratorConfig.settings_customise_sources`` builds its
-    ``YamlSettingsSource`` from ``os.environ['ORCH_CONFIG_PATH']`` alone,
-    falling back to a CWD-relative ``config.yaml``. Both ambient states are
-    wrong here, in OPPOSITE directions:
-
-      * UNSET — the state INSIDE VERIFY, because
-        ``verify._target_subprocess_env`` deliberately scrubs the whole
-        ``ORCH_`` prefix — finds no file, so every value collapses to the
-        pydantic DEFAULTS. Assertion (c) below would then compare each module
-        budget against a default this repo does not declare.
-      * SET, as an operator's shell has it, points at whichever checkout that
-        orchestrator serves — typically the MAIN one, not this worktree. Every
-        assertion would then be about a different checkout's yaml and report
-        GREEN on a worktree that had actually regressed.
-
-    Setting the env var IS the production load path (``config.load_config``
-    stamps it before constructing), so this stays a read through the real
-    loader, pinned to THIS worktree's committed yaml.
-
-    Fails LOUDLY on a missing file: ``YamlSettingsSource`` SKIPS a non-existent
-    ``config_path`` rather than raising, so a bad path would silently yield the
-    pydantic defaults instead of an error.
-    """
-    assert DF_CONFIG_PATH.is_file(), (
-        f'{DF_CONFIG_PATH} does not exist, so anchoring ORCH_CONFIG_PATH at it '
-        'would silently load the pydantic DEFAULTS instead (YamlSettingsSource '
-        'skips a non-existent path rather than raising), and every value read '
-        'from the returned config would be about a config this repo does not '
-        'declare. dark-factory-orchestrator.yaml is the canonical, required '
-        "filename for a project's top-level orchestrator config"
-    )
-    monkeypatch.setenv('ORCH_CONFIG_PATH', str(DF_CONFIG_PATH))
-    return OrchestratorConfig(project_root=REPO_ROOT)
-
-
-def _executed_for_touched(prefix: str, files: list[str], cfg: OrchestratorConfig):
-    """Run the PRODUCTION plan->execution bridge and return the single executed config.
-
-    ``derive_verify_plan`` decides scope; ``_executed_module_configs_from_plan``
-    renders those PlannedRuns into the exact ModuleConfig ``run_verification``
-    executes. Asserting on THAT is what makes "the budget survives to
-    execution" a structural claim rather than a claim about the yaml.
-
-    *cfg* IS A REQUIRED PARAMETER, not a convenience. It must be a config built
-    by ``_root_config``, whose docstring spells out why the ``ORCH_CONFIG_PATH``
-    anchor is load-bearing: an unset anchor collapses every value to the
-    pydantic defaults, SILENTLY. This helper used to construct its own
-    ``OrchestratorConfig(project_root=REPO_ROOT)`` and read the right yaml only
-    because its caller happened to have called ``_root_config`` earlier in the
-    same test body, leaving the env var set as a SIDE EFFECT. Reordering the
-    assertions, or calling this helper from a new test, would have handed it a
-    defaults-collapsed config with no failure signal. Taking the config as an
-    argument makes the dependency structural instead of ordering-dependent.
-
-    The ``lambda _f: None`` worktree_reader keeps this hermetic: no file reads,
-    and nothing classifies STRUCTURAL.
-    """
-    mc = _discovered()[prefix]
-    plan = verify_plan.derive_verify_plan(files, [mc], cfg, lambda _f: None)
-    executed = verify._executed_module_configs_from_plan([mc], plan)
-    assert len(executed) == 1, (
-        f'expected exactly one executed module config for {files!r}, got '
-        f'{[e.prefix for e in executed]!r}'
-    )
-    return executed[0]
 
 
 @pytest.mark.parametrize('prefix', sorted(MEASURED_MODULE_SUITE_WORST_SECS))
 def test_module_carries_its_own_measured_verify_budget(
-    prefix: str, monkeypatch: pytest.MonkeyPatch
+    prefix: str,
+    root_config: OrchestratorConfig,
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+    executed_for_touched: Callable[[str, list[str], OrchestratorConfig], ModuleConfig],
 ) -> None:
     """Each measured module declares a warm budget, narrower than the repo-root ceiling.
 
@@ -282,7 +542,7 @@ def test_module_carries_its_own_measured_verify_budget(
     (a) DECLARED AT ALL. Otherwise ``verify._resolve_verify_timeout`` falls
         hard through to the repo-root whole-fleet ceiling — a budget sized for
         nine suites chained into one shell command, applied to one suite.
-    (b) At least ``_min_budget(W)``, ~2x the worst measured run.
+    (b) At least ``min_budget(W)``, ~2x the worst measured run.
     (c) STRICTLY below the repo-root warm ceiling: a real narrowing rather
         than a relabelling. A per-module budget at or above the global one
         surfaces a hang no sooner than the fleet ceiling already would.
@@ -298,8 +558,31 @@ def test_module_carries_its_own_measured_verify_budget(
         ``_resolve_verify_timeout``'s cascade an unset module cold knob falls
         through to ``config.verify_cold_command_timeout_secs``, NOT to the
         module's warm budget. This is exactly the misreading the sibling guard
-        was written to make un-silent, and it is folded in here so six modules
-        get it for the cost of one assertion.
+        was written to make un-silent, and it is folded in here so every
+        parametrized module gets it for the cost of one assertion. ONE module
+        is carved out of that fall-through contract: ``orchestrator`` now
+        DECLARES its own ``verify_cold_command_timeout_secs``, so for it this
+        assertion checks the RULED shape instead — that the RESOLVER returns
+        the declared value rather than the cascade shadowing it, and that the
+        value sits at or above BOTH the module's own warm budget and the fleet
+        cold ceiling, because a cold verify pays the warm cost plus
+        preprovision. Why it is declared rather than left to fall through —
+        commit 36c4c71eb4's revert condition would return the cold ceiling to
+        5400, below this module's warm budget — is stated at the definition
+        site in ``RULED_COLD_BUDGET_DECLARATIONS`` and in
+        ``orchestrator/orchestrator.yaml``'s provenance block. Every other
+        prefix keeps the fall-through contract in full.
+
+    (f) COVERS THE TASK/BACKGROUND COLD LANE ONLY. ``_resolve_verify_timeout``
+        has TWO cold lanes and its cold track tries
+        ``merge_verify_cold_command_timeout_secs`` FIRST, ahead of any module
+        knob. So for ``orchestrator`` the declared 10800 is returned at
+        ``is_merge_verify=False`` and SHADOWED at ``is_merge_verify=True``,
+        which resolves to 7200 — equal to its warm budget, on the strictly
+        costlier path. That carve-out is asserted below rather than merely
+        described, so closing it (or forgetting it) turns a test red. Closing
+        it needs a repo-root ceiling raise, which ruling D17 places outside
+        this task.
 
     SCOPE, STATED HONESTLY — this guard's advertised reach must equal its real
     reach, because a guard that overstates itself is the same defect wearing a
@@ -313,7 +596,7 @@ def test_module_carries_its_own_measured_verify_budget(
       Detecting that requires RE-MEASUREMENT, which a table cannot do to
       itself.
     * ASSERTION (b) DEGENERATES FOR CHEAP SUITES AND IS VACUOUS FOR SOME
-      MODULES HERE. ``_min_budget`` floors to the nearest 100s, so any suite
+      MODULES HERE. ``min_budget`` floors to the nearest 100s, so any suite
       whose worst run is under 50s yields a floor of 0 and (b) asserts
       ``budget >= 0`` — literally unfalsifiable. sampler's worst run is
       22.49s, giving exactly that. For such modules the load-bearing
@@ -323,9 +606,22 @@ def test_module_carries_its_own_measured_verify_budget(
       introduced precisely because a hand-coded pair had already rotted, and
       dropping (b) for cheap modules would make the parametrization
       non-uniform.
+    * ASSERTIONS (b) AND (c) HAVE ONE RULED, DOCUMENTED EXCEPTION: `orchestrator`
+      (see ``RULED_INTERIM_BUDGET_EXCEPTIONS``). Its budget deliberately does
+      NOT narrow below the fleet ceiling, and is an operator estimate rather
+      than derived from ``min_budget``, per Leo's ruling esc-4211-6 — so this
+      test asserts the RULING's own shape for that one module instead of
+      (b)/(c), and every other assertion ((a), (d), (e), (f)) still runs
+      unchanged for it. THE EXCEPTION IS NOT A
+      FREE PASS: the replacement is TWO assertions, not none — the budget must
+      sit AT OR ABOVE the fleet ceiling AND still clear the module's own worst
+      recorded green run. Only (b)'s ~2x multiple is dropped, and only because
+      the ruling rejected it as a moving target; the measurement floor itself
+      survives, which is what stops a later edit from lowering the budget back
+      into the band where green runs have already been observed.
     """
     worst = MEASURED_MODULE_SUITE_WORST_SECS[prefix]
-    discovered = _discovered()
+    discovered = discover_module_configs()
 
     assert prefix in discovered, (
         f'{prefix}/orchestrator.yaml is not discovered by the production '
@@ -346,34 +642,134 @@ def test_module_carries_its_own_measured_verify_budget(
         f'the fleet ceiling (~an hour), not in minutes'
     )
 
-    # (b) Measurement-derived floor. VACUOUS where _min_budget degenerates to
-    # 0 (any suite under ~50s) — see the docstring; not silently so.
-    floor = _min_budget(worst)
-    assert mc.verify_command_timeout_secs >= floor, (
-        f'{prefix} verify_command_timeout_secs='
-        f'{mc.verify_command_timeout_secs} is below the {floor}s floor derived '
-        f'from its worst measured run ({worst}s, CONTENDED — see '
-        f'.task/measurements.md and the module yaml\'s provenance block). A '
-        f'budget under the floor would manufacture infra_timeout on the honest '
-        f'green path — the exact defect task 3350 exists to remove, '
-        f'reintroduced one level down'
-    )
+    # (b)/(c) are held in full for every module EXCEPT one ruled, documented
+    # exception — see RULED_INTERIM_BUDGET_EXCEPTIONS and the docstring's
+    # scope note. Do not widen this branch to cover any other prefix.
+    ruled_exception = RULED_INTERIM_BUDGET_EXCEPTIONS.get(prefix)
+    root_warm = root_config.verify_command_timeout_secs
 
-    # (c) Strictly tighter than the repo-root ceiling: a real narrowing. Read
-    # through the PRODUCTION loader (see _root_config's docstring for why the
-    # ORCH_CONFIG_PATH anchoring is load-bearing rather than hygiene).
-    cfg = _root_config(monkeypatch)
-    root_warm = cfg.verify_command_timeout_secs
-    assert mc.verify_command_timeout_secs < root_warm, (
-        f'{prefix} verify_command_timeout_secs='
-        f'{mc.verify_command_timeout_secs} is not strictly below the repo-root '
-        f'verify_command_timeout_secs={root_warm} (task 3473). A per-module '
-        f'budget at or above the global one is a relabelling, not a narrowing: '
-        f'it surfaces a hang no sooner than the whole-fleet ceiling would'
-    )
+    if ruled_exception is None:
+        # (b) Measurement-derived floor. VACUOUS where min_budget degenerates
+        # to 0 (any suite under ~50s) — see the docstring; not silently so.
+        floor = min_budget(worst)
+        assert mc.verify_command_timeout_secs >= floor, (
+            f'{prefix} verify_command_timeout_secs='
+            f'{mc.verify_command_timeout_secs} is below the {floor}s floor derived '
+            f'from its worst measured run ({worst}s, CONTENDED — see '
+            f'.task/measurements.md and the module yaml\'s provenance block). A '
+            f'budget under the floor would manufacture infra_timeout on the honest '
+            f'green path — the exact defect task 3350 exists to remove, '
+            f'reintroduced one level down'
+        )
+
+        # (c) Strictly tighter than the repo-root ceiling: a real narrowing.
+        # The repo-root config arrives from the directory-wide `root_config`
+        # fixture, which reads it through the PRODUCTION loader — see its
+        # docstring in tests/scripts/conftest.py for why the ORCH_CONFIG_PATH
+        # anchoring is load-bearing rather than hygiene.
+        assert mc.verify_command_timeout_secs < root_warm, (
+            f'{prefix} verify_command_timeout_secs='
+            f'{mc.verify_command_timeout_secs} is not strictly below the repo-root '
+            f'verify_command_timeout_secs={root_warm} (task 3473). A per-module '
+            f'budget at or above the global one is a relabelling, not a narrowing: '
+            f'it surfaces a hang no sooner than the whole-fleet ceiling would'
+        )
+    else:
+        # RULED EXCEPTION (see RULED_INTERIM_BUDGET_EXCEPTIONS for the full
+        # reason, including why this comparison is `>=` and not `>`): this
+        # module's budget deliberately does NOT narrow below the fleet ceiling
+        # — the opposite of (c) — and is an operator estimate rather than
+        # min_budget(worst) — the opposite of (b). Assert the ruling's own
+        # shape instead of skipping outright, so this branch still checks
+        # something. root_warm is operator-tunable and currently sits ON this
+        # module's ruled figure; the floor that actually holds the budget up
+        # is the measurement assertion below, not this one.
+        census = RULED_BUDGET_CENSUS[prefix]
+
+        # (4) THE WINDOW IS REGIME-SCOPED. Asserted BEFORE the derivation it
+        # feeds, because a straddling window makes every figure below describe
+        # a configuration that no longer exists. Goes inert on its own once 14
+        # days of prevailing-regime data exist.
+        assert census.window_start >= census.regime_since, (
+            f'{prefix} budget census window starts {census.window_start}, '
+            f'BEFORE the prevailing config regime began '
+            f'({census.regime_since}, commit 36c4c71eb4). A window that '
+            f'straddles the retired 3-slot / 3600s-ceiling regime derives the '
+            f'floor below from runs made under a configuration that no longer '
+            f'exists — measured, that regime max is 4991s and yields a 7500s '
+            f'floor, which trips CENSUS_FLOOR_REFUSAL_CEILING. Re-run '
+            f'{census.census_command!r} with an explicit '
+            f'--window {census.regime_since}..<now> and replace the record'
+        )
+
+        # (3) D17's HARD CONSTRAINT, asserted before it is used as a floor.
+        derived_floor = census_budget_floor(census.max_secs)
+        assert derived_floor <= CENSUS_FLOOR_REFUSAL_CEILING, (
+            f'{prefix} census-derived floor is {derived_floor}s — ABOVE the '
+            f'{CENSUS_FLOOR_REFUSAL_CEILING}s refusal ceiling. THIS IS A '
+            f'FINDING TO ESCALATE, NOT A NUMBER TO RAISE. Commit 36c4c71eb4 '
+            f'raised the fleet ceiling 3600 -> 7200 as a stopgap and recorded '
+            f'that "the next raise should be refused", so do NOT edit '
+            f'CENSUS_FLOOR_REFUSAL_CEILING, do NOT raise the yaml, and do NOT '
+            f'weaken this assertion. File '
+            f"escalate_blocker(category='design_concern') naming this census "
+            f'(n={census.n}, p50={census.p50}, p90={census.p90}, '
+            f'max={census.max_secs}, window {census.window_start}..'
+            f'{census.window_end}, measured {census.measured_at}) and that '
+            f'refusal condition. The remedy is trimming the suite — tasks '
+            f'4600 / 5412 / 5280 own that half of scope D — not a wider budget'
+        )
+
+        # (1) THE DERIVATION. Replaces a bare `>= root_warm`: that alone would
+        # let the budget sit anywhere at or above an operator-tunable value,
+        # including inside the band where green runs land once the ceiling
+        # reverts. The floor is now the STRONGER of the census derivation and
+        # the fleet ceiling, so it survives commit 36c4c71eb4's revert.
+        census_floor = max(derived_floor, root_warm)
+        assert mc.verify_command_timeout_secs >= census_floor, (
+            f'{prefix} verify_command_timeout_secs='
+            f'{mc.verify_command_timeout_secs} is below its census-derived '
+            f'floor of {census_floor}s = max(census_budget_floor('
+            f'{census.max_secs})={derived_floor}, root ceiling={root_warm}). '
+            f'Its RULED_INTERIM_BUDGET_EXCEPTIONS entry ({ruled_exception}) '
+            f'excuses it from (b)/(c), NOT from the derivation that replaced '
+            f'them. Either the ruling no longer applies — remove this prefix '
+            f'so (b)/(c) apply in full — or {prefix}/orchestrator.yaml '
+            f'regressed. Re-measure with {census.census_command!r}'
+        )
+
+        # ...AND IT STILL CLEARS THIS MODULE'S OWN WORST RECORDED GREEN RUN.
+        # The exception drops (b)'s ~2x min_budget multiple — which the ruling
+        # rejected as a moving target against an unsharded, still-growing
+        # suite — but it deliberately does NOT drop the measurement floor
+        # altogether. Without this line the only surviving floor would be
+        # root_warm — an operator-tunable value that has sat INSIDE the band
+        # where green runs have already been observed to land, and is due to
+        # again under commit 36c4c71eb4's own revert condition: at the 3600s
+        # ceiling this exception was ruled against, green runs of
+        # 5288/5269/5196/5093/4991/4708s were already clearing it (see the
+        # MEASURED_MODULE_SUITE_WORST_SECS caveat for the census). A future
+        # edit lowering the budget to, say, 3700 would then keep this guard
+        # green while re-manufacturing the exact false infra_timeout the
+        # ruling exists to remove. This is also what makes this module's W
+        # entry load-bearing rather than decorative: everywhere else in the
+        # excepted branch, `worst` reaches only assertion (a)'s message.
+        assert mc.verify_command_timeout_secs > worst, (
+            f'{prefix} verify_command_timeout_secs='
+            f'{mc.verify_command_timeout_secs} does not clear its own worst '
+            f'recorded GREEN run ({worst}s). Its RULED_INTERIM_BUDGET_EXCEPTIONS '
+            f'entry ({ruled_exception}) excuses it from (b)\'s ~2x '
+            f'min_budget({worst})={min_budget(worst)}s floor, NOT from clearing '
+            f'the measurement itself: a budget at or under a run that has '
+            f'already completed green manufactures infra_timeout on the honest '
+            f'green path, which is the precise defect the ruling exists to '
+            f'remove. Do not lower the budget to satisfy this — RE-MEASURE (see '
+            f'the MEASURED_MODULE_SUITE_WORST_SECS caveat for how) and raise '
+            f'both together'
+        )
 
     # (d) The REAL precedence mechanism honours it, warm.
-    resolved = verify._resolve_verify_timeout(cfg, mc, is_cold=False)
+    resolved = verify._resolve_verify_timeout(root_config, mc, is_cold=False)
     assert resolved == mc.verify_command_timeout_secs, (
         f'_resolve_verify_timeout returned {resolved} for a warm verify of '
         f'{prefix}, not the declared module budget '
@@ -384,7 +780,9 @@ def test_module_carries_its_own_measured_verify_budget(
     # (e) Survives the PRODUCTION plan -> execution bridge, not just the
     # resolver in isolation. See the docstring for why _apply_cargo_scope makes
     # this a live risk rather than a formality.
-    executed = _executed_for_touched(prefix, [SAMPLE_TOUCHED_FILE[prefix]], cfg)
+    executed = executed_for_touched(
+        prefix, [SAMPLE_TOUCHED_FILE[prefix]], root_config
+    )
     assert executed.verify_command_timeout_secs == mc.verify_command_timeout_secs, (
         f'the production plan->execution bridge '
         f'(verify._executed_module_configs_from_plan) rendered '
@@ -396,18 +794,109 @@ def test_module_carries_its_own_measured_verify_budget(
 
     # (f) The warm knob deliberately does NOT cover cold. An unset module cold
     # knob falls through to the ROOT cold ceiling, not to this warm value.
+    #
+    # ONE per-module carve-out (RULED_COLD_BUDGET_DECLARATIONS) for a module
+    # that DOES declare its own cold budget. The fall-through contract below is
+    # untouched for every other prefix, so the misreading (f) exists to make
+    # un-silent stays closed for them.
+    cold_declaration = RULED_COLD_BUDGET_DECLARATIONS.get(prefix)
+    # The fleet's EFFECTIVE cold ceiling. An unset root cold knob is not the
+    # absence of a ceiling: the cascade's step 3 falls through to the root WARM
+    # budget (verify._resolve_verify_timeout), so that is the figure a module
+    # declaration must still clear. Reading it as None would both make the
+    # floor below vacuous and raise TypeError on the comparison.
+    root_cold_ceiling = (
+        root_config.verify_cold_command_timeout_secs
+        if root_config.verify_cold_command_timeout_secs is not None
+        else root_config.verify_command_timeout_secs
+    )
+    if cold_declaration is not None:
+        declared_cold = mc.verify_cold_command_timeout_secs
+        assert declared_cold is not None, (
+            f'{prefix} is listed in RULED_COLD_BUDGET_DECLARATIONS '
+            f'({cold_declaration}) but {prefix}/orchestrator.yaml declares no '
+            f'verify_cold_command_timeout_secs. Either the declaration was '
+            f'reverted — drop this prefix from the dict so (f)\'s '
+            f'fall-through contract applies again — or the yaml regressed'
+        )
+
+        # The RESOLVER returns it, not merely the yaml holding it. This is what
+        # proves the cascade's step 1 is actually reached: a number present in
+        # the config but shadowed by the cascade would satisfy a yaml-only
+        # check while the cold lane still ran on the root ceiling.
+        resolved_declared = verify._resolve_verify_timeout(
+            root_config, mc, is_cold=True, is_merge_verify=False
+        )
+        assert resolved_declared == declared_cold, (
+            f'_resolve_verify_timeout(is_cold=True) returned '
+            f'{resolved_declared} for {prefix}, not its DECLARED '
+            f'verify_cold_command_timeout_secs={declared_cold}. The value is '
+            f'in the yaml but the cascade is not reaching it, so the cold lane '
+            f'is still running on some other budget'
+        )
+
+        # The OTHER cold lane, pinned as the carve-out it is. The cold track
+        # tries merge_verify_cold_command_timeout_secs BEFORE the module knob,
+        # so on a cold MERGE verify this module's declaration is shadowed. The
+        # yaml block says so; this asserts it, so the prose cannot drift from
+        # the resolver and a future closing of the lane cannot land silently.
+        merge_cold = verify._resolve_verify_timeout(
+            root_config, mc, is_cold=True, is_merge_verify=True,
+        )
+        root_merge_cold = root_config.merge_verify_cold_command_timeout_secs
+        assert merge_cold == root_merge_cold, (
+            f'_resolve_verify_timeout(is_cold=True, is_merge_verify=True) '
+            f'returned {merge_cold} for {prefix}, not the repo-root '
+            f'merge_verify_cold_command_timeout_secs={root_merge_cold}. The '
+            f'cold MERGE lane is a documented carve-out (esc-3353-20): the '
+            f'module cold declaration is shadowed there. If this lane was '
+            f'deliberately closed, update this assertion AND the '
+            f'orchestrator.yaml provenance block together — the finding they '
+            f'both record would no longer be true'
+        )
+
+        # A cold verify pays verify_cold_preprovision_command and unwarmed
+        # caches ON TOP of the warm cost, so a cold budget BELOW the warm one
+        # is incoherent by construction — it would make the strictly costlier
+        # path the one that times out first.
+        assert declared_cold >= mc.verify_command_timeout_secs, (
+            f'{prefix} declares verify_cold_command_timeout_secs='
+            f'{declared_cold}, BELOW its warm '
+            f'verify_command_timeout_secs={mc.verify_command_timeout_secs}. A '
+            f'cold verify pays the cold preprovision command and unwarmed '
+            f'caches on top of everything the warm run pays, so this makes the '
+            f'strictly more expensive path time out first'
+        )
+
+        # ...and never below the fleet cold ceiling, the same rule the warm
+        # exception carries and for the same reason: the ceiling is
+        # operator-tunable and this figure is RULED, so the declaration must
+        # survive commit 36c4c71eb4's revert condition rather than falling back
+        # with it.
+        assert declared_cold >= root_cold_ceiling, (
+            f'{prefix} declares verify_cold_command_timeout_secs='
+            f'{declared_cold}, below the repo-root effective cold ceiling '
+            f'{root_cold_ceiling} (its verify_cold_command_timeout_secs, or '
+            f'the warm budget the cold cascade falls through to when that is '
+            f'unset). The root '
+            f'ceiling is operator-tunable and this module\'s figure is ruled, '
+            f'so the declaration exists precisely to survive a revert of that '
+            f'ceiling — a module figure that falls back with it buys nothing'
+        )
+        return
+
     assert mc.verify_cold_command_timeout_secs is None, (
         f'{prefix}/orchestrator.yaml now declares '
         f'verify_cold_command_timeout_secs='
         f'{mc.verify_cold_command_timeout_secs} (task 3473 deliberately left '
-        f'this UNSET: none of these six modules has a build step whose cold '
+        f'this UNSET: none of these modules has a build step whose cold '
         f'cost would justify a separate cold budget). If that was set '
         f'intentionally, this assertion and the module yaml\'s cold-cascade '
         f'note must be updated together, not just this line'
     )
-    root_cold = cfg.verify_cold_command_timeout_secs
+    root_cold = root_config.verify_cold_command_timeout_secs
     resolved_cold = verify._resolve_verify_timeout(
-        cfg, mc, is_cold=True, is_merge_verify=False
+        root_config, mc, is_cold=True, is_merge_verify=False
     )
     assert resolved_cold == root_cold, (
         f'_resolve_verify_timeout(is_cold=True) returned {resolved_cold} for '
@@ -428,8 +917,9 @@ def test_module_carries_its_own_measured_verify_budget(
 # production walk must still resolve. Same purpose as
 # KNOWN_PER_MODULE_CONFIG_NAMES in test_fallback_verify_config.py — if discovery
 # silently regresses, the coverage loop below would pass VACUOUSLY on a shrunken
-# set, so it is asserted rather than trusted. Includes the six this task closed
-# plus the two sibling tasks 3350/3458 closed and the one excluded below.
+# set, so it is asserted rather than trusted. Includes the six task 3473 closed,
+# the two sibling tasks 3350/3458 closed, and `orchestrator` — excluded below
+# until task 5422 closed it, and covered like every other prefix since.
 KNOWN_MODULE_CONFIG_PREFIXES = frozenset(
     {
         'shared',
@@ -453,27 +943,39 @@ KNOWN_MODULE_CONFIG_PREFIXES = frozenset(
 #
 # These entries are NOT a statement that the owning guard is CURRENT. They
 # record only WHERE a module's provenance lives, so this file does not become a
-# second home for it; see the tests/scripts entry, which names a known staleness
-# in its own owner rather than papering over it.
+# second home for it. When an owner IS known to be stale, say so in its entry
+# rather than papering over it — the tests/scripts entry did exactly that until
+# task 3703 fixed the owner, and now records the repair as history instead.
 MEASURED_BY_SIBLING_GUARD: dict[str, str] = {
     'scripts': (
         'MEASURED_SUITE_WORST_SECS = 930.59 in '
         'tests/scripts/test_scripts_module_config.py (task 3458), sourced from '
         "scripts/orchestrator.yaml's own PER-MODULE VERIFY BUDGET block, whose "
-        'floor is DERIVED from that constant by the same expression _min_budget '
-        'uses.'
+        'floor is DERIVED from that constant by module_budget_family.min_budget, '
+        'the family\'s one implementation of that expression.'
     ),
     'tests/scripts': (
-        'MEASURED worst run 233.50s recorded in tests/scripts/orchestrator.yaml. '
-        'NOTE THE OWNING GUARD IS STALE: '
-        'tests/scripts/test_tests_scripts_module_config.py (task 3350) still '
-        'pins MEASURED_SUITE_WORST_SECS = 127.0 with a HAND-SET '
-        'MIN_MODULE_BUDGET_SECS = 300, so the 233.50s figure in the yaml is '
-        'gated by nothing — this is the exact rot _min_budget\'s docstring '
-        'names, and it is why task 3458 made the floor derived rather than '
-        'hand-set. Excluded here to avoid creating a SECOND copy of the '
-        'measurement, NOT because the sibling floor is current. Fixing that '
-        'guard is not task 3473\'s scope (it does not hold the lock).'
+        'The measured worst run is recorded in tests/scripts/orchestrator.yaml, '
+        "whose PER-MODULE VERIFY BUDGET block carries every run behind it; the "
+        'owning guard is tests/scripts/test_tests_scripts_module_config.py, '
+        'which pins MEASURED_SUITE_WORST_SECS with MIN_MODULE_BUDGET_SECS '
+        'DERIVED from it by module_budget_family.min_budget, the same one '
+        'implementation. NO FIGURE IS '
+        'QUOTED HERE, corrected in place by task 4320: this entry used to read '
+        '"MEASURED worst run 233.50s ... which pins MEASURED_SUITE_WORST_SECS = '
+        '233.50", and both numbers went stale the moment task 4320 re-measured '
+        'the suite and moved that constant to a larger figure. A quoted number '
+        'is a THIRD copy that has to be raised in lockstep with the yaml and '
+        'the owning guard — the exact drift this dict exists to avoid, '
+        'reintroduced inside the dict itself. What survives is the POINTER, '
+        'which cannot go stale that way and which '
+        'test_the_budget_family_derives_every_floor_from_one_canonical_expression '
+        'now checks actually resolves to a published pair. HISTORY, kept '
+        'because it is why this family derives rather than hand-sets: that '
+        'guard USED to pin 127.0 with a hand-set 300s floor (task 3350), so '
+        "the yaml's own worst-run figure was gated by nothing and only a "
+        'reviewer caught it; task 3703 refreshed the constant and made the '
+        'floor derived, so it is now gated.'
     ),
 }
 
@@ -485,32 +987,23 @@ MEASURED_BY_SIBLING_GUARD: dict[str, str] = {
 # That is documentation, not an enforced property — see the coverage guard's
 # docstring for why no in-file assertion could enforce it.
 #
-# THIS IS THE ONE REMAINING GAP in the repo-root yaml's claim that "tight
-# timeouts surface hangs ... on the PER-MODULE budgets". Nine of ten configs
-# now declare their own; this is the tenth. Recorded here so the guard REPORTS
-# that gap on every run rather than hiding it.
-MODULE_BUDGET_EXCLUSIONS: dict[str, str] = {
-    'orchestrator': (
-        'Owned by task 3353, which is still pending. Deliberately not fixed by '
-        'task 3473 to avoid scope creep onto files 3473 does not lock. The '
-        'exclusion is TECHNICALLY correct, not merely deferential: orchestrator '
-        'is the dominant fleet segment (measured 1366.23s and 1157.62s on one '
-        'day, ~18% apart, in task 3062 attempt-2 / esc-3062-3), and task 3353 '
-        "has since been rewritten to \"split or shard the orchestrator test "
-        'suite\" — so a budget declared now against an unsharded 1366s figure '
-        "would be invalidated by 3353's own change rather than merely refined "
-        'by it. DELETION CONDITION: once orchestrator/orchestrator.yaml declares '
-        'its own verify_command_timeout_secs, delete this entry — the coverage '
-        'guard then covers it automatically with no further edit.'
-    ),
-}
+# EMPTY as of task 5422: `orchestrator` was the one remaining gap in the
+# repo-root yaml's claim that "tight timeouts surface hangs ... on the
+# PER-MODULE budgets", and its deletion condition — orchestrator/
+# orchestrator.yaml declaring its own verify_command_timeout_secs — is now
+# met (7200, RULED BY LEO, esc-4211-6; see that yaml's own comment and
+# RULED_INTERIM_BUDGET_EXCEPTIONS below). The coverage guard now covers every
+# discovered module config with no further edit here.
+MODULE_BUDGET_EXCLUSIONS: dict[str, str] = {}
 
 
-def test_every_discovered_module_config_declares_its_own_verify_budget() -> None:
+def test_every_discovered_module_config_declares_its_own_verify_budget(
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+) -> None:
     """Every module config defining a test_command must declare a warm budget.
 
     THE ANTI-DRIFT HALF of this file, and the generalisation task 3473 exists
-    to make. The parametrized guard above covers exactly the six modules whose
+    to make. The parametrized guard above covers exactly the modules whose
     figures are in ``MEASURED_MODULE_SUITE_WORST_SECS``; nothing there notices
     a NEWLY-REGISTERED module config landing with no budget at all. This
     walks what discovery actually registers, so a new subproject is covered
@@ -537,10 +1030,17 @@ def test_every_discovered_module_config_declares_its_own_verify_budget() -> None
     literals cannot verify a task exists (``task 0`` would satisfy it), which
     would make the check read as enforcement while enforcing nothing.
 
-    THE GUARD REPORTS THE REMAINING GAP RATHER THAN HIDING IT. Exactly one
-    entry is excluded today (``orchestrator``, task 3353), and that is the one
-    place where the repo-root yaml's "tight timeouts live on the per-module
-    budgets" claim is still false.
+    THERE IS NO REMAINING GAP TO REPORT (task 5422). ``MODULE_BUDGET_EXCLUSIONS``
+    is EMPTY and every discovered module config declares its own warm budget, so
+    the repo-root yaml's "tight timeouts live on the per-module budgets" claim is
+    now true of all of them. This paragraph used to read "THE GUARD REPORTS THE
+    REMAINING GAP RATHER THAN HIDING IT. Exactly one entry is excluded today
+    (``orchestrator``, task 3353), and that is the one place where [that] claim
+    is still false" — CORRECTED IN PLACE rather than deleted, because the
+    mechanism it describes is still live: this dict remains the place a FUTURE
+    gap gets REPORTED rather than hidden, and the assertions below still enforce
+    that on whatever lands in it next. An empty dict is the claim's satisfied
+    state, not its retirement.
 
     AND THE CARVE-OUT EXPIRES ON ITS OWN TERMS. Each entry states a deletion
     condition; this test enforces it, by asserting an excluded module still
@@ -559,7 +1059,7 @@ def test_every_discovered_module_config_declares_its_own_verify_budget() -> None
     """
     discovered = {
         prefix: mc
-        for prefix, mc in _discovered().items()
+        for prefix, mc in discover_module_configs().items()
         if mc.test_command
     }
 
@@ -659,3 +1159,770 @@ def test_every_discovered_module_config_declares_its_own_verify_budget() -> None
             f'table above and in the yaml\'s provenance block, then add the '
             f'worst wall-clock here'
         )
+
+
+# ---------------------------------------------------------------------------
+# CROSS-FILE DERIVATION (task 4320)
+# ---------------------------------------------------------------------------
+
+# The family members that PUBLISH a (measurement, derived floor) pair, expressed
+# as prefixes rather than as file paths so the floor below cannot be satisfied
+# by a reader that found the right NUMBER of files but the wrong ones.
+# ``FAMILY_PUBLISHER_PATHS`` names the files; this names what they must turn out
+# to be about. Modelled on ``KNOWN_MODULE_CONFIG_PREFIXES`` above, for the same
+# reason: without it a shrunken discovery set makes every per-pair assertion
+# below pass VACUOUSLY.
+FAMILY_PUBLISHED_PREFIXES = frozenset({'scripts', 'tests/scripts'})
+
+
+def test_the_budget_family_derives_every_floor_from_one_canonical_expression(
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+) -> None:
+    """No family member may spell the floor derivation for itself (task 4320).
+
+    THE HOLE THIS CLOSES, in the family's own words. Until this guard existed,
+    ``test_tests_scripts_module_config.py``'s derivation test carried a scope
+    paragraph conceding that ``_min_budget`` there "is a LOCAL copy ... nothing
+    here can observe a sibling's expression: if ``test_scripts_module_config.py``
+    changed its own inline derivation, every assertion below would still pass",
+    and that "real cross-file enforcement — one guard reading every family
+    member's published pair and checking the derivation holds for all of them —
+    would be a new mechanism rather than an amendment, and is filed as a
+    follow-up instead of being claimed here". This IS that follow-up. Before it,
+    the derivation existed in THREE spellings — two ``def _min_budget`` copies
+    and one inlined ``(int(2 * W) // 100) * 100`` — and nothing in the repo could
+    observe drift between them.
+
+    WHY IT LIVES HERE. This file is the family's designated anti-drift member:
+    it already owns ``MEASURED_BY_SIBLING_GUARD`` (the table pointing at the
+    owning guards) and ``KNOWN_MODULE_CONFIG_PREFIXES`` (the floor that stops a
+    shrunken discovery set passing vacuously). A cross-file check belongs with
+    the tables it makes checkable, not in either publisher — a publisher checking
+    its sibling is exactly the guard-couples-guard shape this directory refuses.
+
+    SEVEN ASSERTIONS, each closing a distinct way the derivation can rot:
+
+      (1) FLOOR SET. Every path in ``FAMILY_PUBLISHER_PATHS`` exists and yields
+          a pair, and the discovered prefixes are EXACTLY
+          ``FAMILY_PUBLISHED_PREFIXES``. Without this the loop below passes on
+          an empty or shrunken set — the vacuous-pass hole
+          ``KNOWN_MODULE_CONFIG_PREFIXES`` closes for the sibling guard. It
+          also pins ``FAMILY_READER_PATH`` to THIS file, so the shared module's
+          record of where the family's only cross-file enforcement lives cannot
+          rot into a pointer at nothing — the same stale-pointer failure (7)
+          closes for ``MEASURED_BY_SIBLING_GUARD``, applied to the constant
+          that names this guard.
+
+      (2) THE MEASUREMENT IS A MEASUREMENT. ``MEASURED_SUITE_WORST_SECS`` must
+          be a plain numeric literal, not a computed expression. A measurement
+          that is itself derived from something has no provenance a yaml block
+          can record, and would let the pair be satisfied by two expressions
+          that agree with each other and with no observed run.
+
+      (3) THE FLOOR IS DERIVED, NOT TRANSCRIBED. The ``MIN_MODULE_BUDGET_SECS``
+          expression must REFERENCE ``MEASURED_SUITE_WORST_SECS`` by name. This
+          is the rot task 3703 fixed for ONE file and nothing enforced for the
+          others: a hand-set ``MIN_MODULE_BUDGET_SECS = 1800`` evaluates fine
+          and agrees with today's measurement, then silently stops agreeing the
+          next time the measurement moves. It now fails HERE, cross-file.
+
+      (4) ONE CANONICAL DERIVATION, closed on BOTH sides. The expression is
+          evaluated in a namespace whose ONLY bindings are the published worst
+          and ``module_budget_family.min_budget`` — deliberately without
+          ``__builtins__``. So ``min_budget(MEASURED_SUITE_WORST_SECS)``
+          succeeds, while a local ``_min_budget`` copy or an inlined
+          ``(int(2 * W) // 100) * 100`` raises ``NameError`` and fails here.
+          That namespace only closes re-spellings under a DIFFERENT name,
+          though, and saying it closed all of them was an over-claim a reviewer
+          caught: it evaluates against the CANONICAL helper, so a publisher
+          spelling the call exactly while binding ``min_budget`` to a local
+          ``def`` — or re-assigning it after the import — satisfied every check
+          while its own floor was whatever the shadow returned. So the reader
+          also scans the publisher's MODULE-SCOPE bindings of that name and
+          requires them all to be ``from module_budget_family import
+          min_budget``, reporting a shadow through the same ``error`` this
+          assertion prints. Together the two halves are what make "one
+          canonical expression" a mechanism rather than a convention:
+          re-spelling the derivation locally is now impossible to land green
+          under ANY name, whatever value it happens to produce today.
+          ``test_the_published_pair_reader_rejects_every_way_the_derivation_
+          can_rot`` is where each of those rejections is actually OBSERVED —
+          this assertion only ever meets publishers that comply.
+
+      (5) SAME SHAPE. The evaluated value equals ``min_budget(published
+          worst)``. (4) rejects a different SPELLING; (5) rejects a different
+          MEANING — a 3x multiple, or a round-UP, reached through the canonical
+          helper.
+
+      (6) RAISE-TOGETHER MADE STRUCTURAL. For each family prefix, the
+          PRODUCTION-discovered ``verify_command_timeout_secs`` (via
+          ``config._discover_module_configs``, not a yaml re-read) is declared
+          and is >= ``min_budget(published worst)``. Every yaml in the family
+          carries a RAISE-TOGETHER rule in prose; this makes refreshing a
+          measurement without raising its budget fail in ONE place for the WHOLE
+          family, and keeps it failing even if an owning guard is later deleted
+          or weakened. Task 4320's own step 1 is the worked example: the trigger
+          fired, and this assertion is where it would have fired even had the
+          owning guard not existed.
+
+      (7) ``MEASURED_BY_SIBLING_GUARD`` BECOMES CHECKED, NOT DOCUMENTED. Every
+          key in that table resolves to a pair the reader actually FOUND. That
+          table's whole purpose is to say "this module's provenance lives over
+          there" instead of copying a number here; until now nothing verified
+          the pointer still landed on a guard that publishes one. A pointer that
+          silently stops resolving is worse than a copied number, because it
+          reads as delegation rather than as a gap.
+
+    ASSERTS ON STRUCTURE AND VALUES, NEVER ON PROSE. Every check above is
+    against a parsed AST node, an evaluated expression, or a ModuleConfig field.
+    Nothing here reads a docstring, a comment or a string literal — the same
+    line ``test_every_discovered_module_config_declares_its_own_verify_budget``
+    draws when it declines to regex ``MODULE_BUDGET_EXCLUSIONS`` justifications.
+    """
+    # ---- (1) FLOOR SET -----------------------------------------------------
+    absent = [str(p) for p in FAMILY_PUBLISHER_PATHS if not p.is_file()]
+    assert not absent, (
+        f'module_budget_family.FAMILY_PUBLISHER_PATHS names {absent} which do '
+        f'not exist (task 4320). Either a publisher was renamed — in which case '
+        f'update FAMILY_PUBLISHER_PATHS — or it was deleted, in which case the '
+        f'family has lost a member and every assertion below would go quiet '
+        f'about it rather than failing'
+    )
+
+    assert FAMILY_READER_PATH.is_file(), (
+        f'module_budget_family.FAMILY_READER_PATH names {FAMILY_READER_PATH}, '
+        f'which does not exist (task 4320). That constant records WHERE the '
+        f'family\'s sole cross-file enforcement lives, so that a reader which '
+        f'is renamed or deleted is visible from the shared module every '
+        f'publisher already depends on rather than only from the file that '
+        f'disappeared'
+    )
+    assert FAMILY_READER_PATH.resolve() == pathlib.Path(__file__).resolve(), (
+        f'module_budget_family.FAMILY_READER_PATH names {FAMILY_READER_PATH}, '
+        f'but the guard that actually reads the published pairs is '
+        f'{pathlib.Path(__file__)} (task 4320). The constant exists to be true, '
+        f'not to be decorative: a pointer nothing checks reads as authoritative '
+        f'while naming the wrong file, which is the same stale-pointer failure '
+        f'assertion (7) below closes for MEASURED_BY_SIBLING_GUARD'
+    )
+
+    pairs = published_pairs()
+
+    assert len(pairs) == len(FAMILY_PUBLISHER_PATHS), (
+        f'module_budget_family.published_pairs() returned {len(pairs)} pair(s) '
+        f'{sorted(pairs)} for {len(FAMILY_PUBLISHER_PATHS)} publisher file(s) '
+        f'(task 4320). A publisher that no longer defines a module-level '
+        f'MODULE_PREFIX yields no pair at all, so it would drop out of every '
+        f'check below silently'
+    )
+    assert set(pairs) == FAMILY_PUBLISHED_PREFIXES, (
+        f'the budget family publishes pairs for {sorted(pairs)}, expected '
+        f'exactly {sorted(FAMILY_PUBLISHED_PREFIXES)} (task 4320). This floor '
+        f'exists so the per-pair assertions below cannot pass VACUOUSLY on a '
+        f'shrunken set — the same hole KNOWN_MODULE_CONFIG_PREFIXES closes for '
+        f'the coverage guard. If a module genuinely joined or left the family, '
+        f'update FAMILY_PUBLISHED_PREFIXES and FAMILY_PUBLISHER_PATHS together'
+    )
+
+    discovered = discover_module_configs()
+
+    for prefix, pair in sorted(pairs.items()):
+        # ---- (2) THE MEASUREMENT IS A MEASUREMENT --------------------------
+        assert pair.worst_source is not None, (
+            f'{prefix}: {pair.path.name} defines no module-level '
+            f'MEASURED_SUITE_WORST_SECS (task 4320), so this family member '
+            f'publishes a floor with no measurement behind it. The pair is the '
+            f'unit — a floor without its worst run is a number with no '
+            f'provenance, which is what the whole family exists to prevent'
+        )
+        worst_node = ast.parse(pair.worst_source, mode='eval').body
+        assert (
+            isinstance(worst_node, ast.Constant)
+            and isinstance(worst_node.value, (int, float))
+            and not isinstance(worst_node.value, bool)
+        ), (
+            f'{prefix}: MEASURED_SUITE_WORST_SECS in {pair.path.name} is '
+            f'`{pair.worst_source}`, which is not a plain numeric literal '
+            f'(task 4320). A MEASUREMENT is transcribed from an observed run '
+            f'and recorded run-by-run in the owning yaml\'s PER-MODULE VERIFY '
+            f'BUDGET block; a computed one has no run behind it, and would let '
+            f'this pair be satisfied by two expressions that agree with each '
+            f'other and with nothing that was ever measured'
+        )
+        assert pair.worst is not None, (
+            f'{prefix}: MEASURED_SUITE_WORST_SECS in {pair.path.name} could not '
+            f'be read as a literal value (task 4320): {pair.worst_source!r}'
+        )
+
+        # ---- (3) THE FLOOR IS DERIVED, NOT TRANSCRIBED ---------------------
+        assert pair.floor_source is not None, (
+            f'{prefix}: {pair.path.name} defines no module-level '
+            f'MIN_MODULE_BUDGET_SECS (task 4320), so it records a measurement '
+            f'that gates nothing'
+        )
+        floor_names = {
+            node.id
+            for node in ast.walk(ast.parse(pair.floor_source, mode='eval'))
+            if isinstance(node, ast.Name)
+        }
+        assert 'MEASURED_SUITE_WORST_SECS' in floor_names, (
+            f'{prefix}: MIN_MODULE_BUDGET_SECS in {pair.path.name} is '
+            f'`{pair.floor_source}`, which does not REFERENCE '
+            f'MEASURED_SUITE_WORST_SECS (task 4320) — it is transcribed rather '
+            f'than derived. That is the exact rot task 3703 repaired for '
+            f'tests/scripts and which nothing enforced for the rest of the '
+            f'family: a hand-set floor agrees with the measurement on the day '
+            f'it is written and then silently stops agreeing, and only a '
+            f'reviewer ever caught it. Names referenced: {sorted(floor_names)}'
+        )
+
+        # ---- (4) ONE CANONICAL DERIVATION ----------------------------------
+        assert pair.error is None and pair.floor is not None, (
+            f'{prefix}: MIN_MODULE_BUDGET_SECS in {pair.path.name} is '
+            f'`{pair.floor_source}`, which does not evaluate against the ONE '
+            f'canonical derivation (task 4320): {pair.error}. The expression is '
+            f'evaluated with only `min_budget` and `MEASURED_SUITE_WORST_SECS` '
+            f'bound and no __builtins__, so a locally re-spelled derivation — a '
+            f'`def _min_budget` copy, or an inlined `(int(2 * W) // 100) * 100` '
+            f'— raises NameError HERE even when it computes the right number '
+            f'today; and the same check reports a `min_budget` that is bound in '
+            f'the publisher by anything other than `from module_budget_family '
+            f'import min_budget`, which is how a SAME-NAME shadow is caught '
+            f'despite evaluating cleanly against the canonical helper. Import '
+            f'module_budget_family.min_budget and call it: the family may hold '
+            f'exactly one implementation of this expression'
+        )
+
+        # ---- (5) SAME SHAPE ------------------------------------------------
+        expected_floor = min_budget(pair.worst)
+        assert pair.floor == expected_floor, (
+            f'{prefix}: MIN_MODULE_BUDGET_SECS in {pair.path.name} evaluates to '
+            f'{pair.floor}, but min_budget(MEASURED_SUITE_WORST_SECS='
+            f'{pair.worst}) is {expected_floor} (task 4320). Assertion (4) '
+            f'rejects a different SPELLING of the derivation; this one rejects a '
+            f'different MEANING reached through the canonical helper — a '
+            f'different multiple, or a round-UP where the family rounds DOWN'
+        )
+
+        # ---- (6) RAISE-TOGETHER MADE STRUCTURAL ----------------------------
+        mc = discovered.get(prefix)
+        assert mc is not None, (
+            f'{prefix} publishes a measurement/floor pair in {pair.path.name} '
+            f'but config._discover_module_configs no longer registers a module '
+            f'config at that prefix (task 4320), so the floor gates nothing in '
+            f'production'
+        )
+        assert mc.verify_command_timeout_secs is not None, (
+            f'{prefix}/orchestrator.yaml declares no verify_command_timeout_secs '
+            f'(task 4320) while {pair.path.name} publishes a derived floor of '
+            f'{pair.floor}s for it, so the module silently inherits the '
+            f'repo-root whole-fleet ceiling and the floor is decorative'
+        )
+        assert mc.verify_command_timeout_secs >= expected_floor, (
+            f'{prefix}/orchestrator.yaml declares '
+            f'verify_command_timeout_secs={mc.verify_command_timeout_secs}, '
+            f'below the {expected_floor}s floor min_budget derives from '
+            f'MEASURED_SUITE_WORST_SECS={pair.worst} in {pair.path.name} '
+            f'(task 4320). THIS IS THE RAISE-TOGETHER RULE, enforced rather '
+            f'than merely written in that yaml\'s provenance block: a refreshed '
+            f'measurement must be accompanied by a raised budget IN THE SAME '
+            f'CHANGE. Raise the yaml — never lower the measurement, and never '
+            f'hand-set the floor back'
+        )
+
+    # ---- (7) MEASURED_BY_SIBLING_GUARD BECOMES CHECKED ---------------------
+    unresolved = sorted(set(MEASURED_BY_SIBLING_GUARD) - set(pairs))
+    assert not unresolved, (
+        f'MEASURED_BY_SIBLING_GUARD points at an owning guard for '
+        f'{unresolved}, but module_budget_family.published_pairs() found no '
+        f'published (measurement, floor) pair for those prefixes (task 4320). '
+        f'That table exists so this file does not become a SECOND home for a '
+        f'measurement; the price is that its entries are pointers, and a '
+        f'pointer that has stopped resolving reads as delegation while '
+        f'delegating to nothing. Either restore the pair in the owning guard, '
+        f'or move the prefix into MEASURED_MODULE_SUITE_WORST_SECS and record '
+        f'the figure here. Pairs found: {sorted(pairs)}'
+    )
+
+
+def test_root_config_fixture_anchors_this_worktrees_own_yaml(
+    root_config: OrchestratorConfig,
+) -> None:
+    """The shared ``root_config`` fixture must pin the config to THIS worktree's yaml.
+
+    Task 4320. Three near-identical ``_root_config`` helpers used to live in this
+    directory — one in each member of the budget-guard family — and the anchoring
+    they performed was load-bearing rather than hygiene. De-triplicating them into
+    a single ``tests/scripts/conftest.py`` fixture is only safe if the BEHAVIOUR
+    survives the move, so this pins the behaviour rather than the arrangement.
+
+    Nothing here asserts about naming, placement or prose. Three properties, each
+    the negation of a way the anchor can silently stop working:
+
+      (a) THE ANCHOR IS APPLIED. ``ORCH_CONFIG_PATH`` names THIS worktree's
+          ``dark-factory-orchestrator.yaml`` while the test runs.
+          ``project_root`` is only a model FIELD and selects nothing:
+          ``OrchestratorConfig.settings_customise_sources`` builds its
+          ``YamlSettingsSource`` from ``os.environ['ORCH_CONFIG_PATH']`` alone,
+          falling back to a CWD-relative ``config.yaml``. Both ambient states are
+          wrong in OPPOSITE directions — UNSET (the state inside verify, which
+          scrubs the whole ``ORCH_`` prefix) collapses every value to the
+          pydantic defaults, while SET as an operator's shell has it points at
+          whichever checkout that orchestrator serves, so every assertion would
+          be about a DIFFERENT checkout and would report green on a worktree that
+          had regressed.
+
+      (b) THE YAML WAS ACTUALLY READ. The returned config's ``test_command`` and
+          ``verify_command_timeout_secs`` equal what ``yaml.safe_load`` reads
+          from that exact file. Asserted AGAINST THE FILE rather than against
+          pinned literals, deliberately: pinning the warm ceiling as a number
+          here would create a second copy of a value the root yaml owns, and it
+          would start failing the day that yaml is legitimately retuned. The
+          parse being a mapping, and both keys being PRESENT in it, are
+          asserted before either is indexed — otherwise a root config that
+          stopped declaring one died with a bare ``KeyError`` and said nothing
+          about which file or which key.
+
+      (c) IT IS NOT A DEFAULTS COLLAPSE. ``test_command`` is not the pydantic
+          default ``'pytest'``. This is the SILENT failure mode: a missing or
+          unset ``config_path`` makes ``YamlSettingsSource`` SKIP the file rather
+          than raise, so a broken anchor yields a fully-populated config of
+          DEFAULTS with no error anywhere. (a) and (b) would both still hold if
+          the repo happened to declare exactly the defaults; (c) is what makes
+          the distinction observable at all.
+    """
+    expected_path = REPO_ROOT / 'dark-factory-orchestrator.yaml'
+
+    # (a) THE ANCHOR IS APPLIED.
+    assert os.environ.get('ORCH_CONFIG_PATH') == str(expected_path), (
+        f'ORCH_CONFIG_PATH is {os.environ.get("ORCH_CONFIG_PATH")!r} during this '
+        f'test, not {str(expected_path)!r} (task 4320). The root_config fixture '
+        f'exists to pin config loading to THIS worktree; project_root is only a '
+        f'model field and selects nothing, so without the env var the config is '
+        f'read from whatever checkout the ambient environment points at — or, '
+        f'when unset, from nowhere at all'
+    )
+
+    # (b) THE YAML WAS ACTUALLY READ — compared against the file, not a literal.
+    declared = yaml.safe_load(expected_path.read_text(encoding='utf-8'))
+    # THE KEYS ARE ASSERTED BEFORE THEY ARE INDEXED (task 4320 amendment).
+    # Indexing straight into the parsed yaml made a root config that stopped
+    # declaring either key die with a bare KeyError on the comparison line —
+    # none of the messages below, and no hint that the failure is about the
+    # root yaml declaring nothing. That is the inverse of the loud-structured-
+    # failure norm the rest of this file follows, and of the `is_file()`
+    # precheck the fixture itself carries for the same class of silent failure.
+    assert isinstance(declared, dict), (
+        f'{expected_path} parsed to {type(declared).__name__}, not a mapping '
+        f'(task 4320), so nothing below can be compared against it. An empty '
+        f'or malformed root config yields None here while the fixture\'s '
+        f'config silently collapses to the pydantic defaults'
+    )
+    missing = [
+        key
+        for key in ('test_command', 'verify_command_timeout_secs')
+        if key not in declared
+    ]
+    assert not missing, (
+        f'{expected_path.name} declares no {missing!r} (task 4320), so the '
+        f'comparisons below have nothing to compare the fixture\'s config '
+        f'against. Both keys are read through this fixture by every "strictly '
+        f'below the root warm ceiling" assertion in this directory: a root '
+        f'config that stopped declaring them would leave those assertions '
+        f'reading the pydantic defaults, which is the exact silent collapse (c) '
+        f'exists to make observable'
+    )
+    assert root_config.test_command == declared['test_command'], (
+        f'root_config.test_command is {root_config.test_command!r} but '
+        f'{expected_path.name} declares {declared["test_command"]!r} '
+        f'(task 4320) — the fixture did not load this worktree\'s yaml'
+    )
+    assert (
+        root_config.verify_command_timeout_secs
+        == declared['verify_command_timeout_secs']
+    ), (
+        f'root_config.verify_command_timeout_secs is '
+        f'{root_config.verify_command_timeout_secs} but {expected_path.name} '
+        f'declares {declared["verify_command_timeout_secs"]} (task 4320). Every '
+        f'"strictly below the root warm ceiling" assertion in this directory is '
+        f'read through this fixture, so a wrong value here silently changes what '
+        f'those assertions mean'
+    )
+
+    # (c) IT IS NOT A DEFAULTS COLLAPSE.
+    assert root_config.test_command != 'pytest', (
+        "root_config.test_command is the pydantic default 'pytest' (task 4320), "
+        'which is what OrchestratorConfig yields when YamlSettingsSource finds '
+        'no file — it SKIPS a non-existent config_path rather than raising, so '
+        'a broken anchor produces a fully-populated config of DEFAULTS and no '
+        'error anywhere. That silence is the whole reason the fixture asserts '
+        'the path is a real file before setting the env var'
+    )
+
+
+# SYNTHETIC publishers for the reader's own negative test below. Each is a
+# minimal module in the shape a real family member has — a MODULE_PREFIX, a
+# MEASURED_SUITE_WORST_SECS and a MIN_MODULE_BUDGET_SECS — differing in exactly
+# one way the pair can rot. Kept as SOURCE TEXT rather than as real files under
+# tests/scripts/, because a second real publisher would join FAMILY_PUBLISHER_
+# PATHS' production set and every guard above would then assert about it.
+_SYNTHETIC_PUBLISHERS: dict[str, str] = {
+    # The shape a compliant publisher has. Everything below is this, minus one
+    # property, so a failure names the property rather than the arrangement.
+    'canonical': """
+        from module_budget_family import min_budget
+
+        MODULE_PREFIX = 'synthetic'
+        MEASURED_SUITE_WORST_SECS = 397.47
+        MIN_MODULE_BUDGET_SECS = min_budget(MEASURED_SUITE_WORST_SECS)
+    """,
+    # The exact spelling test_scripts_module_config.py carried before task 4320.
+    # Computes the RIGHT number; must still be rejected.
+    'inlined': """
+        MODULE_PREFIX = 'synthetic'
+        MEASURED_SUITE_WORST_SECS = 397.47
+        MIN_MODULE_BUDGET_SECS = (int(2 * MEASURED_SUITE_WORST_SECS) // 100) * 100
+    """,
+    # The other pre-4320 spelling: a copied `def _min_budget`, per-file.
+    'copied_helper': """
+        MODULE_PREFIX = 'synthetic'
+        MEASURED_SUITE_WORST_SECS = 397.47
+
+
+        def _min_budget(worst: float) -> int:
+            return (int(2 * worst) // 100) * 100
+
+
+        MIN_MODULE_BUDGET_SECS = _min_budget(MEASURED_SUITE_WORST_SECS)
+    """,
+    # The rot task 3703 repaired for ONE file: a floor transcribed beside its
+    # measurement instead of derived from it. Evaluates fine in any namespace.
+    'transcribed_literal': """
+        MODULE_PREFIX = 'synthetic'
+        MEASURED_SUITE_WORST_SECS = 397.47
+        MIN_MODULE_BUDGET_SECS = 700
+    """,
+    # A "measurement" that is itself computed has no observed run behind it.
+    'computed_measurement': """
+        from module_budget_family import min_budget
+
+        MODULE_PREFIX = 'synthetic'
+        MEASURED_SUITE_WORST_SECS = 2 * 198.735
+        MIN_MODULE_BUDGET_SECS = min_budget(MEASURED_SUITE_WORST_SECS)
+    """,
+    # THE SAME-NAME SHADOW. Spells the canonical call exactly, and binds the
+    # name to something else. Defeats the namespace check outright.
+    'shadowed_helper': """
+        from module_budget_family import min_budget
+
+
+        def min_budget(worst: float) -> int:
+            return 0
+
+
+        MODULE_PREFIX = 'synthetic'
+        MEASURED_SUITE_WORST_SECS = 397.47
+        MIN_MODULE_BUDGET_SECS = min_budget(MEASURED_SUITE_WORST_SECS)
+    """,
+    # The same shadow by re-assignment rather than by `def`, and AFTER the
+    # canonical import — the ordering that reads most like a harmless alias.
+    'reassigned_helper': """
+        from module_budget_family import min_budget
+
+        min_budget = lambda worst: 0
+
+        MODULE_PREFIX = 'synthetic'
+        MEASURED_SUITE_WORST_SECS = 397.47
+        MIN_MODULE_BUDGET_SECS = min_budget(MEASURED_SUITE_WORST_SECS)
+    """,
+    # A shadow hidden in a module-level `if`, which binds in module scope just
+    # as a top-level statement does.
+    'conditionally_shadowed_helper': """
+        from module_budget_family import min_budget
+
+        if True:
+            def min_budget(worst: float) -> int:
+                return 0
+
+        MODULE_PREFIX = 'synthetic'
+        MEASURED_SUITE_WORST_SECS = 397.47
+        MIN_MODULE_BUDGET_SECS = min_budget(MEASURED_SUITE_WORST_SECS)
+    """,
+    # Calls the canonical name while importing nothing at all.
+    'unimported_helper': """
+        MODULE_PREFIX = 'synthetic'
+        MEASURED_SUITE_WORST_SECS = 397.47
+        MIN_MODULE_BUDGET_SECS = min_budget(MEASURED_SUITE_WORST_SECS)
+    """,
+    # A measurement that gates nothing.
+    'no_floor': """
+        MODULE_PREFIX = 'synthetic'
+        MEASURED_SUITE_WORST_SECS = 397.47
+    """,
+    # No MODULE_PREFIX: yields NO entry, which is why the consuming guard pins
+    # the SET of prefixes rather than iterating whatever it happens to find.
+    'no_prefix': """
+        from module_budget_family import min_budget
+
+        MEASURED_SUITE_WORST_SECS = 397.47
+        MIN_MODULE_BUDGET_SECS = min_budget(MEASURED_SUITE_WORST_SECS)
+    """,
+    # The derivation reached through the CANONICAL helper, at a different
+    # meaning — the case assertion (5) exists for, and which (4) cannot see.
+    'different_meaning': """
+        from module_budget_family import min_budget
+
+        MODULE_PREFIX = 'synthetic'
+        MEASURED_SUITE_WORST_SECS = 397.47
+        MIN_MODULE_BUDGET_SECS = min_budget(MEASURED_SUITE_WORST_SECS * 3)
+    """,
+}
+
+
+def test_the_published_pair_reader_rejects_every_way_the_derivation_can_rot(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The cross-file mechanism itself must be observed FAILING, not only passing.
+
+    Task 4320 amendment. ``test_the_budget_family_derives_every_floor_from_one_
+    canonical_expression`` above runs only against the two real publishers,
+    which already comply — so every one of its seven assertions was exercised on
+    the happy path exclusively, and the load-bearing claims underneath them were
+    demonstrated NOWHERE. If ``published_pairs`` regressed — someone adds
+    ``'int': int`` to its namespace, or the bare-``except`` branch stops setting
+    ``error`` — that guard would stay green and the anti-drift property would be
+    silently gone.
+
+    THAT IS THE SAME GAP THE FAMILY NAMES FOR HAND-SET FLOORS: an assertion
+    nobody has ever seen fail is indistinguishable from one that cannot. This
+    test is the negative half, and it follows the precedent
+    ``test_min_module_budget_is_derived_from_the_measured_worst_run`` set next
+    door when it switched from pinning the sibling's real published pair to
+    pinning ``min_budget``'s SHAPE against synthetic cases.
+
+    SYNTHETIC PUBLISHERS IN ``tmp_path``, not real files in this directory. A
+    second real publisher would land in ``FAMILY_PUBLISHER_PATHS``' production
+    set, where every assertion of the guard above would start asserting about
+    it. Passing *paths* explicitly is what keeps the mechanism testable without
+    widening what it checks in production — the default remains this module's
+    own tuple, so no caller can quietly narrow the real set.
+
+    ASSERTS ON THE READER'S OUTPUT, never on its prose: each case checks
+    ``PublishedPair.error`` / ``.floor`` / ``.worst`` / ``.floor_source``, plus
+    (for the two rots the reader deliberately does NOT catch) the consuming
+    guard's own reference and value checks reproduced against the same pair.
+    """
+
+    def read_one(case: str) -> dict:
+        path = tmp_path / f'{case}.py'
+        path.write_text(
+            textwrap.dedent(_SYNTHETIC_PUBLISHERS[case]).lstrip('\n'),
+            encoding='utf-8',
+        )
+        return published_pairs(paths=(path,))
+
+    # ---- the compliant shape, so every rejection below is one property apart -
+    canonical = read_one('canonical')['synthetic']
+    assert canonical.error is None, (
+        f'the canonical synthetic publisher was rejected: {canonical.error} '
+        f'(task 4320). Every case below differs from it in exactly one way, so '
+        f'a false positive here would make all of them meaningless'
+    )
+    assert canonical.worst == 397.47 and canonical.floor == min_budget(397.47), (
+        f'canonical synthetic publisher read back worst={canonical.worst}, '
+        f'floor={canonical.floor}, expected 397.47 / {min_budget(397.47)}'
+    )
+
+    # ---- (4) re-spellings under a DIFFERENT name: caught by the namespace ----
+    inlined = read_one('inlined')['synthetic']
+    assert inlined.floor is None and inlined.error is not None, (
+        f'an INLINED `(int(2 * W) // 100) * 100` — the spelling '
+        f'test_scripts_module_config.py carried before task 4320 — was accepted '
+        f'(floor={inlined.floor}). It computes the right number, so only the '
+        f'builtins-free namespace can reject it; if `int` ever becomes '
+        f'available there, the one-canonical-expression property is gone'
+    )
+    assert 'NameError' in inlined.error and 'int' in inlined.error, (
+        f'the inlined derivation was rejected for the wrong reason: '
+        f'{inlined.error!r} (task 4320). It must fail as a NameError on `int`, '
+        f'which is what shows the namespace — not luck — is doing the work'
+    )
+
+    copied = read_one('copied_helper')['synthetic']
+    assert copied.floor is None and copied.error is not None, (
+        f'a COPIED `def _min_budget` — the other pre-4320 spelling — was '
+        f'accepted (floor={copied.floor}), so the family could go back to one '
+        f'implementation per file'
+    )
+    assert 'NameError' in copied.error and '_min_budget' in copied.error, (
+        f'the copied helper was rejected for the wrong reason: {copied.error!r}'
+    )
+
+    # ---- re-spellings under the SAME name: caught by the binding check -------
+    for case, needle in (
+        ('shadowed_helper', 'def min_budget'),
+        ('reassigned_helper', 'assignment'),
+        ('conditionally_shadowed_helper', 'def min_budget'),
+        ('unimported_helper', 'no module-level'),
+    ):
+        shadowed = read_one(case)['synthetic']
+        assert shadowed.floor is None and shadowed.error is not None, (
+            f'{case}: a publisher that spells `min_budget(MEASURED_SUITE_WORST_'
+            f'SECS)` while binding `min_budget` to something else was accepted '
+            f'(floor={shadowed.floor}) (task 4320). The floor is evaluated in a '
+            f'SYNTHETIC namespace holding the canonical helper, so the eval '
+            f'cannot see this — only the module-scope binding scan can, and '
+            f'without it every re-spelling under the same name lands green '
+            f'while that module publishes whatever the shadow returns'
+        )
+        assert needle in shadowed.error, (
+            f'{case}: rejected for the wrong reason: {shadowed.error!r} '
+            f'(expected the message to name {needle!r})'
+        )
+
+    # ---- (2) a measurement that is not a measurement ------------------------
+    computed = read_one('computed_measurement')['synthetic']
+    assert computed.worst is None and computed.error is not None, (
+        f'MEASURED_SUITE_WORST_SECS = 2 * 198.735 was read as a measurement '
+        f'(worst={computed.worst}) (task 4320). A computed figure has no '
+        f'observed run behind it and no yaml provenance block can record it'
+    )
+    assert 'numeric literal' in computed.error, (
+        f'the computed measurement was rejected for the wrong reason: '
+        f'{computed.error!r}'
+    )
+    assert computed.worst_source == '2 * 198.735', (
+        f'worst_source is {computed.worst_source!r} — the VERBATIM source '
+        f'segment is what lets the consuming guard quote the offending '
+        f'expression back rather than merely reporting a type'
+    )
+
+    # ---- (3) THE READER DOES NOT CATCH A LITERAL, and must not pretend to ---
+    literal = read_one('transcribed_literal')['synthetic']
+    assert literal.error is None and literal.floor == 700, (
+        f'a transcribed `MIN_MODULE_BUDGET_SECS = 700` was reported as an eval '
+        f'failure ({literal.error}) (task 4320). It evaluates fine in ANY '
+        f'namespace — that is precisely why the consuming guard needs its '
+        f'separate reference check, and why documenting the eval as catching it '
+        f'would be an over-claim'
+    )
+    literal_names = {
+        node.id
+        for node in ast.walk(ast.parse(literal.floor_source or '', mode='eval'))
+        if isinstance(node, ast.Name)
+    }
+    assert 'MEASURED_SUITE_WORST_SECS' not in literal_names, (
+        f'the transcribed literal `{literal.floor_source}` references '
+        f'{sorted(literal_names)}, so the consuming guard\'s assertion (3) — '
+        f'the ONLY check that catches a hand-set floor — would pass it'
+    )
+
+    # ---- (5) the canonical helper, at a different MEANING -------------------
+    different = read_one('different_meaning')['synthetic']
+    assert different.error is None and different.floor is not None, (
+        f'`min_budget(MEASURED_SUITE_WORST_SECS * 3)` failed to evaluate '
+        f'({different.error}) (task 4320) — it calls the canonical helper, so '
+        f'assertion (4) is not what rejects it'
+    )
+    assert different.floor != min_budget(397.47), (
+        f'a 3x argument to the canonical helper produced {different.floor}, the '
+        f'SAME floor as min_budget(397.47) (task 4320), so assertion (5) would '
+        f'pass it. That assertion exists because (4) rejects a different '
+        f'SPELLING and this is a different MEANING reached through the right '
+        f'spelling'
+    )
+
+    # ---- structural absences, reported rather than crashed on ---------------
+    no_floor = read_one('no_floor')['synthetic']
+    assert no_floor.floor_source is None and no_floor.error is not None, (
+        f'a publisher binding no MIN_MODULE_BUDGET_SECS yielded '
+        f'floor_source={no_floor.floor_source!r}, error={no_floor.error!r} '
+        f'(task 4320) — it records a measurement that gates nothing, and must '
+        f'say so rather than raising out of the reader'
+    )
+    assert read_one('no_prefix') == {}, (
+        'a publisher binding no module-level MODULE_PREFIX yielded an entry '
+        '(task 4320). It must yield NONE — which is exactly why the consuming '
+        'guard pins the SET of returned prefixes against '
+        'FAMILY_PUBLISHED_PREFIXES instead of iterating whatever it finds'
+    )
+
+
+class TestCensusBudgetFloor:
+    """`census_budget_floor` — the family's ONE spelling of D17's derivation.
+
+    ceil-to-100(1.5 * worst). Lives beside `min_budget` in
+    `module_budget_family` so the family has one home for budget expressions,
+    and imported by name here under the same single-import discipline the
+    canonical-expression guard enforces for `min_budget`.
+
+    It is a DIFFERENT trade from `min_budget`, not a weakening of it: ruling
+    D17 rejected the 2x multiple for this module as a moving target against a
+    still-growing unsharded suite, and replaced it with a tighter multiple over
+    a SHORTER, regime-scoped window.
+    """
+
+    @pytest.mark.parametrize(
+        ('worst', 'expected'),
+        [
+            # An already-round product must not round up a further 100.
+            (4800.0, 7200),
+            # The plan's worked example: 1.5 * 3753 = 5629.5 -> 5700.
+            (3753.0, 5700),
+            # The measured prevailing-regime max: 1.5 * 4626.17 = 6939.25 -> 7000.
+            (4626.166946739017, 7000),
+            # The retired-regime max, which is why the window is regime-scoped.
+            (4991.13326132996, 7500),
+            (0.0, 0),
+            # Any positive fraction of a 100s block rounds UP to it.
+            (0.1, 100),
+            (66.66, 100),
+            (66.67, 200),
+        ],
+    )
+    def test_exact_values_across_the_rounding_boundaries(self, worst, expected):
+        assert census_budget_floor(worst) == expected
+
+    def test_the_return_type_is_int(self):
+        """It is compared against a yaml-declared budget, so it must not be a
+        float that prints as one thing and compares as another."""
+        assert isinstance(census_budget_floor(3753.0), int)
+
+    def test_it_rounds_up_where_min_budget_rounds_down(self):
+        """The direction is load-bearing and opposite.
+
+        `min_budget` truncates DOWN and degenerates to zero for cheap suites —
+        acceptable for a "at least 2x" sanity floor. A floor derived from a
+        measured TAIL must not be truncated BELOW that tail, so this one rounds
+        up. A single value where both are non-degenerate shows the split.
+        """
+        assert census_budget_floor(66.67) == 200
+        assert min_budget(66.67) == 100
+
+    def test_it_never_returns_less_than_the_worst_run_it_derives_from(self):
+        """The property that makes it a FLOOR: 1.5x, rounded up, always clears W."""
+        for worst in (0.1, 22.49, 66.67, 233.5, 3753.0, 4626.17, 4991.13, 5288.0):
+            assert census_budget_floor(worst) > worst
+
+    def test_it_is_distinct_from_min_budget_in_multiple_and_direction(self):
+        """A test asserting the two AGREE somewhere would let one silently
+        become the other. This asserts they disagree on a live figure."""
+        worst = 4626.166946739017
+
+        assert census_budget_floor(worst) == 7000
+        assert min_budget(worst) == 9200
+        assert census_budget_floor(worst) != min_budget(worst)
+
+    def test_it_is_not_in_the_canonical_expression_namespace(self):
+        """Deliberately NOT wired into the family's publisher guard.
+
+        That guard evaluates each publisher's floor expression in a namespace
+        holding only `min_budget` and the published worst, without
+        `__builtins__`, so a re-spelled derivation raises NameError. Adding a
+        second callable to it would let a publisher's MIN_MODULE_BUDGET_SECS
+        silently switch derivations and still evaluate green — which is the
+        exact drift that namespace exists to catch.
+        """
+        import module_budget_family as family  # noqa: PLC0415
+
+        assert family.HELPER_NAME == 'min_budget'

@@ -26,6 +26,7 @@ from shared.invocation_outcome import (
     ZeroOutputWedge,
     _extract_cap_message,
     _parse_resets_at,
+    auth_failure_reason,
     classify_invocation,
 )
 
@@ -56,6 +57,23 @@ class TestInvocationOutcomeSumType:
         outcome = AuthFailed(status=401)
         assert isinstance(outcome, InvocationOutcome)
         assert outcome.status == 401
+
+    def test_auth_failed_round_trips_body(self):
+        body = '{"type":"error","error":{"type":"authentication_error"}}'
+        outcome = AuthFailed(status=401, body=body)
+        assert outcome.status == 401
+        assert outcome.body == body
+
+    def test_auth_failed_body_defaults_to_empty(self):
+        # The field MUST default so the ~10 existing bare AuthFailed(status=...)
+        # construction sites across test_invocation_outcome.py, test_cap_retry.py
+        # and test_api_health.py keep constructing.
+        assert AuthFailed(status=401).body == ''
+
+    def test_auth_failed_body_participates_in_equality(self):
+        # Pins that the frozen-dataclass value semantics extend to the new field.
+        assert AuthFailed(status=401, body='a') != AuthFailed(status=401, body='b')
+        assert AuthFailed(status=401, body='a') == AuthFailed(status=401, body='a')
 
     def test_cli_local_error_round_trips_marker(self):
         outcome = CliLocalError(marker='is already in use')
@@ -111,6 +129,36 @@ class TestInvocationOutcomeSumType:
         assert CapHit(resets_at=None, reason='r') != NearCap(reason='r')
         assert OK() != ZeroOutputWedge()
         assert AuthFailed(status=401) != AuthFailed(status=403)
+
+
+class TestAuthFailureReason:
+    """The reason string handed to UsageGate._handle_auth_failure.
+
+    Single-sourced on purpose: production ``usage_gate.InvokeSlot.report`` and
+    the shipped mock-gate mirror ``shared.testing.make_gate_mock`` both render
+    it, and their docstrings require them to stay byte-for-byte in step.
+    """
+
+    def test_renders_status_and_body(self):
+        # Matches the pre-refactor f'HTTP {status}: {output[:120]}' shape.
+        outcome = AuthFailed(status=401, body='OAuth token has been revoked')
+        assert auth_failure_reason(outcome) == 'HTTP 401: OAuth token has been revoked'
+
+    def test_renders_bare_status_when_body_empty(self):
+        # Backward-compatibility pin: EXACTLY the string produced today, with no
+        # trailing ': '. An empty body must leave the persisted reason and the
+        # `Account X AUTH-FAILED: ...` log line byte-identical to current behaviour.
+        assert auth_failure_reason(AuthFailed(status=403)) == 'HTTP 403'
+
+    def test_is_exported(self):
+        assert 'auth_failure_reason' in invocation_outcome_module.__all__
+
+
+# Reference "now" for the cases ported from the retired usage_gate.py fork
+# (task 4357). Distinct from TestParseResetsAt.FIXED_NOW so the pre-existing
+# cases keep their own measured expectations; mid-January and midday so that
+# both "already past this year" and "still ahead today" branches are reachable.
+_MID_JAN = datetime(2026, 1, 15, 12, 0, tzinfo=UTC)
 
 
 class TestParseResetsAt:
@@ -206,6 +254,102 @@ class TestParseResetsAt:
         result = _parse_resets_at('resets in 1h')
         assert result is not None
 
+    # --- Ported from the retired usage_gate.py _parse_resets_at fork (task
+    # 4357). Every expectation below was previously pinned ONLY against that
+    # fork; the fork read the wall clock unconditionally, so its assertions
+    # were wall-clock windows. Here ``now`` is injected, so each is an exact
+    # equality instead. ---
+
+    def test_absolute_with_date_no_comma(self):
+        """'resets Mar 30 6pm (UTC)' — the comma after the day is optional
+        (`,?` in the with-date regex)."""
+        result = _parse_resets_at('resets Mar 30 6pm (UTC)', now=_MID_JAN)
+        assert result == datetime(2026, 3, 30, 18, 0, tzinfo=UTC)
+
+    def test_absolute_with_date_non_utc_timezone(self):
+        """A non-UTC tz is honoured, DST included: Mar 31 is inside BST
+        (UTC+1), so 2:30pm London is 13:30 UTC."""
+        result = _parse_resets_at('resets Mar 31, 2:30pm (Europe/London)', now=_MID_JAN)
+        assert result == datetime(2026, 3, 31, 13, 30, tzinfo=UTC)
+
+    def test_relative_is_case_insensitive(self):
+        result = _parse_resets_at('RESETS IN 3H', now=_MID_JAN)
+        assert result == _MID_JAN + timedelta(hours=3)
+
+    def test_relative_zero_hours_is_now_exactly(self):
+        """The zero-delta boundary: 'resets in 0h' is a parse SUCCESS
+        returning `now` itself, not a fall-through to None."""
+        result = _parse_resets_at('resets in 0h', now=_MID_JAN)
+        assert result == _MID_JAN
+
+    def test_relative_embedded_in_longer_text(self):
+        text = "You've hit your limit. Your usage resets in 5h. Please wait."
+        result = _parse_resets_at(text, now=_MID_JAN)
+        assert result == _MID_JAN + timedelta(hours=5)
+
+    def test_absolute_with_date_embedded_in_longer_text(self):
+        text = "You've hit your limit - resets Mar 30, 6pm (Europe/London)"
+        result = _parse_resets_at(text, now=_MID_JAN)
+        assert result == datetime(2026, 3, 30, 17, 0, tzinfo=UTC)
+
+    def test_full_month_name(self):
+        """Full month names parse identically to their 3-letter
+        abbreviations. Regression: the month group was once `[A-Za-z]{3}`,
+        requiring EXACTLY 3 characters, so any 4+ char month name silently
+        fell through — on the old fork, to a fabricated `now + 1h`."""
+        result = _parse_resets_at('resets June 5, 7pm (UTC)', now=_MID_JAN)
+        assert result == datetime(2026, 6, 5, 19, 0, tzinfo=UTC)
+
+    def test_full_month_name_april_with_colon_minutes(self):
+        """Same `[A-Za-z]{3}`-once-required regression as above, with a
+        H:MM am time rather than a bare hour."""
+        result = _parse_resets_at('resets April 15, 9:30am (UTC)', now=_MID_JAN)
+        assert result == datetime(2026, 4, 15, 9, 30, tzinfo=UTC)
+
+    def test_full_month_name_september_is_the_nine_char_upper_bound(self):
+        """'September' is the longest English month name (9 chars) — the
+        upper bound of the `[A-Za-z]{3,9}` month group. Same regression
+        note as the two cases above."""
+        result = _parse_resets_at('resets September 1, 6am (UTC)', now=_MID_JAN)
+        assert result == datetime(2026, 9, 1, 6, 0, tzinfo=UTC)
+
+    def test_midnight_and_next_year_bump(self):
+        """'12am' parses to hour 0 (not 12), and Jan 1 00:00 is already
+        behind a mid-January `now`, so the with-date branch bumps the
+        year."""
+        result = _parse_resets_at('resets Jan 1, 12am (UTC)', now=_MID_JAN)
+        assert result == datetime(2027, 1, 1, 0, 0, tzinfo=UTC)
+
+    # --- Fall-through arms of the two absolute branches. These were never
+    # covered on this copy in either form: the fork's tests could not pin
+    # them because the fork answered every one with a fabricated `now + 1h`
+    # rather than a distinguishable None. ---
+
+    def test_unknown_month_returns_none(self):
+        """The with-date regex matches but `_MONTH_ABBR` has no 'xyz', so
+        the branch raises into `except Exception: pass`; the no-date branch
+        then fails to match (a month word precedes the time), so the
+        function falls all the way through to None."""
+        assert _parse_resets_at('resets Xyz 30, 6pm (UTC)', now=_MID_JAN) is None
+
+    def test_with_date_unparseable_time_returns_none(self):
+        """The regex matches '99:99pm', but every strptime format fails, so
+        the `for/else` raises into `except Exception: pass` → None."""
+        assert _parse_resets_at('resets Mar 30, 99:99pm (UTC)', now=_MID_JAN) is None
+
+    def test_with_date_unknown_timezone_returns_none(self):
+        """ZoneInfo raises on a non-existent key inside the with-date
+        branch's try → None."""
+        assert _parse_resets_at('resets Mar 30, 6pm (Fake/Zone)', now=_MID_JAN) is None
+
+    def test_no_date_unparseable_time_returns_none(self):
+        """The no-date branch's own `for/else: return None` arm."""
+        assert _parse_resets_at('resets 99:99pm (UTC)', now=_MID_JAN) is None
+
+    def test_no_date_unknown_timezone_returns_none(self):
+        """ZoneInfo raises inside the no-date branch's try → None."""
+        assert _parse_resets_at('resets 6pm (Fake/Zone)', now=_MID_JAN) is None
+
 
 class TestExtractCapMessage:
     """_extract_cap_message: returns the sentence containing the matched prefix."""
@@ -222,6 +366,45 @@ class TestExtractCapMessage:
         text = "YOU'VE HIT YOUR usage limit. resets in 3h."
         message = _extract_cap_message(text, "you've hit your")
         assert message != ''
+
+    # --- Truncation, ported from the retired usage_gate.py fork (task 4357).
+    # The two bodies were byte-identical, so these pin behaviour that was
+    # always this copy's too — it simply had no test here. ---
+
+    def test_long_text_truncated_at_newline(self):
+        """A newline inside the 200-char window wins over the char bound:
+        the whole first line comes back, however long."""
+        line = "You've hit your " + 'x' * 300
+        result = _extract_cap_message(line + '\nNext line', "You've hit your")
+        assert result == line.strip()
+
+    def test_no_newline_truncated_at_200_chars(self):
+        """With no newline the extract is capped at idx+200."""
+        text = "You've hit your " + 'x' * 300
+        result = _extract_cap_message(text, "You've hit your")
+        assert len(result) == 200
+
+    # --- Offset arithmetic, also ported from the fork suites (task 4357).
+    # Every case above puts the prefix at index 0, where `text.find('\n', idx)`
+    # and `min(idx + 200, len(text))` are indistinguishable from `text.find(
+    # '\n')`, `text[:end]` and `min(200, len(text))`. These two pin the `idx`
+    # in all three — measured to kill each of those mutants. ---
+
+    def test_prefix_after_a_preamble_line_returns_only_that_line(self):
+        """The line the prefix is ON, and nothing else: the preceding line is
+        not swallowed, and the newline that ends the extract is the one AFTER
+        the prefix rather than the earlier one that ends the preamble."""
+        text = "Some preamble\nYou've hit your usage limit for Claude.\nMore text"
+        result = _extract_cap_message(text, "You've hit your")
+        assert result == "You've hit your usage limit for Claude."
+
+    def test_char_bound_counts_from_the_prefix_not_the_text_start(self):
+        """With no newline AFTER the prefix the 200-char window opens at the
+        prefix, so a preamble must not eat into it."""
+        text = 'Some preamble\n' + "You've hit your " + 'x' * 300
+        result = _extract_cap_message(text, "You've hit your")
+        assert result.startswith("You've hit your ")
+        assert len(result) == 200
 
 
 class TestSingleSourceOwnership:
@@ -288,7 +471,9 @@ class TestClassifyInvocationAuthFailedPrecedence:
             api_error_status=401,
         )
         outcome = classify_invocation(result, strict_confirm=True)
-        assert outcome == AuthFailed(status=401)
+        assert outcome == AuthFailed(
+            status=401, body="You've hit your usage limit. Your plan resets in 3h."
+        )
 
     def test_429_with_cap_text_is_cap_hit_not_auth_failed(self):
         """429 is deliberately excluded from AuthFailed — it carries a real cap body."""
@@ -306,6 +491,204 @@ class TestClassifyInvocationAuthFailedPrecedence:
         outcome = classify_invocation(result, strict_confirm=True)
         assert not isinstance(outcome, AuthFailed)
         assert isinstance(outcome, Failure)
+
+    def test_401_captures_output_body(self):
+        body = (
+            '{"type":"error","error":{"type":"authentication_error",'
+            '"message":"OAuth token has been revoked"}}'
+        )
+        assert len(body) <= 120  # guards the assertion below against truncation
+        result = AgentResult(success=False, output=body, api_error_status=401)
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
+        assert outcome.body == body
+
+    def test_403_captures_output_body(self):
+        body = (
+            '{"type":"error","error":{"type":"permission_error",'
+            '"message":"Org policy blocks this model"}}'
+        )
+        assert len(body) <= 120
+        result = AgentResult(success=False, output=body, api_error_status=403)
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
+        assert outcome.body == body
+
+    def test_body_falls_back_to_stderr_when_output_empty(self):
+        result = AgentResult(
+            success=False,
+            output='',
+            api_error_status=401,
+            stderr='Error: invalid bearer token',
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
+        assert outcome.body == 'Error: invalid bearer token'
+
+    def test_output_wins_over_stderr_when_both_present(self):
+        result = AgentResult(
+            success=False,
+            output='invalid x-api-key',
+            api_error_status=401,
+            stderr='Error: invalid bearer token',
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
+        assert outcome.body == 'invalid x-api-key'
+
+    def test_body_truncated_to_120_chars(self):
+        result = AgentResult(success=False, output='x' * 500, api_error_status=401)
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
+        assert len(outcome.body) == 120
+        assert outcome.body == 'x' * 120
+
+    def test_body_is_empty_when_no_text_available(self):
+        # This is what keeps the bare-equality assertions above valid.
+        result = AgentResult(success=False, output='', api_error_status=401)
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
+        assert outcome.body == ''
+        assert outcome == AuthFailed(status=401)
+
+    def test_body_is_stripped(self):
+        # No leading/trailing whitespace may leak into the AUTH-FAILED WARNING
+        # log line, the `paused_reason` dashboard cell, or the persisted
+        # cost-event reason.
+        result = AgentResult(success=False, output='\n  Unauthorized  \n', api_error_status=401)
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
+        assert outcome.body == 'Unauthorized'
+
+    def test_body_collapses_internal_newlines_to_one_line(self):
+        # The INTERNAL case, which end-stripping alone does not cover: the
+        # stderr fallback stream is commonly multi-line, and the reason string
+        # is emitted as ONE `Account X AUTH-FAILED: {reason}` WARNING record
+        # and stored as one JSON string in the auth_failed cost event.
+        result = AgentResult(
+            success=False,
+            output='Error:\nunauthorized\nrun /login',
+            api_error_status=401,
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
+        assert outcome.body == 'Error: unauthorized run /login'
+        assert '\n' not in outcome.body
+        assert '\n' not in auth_failure_reason(outcome)
+
+    def test_body_collapses_indentation_runs(self):
+        # Collapsing spends the 120-char budget on content, not indentation.
+        result = AgentResult(
+            success=False,
+            output='401 Unauthorized\n    at Object.<anonymous>\n\tat Module._compile',
+            api_error_status=403,
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
+        assert outcome.body == '401 Unauthorized at Object.<anonymous> at Module._compile'
+
+    def test_multiline_stderr_fallback_is_also_collapsed(self):
+        result = AgentResult(
+            success=False,
+            output='',
+            api_error_status=401,
+            stderr='Error: invalid token\n  Please run /login\n',
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
+        assert outcome.body == 'Error: invalid token Please run /login'
+
+
+class TestClassifyInvocationAuthFailedBodyIsScrubbed:
+    """A 401/403 body snippet must not park credential material on a durable surface.
+
+    The snippet is no longer log-only: `_handle_auth_failure` persists it into
+    the `auth_failed` cost-event JSON and surfaces it through
+    `gate.paused_reason` to the dashboard. If a backend CLI ever echoes key
+    material in its 401/403 stderr/output, it lands there verbatim unless it is
+    masked at the classifier — the only chokepoint every AuthFailed body flows
+    through.
+    """
+
+    def test_api_key_is_masked(self):
+        result = AgentResult(
+            success=False,
+            output='invalid x-api-key: sk-ant-api03-AbCdEf1234567890xyz',
+            api_error_status=401,
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
+        assert 'sk-ant-api03' not in outcome.body
+        assert 'AbCdEf1234567890xyz' not in outcome.body
+        assert outcome.body == 'invalid x-api-key: [REDACTED]'
+
+    def test_oauth_token_is_masked_in_stderr_fallback(self):
+        result = AgentResult(
+            success=False,
+            output='',
+            api_error_status=403,
+            stderr='Error: token sk-ant-oat01-ZZZ_zzz-9999999999 was revoked',
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
+        assert 'sk-ant-oat01' not in outcome.body
+        assert outcome.body == 'Error: token [REDACTED] was revoked'
+
+    def test_bearer_header_dump_is_masked_but_labelled(self):
+        result = AgentResult(
+            success=False,
+            output='401: Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.abcdef',
+            api_error_status=401,
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
+        assert 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9' not in outcome.body
+        # The label survives so an operator can see WHICH field was masked.
+        assert outcome.body == '401: Authorization: Bearer [REDACTED]'
+
+    def test_scrub_survives_the_reason_string(self):
+        # The end-to-end surface that actually gets persisted/logged.
+        result = AgentResult(
+            success=False,
+            output='auth failed for key sk-proj-0123456789abcdefghij',
+            api_error_status=401,
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
+        assert auth_failure_reason(outcome) == 'HTTP 401: auth failed for key [REDACTED]'
+
+    def test_scrub_runs_before_truncation(self):
+        # The key straddles the 120-char edge such that truncate-FIRST would
+        # slice it to `sk-ant-a` — below the {12,} match floor — so a scrub
+        # applied afterwards would no longer recognise it and the prefix would
+        # leak. Scrub-first masks the whole key before the cut.
+        key = 'sk-ant-api03-' + 'K' * 60
+        raw = 'x' * 110 + ' ' + key
+        assert 'sk-ant-a' in raw[:120]  # what truncate-first would have kept
+        result = AgentResult(success=False, output=raw, api_error_status=401)
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
+        assert 'sk-' not in outcome.body
+        # 110 + 1 + len('[REDACTED]') == 121, so the closing bracket is what
+        # falls off the 120-char edge here — harmless, unlike a key prefix.
+        assert outcome.body == ('x' * 110 + ' [REDACTED]')[:120]
+        assert len(outcome.body) == 120
+
+    def test_ordinary_diagnostic_prose_is_not_over_masked(self):
+        # The scrub is deliberately narrow: it must not eat the words that make
+        # the snippet worth capturing in the first place. `risk-assessment...`
+        # is the lookbehind's regression case; `bearer token` is the {16,}
+        # floor's.
+        for text in (
+            'Error: invalid bearer token',
+            'invalid x-api-key',
+            'org policy risk-assessment-failure blocks this model',
+            'authentication_error: OAuth token has been revoked',
+        ):
+            result = AgentResult(success=False, output=text, api_error_status=401)
+            outcome = classify_invocation(result, strict_confirm=True)
+            assert isinstance(outcome, AuthFailed)
+            assert outcome.body == text, f'over-masked: {text!r} -> {outcome.body!r}'
 
 
 class TestClassifyInvocationCliLocalError:
@@ -345,6 +728,50 @@ class TestClassifyInvocationCliLocalError:
         outcome = classify_invocation(result, strict_confirm=True)
         assert outcome == CliLocalError(marker='permission denied')
 
+    def test_unresolvable_resume_session_is_cli_local_error(self):
+        """A `--resume` the CLI cannot resolve is a LOCAL error, never a cap.
+
+        The CLI resolves the session id against the on-disk transcript store and
+        exits BEFORE contacting the API, so a usage cap can never be the cause.
+        Its shape — zero cost, one turn, sub-5s — is exactly the shape
+        ``invoke_with_cap_retry``'s heuristic safety net reads as "a cap hit with
+        an unrecognised message format", so without a POSITIVE non-cap
+        attribution here a HEALTHY account gets marked CAPPED.
+
+        This is LATENT-FRAGILITY hardening with ZERO live occurrences, not an
+        active incident: real resume failures currently exceed the net's 5000 ms
+        floor. It is the same class as the reify-3604 ``CliLocalError`` escape
+        and the 2026-07-29 ``ServerError`` escape — a third instance.
+
+        The string and its STDERR placement were measured against Claude Code
+        CLI 2.1.236 on 2026-08-19, not guessed.
+        """
+        result = AgentResult(
+            success=False,
+            output='',
+            stderr=(
+                'No conversation found with session ID: '
+                '4aed993b-20c0-4b91-a8dd-60180e7db2e0'
+            ),
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert outcome == CliLocalError(marker='no conversation found with session id')
+
+    def test_unresolvable_resume_session_match_is_case_insensitive(self):
+        """The table is matched against ``combined.lower()``, so an upper-cased
+        variant must classify identically — the CLI's exact casing is not a
+        thing this escape may depend on."""
+        result = AgentResult(
+            success=False,
+            output='',
+            stderr=(
+                'NO CONVERSATION FOUND WITH SESSION ID: '
+                '4AED993B-20C0-4B91-A8DD-60180E7DB2E0'
+            ),
+        )
+        outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, CliLocalError)
+
     def test_marker_in_output_not_just_stderr(self):
         result = AgentResult(success=False, output='unrecognized arguments: --foo', stderr='')
         outcome = classify_invocation(result, strict_confirm=True)
@@ -374,7 +801,9 @@ class TestClassifyInvocationCliLocalError:
             stderr='Error: Session ID abc-123 is already in use.',
         )
         outcome = classify_invocation(result, strict_confirm=True)
-        assert outcome == AuthFailed(status=401)
+        assert outcome == AuthFailed(
+            status=401, body='Error: Session ID abc-123 is already in use.'
+        )
 
     def test_success_true_outranks_incidental_cli_marker_text(self):
         """A successful invocation is authoritative even when its own output

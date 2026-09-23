@@ -21,10 +21,12 @@ Task 3533 widened :class:`EscalationRef` with ``severity`` and
 ``filing_claimant_run_id`` so refs can feed the shared
 ``escalation.pins.classify_pins`` predicate (spec
 ``docs/task-escalation-state-spec.md`` S6/E7) without a downstream re-read.
-That task deliberately rewires NO veto site: ``_shape``'s
-``has_open_escalation = bool(report.open_escalations)``, ``classify_recovery``
-and the ``_RECOVERY`` table are unchanged, and making that boolean
-pin-class-aware is task eta (3541).
+That boolean is now pin-class-aware (task 3541): ``_shape``'s escalation
+element is ``classify_pins(...).vetoes_done_flip``, and the recovery/redispatch
+half of the same classification is exposed to the sweep-side appliers as
+:func:`report_pins_recovery` / :func:`report_pins_blocked_recovery`.
+``classify_recovery`` and the ``_RECOVERY`` table itself are unchanged — task
+eta rewired the KEY ELEMENT, never the table.
 
 Task 3563 normalised the OTHER side of that comparison: :class:`Claimant`'s
 ``run_id`` is now homogeneous across all three liveness sources — a full
@@ -36,29 +38,55 @@ presence check or a ``.source`` check), so it changes no recovery outcome —
 it only makes the field COMPARABLE by ``escalation.pins``.
 
 SCOPE HONESTY on that last point: 3563 shipped the SHAPE contract, NOT
-end-to-end reachability. Two gaps outside its scope still gate the payoff.
-(1) The plan.lock leg of :meth:`TaskGroundTruth._resolve_live_claimant` reads
-``<worktree>/.task/plan.lock`` while the production writer targets the
-``.task-meta`` SIBLING, so on a real orchestrator run that leg can only ever
-find a pre-3563 legacy lock and resolves ``run_id=None`` — i.e. the
-composition branch is INERT in production today (task 4262 relocates the read;
-task 4028 tracks deleting the leg outright if that is the ruling instead).
-(2) The only production ``escalation.pins.classify_pins`` call site still
-passes ``live_claimant=False`` with no ``live_claimant_id`` (task 3541 wires
-it). Live-vs-dead filer discrimination becomes REACHABLE when those land; what
-3563 delivers is that the identity is now expressible at all, and that the
-bare-``session_id`` shape which would have made that comparison UNSAFE is gone.
+end-to-end reachability. Its first gap is now CLOSED — the plan.lock leg of
+:meth:`TaskGroundTruth._resolve_live_claimant` reads the ``.task-meta``
+sibling the production writer targets (task 4028), so on a real orchestrator
+run that leg can find a live 3563-shaped lock and the composition branch is
+REACHABLE rather than inert. The second gap is closed too: task 3541 wired the veto sites, and
+:func:`report_pins_recovery` passes the report's OWN resolved claimant
+identity, so live-vs-dead filer discrimination is now REACHABLE rather than
+merely expressible. The bare-``session_id`` shape that would have made that
+comparison UNSAFE is gone.
+
+Task 3539 added :attr:`RecoveryAction.CONVERT_TO_BLOCKED` and the four
+escalation-pinned stranded rows (f)/(i)/(j)/(k) that map to it. It is a
+LEGIBILITY action, NOT a recovery: it stops a churning ``in-progress`` row and
+names the honest status for "pinned, awaiting a human". The converted task
+KEEPS ITS PIN and does not self-heal — its exit is a human, or the shared
+``classify_pins`` predicate ceasing to call the record pinning (the record is
+resolved, or the orphan-L0 reaper promotes a dead-filer L0 to L1 and a human
+consumes it).
+
+That "does not self-heal" property is a statement about a pin OUTSIDE
+``orchestrator.recovery_pins.MERGE_REMEDIABLE_ESC_CATEGORIES``, and the
+APPLIER is what makes it
+unconditionally true: a row pinned only by a merge-remediable escalation would
+be picked straight back up by the blocked-arm upgrade clauses on the next
+sweep, so ``Harness._reconcile_one_stranded`` holds those rows at their
+pre-3539 LEAVE instead of converting them (amendment pass, review finding #3).
+This table cannot express that — it keys on a BOOLEAN ``has_open_escalation``
+and stays pure and config-free — which is exactly why the scoping lives with
+the two sibling sweep-side clauses rather than here. The escalation veto itself is unchanged (no
+new row maps to MARK_DONE); only the silent LEAVE that let the row churn
+forever is replaced. Every CONVERT row is keyed ``TaskStatus.IN_PROGRESS``, so
+conversion is structurally one-shot, and the ``pending`` / ``merge-deferred``
+population stays task 4651's under the 2026-08-24 ownership ruling. This
+module stays PURE and config-free: the observe-before-enforce gate lives in the
+applier (``Harness._reconcile_one_stranded``, behind
+``convert_to_blocked_enforce``), never here.
 """
 
 from __future__ import annotations
 
 import asyncio
 import enum
+import logging
 import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
+from escalation.pins import classify_pins
 from pydantic import ValidationError
 from shared.deploy_state import DeployPhase, DeployState
 from shared.task_claimant import compose_claimant_run_id, is_stranded
@@ -66,6 +94,13 @@ from shared.task_statuses import TaskStatus
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.landed_outbox import MergeProvenance
+from orchestrator.recovery_emission import LeaveReason, render_shape
+from orchestrator.recovery_pins import (
+    records_pin_blocked_done_flip,
+    records_pin_blocked_recovery,
+    records_pin_recovery,
+    records_would_duplicate_a_handoff,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -76,16 +111,25 @@ if TYPE_CHECKING:
     from orchestrator.git_ops import GitOps
     from orchestrator.scheduler import Scheduler
 
+logger = logging.getLogger(__name__)
+
 __all__ = [
     'BranchState',
     'BranchStateKind',
     'Claimant',
     'ClaimantSource',
     'EscalationRef',
+    'LeaveReason',
     'RecoveryAction',
     'TaskGroundTruth',
     'TruthReport',
     'classify_recovery',
+    'leave_reason',
+    'recovery_shape_str',
+    'report_pins_blocked_done_flip',
+    'report_pins_blocked_recovery',
+    'report_pins_recovery',
+    'report_would_duplicate_a_handoff',
 ]
 
 
@@ -117,6 +161,12 @@ class RecoveryAction(enum.StrEnum):
     MARK_DONE_WITH_PROVENANCE = 'mark_done_with_provenance'
     REVERT_TO_PENDING = 'revert_to_pending'
     RE_FILE_ESCALATION = 're_file_escalation'
+    #: Task 3539 — a LEGIBILITY action, not a recovery.  Move a churning,
+    #: escalation-pinned stranded ``in-progress`` row into the honest resting
+    #: status for "pinned, awaiting a human".  It does NOT mean "recovered":
+    #: the converted row keeps its pin.  See the module docstring's task-3539
+    #: paragraph and the CONVERT rows' comment in ``_RECOVERY``.
+    CONVERT_TO_BLOCKED = 'convert_to_blocked'
     LEAVE = 'leave'
 
 
@@ -205,8 +255,15 @@ class EscalationRef:
     ``escalation.pins.classify_pins`` (normative source: spec S6) — this
     docstring deliberately does not restate them.
 
-    Both new fields are DEFAULTED so every existing construction site keeps
-    working untouched.
+    ``created_at`` is the record's filing time (the queue row's ``timestamp``),
+    carried here because this ref is the ONLY record shape available at the
+    reconcile-sweep veto site — re-reading the store there to fetch timestamps
+    would break the one-read discipline this resolver already keeps.  ``None``
+    means "unknown"; ``orchestrator.recovery_emission.escalation_ages_secs``
+    maps that to a ``None`` age rather than dropping the id.
+
+    All three added fields are DEFAULTED so every existing construction site
+    keeps working untouched.
     """
 
     id: str
@@ -214,6 +271,7 @@ class EscalationRef:
     category: str = ''
     severity: str = ''
     filing_claimant_run_id: str | None = None
+    created_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -223,24 +281,30 @@ class TruthReport:
     Frozen — a point-in-time snapshot, not a live view; callers re-derive
     via :meth:`TaskGroundTruth.derive_truth` for a fresh report.
 
-    KNOWN GAP on ``open_escalations`` (task 3533 -> beta/3535): its ``[]`` is
-    currently AMBIGUOUS — "the store was read and holds no open escalations"
-    and "no escalation store was bound, so no read was possible" are
-    indistinguishable (see :meth:`TaskGroundTruth._resolve_open_escalations`).
-    That is exactly the collapse ``escalation.pins.classify_pins(records=None)
-    -> store_unavailable`` exists to make impossible, so this field has no way
-    to reach that third state yet.  Task beta (3535) widens it; until then a
-    consumer must NOT read ``open_escalations == []`` as proof that the task
-    carries no open escalation.
+    ``open_escalations == []`` is no longer ambiguous (task 3535): read it
+    together with ``escalation_store_unavailable``, which distinguishes "the
+    store was read and holds no open records" from "no read was possible".
+    Those are the same two states ``escalation.pins.classify_pins(records=None)
+    -> store_unavailable`` separates, and its store-correctness contract is the
+    normative statement of why — this docstring deliberately does not restate it.
+
+    ``escalation_store_unavailable`` is deliberately NOT folded into
+    :func:`_shape`'s table key; see the comment there for the disposition that
+    fold would change and who owns it.
     """
 
     db_status: str
     live_claimant: Claimant | None
     branch_state: BranchState
     worktree_present: bool
-    # ``[]`` is ambiguous — see the KNOWN GAP note in the class docstring.
+    # Read together with ``escalation_store_unavailable`` below — ``[]`` alone
+    # is not proof that the task carries no open escalation.
     open_escalations: list[EscalationRef]
     deploy_phase: DeployPhase | None
+    #: True when the escalation store could not be READ (no queue bound, or the
+    #: read raised).  DEFAULTED so every existing construction site keeps
+    #: working untouched.
+    escalation_store_unavailable: bool = False
 
 
 def _utc_now() -> datetime:
@@ -382,13 +446,15 @@ class TaskGroundTruth:
         )
         task = task or {}
         worktree_path = self.worktree_resolver(tid)
+        open_escalations, store_unavailable = self._resolve_open_escalations(tid)
         return TruthReport(
             db_status=task.get('status') or '',
             live_claimant=self._resolve_live_claimant(tid, task, worktree_path),
             branch_state=branch_state,
             worktree_present=worktree_path.exists(),
-            open_escalations=self._resolve_open_escalations(tid),
+            open_escalations=open_escalations,
             deploy_phase=self._resolve_deploy_phase(task.get('metadata')),
+            escalation_store_unavailable=store_unavailable,
         )
 
     async def recovery_for(self, tid: str) -> tuple[TruthReport, RecoveryAction]:
@@ -514,10 +580,10 @@ class TaskGroundTruth:
            lock's own run_id/session_id/owner_pid, or left ``None`` when any
            component is missing or malformed — see the :class:`Claimant`
            docstring for why a partial composition is never acceptable
-           (task 3563).  That composition is INERT on a real orchestrator run
-           today: this leg reads the legacy lock path, which the production
-           writer no longer targets (see the PATH GAP comment at the read
-           site below, task 4262).
+           (task 3563).  That composition is REACHABLE on a real orchestrator
+           run: this leg reads the ``.task-meta`` root the production writer
+           targets, with no legacy fallback (task 4028 — see the comment at
+           the read site below).
 
         A present-but-stale db claimant (``is_stranded`` True) collapses
         straight to ``None`` — it deliberately does NOT fall through to the
@@ -543,7 +609,9 @@ class TaskGroundTruth:
         *worktree_path* is :meth:`derive_truth`'s single
         ``worktree_resolver(tid)`` resolution (also shared with
         ``worktree_present``, review finding #2) — this method makes no I/O
-        of its own beyond the plan.lock read under *worktree_path*.
+        of its own beyond the plan.lock read, which is addressed at
+        *worktree_path*'s ``.task-meta`` SIBLING, not inside it (task 4028;
+        see the comment on that leg below).
         """
         if self.scheduler.is_actively_held(tid):
             return Claimant(run_id=None, heartbeat_at=None, source=ClaimantSource.IN_MEMORY)
@@ -558,20 +626,55 @@ class TaskGroundTruth:
                 source=ClaimantSource.DB,
             )
 
-        # PATH GAP — task 4262, deliberately NOT fixed by task 3563 (which
-        # normalises the identity SHAPE, not where the lock is looked up).
-        # No ``meta_root`` here, so this reads the LEGACY
-        # ``<worktree>/.task/plan.lock``, while the production writer
-        # (``TaskWorkflow``, workflow.py:2384-2385) targets the ``.task-meta``
-        # SIBLING and nothing bridges the two: ``ensure_lane_plan_symlink``
-        # (artifacts.py:354-386) relocates plan.json ONLY, and ``_read_path``
-        # has no new-then-old fallback (unlike ``Harness._resolve_recovery_
-        # artifact``). So on a real run this finds at most a PRE-3563 legacy
-        # lock, carrying no ``run_id``, and the composition below resolves to
-        # the fail-safe ``None``. Task 4028 tracks deleting this leg outright
-        # if that is the ruling instead of relocating the read.
+        # Addressed at the ``.task-meta`` SIBLING — where the lock's sole
+        # writer puts it (``TaskWorkflow`` builds its ``TaskArtifacts`` with
+        # ``_meta_root_for_worktree(self.worktree)``, workflow.py) — via
+        # ``meta_root_for``, the single owner of that path shape, so neither
+        # side hand-joins ``.task-meta`` (task 4028).
+        #
+        # Deliberately NO legacy fallback: nothing has written
+        # ``<worktree>/.task/plan.lock`` since the meta-root migration, so a
+        # new-then-old read (as in ``Harness._resolve_recovery_artifact``)
+        # would be dead code on arrival, and any legacy lock still on disk
+        # necessarily predates that migration and so fails ``_lock_fresh``
+        # below anyway. Pinned by
+        # ``TestPlanLockIsReadFromTheMetaRoot::test_lock_at_the_legacy_root_is_ignored``.
+        #
+        # ATTRIBUTION IS BY ADDRESS, NOT BY SESSION IDENTITY: any fresh,
+        # live-pid lock at this task's resolved meta root is taken to be
+        # *tid*'s, WITHOUT checking that ``session_id`` carries the
+        # ``'{tid}-'`` prefix ``clear_stale_plan_lock`` keys on.  Deliberate,
+        # and deliberately not symmetric with that method:
+        #   * The dominant stale-lock case is a crashed PRIOR incarnation of
+        #     the SAME task (a same-task lane reuse preserves the meta root
+        #     precisely because those artifacts are the task's own), and it
+        #     carries a MATCHING prefix — so a prefix gate would not catch
+        #     the case that actually happens.
+        #   * The cross-task case a gate WOULD catch — a warm lane's meta
+        #     root outliving its previous occupant, since it is a sibling of
+        #     the worktree and survives cleanup — is already cleared on every
+        #     different-task acquisition route by
+        #     ``GitOps._clear_foreign_meta_root`` (RECYCLE /
+        #     RESET_IN_PLACE_REATTACH / CREATE_ONCE_FRESH /
+        #     CREATE_ONCE_REATTACH).
+        #   * A gate would fail DANGEROUS. Rejecting a lock this resolver
+        #     cannot positively attribute makes a LIVE task read as
+        #     unclaimed, which is the task-2588 un-claim incident class.
+        #     Mis-attributing the other way only DELAYS recovery.
+        # What bounds that delay is ``_lock_fresh`` alone, not ``_pid_alive``:
+        # ``owner_pid`` is the ORCHESTRATOR's pid, which outlives any single
+        # task, so the liveness half is nearly always true. Freshness caps the
+        # exposure at ``heartbeat_ttl`` — a window in which the harness's R3
+        # ``plan_lock_mid_run_exception`` already forces fall-through to
+        # recovery mid-run. Pinned (both the attribution and its freshness
+        # bound) by test_task_ground_truth.py::TestPlanLockAttributionIsByAddress.
+        #
+        # Derived OUTSIDE the try: this is pure path algebra with no I/O, and
+        # must not be swallowed by the degradation arm below, which exists for
+        # a corrupt lock FILE — not for a mis-derived root.
+        meta_root = TaskArtifacts.meta_root_for(worktree_path.parent, worktree_path.name)
         try:
-            lock_data = TaskArtifacts(worktree_path).read_plan_lock()
+            lock_data = TaskArtifacts(worktree_path, meta_root).read_plan_lock()
         except (ValueError, OSError):
             # A truncated/corrupt plan.lock is a realistic outcome of the
             # very crash this resolver recovers from — degrade to "no
@@ -591,8 +694,15 @@ class TaskGroundTruth:
         # passes through as a list/str/number rather than raising. Guard
         # explicitly rather than crashing `.get()` below — same "degrade to
         # no plan-lock claimant" intent as the except block above (task
-        # 2243, W10-θ2 wiring; caught by
-        # test_reconcile_lock_format_variants[non-dict-json]).
+        # 2243, W10-θ2 wiring; caught by test_task_ground_truth.py::
+        # TestDeriveTruthLiveClaimant::
+        # test_non_dict_plan_lock_json_returns_none_not_raise — repointed
+        # from the sweep-level lock-format parametrization in
+        # test_reconcile_stranded.py, whose fixtures stage the lock at the
+        # legacy worktree address this leg deliberately no longer reads; that
+        # parametrization has since collapsed into
+        # test_vestigial_worktree_lock_is_inert_and_unlinked, which is what it
+        # always actually pinned, task 4028).
         if isinstance(lock_data, dict):
             owner_pid = lock_data.get('owner_pid')
             # Retain the PARSED pid: the composed identity below must embed the
@@ -629,32 +739,45 @@ class TaskGroundTruth:
                 )
         return None
 
-    def _resolve_open_escalations(self, tid: str) -> list[EscalationRef]:
-        """Map *tid*'s pending escalations to lightweight refs.
+    def _resolve_open_escalations(
+        self, tid: str,
+    ) -> tuple[list[EscalationRef], bool]:
+        """Map *tid*'s pending escalations to refs, plus the store's readability.
 
-        ``severity`` and ``filing_claimant_run_id`` travel with each ref so
-        consumers can feed ``escalation.pins.classify_pins`` directly instead
-        of re-reading the store (spec ``docs/task-escalation-state-spec.md``
-        S6/E7).  ``row.severity or ''`` normalises a null/absent severity to
-        the unknown-severity sentinel, so the classifier reaches its
-        documented fail-safe-to-pinning branch rather than raising.
+        ``severity``, ``filing_claimant_run_id`` and ``created_at`` travel with
+        each ref so consumers can feed ``escalation.pins.classify_pins``
+        directly, and age a hold, without re-reading the store (spec
+        ``docs/task-escalation-state-spec.md`` S6/E7).  ``row.severity or ''``
+        normalises a null/absent severity to the unknown-severity sentinel, so
+        the classifier reaches its documented fail-safe-to-pinning branch
+        rather than raising.
 
         STORE-CORRECTNESS (spec S6; esc-3163 was a wrong-store read): this
         resolver reads the escalation store INJECTED by the task's owning
-        orchestrator — never the reconciliation store.
+        orchestrator — never the reconciliation store.  Its second obligation —
+        never substitute ``[]`` for a read that could not be performed — is why
+        this returns a THIRD state rather than collapsing both into ``[]``;
+        ``classify_pins``'s docstring is the normative statement of that
+        contract and is not restated here.
 
-        ``[]`` when no ``escalation_queue`` was injected — a caller that
-        doesn't wire one up gets an empty-but-valid TruthReport field rather
-        than an error.  That degradation is a KNOWN gap: it is indistinguishable
-        from a genuine "no open escalations", which is exactly the collapse
-        ``classify_pins(records=None)`` -> ``store_unavailable`` exists to
-        prevent.  Task beta (3535) replaces it with that distinguishable third
-        state; it is deliberately left unchanged here so this task ships no
-        disposition change.
+        Returns:
+            ``(refs, store_unavailable)``.  ``store_unavailable`` is True when
+            no ``escalation_queue`` was injected, or when the read RAISED — a
+            store fault degrades this one field (loudly, at WARNING) rather
+            than aborting the whole ground-truth sweep, matching the plan.lock
+            and deploy-state degradations elsewhere in this class.
         """
         if self.escalation_queue is None:
-            return []
-        rows = self.escalation_queue.get_by_task(tid, status='pending')
+            return [], True
+        try:
+            rows = self.escalation_queue.get_by_task(tid, status='pending')
+        except Exception:
+            logger.warning(
+                'task_ground_truth: escalation store read failed for task %s '
+                '— reporting store_unavailable rather than "no open '
+                'escalations" (non-fatal)', tid, exc_info=True,
+            )
+            return [], True
         return [
             EscalationRef(
                 id=row.id,
@@ -662,9 +785,10 @@ class TaskGroundTruth:
                 category=row.category,
                 severity=row.severity or '',
                 filing_claimant_run_id=row.filing_claimant_run_id,
+                created_at=getattr(row, 'timestamp', None),
             )
             for row in rows
-        ]
+        ], False
 
     def _resolve_deploy_phase(self, metadata: object) -> DeployPhase | None:
         """Resolve a deterministic task's ``deploy_state.phase`` (DS-1/ε).
@@ -735,13 +859,76 @@ _RECOVERY: dict[_RecoveryShape, RecoveryAction] = {
     # evidence either; same revert-to-pending outcome as (c).
     (TaskStatus.IN_PROGRESS, False, BranchStateKind.GONE_NO_MARKER, False, None):
         RecoveryAction.REVERT_TO_PENDING,
-    # (f) An escalation already open at ANY level (L0/L1/L2 — not just L1)
-    # is the deliberate human/automation-handoff signal — a sweep must never
-    # second-guess it, even with on-main landing evidence (review finding
-    # #1: this used to check level==1 only, so an open L2 slipped through
-    # and still hit row (a)'s auto-flip).
+    # (f)/(i)/(j)/(k) — THE FOUR ESCALATION-PINNED STRANDED ROWS (task 3539).
+    #
+    # An escalation already open at ANY level (L0/L1/L2 — not just L1) is the
+    # deliberate human/automation-handoff signal, and a sweep must never
+    # second-guess it into a mark-done, even with on-main landing evidence
+    # (review finding #1: this used to check level==1 only, so an open L2
+    # slipped through and still hit row (a)'s auto-flip). That veto is
+    # UNCHANGED — none of these rows maps to MARK_DONE_WITH_PROVENANCE.
+    #
+    # What changed is the OTHER half. Row (f) used to map to LEAVE, so the
+    # sweep held SILENTLY and the row churned `in-progress` forever: measured
+    # 39 consecutive `recovery_vetoed` emissions over 10.5h on task 3717,
+    # re-dispatched over and over because `in-progress` is a dispatchable
+    # status. The table now names the honest resting status instead. The
+    # other three branch shapes were never even in the table (they fell
+    # through to the LEAVE default) and churn identically, so all four
+    # convert.
+    #
+    # CONVERT_TO_BLOCKED DOES NOT MEAN "RECOVERED". The converted row arrives
+    # in `blocked` STILL CARRYING ITS PIN; its exit is a human, or the shared
+    # `classify_pins` predicate ceasing to call that record pinning — never an
+    # automatic self-heal from this table. (Mechanically:
+    # `recovery_pins.MERGE_REMEDIABLE_ESC_CATEGORIES` is {'stranded_blocked'}
+    # and `only_merge_remediable` is an `all(...)`, so a `task_failure` pin
+    # fails both blocked-arm upgrade clauses; and this table's only BLOCKED
+    # row, (g), keys the escalation element False.)
+    #
+    # Since task 3541 that exit has a SECOND automatic route, and it is the one
+    # spec S6 assigns: the orphan-L0 reaper promotes a converted row's aged-out
+    # dead-filer L0 to L1 for visibility, after which the record is a genuine
+    # QUEUE_HANDOFF with a supervised consumer. The row still does not
+    # self-heal — a human or the auto-watcher consumes the promoted record —
+    # but it stops being invisible.
+    #
+    # READ THAT PARENTHESIS AS THE PRECONDITION IT IS, not as a property of
+    # every converting row (amendment pass, review finding #3). It holds for a
+    # `task_failure` pin — the measured 3717 population — and NOT for a
+    # `stranded_blocked` one, which `only_merge_remediable` accepts, so the
+    # next sweep's blocked-arm clauses would move the converted row again
+    # (MARK_DONE on main, RE_FILE off it). The applier therefore holds
+    # merge-remediable-pinned rows at their pre-3539 LEAVE and only genuinely
+    # at-rest rows reach the conversion; see the scoping clause in
+    # `Harness._reconcile_one_stranded`.
+    #
+    # Every CONVERT row is keyed `TaskStatus.IN_PROGRESS` BY CONSTRUCTION.
+    # That single fact does two jobs: a converted (`blocked`) task can never
+    # match a CONVERT row again, so conversion is structurally one-shot and
+    # idempotent with no persisted counter; and it keeps this task out of
+    # task 4651's `pending` / `merge-deferred` territory under the 2026-08-24
+    # ownership ruling (gate task 4673 / esc-4673-1). Both properties are
+    # pinned as tests in orchestrator/tests/test_convert_to_blocked.py, not
+    # merely asserted here.
+    #
+    # The applier ships this in LOG MODE behind `convert_to_blocked_enforce`
+    # (config.py, default False) — see Harness._reconcile_one_stranded.
     (TaskStatus.IN_PROGRESS, False, BranchStateKind.ON_MAIN, True, None):
-        RecoveryAction.LEAVE,
+        RecoveryAction.CONVERT_TO_BLOCKED,
+    # (i) Same shape, branch deleted but a merge marker confirms the landing.
+    (TaskStatus.IN_PROGRESS, False, BranchStateKind.GONE_WITH_MERGE_MARKER, True, None):
+        RecoveryAction.CONVERT_TO_BLOCKED,
+    # (j) Same shape with the branch still off-main. Without the pin this is
+    # row (c)'s REVERT_TO_PENDING; the pin vetoes that re-dispatch, and
+    # before 3539 the veto left the row churning instead of resting.
+    (TaskStatus.IN_PROGRESS, False, BranchStateKind.EXISTS_OFF_MAIN, True, None):
+        RecoveryAction.CONVERT_TO_BLOCKED,
+    # (k) Same shape with the branch gone and no marker — row (d)'s revert,
+    # vetoed identically. Note this row is deploy_phase=None, so the D1
+    # crashed-mid-deploy shape (row (h), DeployPhase.RAN) is untouched.
+    (TaskStatus.IN_PROGRESS, False, BranchStateKind.GONE_NO_MARKER, True, None):
+        RecoveryAction.CONVERT_TO_BLOCKED,
     # (g) Stranded 'blocked' with no landing evidence and no escalation
     # already open at any level: blocked discipline forbids a silent
     # blocked->pending revert, so the sweep must re-file an escalation
@@ -796,23 +983,91 @@ _RECOVERY: dict[_RecoveryShape, RecoveryAction] = {
 }
 
 
+def _live_claimant_id(report: TruthReport) -> str | None:
+    """*report*'s live incarnation identity, for ``classify_pins``, or ``None``.
+
+    ``Claimant.run_id`` is homogeneous since task 3563 — a full
+    ``compose_claimant_run_id`` identity or ``None`` (unknown), never a bare
+    ``session_id`` — which is exactly the precondition ``classify_pins``'s
+    ``live_claimant_id`` states.
+    """
+    return report.live_claimant.run_id if report.live_claimant is not None else None
+
+
+def _vetoes_done_flip(report: TruthReport) -> bool:
+    """Does any open record on *report* veto a done-flip? (spec S6, PRD D3).
+
+    THE answer `_shape` keys the table's escalation element on and
+    :func:`leave_reason` link 3 reports, derived once here so the two can never
+    disagree.  True for ANY non-info open record at ANY level (L0/L1/L2): an
+    open record is the same "don't second-guess a pending human/automation
+    handoff" signal regardless of which tier holds it, which is why rows
+    (a)/(f) and (g)/(h) all key off this one boolean (review finding #1: a
+    level-1-only check let an open L2 slip through row (a)'s veto and let rows
+    (g)/(h) re-file over an already-open L0/L2).
+
+    WHY ``vetoes_done_flip`` AND NOT ``pins`` (PRD D3, boundary rows #7/#9).
+    The two are the same classification read for two different questions, and
+    this table asks the CONSERVATIVE one.  ``pins`` treats a DEAD_L0 as
+    non-pinning, so keying on it here would drop an on-main stranded row whose
+    filer died into row (a) and phantom-complete it past an unconsumed handoff.
+    ``vetoes_done_flip`` keeps every dead-L0 and queue-handoff strand on the
+    CONVERT rows (f)/(i)/(j)/(k) — which is what boundary #7 ("conversion
+    proceeds, not LEAVE") and #21 ("landed-but-pinned converts and completes")
+    actually ask for.  ``pins``'s dead-L0 relaxation is consumed at the
+    RECOVERY/REDISPATCH sites instead, through :func:`report_pins_recovery`.
+    The single disposition this changes relative to the pre-3541
+    ``bool(report.open_escalations)`` is boundary #8: an info-severity-only
+    strand stops keying True and takes the plain revert-to-pending path.
+
+    Liveness cannot change this answer (both non-info buckets veto it, and the
+    liveness links only move a record BETWEEN those buckets), but it is passed
+    accurately anyway so the call reads honestly and so a future reader is not
+    misled into thinking this seam ignores liveness by design.
+    """
+    # `task_id=''`: `classify_pins` echoes it onto the report purely for
+    # structured-emission attribution and never filters records against it, and
+    # a `TruthReport` carries no task id.  Nothing is emitted from here — one
+    # attribute is read and the report discarded — so there is nothing to
+    # attribute.
+    #
+    # `records=report.open_escalations`, never `records=None`.  DELIBERATELY
+    # not folded in: report.escalation_store_unavailable.
+    # Today a queue-absent or read-failing store yields open_escalations == []
+    # here, so a stranded in-progress task with an off-main branch classifies
+    # REVERT_TO_PENDING (row (c)).  Making store-unavailable pin would flip
+    # that exact shape to LEAVE — a real disposition change during a store
+    # outage, with its own operator flip and soak gate.  Task eta (3541)
+    # RECONSIDERED this fold while making the element pin-class-aware and
+    # deliberately DECLINED it, so it is a standing decision rather than an
+    # oversight.  This function performs no READ of its own — it is handed a
+    # report — and classify_pins store-correctness obligation 2 binds the
+    # caller that PERFORMED a failed read, so `records=None` would be a false
+    # claim here, not a fail-safe.  The third state keeps travelling separately
+    # on `report.escalation_store_unavailable` and is already surfaced by
+    # `leave_reason` link 2 and the emitted
+    # recovery_left(reason=escalation_store_unavailable).
+    # TestStoreUnavailableChangesNoDisposition pins the unchanged
+    # classification so the fold cannot happen by accident.
+    return classify_pins(
+        '',
+        report.open_escalations,
+        live_claimant=report.live_claimant is not None,
+        live_claimant_id=_live_claimant_id(report),
+    ).vetoes_done_flip
+
+
 def _shape(report: TruthReport) -> _RecoveryShape:
     """Discretize *report* to the tuple `_RECOVERY` is keyed on.
 
-    The escalation-boolean element folds ANY open escalation, at ANY level
-    (L0/L1/L2) — not just L1. An escalation already open at any level is the
-    same "don't second-guess a pending human/automation handoff" signal
-    regardless of which tier is currently holding it, so rows (a)/(f) and
-    (g)/(h) all key off this one boolean (review finding #1: a level-1-only
-    check let an open L2 slip through row (a)'s veto and let rows (g)/(h)
-    re-file over an already-open L0/L2).
+    The escalation element is :func:`_vetoes_done_flip`; see there for which of
+    ``classify_pins``'s two answers this table asks for and why.
     """
-    has_open_escalation = bool(report.open_escalations)
     return (
         report.db_status,
         report.live_claimant is not None,
         report.branch_state.kind,
-        has_open_escalation,
+        _vetoes_done_flip(report),
         report.deploy_phase,
     )
 
@@ -825,3 +1080,153 @@ def classify_recovery(report: TruthReport) -> RecoveryAction:
     phantom-done, never guess on an unrecognized shape).
     """
     return _RECOVERY.get(_shape(report), RecoveryAction.LEAVE)
+
+
+# ---------------------------------------------------------------------------
+# Task 3535 (beta) — DESCRIBING a LEAVE, never deciding one.
+#
+# Both functions below are PURE and add no decision: `classify_recovery`'s body
+# and the `_RECOVERY` table above are untouched.  They exist so every veto site
+# can emit a structured account of the disposition it ALREADY reached.  The
+# canonical WHY for that mechanism lives in
+# orchestrator/src/orchestrator/recovery_emission.py (module docstring).
+#
+# THE PRECEDENCE CHAIN, evaluated top to bottom (same discipline as
+# escalation/pins.py's documented chain: re-ordering these links changes what
+# an operator is told, so change them deliberately).
+#
+#   1. live_claimant present            -> LIVE_CLAIMANT
+#      A held task is not stranded; there is nothing to recover yet.  Above
+#      everything else because a pinned-AND-held task is simply running, and
+#      because this is the healthy majority of every sweep (it emits nothing).
+#   2. escalation_store_unavailable     -> ESCALATION_STORE_UNAVAILABLE
+#      "we could not READ the store" is a strictly better explanation than any
+#      conclusion drawn from the empty list that outage produced.  Above
+#      escalation_pinned only for completeness — an unavailable store always
+#      yields open_escalations == [] — and above unmapped_shape because the
+#      shape is only unmapped as a CONSEQUENCE of the failed read.
+#   3. `_shape`'s escalation element     -> ESCALATION_PINNED
+#      The veto proper: a record actively held back an action the table would
+#      otherwise have taken.  Boundary #9 (row (f)) lands here.  Reads the SAME
+#      `classify_pins(...).vetoes_done_flip` answer `_shape` keyed the table on
+#      (task 3541) rather than re-deriving `bool(report.open_escalations)`: a
+#      LEAVE reached with only an info record open is not a PIN, and labelling
+#      it `escalation_pinned` would tell an operator a handoff is holding a
+#      task when nothing is.
+#   4. deploy_phase present             -> DEPLOY_PHASE_IN_FLIGHT
+#      One of the deliberately-unmapped phases (VERIFIED / FAILED / SCHEDULED /
+#      ESCALATED / DONE — see the note in `_RECOVERY`).  Below link 3 because a
+#      deploy holding an open record is PINNED, not merely in flight.
+#   5. otherwise                        -> UNMAPPED_SHAPE
+#      The table's fail-safe default reached on its own merits.
+# ---------------------------------------------------------------------------
+
+
+def leave_reason(report: TruthReport) -> LeaveReason | None:
+    """Describe WHY *report* classified :attr:`RecoveryAction.LEAVE`.
+
+    Returns ``None`` whenever :func:`classify_recovery` did NOT return LEAVE,
+    so a caller can never mislabel an action it actually took as a hold.
+
+    See the precedence chain above for the ordering and its rationale.  Pure:
+    no I/O, no mutation, and no influence on the disposition itself.
+    """
+    if classify_recovery(report) is not RecoveryAction.LEAVE:
+        return None
+    if report.live_claimant is not None:
+        return LeaveReason.live_claimant
+    if report.escalation_store_unavailable:
+        return LeaveReason.escalation_store_unavailable
+    if _vetoes_done_flip(report):
+        return LeaveReason.escalation_pinned
+    if report.deploy_phase is not None:
+        return LeaveReason.deploy_phase_in_flight
+    return LeaveReason.unmapped_shape
+
+
+# ---------------------------------------------------------------------------
+# Task 3541 (eta) — the RECOVERY/REDISPATCH half of the same classification.
+#
+# `_vetoes_done_flip` above answers the conservative MARK_DONE question the
+# `_RECOVERY` table keys on.  The two adapters below answer the other one —
+# `PinReport.pins`, which deliberately does NOT treat a dead-filer L0 as
+# pinning — for the sweep-side APPLIERS that act on the table's output.  They
+# are report-shaped wrappers over `orchestrator.recovery_pins` and add no
+# policy: their whole job is to unpack a `TruthReport` into the arguments the
+# shared predicate takes, so `Harness._reconcile_one_stranded` consumes the
+# resolver's own answer instead of re-deriving a sixth `bool(open)` copy
+# (INV-5).  `task_id=''` for the reason given in `_vetoes_done_flip`.
+#
+# Both pass `report.open_escalations` and never `records=None`, so the
+# store-unavailable non-fold documented there holds uniformly across the
+# resolver AND its appliers; the third state keeps travelling on
+# `report.escalation_store_unavailable`.
+# ---------------------------------------------------------------------------
+
+
+def report_pins_recovery(report: TruthReport) -> bool:
+    """Do *report*'s open records pin the task against recovery?
+
+    ``escalation.pins.classify_pins(...).pins``, read off the report.  See
+    :func:`orchestrator.recovery_pins.records_pin_recovery`.
+    """
+    return records_pin_recovery(
+        '',
+        report.open_escalations,
+        live_claimant=report.live_claimant is not None,
+        live_claimant_id=_live_claimant_id(report),
+    )
+
+
+def report_pins_blocked_recovery(report: TruthReport) -> bool:
+    """Do *report*'s open records pin a BLOCKED task against its self-heal?
+
+    :func:`report_pins_recovery` narrowed by the merge-remediable relaxation.
+    See :func:`orchestrator.recovery_pins.records_pin_blocked_recovery`.
+    """
+    return records_pin_blocked_recovery(
+        '',
+        report.open_escalations,
+        live_claimant=report.live_claimant is not None,
+        live_claimant_id=_live_claimant_id(report),
+    )
+
+
+def report_pins_blocked_done_flip(report: TruthReport) -> bool:
+    """Do *report*'s open records forbid flipping a BLOCKED task to done?
+
+    :func:`report_pins_blocked_recovery`'s deliberately-more-conservative twin;
+    they differ on exactly one input class.  See
+    :func:`orchestrator.recovery_pins.records_pin_blocked_done_flip`.
+    """
+    return records_pin_blocked_done_flip(
+        '',
+        report.open_escalations,
+        live_claimant=report.live_claimant is not None,
+        live_claimant_id=_live_claimant_id(report),
+    )
+
+
+def report_would_duplicate_a_handoff(report: TruthReport) -> bool:
+    """Does a record with an OWNER already sit on *report*'s task?
+
+    The re-file DEDUP question, report-shaped.  See
+    :func:`orchestrator.recovery_pins.records_would_duplicate_a_handoff`.
+    """
+    return records_would_duplicate_a_handoff(
+        '',
+        report.open_escalations,
+        live_claimant=report.live_claimant is not None,
+        live_claimant_id=_live_claimant_id(report),
+    )
+
+
+def recovery_shape_str(report: TruthReport) -> str:
+    """Render *report*'s discretized shape as the emitted ``shape`` string.
+
+    Delegates to ``recovery_emission.render_shape`` over EXACTLY the tuple
+    :func:`_shape` builds its ``_RECOVERY`` key from — by splatting ``_shape``'s
+    own output, not by re-listing the elements.  That binding is what keeps an
+    emitted shape string from drifting away from the table key it describes.
+    """
+    return render_shape(*_shape(report))

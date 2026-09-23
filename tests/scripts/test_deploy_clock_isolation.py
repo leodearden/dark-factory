@@ -26,12 +26,14 @@ other suite-wide isolation defence, so the two read as one family.
 
 from __future__ import annotations
 
+import importlib
+import json
 import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from types import ModuleType
 
 import pytest
 
@@ -45,10 +47,20 @@ if str(REPO_ROOT) not in sys.path:
 
 import df_pytest_isolation  # noqa: E402
 from df_pytest_isolation import (  # noqa: E402
+    CLOCK_PROVENANCE_SESSION_KEY,
+    CLOCK_PROVENANCE_SOURCE_KEY,
+    FLEET_LEASE_RELPATH,
+    PROTECTED_DEPLOY_CLOCK_ENV_VARS,
     PROTECTED_DEPLOY_CLOCK_RELPATHS,
+    PYTEST_SESSION_TOKEN_ENV,
+    ClockVerdict,
+    DeployClockRedeployWarning,
+    clock_stamp_provenance,
+    deploy_clock_change_report,
     deploy_clock_guard_roots,
     deploy_clock_snapshot,
     deploy_clock_violation_reason,
+    fixture_marker,
 )
 
 # NOT `from df_pytest_isolation import _df_deploy_clocks_unwritten`. Importing a
@@ -57,37 +69,6 @@ from df_pytest_isolation import (  # noqa: E402
 # import and pass even with the conftest wiring removed, i.e. exactly the dead
 # defence it exists to detect. Reach it through the module instead.
 _GUARD_NAME = '_df_deploy_clocks_unwritten'
-
-# pytest's fixture marker is private and has MOVED: <=8.x hangs it off the
-# decorated function as `_pytestfixturefunction`, 9.x wraps the function in a
-# `FixtureFunctionDefinition` carrying `_fixture_function_marker`. Both spellings
-# are accepted, and neither-found is an explicit failure rather than a skipped
-# assertion — a private-API pin that silently stops finding its target is worse
-# than no pin, because it still reads as coverage.
-_MARKER_ATTRS = ('_fixture_function_marker', '_pytestfixturefunction')
-
-
-def _fixture_marker(fixture: object) -> Any:
-    """Return pytest's fixture marker, whatever this pytest version calls it.
-
-    `Any`, not `object`, is the honest annotation and is load-bearing for the
-    type gate: the two `_MARKER_ATTRS` spellings above hang DIFFERENT private
-    classes off the fixture, neither of which pytest exports, so there is no
-    real static type that covers both — and `object` makes every `.scope` /
-    `.autouse` read below a `reportAttributeAccessIssue`. Do not "tighten" this
-    back to `object`; pin the attributes with assertions instead, as the caller
-    does.
-    """
-    for attr in _MARKER_ATTRS:
-        marker = getattr(fixture, attr, None)
-        if marker is not None:
-            return marker
-    pytest.fail(
-        f'cannot find pytest\'s fixture marker on {fixture!r} under any of '
-        f'{_MARKER_ATTRS}. pytest moved its private fixture API again — find the '
-        'new spelling and add it, do NOT delete this assertion.',
-        pytrace=False,
-    )
 
 _FLEET_RELPATH = 'data/orchestrator/last_redeploy_orchestrator.json'
 _FM_RELPATH = 'data/fused-memory/last_redeploy_fused_memory.json'
@@ -122,6 +103,51 @@ class TestProtectedRelpaths:
         environment) that produced the fleet-clock bug.
         """
         assert _FM_RELPATH in PROTECTED_DEPLOY_CLOCK_RELPATHS
+
+    def test_it_covers_the_in_flight_lease_for_the_REDIRECT_ONLY(self) -> None:
+        """The lease gets the redirect half of the guard and NOT the other half.
+
+        REDIRECT: yes. A test that spawns restart-all-orchestrators.sh without
+        setting $ORCH_FLEET_LEASE would create, rewrite and remove the LIVE
+        lease, which is exposed in both directions a clock is exposed in one --
+        one left behind suppresses real redeploys until the max-age bound
+        expires, and a lease_release against the live path deletes a genuine
+        in-flight sweep's lease. The redirect removes that at the source.
+
+        CHANGE DETECTION: no, and this is not an omission. deploy_clock_guard_
+        roots deliberately watches the MAIN checkout as well as the worktree,
+        and a real sweep creates, per-unit rewrites and removes the live lease
+        for its WHOLE duration (~15min today) against documented 26-41min
+        verify runs. A real sweep IS a benign external write -- which is the
+        only reason the guard watches the main checkout at all -- so watching
+        the lease for changes fails innocent branches at roughly (sweep + run)
+        / 8h, re-opening exactly the false-positive class task 4823 closed.
+        """
+        assert FLEET_LEASE_RELPATH in PROTECTED_DEPLOY_CLOCK_ENV_VARS, (
+            f'{FLEET_LEASE_RELPATH!r} must stay in the env-var table: that is '
+            'what drives the suite-wide redirect away from the live lease path.'
+        )
+        assert FLEET_LEASE_RELPATH not in PROTECTED_DEPLOY_CLOCK_RELPATHS, (
+            f'{FLEET_LEASE_RELPATH!r} is CHANGE-DETECTED again. A real fleet '
+            'sweep writes, rewrites and removes the live lease for its whole '
+            'duration, so any verify run straddling either end of one fails an '
+            'innocent branch (REWRITTEN / DELETED / CREATED) -- the false-'
+            'positive class task 4823 closed, with a far wider window than a '
+            'clock, which moves once and instantaneously. Unlike a clock, no '
+            'provenance in the body could rescue it: the DELETED case has '
+            'after=None and leaves nothing to attribute.'
+        )
+
+    def test_the_snapshot_does_not_record_the_lease(self, tmp_path: Path) -> None:
+        """The exclusion has to reach the SNAPSHOT, not just the tuple.
+
+        deploy_clock_snapshot keys off PROTECTED_DEPLOY_CLOCK_RELPATHS, so a
+        lease key appearing here would mean the guard is still watching it by
+        another name.
+        """
+        _write(tmp_path, FLEET_LEASE_RELPATH, b'{"pid": 1, "started_ts": 0}')
+
+        assert FLEET_LEASE_RELPATH not in deploy_clock_snapshot(tmp_path)
 
     def test_the_relpaths_are_relative(self) -> None:
         """They are joined onto a root by the snapshot; an absolute entry would
@@ -250,6 +276,139 @@ class TestDeployClockSnapshot:
 
         assert snapshot[_FLEET_RELPATH] is not None
         assert snapshot[_FM_RELPATH] is None
+
+
+def _entry(body: bytes, mtime_ns: int = 1_700_000_000_000_000_000) -> tuple[bytes, int]:
+    """A snapshot entry built from a literal body — no I/O, no real clock."""
+    return (body, mtime_ns)
+
+
+# A genuine machine-operated stamp: a provenance-aware writer with no pytest
+# ancestor, hence an EMPTY session token. This is the one shape the guard is
+# allowed to forgive, so it is spelled out once and reused.
+_EXTERNAL_BODY = (
+    b'{"ts": 1787849070, "iso": "2026-08-28T09:24:30+00:00", '
+    b'"source": "restart-all-orchestrators.sh", "pytest_session": ""}\n'
+)
+# The pre-4823 shape. MUST stay unattributable: a writer that has not been
+# taught provenance cannot buy itself an exemption by omission.
+_LEGACY_BODY = b'{"ts": 1787849070, "iso": "2026-08-28T09:24:30+00:00"}\n'
+
+
+class TestClockStampProvenance:
+    """Who wrote the stamp — the whole discriminator, parsed from the body alone.
+
+    The attribution half of task 4823; ``df_pytest_isolation.py::
+    deploy_clock_change_report`` states what the attribution is for. Every case
+    here is built from a LITERAL body so the parser's contract is pinned
+    independently of any writer, in either direction: a writer that stops
+    emitting provenance must fail these, not silently degrade the guard.
+    """
+
+    def test_the_env_var_and_key_names_are_the_cross_tier_contract(self) -> None:
+        """Named constants, never inlined literals.
+
+        Four tiers must agree on these spellings and none can import another's
+        (the module docstring's stdlib+pytest import constraint): the two
+        production writers emit them, this parser reads them, and the writer
+        tests assert against THESE objects rather than against strings — which
+        is what makes those tests drift pins rather than tautologies.
+        """
+        assert PYTEST_SESSION_TOKEN_ENV == 'DF_PYTEST_SESSION_TOKEN'
+        assert CLOCK_PROVENANCE_SOURCE_KEY == 'source'
+        assert CLOCK_PROVENANCE_SESSION_KEY == 'pytest_session'
+
+    def test_an_absent_file_has_no_provenance(self) -> None:
+        """``None`` in, ``None`` out — a DELETED clock has no body to attribute."""
+        assert clock_stamp_provenance(None) is None
+
+    @pytest.mark.parametrize('body', [b'not json', b'{"ts": 1', b'', b'\xff\xfe'])
+    def test_an_unparseable_body_is_unattributable_and_never_raises(
+        self, body: bytes,
+    ) -> None:
+        """A parse error must fail CLOSED, not propagate.
+
+        This runs in a session-teardown fixture: an exception here would replace
+        the guard's own message with a traceback about JSON, hiding whichever
+        clock actually moved.
+        """
+        assert clock_stamp_provenance(_entry(body)) is None
+
+    @pytest.mark.parametrize('body', [b'[1, 2]', b'"x"', b'null', b'3'])
+    def test_a_non_object_body_is_unattributable(self, body: bytes) -> None:
+        """Valid JSON is not enough — provenance lives in named keys."""
+        assert clock_stamp_provenance(_entry(body)) is None
+
+    def test_the_legacy_ts_iso_body_is_unattributable(self) -> None:
+        """The pre-4823 shape stays a violation.
+
+        Any stamp written by a writer that predates (or forgets) provenance is
+        indistinguishable from a test's, so it must keep failing the run exactly
+        as it does today. This is what makes the change safe to land with no
+        coordinated writer rollout.
+        """
+        assert clock_stamp_provenance(_entry(_LEGACY_BODY)) is None
+
+    def test_a_half_provenance_body_is_unattributable(self) -> None:
+        """``pytest_session`` alone does not clear a stamp.
+
+        A writer emitting one key of the pair is a broken writer, and trusting
+        it would let a partially-migrated writer grant itself the exemption.
+        """
+        body = b'{"ts": 1, "iso": "x", "pytest_session": ""}'
+
+        assert clock_stamp_provenance(_entry(body)) is None
+
+    def test_a_source_without_a_session_key_is_unattributable(self) -> None:
+        """The mirror case: ``source`` is triage prose, never the discriminator."""
+        body = b'{"ts": 1, "iso": "x", "source": "restart-all-orchestrators.sh"}'
+
+        assert clock_stamp_provenance(_entry(body)) is None
+
+    def test_a_full_external_stamp_parses_to_its_two_strings(self) -> None:
+        provenance = clock_stamp_provenance(_entry(_EXTERNAL_BODY))
+
+        assert provenance == {
+            CLOCK_PROVENANCE_SOURCE_KEY: 'restart-all-orchestrators.sh',
+            CLOCK_PROVENANCE_SESSION_KEY: '',
+        }
+
+    def test_a_session_token_is_returned_verbatim(self) -> None:
+        """Verbatim, because the caller compares it for EQUALITY with its own.
+
+        Any normalisation here (case, strip, truncation) would silently turn a
+        foreign token into a match or a match into a miss.
+        """
+        token = '0f1e2d3c4b5a69788796a5b4c3d2e1f0'
+        body = (
+            b'{"ts": 1, "iso": "x", "source": "orchestrator-watchdog.py", '
+            b'"pytest_session": "' + token.encode() + b'"}'
+        )
+
+        provenance = clock_stamp_provenance(_entry(body))
+
+        assert provenance is not None
+        assert provenance[CLOCK_PROVENANCE_SESSION_KEY] == token
+        assert provenance[CLOCK_PROVENANCE_SOURCE_KEY] == 'orchestrator-watchdog.py'
+
+    @pytest.mark.parametrize(
+        'body',
+        [
+            b'{"ts": 1, "source": 123, "pytest_session": ""}',
+            b'{"ts": 1, "source": null, "pytest_session": ""}',
+            b'{"ts": 1, "source": "x", "pytest_session": 123}',
+            b'{"ts": 1, "source": "x", "pytest_session": null}',
+            b'{"ts": 1, "source": "x", "pytest_session": []}',
+        ],
+    )
+    def test_a_wrong_typed_provenance_field_is_unattributable(self, body: bytes) -> None:
+        """No coercion. A non-string field is a broken writer, not provenance.
+
+        Coercing ``None`` to ``''`` would be actively dangerous: the empty
+        string is the POSITIVE assertion "no pytest session was an ancestor of
+        this write", i.e. the one value that forgives a change.
+        """
+        assert clock_stamp_provenance(_entry(body)) is None
 
 
 class TestDeployClockViolationReason:
@@ -429,6 +588,563 @@ class TestDeployClockViolationReason:
         assert deploy_clock_violation_reason(clean, deploy_clock_snapshot(tmp_path)) is not None
 
 
+# A plausible per-session token: 32 lowercase hex, the shape uuid4().hex has.
+_THIS_SESSION = 'aa11bb22cc33dd44ee55ff6677889900'
+_OTHER_SESSION = '00998877ff66ee55dd44cc33bb22aa11'
+_FLEET_SOURCE = 'restart-all-orchestrators.sh'
+_WATCHDOG_SOURCE = 'orchestrator-watchdog.py'
+
+
+def _stamp(*, token: str, source: str = _FLEET_SOURCE, ts: int = 1787849070) -> bytes:
+    """A provenance-bearing clock body, as the production writers emit it.
+
+    Built with json.dumps rather than a format string so a key-name change in
+    the module constants cannot leave this helper writing the old spelling
+    while still looking right.
+    """
+    return (
+        json.dumps(
+            {
+                'ts': ts,
+                'iso': '2026-08-28T09:24:30+00:00',
+                CLOCK_PROVENANCE_SOURCE_KEY: source,
+                CLOCK_PROVENANCE_SESSION_KEY: token,
+            }
+        ).encode()
+        + b'\n'
+    )
+
+
+class TestDeployClockChangeReport:
+    """The attributing entry point: WHAT changed, and WHO changed it (task 4823).
+
+    Its own docstring is the normative statement of the incident, the
+    discriminator and the verdict table; these pin the table cell by cell. The
+    default — fail — is unchanged for every unattributable change, and exactly
+    one case downgrades: a provenance-bearing stamp written with no pytest
+    ancestor.
+    """
+
+    def test_an_unchanged_absent_clock_reports_nothing(self, tmp_path: Path) -> None:
+        before = deploy_clock_snapshot(tmp_path)
+
+        assert deploy_clock_change_report(
+            before, deploy_clock_snapshot(tmp_path), session_token=_THIS_SESSION,
+        ) is None
+
+    def test_an_unchanged_present_clock_reports_nothing(self, tmp_path: Path) -> None:
+        """Reading a clock is not writing it — provenance never even gets parsed."""
+        _write(tmp_path, _FLEET_RELPATH, _stamp(token=''))
+        before = deploy_clock_snapshot(tmp_path)
+
+        assert deploy_clock_change_report(
+            before, deploy_clock_snapshot(tmp_path), session_token=_THIS_SESSION,
+        ) is None
+
+    def test_a_stamp_carrying_this_sessions_token_is_falsified(
+        self, tmp_path: Path,
+    ) -> None:
+        """The 3797 defect, now with POSITIVE proof instead of an inference.
+
+        The write provably descends from this pytest session, so the message
+        may say so outright rather than hedging between "a test did it" and "a
+        real redeploy did it".
+        """
+        before = deploy_clock_snapshot(tmp_path)
+        _write(tmp_path, _FLEET_RELPATH, _stamp(token=_THIS_SESSION))
+
+        report = deploy_clock_change_report(
+            before, deploy_clock_snapshot(tmp_path), session_token=_THIS_SESSION,
+        )
+
+        assert report is not None
+        verdict, message = report
+        assert verdict is ClockVerdict.FALSIFIED
+        assert 'falsified a REAL deploy clock' in message, message
+        assert _FLEET_SOURCE in message, 'the writer must be named for triage'
+        assert 'this run' in message, message
+
+    def test_an_external_stamp_is_a_redeploy_not_a_falsification(
+        self, tmp_path: Path,
+    ) -> None:
+        """THE FIX. An empty token is the positive statement "no pytest ancestor".
+
+        Only a provenance-AWARE writer can make that statement, so this cannot
+        be reached by a pre-4823 or half-migrated writer.
+        """
+        before = deploy_clock_snapshot(tmp_path)
+        _write(tmp_path, _FLEET_RELPATH, _stamp(token=''))
+
+        report = deploy_clock_change_report(
+            before, deploy_clock_snapshot(tmp_path), session_token=_THIS_SESSION,
+        )
+
+        assert report is not None
+        verdict, message = report
+        assert verdict is ClockVerdict.EXTERNAL_REDEPLOY
+        assert 'falsified a REAL deploy clock' not in message, (
+            'the benign message must not carry the accusing string — the nested '
+            'end-to-end test and the failure-path tests both key on it'
+        )
+        assert 'not at fault' in message.lower(), message
+        assert _FLEET_SOURCE in message, 'the writer must be named for triage'
+
+    def test_a_foreign_session_token_still_fails(self, tmp_path: Path) -> None:
+        """Deliberately conservative: this guard never absolves another session.
+
+        A token that is neither empty nor ours means some OTHER pytest session
+        wrote the shared main-checkout clock. That session's own guard sees its
+        own token and fails, so the signal is never lost — and this run must not
+        become the arbiter of another run's bug on the strength of a token it
+        cannot verify.
+        """
+        before = deploy_clock_snapshot(tmp_path)
+        _write(tmp_path, _FLEET_RELPATH, _stamp(token=_OTHER_SESSION))
+
+        report = deploy_clock_change_report(
+            before, deploy_clock_snapshot(tmp_path), session_token=_THIS_SESSION,
+        )
+
+        assert report is not None
+        verdict, message = report
+        assert verdict is ClockVerdict.FALSIFIED
+        assert 'another pytest session' in message.lower(), message
+
+    def test_a_legacy_provenance_free_stamp_still_fails(self, tmp_path: Path) -> None:
+        """Today's behaviour, preserved: no provenance means no exemption."""
+        before = deploy_clock_snapshot(tmp_path)
+        _write(tmp_path, _FLEET_RELPATH, b'{"ts": 1787849070, "iso": "..."}\n')
+
+        report = deploy_clock_change_report(
+            before, deploy_clock_snapshot(tmp_path), session_token=_THIS_SESSION,
+        )
+
+        assert report is not None
+        assert report[0] is ClockVerdict.FALSIFIED
+
+    def test_a_created_external_stamp_is_a_redeploy(self, tmp_path: Path) -> None:
+        """CREATED-from-absent is the 3797 SHAPE but not necessarily its cause:
+        a machine-operated checkout with no ``data/`` yet gets its first real
+        stamp exactly this way.
+        """
+        before = deploy_clock_snapshot(tmp_path)
+        assert before[_FLEET_RELPATH] is None
+        _write(tmp_path, _FLEET_RELPATH, _stamp(token=''))
+
+        report = deploy_clock_change_report(
+            before, deploy_clock_snapshot(tmp_path), session_token=_THIS_SESSION,
+        )
+
+        assert report is not None
+        assert report[0] is ClockVerdict.EXTERNAL_REDEPLOY
+
+    def test_a_created_provenance_free_stamp_fails(self, tmp_path: Path) -> None:
+        before = deploy_clock_snapshot(tmp_path)
+        _write(tmp_path, _FLEET_RELPATH, b'{"ts": 1, "iso": "x"}\n')
+
+        report = deploy_clock_change_report(
+            before, deploy_clock_snapshot(tmp_path), session_token=_THIS_SESSION,
+        )
+
+        assert report is not None
+        assert report[0] is ClockVerdict.FALSIFIED
+
+    def test_a_deleted_clock_always_fails(self, tmp_path: Path) -> None:
+        """There is no body left to attribute, and nothing legitimate deletes a
+        live clock — the watchdog would read "never redeployed" and lose the
+        real last-deploy time.
+        """
+        clock = _write(tmp_path, _FLEET_RELPATH, _stamp(token=''))
+        before = deploy_clock_snapshot(tmp_path)
+        clock.unlink()
+
+        report = deploy_clock_change_report(
+            before, deploy_clock_snapshot(tmp_path), session_token=_THIS_SESSION,
+        )
+
+        assert report is not None
+        assert report[0] is ClockVerdict.FALSIFIED
+
+    def test_a_restamp_with_identical_bytes_is_still_attributed(
+        self, tmp_path: Path,
+    ) -> None:
+        """The mtime-only signal must carry provenance too.
+
+        The clock writes whole seconds, so a genuine redeploy landing inside the
+        same second as the snapshot is byte-identical and visible only through
+        mtime. If that path skipped attribution it would fail every run it
+        straddled — the exact bug being fixed, surviving in its narrowest form.
+        """
+        body = _stamp(token='')
+        clock = _write(tmp_path, _FLEET_RELPATH, body)
+        before = deploy_clock_snapshot(tmp_path)
+        stat = clock.stat()
+        os.utime(clock, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+        after = deploy_clock_snapshot(tmp_path)
+        before_entry, after_entry = before[_FLEET_RELPATH], after[_FLEET_RELPATH]
+        assert before_entry is not None and after_entry is not None
+        assert after_entry[0] == before_entry[0], 'bytes must be identical'
+
+        report = deploy_clock_change_report(
+            before, after, session_token=_THIS_SESSION,
+        )
+
+        assert report is not None
+        assert report[0] is ClockVerdict.EXTERNAL_REDEPLOY
+
+    @pytest.mark.parametrize('token', [None, ''])
+    def test_an_unstamped_session_token_fails_closed(
+        self, tmp_path: Path, token: str | None,
+    ) -> None:
+        """A falsy token must never read as "everything is external".
+
+        Mirrors ``leaked_drain_processes``' fail-closed contract on its own
+        token: the first time the fixture failed to stamp one, a token-trusting
+        guard would silently forgive every write instead of failing loudly.
+        """
+        before = deploy_clock_snapshot(tmp_path)
+        _write(tmp_path, _FLEET_RELPATH, _stamp(token=''))
+
+        report = deploy_clock_change_report(
+            before, deploy_clock_snapshot(tmp_path), session_token=token,
+        )
+
+        assert report is not None
+        assert report[0] is ClockVerdict.FALSIFIED
+
+    @pytest.mark.parametrize('token,expected', [
+        ('', ClockVerdict.EXTERNAL_REDEPLOY),
+        (_THIS_SESSION, ClockVerdict.FALSIFIED),
+    ])
+    def test_a_root_names_the_absolute_file_in_both_verdicts(
+        self, tmp_path: Path, token: str, expected: ClockVerdict,
+    ) -> None:
+        """A run guards MORE THAN ONE checkout, so a bare relpath cannot say
+        which one moved — and that is as true of the benign verdict as of the
+        accusing one.
+        """
+        before = deploy_clock_snapshot(tmp_path)
+        _write(tmp_path, _FLEET_RELPATH, _stamp(token=token))
+
+        report = deploy_clock_change_report(
+            before, deploy_clock_snapshot(tmp_path),
+            session_token=_THIS_SESSION, root=tmp_path,
+        )
+
+        assert report is not None
+        verdict, message = report
+        assert verdict is expected
+        assert str(tmp_path / _FLEET_RELPATH) in message, message
+
+    @pytest.mark.parametrize('token,expected', [
+        ('', ClockVerdict.EXTERNAL_REDEPLOY),
+        (_THIS_SESSION, ClockVerdict.FALSIFIED),
+    ])
+    def test_the_fm_clock_is_attributed_identically(
+        self, tmp_path: Path, token: str, expected: ClockVerdict,
+    ) -> None:
+        """The second protected clock, and the one the measured 2026-08-28
+        instances actually pointed at — it must not be covered by inheritance
+        from the fleet clock's cases alone.
+        """
+        before = deploy_clock_snapshot(tmp_path)
+        _write(tmp_path, _FM_RELPATH, _stamp(token=token, source=_WATCHDOG_SOURCE))
+
+        report = deploy_clock_change_report(
+            before, deploy_clock_snapshot(tmp_path),
+            session_token=_THIS_SESSION, root=tmp_path,
+        )
+
+        assert report is not None
+        verdict, message = report
+        assert verdict is expected
+        assert str(tmp_path / _FM_RELPATH) in message, message
+
+    def test_both_observed_bodies_are_printed_in_the_benign_verdict_too(
+        self, tmp_path: Path,
+    ) -> None:
+        """Triage from the OUTPUT alone, exactly as the failing path already
+        guarantees: an operator reading a warning in a merge-lane log must be
+        able to check the {ts, iso} against the deploy they expect without
+        re-reading a file that has since moved again.
+        """
+        _write(tmp_path, _FLEET_RELPATH, _stamp(token='', ts=111))
+        before = deploy_clock_snapshot(tmp_path)
+        _write(tmp_path, _FLEET_RELPATH, _stamp(token='', ts=222))
+
+        report = deploy_clock_change_report(
+            before, deploy_clock_snapshot(tmp_path), session_token=_THIS_SESSION,
+        )
+
+        assert report is not None
+        verdict, message = report
+        assert verdict is ClockVerdict.EXTERNAL_REDEPLOY
+        assert '"ts": 111' in message, message
+        assert '"ts": 222' in message, message
+
+    def test_the_first_offender_in_protected_order_is_reported(
+        self, tmp_path: Path,
+    ) -> None:
+        """Same first-offender contract as ``deploy_clock_violation_reason``:
+        one report per root, in PROTECTED_DEPLOY_CLOCK_RELPATHS order.
+        """
+        before = deploy_clock_snapshot(tmp_path)
+        _write(tmp_path, _FLEET_RELPATH, b'{"ts": 1, "iso": "x"}\n')
+        _write(tmp_path, _FM_RELPATH, b'{"ts": 2, "iso": "y"}\n')
+
+        report = deploy_clock_change_report(
+            before, deploy_clock_snapshot(tmp_path),
+            session_token=_THIS_SESSION, root=tmp_path,
+        )
+
+        assert report is not None
+        assert PROTECTED_DEPLOY_CLOCK_RELPATHS[0] in report[1]
+
+
+class TestAFalsificationIsNeverMaskedByABenignChange:
+    """A benign change to an EARLIER clock must not hide a falsified LATER one.
+
+    The precedence rule these pin, cell by cell: ``FALSIFIED`` anywhere outranks
+    ``EXTERNAL_REDEPLOY`` anywhere. ``df_pytest_isolation.py::
+    deploy_clock_change_report`` states why, and why the two clocks can
+    genuinely disagree within one run.
+
+    ``test_the_first_offender_in_protected_order_is_reported`` cannot catch this:
+    it writes provenance-free bodies to BOTH clocks, so both are ``falsified``
+    and reporting the first IS correct there. That contract still holds and that
+    test stays green — first-offender-wins applies among EQUALS.
+
+    CROSS-clock only, deliberately. Two writes to the SAME clock leave only the
+    surviving body to attribute, and nothing here pins that case because nothing
+    can: it is residual gap (2) in ``df_pytest_isolation``'s SECOND DEFENCE
+    section, accepted there with its reasoning.
+    """
+
+    def _report(
+        self, tmp_path: Path, before: dict[str, tuple[bytes, int] | None],
+    ) -> tuple[ClockVerdict, str] | None:
+        return deploy_clock_change_report(
+            before, deploy_clock_snapshot(tmp_path),
+            session_token=_THIS_SESSION, root=tmp_path,
+        )
+
+    def test_a_benign_fleet_stamp_does_not_mask_our_own_token_on_the_fm_clock(
+        self, tmp_path: Path,
+    ) -> None:
+        """The direct regression pin: exactly the merge-queue event, plus a bug.
+
+        A genuine redeploy stamps ``PROTECTED_DEPLOY_CLOCK_RELPATHS[0]`` while a
+        test falsifies ``[1]`` with this run's own token. Task 3797's defence
+        must survive a real redeploy being in flight.
+        """
+        before = deploy_clock_snapshot(tmp_path)
+        _write(tmp_path, _FLEET_RELPATH, _stamp(token=''))
+        _write(
+            tmp_path, _FM_RELPATH,
+            _stamp(token=_THIS_SESSION, source=_WATCHDOG_SOURCE),
+        )
+
+        report = self._report(tmp_path, before)
+
+        assert report is not None
+        verdict, message = report
+        assert verdict is ClockVerdict.FALSIFIED, (
+            'a real redeploy on the fleet clock masked a self-stamped '
+            f'falsification of the fm clock. report={report!r}'
+        )
+        assert str(tmp_path / _FM_RELPATH) in message, (
+            'the message names the benign clock instead of the falsified one, '
+            f'which sends triage to the wrong file. message={message!r}'
+        )
+
+    def test_a_benign_fleet_stamp_does_not_mask_a_foreign_token_on_the_fm_clock(
+        self, tmp_path: Path,
+    ) -> None:
+        """Foreign tokens fail closed (design decision 3) and must not be maskable
+        either — a downgrade reachable only by ordering is not a policy.
+        """
+        before = deploy_clock_snapshot(tmp_path)
+        _write(tmp_path, _FLEET_RELPATH, _stamp(token=''))
+        _write(
+            tmp_path, _FM_RELPATH,
+            _stamp(token=_OTHER_SESSION, source=_WATCHDOG_SOURCE),
+        )
+
+        report = self._report(tmp_path, before)
+
+        assert report is not None
+        assert report[0] is ClockVerdict.FALSIFIED, report
+        assert str(tmp_path / _FM_RELPATH) in report[1], report[1]
+
+    def test_a_benign_fleet_stamp_does_not_mask_an_unattributable_fm_write(
+        self, tmp_path: Path,
+    ) -> None:
+        """The most likely real shape: the falsifying spawner predates provenance.
+
+        A pre-4823 writer, or any writer that never learned to stamp, leaves a
+        body nothing can attribute. That is the case the fail-closed default
+        exists for, so it is the one masking hurts most.
+        """
+        before = deploy_clock_snapshot(tmp_path)
+        _write(tmp_path, _FLEET_RELPATH, _stamp(token=''))
+        _write(tmp_path, _FM_RELPATH, _LEGACY_BODY)
+
+        report = self._report(tmp_path, before)
+
+        assert report is not None
+        assert report[0] is ClockVerdict.FALSIFIED, report
+        assert str(tmp_path / _FM_RELPATH) in report[1], report[1]
+
+    def test_a_benign_fleet_stamp_does_not_mask_a_deleted_fm_clock(
+        self, tmp_path: Path,
+    ) -> None:
+        """A DELETED clock has no body to attribute, so it can never be benign."""
+        _write(tmp_path, _FM_RELPATH, _stamp(token='', source=_WATCHDOG_SOURCE))
+        before = deploy_clock_snapshot(tmp_path)
+        _write(tmp_path, _FLEET_RELPATH, _stamp(token=''))
+        (tmp_path / _FM_RELPATH).unlink()
+
+        report = self._report(tmp_path, before)
+
+        assert report is not None
+        assert report[0] is ClockVerdict.FALSIFIED, report
+        assert str(tmp_path / _FM_RELPATH) in report[1], report[1]
+
+    def test_the_benign_verdict_survives_only_when_every_change_is_attributed(
+        self, tmp_path: Path,
+    ) -> None:
+        """Non-vacuity control: the fix must not turn every multi-clock change
+        into a failure. Two genuinely external stamps stay benign, and the report
+        still names the FIRST in protected order.
+        """
+        before = deploy_clock_snapshot(tmp_path)
+        _write(tmp_path, _FLEET_RELPATH, _stamp(token=''))
+        _write(tmp_path, _FM_RELPATH, _stamp(token='', source=_WATCHDOG_SOURCE))
+
+        report = self._report(tmp_path, before)
+
+        assert report is not None
+        verdict, message = report
+        assert verdict is ClockVerdict.EXTERNAL_REDEPLOY, report
+        assert str(tmp_path / PROTECTED_DEPLOY_CLOCK_RELPATHS[0]) in message, message
+
+    def test_a_falsified_fleet_clock_still_outranks_a_benign_fm_one(
+        self, tmp_path: Path,
+    ) -> None:
+        """The already-correct direction, pinned so the fix cannot invert it."""
+        before = deploy_clock_snapshot(tmp_path)
+        _write(tmp_path, _FLEET_RELPATH, _LEGACY_BODY)
+        _write(tmp_path, _FM_RELPATH, _stamp(token='', source=_WATCHDOG_SOURCE))
+
+        report = self._report(tmp_path, before)
+
+        assert report is not None
+        assert report[0] is ClockVerdict.FALSIFIED, report
+        assert str(tmp_path / _FLEET_RELPATH) in report[1], report[1]
+
+    def test_the_public_wrapper_is_not_maskable_either(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The fixture's failure path and every pre-4823 caller go through
+        ``deploy_clock_violation_reason``, so the fix has to be observable THERE
+        and not only in the report it now delegates to.
+        """
+        monkeypatch.setenv(PYTEST_SESSION_TOKEN_ENV, _THIS_SESSION)
+        before = deploy_clock_snapshot(tmp_path)
+        _write(tmp_path, _FLEET_RELPATH, _stamp(token=''))
+        _write(
+            tmp_path, _FM_RELPATH,
+            _stamp(token=_THIS_SESSION, source=_WATCHDOG_SOURCE),
+        )
+
+        reason = deploy_clock_violation_reason(
+            before, deploy_clock_snapshot(tmp_path), root=tmp_path,
+        )
+
+        assert reason is not None, (
+            'the wrapper returned None for a run that stamped the fm clock with '
+            'its own token, because a real redeploy had moved the fleet clock '
+            'first — task 3797 is disarmed whenever a deploy is in flight.'
+        )
+        assert str(tmp_path / _FM_RELPATH) in reason, reason
+
+
+class TestViolationReasonIsTheFalsifiedHalfOfTheReport:
+    """The old entry point keeps its signature and narrows to one verdict.
+
+    Everything in ``TestDeployClockViolationReason`` above stays green untouched
+    because every body it builds is provenance-free, hence still unattributable
+    and still a violation. What is new is the other direction: an attributed
+    external stamp must now come back as ``None`` from this function, which is
+    what lets the fixture pass the run.
+    """
+
+    def test_an_external_stamp_is_not_a_violation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The token is SET explicitly rather than inherited from the live run.
+
+        The guard fixture does stamp one for the whole session, but a test that
+        leaned on that would be pinning the fixture's wiring (which
+        ``TestGuardIsLiveInThisRun`` owns) instead of this function's contract,
+        and would flip to green for the wrong reason — an absent token fails
+        CLOSED here, which is a different pinned behaviour entirely.
+        """
+        monkeypatch.setenv(PYTEST_SESSION_TOKEN_ENV, _THIS_SESSION)
+        before = deploy_clock_snapshot(tmp_path)
+        _write(tmp_path, _FLEET_RELPATH, _stamp(token=''))
+
+        assert deploy_clock_violation_reason(
+            before, deploy_clock_snapshot(tmp_path),
+        ) is None
+
+    def test_a_provenance_free_stamp_is_still_a_violation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Non-vacuity control for the test above, in the same harness."""
+        monkeypatch.setenv(PYTEST_SESSION_TOKEN_ENV, _THIS_SESSION)
+        before = deploy_clock_snapshot(tmp_path)
+        _write(tmp_path, _FLEET_RELPATH, b'{"ts": 1, "iso": "x"}\n')
+
+        reason = deploy_clock_violation_reason(before, deploy_clock_snapshot(tmp_path))
+
+        assert reason is not None
+        assert 'falsified a REAL deploy clock' in reason
+
+    def test_an_absent_ambient_token_fails_closed(self, tmp_path: Path, monkeypatch) -> None:
+        """The fail-closed default, at the wrapper's own boundary.
+
+        If the guard fixture ever stopped stamping the token, every write would
+        read as unattributable and keep failing — noisily wrong, never silently
+        permissive. That direction is the one worth pinning.
+        """
+        monkeypatch.delenv(PYTEST_SESSION_TOKEN_ENV, raising=False)
+        before = deploy_clock_snapshot(tmp_path)
+        _write(tmp_path, _FLEET_RELPATH, _stamp(token=''))
+
+        assert deploy_clock_violation_reason(
+            before, deploy_clock_snapshot(tmp_path),
+        ) is not None
+
+    def test_it_reads_this_sessions_token_from_the_environment(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The three-argument signature is preserved, so the token can only come
+        from the ambient environment — which is precisely where every spawner
+        picks it up.
+        """
+        monkeypatch.setenv(PYTEST_SESSION_TOKEN_ENV, _THIS_SESSION)
+        before = deploy_clock_snapshot(tmp_path)
+        _write(tmp_path, _FLEET_RELPATH, _stamp(token=_THIS_SESSION))
+
+        reason = deploy_clock_violation_reason(
+            before, deploy_clock_snapshot(tmp_path), root=tmp_path,
+        )
+
+        assert reason is not None
+        assert 'this run' in reason, reason
+
+
 class TestGuardIsLiveInThisRun:
     """The fixture is WIRED, not merely defined.
 
@@ -453,7 +1169,7 @@ class TestGuardIsLiveInThisRun:
         subprocess setup tends to live), and without ``autouse`` nothing would
         ever request it.
         """
-        marker = _fixture_marker(getattr(df_pytest_isolation, _GUARD_NAME))
+        marker = fixture_marker(getattr(df_pytest_isolation, _GUARD_NAME))
 
         assert marker.scope == 'session', f'scope is {marker.scope!r}, expected session'
         assert marker.autouse is True, 'the guard must be autouse — nothing requests it'
@@ -476,6 +1192,51 @@ class TestGuardIsLiveInThisRun:
                 'this whole suite runs with no deploy-clock guard.',
                 pytrace=False,
             )
+
+    def test_this_session_carries_a_token_in_the_ambient_environment(self) -> None:
+        """The attribution mechanism is ARMED in this very process (task 4823).
+
+        The guard is autouse and session-scoped, so by the time any test runs it
+        has already stamped ``$DF_PYTEST_SESSION_TOKEN``. That ambient value is
+        the whole mechanism: every spawner here builds its child env from
+        ``dict(os.environ)``, so descendants — including the ones nobody has
+        written yet — are tagged for free, exactly as
+        :data:`df_pytest_isolation.LEAK_TOKEN_ENV` does for the drain-leak guard.
+        A stamper that stopped stamping would leave every clock write reading as
+        external, silently re-opening task 3797; nothing else in this file would
+        notice.
+        """
+        token = os.environ.get(PYTEST_SESSION_TOKEN_ENV)
+
+        assert token, (
+            f'${PYTEST_SESSION_TOKEN_ENV} is unset in a run where the guard '
+            'fixture is live; no clock write in this session can be attributed '
+            'to it, so a real falsification would read as an external redeploy.'
+        )
+
+    def test_the_benign_verdict_has_its_own_warning_class(self) -> None:
+        """A dedicated ``UserWarning`` subclass, deliberately not a bare
+        ``Warning`` and not a ``RuntimeWarning``.
+
+        The downgrade must stay a WARNING in every suite that imports this
+        module. This repo's only ``filterwarnings`` entries are targeted
+        ``error:<message-regex>:<category>`` pairs on ``RuntimeWarning`` /
+        ``PytestUnraisableExceptionWarning`` / ``PytestWarning``; a fresh
+        ``UserWarning`` subclass matches none of them, so the benign path cannot
+        be silently re-escalated into the failure it exists to replace.
+        """
+        warning_cls = getattr(df_pytest_isolation, 'DeployClockRedeployWarning', None)
+
+        assert warning_cls is not None, (
+            'df_pytest_isolation defines no DeployClockRedeployWarning; the '
+            'benign verdict has no channel to surface on.'
+        )
+        assert issubclass(warning_cls, UserWarning), (
+            f'{warning_cls!r} must subclass UserWarning'
+        )
+        assert not issubclass(warning_cls, RuntimeWarning), (
+            'RuntimeWarning is filtered to an error by orchestrator/pyproject.toml'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -503,50 +1264,99 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from df_pytest_isolation import _df_deploy_clocks_unwritten  # noqa: F401
 '''
 
+_NESTED_STAMP_TS = 1786033966
+_NESTED_STAMP_ISO = '2026-08-06T16:32:46+00:00'
+# The pre-4823 body: no provenance, hence unattributable, hence a violation.
 _NESTED_STAMP_BODY = '{"ts": 1786033966, "iso": "2026-08-06T16:32:46+00:00"}'
 
+# What the nested test does to the protected clock. Named scenarios rather than
+# the original boolean, because task 4823 split "the clock moved" into three
+# outcomes that only a real run can tell apart: no write (exit 0), an
+# unattributable write (exit non-zero), and an attributed one (exit 0 WITH a
+# warning). A boolean cannot express the last two at once.
+_NESTED_SCENARIOS = (
+    'clean', 'violating', 'external', 'own_token', 'external_plus_own_token',
+)
 
-def _nested_test_source(*, writes_clock: bool) -> str:
-    """Source for the nested test module — which PASSES either way.
 
-    Built by concatenation rather than ``str.format``: the stamp body is JSON, so
-    a template would have to escape its braces, and a mis-escaped one would
-    silently write a different file than the guard watches.
+def _nested_test_source(*, scenario: str) -> str:
+    """Source for the nested test module — which PASSES in every scenario.
+
+    The stamp bodies are built with ``json.dumps`` from THIS module's imported
+    key constants rather than from literals, so a key rename cannot leave the
+    nested writer emitting the old spelling while still looking right — the
+    failure mode that would make an ``external`` run silently fail closed and
+    read as a guard regression.
     """
-    body = (
-        (
-            '    clock = Path(__file__).resolve().parent / RELPATH\n'
-            '    clock.parent.mkdir(parents=True, exist_ok=True)\n'
-            f'    clock.write_text({_NESTED_STAMP_BODY!r})\n'
-        )
-        if writes_clock
-        else '    pass\n'
-    )
+    write = {
+        'clean': '    pass\n',
+        'violating': '    _stamp(RELPATH, LEGACY_BODY)\n',
+        # A genuine machine-operated redeploy: provenance, no pytest ancestor.
+        'external': "    _stamp(RELPATH, _provenance(''))\n",
+        # A test falsifying the clock, caught red-handed: the write inherits
+        # THIS nested session's own token through the ambient environment.
+        'own_token': '    _stamp(RELPATH, _provenance(os.environ[TOKEN_ENV]))\n',
+        # BOTH at once, in PROTECTED_DEPLOY_CLOCK_RELPATHS order: a real fleet
+        # redeploy moves the FIRST clock while a test falsifies the SECOND. A
+        # guard that stops at the first CHANGED clock warns and exits 0, never
+        # having looked at the falsification. Task 4823 amendment.
+        'external_plus_own_token': (
+            "    _stamp(RELPATH, _provenance(''))\n"
+            "    _stamp(FM_RELPATH, _provenance(os.environ[TOKEN_ENV]))\n"
+        ),
+    }[scenario]
     return (
+        'import json\n'
+        'import os\n'
         'from pathlib import Path\n'
         '\n'
         f'RELPATH = {_FLEET_RELPATH!r}\n'
+        f'FM_RELPATH = {_FM_RELPATH!r}\n'
+        f'TOKEN_ENV = {PYTEST_SESSION_TOKEN_ENV!r}\n'
+        f'LEGACY_BODY = {_NESTED_STAMP_BODY!r}\n'
+        '\n'
+        '\n'
+        'def _stamp(relpath, body):\n'
+        '    clock = Path(__file__).resolve().parent / relpath\n'
+        '    clock.parent.mkdir(parents=True, exist_ok=True)\n'
+        '    clock.write_text(body)\n'
+        '\n'
+        '\n'
+        'def _provenance(session):\n'
+        '    return json.dumps({\n'
+        f'        "ts": {_NESTED_STAMP_TS}, "iso": {_NESTED_STAMP_ISO!r},\n'
+        f'        {CLOCK_PROVENANCE_SOURCE_KEY!r}: {_FLEET_SOURCE!r},\n'
+        f'        {CLOCK_PROVENANCE_SESSION_KEY!r}: session,\n'
+        '    })\n'
         '\n'
         '\n'
         'def test_a_forgetful_spawner():\n'
         '    """PASSES. The damage is to the checkout, not to this result."""\n'
-        + body
+        + write
     )
 
 
-def _nested_run(tmp_path: Path, *, writes_clock: bool) -> subprocess.CompletedProcess[str]:
+def _nested_run(tmp_path: Path, *, scenario: str) -> subprocess.CompletedProcess[str]:
     """Run a throwaway pytest session wired to the guard, in its own tmp checkout.
 
     The copied ``df_pytest_isolation.py`` sits at the tmp tree's root, so the
     guard's ``Path(__file__).resolve().parent`` resolves THERE and the protected
     clocks it watches are the tmp ones — the real checkout is never involved.
+
+    No ``env=``: the child inherits this session's environment, which is the
+    point.  The nested session's own guard fixture overwrites
+    ``$DF_PYTEST_SESSION_TOKEN`` with a fresh uuid and restores the prior value
+    on teardown, so the ``own_token`` scenario genuinely reads the NESTED token
+    rather than this one's — which is what makes it a test of attribution rather
+    than of inheritance.
     """
-    root = tmp_path / ('violating' if writes_clock else 'clean')
+    assert scenario in _NESTED_SCENARIOS, scenario
+    root = tmp_path / scenario
     root.mkdir()
     shutil.copy2(Path(df_pytest_isolation.__file__), root / 'df_pytest_isolation.py')
     (root / 'pytest.ini').write_text(_NESTED_INI)
     (root / 'conftest.py').write_text(_NESTED_CONFTEST)
-    (root / 'test_forgetful.py').write_text(_nested_test_source(writes_clock=writes_clock))
+    (root / 'test_forgetful.py').write_text(_nested_test_source(scenario=scenario))
     return subprocess.run(
         [sys.executable, '-m', 'pytest', '-q', '-p', 'no:cacheprovider', str(root)],
         cwd=root, capture_output=True, text=True, timeout=300,
@@ -559,7 +1369,7 @@ class TestTheGuardFailsTheRunEndToEnd:
     def test_a_stamped_clock_fails_a_session_whose_tests_all_passed(
         self, tmp_path: Path,
     ) -> None:
-        result = _nested_run(tmp_path, writes_clock=True)
+        result = _nested_run(tmp_path, scenario='violating')
         combined = result.stdout + result.stderr
 
         assert result.returncode != 0, (
@@ -582,10 +1392,278 @@ class TestTheGuardFailsTheRunEndToEnd:
         Without it the failure above could be any nested-harness breakage — a
         bad ini, an unimportable module, a missing pytest.
         """
-        result = _nested_run(tmp_path, writes_clock=False)
+        result = _nested_run(tmp_path, scenario='clean')
 
         assert result.returncode == 0, (
             f'the control run failed for an unrelated reason: '
             f'stdout={result.stdout!r} stderr={result.stderr!r}'
         )
         assert 'falsified a REAL deploy clock' not in result.stdout
+
+
+class TestTheGuardAttributesTheStampEndToEnd:
+    """THE FIX, observed where it actually matters: the RUN's exit code.
+
+    Task 4823. Everything above pins helpers and messages; none of it can show
+    that a run whose protected clock MOVED nonetheless exits 0 — a fixture
+    cannot pass or fail its own session, so only a nested run can observe it.
+    These two scenarios are the two halves of the discriminator, driven through
+    the real fixture rather than through the helper.
+    """
+
+    def test_an_external_redeploy_warns_and_leaves_the_run_green(
+        self, tmp_path: Path,
+    ) -> None:
+        """A REAL redeploy straddling the run must cost the run NOTHING.
+
+        The whole point of the task, observed at the only place that can show
+        it: the run's own exit code.
+
+        The warning must SURFACE, not merely be raised — a warning nobody sees
+        is the silent fail-soft this repo's invariants forbid — so the assertion
+        is on the nested run's own output, which is where an operator would read
+        it.
+
+        The CATEGORY is asserted alongside the message because the category is
+        the whole reason the class exists: a suite wanting the old strictness
+        filters exactly this one warning to an error, and a warn site that
+        drifted to a bare ``UserWarning`` would take that filterability away
+        while leaving the class definition — and every other test here — green.
+        pytest's warnings summary renders ``<file>:<line>: <Category>: <msg>``,
+        so the run output pins it at the warn site rather than at the class.
+        """
+        result = _nested_run(tmp_path, scenario='external')
+        combined = result.stdout + result.stderr
+
+        assert result.returncode == 0, (
+            'an attributed external redeploy still failed the run — the '
+            f'downgrade is not wired. output={combined!r}'
+        )
+        assert '1 passed' in combined, combined
+        assert 'a REAL deploy stamped a protected clock' in combined, (
+            'the benign verdict was not surfaced in the run output; a warning '
+            f'nobody can read is indistinguishable from silence. output={combined!r}'
+        )
+        assert DeployClockRedeployWarning.__name__ in combined, (
+            'the benign verdict surfaced under some OTHER warning category, so '
+            'the one filter a strict suite would write no longer selects it. '
+            f'output={combined!r}'
+        )
+        assert 'falsified a REAL deploy clock' not in combined, combined
+
+    def test_a_write_carrying_the_sessions_own_token_still_fails_the_run(
+        self, tmp_path: Path,
+    ) -> None:
+        """Task 3797, preserved and STRENGTHENED: now proven, not inferred.
+
+        The nested test reads ``$DF_PYTEST_SESSION_TOKEN`` at run time, so the
+        stamp carries the NESTED session's own token — the exact signature of a
+        test spawning a writer that forgot to redirect its clock. The run must
+        still end non-zero even though its only test passed.
+        """
+        result = _nested_run(tmp_path, scenario='own_token')
+        combined = result.stdout + result.stderr
+
+        assert result.returncode != 0, (
+            'a run that stamped a protected clock with its OWN session token '
+            f'exited 0 — the 3797 defence is disarmed. output={combined!r}'
+        )
+        assert '1 passed' in combined, combined
+        assert 'falsified a REAL deploy clock' in combined, combined
+
+    def test_a_real_redeploy_in_flight_does_not_buy_a_falsification_a_pass(
+        self, tmp_path: Path,
+    ) -> None:
+        """Both at once, end to end — the only construction that proves the RUN
+        exits non-zero while a genuine redeploy is in flight.
+
+        The nested test stamps the fleet clock as a real deploy would (empty
+        session token) and the fm clock with its OWN token, in
+        ``PROTECTED_DEPLOY_CLOCK_RELPATHS`` order. If the guard stops at the
+        first CHANGED clock it sees only the benign one, warns, and exits 0 —
+        so task 3797's defence would be disarmed for the whole 8h window after
+        every fleet redeploy, which is precisely the window this task's benign
+        downgrade is designed to serve.
+        """
+        result = _nested_run(tmp_path, scenario='external_plus_own_token')
+        combined = result.stdout + result.stderr
+
+        assert result.returncode != 0, (
+            'a real redeploy on the fleet clock masked a self-stamped '
+            'falsification of the fm clock and the run exited 0 — the benign '
+            f'downgrade is being applied per-clock, not per-run. output={combined!r}'
+        )
+        assert '1 passed' in combined, combined
+        assert 'falsified a REAL deploy clock' in combined, combined
+        # The BASENAME, for the same wrapping reason as the sibling assertions
+        # above: the failure must name the clock that was actually falsified.
+        assert Path(_FM_RELPATH).name in combined, combined
+
+
+# The sibling that used to reach into THIS module for the marker helper. Named
+# and located as constants so the guard below fails with a legible message
+# rather than a bare ModuleNotFoundError if the file is ever renamed.
+_SIBLING_MODULE_NAME = 'test_drain_process_leak_isolation'
+_SIBLING_PATH = Path(__file__).with_name(_SIBLING_MODULE_NAME + '.py')
+
+
+def _sibling_drain_module() -> ModuleType:
+    """The live ``test_drain_process_leak_isolation`` module object.
+
+    Preferred from ``sys.modules``, matched by ``__file__`` rather than by name:
+    pytest's ``--import-mode=importlib`` (set in the root ``addopts``) registers
+    a collected test module under a rootdir-derived dotted key, not under its
+    bare filename, so a name lookup would miss the module the session actually
+    loaded. Only when this file runs alone — the sibling never collected — is it
+    imported by name, which ``tests/scripts/conftest.py`` makes resolvable by
+    putting this directory on ``sys.path``.
+
+    A bare import, never an ``importorskip``: if the sibling stops importing,
+    this guard must say so loudly rather than skip.
+    """
+    for module in list(sys.modules.values()):
+        origin = getattr(module, '__file__', None)
+        if origin and Path(origin).resolve() == _SIBLING_PATH.resolve():
+            return module
+    return importlib.import_module(_SIBLING_MODULE_NAME)
+
+
+def test_fixture_marker_is_the_shared_one_not_a_local_copy() -> None:
+    """The fixture-marker helper must have exactly ONE definition (task 3960).
+
+    WHY A SECOND COPY IS THE DEFECT AND NOT A STYLE NIT. pytest's fixture marker
+    is PRIVATE and has already MOVED once: ``<=8.x`` hangs it off the decorated
+    function as ``_pytestfixturefunction``, while ``9.x`` wraps the function in a
+    ``FixtureFunctionDefinition`` carrying ``_fixture_function_marker``. Every
+    copy of the lookup is one more thing to update the next time it moves — and
+    a private-API pin that silently stops finding its target is worse than no
+    pin, because it still reads as coverage. The shared helper
+    ``df_pytest_isolation.fixture_marker`` is deliberately built to fail loudly
+    instead (``pytest.fail(..., pytrace=False)`` when it finds neither
+    spelling), so there is exactly one place to fix.
+
+    It also removes a test-module-imports-test-module coupling: the sibling
+    ``test_drain_process_leak_isolation`` reached into THIS module for the
+    helper, which only resolved because ``tests/scripts/conftest.py`` puts this
+    directory on ``sys.path`` — something pytest's ``--import-mode=importlib``
+    deliberately does not do.
+
+    MEASURED RED at base main ``23ce883356``: this module defined its own
+    ``_fixture_marker`` (with ``_MARKER_ATTRS`` beside it) and bound no
+    ``fixture_marker`` at all, and the sibling bound ``_fixture_marker`` via
+    ``from test_deploy_clock_isolation import _fixture_marker`` — so all three
+    assertions below failed.
+
+    ``tests/scripts/test_fleet_dir_isolation.py`` is the working reference for
+    the intended shape: it already imports ``fixture_marker`` from
+    ``df_pytest_isolation`` through the same preamble both these modules carry.
+    """
+    this_module = sys.modules[__name__]
+
+    # (a) This module resolves the SHARED symbol, by identity — not a same-named
+    # re-implementation, which would satisfy any weaker "is it callable" test.
+    resolved = getattr(this_module, 'fixture_marker', None)
+    assert resolved is df_pytest_isolation.fixture_marker, (
+        f'{__name__}.fixture_marker is {resolved!r}, not '
+        f'df_pytest_isolation.fixture_marker (task 3960) — import the shared '
+        f'helper into the existing `from df_pytest_isolation import (...)` '
+        f'block rather than re-implementing the private-API lookup here'
+    )
+
+    # (b) The two names the private copy occupied are GONE, so it cannot grow
+    # back beside the shared one and quietly become the one that gets called.
+    for name in ('_fixture_marker', '_MARKER_ATTRS'):
+        assert not hasattr(this_module, name), (
+            f'{__name__} still defines {name!r} (task 3960) — that is the '
+            f'private copy of the fixture-marker lookup; delete it and use '
+            f'df_pytest_isolation.fixture_marker / _FIXTURE_MARKER_ATTRS'
+        )
+
+    # (c) The sibling does not bind the private copy either — the cross-test-
+    # module import must not return. Reached through the live module object
+    # rather than by re-importing the name, so this tests what the session
+    # actually loaded.
+    sibling = _sibling_drain_module()
+    assert not hasattr(sibling, '_fixture_marker'), (
+        f'{_SIBLING_MODULE_NAME} binds _fixture_marker (task 3960) — that is '
+        f'either a second private copy or a `from {__name__} import '
+        f'_fixture_marker`, a test-module-imports-test-module coupling that '
+        f'only resolves because tests/scripts/conftest.py puts this directory '
+        f'on sys.path. Import df_pytest_isolation.fixture_marker there instead.'
+    )
+
+
+class TestALeaseOnlyChangeIsNeverReported:
+    """The behavioural half of the redirect-only split (task 4755 review fix).
+
+    ``scripts/restart-all-orchestrators.sh`` creates the lease at sweep start,
+    rewrites it per unit (``lease_set_current_unit``) and removes it on every
+    catchable exit path, in the MAIN checkout ``deploy_clock_guard_roots``
+    deliberately also watches. So a verify run whose session snapshot straddles
+    either end of a real sweep sees one of exactly three shapes -- REWRITTEN,
+    DELETED or CREATED -- and the lease carries no ``source``/``pytest_session``
+    provenance pair by design (a lease has no benign-external-write case at the
+    PRODUCER, which is a different question from whether a READER can attribute
+    one), so every shape would classify FALSIFIED and fail an innocent branch.
+
+    The non-masking property is pinned in the same class, mirroring
+    ``TestAFalsificationIsNeverMaskedByABenignChange``: an exclusion that could
+    hide a real falsification would be a worse defect than the one it fixes.
+    """
+
+    _LEASE_BODY = b'{"pid": 4242, "started_ts": 1787849070, "current_unit": "u"}'
+    _LEASE_BODY_AFTER = b'{"pid": 4242, "started_ts": 1787849070, "current_unit": "v"}'
+
+    def _report(
+        self, tmp_path: Path, before: dict[str, tuple[bytes, int] | None],
+    ) -> tuple[ClockVerdict, str] | None:
+        return deploy_clock_change_report(
+            before, deploy_clock_snapshot(tmp_path),
+            session_token=_THIS_SESSION, root=tmp_path,
+        )
+
+    def test_a_sweep_starting_mid_run_is_not_reported(self, tmp_path: Path) -> None:
+        """CREATED: the run began before the sweep did."""
+        before = deploy_clock_snapshot(tmp_path)
+        _write(tmp_path, FLEET_LEASE_RELPATH, self._LEASE_BODY)
+
+        assert self._report(tmp_path, before) is None
+
+    def test_a_sweep_advancing_mid_run_is_not_reported(self, tmp_path: Path) -> None:
+        """REWRITTEN: lease_set_current_unit fires once per unit, ~7 times."""
+        _write(tmp_path, FLEET_LEASE_RELPATH, self._LEASE_BODY)
+        before = deploy_clock_snapshot(tmp_path)
+        _write(tmp_path, FLEET_LEASE_RELPATH, self._LEASE_BODY_AFTER)
+
+        assert self._report(tmp_path, before) is None
+
+    def test_a_sweep_finishing_mid_run_is_not_reported(self, tmp_path: Path) -> None:
+        """DELETED: the EXIT trap's lease_release ran while the run was going.
+
+        The shape no provenance scheme could ever rescue: ``after`` is None, so
+        there is no body left to attribute.
+        """
+        _write(tmp_path, FLEET_LEASE_RELPATH, self._LEASE_BODY)
+        before = deploy_clock_snapshot(tmp_path)
+        (tmp_path / FLEET_LEASE_RELPATH).unlink()
+
+        assert self._report(tmp_path, before) is None
+
+    def test_the_exclusion_cannot_mask_a_falsified_clock(self, tmp_path: Path) -> None:
+        """A lease change in the SAME run must not swallow a real falsification.
+
+        The same non-masking property ``TestAFalsificationIsNeverMasked
+        ByABenignChange`` pins cross-clock: an exemption for one file is no
+        evidence at all about a different one.
+        """
+        _write(tmp_path, FLEET_LEASE_RELPATH, self._LEASE_BODY)
+        before = deploy_clock_snapshot(tmp_path)
+        (tmp_path / FLEET_LEASE_RELPATH).unlink()
+        _write(tmp_path, _FLEET_RELPATH, _stamp(token=_THIS_SESSION))
+
+        report = self._report(tmp_path, before)
+
+        assert report is not None, 'the lease exclusion masked a falsified clock'
+        verdict, message = report
+        assert verdict is ClockVerdict.FALSIFIED
+        assert str(tmp_path / _FLEET_RELPATH) in message, message

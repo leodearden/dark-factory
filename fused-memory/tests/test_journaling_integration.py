@@ -1,6 +1,7 @@
 """Integration tests verifying causation_id flows through all paths."""
 
 import asyncio
+import json
 import uuid
 from unittest.mock import AsyncMock, MagicMock
 
@@ -439,3 +440,100 @@ async def test_add_episode_journals_cancellation_as_failure(service, write_journ
     assert write_ops[0]['operation'] == 'add_episode'
     assert write_ops[0]['success'] == 0, 'an enqueue that never committed is not accepted'
     assert 'CancelledError' in (write_ops[0]['error'] or '')
+
+
+# ── task 3212: the SECOND copy of the search-telemetry shape ──────────
+#
+# MemoryService.search self-journals whenever causation_id is truthy — the
+# whole reconciliation read path.  Widening only the MCP tool would leave
+# every recon-path row unusable by leaf eta (3213) while LOOKING done, and
+# would leave two copies of one shape free to drift (INV-5).
+
+_LONG_QUERY = (
+    'what did reconciliation actually retrieve for this task event, and did the '
+    'agent that later wrote a near-duplicate memory ever see the canonical it '
+    'duplicated, across a query long enough that the old 200-character cut would '
+    'have discarded the half that carries the question ENDMARKER'
+)
+assert len(_LONG_QUERY) > 200, 'fixture must exceed the old 200-char truncation'
+
+
+def _mem0_hit(memory_id: str, memory: str, score: float) -> dict:
+    return {'id': memory_id, 'memory': memory, 'score': score, 'metadata': {}}
+
+
+@pytest.mark.asyncio
+async def test_write_journal_is_a_public_read_only_accessor(mock_config, write_journal):
+    """ContextAssembler must reach the journal without touching a private attribute."""
+    from _fm_helpers import install_identity_mocks
+
+    svc = MemoryService(mock_config)
+    svc.graphiti = MagicMock()
+    install_identity_mocks(svc.graphiti)
+
+    assert svc.write_journal is None, (
+        'An unwired service must report None so a caller can skip journalling '
+        f'rather than crash, got {svc.write_journal!r}. RED: accessor missing.'
+    )
+
+    svc.set_write_journal(write_journal)
+    assert svc.write_journal is write_journal, (
+        'The public accessor must return the journal wired by set_write_journal — '
+        'reaching across a package boundary into _write_journal is what this '
+        f'property exists to avoid. got {svc.write_journal!r}. RED: accessor missing.'
+    )
+
+
+@pytest.mark.asyncio
+async def test_causation_search_row_carries_the_widened_shape(service, write_journal):
+    """The recon read path must journal the SAME shape as the MCP tool."""
+    cid = str(uuid.uuid4())
+    service.mem0.search = AsyncMock(
+        return_value={
+            'results': [
+                _mem0_hit('mem0-aaa', 'the canonical body', 0.81),
+                _mem0_hit('mem0-bbb', 'a shorter body', 0.42),
+            ]
+        }
+    )
+
+    await service.search(query=_LONG_QUERY, project_id='test', causation_id=cid)
+
+    ops = await write_journal.get_ops_by_causation(cid)
+    rows = [o for o in ops if o.get('operation') == 'search']
+    assert len(rows) == 1, f'Expected one journalled search row, got {ops!r}'
+    summary = json.loads(rows[0]['result_summary'])
+    params = json.loads(rows[0]['params'])
+
+    entries = summary.get('results') or []
+    assert [e['id'] for e in entries] == ['mem0-aaa', 'mem0-bbb'], (
+        'The recon read path must record per-result IDs too — leaf eta reads these '
+        f'rows, not just the MCP ones. got {summary!r}. '
+        "RED: this copy of the shape is still {'count': N}."
+    )
+    assert [e['content_size'] for e in entries] == [
+        len('the canonical body'),
+        len('a shorter body'),
+    ], f'Per-result content sizes must be recorded, got {summary!r}. RED: not widened.'
+    assert all(e['relevance_score'] is not None for e in entries), (
+        f'Per-result relevance scores must be recorded, got {summary!r}. RED: not widened.'
+    )
+    assert summary.get('size_unit') == 'chars', (
+        f'The size unit must be NAMED on this row too, got {summary!r}. RED: not widened.'
+    )
+    assert 'failed_stores' in summary, (
+        'failed_stores was already recorded here and must SURVIVE the widening — a '
+        f'widening that drops a pre-existing fact is a regression. got {summary!r}.'
+    )
+    assert summary.get('degraded') is False, (
+        'The recon producer stamps degraded by the same rule as the other two, so a '
+        f'healthy row says so rather than staying silent. got {summary!r}.'
+    )
+    assert params.get('query') == _LONG_QUERY, (
+        'The full query must be journalled on the recon path as well, '
+        f'got {params.get("query")!r}. RED: still truncated at 200.'
+    )
+    assert params.get('query_truncated') is False, (
+        'The query bound is disclosed on this row too — one contract, three '
+        f'producers. got {params!r}.'
+    )

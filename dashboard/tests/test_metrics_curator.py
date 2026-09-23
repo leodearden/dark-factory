@@ -17,8 +17,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import aiosqlite
 import httpx
 import pytest
+from _dashboard_helpers import (
+    mcp_init_response,
+    mcp_notify_response,
+    mcp_tool_response,
+)
 
-from dashboard.app import _metrics_loop, _MetricsStore
 from dashboard.config import DashboardConfig
 from dashboard.data.db import DbPool
 from dashboard.data.metrics import (
@@ -26,6 +30,7 @@ from dashboard.data.metrics import (
     collect_metrics_snapshot,
     downsample_metrics,
 )
+from dashboard.loops import _metrics_loop, _MetricsStore
 
 # ---------------------------------------------------------------------------
 # Shared schemas (minimal for tests)
@@ -53,48 +58,6 @@ CREATE TABLE IF NOT EXISTS account_events (
 );
 """
 
-# ---------------------------------------------------------------------------
-# MCP mock helpers (mirrors test_memory.py pattern)
-# ---------------------------------------------------------------------------
-
-
-def _make_mcp_response(inner_dict: dict, request_id: int = 1) -> httpx.Response:
-    body = {
-        'jsonrpc': '2.0',
-        'id': request_id,
-        'result': {
-            'content': [
-                {'type': 'text', 'text': json.dumps(inner_dict)},
-            ],
-        },
-    }
-    return httpx.Response(
-        200,
-        json=body,
-        headers={'mcp-session-id': 'test-session-id'},
-    )
-
-
-def _make_init_response(request_id: int = 1) -> httpx.Response:
-    body = {
-        'jsonrpc': '2.0',
-        'id': request_id,
-        'result': {
-            'protocolVersion': '2025-03-26',
-            'capabilities': {'tools': {}},
-            'serverInfo': {'name': 'test', 'version': '0.1'},
-        },
-    }
-    return httpx.Response(
-        200,
-        json=body,
-        headers={'mcp-session-id': 'test-session-id'},
-    )
-
-
-def _make_notify_response() -> httpx.Response:
-    return httpx.Response(202, headers={'mcp-session-id': 'test-session-id'})
-
 
 class _ListTicketsHandler:
     """Mock MCP handler that returns a fixed count for list_tickets calls."""
@@ -110,13 +73,13 @@ class _ListTicketsHandler:
         request_id = body.get('id', 1)
 
         if method == 'initialize':
-            return _make_init_response(request_id)
+            return mcp_init_response(request_id)
         if method.startswith('notifications/'):
-            return _make_notify_response()
+            return mcp_notify_response()
 
         # tools/call
         self.calls.append(body)
-        return _make_mcp_response(
+        return mcp_tool_response(
             {'count': self.count, 'tickets': [], 'project_id': self.project_id},
             request_id,
         )
@@ -794,10 +757,17 @@ async def test_metrics_loop_passes_tickets_db_kwarg(tmp_path: Path):
     expected_conn = None
     loop_opened = False
     try:
-        with patch('dashboard.app.collect_metrics_snapshot', mock_collect):
+        with patch('dashboard.loops.collect_metrics_snapshot', mock_collect):
             # _metrics_loop calls _run_once() immediately before entering the
             # aligned-sleep loop.  We cancel the task once the event fires.
-            task = asyncio.create_task(_metrics_loop(metrics_store, mock_app))
+            task = asyncio.create_task(
+                _metrics_loop(
+                    metrics_store,
+                    mock_app,
+                    pool=pool,
+                    http_client=mock_app.state.http_client,
+                )
+            )
             try:
                 # 2 s is generous for a single fast AsyncMock _run_once() cycle.
                 await asyncio.wait_for(called_event.wait(), timeout=2.0)

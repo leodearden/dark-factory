@@ -5,43 +5,40 @@ without sys.path pollution — mirrors the pattern in test_audit_duplicate_tasks
 """
 from __future__ import annotations
 
-import importlib.util
+import asyncio
 import json
+import logging
 import sys
-import types
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _fm_helpers import load_script_module
+from _store_mutation_preflight_contract import (
+    SENTINEL,
+    deny,
+    fail_closed_records,
+    neutralise_fixture,
+)
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'cleanup_count_snapshots.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load cleanup_count_snapshots.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    @dataclass and other reflection-based decorators work correctly
-    (they call sys.modules.get(cls.__module__)).
-    """
-    mod_name = 'cleanup_count_snapshots'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='cleanup_count_snapshots')
 EdgeMatch = _mod.EdgeMatch
 EntityScanResult = _mod.EntityScanResult
+
+
+_neutralise = neutralise_fixture(
+    _mod,
+    note="""``run(..., apply=True)`` runs the preflight before it enumerates or
+    scans (task 4293). This suite is deliberately MOCK-unit (a
+    MagicMock/AsyncMock memory, no live Graphiti).
+    ``TestRunApplyStoreMutationPreflight`` re-rigs this per test -- to refuse,
+    to record, or to pass -- so the guard's own behaviour is still pinned
+    explicitly rather than assumed away.""",
+)
 
 
 # ===========================================================================
@@ -723,3 +720,196 @@ class TestRun:
         # stderr: non-empty, names the over-cap project
         assert captured.err.strip(), 'stderr should be non-empty on limit-cap abort'
         assert 'dark_factory' in captured.err
+
+
+# ===========================================================================
+# Tests: --apply store-mutation preflight
+# ===========================================================================
+
+class TestRunApplyStoreMutationPreflight:
+    """``--apply`` refuses to START when this process cannot write mem0's store.
+
+    Ported from ``test_sweep_toolcall_xml_leak.TestRunApplyStoreMutationPreflight``
+    (task 3686), which is the in-repo precedent for this contract.
+
+    ``apply_cleanup`` invalidates edges, writes an audit memory per edge and
+    refreshes entity summaries, each in a sequential loop with its OWN
+    best-effort ``except Exception``. ``StoreMutationUnavailable`` subclasses
+    ``RuntimeError``, so a probe inside any of those loops would be absorbed
+    into ``failed_invalidations`` / ``failed_refreshes`` rows -- and
+    ``update_edge`` invalidates the edge BEFORE its audit memory is written, so
+    each of those "failures" would be an already-invalidated edge with no
+    rollback record. Only a run-wide probe ahead of the scan bounds that.
+    """
+
+    def _make_memory(self):
+        """Mirror of ``TestRun._make_memory``, wired for a snapshot edge that
+        would drive all three mutations."""
+        m = MagicMock()
+        m.update_edge = AsyncMock(return_value=None)
+        m.add_memory = AsyncMock(return_value=None)
+        m.refresh_entity_summary = AsyncMock(return_value=None)
+        g = MagicMock()
+        g.list_entity_nodes = AsyncMock(return_value=[
+            _entity('e1', 'E1'),
+        ])
+        g.get_all_valid_edges = AsyncMock(return_value={
+            'e1': [{'uuid': 'snap-edge', 'fact': '1505 done / 148 cancelled', 'name': ''}],
+        })
+        m.graphiti = g
+        return m
+
+    def _args(self, apply=True, project_id='dark_factory'):
+        """Mirror of ``TestRun._args``."""
+        import argparse
+        return argparse.Namespace(
+            apply=apply,
+            project_id=project_id,
+            limit_per_project=1000,
+            yes_i_am_sure=False,
+        )
+
+    def _known_map(self, pid='dark_factory'):
+        return {pid: '/some/path'}
+
+    @pytest.mark.asyncio
+    async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
+        self, monkeypatch
+    ):
+        """The whole point: refuse to start rather than half-complete.
+
+        ALL THREE mutation entry points are asserted un-awaited, not just one:
+        each sits behind its own swallowing ``except Exception``, so a
+        zero-mutation claim covering only one of them would be vacuous.
+        """
+        deny(_mod, monkeypatch)
+        memory = self._make_memory()
+
+        with pytest.raises(
+            _mod.StoreMutationUnavailable, match=SENTINEL
+        ):
+            await _mod.run(
+                self._args(apply=True),
+                memory=memory,
+                known_projects_map=self._known_map(),
+            )
+
+        memory.update_edge.assert_not_awaited()
+        memory.add_memory.assert_not_awaited()
+        memory.refresh_entity_summary.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_guard_sits_before_every_backend_read(self, monkeypatch):
+        """It aborts without a single round-trip: neither the first-pass entity
+        enumeration nor the second-pass edge scan is paid for by a run that was
+        never going to be allowed to mutate."""
+        deny(_mod, monkeypatch)
+        memory = self._make_memory()
+
+        with pytest.raises(_mod.StoreMutationUnavailable):
+            await _mod.run(
+                self._args(apply=True),
+                memory=memory,
+                known_projects_map=self._known_map(),
+            )
+
+        memory.graphiti.list_entity_nodes.assert_not_awaited()
+        memory.graphiti.get_all_valid_edges.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_dry_run_is_never_gated_on_write_capability(self, monkeypatch):
+        """A read-only run mutates nothing, so it must not require the ability
+        to mutate -- the audit report stays obtainable from anywhere, with the
+        deny still installed."""
+        deny(_mod, monkeypatch)
+        memory = self._make_memory()
+
+        report = await _mod.run(
+            self._args(apply=False),
+            memory=memory,
+            known_projects_map=self._known_map(),
+        )
+
+        assert report['dry_run'] is True
+        assert not report.get('aborted')
+        memory.graphiti.list_entity_nodes.assert_awaited()
+        memory.graphiti.get_all_valid_edges.assert_awaited()
+        memory.update_edge.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_apply_is_unchanged_when_the_preflight_passes(self, monkeypatch):
+        """Happy path: a writable environment cleans up exactly as before."""
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+        memory = self._make_memory()
+
+        report = await _mod.run(
+            self._args(apply=True),
+            memory=memory,
+            known_projects_map=self._known_map(),
+        )
+
+        assert report['dry_run'] is False
+        assert memory.update_edge.await_count == 1
+        assert memory.add_memory.await_count == 1
+        assert memory.refresh_entity_summary.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_the_probe_names_the_operation_being_gated(self, monkeypatch):
+        """The refusal has to be attributable in a log, so the operation string
+        identifies this script and its mutating mode -- and it is probed once
+        for the RUN, not once per project or per edge."""
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            _mod, 'assert_store_mutation_allowed', lambda **kw: calls.append(kw)
+        )
+        memory = self._make_memory()
+
+        await _mod.run(
+            self._args(apply=True),
+            memory=memory,
+            known_projects_map=self._known_map(),
+        )
+
+        assert len(calls) == 1, 'probed ONCE per run, not once per edge'
+        assert 'cleanup_count_snapshots' in calls[0]['operation']
+        assert '--apply' in calls[0]['operation']
+
+    def test_the_refusal_is_loud_when_driven_through_main(self, monkeypatch, caplog):
+        """End-to-end surfacing through the real CLI entry point.
+
+        ``main`` has NO blanket ``except Exception``, so the refusal escapes
+        ``asyncio.run`` uncaught -- which is exactly why the guard site's own
+        ``logger.error`` must carry the fail-closed diagnosis before the raise.
+        Both halves are asserted: the refusal propagates out of ``main`` rather
+        than being converted into a 0 exit code, AND the journal an operator
+        reads carries the diagnosis.
+        """
+        deny(_mod, monkeypatch)
+        memory = self._make_memory()
+        monkeypatch.setattr(sys, 'argv', ['cleanup_count_snapshots.py', '--apply'])
+        real_asyncio_run = asyncio.run
+
+        def _drive(coro, *_a, **_kw):
+            coro.close()  # never construct the live MemoryService
+            return real_asyncio_run(
+                _mod.run(
+                    self._args(apply=True),
+                    memory=memory,
+                    known_projects_map=self._known_map(),
+                )
+            )
+
+        monkeypatch.setattr(_mod.asyncio, 'run', _drive)
+
+        with (
+            caplog.at_level(logging.ERROR),
+            pytest.raises(_mod.StoreMutationUnavailable),
+        ):
+            _mod.main()
+
+        assert fail_closed_records(caplog, 'cleanup_count_snapshots'), (
+            "main has no handler, so the traceback is all an operator gets "
+            'unless the guard site logs the fail-closed diagnosis itself; '
+            f'got: {[rec.getMessage() for rec in caplog.records]}'
+        )
+        memory.update_edge.assert_not_awaited()

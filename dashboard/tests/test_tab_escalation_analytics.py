@@ -7,218 +7,25 @@ TestClient-driven route test against the real FastAPI app.
 
 from __future__ import annotations
 
-import html.parser
 import json
 import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock
 
-import pytest
-from starlette.testclient import TestClient
-
-# ---------------------------------------------------------------------------
-# Module-scoped fixtures (static data.js content) — mirrors test_tab_escalations.py
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture(scope='module')
-def _client():
-    from dashboard.app import app
-
-    with TestClient(app) as c:
-        yield c
-
-
-@pytest.fixture(scope='module')
-def data_js_body(_client):
-    return _client.get('/static/redux/data.js').text
-
-
-@pytest.fixture(scope='module')
-def tab_analytics_jsx_body(_client):
-    return _client.get('/static/redux/tab_escalation_analytics.jsx').text
-
-
-@pytest.fixture(scope='module')
-def app_jsx_body(_client):
-    return _client.get('/static/redux/app.jsx').text
-
-
-@pytest.fixture(scope='module')
-def shell_jsx_body(_client):
-    return _client.get('/static/redux/shell.jsx').text
-
-
-@pytest.fixture(scope='module')
-def index_html_body(_client):
-    return _client.get('/static/redux/index.html').text
-
-
-@pytest.fixture(scope='module')
-def charts_jsx_body(_client):
-    return _client.get('/static/redux/charts.jsx').text
-
-
-# ---------------------------------------------------------------------------
-# Helper: extract a named seed block from window.DF_DATA (brace-aware).
-# Copied from test_tab_escalations.py — see that module for the full rationale
-# (brace-depth walk; does not skip braces inside JS string literals).
-# ---------------------------------------------------------------------------
-
-
-def _extract_df_data_block(src: str, key: str) -> str:
-    """Return the body of the ``<key>: { ... }`` seed object, braces included."""
-    m = re.search(rf'{re.escape(key)}\s*:\s*\{{', src)
-    if m is None:
-        return ''
-    start = m.end() - 1  # index of the opening `{`
-    depth = 0
-    for i in range(start, len(src)):
-        c = src[i]
-        if c == '{':
-            depth += 1
-        elif c == '}':
-            depth -= 1
-            if depth == 0:
-                return src[start : i + 1]
-    return ''
-
+from _dashboard_helpers import (
+    assert_script_loads_before,
+    extract_df_data_block,
+    extract_function_body,
+    find_script_position,
+)
 
 # ---------------------------------------------------------------------------
 # Helper: extract a named JS/JSX function body (brace-aware).
-# Copied from test_tab_escalations.py — scopes token-presence checks to a
+# Imported from `_dashboard_helpers` — scopes token-presence checks to a
 # specific function body rather than searching the entire file (which would
 # give false confidence when a token appears in an unrelated context).
 # ---------------------------------------------------------------------------
-
-
-def _extract_function_body(src: str, fn_name: str) -> str:
-    """Return the body block of a ``function <fn_name>(`` declaration, braces included.
-
-    Uses the same brace-depth walk as ``_extract_df_data_block``.  Only matches
-    named ``function`` declarations — not arrow functions or class methods.
-    Returns the empty string if the function is not found.
-
-    Paren-depth walks past the parameter list before looking for the body's
-    opening ``{`` — a destructured parameter (``function Foo({ a, b }) {``)
-    contains its own ``{``/``}`` pair *inside* the parameter list, so naively
-    taking the first ``{`` after the opening ``(`` would return just the
-    destructuring pattern (e.g. ``{ a, b }``) instead of the function body.
-    """
-    m = re.search(rf'\bfunction\s+{re.escape(fn_name)}\s*\(', src)
-    if m is None:
-        return ''
-    paren_depth = 1
-    i = m.end()
-    while i < len(src) and paren_depth > 0:
-        if src[i] == '(':
-            paren_depth += 1
-        elif src[i] == ')':
-            paren_depth -= 1
-        i += 1
-    if paren_depth != 0:
-        return ''
-    start = src.find('{', i)
-    if start == -1:
-        return ''
-    depth = 0
-    for j in range(start, len(src)):
-        c = src[j]
-        if c == '{':
-            depth += 1
-        elif c == '}':
-            depth -= 1
-            if depth == 0:
-                return src[start : j + 1]
-    return ''
-
-
-# ---------------------------------------------------------------------------
-# Load-order helpers (copied from test_tab_escalations.py / test_index_html.py)
-# ---------------------------------------------------------------------------
-
-
-class _ScriptTagCollector(html.parser.HTMLParser):
-    """Collects the attribute dicts for every <script> start-tag encountered."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.script_attrs: list[dict[str, str | None]] = []
-
-    def handle_starttag(
-        self, tag: str, attrs: list[tuple[str, str | None]]
-    ) -> None:
-        if tag == 'script':
-            self.script_attrs.append(dict(attrs))
-
-
-def _find_script_position(
-    body: str, src_prefix: str
-) -> tuple[int, dict[str, str | None]] | None:
-    """Return ``(index, attrs)`` for the first <script> tag whose ``src``
-    starts with ``src_prefix``, or ``None`` if no such tag exists.
-    """
-    collector = _ScriptTagCollector()
-    collector.feed(body)
-    for i, attrs in enumerate(collector.script_attrs):
-        if (attrs.get('src') or '').startswith(src_prefix):
-            return i, attrs
-    return None
-
-
-def _assert_script_loads_before(
-    body: str,
-    before_src_prefix: str,
-    after_src_prefix: str,
-    before_label: str,
-    after_label: str,
-    consumer_note: str = '',
-) -> None:
-    """Assert that the script for ``before_src_prefix`` loads BEFORE the
-    script for ``after_src_prefix`` in ``body``.  Combines a
-    defer/async/type=module false-pass guard with the document-order
-    position comparison.
-    """
-    before_result = _find_script_position(body, before_src_prefix)
-    assert before_result is not None, (
-        f'No <script src="{before_src_prefix}..."> tag found in index.html. '
-        f'{consumer_note}'
-    )
-    before_pos, before_attrs = before_result
-    before_src = before_attrs.get('src')
-
-    after_result = _find_script_position(body, after_src_prefix)
-    assert after_result is not None, (
-        f'<script src="{after_src_prefix}..."> not found in index.html — '
-        f'cannot verify load-order invariant for {before_label}.'
-    )
-    after_pos, after_attrs = after_result
-
-    # Both tags must be classic synchronous scripts — otherwise document order
-    # diverges from execution order and the position comparison below is moot.
-    for _label, _attrs in [
-        (before_label, before_attrs),
-        (after_label, after_attrs),
-    ]:
-        assert 'defer' not in _attrs, (
-            f'{_label} has a defer attribute; document order no longer implies '
-            f'execution order, so the load-order check below may give a false pass.'
-        )
-        assert 'async' not in _attrs, (
-            f'{_label} has an async attribute; document order no longer implies '
-            f'execution order, so the load-order check below may give a false pass.'
-        )
-        assert (_attrs.get('type') or '').lower() != 'module', (
-            f'{_label} has type="module"; ES modules are deferred by default, '
-            f'so document order no longer implies execution order.'
-        )
-
-    assert before_pos < after_pos, (
-        f'{before_label} (position {before_pos}, src={before_src!r}) must load '
-        f'BEFORE {after_label} (position {after_pos}). '
-        f'{consumer_note}'
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -248,7 +55,7 @@ def test_data_js_registers_escalation_analytics_endpoint(data_js_body: str) -> N
         'escalation-analytics must stay unwindowed (no ?window= query param) — the '
         'frontend windows client-side over samples/flow_daily (per the PRD).'
     )
-    seed_block = _extract_df_data_block(data_js_body, 'ESCALATION_ANALYTICS')
+    seed_block = extract_df_data_block(data_js_body, 'ESCALATION_ANALYTICS')
     assert seed_block, (
         'data.js does not contain an `ESCALATION_ANALYTICS: { ... }` seed block — '
         'add the initializer to the window.DF_DATA assignment so applyKey has '
@@ -598,10 +405,16 @@ class TestEscalationAnalyticsCacheability:
 # task 2659 (delta) — tab_escalation_analytics.jsx UI wiring
 # ---------------------------------------------------------------------------
 #
-# The fixtures/helpers above (tab_analytics_jsx_body, app_jsx_body,
-# shell_jsx_body, index_html_body, _extract_function_body,
-# _ScriptTagCollector, _find_script_position, _assert_script_loads_before)
-# were scaffolded in prereq-1; the tests below consume them.
+# The tests below consume the served-asset fixtures (tab_analytics_jsx_body,
+# app_jsx_body, shell_jsx_body, index_html_body) that now live in conftest.py
+# and `extract_function_body` from _dashboard_helpers (task 3549), plus the
+# load-order helpers `find_script_position` and `assert_script_loads_before`,
+# which are ALSO imported from _dashboard_helpers rather than defined here:
+# task 4881 retired the byte-identical copy this module and four others each
+# carried, together with the `ScriptTagCollector` those two parse with (which
+# is why it is not in this module's import list — nothing here calls it
+# directly).  Their contract lives in
+# test_jsx_source_helpers.py::TestScriptOrderHelpers.
 
 
 # ---------------------------------------------------------------------------
@@ -622,7 +435,7 @@ def test_tab_analytics_jsx_served_and_exports(_client) -> None:
     (f) fold state is persisted via useOpenSet( referencing 'df.open.escanalytics'.
 
     (d)-(f) are scoped to the extracted `EscalationAnalyticsTab` function body
-    via `_extract_function_body`, and (c)'s export check requires the actual
+    via `extract_function_body`, and (c)'s export check requires the actual
     `=` assignment syntax rather than a bare dotted-path substring — this
     file's own header comment mentions "window.DF_TABS.EscalationAnalyticsTab"
     in prose, so an unscoped raw substring check would still pass even if the
@@ -637,11 +450,7 @@ def test_tab_analytics_jsx_served_and_exports(_client) -> None:
         'tab_escalation_analytics.jsx does not define `function EscalationAnalyticsTab(` — '
         'the component must be declared as a named function for the export to work.'
     )
-    tab_body = _extract_function_body(body, 'EscalationAnalyticsTab')
-    assert tab_body, (
-        'Could not locate the `function EscalationAnalyticsTab(` body in '
-        'tab_escalation_analytics.jsx.'
-    )
+    tab_body = extract_function_body(body, 'EscalationAnalyticsTab')
     # Additive export — must NOT clobber window.DF_TABS = {...} and must assign
     # EscalationAnalyticsTab. Requires the assignment's `=` (not just the
     # dotted path) so a prose mention in a comment cannot satisfy the check.
@@ -709,7 +518,7 @@ def test_index_html_registers_tab_analytics_load_order(index_html_body: str) -> 
     _TAB_ANALYTICS_PREFIX = '/static/redux/tab_escalation_analytics.jsx'
 
     # (a) tab_escalation_analytics.jsx script tag must exist
-    result = _find_script_position(index_html_body, _TAB_ANALYTICS_PREFIX)
+    result = find_script_position(index_html_body, _TAB_ANALYTICS_PREFIX)
     assert result is not None, (
         f'No <script src="{_TAB_ANALYTICS_PREFIX}..."> tag found in index.html — '
         'add it after tab_escalations.jsx and before app.jsx.'
@@ -730,7 +539,7 @@ def test_index_html_registers_tab_analytics_load_order(index_html_body: str) -> 
     )
 
     # (b) Loads after data.js
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         '/static/redux/data.js',
         _TAB_ANALYTICS_PREFIX,
@@ -740,7 +549,7 @@ def test_index_html_registers_tab_analytics_load_order(index_html_body: str) -> 
     )
 
     # (c) Loads after shell.jsx
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         '/static/redux/shell.jsx',
         _TAB_ANALYTICS_PREFIX,
@@ -750,7 +559,7 @@ def test_index_html_registers_tab_analytics_load_order(index_html_body: str) -> 
     )
 
     # (d) Loads after tabs.jsx
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         '/static/redux/tabs.jsx',
         _TAB_ANALYTICS_PREFIX,
@@ -760,7 +569,7 @@ def test_index_html_registers_tab_analytics_load_order(index_html_body: str) -> 
     )
 
     # (e) Loads before app.jsx
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _TAB_ANALYTICS_PREFIX,
         '/static/redux/app.jsx',
@@ -889,11 +698,7 @@ def test_tab_analytics_window_toggle_and_crosscutting(tab_analytics_jsx_body: st
     body = tab_analytics_jsx_body
 
     # (a) Window toggle, scoped to EscalationAnalyticsTab's own body.
-    tab_body = _extract_function_body(body, 'EscalationAnalyticsTab')
-    assert tab_body, (
-        'Could not locate the `function EscalationAnalyticsTab(` body in '
-        'tab_escalation_analytics.jsx.'
-    )
+    tab_body = extract_function_body(body, 'EscalationAnalyticsTab')
     assert re.search(
         r"usePersistedState\(\s*['\"]df\.escanalytics\.window['\"]\s*,\s*['\"]28d['\"]\s*\)",
         tab_body,
@@ -923,8 +728,7 @@ def test_tab_analytics_window_toggle_and_crosscutting(tab_analytics_jsx_body: st
         'tab_escalation_analytics.jsx does not define `function windowCutoffDate(` — '
         'add the helper that computes the window cutoff relative to generated_at.'
     )
-    cutoff_body = _extract_function_body(body, 'windowCutoffDate')
-    assert cutoff_body, 'Could not locate the windowCutoffDate( function body.'
+    cutoff_body = extract_function_body(body, 'windowCutoffDate')
     assert 'generatedAt' in cutoff_body, (
         'windowCutoffDate does not reference its generatedAt parameter — the window '
         'cutoff must be anchored to the payload clock, not the browser clock.'
@@ -983,8 +787,7 @@ def test_tab_analytics_origin_panel(tab_analytics_jsx_body: str) -> None:
         'tab_escalation_analytics.jsx does not define `function OriginPanel(` — '
         'add the Origin panel component.'
     )
-    origin_body = _extract_function_body(body, 'OriginPanel')
-    assert origin_body, 'Could not locate the OriginPanel( function body.'
+    origin_body = extract_function_body(body, 'OriginPanel')
 
     # (a) StackedAreaChart over daily_by_source, long tail folded into 'other'.
     assert 'daily_by_source' in origin_body, (
@@ -1073,8 +876,7 @@ def test_tab_analytics_lifespan_panel(tab_analytics_jsx_body: str) -> None:
         'tab_escalation_analytics.jsx does not define `function LifespanPanel(` — '
         'add the Lifespan panel component.'
     )
-    lifespan_body = _extract_function_body(body, 'LifespanPanel')
-    assert lifespan_body, 'Could not locate the LifespanPanel( function body.'
+    lifespan_body = extract_function_body(body, 'LifespanPanel')
 
     # (a) StatTile percentiles keyed by level from percentiles_by_level.
     assert 'percentiles_by_level' in lifespan_body, (
@@ -1161,8 +963,7 @@ def test_tab_analytics_workflow_panel(tab_analytics_jsx_body: str) -> None:
         'tab_escalation_analytics.jsx does not define `function WorkflowPanel(` — '
         'add the Workflow panel component.'
     )
-    workflow_body = _extract_function_body(body, 'WorkflowPanel')
-    assert workflow_body, 'Could not locate the WorkflowPanel( function body.'
+    workflow_body = extract_function_body(body, 'WorkflowPanel')
 
     # (a) 100%-normalized StackedAreaChart of tier absorption from tier_weekly.
     assert 'tier_weekly' in workflow_body, (
@@ -1247,8 +1048,7 @@ def test_esc_per_done_chart_does_not_compact_its_series(tab_analytics_jsx_body: 
     values must come from the SAME row list, and that list must be the windowed
     rows themselves, not a filtered copy.
     """
-    workflow_body = _extract_function_body(tab_analytics_jsx_body, 'WorkflowPanel')
-    assert workflow_body, 'Could not locate the WorkflowPanel( function body.'
+    workflow_body = extract_function_body(tab_analytics_jsx_body, 'WorkflowPanel')
 
     filter_on_ratio = re.search(r'\.filter\([^)]*\bratio\b[^)]*\bnull\b', workflow_body)
     assert filter_on_ratio is None, (
@@ -1316,8 +1116,7 @@ def test_charts_jsx_padding_matches_analytics_marker_overlay(charts_jsx_body: st
     requiring charts.jsx to export anything.
     """
     for fn_name in ('LineChart', 'StackedAreaChart'):
-        fn_body = _extract_function_body(charts_jsx_body, fn_name)
-        assert fn_body, f'Could not locate the {fn_name}( function body in charts.jsx.'
+        fn_body = extract_function_body(charts_jsx_body, fn_name)
         assert re.search(r'padL\s*=\s*38\b', fn_body), (
             f'charts.jsx {fn_name} no longer declares padL = 38 — '
             'tab_escalation_analytics.jsx hardcodes _CHART_PAD_L = 38 for its '

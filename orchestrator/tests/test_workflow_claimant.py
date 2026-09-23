@@ -15,6 +15,7 @@ Covers:
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import dataclasses
 import os
@@ -24,9 +25,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import pydantic_spec
-from escalation.pins import PinReport, classify_pins
+from escalation.pins import PinReport, _norm_id, classify_pins
 from shared.task_claimant import compose_claimant_run_id
 
+import orchestrator.workflow as workflow_module
 from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import WorktreeInfo
 from orchestrator.task_ground_truth import ClaimantSource
@@ -323,38 +325,29 @@ def _resolve_plan_lock_claimant(wf: TaskWorkflow):
     Uses the claimant-absent task shape, which is the ONLY shape that reaches
     the plan.lock leg (a present db claimant wins outright).
 
-    FIXTURE-ONLY SYMLINK — read this before trusting the tests below.
+    NO FIXTURE BRIDGE — this is the production path end to end.
     ``TaskWorkflow`` builds its artifacts with
-    ``meta_root=_meta_root_for_worktree(...)`` (workflow.py:2384-2385), so
-    plan.lock lives in the ``.task-meta`` SIBLING, whereas
-    ``_resolve_live_claimant`` constructs a bare ``TaskArtifacts(worktree_path)``
-    and therefore reads ``<worktree>/.task/plan.lock``.  NOTHING in production
-    bridges those two paths: ``TaskArtifacts.ensure_lane_plan_symlink``
-    (artifacts.py:354-386) relocates ``plan.json`` ONLY — there is no
-    ``.task`` -> ``.task-meta`` compat shape for plan.lock, and ``_read_path``
-    has no new-then-old fallback (unlike ``Harness._resolve_recovery_artifact``).
-    The link below is manufactured HERE and nowhere else.
+    ``meta_root=_meta_root_for_worktree(self.worktree)`` (workflow.py), so
+    plan.lock lives in the ``.task-meta`` SIBLING, and
+    ``_resolve_live_claimant`` derives that same root through
+    ``TaskArtifacts.meta_root_for`` on the read side (task 4028).  Writer and
+    reader meet at one path with nothing manufactured in between.
 
-    So these tests prove the identity ALGEBRA — that one incarnation's
-    lock-derived and DB-stamped identities are the same string, and that the
-    result discriminates in the real ``classify_pins`` — NOT that the
-    composition branch is reachable on a real orchestrator run.  It is not:
-    the only plan.lock a real run can find at that path is a PRE-3563 legacy
-    lock with no ``run_id``, which resolves to the fail-safe ``run_id=None``,
-    so that leg is inert in production until the path gap closes.  The gap is
-    out of task 3563's scope (which normalises the identity SHAPE, not where
-    the lock is looked up) and is tracked as task 4262 (relocate the read),
-    with task 4028 tracking deletion of the leg if that is the ruling instead.
+    That is what gives these tests their reach.  Before 4028 the reader
+    constructed a bare ``TaskArtifacts(worktree_path)`` and looked under
+    ``<worktree>/.task``, so a ``.task`` -> ``.task-meta`` symlink had to be
+    forged HERE for the leg to see anything at all — and they proved only the
+    identity ALGEBRA, not that the composition branch was reachable on a real
+    orchestrator run.  It was not.  With the read repointed they now prove
+    both: that one incarnation's lock-derived and DB-stamped identities are
+    the same string, that the result discriminates in the real
+    ``classify_pins``, and that a real run can actually get there.  If the
+    repoint ever regresses, these go red rather than passing on a shim.
     """
     from orchestrator.task_ground_truth import TaskGroundTruth
 
     assert wf.artifacts is not None and wf.worktree is not None
     worktree = Path(wf.worktree)
-    legacy_lock = worktree / '.task' / 'plan.lock'
-    real_lock = wf.artifacts.root / 'plan.lock'
-    if real_lock != legacy_lock and not legacy_lock.exists():
-        legacy_lock.parent.mkdir(parents=True, exist_ok=True)
-        legacy_lock.symlink_to(real_lock)
 
     scheduler = MagicMock()
     # Not held in memory — signal 1 short-circuits to IN_MEMORY otherwise, and
@@ -481,3 +474,155 @@ async def test_resolved_plan_lock_identity_discriminates_live_from_dead_filers(
     assert _classify(live_id).queue_handoff == ('esc-303-1',)
     # A dead incarnation's L0 does not — nobody is left to consume it.
     assert _classify(dead_id).dead_l0 == ('esc-303-1',)
+
+
+# ---------------------------------------------------------------------------
+# task 3550: the FILING incarnation's identity
+# ---------------------------------------------------------------------------
+
+
+class TestFilingClaimantIdentity:
+    """``TaskWorkflow._filing_claimant_run_id`` — the identity stamped on
+    every ``Escalation`` this workflow files (task 3550).
+
+    Spec ``docs/task-escalation-state-spec.md`` S6 / ``escalation.pins``
+    Link 4: an L0 is a live handoff ONLY while the incarnation that FILED it
+    lives, judged by an EXACT whole-string comparison of the filed identity
+    against the live claimant.  The live claimant is read from the DB column
+    the dispatch stamp writes, so the filed identity has to be
+    byte-identical to that stamp or a live filer's own L0 classifies
+    ``dead_l0`` — the unsafe direction.  These tests pin that equality at the
+    source: one property, one expression, no second copy to drift.
+    """
+
+    @pytest.mark.asyncio
+    async def test_property_is_the_composed_identity(self, tmp_path: Path):
+        """The property is exactly compose_claimant_run_id(run_id, session, pid)."""
+        wf = _make_workflow(project_root=tmp_path, task_id='101', run_id='run-abc123')
+
+        assert wf._filing_claimant_run_id == compose_claimant_run_id(
+            'run-abc123', wf.session_id, os.getpid(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_property_is_byte_identical_to_the_db_dispatch_stamp(
+        self, tmp_path: Path,
+    ):
+        """The filed identity and the DB claimant stamp are the SAME string.
+
+        Link 4 compares them whole (``shared.task_claimant`` ships a composer
+        and deliberately no parser), so anything short of byte-identity —
+        a differing ``pid=`` suffix included — reads as a DIFFERENT
+        incarnation.
+        """
+        wf = _make_workflow(project_root=tmp_path, task_id='101', run_id='run-abc123')
+
+        await _setup(wf)
+        await wf._stop_claimant_heartbeat()
+
+        db_identity = wf.scheduler.set_task_status.call_args.kwargs['claimant_run_id']  # type: ignore[attr-defined]
+        assert wf._filing_claimant_run_id == db_identity
+
+    @pytest.mark.asyncio
+    async def test_property_passes_the_pins_shape_guard(self, tmp_path: Path):
+        """``escalation.pins._norm_id`` leaves the value untouched.
+
+        A value without the ``/pid=`` marker collapses to UNKNOWN inside
+        ``_norm_id`` and Link 4 then fails safe to pinning — the stamp would
+        be inert.  ``_norm_id(prop) == prop`` is the guard that the stamp is
+        actually COMPARABLE, not merely present.
+        """
+        wf = _make_workflow(project_root=tmp_path, task_id='101', run_id='run-abc123')
+
+        prop = wf._filing_claimant_run_id
+        assert _norm_id(prop) == prop
+
+    @pytest.mark.asyncio
+    async def test_a_real_workflow_filing_carries_the_identity_and_drives_link_4(
+        self, tmp_path: Path,
+    ):
+        """A REAL level-0 filing path stamps the identity, and pins acts on it.
+
+        ``_escalate_plan_overwrite`` is one of the six level-0 non-``info``
+        sites in ``workflow.py`` — the ones Link 4 actually governs.  Driving
+        it end to end and feeding the resulting record straight into
+        :func:`classify_pins` is the point of this whole task: the rule fires
+        on a PRODUCTION-shaped record, not only on a synthetic double.
+        """
+        wf = _make_workflow(project_root=tmp_path, task_id='404', run_id='run-abc123')
+
+        submitted: list[object] = []
+        queue = MagicMock()
+        queue.make_id = MagicMock(return_value='esc-404-1')
+        queue.submit = MagicMock(side_effect=submitted.append)
+        wf.escalation_queue = queue
+        wf.event_store = None
+        wf.artifacts = None
+
+        wf._escalate_plan_overwrite()
+
+        assert len(submitted) == 1
+        esc = submitted[0]
+        assert esc.filing_claimant_run_id == wf._filing_claimant_run_id  # type: ignore[attr-defined]
+        assert esc.level == 0 and esc.severity == 'blocking'  # type: ignore[attr-defined]
+
+        live_id = wf._filing_claimant_run_id
+        # The filing incarnation is still live — its handoff has a consumer.
+        assert classify_pins(
+            '404', [esc], live_claimant=True, live_claimant_id=live_id,  # type: ignore[list-item]
+        ).queue_handoff == ('esc-404-1',)
+        # A DIFFERENT incarnation holds the claim — differing pid only.
+        other_id = compose_claimant_run_id('run-abc123', wf.session_id, os.getpid() + 1)
+        assert other_id != live_id
+        assert classify_pins(
+            '404', [esc], live_claimant=True, live_claimant_id=other_id,  # type: ignore[list-item]
+        ).dead_l0 == ('esc-404-1',)
+
+
+def _escalation_call_sites(module_path: Path) -> list[ast.Call]:
+    """Every ``Escalation(...)`` construction in *module_path*.
+
+    MUST be ``ast``, never a regex: both ``workflow.py`` and ``harness.py``
+    carry docstring/comment prose mentioning ``Escalation(category=...,
+    summary=..., detail=...)``, which a regex would report as an unstamped
+    filing site.
+    """
+    tree = ast.parse(module_path.read_text(encoding='utf-8'))
+    return [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == 'Escalation'
+    ]
+
+
+class TestEveryWorkflowFilingSiteIsStamped:
+    """Structural tripwire: no ``Escalation(...)`` in ``workflow.py`` may omit
+    ``filing_claimant_run_id`` (task 3550).
+
+    A TOTAL rule on purpose, with no allowlist.  The field is load-bearing
+    only for level-0 non-``info`` records (``pins._classify_record`` Links
+    1/2/3/3b short-circuit above Link 4), so a minimal fix would stamp six of
+    the seventeen sites — but then a site whose level later flips to 0 would
+    silently lose the stamp, which is precisely how this defect arose.
+    Stamping everywhere is harmless, is useful provenance, and leaves nothing
+    to rot.
+    """
+
+    _MODULE = Path(workflow_module.__file__)
+
+    def test_all_escalation_constructions_pass_filing_claimant_run_id(self):
+        calls = _escalation_call_sites(self._MODULE)
+        # Baseline at the time of writing; a drop means sites moved out of
+        # this module and the tripwire's coverage silently shrank.
+        assert len(calls) >= 17, f'expected >=17 Escalation(...) sites, found {len(calls)}'
+
+        unstamped = [
+            node.lineno for node in calls
+            if not any(kw.arg == 'filing_claimant_run_id' for kw in node.keywords)
+        ]
+        assert not unstamped, (
+            f'{self._MODULE.name}: Escalation(...) without filing_claimant_run_id '
+            f'at lines {unstamped} — every filing site must stamp the filing '
+            f'incarnation (task 3550); use self._filing_claimant_run_id.'
+        )

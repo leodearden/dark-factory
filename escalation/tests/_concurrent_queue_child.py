@@ -17,6 +17,10 @@ op
     Operation to run.  One of:
     - ``add_members`` — calls ``add_members_to_l2(parent_id, [f'{prefix}-{i}'])``
       on each iteration.
+    - ``add_members_with_variant`` — as ``add_members``, but each call also
+      carries a DISTINCT pre-canonical ``root_cause`` spelling, so the parent
+      test can assert that ``root_cause_variants`` is union-preserving under
+      cross-process contention.
     - ``attach`` — calls ``attach_dedupe_child(parent_id, f'{prefix}-{i}')`` on
       each iteration.
     - ``make_id_submit`` — calls ``eid = queue.make_id(parent_id)`` (here
@@ -70,6 +74,14 @@ def main() -> None:
     if op == 'add_members':
         for i in range(count):
             queue.add_members_to_l2(parent_id, [f'{prefix}-{i}'])
+    elif op == 'add_members_with_variant':
+        # Same as ``add_members`` but each fold also carries a DISTINCT
+        # pre-canonical root_cause spelling, exercising the root_cause_variants
+        # accumulation under cross-process contention (task 3998).
+        for i in range(count):
+            queue.add_members_to_l2(
+                parent_id, [f'{prefix}-{i}'], root_cause=f'cause {prefix} {i}',
+            )
     elif op == 'attach':
         for i in range(count):
             queue.attach_dedupe_child(parent_id, f'{prefix}-{i}')

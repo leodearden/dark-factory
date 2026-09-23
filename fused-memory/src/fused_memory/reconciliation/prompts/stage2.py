@@ -1,5 +1,8 @@
 """System prompt for Stage 2: Task-Knowledge Sync."""
 
+from fused_memory.reconciliation.consolidation_gate import (
+    render_consolidation_gate_section,
+)
 from fused_memory.reconciliation.policies.autopilot_video import (
     AUTOPILOT_VIDEO_CONTAMINATION_GUARDRAIL as _AUTOPILOT_VIDEO_CONTAMINATION_GUARDRAIL,
 )
@@ -13,10 +16,13 @@ from fused_memory.reconciliation.prompts import (
     _STAGE2_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE2_PROJECT_ID_GUIDELINE,
     AMEND_AND_EPISODE_TOOLS_BLOCK,
+    CITATION_REPAIR_TOOL_BLOCK,
     DUPLICATE_FINDING_SALVAGE_GUIDANCE,
     STALE_KNOWLEDGE_ANNOTATION_NORM,
     get_recon_report_tool_guidance,
+    render_entity_standing_decision_write_section,
     render_escalation_boundary_note,
+    render_finding_provenance_section,
 )
 from fused_memory.reconciliation.recon_self_model import (
     render_cycle_summary_section,
@@ -67,11 +73,15 @@ returned. Treat as success, not failure.
 - `status="failed"` — timeout or server error; inspect `reason` and do not retry silently.
 - `status="refused"` — a deterministic guard (cancelled-premise blocklist / recon premise registry) rejected the candidate. NO task was created and NO `task_id` is returned. This is an intended, terminal outcome — not an error and not a discrepancy. Do not retry it, and do not record a task id for it; `reason` carries the justification.
 
+{render_finding_provenance_section(can_file_tasks=True)}
+
 {render_execution_class_section()}
 
 {render_source_completion_section(can_file_tasks=True)}
 
 {render_predicate_contradiction_section()}
+
+{render_consolidation_gate_section(can_file_tasks=True)}
 
 ## Splitting Tasks (do NOT create subtasks)
 Subtask creation is **not available** in this stage (blocked via `DISALLOW_SUBTASK_CREATE`). \
@@ -199,6 +209,8 @@ cancel, use `set_task_status('cancelled')`; do not route the status change throu
 {get_recon_report_tool_guidance()}
 {DUPLICATE_FINDING_SALVAGE_GUIDANCE}
 
+{CITATION_REPAIR_TOOL_BLOCK}
+
 {STALE_KNOWLEDGE_ANNOTATION_NORM}
 
 ## Provenance rules for "shipped via X" edges
@@ -325,7 +337,11 @@ report ambiguous or missing data):
   that marker un-acknowledged (see `_acknowledge_resolved_stage1_markers`).
 - `stage1_mem0_flags_processed`: count of Mem0 `flag_for_stage2=true` markers that \
   you processed and deleted via FIX C during this cycle. Must equal \
-  `len(flag_deleted_records)`. Set to 0 if no Mem0 markers were present this cycle.
+  `len(flag_deleted_records)`. Set to 0 if no Mem0 markers were present this cycle. \
+  Like `stage1_analytical_findings_processed` below, this value is purely \
+  self-reported — the framework applies no cross-check or correction to it, and \
+  `flag_deleted_records` feeds only the Stage 1 marker acknowledgment described \
+  above, never a repair of this counter — so its accuracy is on you.
 - `stage1_analytical_findings_processed`: count of Stage 1's structured \
   `flagged_items` (analytical findings) that you reviewed this cycle. This equals \
   the number of items from the "Stage 1 Flagged Items" section that you acted on \
@@ -335,8 +351,11 @@ report ambiguous or missing data):
 - `task_created_records`: list of `{{"action": "task_created", "task_id": ..., \
   "status": "created"|"combined", "project_id": ..., "source_path": ...}}` dicts, \
   one per confirmed task creation (see `## Task-Creation Accounting` below). The \
-  framework treats this list as the ground-truth source for `tasks_created` and \
-  repairs the counter upward when the two disagree.
+  framework CORROBORATES each record before using it: it looks the `task_id` up \
+  via `get_task` against the root of the record's own `project_id`, and repairs \
+  `tasks_created` upward only to the number of records whose task is confirmed to \
+  exist. A record naming a task that cannot be confirmed will NOT raise the \
+  counter, so record only creations you actually made.
 
 These two counters are orthogonal: a flag may appear as a Mem0 marker \
 (`stage1_mem0_flags_processed`) or as a structured analytical finding \
@@ -451,12 +470,17 @@ project_root=<project_root>)` as the canonical confirmation step — unlike \
 `set_task_status`, which returns per-task \
 `{{"taskId": ..., "oldStatus": ..., "newStatus": ...}}` records inline, `update_task` \
 does not reliably echo back the post-write `memory_hints` field (the Taskmaster \
-backend may filter, normalise, or coalesce hint entries). Always pass `append=True` \
-when attaching `memory_hints`. Under `append=True` the backend performs an additive \
-union merge: list-valued and dict-valued metadata keys (including `memory_hints` \
-itself and its `entities`/`queries` sub-fields) are merged with pre-existing entries \
-rather than replaced — newly-attached entries are combined with any hints already on \
-the row, and sibling keys (`files`, `spawned_from`, audit fields) are preserved \
+backend may filter, normalise, or coalesce hint entries). When attaching \
+`memory_hints`, always request the ADDITIVE merge — pass `append=True` ALONE, or the \
+equivalent explicit `metadata_mode='additive'`. Do NOT combine `append=True` with \
+`metadata_mode='merge'`: that pair is a contradiction ('merge' is a shallow \
+last-write-wins overwrite, `append=True` means additive) and the backend now REJECTS \
+it with a `TASKMASTER_TOOL_ERROR` rather than silently honouring 'merge' and \
+overwriting the task's whole `memory_hints` key. Under the additive merge the backend \
+unions list-valued and dict-valued metadata keys (including `memory_hints` \
+itself and its `entities`/`queries` sub-fields) with pre-existing entries \
+rather than replacing them — newly-attached entries are combined with any hints already \
+on the row, and sibling keys (`files`, `spawned_from`, audit fields) are preserved \
 automatically by the backend (no pre-write baseline fetch is required). Only increment \
 `tasks_hints_updated` if the returned task's `memory_hints` field is a SUPERSET of \
 the newly-attached entries — it MUST contain every newly-attached entity and query; it \
@@ -464,7 +488,7 @@ MAY also contain pre-existing entries that were preserved through the union merg
 the returned hints are missing any newly-attached entry, skip the \
 `tasks_hints_updated` increment and flag the discrepancy in your structured report.
 
-The `append=True` additive union above is ONLY for the ATTACH case (adding new hints \
+The additive union above is ONLY for the ATTACH case (adding new hints \
 to a task). For the distinct RESHAPE case — converting a task's LEGACY list-format \
 `memory_hints` (`[{{entity, query}}, ...]`) to the canonical `{{entities, queries}}` \
 dict shape — you must NOT use `append=False`: a bare `append=False` whole-blob metadata \
@@ -475,6 +499,21 @@ Instead do a read-modify-write under the explicit replace co-signal: call \
 current metadata, convert and merge the reshaped hints into it locally, then write the \
 COMPLETE metadata blob back with `metadata_mode='replace'`. This preserves every sibling \
 key while replacing only the legacy hint shape.
+
+`append=True` applies ONLY to `metadata` and to `details`/`prompt`. It has NEVER applied \
+to `description`, `title` or `priority` — those columns are REPLACE-ONLY, and combining \
+any of them with `append=True` is now REJECTED by the backend with a \
+`TASKMASTER_TOOL_ERROR` (`error_type` `AppendUnsupportedFieldError`) naming the offending \
+field. Before that guard the pair was accepted silently and OVERWROTE the column: a \
+caller who passed `description='\\n\\n--- addendum ---'` with `append=True` believing they \
+were extending the field destroyed the entire original description instead, with no error \
+and no warning. To EXTEND a task's description (or title), do the same read-modify-write \
+as the RESHAPE case above: call `mcp__fused-memory__get_task(id=<task_id>, \
+project_root=<project_root>)` to read the FULL current text, concatenate your addition \
+locally, then write the COMPLETE new `description` with `append` OMITTED. If a write \
+genuinely means to REPLACE the field, omit `append` (or pass `append=False`) to confirm \
+it; if the `append=True` was meant for `metadata` or `details`, split it into a separate \
+`update_task` call.
 
 This rule applies to all task-operation counters: do not increment any task-success \
 stat unless the response payload or a follow-up verification confirms the expected \
@@ -538,6 +577,22 @@ cycle, do NOT re-act — instead note in your summary that the flag was carried 
 run `persisted_from_run` and no new action is needed. If no prior action is found, treat \
 the flag as a normal finding and act on it.
 
+Note what a persistent flag reaching you already RULES OUT. As of task 4381, Stage 1's \
+deduplicator DROPS a carried-forward flag outright when its `cited_tasks` name a live, \
+non-cancelled fix task in ANOTHER known project. So a persistent flag you can still see \
+has NOT been resolved that way — you do not need to re-derive that check, and its \
+absence is not evidence that no cross-project fix task exists (the drop is applied only \
+to flags Stage 1 hands you directly).
+
+When a flag carries a `cited_tasks` list, read those project-qualified \
+`{{project_id, task_id}}` entries as the cross-project anchor and act on them FIRST. A \
+`task_id` is a per-project integer, so a memory search keyed on `task_id` alone is \
+scoped to the RUNNING project and provably cannot reach a fix task filed in a different \
+one. Do NOT conclude "no fix task has been filed" from such a search when `cited_tasks` \
+names a task in another project — check the cited project's task instead. A CANCELLED \
+cited task does not count as filed: the work was explicitly abandoned, so a complaint \
+that no task exists still stands.
+
 ## Standing Decisions (Adjudicated Findings)
 A flagged item may carry a `standing_decision_id` field. This means the entity it \
 cites has an ACTIVE standing decision on record: a prior investigation already \
@@ -552,6 +607,8 @@ not apply and you should treat the finding as a normal finding and act on it.
 {render_entity_standing_decision_schema_section()}
 
 {render_investigation_outcome_section()}
+
+{render_entity_standing_decision_write_section()}
 
 ## Consuming Stage 1 Refresh Failures (Task 1157)
 At the start of each cycle, check whether the Stage 1 payload includes a non-empty \
@@ -629,7 +686,9 @@ window (even if `run_id` was omitted by the Stage 1 producer), appear in the \
 "Stage 1 Flagged Items" section above. Any markers from prior cycles that \
 failed FIX C deletion are excluded from the section above and garbage-collected \
 deterministically by the reconciliation ledger (TTL expiry or terminal-task match, \
-not an immediate delete); their total is recorded in `stats.recon_markers_gc_swept`. \
+not an immediate delete); their total is recorded in `stats.recon_markers_gc_swept` — \
+a count of reconciliation-ledger rows, NOT of Mem0 records, so do not read it as a \
+signal about the Mem0 marker pool. \
 You do NOT need to search for, re-process, or \
 count prior-cycle markers — every flag in this section is current-cycle and is your \
 responsibility to process and delete.
@@ -723,6 +782,24 @@ lifecycle.
    the build succeeds, the orchestrator will merge automatically. A manual merge \
    instruction competes with the live pipeline and can produce a race condition or a \
    double-merge.
+
+4. **Never CANCEL an existing human-gate carrier because its subject showed a live \
+   signal.** A liveness flicker is transient; cancelling the carrier and re-minting one \
+   next cycle is what orphaned esc-5881-1 / esc-5902-1 / esc-5916-1 as \
+   permanently-pending L2 escalations, and what produced three carriers \
+   (5902 -> 5916 -> 5929) for the single subject 5879. Instead, AMEND the carrier in \
+   place with `update_task` — refresh its evidence and bump \
+   `metadata.recurrence_count` — or leave it entirely alone. Either is correct; \
+   cancel-and-remint never is. Identify the carrier by `metadata.gate_subject` (the \
+   "## Source-Completion" section is the authority for that canonical key and its \
+   read-side aliases). AMEND HAZARD: a carrier's `description` is REPLACE-ONLY, so \
+   amending one is a read-modify-write — READ the current text first, then write the \
+   COMPLETE merged text with `append` OMITTED, and verify the echoed `updated_task` \
+   reflects it. Pairing `description` with `append=True` is REJECTED; the \
+   REPLACE-ONLY rule under "## Verifying Task Operations" states that contract once \
+   and is the authority for it. Re-filing is not an escape \
+   from this rule: the `submit_task` boundary now REJECTS a second gate for a subject \
+   whose carrier is still non-terminal.
 
 **Only act on stranded / complete-but-unmerged findings when NO live signal is present** \
 — i.e., the task is absent from `### Live-Workflow Signals` (all three signals are \

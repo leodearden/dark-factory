@@ -34,6 +34,31 @@ This repo uses `ruff check` only; `ruff format` is deliberately NOT adopted
 and most files are not format-clean. Do not file or perform
 formatting-cleanup work — see `CONTRIBUTING.md` section 3 (task 3441).
 
+<!-- line-pin-policy:begin — mirrors CONTRIBUTING.md §2; pinned by
+     tests/scripts/test_line_pin_policy.py (markers + non-enforcement only,
+     never the wording). -->
+Cite cross-file references in comments and docstrings as
+`path/to/module.py::symbol`, never `module.py:1234`. The **428** existing
+bare line pins are **tolerated drift, not debt** — ~80% are already stale
+(hand-adjudicated n=49) and none has ever been shown to mislead a reader.
+**Do not file or perform pin-cleanup work, and do not escalate the
+population**; a task or escalation proposing a sweep is correctly closable
+as won't-fix. Fix a pin only in prose your own change introduces or edits.
+Nothing enforces this mechanically, by choice — see `CONTRIBUTING.md` §2
+(esc-3815-7).
+<!-- line-pin-policy:end -->
+
+## Code quality
+
+`docs/code-quality.md` is the single normative definition of code quality
+for this repo and for every project the factory operates: quality is the
+cost and risk of the next change, and here the next change is made by an
+agent; fourteen named heuristics with their agreed readings; comments as a
+clarity smell; tests reaching a module's internals as an interface smell.
+Review, refactor and PRD work cite those heuristics by name from that file.
+Do not restate them elsewhere (INV-9). The `CONTRIBUTING.md` §4 gates are
+the floor, not the bar.
+
 ## Prerequisites
 
 ```bash
@@ -48,6 +73,66 @@ cd fused-memory && uv sync
 ```
 
 Full fresh-machine walkthrough: `SETUP.md`.
+
+### Locating installed code
+
+The uv workspace has ONE root `.venv` per tree — `<project_root>/.venv` (CPython
+3.13.9, uv 0.11.6 in the main checkout). None of the seven workspace members
+carries its own. A task worktree gets an INDEPENDENT root `.venv`, not a share
+of main's, once it has been cold-verified — `verify_cold_preprovision_command`
+(`uv sync --all-packages && npm ci …`) runs *inside* the worktree, and such a
+venv can even be a different interpreter (measured: several `.worktrees/*/.venv` are CPython
+3.14.0 against main's 3.13.9). Before that it has no `.venv` at all. Meanwhile
+an agent Bash session typically inherits `VIRTUAL_ENV` and a bare `python` from
+the MAIN checkout's `.venv` even when cwd is a worktree.
+
+So the venv path is **not derivable from your cwd**. Ask the interpreter; never
+guess a path.
+
+<!-- package-source-lookup:begin
+     This command is EXECUTED verbatim by
+     tests/scripts/test_package_source_lookup_convention.py. Edit it into
+     anything that is not a `python -c` interpreter query and that guard goes
+     red — that is deliberate, and it is what keeps this recipe honest. -->
+- **Third-party package source**: `python -c 'import uvicorn, os; print(os.path.dirname(uvicorn.__file__))'`
+<!-- package-source-lookup:end -->
+
+That prints `<venv>/lib/python3.13/site-packages/uvicorn` in ~0.4s (measured
+0.396s); grep inside that directory for whatever you actually wanted.
+
+**Never `find /` for an installed package.** The scan this replaces —
+`find / -path '*/uvicorn/config.py'` — blew through the Bash tool's 120000ms
+default `timeout` and returned nothing (exit 143). That `timeout` can be raised,
+but raising it is the wrong fix: the scoped query above is ~300x faster.
+
+Third-party packages resolve under `<venv>/lib/python3.X/site-packages/`.
+First-party workspace members do NOT: they are installed **editable**, so they
+resolve into a checkout's `src/` tree instead. WHICH checkout is the question
+that matters — from a worktree shell that inherited main's `VIRTUAL_ENV`,
+`import <member>` hands you MAIN's source, not the code you just edited in your
+worktree. That inheritance is real for **your own Bash session and only there**
+— the orchestrator hands an agent subprocess a plain copy of its own environment
+(`orchestrator/src/orchestrator/agents/invoke.py`), `VIRTUAL_ENV` included. It is
+NOT how verify runs: every verify command is spawned through
+`orchestrator/src/orchestrator/verify.py::_target_subprocess_env`, which strips
+`VIRTUAL_ENV` and drops the venv's `bin` from `PATH` so the target resolves its
+OWN `.venv`. So a hand-run import in your shell can disagree with verify — when
+it does, verify is the one reading your worktree. That asymmetry is the mechanism
+behind the `OPERATIONS.md` Troubleshooting row for an agent reporting an
+`AttributeError` in its own shell for code it just wrote.
+
+<!-- import-provenance-check:begin
+     Also EXECUTED verbatim by
+     tests/scripts/test_package_source_lookup_convention.py, which asserts the
+     INVERSE of the check above: this one must resolve into a checkout's `src/`
+     tree, never under `site-packages`. -->
+- **First-party import provenance**: `python -c 'import shared; print(shared.__file__)'`
+<!-- import-provenance-check:end -->
+
+Any workspace member works; `shared` is used because it is the one member every
+`uv run --project shared` environment installs. A cold-verified worktree
+resolves to its OWN tree, an un-synced one to the main checkout — both are
+correct, and knowing which you are in is the whole point of asking.
 
 ## Memory Usage
 
@@ -67,7 +152,7 @@ Full fresh-machine walkthrough: `SETUP.md`.
 - **Decisions made** — immediately, don't wait until session end
 - **Conventions discovered** — coding patterns, naming rules, project norms
 - **Session end** — reflect and write observations, summaries of what was accomplished
-- **Before writing a gotcha-class `procedural_knowledge` entry** — `search()` first for existing coverage; if a near-duplicate already exists, consolidate into/update it instead of writing a new one. (`fused-memory/scripts/audit_duplicate_memories.py` is the automated backstop sweep for whatever slips through.) `add_memory` now ENFORCES this at write time: a `procedural_knowledge` write matching an existing entry at high similarity is soft-blocked; override with `metadata={'allow_near_duplicate': True}` only for genuinely distinct content.
+- **Before writing a gotcha-class `procedural_knowledge` or `preferences_and_norms` entry** — `search()` first for existing coverage; if a near-duplicate already exists, consolidate into/update it instead of writing a new one. (`fused-memory/scripts/audit_duplicate_memories.py` is the automated backstop sweep for whatever slips through.) `add_memory` now ENFORCES this at write time with two guards of different scope: (1) a deterministic topic-cluster guard covering BOTH categories, which soft-blocks content matching a known-contradictory topic cluster (error_type `ProceduralKnowledgeKnownTopicClusterWriteRejected`); and (2) a cosine near-duplicate guard that remains `procedural_knowledge`-only, which soft-blocks content matching an existing entry at high similarity. Both guards fire only on an explicit `category=` argument — a `category=None` write that auto-classifies to `procedural_knowledge` is covered by neither. Override either with `metadata={'allow_near_duplicate': True}` only for genuinely distinct content. Full statement: `fused-memory/src/fused_memory/server/tools.py::add_memory` docstring.
 
 ### Write operations
 
@@ -118,6 +203,35 @@ metadata vocabulary/census (Tier-A blessed keys, Tier-B canonical
 spellings, Tier-C `x_` namespace) — lives in **`docs/task-authoring.md`**.
 Consult it before authoring any of those fields; the shapes are
 validated at write time and a malformed spec is rejected.
+
+### Forensic reads of tasks.db
+
+Read-only sqlite against the live store is the right tool for FORENSICS —
+asking what the store says right now, mid-incident or mid-census. Operations
+still go through the MCP tools above; a direct write skips the reconciliation
+events the interceptor exists to emit.
+
+Two things about that store are not derivable from your cwd or your memory.
+WHERE it is: `.taskmaster/` is not tracked in git, so it exists only at the
+MAIN checkout and never inside your worktree — and the `.taskmaster/tasks.db`
+one directory above the real `.taskmaster/tasks/tasks.db` is a 0-byte decoy
+whose every query answers `no such table: tasks`. WHAT SHAPE it is: neither
+its columns (`no such column: created_at`) nor its value types (an INTEGER
+column hands you an `int`, so a string method on a task id raises
+`AttributeError`) survive being remembered. Ask the database; never guess.
+
+<!-- tasks-db-schema-lookup:begin
+     EXECUTED verbatim by tests/scripts/test_tasks_db_schema_convention.py.
+     Degrade it into a hand-written sqlite query and that guard goes red —
+     which is the point: the recipe stays certified to actually run. -->
+- **Task store shape**: `python scripts/tasks_db_schema.py`
+<!-- tasks-db-schema-lookup:end -->
+
+It resolves the live store from wherever you are standing (`--db` and
+`--project-root` override), prints every table with each column's declared
+type and the Python type its values arrive as, and refuses loudly rather than
+reporting an empty schema. It states no column names of its own, deliberately:
+the store is the only copy of them that cannot be stale.
 
 ## Model Routing
 
@@ -178,12 +292,24 @@ workflow: **`OPERATIONS.md` §"Config reload vs restart"** and
 Three deliberately orthogonal restart mechanisms act on the fleet:
 watchdog **liveness** probes (revive a wedged unit immediately, no clock),
 the watchdog **staleness** backstop and the merge-landed **coordinator**
-(both funnel through `scripts/restart-all-orchestrators.sh --drain` and
-share one 8h fleet-deploy clock). Don't conflate them when debugging a
+(both invoke `scripts/restart-all-orchestrators.sh` and read one 8h
+fleet-deploy clock). Don't conflate them when debugging a
 restart, and run `scripts/orchestrator-watchdog.py --report` (strictly
 read-only) before manually restarting anything. Full model, `--report`
 column reference, and the soak signal to watch:
 **`OPERATIONS.md` §"Fleet redeploy & watchdog"**.
+
+Two things that section used to claim, and that measurement disproved on
+2026-08-24/25: only the **staleness** tier passes `--drain` (the coordinator
+passes no arguments, so it restarts mid-merge units ungated), and the two
+tiers **can** both redeploy inside one 8h window — the clock is stamped only
+when a sweep completes, so a long sweep leaves it reading the previous deploy
+throughout. Tasks **4754** and **4755** have since closed this: a sweep now
+holds an in-flight lease that the backstop, the coordinator and (for its
+`current_unit` only) the liveness probe all honor. Two residuals remain — a
+sweep overrunning `orchestrator_restart_lease_max_age_secs` loses the lease
+and degrades to the old collision, and the fused-memory tier has no lease at
+all — so read `--report`'s `FLEET-LEASE:` line rather than assuming.
 
 ## Working in the main checkout
 
@@ -199,6 +325,15 @@ directly, not just interactive agents.
   `pyright skipped (no Python changes)` and is quick. When a commit does stage
   Python, pass `timeout: 300000` (or higher) to `Bash`, or run detached via
   `setsid` and poll, rather than letting the default timeout kill it mid-hook.
+- `git commit --only` holds `.git/index.lock` for that **entire** hook run,
+  and under a held lock `git stash create` fails silently (rc=1, empty
+  stdout *and* stderr). The merge worker therefore **stands off** for up to
+  `git.merge_park_lock_grace_seconds` (default 300s, matching the pre-commit
+  budget above) whenever `project_root` has main checked out and the index
+  lock is held: a docs-direct-commit-on-main now merely *delays* a merge
+  instead of halting the queue, and no operator rescue is needed for this
+  case. If the grace still expires, that one merge is blocked per-task (see
+  `park_lock_contended` in `OPERATIONS.md`) — the queue keeps running.
 - **Never** run `git stash` in **any** dark-factory checkout — `project_root`
   or a `.worktrees/<id>` task worktree. `refs/stash` is a single ref in the
   shared `.git` dir and is *not* per-worktree, so every checkout pushes onto

@@ -11,6 +11,7 @@ from shared.testing import make_gate_mock
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.reconciliation.agent_loop import (
+    CLI_WARNING_ORIGINS,
     AgentLoop,
     CircuitBreakerError,
     ToolDefinition,
@@ -432,6 +433,145 @@ async def test_no_tool_calls_ends_loop():
     result, entries = await agent.run('test')
     assert result.get('warning') == 'no_tool_calls'
     assert 'I am done thinking.' in result.get('text', '')
+
+
+def _no_tool_call_agent() -> AgentLoop:
+    """AgentLoop wired with one terminal tool, for no-tool-call exit tests."""
+    return AgentLoop(
+        config=_make_config(),
+        system_prompt='Test',
+        tools={
+            'stage_complete': ToolDefinition(
+                name='stage_complete',
+                description='Complete',
+                parameters={'type': 'object', 'properties': {}},
+                function=lambda **kw: kw,
+            ),
+        },
+        terminal_tool='stage_complete',
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'origin_token',
+    ['cli_output_empty', 'cli_output_unparseable'],
+)
+async def test_no_tool_calls_propagates_cli_warning_origin(origin_token):
+    """Task 4343: run() must surface the SPECIFIC CLI-failure origin.
+
+    _CLIResponseAdapter computes 'cli_output_empty' (the CLI returned nothing)
+    vs 'cli_output_unparseable' (the CLI returned junk) — different operator
+    responses — and today run() throws the distinction away, collapsing both
+    into the generic 'no_tool_calls'.
+
+    The generic token must stay UNCHANGED: extract_agent_verdict derives its
+    'agent-failed:<token>' sentinel from result['warning'], and
+    test_no_tool_calls_ends_loop pins it.  The origin travels in a separate,
+    additive key.
+    """
+    agent = _no_tool_call_agent()
+
+    async def mock_llm(messages, tool_schemas):
+        return _CLIResponseAdapter(
+            {'thinking': '', 'tool_calls': [], 'warning': origin_token},
+            session_id='sess-1',
+        )
+
+    agent._call_llm = mock_llm
+
+    result, _entries = await agent.run('test')
+
+    assert result.get('warning') == 'no_tool_calls', (
+        f"Expected the generic token to stay 'no_tool_calls' but got "
+        f'{result.get("warning")!r}'
+    )
+    assert result.get('warning_origin') == origin_token, (
+        f'Expected warning_origin={origin_token!r} but got '
+        f'{result.get("warning_origin")!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_tool_calls_without_origin_omits_warning_origin():
+    """Task 4343: the new key is strictly ADDITIVE and absent when unknown.
+
+    The anthropic and OpenAI adapters have no `.warning` attribute at all —
+    only _CLIResponseAdapter does.  run() must therefore read it defensively
+    and omit the key entirely rather than emitting an empty string that would
+    read like a measured value.  This is the backward-compatibility guard the
+    _CLIResponseAdapter docstring worried about.
+    """
+    agent = _no_tool_call_agent()
+
+    async def mock_llm(messages, tool_schemas):
+        return FakeResponse(content=[FakeText(text='I am done thinking.')])
+
+    agent._call_llm = mock_llm
+
+    result, _entries = await agent.run('test')
+
+    assert result.get('warning') == 'no_tool_calls'
+    assert 'warning_origin' not in result, (
+        f'Expected no warning_origin key when the response carries no origin, '
+        f'got {result.get("warning_origin")!r}'
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'agent_warning',
+    [
+        'i was unable to finish',   # agent-authored prose
+        'CLI_OUTPUT_EMPTY',         # near-miss on a real token
+        {'nested': 'dict'},         # non-str: would raise ValidationError downstream
+        17,
+    ],
+    ids=['prose', 'case_mismatch', 'dict', 'int'],
+)
+async def test_no_tool_calls_drops_unknown_warning_origin(agent_warning):
+    """Task 4343: warning_origin is a CLOSED vocabulary, not a passthrough.
+
+    _CLIResponseAdapter.warning is just structured_output['warning'], so on a
+    real turn it holds whatever the agent's own JSON put there — only
+    _call_llm_cli's synthesised dicts carry our tokens.  The value flows to
+    VerificationResult.failure_token and into the reconciliation.db audit row
+    operators GROUP BY, so an arbitrary string would pollute that census and a
+    non-str would raise ValidationError inside CodebaseVerifier.verify —
+    collapsing the diagnosis into a generic error row, the exact outcome this
+    task removes.  Unknown values are dropped; the generic 'no_tool_calls'
+    still travels in `warning`, so nothing is silently lost.
+    """
+    agent = _no_tool_call_agent()
+
+    async def mock_llm(messages, tool_schemas):
+        return _CLIResponseAdapter(
+            {'thinking': '', 'tool_calls': [], 'warning': agent_warning},
+            session_id='sess-1',
+        )
+
+    agent._call_llm = mock_llm
+
+    result, _entries = await agent.run('test')
+
+    assert result.get('warning') == 'no_tool_calls'
+    assert 'warning_origin' not in result, (
+        f'Expected an unrecognised warning {agent_warning!r} to be dropped, but '
+        f'warning_origin={result.get("warning_origin")!r} was propagated'
+    )
+
+
+def test_cli_warning_origins_matches_the_tokens_call_llm_cli_synthesises():
+    """The closed vocabulary must not drift from its only producer.
+
+    _call_llm_cli builds {'warning': 'cli_output_unparseable'} and
+    {'warning': 'cli_output_empty'} as literals; if either is renamed without
+    updating CLI_WARNING_ORIGINS, run() would silently start dropping a real
+    diagnosis.  Pin the set.
+    """
+    assert set(CLI_WARNING_ORIGINS) == {'cli_output_unparseable', 'cli_output_empty'}, (
+        f'CLI_WARNING_ORIGINS drifted from _call_llm_cli: {CLI_WARNING_ORIGINS!r}'
+    )
 
 
 # --- _OpenAIResponseAdapter tests ---
@@ -1283,6 +1423,160 @@ async def test_call_claude_cli_forwards_cwd_to_invoke_claude_agent(tmp_path):
     mock_agent.assert_called_once()
     call_kwargs = mock_agent.call_args.kwargs
     assert call_kwargs['cwd'] == Path(explore_root)
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_explicit_cwd_overrides_config_explore_root(tmp_path):
+    """An explicit `cwd=` wins over config.explore_codebase_root (task 4722, PRD D5).
+
+    The verifier now runs against the TASK's own project root, not the
+    process-global explore root, so AgentLoop must accept a per-instance cwd
+    and hand exactly that to invoke_with_cap_retry.
+
+    The `!=` assertion is not redundant: a regression that silently ignores the
+    parameter and keeps using the global root would still produce a Path, and
+    on an accidental path equality the positive assertion alone could pass.
+    Pinning the inequality against a deliberately DISTINCT global root makes
+    that failure mode loud.
+    """
+    from pathlib import Path
+
+    from shared.cli_invoke import AgentResult
+
+    global_root = tmp_path / 'global'
+    global_root.mkdir()
+    target = tmp_path / 'target'
+    target.mkdir()
+
+    config = _make_cli_config(explore_codebase_root=str(global_root))
+
+    fake_result = AgentResult(
+        success=True,
+        output='',
+        session_id='sess-cwd-explicit',
+        structured_output={'thinking': '', 'tool_calls': []},
+    )
+
+    with patch(
+        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+    ) as mock_invoke:
+        mock_invoke.return_value = fake_result
+
+        agent = AgentLoop(
+            config=config,
+            system_prompt='Test',
+            tools={},
+            usage_gate=make_gate_mock(),
+            cwd=target,
+        )
+
+        await agent._call_claude_cli(prompt='hi', tools=[])
+
+    mock_invoke.assert_called_once()
+    call_kwargs = mock_invoke.call_args.kwargs
+    assert call_kwargs['cwd'] == target
+    assert call_kwargs['cwd'] != Path(config.explore_codebase_root)
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_cwd_defaults_to_config_explore_root(tmp_path):
+    """Without an explicit cwd, AgentLoop falls back to config.explore_codebase_root.
+
+    PRD D5's "test compat" clause: `cwd` is optional precisely so this file's
+    ~28 existing construction sites keep working unchanged.  That is the
+    WHOLE blast radius — `AgentLoop(` has exactly ONE call site outside
+    tests, verify.py, and it always passes `cwd`.  The recon stages, the
+    judge harness and cli_stage_runner call `invoke_with_cap_retry` directly
+    and never construct an AgentLoop at all, so nothing in production depends
+    on this fallback and the default is in fact unreachable there.
+
+    This pins the fallback while those test sites still rely on it; a later
+    task can make `cwd` required outright once they pass it explicitly.
+    """
+    from pathlib import Path
+
+    from shared.cli_invoke import AgentResult
+
+    global_root = tmp_path / 'global'
+    global_root.mkdir()
+    config = _make_cli_config(explore_codebase_root=str(global_root))
+
+    fake_result = AgentResult(
+        success=True,
+        output='',
+        session_id='sess-cwd-default',
+        structured_output={'thinking': '', 'tool_calls': []},
+    )
+
+    with patch(
+        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+    ) as mock_invoke:
+        mock_invoke.return_value = fake_result
+
+        agent = AgentLoop(
+            config=config,
+            system_prompt='Test',
+            tools={},
+            usage_gate=make_gate_mock(),
+        )
+
+        await agent._call_claude_cli(prompt='hi', tools=[])
+
+    mock_invoke.assert_called_once()
+    call_kwargs = mock_invoke.call_args.kwargs
+    assert call_kwargs['cwd'] == Path(config.explore_codebase_root)
+
+
+@pytest.mark.asyncio
+async def test_explicit_cwd_survives_forwarding_to_invoke_claude_agent(tmp_path):
+    """The explicit cwd survives the kwargs-forwarding layer down to the CLI call.
+
+    Sibling of test_call_claude_cli_forwards_cwd_to_invoke_claude_agent, but
+    for the per-instance root: `usage_gate=None` takes invoke_with_cap_retry's
+    fast path so the REAL forwarding code runs, and ``autospec=True`` validates
+    every kwarg against the real invoke_claude_agent signature — a dropped or
+    misspelled kwarg raises TypeError here rather than in production.
+    """
+    from pathlib import Path
+
+    from shared.cli_invoke import AgentResult
+
+    global_root = tmp_path / 'global'
+    global_root.mkdir()
+    target = tmp_path / 'target'
+    target.mkdir()
+
+    config = _make_cli_config(explore_codebase_root=str(global_root))
+
+    fake_result = AgentResult(
+        success=True,
+        output='',
+        session_id='sess-cwd-fwd',
+        structured_output={'thinking': '', 'tool_calls': []},
+    )
+
+    with patch(
+        'shared.cli_invoke.invoke_claude_agent',
+        autospec=True,
+    ) as mock_agent:
+        mock_agent.return_value = fake_result
+
+        agent = AgentLoop(
+            config=config,
+            system_prompt='Test',
+            tools={},
+            usage_gate=None,  # fast path: real invoke_with_cap_retry, real forwarding
+            cwd=target,
+        )
+
+        await agent._call_claude_cli(prompt='hi', tools=[])
+
+    mock_agent.assert_called_once()
+    call_kwargs = mock_agent.call_args.kwargs
+    assert call_kwargs['cwd'] == target
+    assert call_kwargs['cwd'] != Path(config.explore_codebase_root)
 
 
 @pytest.mark.asyncio

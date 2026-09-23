@@ -19,13 +19,17 @@ workflow_cancel_recent) are covered separately (step-07/08).
 
 import asyncio
 import contextlib
+import json
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from escalation.models import Escalation
 
 from orchestrator.config import OrchestratorConfig
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.harness import Harness
 from orchestrator.scheduler import _CONTINUE, Scheduler, TickContext
 
@@ -551,3 +555,971 @@ class TestStartEscalationServerInjectsSchedulerEscalationQueue:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+
+
+# ---------------------------------------------------------------------------
+# Task 3535 (PRD task beta, D5) — STRUCTURED EMISSION at this veto site.
+#
+# Until now the open-escalation veto below was a BARE ``continue``: a blocked
+# task could sit un-redispatched for weeks and the journal said nothing about
+# which record was holding it.  These tests pin the emission half.
+#
+# The whole point of this task is EMISSION BEFORE BEHAVIOR, so every class
+# here carries a disposition assertion alongside its event assertion: the set
+# of blocked -> pending flips must be byte-identical to what it was before a
+# single event row existed.  The canonical WHY lives in
+# ``orchestrator.recovery_emission``'s module docstring; it is not restated
+# here or at the call site.
+# ---------------------------------------------------------------------------
+
+def _esc(
+    esc_id: str,
+    *,
+    task_id: str = 'T1',
+    severity: str = 'blocking',
+    level: int = 1,
+    category: str = 'infra_issue',
+    secs_ago: float = 120.0,
+) -> Escalation:
+    """A REAL ``Escalation`` row — the shape ``get_by_task`` actually returns.
+
+    Real rather than a stub so ``classify_pins`` reads the genuine
+    severity/level/filing-identity surface, and so the age helper is exercised
+    against the real ``timestamp`` field name (``Escalation`` carries
+    ``timestamp``; the emitter reads ``created_at``, so the scheduler must
+    normalise — a mismatch there would silently null every age).
+
+    ``level`` DEFAULTS TO 1 since task 3541.  It was 0 while the veto was a
+    bare ``bool(rows)``, under which every level pinned identically.  Now an L0
+    read at this site is a DEAD_L0 — ``is_stranded_blocked`` already proved no
+    incarnation holds the task, so ``classify_pins`` link 4 proves the filer
+    dead — and deliberately does NOT pin.  Every fixture below that means "a
+    record that PINS" therefore needs a queue-backed handoff, which is what an
+    L1 is; the cases that are ABOUT the dead-L0 relaxation pass ``level=0``
+    explicitly.
+    """
+    return Escalation(
+        id=esc_id,
+        task_id=task_id,
+        agent_role='implementer',
+        severity=severity,
+        category=category,
+        summary=f'{esc_id} summary',
+        level=level,
+        timestamp=(FIXED_DT - timedelta(seconds=secs_ago)).isoformat(),
+    )
+
+
+class _RaisingEscalationQueue:
+    """``get_by_task`` RAISES — the store-unreadable third state.
+
+    Distinct from an empty return: collapsing the two would route a
+    genuinely-pinned strand into the flip branch (the esc-3163 lesson).
+    """
+
+    def __init__(self, exc: Exception | None = None):
+        self.exc = exc or OSError('escalation store is unreadable')
+        self.calls: list[str] = []
+
+    def get_by_task(self, task_id: str, status: str | None = None) -> list:
+        self.calls.append(task_id)
+        raise self.exc
+
+
+def _emitting_scheduler(tmp_path: Path, **config_overrides) -> Scheduler:
+    """``_make_scheduler`` plus a REAL EventStore on tmp_path.
+
+    Real (not a mock) so the payload's JSON round-trip through the store is
+    exercised — an unserialisable member would drop the whole row in
+    production and a MagicMock would happily accept it.
+    """
+    scheduler = _make_scheduler(**config_overrides)
+    scheduler.event_store = EventStore(tmp_path / 'runs.db', 'run-test')
+    return scheduler
+
+
+def _recovery_rows(scheduler: Scheduler) -> list[dict]:
+    """Every recovery event row, oldest first, ``data`` JSON-decoded."""
+    conn = sqlite3.connect(str(scheduler.event_store.db_path))  # type: ignore[union-attr]
+    try:
+        return [
+            {'task_id': tid, 'event_type': et, 'data': json.loads(raw or '{}')}
+            for tid, et, raw in conn.execute(
+                'SELECT task_id, event_type, data FROM events '
+                'WHERE event_type IN (?, ?) ORDER BY id',
+                (EventType.recovery_vetoed.value, EventType.recovery_left.value),
+            )
+        ]
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+class TestBlockedRedispatchVetoIsDescribed:
+    """(1) The open-escalation veto emits ``recovery_vetoed`` on first sight."""
+
+    async def test_veto_still_holds_the_task(self, tmp_path: Path):
+        """The disposition half, asserted FIRST: emission changes nothing."""
+        scheduler = _emitting_scheduler(tmp_path)
+        scheduler.escalation_queue = _FakeEscalationQueue(  # type: ignore[assignment]
+            {'T1': [_esc('esc-1')]},
+        )
+
+        result = await scheduler._phase_redispatch_stranded_blocked(
+            _ctx_with_done_dep(_blocked_task('T1')),
+        )
+
+        assert result is _CONTINUE
+        assert scheduler.set_task_status.await_count == 0, (  # type: ignore[attr-defined]
+            'an open escalation must still VETO the flip — emission is not a decision'
+        )
+
+    async def test_veto_emits_exactly_one_recovery_vetoed_row(self, tmp_path: Path):
+        scheduler = _emitting_scheduler(tmp_path)
+        scheduler.escalation_queue = _FakeEscalationQueue(  # type: ignore[assignment]
+            {'T1': [_esc('esc-1')]},
+        )
+
+        await scheduler._phase_redispatch_stranded_blocked(
+            _ctx_with_done_dep(_blocked_task('T1')),
+        )
+
+        rows = _recovery_rows(scheduler)
+        assert len(rows) == 1, f'expected exactly one row, got {rows}'
+        assert rows[0]['event_type'] == EventType.recovery_vetoed.value
+        assert rows[0]['task_id'] == 'T1', (
+            'task_id must be a first-class COLUMN so these rows stay joinable'
+        )
+
+    async def test_payload_names_the_site_and_the_reason(self, tmp_path: Path):
+        scheduler = _emitting_scheduler(tmp_path)
+        scheduler.escalation_queue = _FakeEscalationQueue(  # type: ignore[assignment]
+            {'T1': [_esc('esc-1')]},
+        )
+
+        await scheduler._phase_redispatch_stranded_blocked(
+            _ctx_with_done_dep(_blocked_task('T1')),
+        )
+
+        data = _recovery_rows(scheduler)[0]['data']
+        assert data['site'] == 'scheduler_blocked_redispatch'
+        assert data['reason'] == 'escalation_pinned'
+        assert data['store_unavailable'] is False
+        assert data['task_id'] == 'T1'
+        assert set(data) == {
+            'task_id', 'site', 'shape', 'reason', 'escalation_ids',
+            'ages_secs', 'measured_at', 'store_unavailable', 'streak',
+        }
+
+    async def test_payload_names_the_pinning_ids(self, tmp_path: Path):
+        """Both a pinning L1 and a dead L0 are NAMED — the bucketing is
+        descriptive here, never the veto answer (that stays ``bool(rows)``)."""
+        scheduler = _emitting_scheduler(tmp_path)
+        scheduler.escalation_queue = _FakeEscalationQueue(  # type: ignore[assignment]
+            {'T1': [_esc('esc-1', level=1), _esc('esc-2', level=0)]},
+        )
+
+        await scheduler._phase_redispatch_stranded_blocked(
+            _ctx_with_done_dep(_blocked_task('T1')),
+        )
+
+        buckets = _recovery_rows(scheduler)[0]['data']['escalation_ids']
+        assert buckets['queue_handoff'] == ['esc-1']
+        assert buckets['dead_l0'] == ['esc-2'], (
+            'no live claimant, so an L0 filed by a dead incarnation buckets dead_l0'
+        )
+        assert set(buckets) == {'dead_l0', 'queue_handoff', 'non_pinning'}
+
+    async def test_payload_ages_each_pinning_id_by_id(self, tmp_path: Path):
+        """``ages_secs`` is a MAPPING keyed by id — a parallel list would
+        mis-attribute an age the moment a consumer re-sorted the ids."""
+        scheduler = _emitting_scheduler(tmp_path)
+        scheduler.escalation_queue = _FakeEscalationQueue(  # type: ignore[assignment]
+            {'T1': [_esc('esc-1', secs_ago=120.0), _esc('esc-2', secs_ago=600.0)]},
+        )
+
+        await scheduler._phase_redispatch_stranded_blocked(
+            _ctx_with_done_dep(_blocked_task('T1')),
+        )
+
+        ages = _recovery_rows(scheduler)[0]['data']['ages_secs']
+        assert set(ages) == {'esc-1', 'esc-2'}
+        assert ages['esc-1'] is not None and ages['esc-1'] >= 100.0
+        assert ages['esc-2'] > ages['esc-1'], (
+            'the older record must age larger — the ages come from the real '
+            'row timestamps, not from position'
+        )
+
+    async def test_payload_names_the_shape_this_site_can_resolve(self, tmp_path: Path):
+        """The elements this phase KNOWS are stated; the branch state it does
+        not resolve renders ``unknown`` rather than being guessed."""
+        scheduler = _emitting_scheduler(tmp_path)
+        scheduler.escalation_queue = _FakeEscalationQueue(  # type: ignore[assignment]
+            {'T1': [_esc('esc-1')]},
+        )
+
+        await scheduler._phase_redispatch_stranded_blocked(
+            _ctx_with_done_dep(_blocked_task('T1')),
+        )
+
+        assert _recovery_rows(scheduler)[0]['data']['shape'] == (
+            'blocked|false|unknown|true|-'
+        )
+
+    async def test_payload_stamps_an_iso_utc_measured_at(self, tmp_path: Path):
+        scheduler = _emitting_scheduler(tmp_path)
+        scheduler.escalation_queue = _FakeEscalationQueue(  # type: ignore[assignment]
+            {'T1': [_esc('esc-1')]},
+        )
+
+        await scheduler._phase_redispatch_stranded_blocked(
+            _ctx_with_done_dep(_blocked_task('T1')),
+        )
+
+        measured_at = datetime.fromisoformat(
+            _recovery_rows(scheduler)[0]['data']['measured_at'],
+        )
+        assert measured_at.tzinfo is not None
+
+    async def test_a_healthy_flip_emits_nothing(self, tmp_path: Path):
+        """A task that is actually redispatched is not a hold — no row."""
+        scheduler = _emitting_scheduler(tmp_path)
+        scheduler.escalation_queue = _FakeEscalationQueue()  # type: ignore[assignment]
+
+        await scheduler._phase_redispatch_stranded_blocked(
+            _ctx_with_done_dep(_blocked_task('T1')),
+        )
+
+        scheduler.set_task_status.assert_awaited_once_with('T1', 'pending')  # type: ignore[attr-defined]
+        assert _recovery_rows(scheduler) == [], (
+            'an ACTION is not a hold — emitting here would bury the strands'
+        )
+
+    async def test_a_task_skipped_before_the_veto_emits_nothing(self, tmp_path: Path):
+        """A live-claimant / deterministic / cooldown skip never reaches the
+        veto, so it stays silent — those are the healthy majority."""
+        scheduler = _emitting_scheduler(tmp_path)
+        scheduler.escalation_queue = _FakeEscalationQueue(  # type: ignore[assignment]
+            {'T1': [_esc('esc-1')]},
+        )
+
+        await scheduler._phase_redispatch_stranded_blocked(
+            _ctx_with_done_dep(_deterministic_blocked_task('T1')),
+        )
+
+        assert _recovery_rows(scheduler) == []
+
+
+@pytest.mark.asyncio
+class TestBlockedRedispatchTickFrequencyGuard:
+    """(2) This phase runs per dispatch TICK, not per sweep.
+
+    Unconditional emission would append one SQLite row per tick per pinned
+    task, forever (INV-4).  Emission is signature-transition-gated instead.
+    """
+
+    async def test_repeat_ticks_with_an_identical_signature_emit_once(
+        self, tmp_path: Path,
+    ):
+        scheduler = _emitting_scheduler(tmp_path)
+        scheduler.escalation_queue = _FakeEscalationQueue(  # type: ignore[assignment]
+            {'T1': [_esc('esc-1')]},
+        )
+
+        for _ in range(2):
+            await scheduler._phase_redispatch_stranded_blocked(
+                _ctx_with_done_dep(_blocked_task('T1')),
+            )
+
+        assert len(_recovery_rows(scheduler)) == 1, (
+            'a quiet repeat of a hold already on record must not re-state it'
+        )
+
+    async def test_many_ticks_stay_bounded_not_one_row_per_tick(
+        self, tmp_path: Path,
+    ):
+        """Ten ticks produce TWO rows, not ten: the transition, plus the one
+        deliberate re-statement at the streak threshold crossing (the moment
+        a sweep-frequency site would have alarmed)."""
+        scheduler = _emitting_scheduler(tmp_path)
+        scheduler.escalation_queue = _FakeEscalationQueue(  # type: ignore[assignment]
+            {'T1': [_esc('esc-1')]},
+        )
+
+        for _ in range(10):
+            await scheduler._phase_redispatch_stranded_blocked(
+                _ctx_with_done_dep(_blocked_task('T1')),
+            )
+
+        rows = _recovery_rows(scheduler)
+        assert len(rows) == 2, f'expected transition + threshold crossing, got {rows}'
+        assert [r['data']['streak'] for r in rows] == [
+            1, scheduler.config.recovery_emission.veto_streak_threshold,
+        ]
+
+    async def test_a_changed_pinning_id_set_re_emits(self, tmp_path: Path):
+        """A DIFFERENT record holding the task is a new fact, not a repeat."""
+        scheduler = _emitting_scheduler(tmp_path)
+        queue = _FakeEscalationQueue({'T1': [_esc('esc-1')]})
+        scheduler.escalation_queue = queue  # type: ignore[assignment]
+
+        await scheduler._phase_redispatch_stranded_blocked(
+            _ctx_with_done_dep(_blocked_task('T1')),
+        )
+        queue._by_task['T1'] = [_esc('esc-1'), _esc('esc-2')]
+        await scheduler._phase_redispatch_stranded_blocked(
+            _ctx_with_done_dep(_blocked_task('T1')),
+        )
+
+        rows = _recovery_rows(scheduler)
+        assert len(rows) == 2
+        assert [r['data']['streak'] for r in rows] == [1, 1], (
+            'a changed signature RESTARTS the streak, so an alarm only ever '
+            'describes N genuinely identical holds'
+        )
+
+    async def test_two_pinned_tasks_keep_independent_streaks(self, tmp_path: Path):
+        scheduler = _emitting_scheduler(tmp_path)
+        scheduler.escalation_queue = _FakeEscalationQueue(  # type: ignore[assignment]
+            {'T1': [_esc('esc-1')], 'T2': [_esc('esc-2', task_id='T2')]},
+        )
+        dep = {'id': '9', 'status': 'done'}
+        t1, t2 = _blocked_task('T1'), _blocked_task('T2')
+        ctx = TickContext(
+            tasks=[dep, t1, t2],
+            status_map={'9': 'done'},
+            tasks_by_id={'9': dep, 'T1': t1, 'T2': t2},
+        )
+
+        await scheduler._phase_redispatch_stranded_blocked(ctx)
+
+        rows = _recovery_rows(scheduler)
+        assert {r['task_id'] for r in rows} == {'T1', 'T2'}
+        assert all(r['data']['streak'] == 1 for r in rows)
+
+
+@pytest.mark.asyncio
+class TestBlockedRedispatchStoreUnreadable:
+    """(3) A get_by_task that RAISES is the store-unreadable third state."""
+
+    async def test_read_failure_still_skips_the_task(self, tmp_path: Path):
+        """The disposition is IDENTICAL to today's broad ``except: continue``
+        — an unreadable store must never be read as "nothing holds it"."""
+        scheduler = _emitting_scheduler(tmp_path)
+        scheduler.escalation_queue = _RaisingEscalationQueue()  # type: ignore[assignment]
+
+        result = await scheduler._phase_redispatch_stranded_blocked(
+            _ctx_with_done_dep(_blocked_task('T1')),
+        )
+
+        assert result is _CONTINUE
+        assert scheduler.set_task_status.await_count == 0, (  # type: ignore[attr-defined]
+            'a task must NEVER be flipped to pending on an unreadable store'
+        )
+
+    async def test_read_failure_emits_recovery_left(self, tmp_path: Path):
+        scheduler = _emitting_scheduler(tmp_path)
+        scheduler.escalation_queue = _RaisingEscalationQueue()  # type: ignore[assignment]
+
+        await scheduler._phase_redispatch_stranded_blocked(
+            _ctx_with_done_dep(_blocked_task('T1')),
+        )
+
+        rows = _recovery_rows(scheduler)
+        assert len(rows) == 1, f'expected exactly one row, got {rows}'
+        assert rows[0]['event_type'] == EventType.recovery_left.value, (
+            'nothing was held back by a RECORD — the site could not read the store'
+        )
+        assert rows[0]['task_id'] == 'T1'
+        data = rows[0]['data']
+        assert data['reason'] == 'escalation_store_unavailable'
+        assert data['store_unavailable'] is True
+        assert data['site'] == 'scheduler_blocked_redispatch'
+        assert data['escalation_ids'] == {
+            'dead_l0': [], 'queue_handoff': [], 'non_pinning': [],
+        }
+
+    async def test_read_failure_does_not_collateral_strand_a_sibling(
+        self, tmp_path: Path,
+    ):
+        """The narrow read guard replaces the broad handler for this arm only
+        — a sibling sorted after the failing task is still swept."""
+        scheduler = _emitting_scheduler(tmp_path)
+
+        class _OneBadRead:
+            def get_by_task(self, task_id: str, status: str | None = None) -> list:
+                if task_id == 'T1':
+                    raise OSError('unreadable')
+                return []
+
+        scheduler.escalation_queue = _OneBadRead()  # type: ignore[assignment]
+        dep = {'id': '9', 'status': 'done'}
+        t1, t2 = _blocked_task('T1'), _blocked_task('T2')
+        ctx = TickContext(
+            tasks=[dep, t1, t2],
+            status_map={'9': 'done'},
+            tasks_by_id={'9': dep, 'T1': t1, 'T2': t2},
+        )
+
+        await scheduler._phase_redispatch_stranded_blocked(ctx)
+
+        scheduler.set_task_status.assert_awaited_once_with('T2', 'pending')  # type: ignore[attr-defined]
+
+    async def test_repeat_read_failures_stay_bounded(self, tmp_path: Path):
+        """A multi-day store outage must not become one row per tick either."""
+        scheduler = _emitting_scheduler(tmp_path)
+        scheduler.escalation_queue = _RaisingEscalationQueue()  # type: ignore[assignment]
+
+        for _ in range(2):
+            await scheduler._phase_redispatch_stranded_blocked(
+                _ctx_with_done_dep(_blocked_task('T1')),
+            )
+
+        assert len(_recovery_rows(scheduler)) == 1
+
+
+@pytest.mark.asyncio
+class TestBlockedRedispatchQueueAbsent:
+    """(4) No queue at all is a PROCESS-scoped fact, not a per-task one."""
+
+    async def test_queue_absent_emits_one_phase_scoped_row(self, tmp_path: Path):
+        scheduler = _emitting_scheduler(tmp_path)
+        scheduler.escalation_queue = None
+
+        result = await scheduler._phase_redispatch_stranded_blocked(
+            _ctx_with_done_dep(_blocked_task('T1')),
+        )
+
+        assert result is _CONTINUE
+        assert scheduler.set_task_status.await_count == 0, (  # type: ignore[attr-defined]
+            'without the queue this phase cannot verify "no open escalation", '
+            'so it must never flip'
+        )
+        rows = _recovery_rows(scheduler)
+        assert len(rows) == 1
+        assert rows[0]['event_type'] == EventType.recovery_left.value
+        assert rows[0]['task_id'] is None, (
+            'no single subject — the whole PHASE is degraded, not one task'
+        )
+        data = rows[0]['data']
+        assert data['task_id'] is None
+        assert data['reason'] == 'escalation_store_unavailable'
+        assert data['store_unavailable'] is True
+        assert data['site'] == 'scheduler_blocked_redispatch'
+
+    async def test_queue_absent_emits_once_per_process_not_per_tick(
+        self, tmp_path: Path,
+    ):
+        """A queue that is never wired would otherwise emit forever, on every
+        tick, for the life of the orchestrator."""
+        scheduler = _emitting_scheduler(tmp_path)
+        scheduler.escalation_queue = None
+
+        for _ in range(5):
+            await scheduler._phase_redispatch_stranded_blocked(
+                _ctx_with_done_dep(_blocked_task('T1')),
+            )
+
+        assert len(_recovery_rows(scheduler)) == 1
+
+    async def test_queue_absent_notice_re_arms_when_the_queue_comes_and_goes(
+        self, tmp_path: Path,
+    ):
+        """The Harness attribute-injects the queue AFTER the Scheduler is
+        built, so "absent" is a state the process genuinely leaves and can
+        re-enter — a latch that never re-arms would hide the second outage."""
+        scheduler = _emitting_scheduler(tmp_path)
+        scheduler.escalation_queue = None
+        await scheduler._phase_redispatch_stranded_blocked(
+            _ctx_with_done_dep(_blocked_task('T1')),
+        )
+
+        scheduler.escalation_queue = _FakeEscalationQueue()  # type: ignore[assignment]
+        await scheduler._phase_redispatch_stranded_blocked(
+            _ctx_with_done_dep(_blocked_task('T1')),
+        )
+
+        scheduler.escalation_queue = None
+        await scheduler._phase_redispatch_stranded_blocked(
+            _ctx_with_done_dep(_blocked_task('T2')),
+        )
+
+        assert len(_recovery_rows(scheduler)) == 2
+
+    async def test_disabled_sweep_emits_nothing(self, tmp_path: Path):
+        """The kill switch short-circuits BEFORE the queue check — an
+        operator who turned the sweep off is not running a degraded store."""
+        scheduler = _emitting_scheduler(
+            tmp_path, stranded_blocked_redispatch_enabled=False,
+        )
+        scheduler.escalation_queue = None
+
+        await scheduler._phase_redispatch_stranded_blocked(
+            _ctx_with_done_dep(_blocked_task('T1')),
+        )
+
+        assert _recovery_rows(scheduler) == []
+
+
+@pytest.mark.asyncio
+class TestBlockedRedispatchZeroDispositionChange:
+    """(5) The flip SET is identical with the emission kill switch on and off.
+
+    The EMISSION must never change a disposition.  Which records pin is a
+    separate question, owned by ``recovery_pins.records_pin_blocked_recovery``
+    and asserted in ``TestBlockedRedispatchConsumesTheSharedPredicate`` below;
+    this class only pins that turning the events off changes nothing.
+    """
+
+    async def test_an_info_severity_record_no_longer_vetoes(self, tmp_path: Path):
+        """PRD boundary #8 — the deliberate INVERSION of this test (task 3541).
+
+        It was written as the guard against a well-meaning refactor swapping
+        ``bool(rows)`` for ``PinReport.pins``, back when that swap was a real
+        disposition change nobody had signed off.  Task eta IS that sign-off:
+        an info record is an ANNOTATION, never a handoff, so it must not hold a
+        stranded task out of redispatch.  The payload already DESCRIBED it as
+        non-pinning while the veto stood — that measurable gap is what closes
+        here.
+        """
+        scheduler = _emitting_scheduler(tmp_path)
+        scheduler.escalation_queue = _FakeEscalationQueue(  # type: ignore[assignment]
+            {'T1': [_esc('esc-1', severity='info')]},
+        )
+
+        await scheduler._phase_redispatch_stranded_blocked(
+            _ctx_with_done_dep(_blocked_task('T1')),
+        )
+
+        scheduler.set_task_status.assert_awaited_once_with('T1', 'pending')  # type: ignore[attr-defined]
+        assert [
+            r for r in _recovery_rows(scheduler)
+            if r['data'].get('reason') == 'escalation_pinned'
+        ] == [], 'a redispatched task must not also be reported as pinned'
+
+    @pytest.mark.parametrize(
+        ('rows_by_task', 'expect_flip'),
+        [
+            pytest.param({}, True, id='no-open-records-flips'),
+            pytest.param(
+                {'T1': [_esc('esc-1', level=0)]}, True, id='dead-l0-flips',
+            ),
+            pytest.param(
+                {'T1': [_esc('esc-1', level=1)]}, False, id='l1-handoff-vetoes',
+            ),
+            pytest.param(
+                {'T1': [_esc('esc-1', severity='info')]}, True, id='info-flips',
+            ),
+        ],
+    )
+    async def test_flip_set_is_identical_with_emission_on_and_off(
+        self, tmp_path: Path, rows_by_task, expect_flip,
+    ):
+        outcomes = []
+        for enabled in (True, False):
+            scheduler = _emitting_scheduler(
+                tmp_path / f'on-{enabled}',
+                recovery_emission={'enabled': enabled},
+            )
+            scheduler.escalation_queue = _FakeEscalationQueue(  # type: ignore[assignment]
+                dict(rows_by_task),
+            )
+            await scheduler._phase_redispatch_stranded_blocked(
+                _ctx_with_done_dep(_blocked_task('T1')),
+            )
+            outcomes.append([
+                c.args for c in scheduler.set_task_status.await_args_list  # type: ignore[attr-defined]
+            ])
+            if not enabled:
+                assert _recovery_rows(scheduler) == [], (
+                    'the kill switch must silence the events'
+                )
+
+        assert outcomes[0] == outcomes[1], (
+            'emission changed a disposition — that is the one thing this task '
+            'may not do'
+        )
+        assert bool(outcomes[0]) is expect_flip
+
+    async def test_emission_failure_never_collateral_strands_a_sibling(
+        self, tmp_path: Path,
+    ):
+        """(6) The per-task isolation guard still wraps the emission path."""
+        scheduler = _emitting_scheduler(tmp_path)
+        scheduler.escalation_queue = _FakeEscalationQueue(  # type: ignore[assignment]
+            {'T1': [_esc('esc-1')]},
+        )
+        scheduler._emit_recovery_disposition = MagicMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError('telemetry exploded'),
+        )
+        dep = {'id': '9', 'status': 'done'}
+        t1, t2 = _blocked_task('T1'), _blocked_task('T2')
+        ctx = TickContext(
+            tasks=[dep, t1, t2],
+            status_map={'9': 'done'},
+            tasks_by_id={'9': dep, 'T1': t1, 'T2': t2},
+        )
+
+        result = await scheduler._phase_redispatch_stranded_blocked(ctx)
+
+        assert result is _CONTINUE
+        scheduler.set_task_status.assert_awaited_once_with('T2', 'pending')  # type: ignore[attr-defined]
+
+    async def test_no_event_store_is_a_silent_no_op(self, tmp_path: Path):
+        """Every disposition still lands with telemetry entirely absent."""
+        scheduler = _make_scheduler()
+        scheduler.event_store = None
+        scheduler.escalation_queue = _FakeEscalationQueue(  # type: ignore[assignment]
+            {'T1': [_esc('esc-1')]},
+        )
+
+        result = await scheduler._phase_redispatch_stranded_blocked(
+            _ctx_with_done_dep(_blocked_task('T1')),
+        )
+
+        assert result is _CONTINUE
+        assert scheduler.set_task_status.await_count == 0  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+class TestBlockedRedispatchReleasesItsVetoStreak:
+    """The phase pops its tracker entries at end of tick (amendment, cycle 1).
+
+    This site runs per dispatch TICK and charges no alarm, so its tracker
+    entries are pure footprint — and without a release edge a task vetoed here
+    once and then gone done would leave its entry behind for the life of the
+    process.  That is exactly the growth
+    ``RecoveryVetoStreakTracker.clear``'s docstring says the pop exists to
+    prevent, and the per-tick sites are where the loss would actually happen.
+    """
+
+    def _tracked(self, scheduler: Scheduler) -> list[tuple[str, str]]:
+        tracker = getattr(scheduler, '_recovery_veto_tracker', None)
+        return [] if tracker is None else list(tracker.tracked())
+
+    async def _tick(self, scheduler: Scheduler, task: dict) -> None:
+        await scheduler._phase_redispatch_stranded_blocked(
+            _ctx_with_done_dep(task),
+        )
+
+    async def test_a_hold_that_ends_pops_the_entry(self, tmp_path: Path):
+        scheduler = _emitting_scheduler(tmp_path)
+        queue = _FakeEscalationQueue({'T1': [_esc('esc-1')]})
+        scheduler.escalation_queue = queue  # type: ignore[assignment]
+
+        await self._tick(scheduler, _blocked_task('T1'))
+        assert self._tracked(scheduler) == [
+            ('scheduler_blocked_redispatch', 'T1'),
+        ]
+
+        # The escalation is resolved: the task is no longer held, and this
+        # tick redispatches it instead.
+        queue._by_task['T1'] = []
+        await self._tick(scheduler, _blocked_task('T1'))
+
+        assert self._tracked(scheduler) == [], (
+            'a tick that described no hold for T1 must pop its streak'
+        )
+
+    async def test_a_task_that_leaves_the_candidate_set_pops_too(
+        self, tmp_path: Path,
+    ):
+        """The case a per-task 'the hold ended' signal can never deliver: the
+        task went done/cancelled, so this phase never looks at it again."""
+        scheduler = _emitting_scheduler(tmp_path)
+        scheduler.escalation_queue = _FakeEscalationQueue(  # type: ignore[assignment]
+            {'T1': [_esc('esc-1')]},
+        )
+
+        await self._tick(scheduler, _blocked_task('T1'))
+        assert self._tracked(scheduler)
+
+        # T1 is gone from ctx.tasks entirely; only an unrelated task remains.
+        await self._tick(scheduler, _blocked_task('T2'))
+
+        assert self._tracked(scheduler) == []
+
+    async def test_a_hold_that_returns_starts_a_fresh_streak(
+        self, tmp_path: Path,
+    ):
+        """The pop is a RELEASE, not a mute: the same hold reappearing is a
+        new fact and must announce itself again (streak back to 1)."""
+        scheduler = _emitting_scheduler(tmp_path)
+        queue = _FakeEscalationQueue({'T1': [_esc('esc-1')]})
+        scheduler.escalation_queue = queue  # type: ignore[assignment]
+
+        await self._tick(scheduler, _blocked_task('T1'))
+        queue._by_task['T1'] = []
+        await self._tick(scheduler, _blocked_task('T1'))
+        queue._by_task['T1'] = [_esc('esc-1')]
+        await self._tick(scheduler, _blocked_task('T1'))
+
+        rows = _recovery_rows(scheduler)
+        assert [r['data']['streak'] for r in rows] == [1, 1], (
+            f'a released-and-returned hold must re-announce at streak 1: {rows}'
+        )
+
+    async def test_an_isolated_exception_does_not_pop_the_entry(
+        self, tmp_path: Path,
+    ):
+        """The isolation guard means the phase never reached a verdict for
+        that task — popping would read as 'the hold ended', which is the
+        opposite of what an exception says."""
+        scheduler = _emitting_scheduler(tmp_path)
+        queue = _FakeEscalationQueue({'T1': [_esc('esc-1')]})
+        scheduler.escalation_queue = queue  # type: ignore[assignment]
+
+        await self._tick(scheduler, _blocked_task('T1'))
+        assert self._tracked(scheduler)
+
+        scheduler.escalation_queue = _RaisingEscalationQueue(  # type: ignore[assignment]
+            RuntimeError('boom'),
+        )
+        scheduler._emit_recovery_disposition = MagicMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError('boom'),
+        )
+        await self._tick(scheduler, _blocked_task('T1'))
+
+        assert self._tracked(scheduler) == [
+            ('scheduler_blocked_redispatch', 'T1'),
+        ], 'an unknown verdict must not be read as a released hold'
+
+    async def test_the_release_never_breaks_the_tick(self, tmp_path: Path):
+        """Bookkeeping is never load-bearing: a tracker that raises must not
+        abort a tick phase."""
+        scheduler = _emitting_scheduler(tmp_path)
+        scheduler.escalation_queue = _FakeEscalationQueue()  # type: ignore[assignment]
+        scheduler._recovery_veto_tracker = MagicMock()
+        scheduler._recovery_veto_tracker.tracked = MagicMock(
+            side_effect=RuntimeError('tracker is gone'),
+        )
+
+        await self._tick(scheduler, _blocked_task('T1'))
+
+        flip: AsyncMock = scheduler.set_task_status  # type: ignore[assignment]
+        flip.assert_awaited_once_with('T1', 'pending')
+
+
+# ---------------------------------------------------------------------------
+# task 3541 (eta) — THE NAMED DRIFT CLOSES HERE.
+#
+# This sweep and `Harness._reconcile_one_stranded`'s blocked arm decide the
+# SAME question — "do this blocked task's open records pin it against its
+# sweep-side remediation?" — and answered it differently.  The harness relaxed
+# on merge-remediable categories (PRD leaf δ); this sweep kept a bare
+# `bool(rows)`, because the relaxation was a private `Harness` staticmethod it
+# could not import.  Both now call `recovery_pins.records_pin_blocked_recovery`.
+#
+# The two mechanisms still TAKE different actions — the harness re-files or
+# marks done, this sweep re-pends.  What is unified is only the PREDICATE.
+# ---------------------------------------------------------------------------
+
+_REMEDIABLE = 'stranded_blocked'
+
+
+@pytest.mark.asyncio
+class TestBlockedRedispatchConsumesTheSharedPredicate:
+    """Every pin class and the category relaxation, at this site."""
+
+    @staticmethod
+    async def _drive(tmp_path: Path, rows: list) -> Scheduler:
+        scheduler = _emitting_scheduler(tmp_path)
+        scheduler.escalation_queue = _FakeEscalationQueue({'T1': list(rows)})  # type: ignore[assignment]
+        await scheduler._phase_redispatch_stranded_blocked(
+            _ctx_with_done_dep(_blocked_task('T1')),
+        )
+        return scheduler
+
+    @staticmethod
+    def _flipped(scheduler: Scheduler) -> bool:
+        return any(
+            c.args[:2] == ('T1', 'pending')
+            for c in scheduler.set_task_status.await_args_list  # type: ignore[attr-defined]
+        )
+
+    async def test_a_lone_stranded_blocked_l1_no_longer_vetoes(self, tmp_path: Path):
+        """THE relaxation this sweep was missing.
+
+        `stranded_blocked` is the reaper's OWN "please re-pend this task"
+        request, and this sweep performs exactly that re-pend.  Letting the
+        request veto its own remediation is the anti-synergy PRD leaf δ already
+        closed on the harness side.
+        """
+        scheduler = await self._drive(
+            tmp_path, [_esc('esc-1', category=_REMEDIABLE)],
+        )
+
+        assert self._flipped(scheduler)
+
+    async def test_a_task_failure_l1_still_vetoes(self, tmp_path: Path):
+        """A human-concern class names a problem re-pending does not fix."""
+        scheduler = await self._drive(
+            tmp_path, [_esc('esc-1', category='task_failure')],
+        )
+
+        assert not self._flipped(scheduler)
+        from orchestrator.recovery_emission import render_shape
+
+        rows = _recovery_rows(scheduler)
+        assert rows[0]['data']['reason'] == 'escalation_pinned'
+        assert rows[0]['data']['shape'] == render_shape(
+            'blocked', False, None, True, None,
+        ), 'the emitted shape is unchanged by the predicate rewiring'
+
+    async def test_a_mixed_record_set_still_vetoes(self, tmp_path: Path):
+        """`only_merge_remediable` is an `all(...)`, and that is load-bearing."""
+        scheduler = await self._drive(tmp_path, [
+            _esc('esc-1', category=_REMEDIABLE),
+            _esc('esc-2', category='task_failure'),
+        ])
+
+        assert not self._flipped(scheduler)
+
+    async def test_a_blocking_l0_no_longer_vetoes(self, tmp_path: Path):
+        """`live_claimant=False` is EXACT here, not assumed.
+
+        `is_stranded_blocked(task)` returned True immediately above the read,
+        so no incarnation holds this task and `classify_pins` link 4 reaches
+        its identity-independent branch: the filer is necessarily dead, and a
+        handoff with no consumer left must not pin.
+        """
+        scheduler = await self._drive(
+            tmp_path, [_esc('esc-1', level=0, category='task_failure')],
+        )
+
+        assert self._flipped(scheduler)
+
+    async def test_an_l2_still_vetoes(self, tmp_path: Path):
+        """Level != 0 is a supervised, queue-backed handoff at any severity."""
+        scheduler = await self._drive(
+            tmp_path, [_esc('esc-1', level=2, category='task_failure')],
+        )
+
+        assert not self._flipped(scheduler)
+
+    async def test_an_unreadable_store_still_skips_and_still_describes(
+        self, tmp_path: Path,
+    ):
+        """UNCHANGED — `records=None` never reaches the predicate here.
+
+        The `except` arm emits and `continue`s before the predicate is called,
+        which is why the shared function's always-pin-on-None branch is a
+        contract this site relies on but never exercises.
+        """
+        scheduler = _emitting_scheduler(tmp_path)
+        scheduler.escalation_queue = _RaisingEscalationQueue()  # type: ignore[assignment]
+
+        await scheduler._phase_redispatch_stranded_blocked(
+            _ctx_with_done_dep(_blocked_task('T1')),
+        )
+
+        assert not self._flipped(scheduler)
+        rows = _recovery_rows(scheduler)
+        assert rows[0]['data']['reason'] == 'escalation_store_unavailable'
+
+
+#: The six record shapes the two sites used to disagree about.
+_PARITY_FIXTURES = [
+    ('empty', []),
+    ('lone-remediable', [_esc('esc-1', category=_REMEDIABLE)]),
+    ('lone-human-concern', [_esc('esc-1', category='task_failure')]),
+    ('mixed', [
+        _esc('esc-1', category=_REMEDIABLE),
+        _esc('esc-2', category='task_failure'),
+    ]),
+    ('info-only', [_esc('esc-1', severity='info', category='task_failure')]),
+    ('dead-l0', [_esc('esc-1', level=0, category='task_failure')]),
+]
+_PARITY_IDS = [label for label, _ in _PARITY_FIXTURES]
+
+
+class TestBothSitesNameTheSamePredicate:
+    """Parity, asserted STRUCTURALLY — the half no fixture list can weaken.
+
+    A behavioural comparison only proves the two agreed on the cases it
+    happened to try; function IDENTITY makes disagreement impossible for ANY
+    input, which is what "the drift cannot silently reopen" requires.
+    """
+
+    def test_the_scheduler_imports_the_shared_predicate(self) -> None:
+        from orchestrator import recovery_pins
+        from orchestrator import scheduler as scheduler_mod
+
+        assert (
+            scheduler_mod.records_pin_blocked_recovery
+            is recovery_pins.records_pin_blocked_recovery
+        ), 'the scheduler must import the shared predicate, not keep a local copy'
+
+    def test_the_harness_adapter_wraps_the_shared_predicate(self) -> None:
+        from orchestrator import recovery_pins
+        from orchestrator import task_ground_truth as tgt
+
+        assert (
+            tgt.records_pin_blocked_recovery
+            is recovery_pins.records_pin_blocked_recovery
+        ), 'the harness reaches the same function through report_pins_blocked_recovery'
+
+
+@pytest.mark.asyncio
+class TestHarnessAndSchedulerCannotDriftAgain:
+    """THE parity signal, behavioural half: each side ACTS on that one answer.
+
+    Identity of the predicate (above) is not enough on its own — a site could
+    call it and then ignore the result.  These pin that the disposition each
+    mechanism reaches IS the shared answer, over the six record shapes the two
+    used to disagree about.
+    """
+
+    _FIXTURES = _PARITY_FIXTURES
+
+    @pytest.mark.parametrize('label,rows', _PARITY_FIXTURES, ids=_PARITY_IDS)
+    async def test_the_scheduler_acts_on_exactly_that_answer(
+        self, tmp_path: Path, label: str, rows: list,
+    ) -> None:
+        """The sweep flips iff the shared predicate says the records do NOT pin."""
+        from orchestrator.recovery_pins import records_pin_blocked_recovery
+
+        expected_pin = records_pin_blocked_recovery('T1', rows, live_claimant=False)
+
+        scheduler = _emitting_scheduler(tmp_path)
+        scheduler.escalation_queue = _FakeEscalationQueue({'T1': list(rows)})  # type: ignore[assignment]
+        await scheduler._phase_redispatch_stranded_blocked(
+            _ctx_with_done_dep(_blocked_task('T1')),
+        )
+
+        flipped = any(
+            c.args[:2] == ('T1', 'pending')
+            for c in scheduler.set_task_status.await_args_list  # type: ignore[attr-defined]
+        )
+        assert flipped is not expected_pin, label
+
+    @pytest.mark.parametrize('label,rows', _PARITY_FIXTURES, ids=_PARITY_IDS)
+    async def test_the_harness_adapter_returns_exactly_that_answer(
+        self, label: str, rows: list,
+    ) -> None:
+        """`report_pins_blocked_recovery` is the same answer, report-shaped.
+
+        The harness clauses all require `report.live_claimant is None`, which
+        is the same fact `is_stranded_blocked` establishes for the scheduler —
+        so the two sites pass EQUIVALENT arguments, not merely similar ones.
+        """
+        from orchestrator.recovery_pins import records_pin_blocked_recovery
+        from orchestrator.task_ground_truth import (
+            BranchState,
+            BranchStateKind,
+            TruthReport,
+            report_pins_blocked_recovery,
+        )
+
+        report = TruthReport(
+            db_status='blocked',
+            live_claimant=None,
+            branch_state=BranchState(BranchStateKind.ON_MAIN, 'a' * 40),
+            worktree_present=True,
+            open_escalations=list(rows),
+            deploy_phase=None,
+        )
+
+        assert report_pins_blocked_recovery(report) is records_pin_blocked_recovery(
+            'T1', rows, live_claimant=False,
+        ), label

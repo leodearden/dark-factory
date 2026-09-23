@@ -2,10 +2,10 @@
 # Scopes verification to escalation's own venv.
 
 # Verification commands
-test_command: "uv run --project escalation --directory escalation pytest tests/ --tb=short -q --timeout=300"
+test_command: "uv run --directory escalation pytest tests/ --tb=short -q --timeout=300"
 # bare-MagicMock config gate (also runs in merge-queue verify; see hooks/project-checks)
-lint_command: "uv run --project escalation --directory escalation ruff check src/ tests/ && python3 fused-memory/scripts/check_bare_magicmock_config.py escalation/tests"
-type_check_command: "uv run --project escalation --directory escalation pyright src/ tests/"
+lint_command: "uv run --directory escalation ruff check src/ tests/ && python3 fused-memory/scripts/check_bare_magicmock_config.py escalation/tests"
+type_check_command: "uv run --directory escalation pyright src/ tests/"
 
 # Per-module verify budget (task 3473). Before this, escalation declared
 # nothing here and fell HARD through to the repo-root whole-fleet ceiling —
@@ -38,7 +38,10 @@ type_check_command: "uv run --project escalation --directory escalation pyright 
 # BOUND on the production shape rather than a reproduction of it:
 # verify.run_full_verification asyncio.gathers over module_configs.values() —
 # NINE registered configs today, including the dominant `orchestrator` segment
-# measured at 1366.23s — so a full gather is materially heavier than what was
+# measured at 1366.23s (a pre-cap, 2026-07-31 figure in task 3062, superseded
+# by a heavier post-cap measurement in task 4902 — current canonical figure:
+# tests/scripts/test_fallback_verify_config.py::MEASURED_FLEET_SEGMENT_SECS,
+# key 'orchestrator') — so a full gather is materially heavier than what was
 # measured, and W under-states the fully-concurrent cost. Two uncredited
 # mechanisms bound the gap (verify_plan scoping, and the
 # shared.verify_admission slot gate whose wait falls outside the timeout

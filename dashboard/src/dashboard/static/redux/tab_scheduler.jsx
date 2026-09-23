@@ -364,6 +364,14 @@ function SchedulerTab() {
     offline_projects = [],
     paused = false,
     paused_projects = [],
+    // Recovery/strand sweep events (PRD task-escalation-state-graph D2/S6),
+    // shaped by redux_api.shape_scheduler.  `recovery_events` is the flat row
+    // list (each row already tagged with `project`); `recovery_event_counts`
+    // is {project: n}.  A project with 0 ANSWERED and had no sweeps; a project
+    // MISSING from the counts map is offline (see the offline banner below),
+    // never quiet — the two must not read the same.
+    recovery_events = [],
+    recovery_event_counts = {},
   } = sched;
 
   // Sub-tab: 'tasks' or 'modules'
@@ -402,9 +410,19 @@ function SchedulerTab() {
   const effectiveSelected = chipSelected !== null ? chipSelected : chipOptions;
 
   // Filter rows by chip selection (explicit: row visible iff !r.project or selection includes r.project)
-  const visibleRows = effectiveSelected.length === chipOptions.length || chipOptions.length === 0
-    ? rows
-    : rows.filter(r => !r.project || effectiveSelected.includes(r.project));
+  //
+  // Memoised so the array IDENTITY is stable between renders that changed
+  // nothing relevant — SchedulerHeatmap is a React.memo component, and an
+  // inline .filter() would hand it a fresh array on every one of App's 1 Hz
+  // clock ticks, defeating the memo entirely.  `chipOptions` is itself
+  // memoised and `chipSelected` is state, so `effectiveSelected` is
+  // referentially stable between ticks and this memo holds.
+  const visibleRows = stUseMemo(
+    () => (effectiveSelected.length === chipOptions.length || chipOptions.length === 0
+      ? rows
+      : rows.filter(r => !r.project || effectiveSelected.includes(r.project))),
+    [rows, effectiveSelected, chipOptions]
+  );
 
   // Filter modules by chip selection — same strict per-project predicate as visibleRows.
   // A module is visible iff:
@@ -414,9 +432,14 @@ function SchedulerTab() {
   // holder_project == project whenever a holder exists, making it redundant.
   // cellStateFor already returns 'not-in-set' for cross-project cells, so no genuine
   // cross-project conflict is hidden by this strictness.
-  const visibleModules = effectiveSelected.length === chipOptions.length || chipOptions.length === 0
-    ? modules
-    : modules.filter(m => !m.project || effectiveSelected.includes(m.project));
+  // Memoised for the same reason as visibleRows above; the predicate moves
+  // inside the callback verbatim.
+  const visibleModules = stUseMemo(
+    () => (effectiveSelected.length === chipOptions.length || chipOptions.length === 0
+      ? modules
+      : modules.filter(m => !m.project || effectiveSelected.includes(m.project))),
+    [modules, effectiveSelected, chipOptions]
+  );
 
   // ── Override submit ──
   const handleSubmitOverride = stUseCallback(async (body) => {
@@ -533,6 +556,21 @@ function SchedulerTab() {
 
   const snapshotLabel = snapshot_at ? `snapshot ${fmtDateTime(snapshot_at)}` : 'no snapshot';
 
+  // Recovery-sweep totals — read straight off the shaped payload.  Never
+  // re-derived by re-filtering events_by_task on the client: those sparklines
+  // are already narrowed to task_skipped, so a client-side derivation would
+  // always report zero sweeps no matter how many the sweep actually emitted.
+  const recoveryTotal = recovery_events.length;
+  const recoveryByType = recovery_events.reduce((acc, e) => {
+    const k = e.event_type || 'unknown';
+    acc[k] = (acc[k] || 0) + 1;
+    return acc;
+  }, {});
+  const recoveryHint = [
+    Object.entries(recovery_event_counts).map(([p, n]) => `${p}: ${n}`).join(', '),
+    Object.entries(recoveryByType).map(([t, n]) => `${t} ×${n}`).join(', '),
+  ].filter(Boolean).join(' — ');
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12, height: '100%', position: 'relative' }}>
 
@@ -567,6 +605,16 @@ function SchedulerTab() {
           </div>
         );
       })()}
+
+      {/* Recovery-sweep count — a count surface only, no new panel.  Sits
+           beside the existing event surfaces so a sweep that vetoed, left, or
+           converted a strand is visible at all; before this the dashboard
+           requested only task_skipped and every sweep row landed invisibly. */}
+      {recoveryTotal > 0 && (
+        <div className="badge info" style={{ padding: '6px 12px', fontSize: 11 }} title={recoveryHint}>
+          ⟳ {recoveryTotal} recovery sweep event{recoveryTotal !== 1 ? 's' : ''}
+        </div>
+      )}
 
       {/* Active-Pins strip */}
       <div className="panel" style={{ padding: '8px 12px' }}>

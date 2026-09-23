@@ -20,48 +20,32 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import errno
 import hashlib
-import importlib.util
 import json
+import os
 import random
 import re
+import subprocess
 import sys
 import types
 from pathlib import Path
 from typing import Any
 
 import pytest
-from _fm_helpers import falkor_skipif
+from _fm_helpers import falkor_skipif, load_script_module
+from shared.testing_streams import (
+    StdoutWithAFailingFlush,
+    StdoutWithAFailingWrite,
+    closed_pipe_stdout,
+)
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'local_memory_models_eval' / 'build_corpus.py'
 )
 
 
-def _load_module() -> types.ModuleType:
-    """Load build_corpus.py from its file path.
-
-    The module is registered in sys.modules under its name BEFORE
-    ``exec_module`` so that ``@dataclass`` and other reflection-based
-    decorators work correctly (they call ``sys.modules.get(cls.__module__)``),
-    and build_corpus.py defines frozen dataclasses. See the note at
-    test_memory_eval_retrieval_probe.py's copy of this helper.
-    """
-    mod_name = 'lme_build_corpus'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='lme_build_corpus')
 
 
 # ===========================================================================
@@ -1758,6 +1742,245 @@ class TestVerifyAttributesARecordParseFailureToTheStore:
         assert capsys.readouterr().err.strip()
 
 
+class TestVerifyAttributesADuplicateUuidToTheStore:
+    """A DUPLICATED store row is not a broken artifact either.
+
+    The second instance of the doctrine the sibling class above pins for the
+    window parse: ``verify_manifest`` answers two different questions with two
+    different mechanisms, so a defect in the manifest is a VERDICT
+    (``bad_manifest``, a documented exit code) and a defect in the store is a
+    FAILURE (a raised ``CorpusBuildError``, no verdict at all).
+
+    No manifest value can put the same node in FalkorDB twice, so a duplicate
+    uuid is unambiguously a store condition. Reporting it as ``bad_manifest``
+    hands the operator exit 5, whose documented remedy is "the artifact is
+    structurally unusable — re-derive, or investigate tampering": they go and
+    rebuild a corpus that was never wrong, while the duplicated node that
+    actually needs deleting stays put and unnamed.
+
+    The three controls pin the other half. ``select`` is handed two MANIFEST
+    values (``n`` and ``seed``) over a STORE-supplied population, so the clause
+    must be narrowed surgically rather than emptied.
+    """
+
+    def _duplicated(self):
+        """A good manifest plus a population that holds one record TWICE.
+
+        An EXISTING record is duplicated rather than a fresh uuid invented, so
+        the ``missing_episodes`` check does not short-circuit ahead of the
+        selection this class is about — the same reason the sibling class
+        preserves the uuid on its corrupted row.
+        """
+        population = _population(SYNTHETIC_CELLS)
+        manifest = _built(population=population)
+        return manifest, [*population, population[0]], population[0].uuid
+
+    def _past_the_cutoff(self, records):
+        """Re-date *records* past any cutoff a clean population can record.
+
+        ``build_manifest`` bounds the window at the population's own latest
+        ``created_at``, so a later instant is outside the recorded frame by
+        construction. uuids are left alone, so ``missing_episodes`` does not
+        fire ahead of the windowing these controls are about.
+        """
+        return [
+            dataclasses.replace(record, created_at='2027-01-16T12:00:00+00:00')
+            for record in records
+        ]
+
+    def test_a_duplicated_store_row_is_not_reported_as_a_bad_manifest(self):
+        """The failure propagates; it is not laundered into a verdict.
+
+        Both halves are asserted in one test because pytest's bare "DID NOT
+        RAISE" would not say WHICH verdict came back, and "it came back as
+        bad_manifest" is the exact regression this class exists to prevent.
+        """
+        manifest, duplicated, _ = self._duplicated()
+        with pytest.raises(_mod.CorpusBuildError):
+            report = _mod.verify_manifest(manifest, duplicated)
+            raise AssertionError(
+                f'a duplicated store row came back as a {report.status!r} verdict '
+                f'instead of raising'
+            )
+
+    def test_the_error_names_the_duplicated_episode(self):
+        """An operator cannot go and delete a node the message never identifies."""
+        manifest, duplicated, target = self._duplicated()
+        with pytest.raises(_mod.CorpusBuildError) as excinfo:
+            _mod.verify_manifest(manifest, duplicated)
+        assert target in str(excinfo.value)
+
+    def test_the_error_says_it_is_a_store_condition(self):
+        """Both halves of the pattern read identically to an operator.
+
+        The wording is the one ``_window_population`` already emits, so a
+        reader who has met one attribution meets the same sentence in the
+        other rather than having to infer that they mean the same thing.
+        """
+        manifest, duplicated, _ = self._duplicated()
+        with pytest.raises(_mod.CorpusBuildError) as excinfo:
+            _mod.verify_manifest(manifest, duplicated)
+        message = str(excinfo.value)
+        assert 'store condition' in message
+        assert 'not a defect in the manifest' in message
+
+    def test_an_emptied_window_is_still_a_bad_manifest(self):
+        """CONTROL: an empty sampling frame stays a verdict.
+
+        The emptied window is the degenerate limit of the shrunk window below
+        — the recorded bound no longer holds enough episodes to re-derive from
+        — so the two must not report different exit codes. Carving only the
+        zero case out would make the exit code discontinuous at the point the
+        shrink happens to reach zero.
+        """
+        population = _population(SYNTHETIC_CELLS)
+        manifest = _built(population=population)
+        report = _mod.verify_manifest(manifest, self._past_the_cutoff(population))
+        assert report.status == 'bad_manifest'
+        assert report.detail
+
+    def test_a_window_that_shrank_below_the_recorded_n_is_still_a_bad_manifest(self):
+        """CONTROL: the non-degenerate twin of the test above.
+
+        A recorded ``n`` the surviving frame cannot fill genuinely IS "cannot
+        re-derive from the recorded criteria", and reports on a MANIFEST value.
+        """
+        population = _population(SYNTHETIC_CELLS)
+        manifest = _built(n=20, population=population)
+        shrunk = [*population[:5], *self._past_the_cutoff(population[5:])]
+        report = _mod.verify_manifest(manifest, shrunk)
+        assert report.status == 'bad_manifest'
+        assert 're-derive' in report.detail
+
+    def test_a_duplicate_outside_the_recorded_window_does_not_block_the_verdict(self):
+        """The integrity check is scoped to the frame ``select`` actually sees.
+
+        A store defect that provably cannot change the answer must not deny
+        the operator one: these two rows are past the recorded bound, so they
+        were never in the sampling frame and the re-derivation is unaffected.
+        """
+        population = _population(SYNTHETIC_CELLS)
+        manifest = _built(population=population)
+        outside = self._past_the_cutoff(
+            [dataclasses.replace(population[0], uuid='ffffffff-0000-0000-0000-000000000000')] * 2
+        )
+        assert _mod.verify_manifest(manifest, [*population, *outside]).status == 'ok'
+
+    def _straddling(self, *, duplicate_first: bool):
+        """A MANIFEST-NAMED uuid held twice, once inside the window and once outside.
+
+        The outside copy carries DIFFERENT content, because that is what makes
+        "which copy won" observable at all: identical bytes hash the same and
+        the ambiguity stays invisible.
+        """
+        population = _population(SYNTHETIC_CELLS)
+        manifest = _built(population=population)
+        target = manifest['episodes'][0]['uuid']
+        straddling = dataclasses.replace(
+            next(record for record in population if record.uuid == target),
+            created_at='2027-01-16T12:00:00+00:00',
+            content='bytes that were never in the sampling frame',
+        )
+        rows = [straddling, *population] if duplicate_first else [*population, straddling]
+        return manifest, rows, target
+
+    @pytest.mark.parametrize('duplicate_first', [False, True])
+    def test_a_manifest_named_uuid_duplicated_across_the_cutoff_is_a_store_condition(
+        self, duplicate_first
+    ):
+        """Scoping the frame check to the window must not leave ``present`` reading a phantom.
+
+        The control above is right that a duplicate the sampling frame never
+        sees cannot change the RE-DERIVATION. But ``present`` — the lookup both
+        the missing check and the hash comparison read — is built from the FULL
+        population, deliberately, and a dict comprehension keeps whichever row
+        came LAST. So a manifest-named uuid held twice, once at or before the
+        recorded bound and once after it with different bytes, makes the hash
+        comparison hash a row that was never in the frame.
+
+        BOTH row orders are asserted, because the defect is precisely that the
+        answer depends on the order FalkorDB happened to return rows in — which
+        is not guaranteed. Measured before the fix: duplicate-last reported
+        ``hash_drift`` (exit 3, remedy "the episode bytes changed"), and
+        duplicate-first reported ``ok``, masking it. Either alone reads like a
+        stable verdict; the pair is what shows neither is.
+        """
+        manifest, rows, _ = self._straddling(duplicate_first=duplicate_first)
+        with pytest.raises(_mod.CorpusBuildError):
+            report = _mod.verify_manifest(manifest, rows)
+            raise AssertionError(
+                f'a uuid duplicated across the cutoff came back as a '
+                f'{report.status!r} verdict instead of raising'
+            )
+
+    def test_the_straddling_error_names_the_episode_and_the_culprit(self):
+        """Same two obligations as the in-window case, for the same reason.
+
+        The operator has to be told which node to delete, and told that the
+        artifact is not what needs fixing — so this half of the check emits the
+        identical sentence rather than a second wording of the same finding.
+        """
+        manifest, rows, target = self._straddling(duplicate_first=False)
+        with pytest.raises(_mod.CorpusBuildError) as excinfo:
+            _mod.verify_manifest(manifest, rows)
+        message = str(excinfo.value)
+        assert target in message
+        assert 'store condition' in message
+        assert 'not a defect in the manifest' in message
+
+    def test_verifying_derives_the_stratification_no_more_often_than_selecting_does(
+        self, monkeypatch
+    ):
+        """The attribution fix must not buy itself a second grouping pass.
+
+        Same argument as TestSelectGroupsThePopulationOnce, one call frame out:
+        ``_group_by_cell`` derives a ``stratum_key`` per record — an ISO-8601
+        parse plus a regex substitution each — and the ``--verify`` path already
+        pays that once inside ``select`` (and once more per row back in
+        ``fetch_population``). Reusing the whole grouper merely to borrow its
+        uniqueness rule would double it, and the waste is invisible in the
+        RESULT: every other test in this class would stay green. Hence a pin on
+        the call count, so the uniqueness rule stays a uuid scan.
+        """
+        calls: list[int] = []
+        real = _mod._group_by_cell
+
+        def counted(population):
+            calls.append(len(population))
+            return real(population)
+
+        population = _population(SYNTHETIC_CELLS)
+        manifest = _built(population=population)
+        monkeypatch.setattr(_mod, '_group_by_cell', counted)
+        assert _mod.verify_manifest(manifest, population).status == 'ok'
+        assert len(calls) == 1, f'grouped {len(calls)} times for one re-derivation'
+
+    def test_the_cli_path_reports_a_duplicated_node_as_a_run_failure_not_a_verdict(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """The two code spaces stay disjoint all the way out to the process.
+
+        Where the sibling's CLI test only pins an ALREADY pre-validated path,
+        this one reaches ``verify_manifest`` for real: ``fetch_population``
+        validates column count, ``stratum_key``, content type and a non-empty
+        result, and nothing else — it carries no uniqueness check. So unlike a
+        bad ``created_at``, a duplicated node survives the reader and lands in
+        the re-derivation, which is exactly the operator-visible exit 5 this
+        task exists to correct.
+        """
+        out = tmp_path / 'corpus_manifest.json'
+        _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out))
+        rows = _cli_rows()
+        rows.append(list(rows[0]))
+        capsys.readouterr()
+        code, _ = _run_cli(monkeypatch, '--verify', '--out', str(out), rows=rows)
+        assert code == _mod.EXIT_RUN_FAILED
+        assert code != _mod.EXIT_CODES['bad_manifest']
+        err = capsys.readouterr().err
+        assert err.strip()
+        assert rows[0][0] in err
+
+
 class TestVerifyCatchesContentDrift:
     """Hash drift is a DIFFERENT failure from an id mismatch."""
 
@@ -1918,7 +2141,9 @@ def _cli_rows(population=None) -> list[list[object]]:
     ]
 
 
-def _run_cli(monkeypatch, *argv, rows=None, double=None) -> tuple[int, _StubReaderFactory]:
+def _run_cli(
+    monkeypatch, *argv, rows=None, double=None, entry=None
+) -> tuple[int, _StubReaderFactory]:
     """Drive ``main()`` in-process against the offline double.
 
     Precedent: ``_run_cli`` in test_memory_eval_transcript_corpus.py. Returns
@@ -1928,12 +2153,22 @@ def _run_cli(monkeypatch, *argv, rows=None, double=None) -> tuple[int, _StubRead
     *rows* is the ordinary path: a store that answers. *double* substitutes the
     graph handle outright, for a store that does not — see
     ``_UnreachableDouble``.
+
+    *entry* selects which layer to drive. The default, ``None``, means
+    ``main(argv)`` — the seam every other CLI test in this module goes through,
+    left byte-for-byte unchanged. Pass ``_mod._cli`` to drive the
+    process-boundary wrapper instead; it takes NO argv, because the ``__main__``
+    guard calls it bare, so *argv* is installed on ``sys.argv`` the way a real
+    invocation supplies it rather than handed over as a parameter.
     """
     if double is None:
         double = _FalkorDouble(rows if rows is not None else _cli_rows())
     factory = _StubReaderFactory(double)
     monkeypatch.setattr(_mod, 'EpisodeReader', factory)
-    return _mod.main(list(argv)), factory
+    if entry is None:
+        return _mod.main(list(argv)), factory
+    monkeypatch.setattr(sys, 'argv', ['build_corpus.py', *argv])
+    return entry(), factory
 
 
 class TestCliFlagSurface:
@@ -2460,6 +2695,677 @@ class TestAWriteFailureIsNotBlamedOnTheStore:
         """
         code, _ = _run_cli(monkeypatch, '--verify', '--out', str(tmp_path / 'nope.json'))
         assert code == _mod.EXIT_CODES['bad_manifest']
+
+
+class TestBrokenPipeIsARunFailureNotATraceback:
+    """A downstream reader closing stdout early (``--verify | head``) must not traceback.
+
+    Task 3900, filed as an agent follow-up from 3757: the store-error handler
+    was correctly narrowed in 3757 step 8 to wrap only ``_fetch_population``,
+    the sole seam that talks to the store, so it no longer incidentally
+    swallows a ``BrokenPipeError`` from a ``print`` into a closed stdout — that
+    print is not a store condition at all. Left uncaught, it surfaces as a raw
+    traceback and only happens to exit 1 by accident, where every other
+    failure in this CLI prints one ``error: ...`` line.
+
+    Line-buffered here, so the failure is raised in-band during the run; the
+    class below covers the buffered regime it cannot see.
+    """
+
+    def test_a_closed_stdout_pipe_exits_run_failed_without_a_traceback(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        out = tmp_path / 'corpus_manifest.json'
+        capsys.readouterr()
+        with closed_pipe_stdout(monkeypatch, buffering=1):
+            code, _ = _run_cli(
+                monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), entry=_mod._cli
+            )
+
+        assert code == _mod.EXIT_RUN_FAILED
+        assert not out.exists()
+        # ONE line, the same `error: ` shape every other failure in this CLI
+        # prints — the failure is reported once even though it is seen twice,
+        # in-band by `main` and again by the boundary's flush.
+        err_lines = [line for line in capsys.readouterr().err.splitlines() if line.strip()]
+        assert len(err_lines) == 1
+        assert err_lines[0].startswith('error: ')
+
+    def test_main_alone_reports_the_failure_without_taking_over_the_caller_s_stdout(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """The layering, pinned: ``main`` reports; only ``_cli`` redirects fd 1.
+
+        ``main(argv) -> int`` is the seam the rest of this module drives, and
+        its contract is "parse and run, return a code". Silently sending the
+        caller's fd 1 to ``os.devnull`` for the remainder of the process is not
+        in that contract — ``quiet_close=False`` is what fails if it creeps
+        back in.
+        """
+        out = tmp_path / 'corpus_manifest.json'
+        capsys.readouterr()
+        with closed_pipe_stdout(monkeypatch, buffering=1, quiet_close=False):
+            code, _ = _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out))
+
+        assert code == _mod.EXIT_RUN_FAILED
+        assert capsys.readouterr().err.startswith('error: ')
+
+    def test_dry_run_build_also_exits_run_failed_on_a_closed_pipe(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """CONTROL: not specific to the write path — the report print itself is the hazard."""
+        out = tmp_path / 'corpus_manifest.json'
+        capsys.readouterr()
+        with closed_pipe_stdout(monkeypatch, buffering=1):
+            code, _ = _run_cli(
+                monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), '--dry-run',
+                entry=_mod._cli,
+            )
+        assert code == _mod.EXIT_RUN_FAILED
+
+
+class TestAShortBufferedWriteIntoAClosedPipeIsAlsoARunFailure:
+    """The task's headline shape — ``--verify | head`` — which the class above cannot see.
+
+    A closed stdout pipe fails in two measurably different ways, and the
+    difference is buffering:
+
+    * REGIME A, in-band. The write is big enough to overflow stdout's buffer
+      (or the stream is line-buffered), so ``print`` flushes, the ``write()``
+      fails, and ``BrokenPipeError`` is raised inside ``main()``'s ``try``.
+    * REGIME B, deferred — this class. The write is SHORT and stays in the
+      buffer, so nothing is raised during the run at all: ``main()`` returns
+      its ordinary verdict code and the failure surfaces only when the
+      interpreter flushes ``sys.stdout`` during finalization, where no
+      ``except`` can reach it and the returned code is overridden.
+
+    ``--verify`` lands squarely in regime B: :func:`_emit_verdict` emits ONE
+    short ``verify: ok — ...`` line. So the pipe here is block-buffered and the
+    entry point is ``_cli()``, the process boundary that flushes stdout
+    explicitly while a handler is still on the stack.
+    """
+
+    def _built_manifest(self, monkeypatch, tmp_path) -> Path:
+        out = tmp_path / 'corpus_manifest.json'
+        _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out))
+        return out
+
+    def test_a_short_verdict_into_a_closed_pipe_exits_run_failed(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """Not the verdict's own code: the run never reached its reader.
+
+        Without the explicit flush this returns 0 — a clean "verify: ok" the
+        caller never received — and the process then dies with shutdown noise.
+        Both outcomes lie about what happened.
+        """
+        out = self._built_manifest(monkeypatch, tmp_path)
+        capsys.readouterr()
+        with closed_pipe_stdout(monkeypatch):
+            code, _ = _run_cli(
+                monkeypatch, '--verify', '--out', str(out), entry=_mod._cli
+            )
+
+        assert code == _mod.EXIT_RUN_FAILED
+
+        # One line, the same `error: ` shape every other failure in this CLI
+        # prints — not a traceback, and not the "Exception ignored" noise.
+        err_lines = [line for line in capsys.readouterr().err.splitlines() if line.strip()]
+        assert len(err_lines) == 1
+        assert err_lines[0].startswith('error: ')
+
+    def test_a_healthy_stdout_still_returns_the_ordinary_verdict_code(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """CONTROL: the wrapper is a pass-through, not a swallow.
+
+        A fix that returned EXIT_RUN_FAILED unconditionally, or that ate the
+        verdict line, would satisfy the test above and be caught here.
+        """
+        out = self._built_manifest(monkeypatch, tmp_path)
+        capsys.readouterr()
+        code, _ = _run_cli(monkeypatch, '--verify', '--out', str(out), entry=_mod._cli)
+        assert code == 0
+        assert 'ok' in capsys.readouterr().out.lower()
+
+
+class TestAPipeThatBrokeAfterTheManifestLandedSaysSo:
+    """``build_corpus.py --out ... | head``: exit 1 must not read as "nothing happened".
+
+    The ordering is the point, and it is reachable rather than theoretical: the
+    report and the trailing ``manifest: ...`` line both fit stdout's buffer, so
+    nothing fails in-band, ``write_manifest`` lands the artifact, and the pipe
+    failure surfaces only at the boundary's flush — AFTER the run did its work.
+
+    Exit 1 is documented as "the run could not complete at all", so on its own
+    it tells an operator or a CI wrapper that no artifact exists. It does. The
+    message therefore names it, which is the only channel left once the exit
+    code has been spent.
+    """
+
+    def test_the_error_line_names_the_manifest_that_was_written(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        out = tmp_path / 'corpus_manifest.json'
+        capsys.readouterr()
+        with closed_pipe_stdout(monkeypatch):  # block-buffered: nothing fails in-band
+            code, _ = _run_cli(
+                monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), entry=_mod._cli
+            )
+        err = capsys.readouterr().err
+
+        assert code == _mod.EXIT_RUN_FAILED
+        assert out.exists(), 'premise: the artifact landed before the pipe failure surfaced'
+        assert str(out) in err
+
+    def test_a_run_that_wrote_nothing_does_not_claim_a_manifest(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """CONTROL: --dry-run writes nothing, so nothing may be named.
+
+        The earlier successful build is deliberate: it leaves the module
+        holding a record of a manifest it once wrote, and this run must not
+        inherit it. Without a per-run reset, a stale path would be reported as
+        this run's output — a worse lie than the bare exit code.
+        """
+        out = tmp_path / 'corpus_manifest.json'
+        _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out))
+        out.unlink()
+
+        capsys.readouterr()
+        with closed_pipe_stdout(monkeypatch):
+            code, _ = _run_cli(
+                monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), '--dry-run',
+                entry=_mod._cli,
+            )
+        err = capsys.readouterr().err
+
+        assert code == _mod.EXIT_RUN_FAILED
+        assert not out.exists()
+        assert str(out) not in err
+
+
+class TestTheCorpusCliConsumesTheSharedBoundaryHelper:
+    """build_corpus.py must USE ``shared.cli_boundary``, not carry its own copy.
+
+    Asserted BEHAVIOURALLY rather than by introspection: an ``import``-scanning
+    or ``hasattr``-based test would pass against a module that imported the
+    helper and then went on using its own private duplicate, which is the exact
+    regression this class exists to catch (INV-5).
+
+    The lever is the shared module's per-run state. If build_corpus is really
+    the consumer, then a run of ITS CLI spends the SHARED once-only budget and
+    installs its manifest detail on the SHARED reporter — both observable from
+    here by calling into ``shared.cli_boundary`` directly afterwards. If it
+    kept a private copy, the shared reporter is untouched and still armed.
+
+    The five spec classes above are deliberately NOT modified: their unchanged
+    passing is the evidence that this hoist preserved behaviour, and rewriting
+    them would destroy it at the moment it is needed.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fresh_shared_reporter_state(self):
+        """Leave ``shared.cli_boundary``'s per-run state as clean as it was found.
+
+        This class is the ONLY place in this file that reaches into another
+        module's per-run state, and every test in it ends by calling a shared
+        reporter DIRECTLY — which is the point (that call is the observation),
+        but it also leaves ``_STDOUT_FAILURE_REPORTED`` spent and ``_DETAIL``
+        bound to ``build_corpus._manifest_detail``, whose ``_WRITTEN_MANIFEST``
+        points into a ``tmp_path`` pytest is about to delete.
+
+        Every OTHER test in this file enters through ``main``/``_cli``, which
+        reset on the way in, so the leak is latent rather than live. It stays
+        latent only until some future test calls a shared reporter directly or
+        asserts on stderr from a path that does not go through ``main``.
+
+        MEASURED, because the obvious check gives the wrong answer here. This
+        package runs ``-n auto --dist loadgroup`` (fused-memory/pyproject.toml
+        addopts), so a probe appended after this class usually lands in a
+        DIFFERENT xdist worker process and sees pristine module state no matter
+        what this class did — the leak reads as absent. Forced into one process
+        with ``-n 0`` and this fixture disabled, that same probe fails with the
+        reporter already spent; re-enabled, it passes. So the hazard is not
+        merely collection order: it is which worker drew the straw, which is
+        the worst possible way to find out.
+
+        Cleared on both edges, mirroring ``_fresh_reporter_state`` in
+        ``shared/tests/test_cli_boundary.py``: entry so this class cannot
+        inherit someone else's spent flag and assert nothing, exit so it cannot
+        hand one on.
+        """
+        import shared.cli_boundary as cli_boundary
+
+        cli_boundary.reset_stdout_failure_state()
+        yield
+        cli_boundary.reset_stdout_failure_state()
+
+    def test_the_corpus_cli_spends_the_shared_reporters_once_only_budget(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """One ``error: ...`` line per run — counted across the MODULE boundary.
+
+        After the CLI has reported its line, a direct call into the shared
+        reporter must return the code and stay silent, because the run already
+        spent that budget. With a private duplicate flag the shared reporter is
+        still armed and prints a second line.
+        """
+        import shared.cli_boundary as cli_boundary
+
+        out = tmp_path / 'corpus_manifest.json'
+        capsys.readouterr()
+        with closed_pipe_stdout(monkeypatch):  # block-buffered: nothing fails in-band
+            code, _ = _run_cli(
+                monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), entry=_mod._cli
+            )
+        err = capsys.readouterr().err
+
+        assert code == _mod.EXIT_RUN_FAILED
+        assert len([line for line in err.splitlines() if line.strip()]) == 1
+
+        assert cli_boundary.report_broken_pipe() == cli_boundary.EXIT_STDOUT_FAILED
+        assert capsys.readouterr().err == '', 'the run had already spent the shared budget'
+
+    def test_the_manifest_detail_is_installed_on_the_shared_reporter(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """``main()`` installs the corpus's detail callback on the SHARED module.
+
+        The sentence stays with the caller that knows the artifact; the shared
+        reporter supplies only the parenthesised suffix. Driven through
+        ``main`` rather than ``_cli`` because ``main`` is where the install
+        must happen — it runs first, and it is the seam an in-process caller
+        drives.
+        """
+        import shared.cli_boundary as cli_boundary
+
+        out = tmp_path / 'corpus_manifest.json'
+        _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out))
+        assert out.exists(), 'premise: the run landed a manifest to name'
+
+        capsys.readouterr()
+        assert cli_boundary.report_broken_pipe() == cli_boundary.EXIT_STDOUT_FAILED
+        assert str(out) in capsys.readouterr().err
+
+    def test_a_later_run_that_wrote_nothing_clears_the_shared_detail(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """CONTROL, guarding the reset seam across the move to another module.
+
+        The cross-run staleness hazard ``test_a_run_that_wrote_nothing_does_
+        not_claim_a_manifest`` already guards must survive the state living in
+        ``shared.cli_boundary`` rather than here: a stale path reported as this
+        run's output is a worse lie than the bare exit code.
+        """
+        import shared.cli_boundary as cli_boundary
+
+        out = tmp_path / 'corpus_manifest.json'
+        _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out))
+        out.unlink()
+
+        _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), '--dry-run')
+
+        capsys.readouterr()
+        assert cli_boundary.report_broken_pipe() == cli_boundary.EXIT_STDOUT_FAILED
+        assert str(out) not in capsys.readouterr().err
+
+
+class TestAStdoutFailureThatIsNotAClosedPipeIsAlsoReported:
+    """``build_corpus.py --dry-run > /full/disk/report.txt``: ENOSPC is not a traceback either.
+
+    The contract this whole area exists to keep is "every failure in this CLI
+    prints a single ``error: ...`` line". A flush guard that names only
+    ``BrokenPipeError`` keeps it for the ``| head`` shape and breaks it for the
+    disk-full and disconnected-tty ones — at least as likely for a builder
+    whose report is routinely redirected to a file.
+
+    Both frames a full disk can surface in are covered here, because a handler
+    on one is not a handler on the other — the same split the closed-pipe tests
+    above already make between a deferred flush and an in-band raise:
+
+    * DEFERRED — every write is accepted into the buffer and the flush fails.
+    * IN-BAND — the report write is large enough to reach the device and raises
+      from ``print`` itself, inside ``main()``, where no flush guard can see it.
+    """
+
+    def test_a_full_disk_on_the_final_flush_exits_run_failed_and_names_the_errno(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        out = tmp_path / 'corpus_manifest.json'
+        monkeypatch.setattr(
+            sys,
+            'stdout',
+            StdoutWithAFailingFlush(OSError(errno.ENOSPC, 'No space left on device')),
+        )
+        capsys.readouterr()
+        code, _ = _run_cli(
+            monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), '--dry-run',
+            entry=_mod._cli,
+        )
+        monkeypatch.undo()
+        err = capsys.readouterr().err
+
+        assert code == _mod.EXIT_RUN_FAILED
+        err_lines = [line for line in err.splitlines() if line.strip()]
+        assert len(err_lines) == 1
+        assert err_lines[0].startswith('error: ')
+        # The remedy differs from a closed reader's, so the message must too.
+        assert 'No space left on device' in err
+        assert 'closed the output pipe' not in err
+
+    def test_a_full_disk_on_the_report_write_itself_exits_run_failed_the_same_way(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """The IN-BAND leg: ENOSPC raised by ``print``, not by a later flush.
+
+        ``_run_build``'s ``print(render_report(...), end='')`` is the one write
+        in this CLI large enough to reach the device on its own. When it fails,
+        the error is raised inside ``main()`` — which catches only
+        ``BrokenPipeError`` and ``CorpusBuildError`` — and then passes ``_cli``,
+        which catches only ``BrokenPipeError`` and ``SystemExit``. Nothing on
+        that path is looking for a plain ``OSError``, so it reaches the
+        interpreter as a raw traceback.
+
+        Asserted to land on the SAME outcome as the deferred-flush case above:
+        one handler, one message shape, one exit code, whichever frame the disk
+        filled up in. A reader comparing the two tests should see the failure
+        site differ and nothing else.
+        """
+        out = tmp_path / 'corpus_manifest.json'
+        # min_length is MEASURED against THIS CLI, which is why the shared
+        # double leaves the threshold to its caller. On ``--n 20 --dry-run``
+        # build_corpus makes four stdout writes — 759, 0, 70 and 1 characters:
+        # the ``render_report`` body, then the ``dry-run: ...`` line and its
+        # newline. Any threshold between 71 and 759 fails exactly the report
+        # write; 200 sits comfortably clear of both edges. Too low and the
+        # double explodes on the first character, so the run never reaches the
+        # write under test; too high and nothing fails at all and the test goes
+        # green while asserting nothing.
+        monkeypatch.setattr(
+            sys,
+            'stdout',
+            StdoutWithAFailingWrite(
+                OSError(errno.ENOSPC, 'No space left on device'), min_length=200
+            ),
+        )
+        capsys.readouterr()
+        code, _ = _run_cli(
+            monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), '--dry-run',
+            entry=_mod._cli,
+        )
+        monkeypatch.undo()
+        err = capsys.readouterr().err
+
+        assert code == _mod.EXIT_RUN_FAILED
+        err_lines = [line for line in err.splitlines() if line.strip()]
+        assert len(err_lines) == 1, err
+        assert err_lines[0].startswith('error: ')
+        assert 'No space left on device' in err
+        assert 'closed the output pipe' not in err
+        # --dry-run writes nothing, so the report must not claim an artifact.
+        assert not out.exists()
+
+
+def _spawn(
+    *argv,
+    closed_stdout: bool,
+    unbuffered: bool,
+    closed_stderr: bool = False,
+    full_stdout: bool = False,
+) -> tuple[int, str, str]:
+    """Run build_corpus.py in a CHILD process and return (exit status, stdout, stderr).
+
+    A real subprocess is the only shape that can observe the two things this
+    file's in-process tests structurally cannot: the interpreter's own
+    finalization-time flush of ``sys.stdout``, and the exit status the OS
+    actually reports (CPython overrides the returned code when that flush
+    fails, which nothing inside the process can express).
+
+    With *closed_stdout*, fd 1 is a pipe whose READ end is closed BEFORE the
+    spawn. Closing the reader first is what makes it deterministic: leave it
+    open and the child's write lands in the kernel's pipe buffer and never
+    fails, so the test would pass for the wrong reason. Python re-installs
+    ``SIGPIPE`` as ``SIG_IGN`` at startup, so the child gets EPIPE as a
+    catchable ``BrokenPipeError`` rather than dying on the signal — the status
+    here is therefore always a real exit code, never ``-13``.
+
+    *closed_stderr* puts stderr on that SAME closed pipe: the ``cmd 2>&1 |
+    head`` shape, where the diagnostic has nowhere to go either. Returned
+    stderr is then empty by construction — the exit status is the only
+    observable, and the only one that matters there.
+
+    With *full_stdout*, fd 1 is ``/dev/full``, which accepts the ``open`` and
+    fails EVERY write with ``ENOSPC``: the ``> /full/disk/report.txt`` shape at
+    the process level. It is a distinct parameter rather than another flavour
+    of *closed_stdout* because a closed pipe can only ever produce ``EPIPE`` —
+    i.e. a ``BrokenPipeError``, the one stdout failure this CLI already had a
+    handler for. ``/dev/full`` is the only way to make a REAL child process
+    produce a non-``BrokenPipeError`` stdout failure, which is what separates
+    "the pipe handler catches it" from "any stdout failure is handled". Linux
+    only; callers guard with a skipif rather than assuming the device exists.
+
+    *unbuffered* is set EXPLICITLY rather than inherited, and that is the whole
+    point of the parameter: ``PYTHONUNBUFFERED`` decides WHERE a closed-pipe
+    write fails (in-band inside ``argparse`` when unbuffered, at a later flush
+    when block-buffered), so a test that merely inherits it asserts against
+    whichever regime the ambient environment happens to supply. This suite is
+    normally run by a harness that exports ``PYTHONUNBUFFERED=1`` and by hand
+    without it, so an inherited value made the same test pass locally and fail
+    under the harness. Pinning it here makes each regime its own case.
+    """
+    assert closed_stdout or not closed_stderr, 'closed_stderr shares stdout closed pipe'
+    assert not (closed_stdout and full_stdout), 'stdout gets exactly one shape'
+    env = {**os.environ}
+    if unbuffered:
+        env['PYTHONUNBUFFERED'] = '1'
+    else:
+        env.pop('PYTHONUNBUFFERED', None)
+    cmd = [sys.executable, str(SCRIPT_PATH), *argv]
+
+    if full_stdout:
+        write_fd = os.open('/dev/full', os.O_WRONLY)
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=write_fd, stderr=subprocess.PIPE, env=env
+            )
+        finally:
+            os.close(write_fd)  # the child holds its own dup of the device
+    elif not closed_stdout:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    else:
+        read_fd, write_fd = os.pipe()
+        os.close(read_fd)  # the reader is already gone, like `head` after its window
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=write_fd,
+                stderr=write_fd if closed_stderr else subprocess.PIPE,
+                env=env,
+            )
+        finally:
+            os.close(write_fd)  # the child now holds the only write end
+
+    # A wedged child must not outlive the run: it holds the only write end of
+    # the closed pipe, so an un-killed one leaks an interpreter per failure in
+    # a helper this module calls a dozen times.
+    try:
+        out, err = proc.communicate(timeout=120)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        raise
+    return (
+        proc.returncode,
+        (out or b'').decode('utf-8', 'replace'),
+        (err or b'').decode('utf-8', 'replace'),
+    )
+
+
+#: Both stdout buffering regimes, which is the axis this CLI's closed-pipe
+#: handling actually turns on — NOT an incidental parametrization.
+_BUFFERING = pytest.mark.parametrize(
+    'unbuffered', [False, True], ids=['block-buffered', 'unbuffered']
+)
+
+
+class TestArgparseOutputIntoAClosedPipeExitsCleanlyToo:
+    """``--help | head``: the leg that reaches neither ``main()`` nor ``_cli()``'s pipe handler.
+
+    ``argparse`` writes the help text and leaves via ``SystemExit(0)`` from
+    ``parse_args()`` — which happens INSIDE ``main()`` but before its ``try``,
+    and propagates straight past ``_cli()``'s ``except BrokenPipeError``
+    because nothing is raised in-band at all.
+
+    Run against BOTH buffering regimes, because they fail in different places
+    and one handler catches only one of them — measured, each regime red on its
+    own before its own fix:
+
+    * BLOCK-buffered — the help text fits stdout's buffer, so ``parse_args``
+      raises nothing and the failure waits for ``_cli()``'s explicit flush.
+      Before that flush existed it landed at interpreter shutdown instead,
+      where the exit status is overridden and the noise cannot be caught.
+    * UNBUFFERED (``PYTHONUNBUFFERED=1``, which the verify harness exports) —
+      the write reaches fd 1 during ``parse_args`` and raises inside argparse,
+      which discards it (``BrokenPipeError`` is an ``OSError``). ``_cli``'s
+      flush then finds an empty buffer and the process exits **0** — a success
+      status for a run whose output went nowhere. Closed by
+      ``shared/src/shared/cli_boundary.py::LoudArgumentParser``.
+
+    The controls matter as much as the assertion. ``--help`` must keep exiting
+    0 and an unrecognized flag must keep exiting 2 — a fix that routed every
+    ``SystemExit`` through the broken-pipe handler would satisfy the headline
+    assertion by breaking argparse's ordinary contract, and would be caught
+    here rather than by a user.
+    """
+
+    @_BUFFERING
+    def test_help_into_a_closed_pipe_exits_run_failed_without_shutdown_noise(self, unbuffered):
+        code, _, err = _spawn('--help', closed_stdout=True, unbuffered=unbuffered)
+        assert code == _mod.EXIT_RUN_FAILED
+        assert 'Traceback' not in err
+        assert 'Exception ignored' not in err
+        # Reads like every other failure in this CLI. Asserted as "contains"
+        # rather than "is exactly one line", unlike the in-process tests above:
+        # a child interpreter's stderr is not fully under this test's control
+        # (an unrelated warning would be a real signal, not a reason to go
+        # red), and the single-line contract is already pinned in-process
+        # where stderr IS controlled.
+        assert any(line.startswith('error: ') for line in err.splitlines())
+
+    @_BUFFERING
+    def test_help_with_stderr_on_the_same_closed_pipe_still_exits_run_failed(self, unbuffered):
+        """``--help 2>&1 | head``: the diagnostic is lost; the exit code is not.
+
+        With both streams on the closed pipe the ``error: ...`` line cannot be
+        written and cannot be observed, so the exit status is the whole
+        contract — and it is enough. A stream left holding an unwritable buffer
+        fails again during interpreter finalization, and CPython overrides the
+        returned status when that happens; exiting EXIT_RUN_FAILED is therefore
+        a positive statement that NEITHER stream was left in that state.
+
+        Pins the best-effort stderr write as deliberate rather than accidental:
+        the message is allowed to vanish here, and nothing else is.
+        """
+        code, _, _ = _spawn(
+            '--help', closed_stdout=True, closed_stderr=True, unbuffered=unbuffered
+        )
+        assert code == _mod.EXIT_RUN_FAILED
+
+    @_BUFFERING
+    def test_help_with_a_healthy_stdout_still_exits_zero_and_prints_usage(self, unbuffered):
+        """CONTROL: the ordinary `--help` contract is untouched.
+
+        Sharper than it looks now that ``print_help`` is overridden: this is
+        what pins the override to still EMIT the help text, in full, rather
+        than merely re-raising on a broken pipe.
+        """
+        code, out, _ = _spawn('--help', closed_stdout=False, unbuffered=unbuffered)
+        assert code == 0
+        assert 'usage:' in out
+        # The whole document, not a truncated first line — `format_help()`
+        # output routed through the override unchanged.
+        assert '--verify' in out and '--seed' in out
+
+    @_BUFFERING
+    def test_an_unrecognized_flag_still_exits_two(self, unbuffered):
+        """CONTROL: argparse's usage-error code survives, on BOTH stdout shapes.
+
+        The closed-pipe half is the sharper of the two. argparse writes its
+        error to stderr, so stdout's buffer is empty and the flush attempts no
+        write and cannot fail — meaning the exit status must still be 2. A fix
+        that collapsed "stdout is a closed pipe" into EXIT_RUN_FAILED
+        regardless of whether the flush actually failed would go red here, and
+        nowhere else.
+        """
+        healthy_code, _, healthy_err = _spawn(
+            '--definitely-not-a-flag', closed_stdout=False, unbuffered=unbuffered
+        )
+        assert healthy_code == 2
+        assert 'unrecognized' in healthy_err
+
+        closed_code, _, closed_err = _spawn(
+            '--definitely-not-a-flag', closed_stdout=True, unbuffered=unbuffered
+        )
+        assert closed_code == 2
+        # Still reported: the usage error goes to stderr, which is NOT the
+        # closed stream, so a closed stdout must not cost the diagnostic.
+        assert 'unrecognized' in closed_err
+
+
+@pytest.mark.skipif(
+    not os.path.exists('/dev/full'),
+    reason='/dev/full is Linux-specific; no portable way to fail every stdout write',
+)
+class TestArgparseOutputOntoAFullDiskExitsCleanlyToo:
+    """``--help > /full/disk/help.txt``: the same leg, failing a way the pipe handler misses.
+
+    The class above pins ``--help`` into a CLOSED PIPE, whose only possible
+    errno is ``EPIPE`` — so every fix it can force is a fix to the
+    ``BrokenPipeError`` path. ``/dev/full`` fails the identical write with
+    ``ENOSPC`` instead, and that one distinction is what separates a handler
+    for one stdout failure from a handler for stdout failures.
+
+    Both buffering regimes again, because they still fail in different frames
+    and the difference is still load-bearing — MEASURED before this test was
+    written:
+
+    * BLOCK-buffered — the help text fits the buffer, ``parse_args`` raises
+      nothing, and ``_cli``'s explicit flush finds the ENOSPC. Already handled
+      by ``shared/src/shared/cli_boundary.py::_flush_stdout``'s widened
+      ``except OSError``, so this id is a CONTROL that must stay green.
+    * UNBUFFERED — the write reaches ``/dev/full`` during ``parse_args``,
+      ``shared/src/shared/cli_boundary.py::LoudArgumentParser``'s
+      ``print_help`` re-raises it, and it arrives at
+      ``_cli`` as a plain ``OSError`` where only ``BrokenPipeError`` and
+      ``SystemExit`` are being caught. This id is the RED: measured as a full
+      argparse traceback with NO ``error: `` line, which falsifies both the
+      README's "never a traceback" guarantee and the class docstring above.
+
+    So the two ids assert the same contract from opposite sides of the fix, and
+    a remedy that only widened the flush guard would leave the unbuffered one
+    red.
+    """
+
+    @_BUFFERING
+    def test_help_onto_a_full_disk_exits_run_failed_without_a_traceback(self, unbuffered):
+        code, _, err = _spawn('--help', full_stdout=True, closed_stdout=False,
+                              unbuffered=unbuffered)
+        assert code == _mod.EXIT_RUN_FAILED
+        assert 'Traceback' not in err, err
+        assert 'Exception ignored' not in err, err
+        # Counted, not merely present: the failure is legitimately observable
+        # at more than one frame on the way out, and the contract is ONE line.
+        # Counting only `error: `-prefixed lines rather than all of stderr, for
+        # the reason the class above gives — a child interpreter's stderr is
+        # not fully under this test's control, and an unrelated warning is a
+        # real signal rather than a reason to go red.
+        reported = [line for line in err.splitlines() if line.startswith('error: ')]
+        assert len(reported) == 1, err
+        # The errno text survives, because "no space left" and "the reader went
+        # away" are different remedies for the operator.
+        assert 'No space left on device' in reported[0]
+        assert 'closed the output pipe' not in err
 
 
 class TestBuilderScriptSatisfiesTheDeliveredCheck:

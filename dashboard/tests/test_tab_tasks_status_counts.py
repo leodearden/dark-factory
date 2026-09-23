@@ -29,67 +29,31 @@ from __future__ import annotations
 import re
 
 import pytest
-from starlette.testclient import TestClient
-
-
-@pytest.fixture(scope='module')
-def _client():
-    from dashboard.app import app
-
-    with TestClient(app) as c:
-        yield c
-
-
-@pytest.fixture(scope='module')
-def tab_tasks_jsx_body(_client):
-    return _client.get('/static/redux/tab_tasks.jsx').text
-
-
-def _extract_function_body(source: str, func_name: str) -> str:
-    """Extract the source text of a top-level ``function <func_name>(`` up to
-    (but not including) the next top-level ``function`` declaration, or to
-    end-of-file if it's the last one.
-
-    Used to scope structural assertions to a single component's render
-    function so an assertion can't be accidentally satisfied by an unrelated
-    component elsewhere in the same 780-line file (mirrors
-    test_tab_tasks_runtime.py's identically-named helper).
-    """
-    start_match = re.search(rf'^function {re.escape(func_name)}\(', source, re.MULTILINE)
-    assert start_match is not None, f'function {func_name}( not found in tab_tasks.jsx'
-    start = start_match.start()
-    next_match = re.search(r'^function \w+\(', source[start + 1 :], re.MULTILINE)
-    end = start + 1 + next_match.start() if next_match else len(source)
-    return source[start:end]
+from _dashboard_helpers import extract_function_body, strip_js_comments
 
 
 @pytest.fixture(scope='module')
 def tasks_tab_body(tab_tasks_jsx_body):
-    """TasksTab's own source text, scoped away from the other component
-    functions (TaskGraph, PrdBox, TaskDetail, ...) in the same file."""
-    return _extract_function_body(tab_tasks_jsx_body, 'TasksTab')
+    """TasksTab's brace-delimited body, signature excluded.
+
+    Scoped away from the other component functions (TaskGraph, PrdBox,
+    TaskDetail, ...) in the same 780-line file so an assertion cannot be
+    satisfied by an unrelated component.
+    """
+    return extract_function_body(tab_tasks_jsx_body, 'TasksTab')
 
 
-def _strip_comments(source: str) -> str:
-    """Drop ``/* … */`` blocks and ``// …`` line comments from JSX source.
+@pytest.fixture(scope='module')
+def tasks_tab_code(tasks_tab_body):
+    """TasksTab's body with comments blanked — what the assertions run on.
 
     Every structural assertion below runs against the stripped text, because a
     comment can satisfy or falsify one either way: an absence assertion
     ("``counts.done`` must not appear") is broken by the very comment that
     explains why it must not appear, and a presence assertion can be met by
-    prose mentioning the token instead of by code doing it. Stripping first
-    keeps this module's contract — assert structure, never comment text.
-
-    The ``(?<!:)`` guard leaves ``https://…`` inside a string literal alone.
+    prose mentioning the token instead of by code doing it.
     """
-    without_blocks = re.sub(r'/\*.*?\*/', '', source, flags=re.DOTALL)
-    return re.sub(r'(?<!:)//.*', '', without_blocks)
-
-
-@pytest.fixture(scope='module')
-def tasks_tab_code(tasks_tab_body):
-    """TasksTab's source with comments stripped — what the assertions run on."""
-    return _strip_comments(tasks_tab_body)
+    return strip_js_comments(tasks_tab_body)
 
 
 class TestHeaderCountsWiring:
@@ -288,17 +252,16 @@ class TestActiveFilterStillMerged:
     oversight, and "finishes the job"."""
 
     def test_status_matches_keeps_the_three_status_disjunction(self, tasks_tab_code):
-        # statusMatches is declared INSIDE TasksTab, so it is not a top-level
-        # `function` _extract_function_body can isolate. Scope to the
-        # `filters.active && (...)` condition itself instead, which is both
-        # narrower and exactly the thing that must not change.
-        match = re.search(r'filters\.active\s*&&\s*\(([^)]*)\)', tasks_tab_code)
-        assert match is not None, (
-            "statusMatches no longer has a `filters.active && (...)` condition."
-        )
-        active_condition = match.group(1)
+        # statusMatches is declared INSIDE TasksTab, so the retired
+        # top-level-slice extractor could not isolate it and this assertion was
+        # scoped to the `filters.active && (...)` condition by an ad-hoc regex
+        # instead. `extract_function_body` scopes to the nested declaration
+        # directly (task 3549), which is narrower still and says what it means
+        # — and raises loudly if statusMatches is ever renamed, where the regex
+        # would have needed its own not-None guard to avoid going quiet.
+        status_matches_body = extract_function_body(tasks_tab_code, 'statusMatches')
         for status in ('in-progress', 'blocked', 'merge-deferred'):
-            assert f"'{status}'" in active_condition, (
+            assert f"'{status}'" in status_matches_body, (
                 f'statusMatches no longer treats {status!r} as active — the '
                 'filter toggle deliberately keeps its merged three-status '
                 'meaning (task 3516 splits the DISPLAY only). The node suite '

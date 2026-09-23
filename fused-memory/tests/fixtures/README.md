@@ -635,3 +635,99 @@ is that no distractor may accidentally be a right answer:
 
 Verified on the committed file: 300/300 ids unique, zero α id or content
 overlap, zero reserved vocabulary keys present.
+
+---
+
+## `e2_regrowth_injection.jsonl`
+
+The fixture the E2 **+1-re-emission regrowth probe** (task 4012,
+`scripts/bake_off_storage_shape.py`) injects. It is consumed **only** by
+that probe — no other fixture, script, or test reads it, and the five
+fixtures above are unaffected by its existence.
+
+### Purpose
+
+esc-3200-3 ratified Option C's *write* shape and delegated the *read*
+transform to task 4004, which selected the promoting topic pin. Neither
+decision answered the question the 3111 implementer is owed: what does
+**one** organic re-emission of an already-canonical claim cost
+retrieval under that ratified shape, and does the selected transform
+absorb it? The probe answers it by materialising the `c_peers` arm
+twice more — once per injection mode — with exactly one extra
+near-duplicate record per topic, and reporting the per-metric delta
+against the un-injected arm's own rankings.
+
+The **+1** is the experiment. One re-emission per topic, never two: the
+quantity is the independent variable, so a second injection on any topic
+is a fixture defect and cross-validation rejects it.
+
+### Record schema
+
+20 rows — **exactly one per topic** in `e2_arm_claims.jsonl`:
+
+| field | meaning |
+|---|---|
+| `injection_id` | `<topic>-regrowth-01`; unique across the file |
+| `topic` | the topic slug, **verbatim** from the claims fixture (which took it verbatim from the E1 registry — one namespace, no slug invented here) |
+| `cluster_id` | that topic's α cluster; must agree with the claims fixture |
+| `reemits_claim_id` | the claim this row re-emits — pinned by cross-validation to be that cluster's `canonical: true` claim |
+| `text` | a fresh near-duplicate body restating the canonical claim |
+
+### Join keys
+
+`topic` joins to `e2_arm_claims.jsonl` (and through it to
+`memory_eval_topic_registry.json`); `cluster_id` joins to the α
+`write_triage_calibration.jsonl` cluster; `reemits_claim_id` joins to a
+`claim_id` in the claims fixture. `cross_validate_regrowth_injections`
+checks all three on every probe run, before any collection is created.
+
+`reemits_claim_id` is named in the fixture rather than derived because
+the materialised record carries `claim_ids = [reemits_claim_id]`: a
+near-duplicate that restates the canonical's claim genuinely *does*
+realize it, and crediting it is both the truthful modelling and the
+conservative one (scoring it as realizing nothing would make claim
+recall able only to fall under injection, rigging the probe toward the
+conclusion it exists to test). Naming the re-emitted claim in the
+fixture keeps that choice auditable here rather than buried in the
+materializer.
+
+### Authoring rules
+
+Each `text` **restates** its canonical claim in different words — the
+organic re-emission pattern esc-3200-3 documents, where four
+near-verbatim re-emissions of a trigger signature arrived for a claim
+the canonical already documented in full. It is neither a copy of the
+canonical's sentence nor a reuse of any existing `e2_arm_claims.jsonl`
+body, and its length sits in the same band as the peer claims it
+competes with, so the probe measures **displacement** rather than a
+token-count artifact.
+
+Measured on the committed file, following the sibling convention of
+reporting ratios rather than asserting a bound on them: injected-vs-
+canonical `difflib.SequenceMatcher` ratio **median 0.371, min 0.040,
+max 0.779**; body length **227–382 chars** (median 294) against the
+claims fixture's 139–473. Zero injected bodies are byte-identical to any
+claim body. No test asserts any similarity threshold — a bound here
+would be a guess dressed as a finding (gate G6).
+
+### Blind authoring — **not** claimed
+
+Unlike the three fixtures above, this one carries **no** blind-authoring
+protection and must not be read as if it did. The E2 protocol mechanized
+blindness by commit ordering — arms and queries committed while
+`scripts/bake_off_storage_shape.py` was still a docstring-only stub — and
+that is **unrecoverable** for this probe, because the whole metric
+apparatus was already in the tree when these rows were written. The
+fixture was committed on its own, ahead of any probe code, as a partial
+audit trail and nothing more. The rendered report says so in its own
+voice; see `REGROWTH_BLIND_AUTHORING_DISCLOSURE`.
+
+### Exclusions
+
+A row carries **no** `canonical`, `parent_id`, `contested` or `kind`
+key, and the materializer never writes one: a second `canonical: true`
+on a topic would make `build_canonical_by_topic` raise, and `contested`
+has no writer in the live system, so an injection must not inherit
+contested-ness from the claim it re-emits. The `topic` key is written
+into record metadata only under the `stamped` mode — the `unstamped`
+mode, which models reality today, carries no `topic` key at all.

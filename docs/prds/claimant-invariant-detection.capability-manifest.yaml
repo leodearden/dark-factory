@@ -1,0 +1,136 @@
+prd: docs/prds/claimant-invariant-detection.md
+schema_version: 1
+tasks:
+- label: d1
+  task_id: 4670
+  title: 'Dashboard claimant-invariant gauge: per-root tasks.db pool path + /api/v2/dashboard/invariants
+    + UI chip'
+  capabilities:
+  - name: predicates-consumed-from-enforcement-alpha
+    binding: capability→producer — producer:task-4618 upstream (dep wired at decompose);
+      DAG-direction correct
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: 4618's own delivered_checks gate the predicate exports; this binding
+        records the dep direction
+  - name: invariants-endpoint-served
+    binding: capability→producer (this task) — FastAPI /api/v2/dashboard/* exemplars
+      verified in dashboard/app.py; pattern 0-today with control escalation-analytics=12
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: dashboard/invariants
+      paths:
+      - dashboard/
+      expect: present
+  - name: per-root-tasksdb-pool-path
+    binding: capability→producer (this task) — DbPool per-root idiom verified (runs.db/burndown.db
+      precedent); doubled-tasks-dir path pinned; 0-today
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: tasks/tasks\.db
+      paths:
+      - dashboard/
+      expect: present
+  - name: blind-state-rendering
+    binding: field-population — unreadable root renders status=blind, never zero;
+      boundary test B2
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: blind-vs-zero rendering is judged by boundary test B2, not a grep
+- label: d2
+  task_id: 4671
+  title: Watcher-rotation consumption step in both watcher skills
+  capabilities:
+  - name: invariants-step-in-both-main-loops
+    binding: capability→producer (this task) — both skills in-repo only, numbered
+      Main Loop sections verified; 0-today with control reap-decisions=1
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: dashboard/invariants
+      paths:
+      - skills/escalation-watcher/
+      - skills/recon-escalation-watcher/
+      expect: present
+- label: d3
+  task_id: 4672
+  title: Interceptor C4-E2 ledger stamp (metadata.claimant_exception) + structured
+    WARNING; bless the key
+  capabilities:
+  - name: ledger-stamp-on-explicit-terminal-supply
+    binding: capability→producer (this task) — requested_claimant_write tri-state
+      verified at the interceptor; 0-today
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: claimant_exception
+      paths:
+      - fused-memory/src/fused_memory/
+      expect: present
+  - name: claimant-exception-key-blessed
+    binding: capability→producer (this task) — _BLESSED_METADATA_KEYS verified writable;
+      unknown_key confirmed non-fatal today; 0-today
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: claimant_exception
+      paths:
+      - shared/src/shared/
+      expect: present
+  - name: atomic-with-status-write
+    binding: capability→producer — audit_fields ride set_status_and_stamp_audit (single
+      txn, sibling-preserving merge), verified in sqlite_task_backend
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: atomicity is a test property (B5), not mechanically greppable
+- label: d4
+  task_id: 4674
+  title: set_task_claimant terminal-observation ERROR (extend the in-txn SELECT to
+    status)
+  capabilities:
+  - name: terminal-stamp-error-emitted
+    binding: capability→producer (this task) — in-txn SELECT verified present in set_task_claimant;
+      discriminator claimant_stamped_on_terminal prescribed; 0-today
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: claimant_stamped_on_terminal
+      paths:
+      - fused-memory/src/fused_memory/
+      expect: present
+  - name: observation-not-refusal
+    binding: rejection-mechanism inverse — the write must persist (B8); heartbeat-only
+      ticks silent (B9)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: write-persists and heartbeat-silence are behavioural (B8/B9)
+- label: d5
+  task_id: 4675
+  title: Amend C4-E2/C4-E7 in the enforcement PRD + OPERATIONS.md operator subsection
+  capabilities:
+  - name: enforcement-prd-amended
+    binding: capability→producer (this task) — C4-E7 target text located; no collision
+      with 4626 (scoped to task-status-authority only); 0-today
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: claimant-invariant-detection
+      paths:
+      - docs/prds/claimant-invariant-enforcement.md
+      expect: present
+  - name: operations-runbook-subsection
+    binding: capability→producer (this task) — OPERATIONS.md §4 'Watching a run' subsection
+      pattern verified; 0-today with control claimant>=1
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: claimant-invariant-detection
+      paths:
+      - OPERATIONS.md
+      expect: present

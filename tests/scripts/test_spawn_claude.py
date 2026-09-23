@@ -7,13 +7,16 @@ branches by name (the script dispatches on the first word of $CLAUDE_TERMINAL_CM
 
 from __future__ import annotations
 
-import math
 import os
 import pathlib
+import re
+import shlex
+import shutil
 import signal
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from datetime import UTC, datetime, timedelta
 
@@ -34,6 +37,24 @@ SPAWN_SCRIPT = REPO_ROOT / "skills" / "spawn" / "spawn-claude.sh"
 _ORCH_SRC = REPO_ROOT / "orchestrator" / "src"
 if str(_ORCH_SRC) not in sys.path:
     sys.path.insert(0, str(_ORCH_SRC))
+
+# APPEND, never insert(0, ...): the repo root must stay LAST on sys.path or the
+# subproject directories (orchestrator/, shared/, ...) resolve as namespace
+# packages shadowing their own src/<pkg>/ -- the failure the root conftest.py
+# docstring exists to prevent. Mirrors the same block in
+# tests/scripts/test_orchestrator_watchdog.py and
+# tests/scripts/test_fleet_dir_isolation.py. Needed here because
+# --import-mode=importlib does not put a test module's own tree on sys.path.
+if str(REPO_ROOT.resolve()) not in sys.path:
+    sys.path.append(str(REPO_ROOT.resolve()))
+
+# `_load_scaled_grace` lives in df_pytest_isolation (task 4890 promoted it out
+# of this file so scripts/tests/ could reach it); aliased back to the local
+# name every call site below already uses. See the task-2733 section comment
+# further down for the history and the reason it is load-scaled at all.
+from df_pytest_isolation import (  # noqa: E402
+    load_scaled_grace as _load_scaled_grace,
+)
 
 # noqa must sit on the STATEMENT's first line: E402 is reported at the start of
 # the import, so the per-name noqas ruff's I001 fix left on lines below suppress
@@ -133,6 +154,69 @@ _STRESS_DETACHING_TERM_TEMPLATE = textwrap.dedent("""\
     # claude binary once spawn-claude.sh has armed the EXIT/HUP/TERM traps)
     # is the synchronization gate, not a blind sleep.
     echo "$leader_pid" > {pidfile}
+    exit 0
+""")
+
+# Sentinel-planting DETACHING terminal (task 5137, esc-4389-4).
+#
+# WHY THIS EXISTS. spawn-claude.sh's payload publishes claude's exit code by
+# writing it into a `$TMPDIR/spawn-claude-XXXXXX.done` sentinel, and finish()
+# reads that file to decide both the script's own exit status and the
+# `--code` it hands session_registry. Every readiness gate around it,
+# however, tests only `[ -f "$sentinel" ]`. Existence is the WRONG readiness
+# signal for a file whose CONTENT is about to be parsed: `>` creates and
+# truncates before the write lands, so a reader can observe the sentinel
+# existing and ZERO-LENGTH and read back the empty string. This is the exact
+# create-then-write defect class already fixed on the Python side of this
+# very file -- see _wait_for_path(require_nonempty=...) below (task 4776),
+# whose docstring states the general principle; task 5137 applies it to the
+# shell side. It is a DIFFERENT defect from task 1643 (sentinel never
+# written at all), where the file's absence is unambiguous.
+#
+# Racing a real payload to catch that window would produce a test that is
+# itself flaky and can never go reliably RED. This terminal instead makes
+# the state under test a PRECONDITION: it plants the zero-length sentinel
+# itself and exits 0 WITHOUT ever running the payload, so "sentinel exists,
+# content not yet settled" is deterministic in both directions. The
+# exit-0-without-payload idiom is lifted from
+# test_failed_to_start_detected_on_detached_exit0, which uses it to drive
+# the same resolve_detached launch_rc==0 branch.
+#
+# The sentinel path is recovered from the payload text rather than guessed,
+# because spawn-claude.sh picks it with `mktemp -u` and never tells the
+# caller. MEASURED: the regex below yields the same path against BOTH the
+# pre-fix payload (`> /tmp/x.done`) and the post-fix atomic-publish payload
+# (`> /tmp/x.done.tmp && mv -f ...`), because the match stops at `.done` --
+# so this helper is stable across the writer change and needs no rework.
+#
+# {delayed_write} -- one of three: a no-op (the sentinel never settles), a
+#                    SYNCHRONOUS write before the launcher exits (delay=0 --
+#                    used to plant non-numeric content deterministically),
+#                    or a backgrounded `( sleep N; printf C > "$s" )` that
+#                    publishes a real code late, the faithful reproduction of
+#                    the production race.
+_SENTINEL_PLANTING_TERM_TEMPLATE = textwrap.dedent("""\
+    #!/usr/bin/env bash
+    # Find 'bash' in argv so $3 is the payload, whatever the branch's argv shape.
+    while [[ $# -gt 0 ]]; do
+      if [[ "$1" == "bash" ]]; then
+        break
+      fi
+      shift
+    done
+    # $1=bash  $2=-c  $3=<inner payload>
+    s=$(grep -oE '[^ ]*spawn-claude-[A-Za-z0-9]+\\.done' <<<"$3" | head -1)
+    if [[ -z "$s" ]]; then
+      echo "sentinel-planting terminal: no sentinel path in payload" >&2
+      exit 1
+    fi
+    # Create it ZERO-LENGTH: exactly what `>` leaves behind between the
+    # open()-truncate and the write that has not landed yet.
+    : > "$s"
+    {delayed_write}
+    # Exit 0 WITHOUT running the payload: the launcher reports success, so
+    # resolve_detached takes its launch_rc==0 branch -> await_sentinel
+    # returns immediately (the file exists) -> finish().
     exit 0
 """)
 
@@ -244,18 +328,44 @@ def _write_fake_claude_capturing_prompt_and_writing_result(
     p.chmod(0o755)
 
 
-def _wait_for_path(path: pathlib.Path, timeout: float) -> None:
+def _wait_for_path(
+    path: pathlib.Path, timeout: float, *, require_nonempty: bool = False
+) -> None:
     """Poll until *path* exists, raising ``AssertionError`` on timeout.
 
     Low-level primitive only -- direct callers should prefer
     _wait_for_path_scaled (below) for a load-adaptive budget instead of a
     fixed timeout; this function remains only as its poll implementation.
+
+    require_nonempty=True additionally waits for the file's size to be
+    nonzero before returning (task 4776). Existence alone is the wrong
+    readiness signal for a file whose CONTENT the caller is about to parse:
+    a writer that creates-then-writes (e.g. a terminal publishing a pidfile
+    via separate open() and write() calls) can be observed by the poll loop
+    in the gap between the two, and `while not path.exists()` returns right
+    then -- handing the caller an existing-but-empty file. Default False
+    preserves exists-only semantics for marker files whose content is never
+    parsed (e.g. a readyfile checked only for presence).
     """
     deadline = time.monotonic() + timeout
-    while not path.exists():
+
+    def _ready() -> bool:
+        if not path.exists():
+            return False
+        if require_nonempty:
+            try:
+                return path.stat().st_size > 0
+            except OSError:
+                # Vanished between exists() and stat() (e.g. a concurrent
+                # rewrite) -- not ready yet, keep polling.
+                return False
+        return True
+
+    while not _ready():
         if time.monotonic() >= deadline:
+            what = "become non-empty" if require_nonempty else "appear"
             raise AssertionError(
-                f"Timed out after {timeout}s waiting for {path} to appear"
+                f"Timed out after {timeout}s waiting for {path} to {what}"
             )
         time.sleep(0.05)
 
@@ -289,6 +399,7 @@ def _wait_for_path_scaled(
     *,
     extra_secs: float = 0.0,
     cap_secs: int = _READINESS_WAIT_CAP_SECS,
+    require_nonempty: bool = False,
 ) -> float:
     """Wait for *path* with a load-scaled budget, and return the budget used.
 
@@ -323,9 +434,13 @@ def _wait_for_path_scaled(
     _load_scaled_grace(5) halves (up to 2*30=60s under load), so collapsing
     it onto the default single 30s cap would nearly halve its loaded-host
     protection.
+
+    require_nonempty is forwarded to _wait_for_path unchanged (task 4776):
+    it does not affect the computed budget, only the readiness predicate
+    used while spending it. See _wait_for_path's docstring.
     """
     budget = _load_scaled_grace(base_secs, cap_secs=cap_secs) + extra_secs
-    _wait_for_path(path, timeout=budget)
+    _wait_for_path(path, timeout=budget, require_nonempty=require_nonempty)
     return budget
 
 
@@ -339,6 +454,60 @@ def _write_detaching_terminal(
     bin_dir: pathlib.Path, name: str, pidfile: pathlib.Path
 ) -> None:
     script = _DETACHING_TERM_TEMPLATE.format(pidfile=str(pidfile))
+    p = bin_dir / name
+    p.write_text(script)
+    p.chmod(0o755)
+
+
+def _write_sentinel_planting_terminal(
+    bin_dir: pathlib.Path,
+    name: str,
+    *,
+    delay: float | None = None,
+    code: int | str | None = None,
+) -> None:
+    """Write a fake detaching terminal that plants a ZERO-LENGTH sentinel.
+
+    Same shape as _write_detaching_terminal: format the module-level
+    template, write it into *bin_dir*, chmod it executable.
+
+    delay=None (the default) -- the sentinel is created empty and NEVER
+    settles, so finish() must fall back to its documented "no usable exit
+    code recovered" verdict rather than propagating the empty string.
+
+    delay>0 with *code* -- create the sentinel empty, then publish *code*
+    into it *delay* seconds later from a backgrounded subshell. This is the
+    faithful reproduction of the production race (esc-4389-4): the real
+    session's exit code IS on its way, and a reader that gives up on the
+    first empty read destroys it.
+
+    delay=0 with *code* -- publish *code* SYNCHRONOUSLY, before the launcher
+    returns, so the content is already in place the first time finish() reads
+    it. That is what makes a NON-NUMERIC *code* (which `_sentinel_settled`
+    must reject through its `*[!0-9]*` arm, not its `''` arm) deterministic:
+    a backgrounded writer would race finish()'s first poll and the test could
+    pass by reading the file while still empty, leaving the arm it exists to
+    cover untested. *code* is typed `int | str` for exactly that case and is
+    shell-quoted, so a garbage payload cannot inject shell syntax.
+
+    All three modes exist because existence is the wrong readiness gate for a
+    parsed file -- the same reasoning _wait_for_path(require_nonempty=...)
+    records for the Python side of this suite (task 4776).
+    """
+    if (delay is None) != (code is None):
+        raise AssertionError("delay and code must be given together, or neither")
+    if delay is None:
+        delayed_write = ": # no delayed write -- the sentinel never settles"
+    elif delay == 0:
+        delayed_write = f"printf '%s\\n' {shlex.quote(str(code))} > \"$s\""
+    else:
+        # Fully detached from this shell's stdio so the launcher can exit 0
+        # immediately; spawn-claude.sh's own `wait $!` must not block on it.
+        delayed_write = (
+            f"( sleep {delay}; printf '%s\\n' {shlex.quote(str(code))} > \"$s\" ) "
+            "</dev/null >/dev/null 2>&1 &"
+        )
+    script = _SENTINEL_PLANTING_TERM_TEMPLATE.format(delayed_write=delayed_write)
     p = bin_dir / name
     p.write_text(script)
     p.chmod(0o755)
@@ -386,6 +555,31 @@ def _base_env(bin_dir: pathlib.Path, terminal_name: str) -> dict[str, str]:
     # watchdog never scans (or finds stray evidence in) the real
     # ~/.claude/projects tree.
     env["CLAUDE_PROJECTS_DIR"] = str(bin_dir.parent / "projects")
+    return env
+
+
+def _sentinel_test_env(
+    bin_dir: pathlib.Path, terminal_name: str, tmp_path: pathlib.Path
+) -> dict[str, str]:
+    """_base_env plus a test-owned TMPDIR, for the sentinel-content tests.
+
+    spawn-claude.sh picks its sentinel with `mktemp -u -t
+    spawn-claude-XXXXXX.done`, which honours $TMPDIR. Overriding it keeps
+    every sentinel (and the spawn_ref / fts_marker written beside it) inside
+    the test's own tree instead of the host's real /tmp, which matters twice
+    here: these tests deliberately drive paths that leave a sentinel behind,
+    and the atomic-publish test asserts that no `*.done.tmp` REMAINS
+    afterwards -- an assertion that would be meaningless, and could be
+    poisoned by an unrelated concurrent spawn, against a shared /tmp.
+
+    The directory is a plain lowercase-and-hyphen name under *tmp_path* so
+    the resulting sentinel path contains nothing `printf %q` would quote --
+    the payload string is what the planting terminal greps for the path.
+    """
+    env = _base_env(bin_dir, terminal_name)
+    spawn_tmp = tmp_path / "spawntmp"
+    spawn_tmp.mkdir(exist_ok=True)
+    env["TMPDIR"] = str(spawn_tmp)
     return env
 
 
@@ -745,7 +939,15 @@ def test_window_close_yields_129_not_hang(
     # Budgets are load-scaled (task 3486's _wait_for_path_scaled) rather than
     # fixed, since a burst-load excursion past a fixed 5.0s pidfile timeout is
     # exactly the flake that was observed here (this test, konsole lane).
-    _wait_for_path_scaled(pidfile, 5)
+    #
+    # require_nonempty=True on the pidfile (task 4776): the terminal
+    # publishes it via a separate create-then-write, and the line below
+    # immediately parses its content -- exists-only would let a
+    # still-empty read through as ValueError instead of the intended
+    # timeout/AssertionError. readyfile does NOT need it: its content
+    # (`echo ready > ...`) is never parsed, only its existence is checked,
+    # so exists-only is the correct (and cheaper) predicate there.
+    _wait_for_path_scaled(pidfile, 5, require_nonempty=True)
     _wait_for_path_scaled(readyfile, 10)
 
     leader_pid = int(pidfile.read_text().strip())
@@ -959,7 +1161,12 @@ def test_window_close_129_robust_to_delayed_trap_install(
     # constant's own cap raise and keeps this gate's loaded-host protection
     # >= what it replaces. The idle-host floor is unaffected by the cap
     # either way: 5 + DELAY + 5 == _load_scaled_grace(10) + DELAY == 11.0s.
-    _wait_for_path_scaled(pidfile, 5)
+    #
+    # require_nonempty=True on the pidfile (task 4776): same create-then-write
+    # race as test_window_close_yields_129_not_hang above -- this test parses
+    # the pidfile's content immediately below. readyfile stays exists-only:
+    # its content is never parsed here either.
+    _wait_for_path_scaled(pidfile, 5, require_nonempty=True)
     _wait_for_path_scaled(readyfile, 10, extra_secs=DELAY, cap_secs=60)
 
     leader_pid = int(pidfile.read_text().strip())
@@ -1281,30 +1488,22 @@ def test_failed_to_start_detected_on_detached_exit0(tmp_path: pathlib.Path) -> N
 # target as host load climbs; _load_scaled_grace instead scales the grace by
 # load-per-core -- floored at base_secs (an idle host is byte-identical to
 # today) and capped at cap_secs (a pathological host stays bounded).
-
-
-def _load_scaled_grace(base_secs: int, *, cap_secs: int = 30) -> int:
-    """Scale a started-grace budget by host load-per-core, floored and capped.
-
-    A fixed started-grace chases a moving target as host load climbs (this
-    is the SECOND recurrence of a started-grace flake in this file -- task
-    2367 already bumped a fixed 1s/2s -> 3s/8s six days ago). Load-per-core
-    headroom tracks the actual contention that delays the fake claude
-    startup chain, instead of chasing that moving target with another
-    one-off bump.
-
-    Floored at base_secs: an idle host (loadavg_1min <= cpu_count) returns
-    base_secs unchanged, so this is byte-identical to the pre-existing fixed
-    grace there -- no regression. Capped at cap_secs so a pathologically
-    loaded host stays bounded. Fails safe to base_secs if getloadavg is
-    unavailable on this platform.
-    """
-    try:
-        load1 = os.getloadavg()[0]
-    except (OSError, AttributeError):
-        return base_secs
-    factor = max(1.0, load1 / (os.cpu_count() or 1))
-    return max(base_secs, min(cap_secs, math.ceil(base_secs * factor)))
+#
+# Task 4890 PROMOTED the definition to `df_pytest_isolation::load_scaled_grace`
+# so `scripts/tests/` could reach it too -- the two test roots cannot import
+# each other's test modules. It is imported at the top of this file and bound
+# back under the SAME module-local name `_load_scaled_grace`, so every call
+# site below keeps working unchanged. The behaviour is identical -- the
+# promoted body is this one, character for character.
+#
+# The four `test_load_scaled_grace_*` cases that used to sit here MOVED with
+# the definition, to `tests/scripts/test_drain_process_leak_isolation.py::TestLoadScaledGrace`
+# (task 4890 amendment). They were not a cross-root mirror -- that module is
+# in THIS root, so the import barrier that justifies duplicating a test never
+# applied, and after the promotion both copies exercised the same shared
+# function. What stays here is only what is WRAPPER-specific: `_spawn_run_budget`,
+# `_wait_for_path_scaled` and `_set_started_grace`, each of which uses the
+# scaler as an ORACLE rather than re-deriving its floor/scale/clamp arithmetic.
 
 
 # _NOT_FLAGGED_GRACE_BASE_SECS: raised from 2 to 8 (task 3451). Derived, not
@@ -1351,52 +1550,6 @@ def _set_started_grace(env: dict[str, str]) -> int:
     return grace
 
 
-def test_load_scaled_grace_idle_host_returns_base_unchanged(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """load-per-core <= 1 (idle host) floors at base_secs -- no scaling up."""
-    monkeypatch.setattr(os, "getloadavg", lambda: (10.0, 10.0, 10.0))
-    monkeypatch.setattr(os, "cpu_count", lambda: 32)
-
-    assert _load_scaled_grace(3, cap_secs=30) == 3
-
-
-def test_load_scaled_grace_scales_up_with_load_per_core(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """load-per-core > 1 scales grace up to ceil(base_secs * loadavg / cpu_count)."""
-    monkeypatch.setattr(os, "getloadavg", lambda: (64.0, 64.0, 64.0))
-    monkeypatch.setattr(os, "cpu_count", lambda: 32)
-
-    assert _load_scaled_grace(3, cap_secs=30) == 6
-
-
-def test_load_scaled_grace_clamps_to_cap(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pathological load is clamped at cap_secs instead of growing unbounded."""
-    monkeypatch.setattr(os, "getloadavg", lambda: (3200.0, 3200.0, 3200.0))
-    monkeypatch.setattr(os, "cpu_count", lambda: 32)
-
-    assert _load_scaled_grace(3, cap_secs=30) == 30
-
-
-def test_load_scaled_grace_getloadavg_error_returns_base(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """getloadavg unavailable (OSError or AttributeError) fails safe to base_secs."""
-
-    def _raise_oserror() -> tuple[float, float, float]:
-        raise OSError("getloadavg not supported on this platform")
-
-    monkeypatch.setattr(os, "getloadavg", _raise_oserror)
-    assert _load_scaled_grace(3, cap_secs=30) == 3
-
-    def _raise_attributeerror() -> tuple[float, float, float]:
-        raise AttributeError("os has no getloadavg on this platform")
-
-    monkeypatch.setattr(os, "getloadavg", _raise_attributeerror)
-    assert _load_scaled_grace(3, cap_secs=30) == 3
-
-
 # ===========================================================================
 # Task 3486: _wait_for_path_scaled -- load-scaled readiness-gate policy
 # ===========================================================================
@@ -1418,8 +1571,9 @@ def test_wait_for_path_scaled_returns_load_scaled_budget_on_loaded_host(
     output -- used as the oracle for arg-forwarding (cap_secs in
     particular), so a change to how arguments reach _load_scaled_grace is
     pinned here without duplicating its floor/scale/clamp/error-safe
-    arithmetic, already pinned once by the test_load_scaled_grace_* family
-    above. That oracle alone can't catch a bug shared by both functions, so
+    arithmetic, already pinned once by
+    tests/scripts/test_drain_process_leak_isolation.py::TestLoadScaledGrace.
+    That oracle alone can't catch a bug shared by both functions, so
     a literal expected value is also pinned below (96.0 loadavg / 32 cores
     => load-per-core 3.0, base 5 => ceil(5 * 3.0) = 15).
 
@@ -1525,8 +1679,9 @@ def test_wait_for_path_scaled_adds_extra_secs_unscaled(
     ) == _load_scaled_grace(10, cap_secs=_READINESS_WAIT_CAP_SECS) + 1.0
 
     # Pathological host: the cap clamps only the scaled part; extra_secs
-    # survives the clamp untouched. Mirrors test_load_scaled_grace_clamps_to_cap
-    # one layer up.
+    # survives the clamp untouched. Mirrors
+    # tests/scripts/test_drain_process_leak_isolation.py::TestLoadScaledGrace
+    # ::test_it_clamps_to_the_cap one layer up.
     monkeypatch.setattr(os, "getloadavg", lambda: (3200.0, 3200.0, 3200.0))
     monkeypatch.setattr(os, "cpu_count", lambda: 32)
     assert (
@@ -1544,7 +1699,8 @@ def test_wait_for_path_scaled_cap_secs_override_widens_the_clamp(
     independently-capped _load_scaled_grace(5) halves it replaced. Pinned
     here at the policy layer so the override itself is tested once, rather
     than only implicitly through that call site. Mirrors
-    test_load_scaled_grace_clamps_to_cap one layer up.
+    tests/scripts/test_drain_process_leak_isolation.py::TestLoadScaledGrace
+    ::test_it_clamps_to_the_cap one layer up.
     """
     monkeypatch.setattr(os, "getloadavg", lambda: (3200.0, 3200.0, 3200.0))
     monkeypatch.setattr(os, "cpu_count", lambda: 32)
@@ -1556,6 +1712,127 @@ def test_wait_for_path_scaled_cap_secs_override_widens_the_clamp(
     assert _wait_for_path_scaled(existing, 10) == _READINESS_WAIT_CAP_SECS
     # ...but an explicit wider cap_secs clamps there instead.
     assert _wait_for_path_scaled(existing, 10, cap_secs=60) == 60
+
+
+# ===========================================================================
+# Task 4776: require_nonempty -- readiness gate must wait for CONTENT, not
+# just the inode
+# ===========================================================================
+# DISTINCT failure mode from every _wait_for_path_scaled flake above: those
+# all widened the TIMEOUT BUDGET (a bigger number). This one is a wrong
+# PREDICATE -- `while not path.exists()` returns the instant the inode
+# appears, but the two pidfile gates (test_window_close_yields_129_not_hang
+# and test_window_close_129_robust_to_delayed_trap_install) immediately
+# parse the file's content with `int(pidfile.read_text().strip())`. The
+# terminal publishes the pidfile via a separate create-then-write, so under
+# host contention the test can win the race against the write half and read
+# an existing-but-empty file, crashing with ValueError instead of the
+# intended AssertionError/timeout. Observed 2026-08-27 during task 4124's
+# post-merge verify: `int('')` at test_spawn_claude.py:751.
+
+
+def test_wait_for_path_require_nonempty_times_out_on_empty_file(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A file that exists but never gains content must still time out when
+    require_nonempty=True -- proving the exists-only predicate (which would
+    return instantly here) is not what's being exercised.
+    """
+    empty = tmp_path / "stays-empty"
+    empty.touch()
+    assert empty.exists() and empty.stat().st_size == 0
+
+    start = time.monotonic()
+    with pytest.raises(AssertionError, match=r"Timed out after 0\.3s"):
+        _wait_for_path(empty, timeout=0.3, require_nonempty=True)
+    elapsed = time.monotonic() - start
+
+    assert elapsed >= 0.3, (
+        f"expected the full 0.3s budget to be spent waiting for content, "
+        f"only waited {elapsed:.2f}s"
+    )
+
+
+def test_wait_for_path_require_nonempty_waits_for_content_to_land(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The gate must not return the instant the (empty) inode appears --
+    it must block until a subsequent write lands content, exactly like the
+    real terminal's create-then-write pidfile publication.
+
+    Reproduces the task-4776 race directly: the file is pre-created empty
+    (winning the exists() race), and a background writer fills it in after
+    a short, deterministic delay. require_nonempty=True must not return
+    before that write happens.
+    """
+    pidfile = tmp_path / "leader.pid"
+    pidfile.touch()  # pre-created empty, exactly like the losing race window
+
+    WRITE_DELAY = 0.2
+
+    writer = threading.Timer(WRITE_DELAY, lambda: pidfile.write_text("12345\n"))
+    # Sampled BEFORE writer.start(), not after: Timer.start() blocks until
+    # the child thread has begun bootstrapping, so sampling afterward lets
+    # the timer's delay clock start ticking before ours does -- shrinking
+    # the observed elapsed below WRITE_DELAY under scheduler contention and
+    # self-inflicting exactly the kind of flake this file exists to
+    # eliminate. Starting our clock first only ever makes elapsed LARGER,
+    # which keeps the `elapsed >= WRITE_DELAY` assertion below sound instead
+    # of racy.
+    start = time.monotonic()
+    writer.start()
+    try:
+        _wait_for_path(pidfile, timeout=5.0, require_nonempty=True)
+        elapsed = time.monotonic() - start
+    finally:
+        writer.join()
+
+    assert elapsed >= WRITE_DELAY, (
+        f"returned after {elapsed:.2f}s, before the {WRITE_DELAY}s write "
+        f"landed -- require_nonempty must wait for CONTENT, not just the "
+        f"inode"
+    )
+    assert int(pidfile.read_text().strip()) == 12345
+
+
+def test_wait_for_path_scaled_forwards_require_nonempty(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both production pidfile gates
+    (test_window_close_yields_129_not_hang and
+    test_window_close_129_robust_to_delayed_trap_install) reach
+    require_nonempty=True through _wait_for_path_scaled, never through
+    _wait_for_path directly -- so the two tests above, which call
+    _wait_for_path directly, cannot catch a dropped forwarding (or a
+    default of False re-hardcoded at the call site inside
+    _wait_for_path_scaled). Mirrors the extra_secs-forwarding precedent in
+    test_wait_for_path_scaled_enforces_the_scaled_budget_not_the_base:
+    an argument must be proven to reach _wait_for_path itself, not just the
+    return value.
+
+    Idle-host load settings (mirroring
+    test_wait_for_path_scaled_idle_host_floors_at_base) keep the budget
+    floored at base_secs, so this stays fast and host-load-independent
+    instead of scaling unpredictably. An exists-only predicate would return
+    instantly on this existing-but-empty file; forwarding must make it
+    time out instead.
+    """
+    monkeypatch.setattr(os, "getloadavg", lambda: (10.0, 10.0, 10.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+
+    existing_empty = tmp_path / "empty"
+    existing_empty.touch()
+
+    start = time.monotonic()
+    with pytest.raises(AssertionError, match="become non-empty"):
+        _wait_for_path_scaled(existing_empty, 1, require_nonempty=True)
+    elapsed = time.monotonic() - start
+
+    assert elapsed >= 1.0, (
+        f"expected the base_secs=1 budget to be spent waiting for content "
+        f"(exists-only would have returned instantly); only waited "
+        f"{elapsed:.2f}s"
+    )
 
 
 # ===========================================================================
@@ -1585,8 +1862,9 @@ def test_spawn_run_cap_leaves_headroom_inside_governing_timeout() -> None:
 
     Deliberately just this one static invariant between the two module-
     level constants, no monkeypatching: the scale/floor/clamp arithmetic
-    _spawn_run_budget delegates to is already pinned by the
-    test_load_scaled_grace_* family above, and _spawn_run_budget's own
+    _spawn_run_budget delegates to is already pinned by
+    tests/scripts/test_drain_process_leak_isolation.py::TestLoadScaledGrace,
+    and _spawn_run_budget's own
     forwarding of it is pinned against real subprocess.run calls by the
     test_run_spawn_* family below -- re-deriving that arithmetic a third
     time here would be pure duplication (task 3599 amendment; a prior
@@ -1704,8 +1982,9 @@ def test_set_started_grace_writes_env_matching_return(
     """_set_started_grace delegates to _load_scaled_grace and writes the
     identical value into env["SPAWN_STARTED_GRACE_SECS"] as a string.
 
-    The floor/scale/cap arithmetic itself is already pinned three ways by
-    the test_load_scaled_grace_* tests above (idle/scale/clamp/error-safe);
+    The floor/scale/cap arithmetic itself is already pinned four ways by
+    tests/scripts/test_drain_process_leak_isolation.py::TestLoadScaledGrace
+    (idle/scale/clamp/error-safe);
     re-deriving that same arithmetic here through _set_started_grace would
     just be duplicate coverage of task 2733's tests. The only contract that
     is genuinely new at this layer is that _set_started_grace's return
@@ -2843,7 +3122,14 @@ def _run_sibling_capture_spawn(
         env["CLAUDE_SPAWN_PARENT_ID"] = spawner_parent_id
 
     result = _run_spawn(env, tmp_path)
-    _wait_for_path_scaled(capture_file, 5)
+    # require_nonempty=True (task 4776): the fake claude above publishes
+    # capture_file via `{ ... } > capture_file` -- bash opens (creates) the
+    # redirect target before the block's echoes run, so an exists-only poll
+    # can observe an empty file and hand _parse_captured_env nothing,
+    # failing later on an unrelated-looking captured.get(...) assertion
+    # instead of the intended readiness-timeout. Same race, same fix, as
+    # the two pidfile gates this task rewired.
+    _wait_for_path_scaled(capture_file, 5, require_nonempty=True)
     captured = _parse_captured_env(capture_file)
     fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
     return result, captured, fleet_root
@@ -3253,6 +3539,69 @@ def test_spawn_unsets_inherited_launch_inputs_from_child_env(
     )
 
 
+def test_owner_ppid_is_exported_and_is_the_owning_claudes_direct_parent(
+    tmp_path: pathlib.Path,
+) -> None:
+    """CLAUDE_SPAWN_OWNER_PPID must name the payload shell that runs claude.
+
+    Task 4193 (L2 ruling item 4-i). This is the ownership discriminator for
+    the window BEFORE the session registry record carries a
+    ``claude_session_id`` -- measured median ~27s, p90 ~141s over the live
+    fleet, and unbounded. ``session_hooks._owner_ppid_verdict`` compares it
+    against ``_parent_pid_of(_owning_claude_pid())``, so the contract this
+    test pins is exactly: *the value the child sees equals the child's own
+    ``getppid()``*.
+
+    That holds only because ``claude`` is invoked WITHOUT ``exec`` -- an
+    implicit-exec optimisation would collapse the payload shell into the
+    claude process and break the equality silently. bash suppresses that
+    optimisation here because ``$inner`` sets traps and ends in
+    ``ec=$?; exit $ec``, but nothing in the source SAYS so, which is why it
+    is pinned by an end-to-end launch rather than by reading the string.
+
+    Also asserted: it survives ``sanitize_env`` (it is exported after the
+    namespace unset) and is present even with no title and no parent, since
+    unlike the other four exports it is gated on nothing.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    capture_file = tmp_path / "captured_env.bin"
+    ppid_file = tmp_path / "claude_ppid.txt"
+    p_claude = bin_dir / "claude"
+    p_claude.write_text(
+        "#!/usr/bin/env bash\n"
+        f"env -0 > {capture_file!s}\n"
+        f"ps -o ppid= -p $$ | tr -d ' ' > {ppid_file!s}\n"
+        "exit 0\n"
+    )
+    p_claude.chmod(0o755)
+    _write_foreground_terminal(bin_dir, "xterm")
+
+    env = _base_env(bin_dir, "xterm")
+    # Poison it: an inherited value must be overwritten by THIS spawn's, the
+    # same way the other identity exports are.
+    env["CLAUDE_SPAWN_OWNER_PPID"] = "999999"
+
+    result = _run_spawn(env, tmp_path)
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    captured = _read_spawn_namespace(capture_file)
+    exported = captured.get("CLAUDE_SPAWN_OWNER_PPID", "")
+    assert exported.isdigit() and int(exported) > 1, (
+        f"CLAUDE_SPAWN_OWNER_PPID must be a real pid, got {exported!r}"
+    )
+    assert exported != "999999", (
+        "the inherited value must be scrubbed and recomputed for THIS child"
+    )
+    actual_parent = ppid_file.read_text().strip()
+    assert exported == actual_parent, (
+        f"CLAUDE_SPAWN_OWNER_PPID ({exported}) must equal the launched "
+        f"claude's own direct parent pid ({actual_parent}) -- if these "
+        f"diverge, the payload shell was exec'd away and "
+        f"session_hooks._owner_ppid_verdict would misread every owner event "
+        f"as an inheritor"
+    )
+
+
 def test_spawn_unset_is_prefix_generic_not_an_enumerated_list(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -3476,4 +3825,748 @@ def test_sanitization_preserves_launcher_stamped_record_identity(
     )
     assert "CLAUDE_SPAWN_TASK_ID" not in captured, (
         f"same for the task id: {captured!r}"
+    )
+
+
+# ===========================================================================
+# task-4058: the macOS Terminal sibling lane must NOT prefix its launch with
+# `setsid`. setsid(1) is util-linux and is not installed on stock macOS --
+# the only platform that ever auto-selects the `mac-terminal` branch (via
+# spawn-claude.sh's `uname == Darwin` arm of emulator selection) -- so the
+# prefix made the launch fail 127 into /dev/null, `open` was never reached,
+# the child was never launched, and resolve_sibling stamped the session
+# record RUNNING regardless: a false liveness signal. No test in this file
+# reached the mac-terminal branch at all before this task, which is why it
+# survived.
+# ===========================================================================
+
+
+def _write_setsid_shim(
+    bin_dir: pathlib.Path, marker: pathlib.Path, *, passthrough: bool
+) -> None:
+    """Write a fake ``setsid`` that appends its argv to *marker* (one line per
+    call), then either refuses to run its arguments or passes them through.
+
+    ``passthrough=False`` -- exit 127 WITHOUT exec'ing the arguments. This
+    reproduces stock macOS, where ``setsid(1)`` -- a util-linux tool -- is
+    simply not installed: the program setsid was asked to run never executes
+    and the caller sees 127. ``_base_env`` prepends *bin_dir* to PATH, so the
+    shim shadows the host's real /usr/bin/setsid and the condition becomes
+    reproducible headlessly on the Linux merge worker instead of only on a
+    Darwin host.
+
+    ``passthrough=True`` -- record, then ``exec "$@"`` so the launch still
+    proceeds. The positive counterpart, used by the scope guard below to
+    prove a branch still routes its launch through setsid.
+
+    The argv marker is a positive signal a genuinely setsid-free PATH could
+    not give: it lets a test assert that a branch invoked setsid ZERO times,
+    or that a particular launch was not prefixed with it -- which is the
+    actual fix contract. Note that spawn-claude.sh's ``_detach`` probes
+    setsid functionally (``setsid true``) before using it, so the marker also
+    records that probe's own argv line whenever the probe runs -- read it
+    per-line (``_recorded_argv_lines``), not as a whole.
+    """
+    tail = 'exec "$@"' if passthrough else "exit 127"
+    p = bin_dir / "setsid"
+    p.write_text(
+        f'#!/usr/bin/env bash\n'
+        f'echo "$*" >> {marker!s}\n'
+        f'{tail}\n'
+    )
+    p.chmod(0o755)
+
+
+def _recorded_argv_lines(marker: pathlib.Path) -> list[str]:
+    """Return the argv lines an argv-recording shim appended to *marker*.
+
+    Empty list when the shim was never invoked at all (the marker file is
+    only created by the first call), so callers can assert absence and
+    content through one accessor.
+    """
+    if not marker.exists():
+        return []
+    return [line for line in marker.read_text().splitlines() if line.strip()]
+
+
+def _write_fake_open(
+    bin_dir: pathlib.Path, marker: pathlib.Path, *, rc: int = 0
+) -> None:
+    """Write a fake macOS ``open`` that records its argv to *marker* and
+    returns immediately -- running the script it was handed when *rc* is 0.
+
+    Mirrors real ``open -a Terminal <script>``: LaunchServices takes the
+    handoff and ``open`` exits without waiting for Terminal.app -- which is
+    precisely why the mac lane is already detached and needs no setsid, and
+    why it is the one sibling lane that can check its launcher's exit status
+    without giving up fire-and-forget. Linux ships no ``open`` at all, so
+    this fake is what makes the branch runnable headlessly.
+
+    A nonzero *rc* stands in for a genuine launch failure (Terminal.app
+    absent or unregistered, an unreadable tmpscript, a LaunchServices
+    error): the argv is still recorded, but nothing is executed.
+    """
+    p = bin_dir / "open"
+    p.write_text(
+        f'#!/usr/bin/env bash\n'
+        f'echo "$*" >> {marker!s}\n'
+        f'[ {rc:d} -ne 0 ] && exit {rc:d}\n'
+        f'shift 2\n'
+        f'bash "$1" &\n'
+        f'exit 0\n'
+    )
+    p.chmod(0o755)
+
+
+def test_mac_terminal_sibling_launches_child_without_setsid(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The mac-terminal sibling lane must actually launch its child on a host
+    that has no ``setsid`` -- i.e. on every macOS host.
+
+    Reaches the branch via ``CLAUDE_TERMINAL_CMD=mac-terminal``:
+    spawn-claude.sh dispatches on ``first_word="${emulator%% *}"`` and
+    $CLAUDE_TERMINAL_CMD is the highest-priority source of $emulator, so the
+    literal string routes into the exact same arm a real Darwin host reaches
+    via the ``uname == Darwin`` auto-select in emulator selection. That keeps
+    this test headless and unconditional on the Linux merge worker -- where
+    this regression would otherwise never be caught -- rather than a
+    skipif(platform != Darwin) that is dead code on every machine that runs
+    CI.
+
+    RED before the fix: ``setsid open -a Terminal ...`` fails 127 into
+    /dev/null, ``open`` is never reached, the child never starts, and yet
+    resolve_sibling stamps the record RUNNING anyway. GREEN once the
+    ``setsid`` prefix is dropped from that one launch.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    started = tmp_path / "started"
+    done = tmp_path / "done"
+    _write_fake_claude_slow_with_markers(bin_dir, started, done, sleep_secs=20)
+
+    setsid_marker = tmp_path / "setsid_argv"
+    _write_setsid_shim(bin_dir, setsid_marker, passthrough=False)
+    open_marker = tmp_path / "open_argv"
+    _write_fake_open(bin_dir, open_marker)
+
+    env = _base_env(bin_dir, "mac-terminal")
+    env["CLAUDE_SPAWN_MODE"] = "sibling"
+
+    result = _run_spawn(env, tmp_path)
+
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    # Snapshot immediately -- must reflect the state at the moment
+    # spawn-claude.sh returned, not after the started-marker poll below.
+    # Fire-and-forget must SURVIVE the fix, not be traded away for it.
+    done_existed_at_return = done.exists()
+    assert not done_existed_at_return, (
+        "the mac-terminal sibling lane must return WITHOUT waiting for the "
+        "child to finish -- the done-marker must not exist yet at the moment "
+        "spawn-claude.sh returns"
+    )
+
+    # THE RED GATE, waited on FIRST: reaching `open` at all is where the
+    # regression actually surfaces, so the failure carries that diagnosis
+    # rather than the generic started-marker timeout that would otherwise
+    # fire one assertion later and say nothing about the cause.
+    try:
+        _wait_for_path_scaled(open_marker, 5)
+    except AssertionError as exc:
+        raise AssertionError(
+            "the mac-terminal sibling lane must reach `open` -- with a "
+            "`setsid` prefix in place it never does, because setsid is "
+            "absent on macOS and the 127 is swallowed by >/dev/null"
+        ) from exc
+
+    recorded_open = open_marker.read_text()
+    assert "-a Terminal" in recorded_open, (
+        f"`open` must still be handed the Terminal.app application flag, "
+        f"got {recorded_open!r}"
+    )
+
+    # Reaching `open` is necessary but not sufficient -- the child itself
+    # must actually come up.
+    _wait_for_path_scaled(started, 5)
+
+    # Checked AFTER the waits above, so any invocation at all would already
+    # have been recorded by the time this runs.
+    assert _recorded_argv_lines(setsid_marker) == [], (
+        f"the mac-terminal branch must not invoke `setsid` at all -- macOS "
+        f"does not ship it -- but it was called with "
+        f"{_recorded_argv_lines(setsid_marker)!r}"
+    )
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert record.status == session_registry.Status.RUNNING, (
+        f"expected a best-effort refresh to RUNNING, got {record.status}"
+    )
+    # ...and, given the started-marker assertion above, that RUNNING stamp is
+    # now a TRUTHFUL liveness signal. Before the fix resolve_sibling wrote the
+    # same RUNNING for a child that had never been launched at all -- the
+    # false-liveness bug this task exists to close.
+
+
+def test_xterm_sibling_still_detaches_via_setsid(tmp_path: pathlib.Path) -> None:
+    """Scope guard: the xterm sibling lane must STILL route its launch through
+    ``setsid``.
+
+    Passes both before and after the mac-terminal fix. It exists to fail an
+    over-broad repair: ``setsid`` appears at five launch sites in
+    spawn-claude.sh and only the mac one is wrong, so the obvious wrong edit
+    is "strip setsid everywhere". xterm/kitty/konsole launch real child
+    processes that must outlive the launcher, so setsid stays there; only the
+    mac lane -- where ``open`` hands off to LaunchServices and setsid is not
+    installed in the first place -- drops it.
+
+    Nothing else in this suite pins setsid on those lanes:
+    test_sibling_mode_foreground_emulator_is_fire_and_forget still passes
+    without it, because the trailing ``&`` and the stdio redirect alone
+    satisfy its fire-and-forget assertions. This closes that hole
+    behaviourally -- a recording pass-through shim proves the invocation --
+    rather than by grepping the source.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    started = tmp_path / "started"
+    done = tmp_path / "done"
+    _write_fake_claude_slow_with_markers(bin_dir, started, done, sleep_secs=20)
+    _write_foreground_terminal(bin_dir, "xterm")
+
+    setsid_marker = tmp_path / "setsid_argv"
+    _write_setsid_shim(bin_dir, setsid_marker, passthrough=True)
+
+    env = _base_env(bin_dir, "xterm")
+    env["CLAUDE_SPAWN_MODE"] = "sibling"
+
+    result = _run_spawn(env, tmp_path)
+
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    done_existed_at_return = done.exists()
+    assert not done_existed_at_return, (
+        "the xterm sibling lane must still be fire-and-forget -- the "
+        "done-marker must not exist yet at the moment spawn-claude.sh returns"
+    )
+
+    _wait_for_path_scaled(started, 5)
+
+    recorded = _recorded_argv_lines(setsid_marker)
+    assert recorded, (
+        "the xterm sibling lane launches a real child process that must "
+        "outlive this script, so it must STILL be prefixed with `setsid` -- "
+        "the mac-terminal fix must not be applied to this branch"
+    )
+    # Per-line, and by the launch line specifically: _detach also probes
+    # `setsid true` for availability before using it, so mere marker
+    # presence would be satisfied by the probe alone.
+    assert any(line.split()[0] == "xterm" for line in recorded), (
+        f"`setsid` must prefix the xterm launch ITSELF, not merely be probed "
+        f"for availability; recorded calls: {recorded!r}"
+    )
+
+
+def test_custom_launcher_sibling_launches_child_on_a_setsid_free_host(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The custom-launcher (`*)`) sibling lane must launch its child on a host
+    where `setsid` does not work -- the same false-liveness bug the
+    mac-terminal lane had, one case below it.
+
+    macOS is the platform whose missing setsid(1) motivated this fix, and any
+    macOS user who points $CLAUDE_TERMINAL_CMD at a launcher other than
+    Terminal (iTerm, wezterm, alacritty, a wrapper script) lands here, not in
+    the mac-terminal branch: a literal ``setsid "${_emcmd[@]}" ...`` fails 127
+    into /dev/null, the emulator is never launched, and resolve_sibling stamps
+    the record RUNNING regardless. Point-patching only the mac-terminal branch
+    would have left that live.
+
+    The fix is spawn-claude.sh's ``_detach``, whose functional setsid probe
+    degrades to the plain ``&`` + stdio redirect when setsid cannot run --
+    a weaker detach than a new session, but a child that is actually
+    launched rather than a silent no-launch. Note this test does NOT assert
+    setsid is unused in general (see the xterm scope guard above, which
+    requires the opposite where setsid works) -- only that the LAUNCH is not
+    routed through a setsid that cannot run it.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    started = tmp_path / "started"
+    done = tmp_path / "done"
+    _write_fake_claude_slow_with_markers(bin_dir, started, done, sleep_secs=20)
+    # "custom-term" matches no known emulator name, so it routes to the *)
+    # branch -- the same convention DETACHING_NAMES documents at the top.
+    _write_foreground_terminal(bin_dir, "custom-term")
+
+    setsid_marker = tmp_path / "setsid_argv"
+    _write_setsid_shim(bin_dir, setsid_marker, passthrough=False)
+
+    env = _base_env(bin_dir, "custom-term")
+    env["CLAUDE_SPAWN_MODE"] = "sibling"
+
+    result = _run_spawn(env, tmp_path)
+
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    # Snapshot immediately -- fire-and-forget must survive the degraded
+    # (setsid-less) detach too, so the caller is not left holding the pipe.
+    done_existed_at_return = done.exists()
+    assert not done_existed_at_return, (
+        "the custom-launcher sibling lane must return WITHOUT waiting for "
+        "the child to finish, even when it had to detach without setsid"
+    )
+
+    # THE RED ASSERTION: before the fix the literal `setsid` prefix fails 127
+    # into /dev/null and the emulator is never launched at all. Wrapped so
+    # the regression reports that diagnosis rather than a bare marker
+    # timeout that says nothing about the cause.
+    try:
+        _wait_for_path_scaled(started, 5)
+    except AssertionError as exc:
+        raise AssertionError(
+            "the custom-launcher sibling lane must launch its child even "
+            "where setsid cannot run -- a literal `setsid` prefix drops the "
+            "launch entirely, failing 127 into /dev/null"
+        ) from exc
+
+    recorded = _recorded_argv_lines(setsid_marker)
+    assert not any(line.split()[0] == "custom-term" for line in recorded), (
+        f"the launch must not be routed through a setsid that cannot run it "
+        f"-- doing so drops the launch entirely; recorded calls: {recorded!r}"
+    )
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert record.status == session_registry.Status.RUNNING, (
+        f"expected a best-effort refresh to RUNNING, got {record.status}"
+    )
+
+
+def test_mac_terminal_sibling_open_failure_yields_127_not_a_running_record(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A failed ``open`` in the mac-terminal sibling lane must surface as the
+    127 launcher-failure verdict, not as a RUNNING record.
+
+    Dropping the setsid prefix closes one cause of a false RUNNING stamp; a
+    discarded ``open`` exit status is another one of the same shape
+    (Terminal.app absent or unregistered, an unreadable tmpscript, a
+    LaunchServices error). ``open`` returns as soon as LaunchServices takes
+    the handoff, so this lane -- uniquely among the sibling lanes -- can
+    branch on that status without giving up fire-and-forget, which is why it
+    runs in the foreground rather than behind a trailing ``&``.
+
+    127 is the script's documented genuine-launcher-failure code and is what
+    the branch's own non-sibling path already returns for the same failure.
+    The record is left LAUNCHING (never refreshed to RUNNING) for the normal
+    stale-pid reaper.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    started = tmp_path / "started"
+    done = tmp_path / "done"
+    _write_fake_claude_slow_with_markers(bin_dir, started, done, sleep_secs=20)
+
+    setsid_marker = tmp_path / "setsid_argv"
+    _write_setsid_shim(bin_dir, setsid_marker, passthrough=False)
+    open_marker = tmp_path / "open_argv"
+    _write_fake_open(bin_dir, open_marker, rc=1)
+
+    env = _base_env(bin_dir, "mac-terminal")
+    env["CLAUDE_SPAWN_MODE"] = "sibling"
+
+    result = _run_spawn(env, tmp_path)
+
+    assert result.returncode == 127, (
+        f"a failed `open` must yield the 127 launcher-failure verdict, got "
+        f"{result.returncode}; stderr: {result.stderr.decode()}"
+    )
+    assert _recorded_argv_lines(open_marker), (
+        "the branch must have attempted the launch at all -- otherwise this "
+        "test would pass for the wrong reason"
+    )
+    assert not started.exists(), (
+        "nothing may have been launched when `open` itself failed"
+    )
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert record.status == session_registry.Status.LAUNCHING, (
+        f"a session that never launched must not be stamped RUNNING -- the "
+        f"record must stay LAUNCHING for the stale-pid reaper, got "
+        f"{record.status}"
+    )
+
+
+# ===========================================================================
+# task-5137: a CREATED-but-EMPTY sentinel must never yield an empty exit code
+# ===========================================================================
+# esc-4389-4. spawn-claude.sh's finish() read the sentinel with
+# `rc=$(cat "$sentinel" 2>/dev/null || echo 127)`. The `|| echo 127` fallback
+# only fires when `cat` FAILS -- but `cat` on a zero-length file SUCCEEDS and
+# prints nothing, so rc became the empty string and was propagated into both
+# consumers verbatim:
+#
+#     usage: session_registry exit [-h] --record RECORD --code CODE
+#     session_registry exit: error: argument --code: invalid int value: ''
+#     ./skills/spawn/spawn-claude.sh: line 509: exit: : numeric argument required
+#     exit=2
+#
+# Two distinct damages: the caller sees bash's own usage code 2 instead of a
+# documented spawn verdict, and the session-registry record is left
+# un-updated because the CLI died in argument parsing.
+#
+# The gap is real because `>` creates and truncates BEFORE the write lands,
+# and every readiness gate in the script tests `[ -f "$sentinel" ]` only --
+# the create-then-write defect class _wait_for_path(require_nonempty=...)
+# (task 4776) already names on the Python side of this file. It is NOT task
+# 1643's defect (sentinel never written at all), where absence is
+# unambiguous and the `|| echo 127` fallback does fire.
+
+
+def test_zero_length_sentinel_never_yields_empty_code_or_nonnumeric_exit(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A sentinel that exists but never settles must yield 127, not bash's 2.
+
+    Drives the shortest deterministic path into finish(): the `custom-term`
+    dispatch branch -> resolve_detached with launch_rc==0 -> await_sentinel
+    returns immediately because the file exists -> finish(). The terminal
+    plants the zero-length sentinel itself and never runs the payload, so
+    "exists, zero-length, never settles" is a precondition rather than a race
+    outcome and the test is deterministic in both directions.
+
+    127 is the right verdict here: the script's documented "no usable exit
+    code recovered" code, whose meaning this widens by exactly one clause
+    (the sentinel appeared but never settled to a numeric code) rather than
+    inventing a new one.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    # delay=None: the sentinel is created empty and NEVER settles.
+    _write_sentinel_planting_terminal(bin_dir, "custom-term")
+    env = _sentinel_test_env(bin_dir, "custom-term", tmp_path)
+
+    result = _run_spawn(env, tmp_path)
+
+    stderr = result.stderr.decode()
+    # Verbatim observed failure (esc-4389-4), inlined so a future RED is
+    # self-explaining without digging the escalation out.
+    observed = (
+        "esc-4389-4 observed, verbatim:\n"
+        "  session_registry exit: error: argument --code: invalid int value: ''\n"
+        "  ./skills/spawn/spawn-claude.sh: line 509: exit: : numeric "
+        "argument required\n"
+        "  exit=2\n"
+        f"this run: rc={result.returncode}\nstderr:\n{stderr}"
+    )
+
+    assert b"numeric argument required" not in result.stderr, (
+        f"finish() must never run `exit \"\"` -- it read an empty sentinel as "
+        f"the exit code.\n{observed}"
+    )
+    assert b"invalid int value: ''" not in result.stderr, (
+        f"session_registry must never be handed an empty --code.\n{observed}"
+    )
+    assert result.returncode == 127, (
+        f"an unsettled sentinel must yield the documented 127 "
+        f"(no usable exit code recovered), never bash's usage code 2.\n"
+        f"{observed}"
+    )
+
+    # The registry half of the defect, which the exit code alone cannot see:
+    # asserting the record was actually UPDATED is strictly stronger than
+    # grepping stderr, because a CLI call that dies in argument parsing
+    # leaves the record stale rather than absent.
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert record.exit_code == 127, (
+        f"the session record must carry a well-formed integer exit code, got "
+        f"{record.exit_code!r} (status {record.status}).\n{observed}"
+    )
+
+
+# The sibling of the test above, covering _sentinel_settled's OTHER rejection
+# arm. Its predicate rejects two things -- the empty string (`''`) and any
+# non-numeric byte (`*[!0-9]*`) -- and the empty arm is what the never-settling
+# and late-settling tests exercise. Without this test, deleting `*[!0-9]*` from
+# the case glob leaves the whole suite green while `exit garbage` /
+# `--code garbage` reproduces the very class of crash this task closes: bash's
+# "numeric argument required" -> exit 2, and an argparse rejection that leaves
+# the record un-updated. Non-numeric content is what a truncated or corrupt
+# read looks like when it is not zero-length.
+
+
+def test_non_numeric_sentinel_is_rejected_like_an_empty_one(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A sentinel holding non-numeric content must yield 127, not bash's 2.
+
+    Same deterministic `custom-term` path as the never-settling test, but the
+    planting terminal writes the garbage SYNCHRONOUSLY (delay=0) before
+    exiting, so the content is already in place the first time finish() reads
+    it. A backgrounded writer would race finish()'s first poll and could pass
+    by reading the file while still empty -- i.e. through the `''` arm, never
+    touching the arm this test exists to cover.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    GARBAGE = "garbage"
+    _write_sentinel_planting_terminal(
+        bin_dir, "custom-term", delay=0, code=GARBAGE
+    )
+    env = _sentinel_test_env(bin_dir, "custom-term", tmp_path)
+
+    result = _run_spawn(env, tmp_path)
+
+    stderr = result.stderr.decode()
+    context = f"planted sentinel content={GARBAGE!r}, rc={result.returncode}\nstderr:\n{stderr}"
+
+    assert b"numeric argument required" not in result.stderr, (
+        f"finish() must never run `exit` on non-numeric sentinel content -- "
+        f"the `*[!0-9]*` rejection arm of _sentinel_settled is what prevents "
+        f"it.\n{context}"
+    )
+    assert b"invalid int value" not in result.stderr, (
+        f"session_registry must never be handed a non-integer --code.\n{context}"
+    )
+    assert result.returncode == 127, (
+        f"a sentinel that never settles to a NUMERIC code must yield the "
+        f"documented 127, never bash's usage code 2.\n{context}"
+    )
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert record.exit_code == 127, (
+        f"the session record must carry a well-formed integer exit code, got "
+        f"{record.exit_code!r} (status {record.status}).\n{context}"
+    )
+
+
+# The counterpart to the never-settling test, and the reason step-2's fallback
+# alone is not the whole fix: degrading EVERY racing spawn to 127 would
+# silently destroy the session's real exit code -- a liveness-signal regression traded
+# for the crash. This is the faithful reproduction of the production race:
+# the code IS on its way, and a reader that gives up on the first empty read
+# throws it away. MEASURED against the pre-fix script this exits 2; against
+# the content-aware read alone it exits 127; only a bounded re-poll recovers 3.
+
+
+def test_late_settling_sentinel_recovers_the_sessions_own_code_not_127(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A sentinel that settles late must yield the session's OWN code.
+
+    Same deterministic `custom-term` path as the test above, but the planting
+    terminal backgrounds a delayed `echo 3 > "$s"` after creating the file
+    empty -- so finish() observes exactly the production window (sentinel
+    exists, content not yet there) with a real code arriving shortly after.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+
+    # Timing budget -- DERIVED, not guessed, and deliberately not inherited.
+    #
+    # WRITE_DELAY is a *deliberately injected* wall-clock sleep inside the
+    # fake terminal: it does NOT stretch with host load, which is exactly the
+    # situation _wait_for_path_scaled's `extra_secs` parameter documents. The
+    # grace it must fit inside DOES need to stretch, so it is set explicitly
+    # via _load_scaled_grace(5) rather than inheriting _base_env's fixed
+    # SPAWN_LAUNCH_GRACE_SECS="2" pin. On an idle host that floor gives 5s
+    # against a 0.5s write -- 10x margin -- and it only grows under load.
+    WRITE_DELAY = 0.5
+    SESSION_EXIT_CODE = 3
+
+    _write_sentinel_planting_terminal(
+        bin_dir, "custom-term", delay=WRITE_DELAY, code=SESSION_EXIT_CODE
+    )
+    env = _sentinel_test_env(bin_dir, "custom-term", tmp_path)
+    grace = _load_scaled_grace(5)
+    env["SPAWN_LAUNCH_GRACE_SECS"] = str(grace)
+
+    # `grace` is ALREADY load-scaled, so per _run_spawn's docstring this must
+    # be passed with scale_timeout=False -- scaling it a second time would
+    # discard this site's own derivation instead of honoring it. The margin
+    # covers the grace the script may spend re-polling plus the injected
+    # sleep plus normal subprocess startup.
+    result = _run_spawn(
+        env,
+        tmp_path,
+        timeout=int(grace + WRITE_DELAY + _spawn_run_budget(20)),
+        scale_timeout=False,
+    )
+
+    stderr = result.stderr.decode()
+    context = (
+        f"rc={result.returncode}, grace={grace}s, injected write delay="
+        f"{WRITE_DELAY}s\nstderr:\n{stderr}"
+    )
+
+    # Same guards as the never-settling test: neither consumer may ever see
+    # the empty string, whatever else this run does.
+    assert b"numeric argument required" not in result.stderr, (
+        f"finish() must never run `exit \"\"`.\n{context}"
+    )
+    assert b"invalid int value: ''" not in result.stderr, (
+        f"session_registry must never be handed an empty --code.\n{context}"
+    )
+
+    assert result.returncode == SESSION_EXIT_CODE, (
+        f"a sentinel that settles within the launch grace must yield the "
+        f"session's OWN exit code {SESSION_EXIT_CODE} -- not 127 (the "
+        f"content-aware read giving up on the first empty poll, destroying a "
+        f"live exit code) and not 2 (the pre-fix empty-string crash).\n"
+        f"{context}"
+    )
+
+    fleet_root = pathlib.Path(env["CLAUDE_FLEET_ROOT"])
+    record_path = _find_one_record(fleet_root)
+    record = session_registry.SessionRecord.from_json(record_path.read_text())
+    assert record.exit_code == SESSION_EXIT_CODE, (
+        f"the session record must carry the session's own exit code, got "
+        f"{record.exit_code!r} (status {record.status}).\n{context}"
+    )
+
+
+# The WRITER half of task 5137. The two tests above harden the READER against
+# any writer we do not control; this one closes the window at the source for
+# OUR payload, which is what makes it correct to leave all eight `-f`
+# existence gates in spawn-claude.sh untouched: a same-directory rename means
+# the sentinel PATH only ever appears fully written, so every one of them is
+# content-correct without being rewritten.
+#
+# Asserted at RUNTIME via a PATH-shadowed `mv` recorder, not by grepping the
+# script. The two obvious alternatives both fail: grepping the source for
+# `mv`/`.tmp` pins the author's wording rather than the program's behaviour
+# and would pass against a commented-out line; polling the sentinel path
+# during a real spawn hoping to catch it existing-and-empty can only fail
+# probabilistically, so it could never go reliably RED -- a flaky test
+# shipped to fix a flake. The recorder observes an actual runtime fact and is
+# deterministic in both directions.
+
+
+# Terminator line between recorded `mv` calls. Argv is logged ONE ITEM PER
+# LINE rather than space-joined, so a path containing whitespace cannot be
+# silently re-split into two fields by the parse below -- pytest's tmp_path is
+# derived from the test name and is safe today, but that is not a property
+# this file controls.
+_MV_CALL_END = "--end-of-mv-call--"
+
+
+def _write_mv_recorder(bin_dir: pathlib.Path, log: pathlib.Path) -> None:
+    """Shadow `mv` on the payload's PATH, recording argv then renaming for real.
+
+    _base_env already puts *bin_dir* first on PATH and the payload inherits
+    it, so this shim sees every rename the payload performs.
+
+    The real `mv` is resolved ONCE here with shutil.which and interpolated as
+    an absolute path, rather than re-resolved in the shim against a pinned
+    ``PATH=/usr/bin:/bin``. That pin is not where `mv` lives on every platform
+    this repo could run on (a Nix-style tree, say), and there the payload's
+    publish would break and surface as an unrelated exit-code mismatch. An
+    absolute exec also cannot recurse back into this shim, which is what the
+    PATH reset was for.
+
+    Both interpolated paths are shell-quoted; see _MV_CALL_END for why argv is
+    recorded one item per line.
+    """
+    real_mv = shutil.which("mv")
+    assert real_mv is not None, "no real `mv` on PATH to delegate to"
+    # shutil.which reads THIS process's PATH, which never contains bin_dir
+    # (only the spawn subprocess's env does) -- assert it anyway, since a
+    # shim exec'ing itself would fork-bomb rather than fail a assertion.
+    assert not real_mv.startswith(str(bin_dir)), (
+        f"the recorder must delegate to the real mv, not itself: {real_mv!r}"
+    )
+    p = bin_dir / "mv"
+    p.write_text(
+        "#!/usr/bin/env bash\n"
+        "{ printf '%s\\n' \"$@\"; printf '%s\\n' "
+        f"{shlex.quote(_MV_CALL_END)}; }} >> {shlex.quote(str(log))}\n"
+        f"exec {shlex.quote(real_mv)} \"$@\"\n"
+    )
+    p.chmod(0o755)
+
+
+def _read_mv_calls(log: pathlib.Path) -> list[list[str]]:
+    """Parse _write_mv_recorder's log into one argv list per recorded call."""
+    if not log.exists():
+        return []
+    calls: list[list[str]] = []
+    current: list[str] = []
+    for line in log.read_text().splitlines():
+        if line == _MV_CALL_END:
+            calls.append(current)
+            current = []
+        else:
+            current.append(line)
+    return calls
+
+
+def test_payload_publishes_sentinel_by_atomic_rename(tmp_path: pathlib.Path) -> None:
+    """The payload must publish the sentinel by rename, never by a direct `>`.
+
+    A NORMAL happy-path spawn -- the real foreground terminal and a fake
+    claude exiting 3 -- so the genuine $inner EXIT trap runs and the assertion
+    is about the shipped payload, not a stand-in.
+    """
+    bin_dir = _make_bin_dir(tmp_path)
+    SESSION_EXIT_CODE = 3
+    _write_fake_claude(bin_dir, exit_code=SESSION_EXIT_CODE)
+    _write_foreground_terminal(bin_dir, "xterm")
+    mv_log = tmp_path / "mv_argv"
+    _write_mv_recorder(bin_dir, mv_log)
+    env = _sentinel_test_env(bin_dir, "xterm", tmp_path)
+
+    result = _run_spawn(env, tmp_path)
+
+    assert result.returncode == SESSION_EXIT_CODE, (
+        f"the atomic publish must be additive to the exit-code contract: "
+        f"expected {SESSION_EXIT_CODE}, got {result.returncode}\n"
+        f"stderr: {result.stderr.decode()}"
+    )
+
+    recorded = _read_mv_calls(mv_log)
+    # The destination is `mv`'s last argv item, so match on that alone -- no
+    # re-splitting of a joined line, and no ambiguity with the `.done.tmp`
+    # source (which this pattern's anchored `.done` end does not match).
+    sentinel_renames = [
+        call
+        for call in recorded
+        if call and re.search(r"spawn-claude-\w+\.done$", call[-1])
+    ]
+    assert len(sentinel_renames) == 1, (
+        f"the payload must publish the sentinel with exactly one rename; "
+        f"recorded mv calls: {recorded!r}\n"
+        f"an EMPTY log is the pre-fix state: the payload wrote the sentinel "
+        f"directly with `>`, which creates and truncates before the write "
+        f"lands, so any `-f` gate can observe it existing and zero-length."
+    )
+
+    # Source and destination must be the tmp path and the sentinel itself --
+    # i.e. the sentinel appears via rename, never via a direct write to its
+    # own path, and the rename is same-directory (hence atomic).
+    fields = sentinel_renames[0]
+    assert len(fields) >= 2, (
+        f"a rename must carry at least a source and a destination, got "
+        f"{fields!r}"
+    )
+    dest = fields[-1]
+    source = fields[-2]
+    assert dest.endswith(".done"), (
+        f"the rename DESTINATION must be the sentinel path, got {dest!r} "
+        f"(full argv: {sentinel_renames[0]!r})"
+    )
+    assert source != dest and source.startswith(dest), (
+        f"the rename SOURCE must be a different path prefixed by the "
+        f"sentinel (a same-directory temp), got source={source!r} "
+        f"dest={dest!r}"
+    )
+
+    # A failed or half-done publish must not leak: nothing may survive.
+    spawn_tmp = pathlib.Path(env["TMPDIR"])
+    leftovers = list(spawn_tmp.glob("spawn-claude-*.done.tmp"))
+    assert not leftovers, (
+        f"the two-step publish must leave no temp file behind, found "
+        f"{leftovers!r}"
     )

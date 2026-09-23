@@ -17,13 +17,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from orchestrator.harness import Harness
-from orchestrator.merge_queue_store import MergeQueueStore
+from orchestrator.merge_queue_store import MergeQueueStore, PersistedMergeRequest
 
 # ---------------------------------------------------------------------------
 # Shared harness builder — mirrors test_harness_merge_registry_wiring
@@ -64,13 +66,32 @@ class TestHarnessInitCreatesMergeStore:
             f'Expected MergeQueueStore, got {type(h._merge_store)!r}'
         )
 
-    def test_merge_store_path(self, mock_orch_config, tmp_path: Path):
-        """_merge_store._path == project_root / data / orchestrator / merge_queue.json."""
+    def test_merge_store_reads_the_canonical_journal(
+        self, mock_orch_config, tmp_path: Path,
+    ):
+        """The harness's store is the one at project_root/data/orchestrator/.
+
+        Seeded through the journal FILE and read back through the store's
+        public ``load()``, so the derived path is pinned by what the store
+        actually reads rather than by its private ``_path``.  A harness that
+        derived any other path would load nothing here.
+        """
+        seeded = PersistedMergeRequest(
+            request_id='seed-1', task_id='T', branch='task/T',
+            worktree=str(tmp_path / 'wt'), pre_rebased=False, task_files=None,
+            snapshot_tip=None, generation=0, lane='merge', enqueued_at=0.0,
+        )
+        journal = tmp_path / 'data' / 'orchestrator' / 'merge_queue.json'
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        journal.write_text(
+            json.dumps({seeded.request_id: dataclasses.asdict(seeded)}),
+        )
+
         h = _build_harness(mock_orch_config)
 
-        expected_path = tmp_path / 'data' / 'orchestrator' / 'merge_queue.json'
-        assert h._merge_store._path == expected_path, (
-            f'Expected {expected_path!r}, got {h._merge_store._path!r}'
+        assert [r.request_id for r in h._merge_store.load()] == ['seed-1'], (
+            f'the harness store must read {journal}; '
+            f'loaded {h._merge_store.load()!r}'
         )
 
 

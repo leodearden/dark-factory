@@ -8,6 +8,10 @@ Two units live in that module:
   so no marker sweep can ever take a ``kind='cycle_summary'`` /
   ``record_type='ledger_stamp'`` mirror no matter how loose its Qdrant payload
   filter is.
+- :func:`is_protected_audit_record` — the sibling precision predicate added by
+  task 4375, consulted at the same choke point, so no marker sweep can take a
+  DELIBERATELY-PERMANENT audit-log record (``kind`` in
+  :data:`PROTECTED_AUDIT_KINDS`) that happens to carry the sweep's match key.
 - :func:`record_mem0_deletion_tombstone` — writes the queryable audit row that
   makes a designed eviction distinguishable from silent data loss (the defining
   signature of the recon-gate-165 / esc-165-1 finding).
@@ -24,9 +28,12 @@ import pytest
 
 from fused_memory.reconciliation.mem0_tombstone import (
     MEM0_TOMBSTONE_TTL_DAYS,
+    PROTECTED_AUDIT_KINDS,
     RECORD_KIND_MEM0_TOMBSTONE,
+    is_protected_audit_record,
     is_protected_mirror_record,
     record_mem0_deletion_tombstone,
+    record_mem0_deletion_tombstones,
 )
 
 _LOGGER = 'fused_memory.reconciliation.mem0_tombstone'
@@ -116,6 +123,98 @@ class TestIsProtectedMirrorRecord:
             summary_pool.CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE
             == recon_pool_map.CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE
         )
+
+
+# The exact live metadata shape measured on the autopilot_video records this
+# sweep destroyed (task 4375). It satisfies the ENTIRE Stage-1 relay contract —
+# flag_for_stage2, flag_type, run_id, source, task_id — so it is
+# indistinguishable from a genuine relay marker by every field except ``kind``.
+# That is why the discrimination has to be a ``kind`` predicate and cannot be a
+# payload filter over the relay contract's own keys.
+_LIVE_CADENCE_CHECK_SHAPE = {
+    'kind': 'cadence_check',
+    'flag_for_stage2': True,
+    'flag_type': 'task452_cadence_check_reminder',
+    'run_id': 'r1',
+    'source': 'recon-stage-memory_consolidator',
+    'task_id': '452',
+}
+
+
+class TestIsProtectedAuditRecord:
+    """The sibling audit-record predicate consulted by every marker sweep (task 4375)."""
+
+    @pytest.mark.parametrize(
+        'metadata',
+        [
+            {'kind': 'cadence_check'},
+            # Satisfying the full relay contract does NOT defeat the guard.
+            _LIVE_CADENCE_CHECK_SHAPE,
+        ],
+    )
+    def test_protected_payloads(self, metadata):
+        assert is_protected_audit_record(metadata) is True
+
+    @pytest.mark.parametrize(
+        'metadata',
+        [
+            # The 57%-majority shape: a genuine relay marker with NO ``kind``
+            # key at all (165 of the 288 records this sweep destroyed).
+            {'flag_for_stage2': True, 'task_id': 't1', 'flag_type': 'x', 'run_id': 'r1'},
+            {'kind': 'stage1_flag', 'flag_for_stage2': True, 'task_id': 't1'},
+            {'kind': 'stage1_flag_relay'},
+            {'kind': 'flag_marker'},
+            {'flag_for_stage2': True},
+            {},
+        ],
+    )
+    def test_ordinary_marker_payloads_are_not_protected(self, metadata):
+        assert is_protected_audit_record(metadata) is False
+
+    @pytest.mark.parametrize(
+        'metadata',
+        [
+            None,
+            'not-a-dict',
+            [],
+            42,
+            ['kind', 'cadence_check'],
+            object(),
+            {'kind': 123},
+            {'kind': None},
+            # UNHASHABLE kind. A naive ``metadata.get('kind') in frozenset``
+            # raises TypeError here, which would break the module's documented
+            # never-raises contract from inside the guard that exists to make
+            # the sweep safer. Mem0 metadata is JSON-shaped and nothing at the
+            # add_memory boundary constrains ``kind`` to a scalar.
+            {'kind': []},
+            {'kind': {}},
+        ],
+    )
+    def test_malformed_input_returns_false_without_raising(self, metadata):
+        """A marker sweep must never crash on a weird payload."""
+        assert is_protected_audit_record(metadata) is False
+
+    def test_module_constants(self):
+        assert isinstance(PROTECTED_AUDIT_KINDS, frozenset)
+        assert 'cadence_check' in PROTECTED_AUDIT_KINDS
+
+    def test_the_two_predicates_do_not_subsume_one_another(self):
+        """Each guard keeps its OWN attributable WARNING at the choke point.
+
+        If either predicate answered True for the other's pool, the sweep's
+        skip message would misattribute what it skipped — regressing the
+        diagnostic value task 3041 built the mirror WARNING for.
+        """
+        assert is_protected_audit_record({'kind': 'cycle_summary', 'record_type': 'ledger_stamp'}) is False
+        assert is_protected_mirror_record({'kind': 'cadence_check'}) is False
+        assert is_protected_mirror_record(_LIVE_CADENCE_CHECK_SHAPE) is False
+
+    def test_both_new_names_are_exported(self):
+        from fused_memory.reconciliation import mem0_tombstone
+
+        assert 'is_protected_audit_record' in mem0_tombstone.__all__
+        assert 'PROTECTED_AUDIT_KINDS' in mem0_tombstone.__all__
 
 
 # Probe run in a FRESH interpreter by TestReconPoolMapIsImportFreeLeaf: import
@@ -423,3 +522,163 @@ class TestRecordMem0DeletionTombstone:
         assert result is True
         record = ledger.upsert.await_args.args[0]
         assert datetime.fromisoformat(record.created_at).tzinfo is not None
+
+
+class TestTheReversePointer:
+    """`absorbed_by` — the survivor id that ate this record (task 3133).
+
+    The recon-gate-165 audit dead-end that motivated this: a consolidation
+    survivor correctly carried the FORWARD pointer
+    (`consolidated_from=<victim>`), but probing the DEAD id returned
+    `{'found': false}` with no tombstone at all. From the victim id alone
+    — the only id an auditor chasing a broken reference actually holds —
+    that deletion was indistinguishable from silent data loss.
+
+    Recorded as a first-class field rather than smuggled through
+    `victim_metadata`: `_VICTIM_IDENTITY_KEYS` is deliberately an
+    identity-only projection of what the VICTIM recorded about itself, and
+    a canonical id is not that. Routing it there would make the tombstone
+    misreport its own provenance and silently widen a projection whose
+    narrowness is a stated invariant.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_canonical_that_absorbed_the_victim_is_recorded(self):
+        memory_service, ledger = _svc_with_ledger()
+
+        await record_mem0_deletion_tombstone(
+            memory_service,
+            'dark_factory',
+            'mem-victim-uuid',
+            victim_metadata=_VICTIM_METADATA,
+            victim_created_at='2026-07-28T00:00:00+00:00',
+            deleter='consolidate_memories',
+            deleting_run_id='run-deleter',
+            absorbed_by='canonical-uuid',
+            now=_NOW,
+        )
+
+        payload = json.loads(ledger.upsert.await_args.args[0].payload_json)
+        assert payload['absorbed_by'] == 'canonical-uuid'
+        # It joins the existing fields rather than displacing any of them.
+        assert payload['deleter'] == 'consolidate_memories'
+        assert payload['deleting_run_id'] == 'run-deleter'
+        assert payload['deleted_at'] == _NOW.isoformat()
+        assert payload['created_at'] == '2026-07-28T00:00:00+00:00'
+        assert payload['kind'] == 'cycle_summary'
+
+    @pytest.mark.asyncio
+    async def test_absent_is_written_as_an_explicit_none(self):
+        """PRESENT-with-None, never omitted. The key must distinguish
+        "reaped by a GC sweep, nothing absorbed it" from a tombstone
+        written before this field existed — and only presence can carry
+        that, which is why the assertion is on the KEY, not on falsiness.
+        Matches how the identity projection already writes explicit `None`
+        for victim keys the record did not have."""
+        memory_service, ledger = _svc_with_ledger()
+
+        await record_mem0_deletion_tombstone(
+            memory_service,
+            'dark_factory',
+            'mem-victim-uuid',
+            victim_metadata=_VICTIM_METADATA,
+            victim_created_at='2026-07-28T00:00:00+00:00',
+            deleter='stage1_cycle_summary_trim',
+            deleting_run_id='run-deleter',
+            now=_NOW,
+        )
+
+        payload = json.loads(ledger.upsert.await_args.args[0].payload_json)
+        assert 'absorbed_by' in payload
+        assert payload['absorbed_by'] is None
+
+    @pytest.mark.asyncio
+    async def test_the_batch_form_stamps_every_victim_with_the_same_absorber(self):
+        """Batch-LEVEL by construction: every victim in one consolidation is
+        absorbed by the same canonical, so this is a property of the call,
+        not of each row."""
+        memory_service, ledger = _svc_with_ledger()
+        victims = [
+            {
+                'id': f'victim-{i}',
+                'metadata': _VICTIM_METADATA,
+                'created_at': '2026-07-28T00:00:00+00:00',
+            }
+            for i in range(3)
+        ]
+
+        written = await record_mem0_deletion_tombstones(
+            memory_service,
+            'dark_factory',
+            victims,
+            deleter='consolidate_memories',
+            deleting_run_id='run-deleter',
+            absorbed_by='canonical-uuid',
+            now=_NOW,
+        )
+
+        assert written == 3
+        records = ledger.upsert_many.await_args.args[0]
+        payloads = [json.loads(r.payload_json) for r in records]
+        assert [p['absorbed_by'] for p in payloads] == ['canonical-uuid'] * 3
+        assert [r.task_id for r in records] == ['victim-0', 'victim-1', 'victim-2']
+
+    @pytest.mark.asyncio
+    async def test_the_existing_sweeps_need_no_edit(self):
+        """BACK-COMPAT, called in the exact shape `summary_pool` and
+        `stages/task_knowledge_sync` use. The two live sweeps absorb
+        nothing, so the keyword is keyword-only with a `None` default and
+        the change is purely additive."""
+        memory_service, ledger = _svc_with_ledger()
+        victims = [
+            {
+                'id': 'victim-0',
+                'metadata': _VICTIM_METADATA,
+                'created_at': '2026-07-28T00:00:00+00:00',
+            }
+        ]
+
+        written = await record_mem0_deletion_tombstones(
+            memory_service,
+            'dark_factory',
+            victims,
+            deleter='stage1_flag_marker_gc_sweep',
+            deleting_run_id='run-deleter',
+            now=_NOW,
+        )
+
+        assert written == 1
+        payload = json.loads(ledger.upsert_many.await_args.args[0][0].payload_json)
+        assert payload['absorbed_by'] is None
+
+    @pytest.mark.asyncio
+    async def test_the_writer_stays_fail_safe_with_the_new_arg(self):
+        """No ledger wired => 0/False, no raise. This runs inside a delete
+        path; the new field must not have given it a way to blow up."""
+        memory_service = AsyncMock()
+        memory_service.recon_ledger = None
+
+        assert (
+            await record_mem0_deletion_tombstones(
+                memory_service,
+                'dark_factory',
+                [{'id': 'victim-0', 'metadata': {}, 'created_at': None}],
+                deleter='consolidate_memories',
+                deleting_run_id='run-deleter',
+                absorbed_by='canonical-uuid',
+            )
+            == 0
+        )
+        assert (
+            await record_mem0_deletion_tombstone(
+                memory_service,
+                'dark_factory',
+                'victim-0',
+                victim_metadata=None,
+                victim_created_at=None,
+                deleter='consolidate_memories',
+                deleting_run_id='run-deleter',
+                absorbed_by='canonical-uuid',
+            )
+            is False
+        )

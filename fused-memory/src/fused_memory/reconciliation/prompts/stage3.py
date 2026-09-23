@@ -204,7 +204,11 @@ stage='task_knowledge_sync')`
 it as missing.
 - `ledger_available: true` and `present: false` → the authoritative row is GENUINELY \
 ABSENT. Report it as missing: `category='missing_knowledge'`, `actionable=true`, \
-`suggested_action='reconstruct'`.
+`suggested_action='reconstruct'`. This is not a race you are seeing too early: both of \
+the write paths that precede this check have already had their turn — the stage's own \
+idempotent upsert, and the harness's write-recovered re-attempt with the REAL report, \
+which task 4186 moved ahead of this check (it previously ran after it, in the driver's \
+finally).
 - `ledger_available: false`, or the tool returns an error → INCONCLUSIVE (the ledger is \
 not wired, or the read failed). Do NOT conclude presence or absence from this path — \
 fall through to the FALLBACK below instead.
@@ -304,7 +308,25 @@ Confirm that `result['project_id']` equals the project under reconciliation \
 3. **Raise a `cross_project_routing` finding** if the stamped `project_id` does not match \
 the project under reconciliation — this signals that a wrong project_root was used \
 and the data is from another project. Include the offending task IDs in your description. \
-`cross_project_routing` is an allowed `category` value in the finding schema.
+`cross_project_routing` is an allowed `category` value in the finding schema. \
+**Pass `actionable=True` explicitly on this finding.** It reports corrupt data in hand, \
+not the informational "this work belongs elsewhere" routing note Stage 2 files with \
+`actionable=False`. Omitting `actionable` inherits a computed non-actionable default \
+(triggered by EITHER a null `task_id` OR a `cross_project` category prefix — this finding \
+trips both, so supplying a `task_id` alone would NOT restore it), which lets the finding \
+be dropped from `flagged_items` at read time if its citations all trace back to Stage 1.
+
+4. **Immediately cite the offending task on that finding** — \
+`mcp__recon-report__cite_task(run_id=<from Reconciliation Context>, \
+finding_id=<from add_finding>, project_id=<project_id>, task_id=<the sampled task_id>)`. \
+Required, not optional: a `cross_project_routing` finding whose `cited_tasks` is empty is \
+downgraded to `category='other'` / `flag_type='cross_project_info'` in the assembled report, \
+losing the routing signal outright. Cite the project under reconciliation first — it IS in \
+"Known Projects" (this cycle is bound to it), so cite_task resolves. If that returns \
+`task_not_found`, the sampled id exists only in the stamped foreign project: cite that \
+`(project_id, task_id)` pair instead, which resolves when the foreign project is itself \
+listed in "Known Projects" (an unlisted project_id returns `unknown_project` and attaches \
+nothing).
 
 Example verification (pseudocode — preferred get_statuses + get_task pattern):
 ```
@@ -326,9 +348,13 @@ sample_id = next(iter(statuses))
 task_result = get_task(id=sample_id, project_root="<this project's root>")
 expected_project_id = "<the project under reconciliation>"
 if task_result.get('project_id') != expected_project_id:
-    add_finding(run_id=<from Reconciliation Context>, category='cross_project_routing',
-                severity='serious',
-                description='get_task returned task from project ..., expected ...')
+    finding = add_finding(run_id=<from Reconciliation Context>, category='cross_project_routing',
+                          severity='serious', actionable=True,   # explicit: see bullet 3
+                          description='get_task returned task from project ..., expected ...')
+    # required (see bullet 4): with an empty cited_tasks this finding is downgraded to
+    # category='other' / flag_type='cross_project_info' in the assembled report
+    cite_task(run_id=<from Reconciliation Context>, finding_id=finding['finding_id'],
+              project_id=expected_project_id, task_id=sample_id)
 ```
 
 ## Cross-Project Task-Creation Corroboration (IMPORTANT — task 2525)

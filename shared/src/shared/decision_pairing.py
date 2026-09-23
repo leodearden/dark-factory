@@ -1,0 +1,281 @@
+"""THE owner of the plan-decision cross-pairing predicate (task 3967).
+
+DETECTION-ONLY: this module reports, and has no repair counterpart and no
+mutating entry point at all. :func:`scan_design_decisions` never assigns into
+the document it walks, and the CLI over it
+(``scripts/scan_plan_decision_pairing.py``) has no ``--apply`` or ``--repair``
+flag and never will. That is a contract, not an omission — see "Why there is no
+repair" below.
+
+## The damage class
+
+A ``design_decisions`` entry whose ``decision`` and ``rationale`` are each
+perfectly well-formed prose, but whose *association* is wrong: the rationale
+recorded under one decision-line actually argues for a different one. Both
+texts are intact. Nothing is malformed, no sentinel is present, no parser is
+upset.
+
+This is a DIFFERENT damage class from the one :mod:`shared.toolcall_markup`
+owns, and the two are disjoint at the detector. Measured over the 23 committed
+specimens' 46 strings, 34 carry no envelope literal at all, so
+``toolcall_markup.detect`` returns ``None`` and the write-time markup tripwire
+admits them. ``shared/tests/test_decision_pairing_containment.py`` pins that as
+an observation rather than an argument.
+
+Folding this predicate into :mod:`shared.toolcall_markup` was considered and
+rejected: that module owns an enumeration of ENVELOPE LITERALS, and a semantic
+predicate over prose is a different kind of thing. Keeping them apart preserves
+the one boundary the toolcall-markup PRD's INV-5 consolidation established.
+
+## The predicate is a CONJUNCTION
+
+An entry is reported when BOTH hold:
+
+1. its ``decision`` is start-anchored (leading whitespace tolerated,
+   case-insensitive) on one of :data:`HEADER_MARKERS`; **and**
+2. one of :data:`PAIRING_MARKERS` appears anywhere in ``decision`` **or**
+   ``rationale``.
+
+Dropping either conjunct costs real specimens, which is why both are pinned as
+load-bearing by their own tests:
+
+* Without the **start-anchor**, three separate entries in task 3209's plan that
+  merely use the word ``supersedes`` mid-sentence for a metadata edge kind are
+  swept in, as is task 3298's ``(restatement of decision #1 ...)`` named
+  parenthetically mid-prose, as is task 3692's plan — prose ABOUT another
+  plan's mis-pairing, which is the false positive the originating task
+  description acknowledged in its own phrase-list predicate.
+* Without the **pairing conjunct**, task 3382's decision #5 is swept in: it
+  opens ``SUPERSEDES decision #3`` and genuinely does supersede it, but it is a
+  design REVERSAL, not a mis-pairing.
+
+This module is the SINGLE OWNER of both marker tuples, of the two names it
+reads out of an entry (:data:`PAIRING_FIELDS`), of the plan key those entries
+live under (:data:`DESIGN_DECISIONS_KEY`), and of the accept/reject decision,
+exactly as :mod:`shared.toolcall_markup` owns the envelope literals (INV-5).
+No consumer re-spells any of them: the scanner script imports them, and
+:func:`scan_design_decisions` delegates every verdict to
+:func:`detect_mispairing` rather than re-implementing the predicate, so the
+walker and the entry predicate can never disagree about what counts.
+
+## Widenings, and the specimen each was added for
+
+Every relaxation below was forced by a real committed specimen the corpus
+replay caught, never guessed at in advance, and every one is a GENERAL RULE
+rather than a per-specimen carve-out. A per-specimen exception is exactly the
+drift the single-owner marker set exists to prevent.
+
+* **Hyphens in a pairing marker are OPTIONAL** (:func:`_hyphen_tolerant`).
+  Added for specimens ``3757[1]`` and ``4030[2]``, which both spell it
+  ``mispaired``, unhyphenated. Measured over the live corpus: the
+  hyphenated-only predicate finds 18 victim plans / 21 entries, the
+  hyphen-tolerant one 20 / 23 — the two specimens are 2 of the 20 victim
+  plans, so this is not a rounding difference.
+
+## Every count derived from this is a STRICT LOWER BOUND
+
+The predicate can only ever find a mis-pairing that a human or an agent
+NOTICED and then documented in a later entry. A mis-pairing nobody noticed
+leaves no trace at all — both texts are well-formed, so there is nothing to
+key on. Treat any number this module produces as a floor, never as a
+prevalence estimate, and never report it as "N mis-pairings exist".
+
+## Why there is no repair
+
+:func:`shared.toolcall_markup.repair` can exist because envelope damage leaves
+RESIDUE: the original argument text is still present, with parseable markup
+wrapped around it, so a repair is a slice of its own input. Neither
+precondition holds here. A mis-paired document carries both texts but no record
+of which belonged where; the association itself is what was lost, and it is not
+recoverable from the document. A "repair" would have to guess, and a guess
+written back into a plan is worse than the visible damage.
+
+Task 3692 reached the same conclusion from the other direction and deliberately
+asserted no test that task 3567's plan is repaired, despite that plan being
+named as its concrete damage specimen. That restraint is correct and this
+module inherits it.
+
+Symmetrically, no LOCAL DETERMINISTIC predicate can contain this at write time.
+A correct ``(decision, rationale)`` pair and a swapped one both arrive as clean,
+well-formed prose; nothing in the arguments distinguishes them. An LLM
+coherence check is the one thing that could, and the toolcall-markup PRD's
+decision D2 already rejected LLM mediation on this exact surface — the same
+model class that emits the defect would be sitting in the write path. So the
+correction entry an author appends after noticing is not merely the easiest
+signal to key on; it is the only machine-visible one there is.
+
+Remediation of anything this module finds is an author appending a correction,
+or the supersede mechanism task 3865 will add — never a bulk rewrite.
+"""
+from __future__ import annotations
+
+import re
+from typing import NamedTuple
+
+# ---------------------------------------------------------------------------
+# The literal marker sets. ONE owner (INV-5); no consumer re-spells these.
+# ---------------------------------------------------------------------------
+
+#: Correction headers, matched only at the START of a ``decision`` (leading
+#: whitespace tolerated, case-insensitive). Every one is observed in a live
+#: victim plan. Order is the match order, so a decision opening
+#: ``CORRECTION/RESTATEMENT`` reports ``CORRECTION``; no marker is a prefix of
+#: another, so the order is not otherwise load-bearing.
+HEADER_MARKERS: tuple[str, ...] = (
+    'CORRECTION',
+    'CORRECTED',
+    'RESTATEMENT',
+    'READ THIS INSTEAD',
+    'SUPERSEDES',
+)
+
+#: Explicit pairing language, matched anywhere in ``decision`` or ``rationale``,
+#: case-insensitively AND with every literal hyphen OPTIONAL (see
+#: :func:`_hyphen_tolerant`, and "Widenings" in the module docstring). This is
+#: the conjunct that separates a mis-pairing from a genuine supersession. Order
+#: is the match order and decides which marker a hit reports when a text carries
+#: more than one.
+PAIRING_MARKERS: tuple[str, ...] = (
+    'mis-paired',
+    'cross-paired',
+    'mis-titled',
+    'mis-attributed',
+    'recorded against the wrong',
+    'swapped',
+    'belongs to THIS decision',
+)
+
+#: The fields searched for pairing language, in the order searched. ``decision``
+#: is first so a hit's reported field is deterministic when both carry a marker.
+#:
+#: PUBLIC because the scanner script needs the same two names to look up the
+#: entry it is reporting on, and a second spelling there is exactly the drift
+#: the single-owner rule exists to prevent (INV-5) — the same argument as
+#: :data:`DESIGN_DECISIONS_KEY`. A consumer imports this tuple; it never
+#: re-spells the field names.
+PAIRING_FIELDS: tuple[str, ...] = ('decision', 'rationale')
+
+_HEADER_RES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (marker, re.compile(r'\s*' + re.escape(marker), re.IGNORECASE))
+    for marker in HEADER_MARKERS
+)
+
+def _hyphen_tolerant(marker: str) -> str:
+    """*marker* as a pattern in which every literal hyphen is OPTIONAL.
+
+    Spelled by splitting on the hyphen rather than by post-processing
+    :func:`re.escape`'s output, so it does not depend on whether that function
+    escapes ``-`` in the running Python.
+    """
+    return '-?'.join(re.escape(part) for part in marker.split('-'))
+
+
+_PAIRING_RES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (marker, re.compile(_hyphen_tolerant(marker), re.IGNORECASE))
+    for marker in PAIRING_MARKERS
+)
+
+
+class MispairingHit(NamedTuple):
+    """One self-documented mis-pairing, naming the evidence that found it.
+
+    ``header`` and ``marker`` are the module's own declared literals, not the
+    matched text, so a triager reading a report never has to log-scrape which
+    literal fired (INV-2). ``field`` names which of ``decision``/``rationale``
+    carried the pairing marker. ``index`` is the 0-based position in the plan's
+    ``design_decisions`` list, and is ``None`` for an entry-level check made
+    outside a document walk.
+    """
+
+    header: str
+    marker: str
+    field: str
+    index: int | None = None
+
+
+def _match_header(decision: object) -> str | None:
+    """The declared header marker *decision* is start-anchored on, if any."""
+    if not isinstance(decision, str):
+        return None
+    for marker, pattern in _HEADER_RES:
+        if pattern.match(decision) is not None:
+            return marker
+    return None
+
+
+def _match_pairing(decision: object, rationale: object) -> tuple[str, str] | None:
+    """The first ``(marker, field)`` carrying pairing language, if any."""
+    for field, value in zip(PAIRING_FIELDS, (decision, rationale), strict=True):
+        if not isinstance(value, str):
+            continue
+        for marker, pattern in _PAIRING_RES:
+            if pattern.search(value) is not None:
+                return marker, field
+    return None
+
+
+def detect_mispairing(decision: object, rationale: object) -> MispairingHit | None:
+    """Report a self-documented mis-pairing in one ``design_decisions`` entry.
+
+    Pure, synchronous and TOTAL: it never raises, for any input, including
+    ``None`` and non-``str`` values. That is load-bearing rather than defensive
+    — the scanner calls it over plan documents nobody validated, and a detector
+    that raises is a detector that is switched off.
+
+    Both conjuncts are required. The header conjunct is anchored on *decision*
+    ALONE, so a non-``str`` decision can never produce a hit however the
+    rationale reads.
+
+    Returns the :class:`MispairingHit` naming both matched markers, or ``None``.
+    """
+    header = _match_header(decision)
+    if header is None:
+        return None
+    pairing = _match_pairing(decision, rationale)
+    if pairing is None:
+        return None
+    marker, field = pairing
+    return MispairingHit(header=header, marker=marker, field=field)
+
+
+#: The plan key holding the entries this module walks. Named once so the walker
+#: and the scanner script cannot drift on where decisions live.
+DESIGN_DECISIONS_KEY = 'design_decisions'
+
+
+def scan_design_decisions(plan: object) -> list[MispairingHit]:
+    """Every self-documented mis-pairing in *plan*, in ascending index order.
+
+    READ-ONLY BY CONSTRUCTION: it never assigns into *plan* or into any nested
+    item, and returns a fresh list each call. The scanner hands this live plan
+    documents that a running task may be reading, so a walker that normalized a
+    field in passing would be mutating runtime state.
+
+    TOTAL for adversarial shapes, mirroring
+    ``orchestrator.mcp.plan_tools._walk_repairable``'s guard set so the two
+    walkers agree on what an adversarial plan means: a non-dict *plan*, a
+    missing or non-list ``design_decisions``, a non-dict item, and an absent or
+    non-``str`` field are all skipped rather than raising. *plan* is whatever
+    ``json.loads`` returned from a plan file, so its top-level shape is as
+    untrusted as its entries.
+
+    A skipped item still CONSUMES its index: a reported index always addresses
+    the entry a reader will find at that position in the file.
+
+    Every accept/reject decision DELEGATES to :func:`detect_mispairing` rather
+    than re-implementing the predicate, so the walker and the entry predicate
+    can never disagree about what counts (INV-5).
+    """
+    if not isinstance(plan, dict):
+        return []
+    entries = plan.get(DESIGN_DECISIONS_KEY)
+    if not isinstance(entries, list):
+        return []
+    hits: list[MispairingHit] = []
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            continue
+        hit = detect_mispairing(entry.get('decision'), entry.get('rationale'))
+        if hit is not None:
+            hits.append(hit._replace(index=index))
+    return hits

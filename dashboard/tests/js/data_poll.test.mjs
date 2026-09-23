@@ -28,9 +28,21 @@
 // against pre-seam data.js too, which is what step-1's RED depends on.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
+
+// The UI's own reader of the map data.js publishes. Imported so the recovery
+// test below can assert what an OPERATOR sees, not merely what the map holds
+// — a static import is safe here (unlike data.js, this module touches no
+// browser global at load; its window assignment is typeof-guarded).
+import staleness from '../../src/dashboard/static/redux/endpoint_staleness.js';
+
+const { staleNoticesForTab } = staleness;
 
 const MODULE_SPECIFIER = '../../src/dashboard/static/redux/data.js';
+const DATUM_MODULE_SPECIFIER = '../../src/dashboard/static/redux/datum.js';
 const EXPECTED_FUNCTION_NAMES = [
   'endpointsFor',
   'applyKey',
@@ -40,17 +52,32 @@ const EXPECTED_FUNCTION_NAMES = [
   'startPolling',
   'createPollState',
   'pollKey',
+  'datumFor',
+  'requestOnDemand',
 ];
 
 // Full DF_DATA key set (data.js:41-127) — initialised so the first render
 // before fetch completes cannot crash any component reading DF_DATA.*.
 const EXPECTED_DF_DATA_KEYS = [
   'PROJECTS', 'AGENTS', 'ORCHESTRATORS', 'ORCHESTRATORS_SPARK',
-  'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS', 'DONE_COUNTS',
+  'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
+  'TASKS_DEGRADED_PROJECTS', 'TASKS_PROJECT_COUNT', 'DONE_COUNTS',
   'PERFORMANCE', 'MEMORY_STATUS', 'MEMORY_TIMESERIES', 'MEMORY_OPS_BREAKDOWN',
   'RECON_STATE', 'MERGE_QUEUE', 'COSTS', 'BURNDOWN', 'BURNDOWN_BY_PROJECT',
   'CURATOR_STATE', 'ESCALATIONS', 'ESCALATION_ANALYTICS', 'SCHEDULER',
   'MEMORY_EVALS',
+  // Per-endpoint staleness, published by refreshOne (task 4884, #4791).
+  // Nested under DF_DATA alongside __loaded rather than added as a second
+  // global, and seeded here for the same reason every domain key is: the
+  // first render happens before any fetch resolves, and a consumer reading
+  // DF_DATA.__stale[path] must not have to guard the container itself.
+  '__stale',
+  // Per-endpoint receipts, published by refreshOne on the SUCCESS path only
+  // (task 5588). Where __stale records ATTEMPT history, this records the
+  // PROVENANCE of the values now sitting in DF_DATA — which is exactly why it
+  // must NOT advance on a failure: that is what makes a wedged endpoint's
+  // tiles keep ageing on screen instead of resetting to "just received".
+  '__receipt',
 ];
 
 // Number of rows in endpointsFor() (data.js:16-34). Several tests below assert
@@ -61,6 +88,38 @@ const EXPECTED_DF_DATA_KEYS = [
 // test, because scattered copies is what went stale when the memory-evals
 // endpoint was added.
 const EXPECTED_ENDPOINT_COUNT = 14;
+
+// The two shared registry specs. Declared here as literals rather than read off
+// data.js so the reshape is pinned against a stated expectation instead of
+// against itself.
+const PLAIN_SPEC = { kind: 'plain' };
+const DATUM_SPEC = { kind: 'datum' };
+
+// Every DF_DATA key any endpoint row names, as one sorted list. The registry
+// reshape (array of key names -> object of key name to spec) is exactly the
+// kind of edit that can silently DROP a key — an object literal with a
+// duplicated or mistyped name loses a row with no error anywhere — and a
+// dropped key means a tab that simply stops updating. Stated as a literal
+// because deriving it from endpointsFor would be deriving the expectation from
+// the thing under test.
+const EXPECTED_ENDPOINT_KEYS = [
+  'ACTIVE_TASKS', 'AGENTS', 'BURNDOWN', 'BURNDOWN_BY_PROJECT', 'COSTS',
+  'CURATOR_STATE', 'DONE_COUNTS', 'ESCALATIONS', 'ESCALATION_ANALYTICS',
+  'MEMORY_EVALS', 'MEMORY_OPS_BREAKDOWN', 'MEMORY_STATUS', 'MEMORY_TIMESERIES',
+  'MERGE_QUEUE', 'ORCHESTRATORS', 'ORCHESTRATORS_SPARK', 'PERFORMANCE',
+  'PROJECTS', 'RECON_STATE', 'SCHEDULER', 'TASKS_COUNT_UNKNOWN_PROJECTS',
+  'TASKS_DEGRADED_PROJECTS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
+  'TASKS_PROJECT_COUNT',
+];
+
+// A five-key wire envelope, as data/datum.py::Datum.to_wire() emits one.
+const SERVED_DATUM = Object.freeze({
+  value: { total: 9 },
+  as_of: '2026-09-20T09:00:00+00:00',
+  state: 'lower_bound',
+  reason: 'window truncated at 500 rows',
+  freshness_bound_seconds: 60,
+});
 
 // Loads data.js fresh against a shimmed browser-ish global. Installs
 // `globalThis.window` (a bare object recording dispatched events) and a
@@ -88,7 +147,13 @@ function loadDataJs({ fetchStub } = {}) {
   const events = [];
   const fetchCalls = [];
   const intervalCalls = [];
-  const win = { dispatchEvent: ev => events.push(ev) };
+  // DF_ENDPOINT_STALENESS is installed for datum.js, which destructures
+  // formatAge off it at module scope; datum.js is then loaded through the same
+  // shim so it can publish DF_DATUM, which data.js in turn destructures at
+  // module scope. index.html gives them exactly this order —
+  // endpoint_staleness.js -> datum.js -> data.js — and test_index_html.py pins
+  // both edges.
+  const win = { dispatchEvent: ev => events.push(ev), DF_ENDPOINT_STALENESS: staleness };
   globalThis.window = win;
   globalThis.fetch = (url, init) => {
     fetchCalls.push({ url, init });
@@ -97,6 +162,9 @@ function loadDataJs({ fetchStub } = {}) {
   };
 
   const require = createRequire(import.meta.url);
+  const datumResolved = require.resolve(DATUM_MODULE_SPECIFIER);
+  delete require.cache[datumResolved];
+  require(DATUM_MODULE_SPECIFIER);
   const resolved = require.resolve(MODULE_SPECIFIER);
   delete require.cache[resolved];
 
@@ -929,7 +997,7 @@ test('preserved behaviour: a thrown fetch error keeps the prior DF_DATA value an
   try {
     const state = api.createPollState();
     const deps = { fetchImpl: () => Promise.reject(new Error('boom')), now: () => 0 };
-    await api.refreshOne(FLAKY_ENDPOINT_PATH, ['CURATOR_STATE'], state, deps);
+    await api.refreshOne(FLAKY_ENDPOINT_PATH, { CURATOR_STATE: PLAIN_SPEC }, state, deps);
   } finally {
     console.warn = originalWarn;
   }
@@ -951,7 +1019,7 @@ test('preserved behaviour: a non-ok (503) response also keeps the prior DF_DATA 
 
   const state = api.createPollState();
   const deps = { fetchImpl: () => Promise.resolve({ ok: false, status: 503, json: async () => ({}) }), now: () => 0 };
-  await api.refreshOne(FLAKY_ENDPOINT_PATH, ['CURATOR_STATE'], state, deps);
+  await api.refreshOne(FLAKY_ENDPOINT_PATH, { CURATOR_STATE: PLAIN_SPEC }, state, deps);
 
   assert.deepEqual(
     win.DF_DATA.CURATOR_STATE,
@@ -1052,4 +1120,1050 @@ test("preserved behaviour: refreshDFData(win) updates the ?window= param on the 
       `the flow-control state for ${path} must be the SAME object across a chip change (path-keyed, not reset)`,
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+// Per-endpoint staleness publication (task 4884, #4791)
+//
+// The 2026-08-27 incident ran 19.8h with the dashboard serving a fully
+// rendered UI whose numbers had stopped advancing. Keeping the prior values
+// on failure is deliberate (see the keep-last-good tests above) — the defect
+// is that nothing RECORDED that they were old, so no consumer could say so.
+// These tests pin the producer half: refreshOne publishes, per endpoint PATH,
+// how many consecutive attempts have failed and when the last success landed.
+// endpoint_staleness.js holds the decision of what to do with that;
+// dashboard/tests/js/endpoint_staleness.test.mjs covers it.
+// ---------------------------------------------------------------------------
+
+// The contract constants, stated as literals rather than read back out of the
+// module under test. data.js prefers window.DF_ENDPOINT_STALENESS's threshold
+// when that module has loaded and falls back to its own literal otherwise
+// (data.js is the FIRST classic script in index.html, so it must not gain a
+// hard load-order dependency on a later one); under this node harness the
+// window shim carries no DF_ENDPOINT_STALENESS, so the fallback is what runs.
+// endpoint_staleness.test.mjs asserts the two agree.
+const STALE_FAILURE_THRESHOLD = 3;
+const STALE_TIMEOUT_MS = 5000;
+
+const CURATOR_PATH = '/api/v2/dashboard/curator';
+const COSTS_PATH = '/api/v2/dashboard/costs';
+
+const DATA_JS_SOURCE = fs.readFileSync(
+  path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    '../../src/dashboard/static/redux/data.js',
+  ),
+  'utf8',
+);
+
+test('staleness: __stale is seeded as an empty object alongside __loaded', () => {
+  const { window: win } = loadDataJs();
+
+  assert.deepEqual(win.DF_DATA.__stale, {}, 'DF_DATA.__stale must be seeded as {}');
+  assert.ok(win.DF_DATA.__loaded, 'DF_DATA.__loaded must still be seeded');
+});
+
+test('staleness: a successful refresh publishes failures 0 and the success instant', async () => {
+  const fetchImpl = () => Promise.resolve({ ok: true, json: async () => ({}) });
+  const { api, window: win } = loadDataJs({ fetchStub: fetchImpl });
+
+  const state = api.createPollState();
+  const T = 1_700_000_000_000;
+  const deps = { fetchImpl, now: () => T, random: () => 0, sleep: () => Promise.resolve() };
+
+  await api.refreshDFData(undefined, { state, deps, jitterMaxMs: 0 });
+
+  const entry = win.DF_DATA.__stale[CURATOR_PATH];
+  assert.ok(entry, `nothing published for ${CURATOR_PATH}`);
+  assert.equal(entry.failures, 0);
+  assert.equal(entry.lastSuccessAt, T, 'lastSuccessAt must be the injected clock reading, not Date.now()');
+});
+
+test('staleness: entries are keyed by PATH, not URL, and survive a chip change', async () => {
+  // Same reason the flow-control state is path-keyed (see pollKey): the four
+  // ?window= endpoints change URL on every chip click, so a URL-keyed map
+  // would strand the old entry and start a fresh one each time — exactly the
+  // shape in which a wedged endpoint's failure history disappears.
+  const fetchImpl = url =>
+    (pollKey(url) === COSTS_PATH
+      ? Promise.reject(new Error('simulated costs failure'))
+      : Promise.resolve({ ok: true, json: async () => ({}) }));
+  const { api, window: win } = loadDataJs({ fetchStub: fetchImpl });
+
+  const state = api.createPollState();
+  let t = 0;
+  const deps = { fetchImpl, now: () => t, random: () => 0, sleep: () => Promise.resolve() };
+  const opts = { state, deps, jitterMaxMs: 0 };
+
+  await api.refreshDFData(undefined, opts);           // timer path: failure 1
+  assert.equal(win.DF_DATA.__stale[COSTS_PATH].failures, 1);
+
+  // A chip change forces the windowed endpoints past their backoff. A forced
+  // attempt that fails deliberately does NOT escalate the timer path's
+  // backoff (see recordFailure), so the count holds rather than inflating on
+  // user clicks — but the entry must still be there, under the same key.
+  await api.refreshDFData('7d', opts);
+  assert.equal(win.DF_DATA.__stale[COSTS_PATH].failures, 1);
+
+  t = state.get(COSTS_PATH).nextAllowedAt;
+  await api.refreshDFData(undefined, opts);           // timer path: failure 2
+  assert.equal(win.DF_DATA.__stale[COSTS_PATH].failures, 2);
+
+  for (const key of Object.keys(win.DF_DATA.__stale)) {
+    assert.ok(!key.includes('?'), `__stale key ${key} must be query-stripped (pollKey), not a full URL`);
+  }
+});
+
+test('staleness: the last success instant survives a later failure', async () => {
+  // "Loaded once, but failing for N minutes" is precisely the state __loaded
+  // alone cannot express — it flips true on the first success and never back,
+  // so during the 19.8h wedge every key read as loaded and current.
+  let fail = false;
+  const fetchImpl = url =>
+    (pollKey(url) === CURATOR_PATH && fail
+      ? Promise.reject(new Error('simulated curator failure'))
+      : Promise.resolve({ ok: true, json: async () => ({}) }));
+  const { api, window: win } = loadDataJs({ fetchStub: fetchImpl });
+
+  const state = api.createPollState();
+  let t = 1_000;
+  const deps = { fetchImpl, now: () => t, random: () => 0, sleep: () => Promise.resolve() };
+  const opts = { state, deps, jitterMaxMs: 0 };
+
+  await api.refreshDFData(undefined, opts);
+  const successAt = win.DF_DATA.__stale[CURATOR_PATH].lastSuccessAt;
+  assert.equal(successAt, 1_000);
+
+  fail = true;
+  t = 500_000;
+  await api.refreshDFData(undefined, opts);
+
+  const entry = win.DF_DATA.__stale[CURATOR_PATH];
+  assert.equal(entry.failures, 1);
+  assert.equal(
+    entry.lastSuccessAt,
+    successAt,
+    'a failure must not overwrite or clear the recorded success instant — the age is derived from it',
+  );
+});
+
+test('staleness: a recovered endpoint clears its failures AND its notice', async () => {
+  // THE MOST LIKELY FAILURE MODE of a staleness indicator is a banner that
+  // never clears once the endpoint comes back — an operator who has been
+  // taught the indicator lies stops reading it, which costs exactly what the
+  // 19.8h wedge cost. Failure -> recovery is also the one path
+  // publishStaleness + `st.failures = 0` is not covered on at the PUBLISHED
+  // map level the UI actually reads.
+  let fail = true;
+  const fetchImpl = url =>
+    (pollKey(url) === CURATOR_PATH && fail
+      ? Promise.reject(new Error('simulated curator failure'))
+      : Promise.resolve({ ok: true, json: async () => ({}) }));
+  const { api, window: win } = loadDataJs({ fetchStub: fetchImpl });
+
+  const state = api.createPollState();
+  let t = 1_000;
+  const deps = { fetchImpl, now: () => t, random: () => 0, sleep: () => Promise.resolve() };
+  const opts = { state, deps, jitterMaxMs: 0 };
+
+  for (let i = 0; i < STALE_FAILURE_THRESHOLD; i += 1) {
+    await api.refreshDFData(undefined, opts);
+    t = Math.max(t + 1, state.get(CURATOR_PATH).nextAllowedAt);
+  }
+
+  const failing = win.DF_DATA.__stale[CURATOR_PATH];
+  assert.equal(failing.failures, STALE_FAILURE_THRESHOLD);
+  assert.equal(
+    staleNoticesForTab({ tab: 'curator', stale: win.DF_DATA.__stale, now: t }).length, 1,
+    'the tab must actually be reporting the endpoint stale before recovery is ' +
+      'asserted, or the clearing assertions below prove nothing',
+  );
+
+  fail = false;
+  await api.refreshDFData(undefined, opts);
+
+  const recovered = win.DF_DATA.__stale[CURATOR_PATH];
+  assert.equal(
+    recovered.failures, 0,
+    `the published failure count stayed at ${recovered.failures} after a 200 — ` +
+      'the streak must reset on success, or the indicator is permanent',
+  );
+  assert.equal(
+    recovered.lastSuccessAt, t,
+    'the recovery instant must be recorded, or the age keeps growing from the ' +
+      'pre-outage success and the notice would return with a stale age',
+  );
+  assert.deepEqual(
+    staleNoticesForTab({ tab: 'curator', stale: win.DF_DATA.__stale, now: t }),
+    [],
+    'the tab still renders a staleness notice for an endpoint that is serving 200s',
+  );
+});
+
+test('staleness: applyKey cannot clobber __stale (or __loaded)', () => {
+  // No server payload may overwrite the map that reports the server is
+  // failing. Two independent layers, both asserted:
+  //   STRUCTURAL — `__stale` is not an endpoint key, so the production call
+  //     site (`keys.forEach(k => applyKey(k, body[k]))`) can never reach it.
+  //   ENFORCED — applyKey itself refuses DF_DATA's `__`-prefixed internal
+  //     namespace, so the invariant does not depend on nobody ever naming a
+  //     server-side key that way.
+  const { api, window: win } = loadDataJs();
+
+  for (const keySpecs of Object.values(api.endpointsFor('24h'))) {
+    for (const k of Object.keys(keySpecs)) {
+      assert.ok(!k.startsWith('__'), `endpointsFor names an internal key: ${k}`);
+    }
+  }
+
+  win.DF_DATA.__stale[CURATOR_PATH] = { failures: 7, lastSuccessAt: 42 };
+  api.applyKey('__stale', {});
+  api.applyKey('__loaded', { PROJECTS: false });
+
+  assert.deepEqual(
+    win.DF_DATA.__stale[CURATOR_PATH],
+    { failures: 7, lastSuccessAt: 42 },
+    'applyKey must not replace the published staleness map',
+  );
+  assert.deepEqual(win.DF_DATA.__loaded, {}, 'applyKey must not replace the __loaded markers either');
+});
+
+test('staleness: past the threshold the per-attempt deadline drops to STALE_TIMEOUT_MS', async () => {
+  // THE SECOND-ORDER EFFECT. Three wedged endpoints each holding a socket for
+  // the full 30s deadline consumed about half the page's ~6-concurrent-
+  // connections-per-origin budget continuously, which is why the HEALTHY tabs
+  // also felt sluggish during the incident. Once an endpoint has demonstrated
+  // it is failing, there is nothing left to wait 30s for.
+  const armed = [];
+  const fetchImpl = () => Promise.reject(new Error('simulated failure'));
+  const { api } = loadDataJs({ fetchStub: fetchImpl });
+
+  const state = api.createPollState();
+  let t = 0;
+  const deps = {
+    fetchImpl,
+    now: () => t,
+    random: () => 0,
+    sleep: () => Promise.resolve(),
+    setTimeoutImpl: (fn, ms) => { armed.push(ms); return armed.length; },
+    clearTimeoutImpl: () => {},
+  };
+
+  for (let i = 0; i < STALE_FAILURE_THRESHOLD; i += 1) {
+    await api.refreshOne(CURATOR_PATH, {}, state, deps);
+    t = state.get(CURATOR_PATH).nextAllowedAt;
+  }
+
+  assert.equal(armed[0], 30000, 'the FIRST attempt must still use the full 30s deadline');
+  assert.equal(state.get(CURATOR_PATH).failures, STALE_FAILURE_THRESHOLD);
+
+  const before = armed.length;
+  await api.refreshOne(CURATOR_PATH, {}, state, deps);
+  assert.equal(
+    armed[before],
+    STALE_TIMEOUT_MS,
+    `an endpoint at ${STALE_FAILURE_THRESHOLD} consecutive failures must arm a ` +
+      `${STALE_TIMEOUT_MS}ms deadline, not 30000 — got ${armed[before]}`,
+  );
+});
+
+test('staleness: an explicit deps.timeoutMs still wins over both defaults', async () => {
+  // The reduced deadline is a DEFAULT selection, not an override, so
+  // `deps.timeoutMs ?? ...` must stay the outermost choice EVEN past the
+  // threshold — where STALE_TIMEOUT_MS would otherwise be chosen.
+  //
+  // Asserted behaviourally. The earlier form matched /deps\.timeoutMs\s*\?\?/
+  // against DATA_JS_SOURCE, which is a raw readFileSync with no comment
+  // stripping — and data.js carries that exact text inside a COMMENT, so
+  // deleting the production expression left this test green. The very defect
+  // this task found (STALE_TIMEOUT_MS dead in every browser) was a
+  // source-looks-right/behaviour-wrong gap, which makes a source regex the
+  // wrong instrument for the one claim that is directly executable.
+  const armed = [];
+  const fetchImpl = () => Promise.reject(new Error('simulated failure'));
+  const { api } = loadDataJs({ fetchStub: fetchImpl });
+
+  const state = api.createPollState();
+  let t = 0;
+  const deps = {
+    fetchImpl,
+    now: () => t,
+    random: () => 0,
+    sleep: () => Promise.resolve(),
+    setTimeoutImpl: (fn, ms) => { armed.push(ms); return armed.length; },
+    clearTimeoutImpl: () => {},
+  };
+
+  for (let i = 0; i < STALE_FAILURE_THRESHOLD; i += 1) {
+    await api.refreshOne(CURATOR_PATH, {}, state, deps);
+    t = state.get(CURATOR_PATH).nextAllowedAt;
+  }
+  assert.equal(state.get(CURATOR_PATH).failures, STALE_FAILURE_THRESHOLD);
+
+  const before = armed.length;
+  await api.refreshOne(CURATOR_PATH, {}, state, { ...deps, timeoutMs: 1234 });
+  assert.equal(
+    armed[before], 1234,
+    `an explicitly injected deps.timeoutMs must win even past the threshold; ` +
+      `got ${armed[before]} (${STALE_TIMEOUT_MS} means the reduced default ` +
+      'overrode the caller, 30000 means the full default did)',
+  );
+});
+
+test('staleness: DEFAULT_TIMEOUT_MS survives untouched as a parsable literal', () => {
+  // TWO Python structural tests parse this constant out of the shipped source
+  // with exactly this regex — test_tasks_budget.py and
+  // test_fetch_tasks_whole_operation_budget.py — where it is the ONLY ceiling
+  // on the server-side budgets. A rename or a computed expression makes both
+  // fail loudly, which is why STALE_TIMEOUT_MS had to be a NEW, separately
+  // named constant rather than a redefinition of this one.
+  const match = DATA_JS_SOURCE.match(/DEFAULT_TIMEOUT_MS\s*=\s*(\d+)/);
+  assert.ok(match, 'DEFAULT_TIMEOUT_MS is no longer a literal assignment in data.js');
+  assert.equal(Number(match[1]), 30000);
+
+  const stale = DATA_JS_SOURCE.match(/STALE_TIMEOUT_MS\s*=\s*(\d+)/);
+  assert.ok(stale, 'STALE_TIMEOUT_MS must be its own named literal constant');
+  assert.equal(Number(stale[1]), STALE_TIMEOUT_MS);
+  assert.notEqual(
+    Number(stale[1]),
+    Number(match[1]),
+    'the reduced deadline must actually be shorter than the default one',
+  );
+});
+
+test('staleness: the reduced deadline is reached through the PRODUCTION deps merge, not only a hand-built deps', async () => {
+  // REGRESSION FENCE for a defect the sibling test above structurally could
+  // NOT catch, found by step-19's real-browser check (task 4884, #4791).
+  //
+  // WHAT WAS MEASURED. Chrome 151 headless against the worktree's dashboard,
+  // /api/v2/dashboard/merge-queue wedged with `await asyncio.Event().wait()`.
+  // Correlating Network.requestWillBeSent with Network.loadingFailed gave four
+  // consecutive aborts at 30008 / 30164 / 30001 / 29981 ms — including the
+  // attempt that STARTED at failures === 3, which had to arm 5000. The banner
+  // rendered ("4 consecutive attempts failed"), so the threshold was crossed;
+  // only the deadline never dropped.
+  //
+  // WHY THE OTHER TEST PASSED ANYWAY. It calls refreshOne with a deps object
+  // it builds by hand, and that object has no `timeoutMs` key, so
+  // `deps.timeoutMs ?? (...)` falls through to the failures-based selection.
+  // Production never takes that path: refreshDFData merges DEFAULT_POLL_DEPS
+  // FIRST, and pinning `timeoutMs` there made `deps.timeoutMs` permanently
+  // 30000 — the ?? could never fall through, and the reduced deadline was
+  // dead code in every browser while green in the harness.
+  //
+  // So this test drives refreshDFData (the merge site) and injects everything
+  // EXCEPT timeoutMs, reproducing the production shape exactly. A deps default
+  // that re-pins timeoutMs turns it red.
+  const armed = [];
+  const fetchStub = () => Promise.reject(new Error('simulated failure'));
+  const { api } = loadDataJs({ fetchStub });
+
+  const state = api.createPollState();
+  let t = 0;
+  const deps = {
+    now: () => t,
+    random: () => 0,
+    sleep: () => Promise.resolve(),
+    setTimeoutImpl: (fn, ms) => { armed.push(ms); return armed.length; },
+    clearTimeoutImpl: () => {},
+    // DELIBERATELY NO timeoutMs — that is the whole point of this test.
+  };
+  const cycle = async () => {
+    await api.refreshDFData(undefined, { state, deps, jitterMaxMs: 0 });
+    // Clear backoff the way real wall-clock time does, so the next cycle is
+    // an ATTEMPT rather than a skip.
+    for (const st of state.values()) t = Math.max(t, st.nextAllowedAt);
+  };
+
+  for (let i = 0; i < STALE_FAILURE_THRESHOLD; i += 1) await cycle();
+
+  assert.equal(
+    armed[0], 30000,
+    'the FIRST attempt must still use the full 30s deadline through the production merge',
+  );
+  for (const st of state.values()) {
+    assert.ok(
+      st.failures >= STALE_FAILURE_THRESHOLD,
+      `every endpoint must be past the threshold before the assertion below; got ${st.failures}`,
+    );
+  }
+
+  const before = armed.length;
+  await cycle();
+  const past = armed.slice(before);
+  assert.ok(past.length > 0, 'the next cycle must arm at least one deadline');
+  for (const ms of past) {
+    assert.equal(
+      ms, STALE_TIMEOUT_MS,
+      'an endpoint past the threshold must arm a ' + STALE_TIMEOUT_MS + 'ms deadline through ' +
+        'the PRODUCTION deps merge, not 30000 — measured 4 consecutive ~30000ms aborts in ' +
+        'Chrome 151 because DEFAULT_POLL_DEPS pinned timeoutMs',
+    );
+  }
+
+  // The source-level trap, stated separately so the failure names the cause
+  // rather than only the symptom: DEFAULT_POLL_DEPS must not pin `timeoutMs`.
+  // Every other DEFAULT_POLL_DEPS entry is a genuine environment capability
+  // (a clock, an RNG, fetch, the timer pair); `timeoutMs` is a POLICY value
+  // the selection below it is supposed to choose, and pinning a policy in the
+  // defaults is what silently disabled it.
+  // Matched to the TERMINATING `};` at line start, not to the first `}`. The
+  // `[^}]*` form matched the whole literal only because every value in it
+  // happens to be brace-free today: one block-bodied arrow (or any object
+  // value) would truncate the capture and silently make the fence below
+  // vacuous rather than fail it.
+  const defaults = DATA_JS_SOURCE.match(/const DEFAULT_POLL_DEPS = \{[\s\S]*?\n\};/);
+  assert.ok(defaults, 'DEFAULT_POLL_DEPS must remain a greppable object literal');
+  for (const key of ['now', 'random', 'sleep', 'fetchImpl', 'setTimeoutImpl', 'clearTimeoutImpl']) {
+    assert.ok(
+      defaults[0].includes(key),
+      `the captured DEFAULT_POLL_DEPS block is missing ${key} — the match ` +
+        'truncated, so the timeoutMs fence below would be checking a fragment',
+    );
+  }
+  assert.ok(
+    !/timeoutMs/.test(defaults[0]),
+    'DEFAULT_POLL_DEPS must NOT pin timeoutMs — doing so makes `deps.timeoutMs ?? ...` ' +
+      'unreachable in the browser and turns STALE_TIMEOUT_MS into dead code (measured: ' +
+      '4 consecutive ~30000ms aborts in Chrome 151 with the banner already rendered)',
+  );
+});
+
+// ---------------------------------------------------------------------------
+// The datum registry (task 5588, PRD leaf gamma1)
+//
+// endpointsFor's rows become endpoint -> {KEY: SPEC}, where a spec declares
+// whether the wire delivers that key as a bare value or as a Datum envelope.
+// Today every polled key is 'plain', which is the HONEST description of the
+// wire: PRD leaf beta has not landed, so no payload carries a Datum yet. The
+// registry is the single place a later leaf flips a row.
+// ---------------------------------------------------------------------------
+
+test('registry: every endpoint row maps key names to declared specs', () => {
+  const { api } = loadDataJs();
+  const rows = api.endpointsFor('24h');
+
+  assert.equal(Object.keys(rows).length, EXPECTED_ENDPOINT_COUNT);
+  for (const [url, keySpecs] of Object.entries(rows)) {
+    assert.ok(
+      keySpecs && typeof keySpecs === 'object' && !Array.isArray(keySpecs),
+      `${url} must map key names to specs, not list them`,
+    );
+    for (const [key, spec] of Object.entries(keySpecs)) {
+      assert.ok(spec && typeof spec === 'object', `${url}/${key} has no spec`);
+      assert.ok(['datum', 'plain'].includes(spec.kind), `${url}/${key} kind ${spec.kind}`);
+    }
+  }
+});
+
+test('registry: the reshape drops no key — the union is exactly today\'s set', () => {
+  const { api } = loadDataJs();
+  const seen = new Set();
+  for (const keySpecs of Object.values(api.endpointsFor('24h'))) {
+    for (const key of Object.keys(keySpecs)) seen.add(key);
+  }
+  assert.deepEqual([...seen].sort(), EXPECTED_ENDPOINT_KEYS.slice().sort());
+});
+
+test('registry: every polled key is plain today, because no payload serves a Datum', () => {
+  // Not an aspiration — a description. Beta is what puts Datums on the wire;
+  // until it lands, declaring a polled row 'datum' would make applyKey refuse
+  // every real payload and freeze that tab at its seed values.
+  const { api } = loadDataJs();
+  for (const [url, keySpecs] of Object.entries(api.endpointsFor('24h'))) {
+    for (const [key, spec] of Object.entries(keySpecs)) {
+      assert.equal(spec.kind, 'plain', `${url}/${key} is declared datum-kinded`);
+    }
+  }
+});
+
+test('applyKey: a plain-kinded key still applies verbatim, in place for the stable arrays', () => {
+  const { api, window: win } = loadDataJs();
+  const projectsRef = win.DF_DATA.PROJECTS;
+
+  api.applyKey('PROJECTS', [{ id: 'p1' }], PLAIN_SPEC, { servedAt: null, receivedAt: 5 });
+  assert.equal(win.DF_DATA.PROJECTS, projectsRef, 'the captured array reference must survive');
+  assert.deepEqual(win.DF_DATA.PROJECTS, [{ id: 'p1' }]);
+
+  const costs = { summary: { total: 42 } };
+  api.applyKey('COSTS', costs, PLAIN_SPEC, { servedAt: null, receivedAt: 5 });
+  assert.equal(win.DF_DATA.COSTS, costs, 'a plain value is stored verbatim, receipt and all');
+});
+
+test('applyKey: a datum-kinded payload is stored as a COPY carrying its receipt', () => {
+  const { api, window: win } = loadDataJs();
+  const pristine = { ...SERVED_DATUM };
+
+  api.applyKey('DONE_COUNTS', SERVED_DATUM, DATUM_SPEC, { servedAt: 'S', receivedAt: 1234 });
+
+  const stored = win.DF_DATA.DONE_COUNTS;
+  assert.notEqual(stored, SERVED_DATUM, 'the wire payload must not be stored by reference');
+  assert.deepEqual(SERVED_DATUM, pristine, 'the wire payload was mutated');
+  assert.equal(stored._served_at, 'S');
+  assert.equal(stored._received_at, 1234);
+  assert.equal(stored.value.total, 9);
+  assert.equal(win.DF_DATA.__loaded.DONE_COUNTS, true);
+});
+
+// Runs *fn* with console.warn captured, and hands back what it said. Every
+// refusal below is EXPECTED to warn, so the capture keeps the suite's output
+// readable — and makes the warning itself assertable rather than mere noise.
+function warningsFrom(fn) {
+  const original = console.warn;
+  const calls = [];
+  console.warn = (...args) => calls.push(args);
+  try {
+    fn();
+  } finally {
+    console.warn = original;
+  }
+  return calls;
+}
+
+test('applyKey: a datum-kinded payload that is NOT a Datum is refused, prior value kept', () => {
+  // The half that matters. A server regression that starts sending a bare
+  // number where a Datum was declared must leave the last good envelope on
+  // screen — with its age badge still growing — rather than replacing it with
+  // an unprovenanced number that renders as though freshly measured.
+  const { api, window: win } = loadDataJs();
+  const receipt = { servedAt: null, receivedAt: 1 };
+  api.applyKey('DONE_COUNTS', SERVED_DATUM, DATUM_SPEC, receipt);
+  const good = win.DF_DATA.DONE_COUNTS;
+
+  for (const bad of [42, 'nine', [SERVED_DATUM], { value: 1, as_of: null, state: 'fresh', reason: null }]) {
+    warningsFrom(() => api.applyKey('DONE_COUNTS', bad, DATUM_SPEC, { servedAt: null, receivedAt: 2 }));
+    assert.equal(win.DF_DATA.DONE_COUNTS, good, `a non-Datum (${JSON.stringify(bad)}) was applied`);
+  }
+});
+
+test('applyKey: a refusal SAYS SO, naming the key', () => {
+  // Refusing in silence would make a schema break pixel-identical to a wedged
+  // endpoint: in both cases the key's tiles simply keep ageing, and an operator
+  // would diagnose a network outage for a server that is answering perfectly.
+  // The value must still not be applied — only the diagnosis was missing.
+  const { api, window: win } = loadDataJs();
+  const seed = win.DF_DATA.DONE_COUNTS;
+
+  const calls = warningsFrom(() =>
+    api.applyKey('DONE_COUNTS', 42, DATUM_SPEC, { servedAt: null, receivedAt: 1 }),
+  );
+
+  assert.equal(calls.length, 1, 'a refused datum payload must warn exactly once');
+  assert.ok(/DF_DATA/.test(String(calls[0][0])), `the warning must name the source: ${calls[0][0]}`);
+  assert.ok(
+    calls[0].includes('DONE_COUNTS'),
+    `the warning must name the refused key, got ${JSON.stringify(calls[0])}`,
+  );
+  assert.equal(win.DF_DATA.DONE_COUNTS, seed, 'the refused value must still not be applied');
+});
+
+test('applyKey: a plain-kinded key is never second-guessed, and never warns', () => {
+  // The warning is scoped to a DECLARED datum row receiving a non-Datum. Every
+  // polled key is plain today, so a warn on the plain path would fire on every
+  // healthy poll and train an operator to ignore it.
+  const { api } = loadDataJs();
+  const calls = warningsFrom(() => api.applyKey('COSTS', 42, PLAIN_SPEC, { servedAt: null, receivedAt: 1 }));
+  assert.deepEqual(calls, []);
+});
+
+test('applyKey: a refused datum payload does not flip the __loaded marker', () => {
+  const { api, window: win } = loadDataJs();
+  warningsFrom(() => api.applyKey('DONE_COUNTS', 42, DATUM_SPEC, { servedAt: null, receivedAt: 1 }));
+  assert.equal(win.DF_DATA.__loaded.DONE_COUNTS, undefined, '__loaded must mean a real value LANDED');
+});
+
+test('applyKey: __receipt is refused exactly like __loaded and __stale', () => {
+  const { api, window: win } = loadDataJs();
+  win.DF_DATA.__receipt[CURATOR_PATH] = { servedAt: null, receivedAt: 99 };
+  api.applyKey('__receipt', {});
+  assert.deepEqual(win.DF_DATA.__receipt[CURATOR_PATH], { servedAt: null, receivedAt: 99 });
+});
+
+test('datumFor: unknown before the first apply, the stored Datum after', () => {
+  const { api, window: win } = loadDataJs();
+
+  const before = api.datumFor('DONE_COUNTS');
+  assert.equal(before.state, 'unknown');
+  assert.equal(before.reason, 'not yet fetched');
+
+  api.applyKey('DONE_COUNTS', SERVED_DATUM, DATUM_SPEC, { servedAt: 'S', receivedAt: 7 });
+  assert.equal(api.datumFor('DONE_COUNTS'), win.DF_DATA.DONE_COUNTS);
+});
+
+// ---------------------------------------------------------------------------
+// __receipt — published on SUCCESS ONLY
+// ---------------------------------------------------------------------------
+
+function okResponse(body) {
+  return () => Promise.resolve({ ok: true, json: async () => body });
+}
+
+test('receipts: a successful refresh records servedAt from the body and receivedAt from the clock', async () => {
+  const { api, window: win } = loadDataJs();
+  const deps = { fetchImpl: okResponse({ served_at: '2026-09-20T12:00:00+00:00' }), now: () => 555 };
+
+  await api.refreshOne(CURATOR_PATH, {}, api.createPollState(), deps);
+
+  assert.deepEqual(win.DF_DATA.__receipt[CURATOR_PATH], {
+    servedAt: '2026-09-20T12:00:00+00:00',
+    receivedAt: 555,
+  });
+});
+
+test('receipts: a body with no served_at records null, never undefined', async () => {
+  // Today's wire for every endpoint. `null` is a stated absence that plainDatum
+  // can branch on; `undefined` would read as a malformed receipt.
+  const { api, window: win } = loadDataJs();
+  const deps = { fetchImpl: okResponse({ CURATOR_STATE: {} }), now: () => 42 };
+
+  await api.refreshOne(CURATOR_PATH, {}, api.createPollState(), deps);
+
+  assert.deepEqual(win.DF_DATA.__receipt[CURATOR_PATH], { servedAt: null, receivedAt: 42 });
+});
+
+test('receipts: a FAILED refresh leaves the receipt alone, so the tiles keep ageing', async () => {
+  // The single most important property of this map, and the reason it is not
+  // merged into __stale: publishStaleness runs in `finally` BY DESIGN, so a
+  // 503 counts exactly like a timeout. A receipt advanced on failure would
+  // reset every tile's age to zero on each failed poll — the dashboard would
+  // look freshest precisely while it was most wedged.
+  for (const fetchImpl of [
+    () => Promise.reject(new Error('boom')),
+    () => Promise.resolve({ ok: false, status: 503, json: async () => ({}) }),
+  ]) {
+    const { api, window: win } = loadDataJs();
+    const state = api.createPollState();
+    await api.refreshOne(CURATOR_PATH, {}, state, { fetchImpl: okResponse({}), now: () => 100 });
+    const afterSuccess = win.DF_DATA.__receipt[CURATOR_PATH];
+
+    const originalWarn = console.warn;
+    console.warn = () => {};
+    try {
+      await api.refreshOne(CURATOR_PATH, {}, state, { fetchImpl, now: () => 900 });
+    } finally {
+      console.warn = originalWarn;
+    }
+
+    assert.deepEqual(win.DF_DATA.__receipt[CURATOR_PATH], afterSuccess, 'the receipt advanced on a failure');
+    assert.equal(win.DF_DATA.__receipt[CURATOR_PATH].receivedAt, 100);
+  }
+});
+
+// NOT forced with ignoreBackoff: recordFailure deliberately ignores a forced
+// attempt, so `failures` would never move and this test would assert nothing.
+// A plain second call is allowed anyway — the preceding success reset
+// nextAllowedAt to 0.
+test('receipts: __stale still advances on failure — the two maps are not one', async () => {
+  // Stated alongside the test above so the asymmetry is visible in one place:
+  // __stale records ATTEMPT history (and must move), __receipt records the
+  // PROVENANCE of the values now in DF_DATA (and must not).
+  const { api, window: win } = loadDataJs();
+  const state = api.createPollState();
+  await api.refreshOne(CURATOR_PATH, {}, state, { fetchImpl: okResponse({}), now: () => 100 });
+
+  const originalWarn = console.warn;
+  console.warn = () => {};
+  try {
+    await api.refreshOne(CURATOR_PATH, {}, state, {
+      fetchImpl: () => Promise.reject(new Error('boom')),
+      now: () => 900,
+    });
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  assert.equal(win.DF_DATA.__stale[CURATOR_PATH].failures, 1);
+  assert.equal(win.DF_DATA.__receipt[CURATOR_PATH].receivedAt, 100);
+});
+
+// ---------------------------------------------------------------------------
+// ON_DEMAND_KEYS / requestOnDemand — per-project parameterised keys
+//
+// The mechanism PRD leaf gamma3 fetches `?terminal=<project>` through. Two
+// properties carry the whole design.
+//
+// ONE NAME PER KEY. A declared row's key builder names BOTH what the response
+// body calls the value and what DF_DATA calls it — exactly the rule every
+// polled row already follows, where a row's key name is simultaneously the
+// body key and the DF_DATA key. The only difference here is that the name is
+// BUILT from a parameter instead of written as a literal, which is why the row
+// carries builders rather than strings, and why nothing re-derives either one
+// by string surgery at a call site.
+//
+// ISOLATION FROM THE POLL LOOP. pollKey strips the query string on purpose, so
+// an on-demand `/api/v2/dashboard/tasks?terminal=<p>` would otherwise land on
+// the POLLED `/api/v2/dashboard/tasks` flow-control entry: it would set that
+// endpoint's in-flight flag (so the poll loop skips the real tasks fetch for
+// as long as a user's terminal request runs), reset or escalate its backoff,
+// and write its __stale entry — corrupting the banner with a failure the
+// polled endpoint never had. A user action must not be able to blind a tab.
+// ---------------------------------------------------------------------------
+
+const TASKS_PATH = '/api/v2/dashboard/tasks';
+const TERMINAL_PROJECT = 'dark-factory';
+const TERMINAL_KEY = `TASKS_TERMINAL:${TERMINAL_PROJECT}`;
+// The flow-control/staleness key an on-demand request must use instead of the
+// polled path. Stated as a literal, not built from the row, so the separation
+// is pinned against an expectation rather than against itself.
+const TERMINAL_STATE_KEY = `${TASKS_PATH}#terminal:${TERMINAL_PROJECT}`;
+
+// A Datum as the terminal endpoint will serve one: a lower_bound, because a
+// terminal listing is truncated by construction.
+const SERVED_TERMINAL_DATUM = Object.freeze({
+  value: { rows: [{ id: '5588' }] },
+  as_of: '2026-09-20T09:00:00+00:00',
+  state: 'lower_bound',
+  reason: 'terminal window truncated at 200 rows',
+  freshness_bound_seconds: 30,
+});
+
+// Responds with the Datum under whatever key the request asked for, so the
+// fixture cannot accidentally hard-code the key the implementation is supposed
+// to build. `served_at` is present so the receipt has both halves.
+function terminalResponse(datum = SERVED_TERMINAL_DATUM, servedAt = '2026-09-20T09:00:01+00:00') {
+  return url => {
+    const project = decodeURIComponent((url.split('terminal=')[1] || '').split('&')[0]);
+    return Promise.resolve({
+      ok: true,
+      json: async () => ({ served_at: servedAt, [`TASKS_TERMINAL:${project}`]: datum }),
+    });
+  };
+}
+
+test('on-demand: the terminal row declares its url builder, its key builder and a datum spec', () => {
+  const { api } = loadDataJs();
+  const row = api.ON_DEMAND_KEYS.terminal;
+
+  assert.ok(row, 'ON_DEMAND_KEYS.terminal must be declared');
+  assert.equal(typeof row.url, 'function', 'the row must BUILD its url, not carry a template string');
+  assert.equal(typeof row.key, 'function', 'the row must BUILD its key, not carry a template string');
+  assert.equal(row.url(TERMINAL_PROJECT), `${TASKS_PATH}?terminal=${TERMINAL_PROJECT}`);
+  assert.equal(row.key(TERMINAL_PROJECT), TERMINAL_KEY);
+  assert.equal(row.spec.kind, 'datum', 'the terminal endpoint serves a Datum, unlike every polled row');
+});
+
+test('on-demand: one request, one fetch, and a validated Datum under the built key', async () => {
+  const { api, window: win } = loadDataJs();
+
+  const fetchUrls = [];
+  const inner = terminalResponse();
+  const deps = { fetchImpl: url => { fetchUrls.push(url); return inner(url); }, now: () => 4242 };
+
+  await api.requestOnDemand('terminal', TERMINAL_PROJECT, { state: api.createPollState(), deps });
+
+  assert.deepEqual(fetchUrls, [`${TASKS_PATH}?terminal=${TERMINAL_PROJECT}`], 'exactly one fetch, to the built url');
+
+  const stored = win.DF_DATA[TERMINAL_KEY];
+  assert.ok(stored, `nothing was applied to DF_DATA['${TERMINAL_KEY}']`);
+  assert.equal(stored.state, 'lower_bound');
+  assert.deepEqual(stored.value, { rows: [{ id: '5588' }] });
+  assert.equal(stored._served_at, '2026-09-20T09:00:01+00:00', 'the receipt must come from the body');
+  assert.equal(stored._received_at, 4242, 'the receipt must come from the injected clock');
+  assert.notEqual(stored, SERVED_TERMINAL_DATUM, 'the wire payload must not be stored by reference');
+});
+
+test('on-demand: a non-Datum body is refused, so no unprovenanced value reaches a terminal key', async () => {
+  // Same guarantee applyKey gives every datum-kinded polled row; asserted here
+  // because this is the FIRST row declared datum-kinded, so it is the first
+  // path on which the refusal is reachable at all.
+  const { api, window: win } = loadDataJs();
+  const deps = {
+    fetchImpl: () => Promise.resolve({
+      ok: true,
+      json: async () => ({ served_at: null, [TERMINAL_KEY]: { rows: [] } }),
+    }),
+    now: () => 1,
+  };
+
+  await api.requestOnDemand('terminal', TERMINAL_PROJECT, { state: api.createPollState(), deps });
+
+  assert.equal(win.DF_DATA[TERMINAL_KEY], undefined, 'a bare payload was applied to a datum-kinded key');
+});
+
+test('on-demand: a second project gets its own key and leaves the first alone', async () => {
+  const { api, window: win } = loadDataJs();
+  const state = api.createPollState();
+  const deps = { fetchImpl: terminalResponse(), now: () => 10 };
+
+  await api.requestOnDemand('terminal', TERMINAL_PROJECT, { state, deps });
+  const first = win.DF_DATA[TERMINAL_KEY];
+
+  await api.requestOnDemand('terminal', 'other-project', {
+    state,
+    deps: { fetchImpl: terminalResponse(), now: () => 20 },
+  });
+
+  assert.equal(win.DF_DATA[TERMINAL_KEY], first, "the first project's Datum was overwritten");
+  assert.equal(win.DF_DATA[TERMINAL_KEY]._received_at, 10);
+  assert.equal(win.DF_DATA['TASKS_TERMINAL:other-project']._received_at, 20);
+});
+
+test('on-demand: a project name needing escaping is URL-encoded in the url and left literal in the key', () => {
+  // The two halves diverge on purpose: the url must survive HTTP parsing, and
+  // the DF_DATA key must be the name a caller can look up with the project
+  // string it already holds — no call site should have to know which of the
+  // two is encoded.
+  const { api } = loadDataJs();
+  const row = api.ON_DEMAND_KEYS.terminal;
+  const messy = 'a b/c&d=e?f';
+
+  assert.equal(row.url(messy), `${TASKS_PATH}?terminal=${encodeURIComponent(messy)}`);
+  assert.ok(!/[ &?]/.test(row.url(messy).split('terminal=')[1]), 'the encoded param leaked a delimiter');
+  assert.equal(row.key(messy), `TASKS_TERMINAL:${messy}`);
+});
+
+test('on-demand: flow-control and staleness are recorded under the request\'s OWN key', async () => {
+  const { api, window: win } = loadDataJs();
+  const state = api.createPollState();
+
+  await api.requestOnDemand('terminal', TERMINAL_PROJECT, {
+    state,
+    deps: { fetchImpl: terminalResponse(), now: () => 77 },
+  });
+
+  assert.ok(state.get(TERMINAL_STATE_KEY), `no flow-control entry at ${TERMINAL_STATE_KEY}`);
+  assert.equal(state.get(TASKS_PATH), undefined, 'the on-demand request took over the POLLED tasks entry');
+  assert.ok(win.DF_DATA.__stale[TERMINAL_STATE_KEY], 'the on-demand request published no staleness of its own');
+  assert.equal(win.DF_DATA.__stale[TASKS_PATH], undefined, "the on-demand request wrote the polled endpoint's __stale");
+  assert.deepEqual(win.DF_DATA.__receipt[TERMINAL_STATE_KEY], { servedAt: '2026-09-20T09:00:01+00:00', receivedAt: 77 });
+  assert.equal(win.DF_DATA.__receipt[TASKS_PATH], undefined, "the on-demand receipt landed on the polled endpoint's path");
+});
+
+test('on-demand: a poll of /tasks still runs while a terminal request is in flight', async () => {
+  // The isolation property stated as the operator sees it: a user opening a
+  // terminal must not stop the Tasks tab from updating. Shared `state` Map, so
+  // a collision would be real rather than hypothetical.
+  const { api, window: win } = loadDataJs();
+  const state = api.createPollState();
+
+  let releaseTerminal;
+  const terminalGate = new Promise(resolve => { releaseTerminal = resolve; });
+  const polledUrls = [];
+
+  const pending = api.requestOnDemand('terminal', TERMINAL_PROJECT, {
+    state,
+    deps: {
+      now: () => 100,
+      fetchImpl: () => terminalGate.then(() => ({
+        ok: true,
+        json: async () => ({ served_at: null, [TERMINAL_KEY]: SERVED_TERMINAL_DATUM }),
+      })),
+    },
+  });
+  await drain();
+
+  assert.equal(state.get(TERMINAL_STATE_KEY).inFlight, true, 'the held request should be in flight');
+  assert.notEqual(state.get(TASKS_PATH)?.inFlight, true, 'the POLLED tasks endpoint was marked in flight');
+
+  await api.refreshOne(TASKS_PATH, { ACTIVE_TASKS: PLAIN_SPEC }, state, {
+    fetchImpl: url => { polledUrls.push(url); return Promise.resolve({ ok: true, json: async () => ({ ACTIVE_TASKS: [{ id: '1' }] }) }); },
+    now: () => 101,
+  });
+
+  assert.deepEqual(polledUrls, [TASKS_PATH], 'the polled tasks fetch was skipped while the terminal request ran');
+  assert.deepEqual(win.DF_DATA.ACTIVE_TASKS, [{ id: '1' }]);
+
+  releaseTerminal();
+  await pending;
+  assert.equal(win.DF_DATA[TERMINAL_KEY]._received_at, 100, 'the terminal Datum still landed afterwards');
+});
+
+test('on-demand: a failed request never escalates the polled tasks backoff', async () => {
+  const { api, window: win } = loadDataJs();
+  const state = api.createPollState();
+
+  const originalWarn = console.warn;
+  console.warn = () => {};
+  try {
+    await api.requestOnDemand('terminal', TERMINAL_PROJECT, {
+      state,
+      deps: { fetchImpl: () => Promise.reject(new Error('boom')), now: () => 500 },
+    });
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  assert.equal(state.get(TERMINAL_STATE_KEY).failures, 1, "the request's own entry should count the failure");
+  assert.equal(state.get(TASKS_PATH), undefined, 'a failed user action created backoff for the polled endpoint');
+  assert.equal(win.DF_DATA.__stale[TASKS_PATH], undefined, 'a failed user action reported the polled endpoint stale');
+});
+
+test('on-demand: a failed request leaves a previously applied terminal Datum untouched', async () => {
+  const { api, window: win } = loadDataJs();
+  const state = api.createPollState();
+
+  await api.requestOnDemand('terminal', TERMINAL_PROJECT, {
+    state,
+    deps: { fetchImpl: terminalResponse(), now: () => 300 },
+  });
+  const good = win.DF_DATA[TERMINAL_KEY];
+
+  const originalWarn = console.warn;
+  console.warn = () => {};
+  try {
+    for (const fetchImpl of [
+      () => Promise.reject(new Error('boom')),
+      () => Promise.resolve({ ok: false, status: 503, json: async () => ({}) }),
+    ]) {
+      await api.requestOnDemand('terminal', TERMINAL_PROJECT, {
+        state,
+        deps: { fetchImpl, now: () => 900, ignoreBackoff: true },
+      });
+      assert.equal(win.DF_DATA[TERMINAL_KEY], good, 'a failed retry replaced the last good Datum');
+    }
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  assert.equal(win.DF_DATA[TERMINAL_KEY]._received_at, 300, 'the stored Datum must keep ageing from its own receipt');
+});
+
+test('on-demand: datumFor a terminal key is unknown/not yet fetched before the request', async () => {
+  const { api } = loadDataJs();
+
+  const before = api.datumFor(TERMINAL_KEY);
+  assert.equal(before.state, 'unknown');
+  assert.equal(before.reason, 'not yet fetched');
+
+  await api.requestOnDemand('terminal', TERMINAL_PROJECT, {
+    state: api.createPollState(),
+    deps: { fetchImpl: terminalResponse(), now: () => 8 },
+  });
+
+  assert.equal(api.datumFor(TERMINAL_KEY).state, 'lower_bound');
+});
+
+test('on-demand: an undeclared name is refused loudly rather than fetched', async () => {
+  // Nothing re-derives a url or a key by string surgery at a call site, so an
+  // unrecognised name has no url to build. Failing loudly here is what keeps
+  // that true — a silent no-op would let a typo look like an empty result.
+  const { api } = loadDataJs();
+  const fetchUrls = [];
+
+  await assert.rejects(
+    () => api.requestOnDemand('termnial', TERMINAL_PROJECT, {
+      state: api.createPollState(),
+      deps: { fetchImpl: url => { fetchUrls.push(url); return terminalResponse()(url); }, now: () => 1 },
+    }),
+    /termnial/,
+  );
+  assert.deepEqual(fetchUrls, [], 'an undeclared name must not reach the network');
+});
+
+// ---------------------------------------------------------------------------
+// REFRESH_OUTCOMES — what one attempt DID
+//
+// The poll loop ignores this: the next tick retries, so there is nothing for
+// it to decide. It exists for a USER ACTION. Without it `await
+// requestOnDemand(...)` resolves identically whether the Datum landed, the
+// server 503'd, or the key was still inside its backoff window and nothing was
+// even asked — and datumFor reports the same pre-request unknown Datum in all
+// three cases, so the gamma3 terminal UI could only spin.
+// ---------------------------------------------------------------------------
+
+test('outcomes: the vocabulary is a closed, frozen set', () => {
+  // Named constants rather than four hand-typed strings at the call sites that
+  // compare against them — a misspelled `REFRESH_OUTCOMES.x` is `undefined` at
+  // the comparison, not a branch that silently never runs.
+  const { api } = loadDataJs();
+
+  assert.deepEqual(api.REFRESH_OUTCOMES, {
+    applied: 'applied',
+    failed: 'failed',
+    skippedInFlight: 'skipped-inflight',
+    skippedBackoff: 'skipped-backoff',
+  });
+  assert.ok(Object.isFrozen(api.REFRESH_OUTCOMES));
+});
+
+test('outcomes: a landed response reports `applied`', async () => {
+  const { api } = loadDataJs();
+  const outcome = await api.refreshOne(CURATOR_PATH, {}, api.createPollState(), {
+    fetchImpl: okResponse({ CURATOR_STATE: {} }),
+    now: () => 1,
+  });
+  assert.equal(outcome, api.REFRESH_OUTCOMES.applied);
+});
+
+test('outcomes: a non-ok status and a thrown fetch both report `failed`', async () => {
+  // Distinct code paths — the `!resp.ok` early return and the catch arm — and
+  // one outcome, because a caller can act on neither differently: the rows did
+  // not arrive.
+  for (const fetchImpl of [
+    () => Promise.resolve({ ok: false, status: 503, json: async () => ({}) }),
+    () => Promise.reject(new Error('boom')),
+  ]) {
+    const { api } = loadDataJs();
+    let outcome;
+    const original = console.warn;
+    console.warn = () => {};
+    try {
+      outcome = await api.refreshOne(CURATOR_PATH, {}, api.createPollState(), { fetchImpl, now: () => 1 });
+    } finally {
+      console.warn = original;
+    }
+    assert.equal(outcome, api.REFRESH_OUTCOMES.failed);
+  }
+});
+
+test('outcomes: the two skips are told apart from each other and from a failure', async () => {
+  // The distinction the gamma3 UI needs most: "we did not even ask" is neither
+  // an error to report nor rows to draw, and both skips return before any
+  // fetch is issued, so nothing else in the response tells them apart.
+  const { api } = loadDataJs();
+  const state = api.createPollState();
+  const fetchUrls = [];
+  const deps = {
+    fetchImpl: url => { fetchUrls.push(url); return new Promise(() => {}); },
+    now: () => 1,
+  };
+
+  const pending = api.refreshOne(CURATOR_PATH, {}, state, deps);
+  assert.equal(await api.refreshOne(CURATOR_PATH, {}, state, deps), api.REFRESH_OUTCOMES.skippedInFlight);
+  assert.equal(fetchUrls.length, 1, 'the in-flight skip must not issue a second request');
+
+  const backedOff = api.createPollState();
+  backedOff.set(CURATOR_PATH, { inFlight: false, failures: 3, nextAllowedAt: 9_000, lastSuccessAt: 0 });
+  assert.equal(
+    await api.refreshOne(CURATOR_PATH, {}, backedOff, deps),
+    api.REFRESH_OUTCOMES.skippedBackoff,
+  );
+  assert.equal(fetchUrls.length, 1, 'the backoff skip must not issue a request either');
+
+  void pending;
+});
+
+test('outcomes: requestOnDemand propagates refreshOne\'s answer verbatim', async () => {
+  const { api } = loadDataJs();
+
+  const applied = await api.requestOnDemand('terminal', TERMINAL_PROJECT, {
+    state: api.createPollState(),
+    deps: { fetchImpl: terminalResponse(), now: () => 1 },
+  });
+  assert.equal(applied, api.REFRESH_OUTCOMES.applied);
+
+  const original = console.warn;
+  console.warn = () => {};
+  let failed;
+  try {
+    failed = await api.requestOnDemand('terminal', TERMINAL_PROJECT, {
+      state: api.createPollState(),
+      deps: { fetchImpl: () => Promise.reject(new Error('boom')), now: () => 1 },
+    });
+  } finally {
+    console.warn = original;
+  }
+  assert.equal(failed, api.REFRESH_OUTCOMES.failed);
+});
+
+test('outcomes: the poll loop ignores them — refreshDFData still resolves to undefined', async () => {
+  // Nothing about the loop changes. Stated as a test because "poll-loop callers
+  // ignore the return" is the premise that makes this addition safe.
+  const { api } = loadDataJs();
+  const result = await api.refreshDFData(undefined, {
+    state: api.createPollState(),
+    jitterMaxMs: 0,
+    deps: { fetchImpl: okResponse({}), now: () => 1 },
+  });
+  assert.equal(result, undefined);
 });

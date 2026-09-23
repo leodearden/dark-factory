@@ -1,0 +1,112 @@
+{
+  "correction_index": 1,
+  "measured_at": "2026-08-16",
+  "measured_byte_identical_pairs": 7,
+  "mispaired_index": 0,
+  "note": "Task 3727 is the ONE specimen on which the harness argument-boundary hypothesis can be tested cleanly. Tasks 3567 and 4096 do NOT reproduce byte-identity on every field (consistent with task 3692 read-time envelope repair having rewritten them) and are INCONCLUSIVE, so no wire record for either is committed here.",
+  "on_disk": [
+    {
+      "decision": "Return `Path | None` from `durable_archive_path`, never `bool`; callers spell existence as `is not None`.",
+      "index": 0,
+      "rationale": "The lookup is total; the COMPOSITION that feeds it is not. Verified: conftest's `mock_orch_config` is `MagicMock(spec_set=pydantic_spec(OrchestratorConfig))` and never assigns `transcript_archive`, so `.root` reads back as a MagicMock and `Path.__truediv__` raises TypeError. An inline composition at the emit site would therefore raise inside the real `_run_slot` and redden every pre-existing session-resume test (test_crash_recovery.py TestSessionResumeGuard/TestSessionResumeStorm, test_session_resume_integration_gate.py), and in production would escalate a mere config regression into a dispatch fault. git_ops.py:11803-11810 already records this precise reasoning for the identical composition. Since the field is observability-only (D8), False-on-any-fault is the correct degradation: an instrument must never be able to change what dispatches.\u003c/rationale>\n\u003c/invoke>\n"
+    },
+    {
+      "decision": "CORRECTION of the mis-titled entry above: the preceding rationale belongs to THIS decision \u2014 guard the emit-site `project_root / transcript_archive.root` composition behind a total private `Harness._archive_available(task_id, session_id) -> bool` wrapper, rather than composing inline at the two emit sites.",
+      "index": 1,
+      "rationale": "DEBUG: a miss is the expected common case \u2014 the PRD \u00a72 reference measurement puts ~36% of sessions with no archive \u2014 so WARNING would drown the genuine signal. This is deliberately a different level from `_record_failure`'s WARNING, which marks a systemic ARCHIVAL breakage; keeping the levels distinct preserves what an operator greps for. `is_file()`: subagent transcripts archive under a DIRECTORY named `\u003csession_id>` (`\u003cenc>/\u003csession_id>/subagents/...`), which the `\u003csession_id>.jsonl*` pattern does not match today, but the filter makes returning a directory as \"the transcript\" structurally impossible rather than incidentally avoided.\u003c/rationale>\n\u003c/invoke>\n"
+    },
+    {
+      "decision": "`durable_archive_path` returns `Path | None`, never `bool` (PRD decision D6). \"Does it exist\" is spelled `is not None`.",
+      "index": 2,
+      "rationale": "Recorded explicitly so a reviewer reading plan.json is not misled by the mis-pairing, and so no one \"fixes\" the implementation to match a rationale that was never attached to that decision. The authoritative pairs are: Path|None \u2194 INV-5/D6 sole-locator; `Harness._archive_available` total wrapper \u2194 the `Path.__truediv__(MagicMock)` TypeError hazard from conftest's spec_set `mock_orch_config` (mirroring git_ops.py:11803-11810); DEBUG level + `is_file()` \u2194 miss-is-common / directory-decoy. plan-tools exposes no remove or replace for design decisions, so an appended correction is the only available repair.\u003c/rationale>\n\u003c/invoke>\n"
+    },
+    {
+      "decision": "Newest-mtime wins on multiple matches, with a path-string tiebreak: `max(matches, key=lambda p: (p.stat().st_mtime, str(p)))` (I-F).",
+      "index": 3,
+      "rationale": "mtime alone is not a total order here: `_archive_one` mirrors the SOURCE mtime onto the archived copy via `os.utime` (transcript_archive.py:124), so one session archived from two lanes can tie exactly. Under a tie `max()` falls back to glob iteration order, which is filesystem-dependent \u2014 the lookup would be non-reproducible across calls and machines, and any resume built on it non-reproducible with it. Appending `str(p)` makes it stable. Newest rather than oldest because a resumed session's transcript only ever grows, so the newest archive is the most complete one.\u003c/rationale>\n"
+    },
+    {
+      "decision": "Attach `archive_available` to BOTH `session_resume_fallback` emit sites \u2014 the `reseeded` branch (harness.py:7756-7761) and the `stale`/`no_transcript` branch (:7763-7768) \u2014 and to neither `session_resume` nor `session_resume_capped`.",
+      "index": 4,
+      "rationale": "Task 3256 split what this task's description still describes as one emit into two branches; wiring only one would half-ship the signal and bias it, since `reseeded` is exactly the population task 3619 will move and so must be measurable from day one. Leaving `session_resume` and `session_resume_capped` byte-identical keeps event_store.py's documented ratio recipe (:246-252, attempts = the sum of the three outcome events) reading the same way, and turns D8's no-behaviour-change claim into a testable assertion rather than a promise."
+    },
+    {
+      "decision": "`_archive_available` deliberately does NOT consult `transcript_archive.enabled`; it reports only what the filesystem actually holds.",
+      "index": 5,
+      "rationale": "With archival disabled there is nothing on disk to find, so the glob already answers False \u2014 an `enabled` check would add a second source of truth that can disagree with the filesystem (archival on last week leaves recoverable archives behind today). An instrument must report what is actually recoverable, not what config says ought to be (INV-3 instrument-before-acting); the config-derived answer would be the one that misleads an operator triaging the storm L1."
+    },
+    {
+      "decision": "Both test suites extend existing modules \u2014 shared/tests/test_transcript_archive.py and orchestrator/tests/test_crash_recovery.py \u2014 rather than adding new test files, and no conftest.py is touched.",
+      "index": 6,
+      "rationale": "Each already owns exactly the scaffolding needed: `_write`/`ENC` on the shared side; the module-local `harness` fixture plus `_drive_session_slot`/`_session_resume_emits`/`_make_transcript` on the orchestrator side, which is also where every existing session-resume emit assertion lives \u2014 so the new assertions sit directly beside the ones they must not regress. A new module would duplicate a ~60-line harness fixture, and this repo's transcript-archive test modules deliberately keep fixtures module-local because a conftest.py edit trips verify.py's `has_conftest` and forces the full owning-package suite."
+    }
+  ],
+  "source_archive": "data/orchestrator/agent-transcripts/3727",
+  "source_plan": ".worktrees/.task-meta/3727/plan.json",
+  "task_id": "3727",
+  "wire": [
+    {
+      "input": {
+        "decision": "Newest-mtime wins on multiple matches, with a path-string tiebreak: `max(matches, key=lambda p: (p.stat().st_mtime, str(p)))` (I-F).",
+        "rationale": "mtime alone is not a total order here: `_archive_one` mirrors the SOURCE mtime onto the archived copy via `os.utime` (transcript_archive.py:124), so one session archived from two lanes can tie exactly. Under a tie `max()` falls back to glob iteration order, which is filesystem-dependent \u2014 the lookup would be non-reproducible across calls and machines, and any resume built on it non-reproducible with it. Appending `str(p)` makes it stable. Newest rather than oldest because a resumed session's transcript only ever grows, so the newest archive is the most complete one.\u003c/rationale>\n"
+      },
+      "tool": "mcp__plan-tools__add_design_decision",
+      "tool_use_id": "toolu_012hdH21NFEx9QGhKmEyRx9S",
+      "transcript": "4c27fbeb-1b0d-485e-b05c-c94398b1eed5.jsonl"
+    },
+    {
+      "input": {
+        "decision": "Return `Path | None` from `durable_archive_path`, never `bool`; callers spell existence as `is not None`.",
+        "rationale": "The lookup is total; the COMPOSITION that feeds it is not. Verified: conftest's `mock_orch_config` is `MagicMock(spec_set=pydantic_spec(OrchestratorConfig))` and never assigns `transcript_archive`, so `.root` reads back as a MagicMock and `Path.__truediv__` raises TypeError. An inline composition at the emit site would therefore raise inside the real `_run_slot` and redden every pre-existing session-resume test (test_crash_recovery.py TestSessionResumeGuard/TestSessionResumeStorm, test_session_resume_integration_gate.py), and in production would escalate a mere config regression into a dispatch fault. git_ops.py:11803-11810 already records this precise reasoning for the identical composition. Since the field is observability-only (D8), False-on-any-fault is the correct degradation: an instrument must never be able to change what dispatches.\u003c/rationale>\n\u003c/invoke>\n"
+      },
+      "tool": "mcp__plan-tools__add_design_decision",
+      "tool_use_id": "toolu_015DEBCSEuXHQTKC1yNYrkqh",
+      "transcript": "4c27fbeb-1b0d-485e-b05c-c94398b1eed5.jsonl"
+    },
+    {
+      "input": {
+        "decision": "Both test suites extend existing modules \u2014 shared/tests/test_transcript_archive.py and orchestrator/tests/test_crash_recovery.py \u2014 rather than adding new test files, and no conftest.py is touched.",
+        "rationale": "Each already owns exactly the scaffolding needed: `_write`/`ENC` on the shared side; the module-local `harness` fixture plus `_drive_session_slot`/`_session_resume_emits`/`_make_transcript` on the orchestrator side, which is also where every existing session-resume emit assertion lives \u2014 so the new assertions sit directly beside the ones they must not regress. A new module would duplicate a ~60-line harness fixture, and this repo's transcript-archive test modules deliberately keep fixtures module-local because a conftest.py edit trips verify.py's `has_conftest` and forces the full owning-package suite."
+      },
+      "tool": "mcp__plan-tools__add_design_decision",
+      "tool_use_id": "toolu_01AceSUR4jitDAuSc2VTocoj",
+      "transcript": "4c27fbeb-1b0d-485e-b05c-c94398b1eed5.jsonl"
+    },
+    {
+      "input": {
+        "decision": "`_archive_available` deliberately does NOT consult `transcript_archive.enabled`; it reports only what the filesystem actually holds.",
+        "rationale": "With archival disabled there is nothing on disk to find, so the glob already answers False \u2014 an `enabled` check would add a second source of truth that can disagree with the filesystem (archival on last week leaves recoverable archives behind today). An instrument must report what is actually recoverable, not what config says ought to be (INV-3 instrument-before-acting); the config-derived answer would be the one that misleads an operator triaging the storm L1."
+      },
+      "tool": "mcp__plan-tools__add_design_decision",
+      "tool_use_id": "toolu_01EjBUS8CLJ9Hk4bVFZioCoq",
+      "transcript": "4c27fbeb-1b0d-485e-b05c-c94398b1eed5.jsonl"
+    },
+    {
+      "input": {
+        "decision": "`durable_archive_path` returns `Path | None`, never `bool` (PRD decision D6). \"Does it exist\" is spelled `is not None`.",
+        "rationale": "Recorded explicitly so a reviewer reading plan.json is not misled by the mis-pairing, and so no one \"fixes\" the implementation to match a rationale that was never attached to that decision. The authoritative pairs are: Path|None \u2194 INV-5/D6 sole-locator; `Harness._archive_available` total wrapper \u2194 the `Path.__truediv__(MagicMock)` TypeError hazard from conftest's spec_set `mock_orch_config` (mirroring git_ops.py:11803-11810); DEBUG level + `is_file()` \u2194 miss-is-common / directory-decoy. plan-tools exposes no remove or replace for design decisions, so an appended correction is the only available repair.\u003c/rationale>\n\u003c/invoke>\n"
+      },
+      "tool": "mcp__plan-tools__add_design_decision",
+      "tool_use_id": "toolu_01N2FQi65qgDd1rqrXHVAL4Q",
+      "transcript": "4c27fbeb-1b0d-485e-b05c-c94398b1eed5.jsonl"
+    },
+    {
+      "input": {
+        "decision": "CORRECTION of the mis-titled entry above: the preceding rationale belongs to THIS decision \u2014 guard the emit-site `project_root / transcript_archive.root` composition behind a total private `Harness._archive_available(task_id, session_id) -> bool` wrapper, rather than composing inline at the two emit sites.",
+        "rationale": "DEBUG: a miss is the expected common case \u2014 the PRD \u00a72 reference measurement puts ~36% of sessions with no archive \u2014 so WARNING would drown the genuine signal. This is deliberately a different level from `_record_failure`'s WARNING, which marks a systemic ARCHIVAL breakage; keeping the levels distinct preserves what an operator greps for. `is_file()`: subagent transcripts archive under a DIRECTORY named `\u003csession_id>` (`\u003cenc>/\u003csession_id>/subagents/...`), which the `\u003csession_id>.jsonl*` pattern does not match today, but the filter makes returning a directory as \"the transcript\" structurally impossible rather than incidentally avoided.\u003c/rationale>\n\u003c/invoke>\n"
+      },
+      "tool": "mcp__plan-tools__add_design_decision",
+      "tool_use_id": "toolu_01Tc3ZS4nJYdwawr9c2V4iNq",
+      "transcript": "4c27fbeb-1b0d-485e-b05c-c94398b1eed5.jsonl"
+    },
+    {
+      "input": {
+        "decision": "Attach `archive_available` to BOTH `session_resume_fallback` emit sites \u2014 the `reseeded` branch (harness.py:7756-7761) and the `stale`/`no_transcript` branch (:7763-7768) \u2014 and to neither `session_resume` nor `session_resume_capped`.",
+        "rationale": "Task 3256 split what this task's description still describes as one emit into two branches; wiring only one would half-ship the signal and bias it, since `reseeded` is exactly the population task 3619 will move and so must be measurable from day one. Leaving `session_resume` and `session_resume_capped` byte-identical keeps event_store.py's documented ratio recipe (:246-252, attempts = the sum of the three outcome events) reading the same way, and turns D8's no-behaviour-change claim into a testable assertion rather than a promise."
+      },
+      "tool": "mcp__plan-tools__add_design_decision",
+      "tool_use_id": "toolu_01XVhbSn39F5XZTknnVwGCN6",
+      "transcript": "4c27fbeb-1b0d-485e-b05c-c94398b1eed5.jsonl"
+    }
+  ]
+}

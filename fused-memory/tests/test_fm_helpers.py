@@ -1,11 +1,17 @@
 """Tests for the submit_and_resolve helper in _fm_helpers.py."""
 
 import json
+import sys
+import types
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
-from _fm_helpers import submit_and_resolve
+from _fm_helpers import (
+    _LOADED_SCRIPT_MODULE_NAMES,
+    load_script_module,
+    submit_and_resolve,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1075,6 +1081,475 @@ class TestPollUntilStable:
 
 
 # ---------------------------------------------------------------------------
+# Tests for the shared retry_until_observed() observation barrier (task 4972)
+# ---------------------------------------------------------------------------
+# The third member of the barrier family, and the reason it exists: poll_until
+# and poll_until_stable both assume the condition, once it arrives, stays
+# observable long enough for a client read to catch it. A racy TRANSIENT breaks
+# that assumption -- it can close before any client read lands, and then no
+# interval and no deadline on a single attempt can help, because there is
+# nothing left to observe. The only lever that acts on an absent window is to
+# RE-OPEN it and look again.
+#
+# The motivating call site is
+# tests/test_drop_vector_indices_integration.py::TestDropRebuildWindow, whose
+# post-DROP rebuild window measured only 28/30 first-attempt observations under
+# the offline lane's own `nice -n 19 ionice -c3` scheduling: on a miss FalkorDB
+# had finished the rebuild INSIDE the DROP round-trip, so the very first
+# post-DROP read (6.8 ms after DROP returned) already showed one settled
+# OPERATIONAL row.
+#
+# Every assertion below is on CALL COUNTS and CALL ORDER against a shared
+# append-only log -- never on wall clock -- so this suite is load-independent
+# and cannot itself become the next flake, the same discipline TestPollUntil
+# and TestPollUntilStable above already keep.
+
+class TestRetryUntilObserved:
+    """Unit tests for retry_until_observed(observe, *, reopen, attempts, message)."""
+
+    @pytest.mark.asyncio
+    async def test_sync_observation_on_the_first_attempt_returns_verbatim_and_never_reopens(self):
+        """A first-attempt observation returns the value verbatim, at zero reopen cost.
+
+        The no-miss path costing nothing is what makes this barrier safe to
+        adopt in a fixture-backed live test: when the window IS open (the
+        measured 28/30 case) the helper is indistinguishable from the single
+        un-retried observation it replaces.
+
+        Returning the observed value verbatim rather than coerced to True
+        mirrors poll_until's documented return contract, so all three
+        primitives in the family chain the same way.
+        """
+        from _fm_helpers import retry_until_observed
+
+        log: list[str] = []
+        payload = {'rows': 2, 'phantom': True}
+
+        def observe():
+            log.append('observe')
+            return payload
+
+        def reopen():
+            log.append('reopen')
+
+        result = await retry_until_observed(observe, reopen=reopen, attempts=4)
+
+        assert result is payload, f'expected the exact object {payload!r}, got {result!r}'
+        assert log == ['observe'], f'expected exactly one observation and no reopen, got {log!r}'
+
+    @pytest.mark.asyncio
+    async def test_async_observation_on_the_first_attempt_is_awaited(self):
+        """A coroutine-function `observe` is awaited, matching poll_until's isawaitable contract.
+
+        Pinned the way the sibling async tests pin it: an un-awaited coroutine
+        object is always truthy, so a helper that failed to await would still
+        "succeed" on the first attempt -- but it would return the coroutine
+        rather than the payload, and the log would stay empty because the
+        coroutine body never ran.
+        """
+        from _fm_helpers import retry_until_observed
+
+        log: list[str] = []
+        payload = {'rows': 2, 'phantom': True}
+
+        async def observe():
+            log.append('observe')
+            return payload
+
+        def reopen():
+            log.append('reopen')
+
+        result = await retry_until_observed(observe, reopen=reopen, attempts=4)
+
+        assert result is payload, f'expected the exact object {payload!r}, got {result!r}'
+        assert log == ['observe'], f'expected exactly one observation and no reopen, got {log!r}'
+
+    @pytest.mark.asyncio
+    async def test_two_misses_then_an_observation_reopens_exactly_between_attempts(self):
+        """THE BEHAVIOUR THIS BARRIER EXISTS FOR: a missed window is RE-OPENED and observed again.
+
+        `observe` misses on attempts 1 and 2, then observes on attempt 3. The
+        ORDER assertion is the load-bearing one and is what call counts alone
+        cannot express:
+
+        * `reopen` is never called BEFORE the first attempt -- the caller has
+          already opened the window once, and re-opening first would silently
+          discard that opening and double the cost of the common case;
+        * `reopen` is called exactly ONCE BETWEEN attempts -- an extra
+          re-opening would leave the graph in a state the caller did not ask
+          for, and a missing one would re-observe a window that already closed.
+        """
+        from _fm_helpers import retry_until_observed
+
+        log: list[str] = []
+        sentinel = object()
+        observations = 0
+
+        def observe():
+            nonlocal observations
+            observations += 1
+            log.append('observe')
+            return sentinel if observations >= 3 else None
+
+        def reopen():
+            log.append('reopen')
+
+        result = await retry_until_observed(observe, reopen=reopen, attempts=4)
+
+        assert result is sentinel, f'expected the observation verbatim, got {result!r}'
+        assert log == ['observe', 'reopen', 'observe', 'reopen', 'observe'], (
+            f'expected reopen to fire exactly once BETWEEN attempts and never '
+            f'before the first one, got {log!r}'
+        )
+        assert log.count('observe') == 3, f'expected exactly 3 observations, got {log!r}'
+        assert log.count('reopen') == 2, f'expected exactly 2 reopens, got {log!r}'
+
+    @pytest.mark.asyncio
+    async def test_async_reopen_is_awaited_between_attempts(self):
+        """A coroutine-function `reopen` is awaited, matching the sync/async symmetry of `observe`.
+
+        Pinned the way the sibling async tests pin it: an un-awaited coroutine
+        object is silently discarded, so a helper that failed to await would
+        still produce the right CALL ORDER while never actually re-opening the
+        window -- the log entry proves the coroutine BODY ran, not merely that
+        the callable was invoked.
+        """
+        from _fm_helpers import retry_until_observed
+
+        log: list[str] = []
+        sentinel = object()
+        observations = 0
+
+        async def observe():
+            nonlocal observations
+            observations += 1
+            log.append('observe')
+            return sentinel if observations >= 3 else None
+
+        async def reopen():
+            log.append('reopen')
+
+        result = await retry_until_observed(observe, reopen=reopen, attempts=4)
+
+        assert result is sentinel, f'expected the observation verbatim, got {result!r}'
+        assert log == ['observe', 'reopen', 'observe', 'reopen', 'observe'], (
+            f'expected the awaited reopen to fire exactly once between attempts, got {log!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_exhausting_every_attempt_raises_after_spending_the_whole_budget(self):
+        """An always-missing `observe` raises AssertionError, having spent its whole budget.
+
+        This is what preserves the motivating live test's PRIMARY durable job:
+        fail loudly if FalkorDB ever stops opening the rebuild window at all.
+        Returning None on exhaustion would let that failure be read as an
+        ordinary miss and silently swallowed by the caller, leaving every
+        post-drop barrier task 4748 added as undetected dead weight.
+
+        AssertionError, not a bespoke type, matches the family convention --
+        poll_until and poll_until_stable both raise AssertionError on timeout.
+
+        The call-count assertions prove the helper spent its budget rather
+        than giving up early, and that it did not re-arm a window nobody
+        would read: exactly `attempts` observations and exactly
+        `attempts - 1` reopens.
+        """
+        from _fm_helpers import retry_until_observed
+
+        log: list[str] = []
+
+        def observe():
+            log.append('observe')
+            return None
+
+        def reopen():
+            log.append('reopen')
+
+        with pytest.raises(AssertionError):
+            await retry_until_observed(observe, reopen=reopen, attempts=5)
+
+        assert log.count('observe') == 5, f'expected exactly 5 observations, got {log!r}'
+        assert log.count('reopen') == 4, f'expected exactly 4 reopens, got {log!r}'
+        assert log[-1] == 'observe', (
+            f'expected the final act to be an observation, not a reopen nobody reads: {log!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_exhaustion_message_names_the_attempt_count(self):
+        """The raised message names how many attempts were made.
+
+        Without the count an operator cannot tell a one-shot miss from a
+        budget genuinely spent, which is the whole distinction that makes
+        exhaustion evidence the transient is GONE rather than hard to catch.
+        """
+        from _fm_helpers import retry_until_observed
+
+        # match=r'in 7 attempt\(s\)', not a bare '7': a lone digit matches
+        # anywhere in the message -- a timeout value, a count of something
+        # else, a future prefix -- so it would pass on a message that had
+        # stopped naming the ATTEMPT COUNT, which is the only thing this test
+        # exists to pin.
+        with pytest.raises(AssertionError, match=r'in 7 attempt\(s\)'):
+            await retry_until_observed(lambda: None, attempts=7)
+
+    @pytest.mark.asyncio
+    async def test_caller_message_survives_verbatim_into_the_exhaustion_error(self):
+        """A caller-supplied `message` appears verbatim in the raised AssertionError.
+
+        Matches poll_until's caller-message contract, and matters here for a
+        concrete reason: the live call site's message is the "see this class
+        docstring before deleting these barriers" guidance, and it must
+        survive into the failure an operator actually reads.
+        """
+        from _fm_helpers import retry_until_observed
+
+        with pytest.raises(AssertionError, match='see this class docstring before deleting'):
+            await retry_until_observed(
+                lambda: None,
+                attempts=2,
+                message='see this class docstring before deleting them',
+            )
+
+    @pytest.mark.asyncio
+    async def test_reopen_none_is_a_supported_no_op_re_arm(self):
+        """`reopen=None` still makes exactly `attempts` observations and still raises.
+
+        Supports a transient that re-arms ITSELF (an external producer, a
+        periodic emitter): there is nothing for the caller to do between
+        attempts, but the budget and the loud exhaustion must be identical.
+        """
+        from _fm_helpers import retry_until_observed
+
+        log: list[str] = []
+
+        def observe():
+            log.append('observe')
+            return None
+
+        with pytest.raises(AssertionError):
+            await retry_until_observed(observe, attempts=3)
+
+        assert log == ['observe', 'observe', 'observe'], (
+            f'expected exactly 3 observations with no reopen, got {log!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_miss_path_always_yields_and_never_sleeps_after_the_final_miss(self, monkeypatch):
+        """`delay` defaults to 0.0, but the miss path still AWAITS it -- so the loop always yields.
+
+        Without this, a synchronous `observe` with `reopen=None` burns the
+        whole attempt budget inside one event-loop tick: no wall-clock time
+        passes and no other coroutine runs between attempts, so a barrier
+        that gates nothing wears a plausible-looking exhaustion message. That
+        directly contradicts the documented `reopen=None` use case -- a
+        transient that re-arms ITSELF (an external producer, a periodic
+        emitter) -- since nothing can possibly re-arm it in zero time.
+
+        `await asyncio.sleep(0)` is the cheapest thing that fixes it: it costs
+        one event-loop tick and hands control back, which is exactly what a
+        self-re-arming producer needs to make progress.
+
+        The sleep is inside the between-attempts guard, alongside `reopen`,
+        for the same reason: sleeping after the FINAL miss is pure latency
+        paid on the failure path for an attempt nobody will make.
+        """
+        import asyncio
+
+        from _fm_helpers import retry_until_observed
+
+        log: list[str] = []
+        real_sleep = asyncio.sleep
+
+        async def recording_sleep(seconds):
+            log.append(f'sleep:{seconds}')
+            await real_sleep(0)
+
+        monkeypatch.setattr(asyncio, 'sleep', recording_sleep)
+
+        def observe():
+            log.append('observe')
+            return None
+
+        with pytest.raises(AssertionError):
+            await retry_until_observed(observe, attempts=3)
+
+        assert log == ['observe', 'sleep:0.0', 'observe', 'sleep:0.0', 'observe'], (
+            f'expected a yield between every pair of attempts and none after the last, got {log!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_delay_is_slept_between_attempts_after_reopen(self, monkeypatch):
+        """An explicit `delay` is slept AFTER `reopen` and BEFORE the next observation.
+
+        The order is the assertion: `reopen` opens the window, then the delay
+        gives it time to develop, then it is observed. Sleeping BEFORE the
+        re-open would spend the wait on a window that does not exist yet.
+
+        `delay` is the knob the two sibling primitives already expose as
+        `interval`; naming it differently here is deliberate, because it is
+        not a poll cadence -- it is the gap between two independent openings.
+        """
+        import asyncio
+
+        from _fm_helpers import retry_until_observed
+
+        log: list[str] = []
+        real_sleep = asyncio.sleep
+        payload = {'rows': 2}
+
+        async def recording_sleep(seconds):
+            log.append(f'sleep:{seconds}')
+            await real_sleep(0)
+
+        monkeypatch.setattr(asyncio, 'sleep', recording_sleep)
+
+        results = [None, payload]
+
+        def observe():
+            log.append('observe')
+            return results.pop(0)
+
+        def reopen():
+            log.append('reopen')
+
+        result = await retry_until_observed(observe, reopen=reopen, attempts=4, delay=0.25)
+
+        assert result is payload, f'expected the exact object {payload!r}, got {result!r}'
+        assert log == ['observe', 'reopen', 'sleep:0.25', 'observe'], (
+            f'expected the delay to fall between reopen and the next observation, got {log!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_exception_from_observe_propagates_instead_of_counting_as_a_miss(self):
+        """A raising `observe` propagates on the spot; it is NOT absorbed as a falsy observation.
+
+        This is the contract the motivating live call site's SECOND durable
+        job rests on. There, `observe` reads `CALL db.indexes()` and raises
+        IndexHeaderError when FalkorDB no longer exposes the label/types/status
+        columns the barriers depend on. Absorbing that as an ordinary miss
+        would spend the whole attempt budget re-opening a window nobody can
+        read, and then report the FIRST durable job's diagnosis ("FalkorDB
+        stopped rebuilding the merged index in place") for a completely
+        different defect -- the two-modes-one-string collapse IndexHeaderError
+        exists to prevent.
+
+        Only a FALSY observation means "missed". Every other outcome is the
+        caller's to see. Pinned here because a future edit wrapping the loop
+        body in a broad try/except would leave every other test in this class
+        green while silently deleting that guarantee.
+        """
+        from _fm_helpers import retry_until_observed
+
+        log: list[str] = []
+        boom = RuntimeError('CALL db.indexes() changed shape')
+
+        def observe():
+            log.append('observe')
+            raise boom
+
+        def reopen():
+            log.append('reopen')
+
+        with pytest.raises(RuntimeError) as excinfo:
+            await retry_until_observed(observe, reopen=reopen, attempts=5)
+
+        assert excinfo.value is boom, f'expected the original exception, got {excinfo.value!r}'
+        assert log == ['observe'], (
+            f'expected the raise to abort on the FIRST attempt with no reopen, got {log!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_exception_from_reopen_aborts_the_retry_rather_than_being_retried_around(self):
+        """A raising `reopen` propagates after the first miss; the retry does not continue past it.
+
+        The live call site's `reopen` re-creates and re-drops a real index and
+        holds two index-readiness barriers, any of which can raise. If those
+        failures were swallowed and retried around, the helper would keep
+        observing a window that was never successfully re-opened and then
+        report exhaustion -- again the wrong diagnosis for the actual defect.
+        `_reopen_rebuild_window`'s comment asserts this in prose; this test is
+        what makes it checkable.
+        """
+        from _fm_helpers import retry_until_observed
+
+        log: list[str] = []
+        boom = RuntimeError('could not re-create the vector index')
+
+        def observe():
+            log.append('observe')
+            return None
+
+        def reopen():
+            log.append('reopen')
+            raise boom
+
+        with pytest.raises(RuntimeError) as excinfo:
+            await retry_until_observed(observe, reopen=reopen, attempts=5)
+
+        assert excinfo.value is boom, f'expected the original exception, got {excinfo.value!r}'
+        assert log == ['observe', 'reopen'], (
+            f'expected exactly one observation and one failed reopen, got {log!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_attempts_one_degenerates_to_a_single_un_retried_observation(self):
+        """`attempts=1` observes exactly once, never reopens, and still raises on a miss.
+
+        That is EXACTLY the semantics of the un-retried single observation
+        this helper replaces at the live call site, which makes
+        retry_until_observed a strict generalisation of that code rather than
+        a behaviour change wearing a new name.
+        """
+        from _fm_helpers import retry_until_observed
+
+        log: list[str] = []
+
+        def observe():
+            log.append('observe')
+            return None
+
+        def reopen():
+            log.append('reopen')
+
+        with pytest.raises(AssertionError):
+            await retry_until_observed(observe, reopen=reopen, attempts=1)
+
+        assert log == ['observe'], (
+            f'expected exactly one observation and no reopen, got {log!r}'
+        )
+
+    @pytest.mark.parametrize('bad_attempts', [0, -1])
+    @pytest.mark.asyncio
+    async def test_non_positive_attempts_raises_value_error_without_observing(self, bad_attempts):
+        """THE LOUD-OVER-SILENT GUARD: `attempts` < 1 is a ValueError, raised before any observation.
+
+        With a bare loop, `attempts=0` observes ZERO times and then raises the
+        ordinary exhaustion AssertionError -- a barrier that gated nothing
+        while reporting a plausible-looking failure. That is precisely the
+        silent-no-op class await_index_operational's empty-`result_set` note
+        already guards against in this same module.
+
+        ValueError, deliberately NOT AssertionError: a caller that catches the
+        exhaustion error to handle a genuine missed observation must not
+        swallow a mis-configuration with it. The zero-call assertion is what
+        proves the guard runs BEFORE the loop rather than being an
+        after-the-fact relabelling of the exhaustion path.
+        """
+        from _fm_helpers import retry_until_observed
+
+        log: list[str] = []
+
+        def observe():
+            log.append('observe')
+            return None
+
+        with pytest.raises(ValueError, match='attempts'):
+            await retry_until_observed(observe, attempts=bad_attempts)
+
+        assert log == [], f'expected no observation at all, got {log!r}'
+
+
+# ---------------------------------------------------------------------------
 # Tests for the shared ensure_fresh_collection() helper (task 2773, item 3)
 # ---------------------------------------------------------------------------
 # Idempotent + 409-tolerant collection (re)creation, used by the qdrant
@@ -1496,3 +1971,270 @@ class TestAwaitIndexOperational:
 
         with pytest.raises(AssertionError, match='not OPERATIONAL'):
             await await_index_operational(graph, timeout_s=0.05)
+
+
+# ---------------------------------------------------------------------------
+# Tests for the shared load_script_module() loader (task 3738)
+# ---------------------------------------------------------------------------
+# load_script_module imports a script that is NOT a package member and NOT on
+# PYTHONPATH (anything under `scripts/`) by file path, so its pure functions
+# can be tested without sys.path pollution. It was hoisted out of
+# test_sweep_toolcall_xml_leak.py and test_toolcall_xml_leak_sweep_artifacts.py,
+# which carried two independent copies of it.
+#
+# The REUSE guard is the reason the more-robust of those two copies was the one
+# promoted, and it is precisely the behaviour nothing pinned: both sweep modules
+# register the SAME sys.modules key, so an unconditional second load would
+# re-execute the 965-line script and silently replace the first module object,
+# leaving two live module objects whose identity depends on collection order.
+# That guard is currently exercised only INCIDENTALLY, as a side effect of
+# collection order across those two modules — drop it and both still pass. These
+# tests make it load-bearing directly.
+#
+# Everything here drives throwaway tmp_path scripts, never a real repo script,
+# so no case depends on the content of anything under scripts/.
+#
+# load_script_module is imported at module level (with submit_and_resolve),
+# deliberately NOT lazily per-test the way the 8df8 section above does it:
+# every test in this section needs it, so seven copies of one import line bought
+# nothing.
+
+@pytest.fixture
+def registered_module_names():
+    """Yield a registrar for sys.modules keys a test is about to create.
+
+    Every registered key is popped afterwards, pass or fail, so a test that
+    loads a throwaway tmp_path script cannot leak a module object into sibling
+    tests (or shadow a real module for the rest of the session).
+
+    The helper's own record of which keys it installed is cleared for the same
+    keys, so a tmp_path name cannot arrive at a sibling test already marked as
+    helper-owned and quietly disarm the shadowing guard there.
+    """
+    names: list[str] = []
+    yield names.append
+    for name in names:
+        sys.modules.pop(name, None)
+        _LOADED_SCRIPT_MODULE_NAMES.discard(name)
+
+
+class TestLoadScriptModule:
+    """Unit tests for load_script_module(script_path, mod_name=None)."""
+
+    def test_module_level_names_are_reachable_on_the_returned_module(
+        self, tmp_path, registered_module_names
+    ):
+        """The whole point: a by-path script's constants and functions come back
+        as ordinary attributes of the returned module."""
+        script = tmp_path / 'probe_script.py'
+        script.write_text('VALUE = 41\n\n\ndef bump(n):\n    return n + 1\n')
+        registered_module_names('probe_script')
+
+        mod = load_script_module(script)
+
+        assert mod.VALUE == 41
+        assert mod.bump(41) == 42
+
+    def test_registers_under_the_explicit_mod_name(
+        self, tmp_path, registered_module_names
+    ):
+        """An explicit mod_name is the sys.modules key — this is what lets two
+        test modules deliberately SHARE one key for the same script."""
+        script = tmp_path / 'stem_is_ignored.py'
+        script.write_text("ORIGIN = 'explicit'\n")
+        registered_module_names('chosen_key')
+
+        mod = load_script_module(script, mod_name='chosen_key')
+
+        assert sys.modules['chosen_key'] is mod
+        assert 'stem_is_ignored' not in sys.modules
+
+    def test_registers_under_the_file_stem_when_mod_name_is_omitted(
+        self, tmp_path, registered_module_names
+    ):
+        """mod_name defaults to the file stem."""
+        script = tmp_path / 'defaults_to_stem.py'
+        script.write_text("ORIGIN = 'stem'\n")
+        registered_module_names('defaults_to_stem')
+
+        mod = load_script_module(script)
+
+        assert sys.modules['defaults_to_stem'] is mod
+
+    def test_a_second_load_of_the_same_file_reuses_the_module_object(
+        self, tmp_path, registered_module_names
+    ):
+        """REUSE — the guard this loader exists for.
+
+        The second call must return the IDENTICAL object without re-executing
+        the file. Asserted by mutating the first module and looking for the
+        mutation afterwards: a re-execution would hand back a freshly built
+        module object with no SENTINEL on it, so `is`-identity plus the
+        surviving attribute together rule out both replacement and re-exec.
+        """
+        script = tmp_path / 'reused_script.py'
+        script.write_text('VALUE = 1\n')
+        registered_module_names('reused_script')
+
+        first = load_script_module(script)
+        first.SENTINEL = 'set-by-first-caller'  # type: ignore[attr-defined]
+
+        second = load_script_module(script)
+
+        assert second is first
+        assert second.SENTINEL == 'set-by-first-caller'
+
+    def test_reuse_survives_a_non_normalised_path_to_the_same_file(
+        self, tmp_path, registered_module_names
+    ):
+        """The guard compares RESOLVED paths, so an unnormalised spelling of the
+        same file still reuses.
+
+        Callers build these paths with `Path(__file__).parent.parent / ...`, so
+        the second caller's spelling need not be string-equal to the first's.
+        An implementation comparing the cached ``__file__`` as a raw string
+        would re-execute here.
+        """
+        subdir = tmp_path / 'subdir'
+        subdir.mkdir()
+        script = tmp_path / 'roundabout_script.py'
+        script.write_text('VALUE = 1\n')
+        registered_module_names('roundabout_script')
+
+        first = load_script_module(script)
+        first.SENTINEL = 'set-by-first-caller'  # type: ignore[attr-defined]
+
+        second = load_script_module(subdir / '..' / 'roundabout_script.py')
+
+        assert second is first
+        assert second.SENTINEL == 'set-by-first-caller'
+
+    def test_a_different_file_under_a_used_mod_name_is_not_reused(
+        self, tmp_path, registered_module_names
+    ):
+        """The guard keys on the FILE, not on the name.
+
+        Reusing on a name match alone would hand the second caller the first
+        script's module — silently serving the wrong code under the right key.
+
+        Replacement is allowed here because the helper installed that key
+        itself; the shadowing test below covers the case where it did not.
+        """
+        first_script = tmp_path / 'first_source.py'
+        first_script.write_text("ORIGIN = 'first'\n")
+        second_script = tmp_path / 'second_source.py'
+        second_script.write_text("ORIGIN = 'second'\n")
+        registered_module_names('shared_key')
+
+        first = load_script_module(first_script, mod_name='shared_key')
+        assert first.ORIGIN == 'first'
+
+        second = load_script_module(second_script, mod_name='shared_key')
+
+        assert second is not first
+        assert second.ORIGIN == 'second'
+        assert sys.modules['shared_key'] is second
+
+    def test_an_exception_during_exec_propagates_and_leaves_no_partial_entry(
+        self, tmp_path, registered_module_names
+    ):
+        """A script that blows up mid-exec must not leave its half-built module
+        registered.
+
+        The module is inserted into sys.modules BEFORE exec_module (so the
+        script can import itself), which means the failure path has to undo
+        that. Otherwise the next caller's reuse check would find the cached
+        entry, match its __file__, and return a module whose top level never
+        finished running — a partially-initialised module served as a good one.
+        """
+        script = tmp_path / 'exploding_script.py'
+        script.write_text("LOADED_SO_FAR = 1\nraise RuntimeError('boom during exec')\n")
+        registered_module_names('exploding_script')
+
+        with pytest.raises(RuntimeError, match='boom during exec'):
+            load_script_module(script)
+
+        assert 'exploding_script' not in sys.modules
+
+    def test_a_module_the_helper_did_not_install_is_never_shadowed(
+        self, tmp_path, registered_module_names
+    ):
+        """A key some OTHER importer owns must raise, not be overwritten.
+
+        mod_name defaults to the file stem, and `scripts/` is full of names
+        that are also ordinary module names (config.py, utils.py, types.py).
+        Silently replacing `sys.modules['config']` with a script would persist
+        for the rest of the pytest process and surface as an unrelated test
+        failing far away, so the helper refuses and says which name collided.
+        """
+        script = tmp_path / 'shadow_target.py'
+        script.write_text("ORIGIN = 'the script'\n")
+        registered_module_names('shadow_target')
+        pre_existing = types.ModuleType('shadow_target')
+        pre_existing.__file__ = str(tmp_path / 'somewhere_else.py')
+        pre_existing.ORIGIN = 'the real module'  # type: ignore[attr-defined]
+        sys.modules['shadow_target'] = pre_existing
+
+        with pytest.raises(ImportError, match='refusing to shadow'):
+            load_script_module(script)
+
+        assert sys.modules['shadow_target'] is pre_existing
+        assert sys.modules['shadow_target'].ORIGIN == 'the real module'
+
+    def test_a_foreign_module_without_a_file_attribute_is_also_not_shadowed(
+        self, tmp_path, registered_module_names
+    ):
+        """Namespace packages and C/builtin modules have no usable __file__.
+
+        The reuse check reads __file__ to decide whether the cached entry IS
+        this script; a None there must fall through to the ownership guard
+        rather than to a replacement.
+        """
+        script = tmp_path / 'fileless_target.py'
+        script.write_text("ORIGIN = 'the script'\n")
+        registered_module_names('fileless_target')
+        pre_existing = types.ModuleType('fileless_target')
+        sys.modules['fileless_target'] = pre_existing
+
+        with pytest.raises(ImportError, match='refusing to shadow'):
+            load_script_module(script, mod_name='fileless_target')
+
+        assert sys.modules['fileless_target'] is pre_existing
+
+    def test_ownership_lapses_when_a_load_fails_mid_exec(
+        self, tmp_path, registered_module_names
+    ):
+        """A failed load leaves nothing installed, so it must leave no claim.
+
+        Otherwise the helper would still consider the name its own, and a
+        genuine `import <name>` landing in between would be replaced by the
+        next by-path load — the exact shadowing the guard exists to stop,
+        reachable through a failed load.
+        """
+        exploding = tmp_path / 'lapsed_key.py'
+        exploding.write_text("raise RuntimeError('boom during exec')\n")
+        script = tmp_path / 'later_script.py'
+        script.write_text("ORIGIN = 'the script'\n")
+        registered_module_names('lapsed_key')
+
+        with pytest.raises(RuntimeError, match='boom during exec'):
+            load_script_module(exploding)
+
+        pre_existing = types.ModuleType('lapsed_key')
+        pre_existing.__file__ = str(tmp_path / 'a_real_module.py')
+        sys.modules['lapsed_key'] = pre_existing
+
+        with pytest.raises(ImportError, match='refusing to shadow'):
+            load_script_module(script, mod_name='lapsed_key')
+
+        assert sys.modules['lapsed_key'] is pre_existing
+
+    def test_a_path_with_no_importable_loader_raises_import_error(self, tmp_path):
+        """The helper's only explicit error contract.
+
+        spec_from_file_location returns None when no loader claims the suffix,
+        and the helper must turn that into a named ImportError rather than an
+        AttributeError on None further down.
+        """
+        with pytest.raises(ImportError, match='Cannot load'):
+            load_script_module(tmp_path / 'not_a_module.txt')

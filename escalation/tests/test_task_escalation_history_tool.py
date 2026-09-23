@@ -42,9 +42,13 @@ async def _history(server: Any, **kwargs: Any) -> dict[str, Any]:
 
 
 async def _get_pending(server: Any, **kwargs: Any) -> list[dict[str, Any]]:
-    """Invoke get_pending_escalations directly (sync tool), for the B6 contrast."""
+    """Invoke get_pending_escalations directly, for the B6 contrast.
+
+    Async as of task 3543 (it awaits a batched scheduler status read for the
+    pins_recovery annotation), unlike its sync siblings above.
+    """
     tool = await server.get_tool('get_pending_escalations')
-    return tool.fn(**kwargs)
+    return await tool.fn(**kwargs)
 
 
 @pytest.mark.asyncio

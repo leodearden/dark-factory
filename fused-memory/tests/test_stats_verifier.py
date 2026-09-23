@@ -307,6 +307,62 @@ async def test_verify_overrides_all_computed_keys_with_divergent_originals(journ
 
 
 @pytest.mark.asyncio
+async def test_verify_propagates_writes_dead_lettered_without_verifier_changes(journal):
+    """Cross-module contract: adding writes_dead_lettered to
+    _COMPUTED_STAT_KEYS propagates it through the verifier with NO
+    stats_verifier code change, because _apply_observed iterates that
+    frozenset and writes every key back 0-default.
+
+    The stage self-reported graphiti_writes_queued: 1 — it could not know
+    better, since dead-lettering is decided asynchronously by the durable
+    queue after the stage has already finished and reported. The journal
+    shows that enqueue died, so the verifier rewrites the counter to 0,
+    surfaces the death under writes_dead_lettered, and preserves the stage's
+    inflated original under _reported as the judge's divergence signal.
+    """
+    run_id = str(uuid.uuid4())
+    now = datetime.now(UTC)
+
+    write_op_id = str(uuid.uuid4())
+    await journal.log_write_op(
+        write_op_id=write_op_id,
+        causation_id=run_id,
+        source='mcp_tool',
+        operation='add_memory',
+        project_id='test',
+        agent_id='recon-stage-memory_consolidator',
+        result_summary={'memory_ids': [], 'stores': ['graphiti']},
+        success=True,
+    )
+    await journal.record_terminal_outcome(
+        write_op_id=write_op_id,
+        terminal_status='dead',
+        terminal_error='backend refused',
+    )
+
+    reports: dict[str, StageReport | dict] = {
+        'memory_consolidator': _stage_report(
+            StageId.memory_consolidator,
+            now - timedelta(minutes=1), now + timedelta(minutes=1),
+            stats={'graphiti_writes_queued': 1},
+        ),
+    }
+
+    observed = await verify_and_rewrite_stats(run_id, reports, journal)
+
+    assert observed['memory_consolidator']['graphiti_writes_queued'] == 0
+    assert observed['memory_consolidator']['writes_dead_lettered'] == 1
+
+    stats = reports['memory_consolidator'].stats  # type: ignore[union-attr]
+    # The write was accepted at enqueue but never landed: 0, not 1.
+    assert stats['graphiti_writes_queued'] == 0
+    # ...and the reason it is 0 is legible rather than silent.
+    assert stats['writes_dead_lettered'] == 1
+    # The stage's original claim survives as the judge's divergence signal.
+    assert stats['_reported']['graphiti_writes_queued'] == 1
+
+
+@pytest.mark.asyncio
 async def test_verify_returns_empty_when_no_write_journal():
     run_id = str(uuid.uuid4())
     now = datetime.now(UTC)

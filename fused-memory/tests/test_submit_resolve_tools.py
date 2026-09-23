@@ -412,3 +412,63 @@ async def test_routing_intent_warning_merged_into_planning_mode_result(
     assert result.get('status') == 'deferred'
     assert result.get('planning_mode') is True
     assert 'routing_intent_warning' in result, f'Expected warning payload, got: {result!r}'
+
+
+@pytest.mark.asyncio
+async def test_routing_intent_stage2_stamp_does_not_blind_submit_boundary(
+    mcp_server, task_interceptor, monkeypatch,
+):
+    """WARN mode + a marker-bearing submission whose description carries a
+    machine-injected Stage-2 doc-drift stamp ("DOC-DRIFT FIX ...") -> the
+    boundary still flags it. The stamp's bare "FIX" previously armed the
+    code-change suppression and blinded the guard for that task (4532)."""
+    monkeypatch.delenv('FUSED_ROUTING_INTENT_ENFORCE', raising=False)
+    result = await mcp_server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': '/project',
+            'title': 'DO NOT IMPLEMENT this; escalate to a human instead of implementing.',
+            'description': (
+                '[Stage 2 task-knowledge sync 2026-07-07] DOC-DRIFT FIX '
+                '(finding 4e06f01a-cacb-4688-9670-ff6d6ce41baf): the '
+                '`dependencies` array carries 32 entries, but this prose '
+                'previously itemized only 31.'
+            ),
+            'task_kind': 'normal',
+        },
+    )
+    assert 'routing_intent_warning' in result, f'Expected warning payload, got: {result!r}'
+    task_interceptor.submit_task.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_routing_intent_enforce_mode_rejects_a_stamped_submission(
+    mcp_server, task_interceptor, monkeypatch,
+):
+    """ENFORCE mode + a marker-bearing submission whose description carries a
+    machine-injected Stage-2 doc-drift stamp -> the finding RECOVERED by the
+    provenance-stamp carve-out flows all the way into the
+    routing_intent_reject payload and the interceptor is never reached.
+
+    Pins the consequential direction of task 4532: a stamp-recovered finding
+    is a real hard reject under FUSED_ROUTING_INTENT_ENFORCE, not merely an
+    advisory warning, so the carve-out's precision boundaries are
+    load-bearing at the wire."""
+    monkeypatch.setenv('FUSED_ROUTING_INTENT_ENFORCE', '1')
+    result = await mcp_server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': '/project',
+            'title': 'DO NOT IMPLEMENT this; escalate to a human instead of implementing.',
+            'description': (
+                '[Stage 2 task-knowledge sync 2026-07-07] DOC-DRIFT FIX '
+                '(finding abc): re-derived the dependency count.'
+            ),
+            'task_kind': 'normal',
+        },
+    )
+    assert result.get('error_type') == 'ValidationError', f'Expected ValidationError, got: {result!r}'
+    assert 'do_not_implement' in result.get('error', ''), (
+        f'Reject payload must name the recovered marker, got: {result!r}'
+    )
+    task_interceptor.submit_task.assert_not_called()
