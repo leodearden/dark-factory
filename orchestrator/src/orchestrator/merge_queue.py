@@ -17636,13 +17636,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     async def _post_submit_tasks(self, arguments_list: list[dict]) -> None:
         """Fire-and-forget: POST all submit_task calls to the fused-memory MCP.
 
-        Worker-side mirror of
-        ``orchestrator/workflow.py::TaskWorkflow._post_submit_tasks``
-        (task 2564) — a single shared client from
-        ``shared.mcp_post.open_mcp_client`` for the whole batch so only one TCP
-        connection pool is opened regardless of how many tasks are being
-        submitted.  Per-POST exceptions are caught and logged as warnings so a
-        failure on one submission does not abort the rest.
+        Worker-side mirror of ``orchestrator/workflow.py::TaskWorkflow._post_submit_tasks``
+        (task 2564) — a single shared client from ``shared.mcp_post.open_mcp_client``
+        for the whole batch so only one TCP connection pool is opened regardless
+        of how many tasks are being submitted.  Per-POST exceptions are caught
+        and logged as warnings so a failure on one submission does not abort
+        the rest.
 
         None-safe: no-ops when ``self._mcp`` is ``None`` (every bare-worker
         test constructor and any harness that hasn't wired an MCP client).
