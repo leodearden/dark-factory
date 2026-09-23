@@ -916,21 +916,6 @@ class Violation:
 #       matches confined to a single clause.
 _GAP_NO_NEGATION = r"(?:(?!\bnot\b|\bnever\b|n['’]t\b|[.;]).)*"
 
-# Module-level rule table for premise_lint: (compiled case-insensitive
-# regex, invariant_name, detail). Each rule encodes one known-false premise
-# from the 2083/2092/2093 false-premise batch, which mis-modeled run_id and
-# stage1_flag_marker lifecycle. Extend this table as new false premises (or
-# new paraphrasings of an existing one) are discovered; premise_lint returns
-# one Violation per matching rule.
-#
-# BEST-EFFORT DENYLIST, NOT EXHAUSTIVE VALIDATION: premise_lint is a regex
-# lint over a fixed, small set of known-false phrasings — it does not
-# understand the premises semantically. A paraphrase not yet enumerated
-# here (or in the future, an entirely new false premise) silently passes:
-# premise_lint returning no Violation means no KNOWN false premise was
-# matched, not that the description is otherwise correct. Treat a clean
-# lint result accordingly and keep extending this table as new paraphrases
-# surface, rather than over-trusting its coverage.
 # What a clearance claim must be ABOUT for the probe rules below to fire.
 # Without it, an unrelated task reporting "the flaky test did not reproduce"
 # would be rejected under an invariant that says nothing about it.
@@ -944,7 +929,7 @@ _NOT_REPRODUCED = (
 # What turns a negative probe report into a CLEARANCE CLAIM: it scopes the
 # negative to the fault's current existence rather than to the one probe that
 # was run. Without one of these in the same clause, "did not reproduce" is a
-# truthful per-probe observation \u2014 which is precisely the fine-grained
+# truthful per-probe observation — which is precisely the fine-grained
 # reporting the Stage 2 probe protocol asks for, and rejecting it would make
 # the rule reject the protocol's own output.
 _CLEARANCE_QUALIFIER = (
@@ -988,7 +973,7 @@ _NO_POSITIVE_AFTER_IN_CLAUSE = (
 
 # At most a couple of determiners may sit between a negated `reproduce` and
 # the fault it is about. Anything wordier is a DIFFERENT subject wearing the
-# same words \u2014 "the stage1 stall bug did not reproduce after the Graphiti
+# same words — "the stage1 stall bug did not reproduce after the Graphiti
 # degradation was fixed" asserts nothing this invariant forbids.
 _DETERMINER_GAP = r'(?:\s+(?:the|this|that|a|an|any|its|such)){0,2}\s+'
 
@@ -1011,6 +996,23 @@ _NEGATIVE_PROBE_SET_DETAIL = (
     'a verdict: "' + NEGATIVE_SET_VERDICT_TEMPLATE.format(n='N') + '"'
 )
 
+# Module-level rule table for premise_lint: (compiled case-insensitive
+# regex, invariant_name, detail). Each rule encodes one known-false premise
+# recon has written into a task: the run_id and marker rules come from the
+# 2083/2092/2093 batch, which mis-modeled run_id and the stage1_flag_marker
+# lifecycle; the two probe rules from run cd53b227, which promoted a negative
+# probe set to a clearance claim (task 4644). Extend this table as new false
+# premises (or new paraphrasings of an existing one) are discovered;
+# premise_lint returns one Violation per matching rule.
+#
+# BEST-EFFORT DENYLIST, NOT EXHAUSTIVE VALIDATION: premise_lint is a regex
+# lint over a fixed, small set of known-false phrasings — it does not
+# understand the premises semantically. A paraphrase not yet enumerated
+# here (or in the future, an entirely new false premise) silently passes:
+# premise_lint returning no Violation means no KNOWN false premise was
+# matched, not that the description is otherwise correct. Treat a clean
+# lint result accordingly and keep extending this table as new paraphrases
+# surface, rather than over-trusting its coverage.
 _PREMISE_RULES: tuple[tuple[re.Pattern[str], str, str], ...] = (
     (
         re.compile(
