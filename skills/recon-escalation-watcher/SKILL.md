@@ -263,7 +263,7 @@ cd $DARK_FACTORY_ROOT && set -a && \
 ```
 
 Without the service unit's `DASHBOARD_KNOWN_PROJECT_ROOTS`, the reaper exits
-**4** and reaps almost nothing. Always gate on the exit code (table in the
+**4** and skips every project except dark_factory. Always gate on the exit code (table in the
 playbook row below): `0` → report `reaped` and continue; `3`/`4` → a partial
 scan, so continue the loop but tell the human once; `1` → wrong cwd, fix and
 re-run. The reaper closes only records whose subject is `done`/`cancelled` or
