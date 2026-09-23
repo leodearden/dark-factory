@@ -36,12 +36,13 @@ assertions meaningful.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastmcp.exceptions import ToolError
 from shared.mcp_markup_middleware import RepairPolicy
-from shared.toolcall_markup import CANONICAL_OPENER_PREFIX, closer_for
+from shared.toolcall_markup import CANONICAL_OPENER_PREFIX, ENVELOPE_LITERALS, closer_for
 
 from fused_memory.server.markup_guard import install_markup_guard
 from fused_memory.server.markup_tripwire import (
@@ -1470,3 +1471,50 @@ class TestMarkupStormAtTheBoundary:
         assert storm_errors, (
             f'expected a greppable markup_guard_storm ERROR line, got: {caplog.text!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Source-hygiene guard (task 4948). A raw MCP envelope literal in this file
+# would force any agent editing near it to emit that literal inside its own
+# tool call, where the harness parser over-consumes past the mis-closed tag —
+# see shared/src/shared/toolcall_markup.py's "Sentinel-literal hazard"
+# section, the owner of this rule. So every specimen and expected pattern
+# above is assembled from shared.toolcall_markup's constants, and prose
+# spells the bracket with the ``\x3c`` escape.
+#
+# Modelled on tests/server/test_markup_tripwire.py's guard (task 4228). Its
+# needle set and scanner are COPIED here rather than imported: a guard whose
+# needles another module can edit is not a per-file guard.
+# ---------------------------------------------------------------------------
+
+#: Every ENVELOPE_LITERALS member plus the two structural prefixes a
+#: hand-spelled specimen could use instead of the enumerated literals — the
+#: bare closing-tag prefix (catches any closer, not just the enumerated ones)
+#: and the ``parameter`` opening-tag prefix with no trailing space (so it also
+#: catches an attribute-less opener spelling).
+_RAW_SENTINEL_NEEDLES = (*ENVELOPE_LITERALS, chr(60) + '/', chr(60) + 'parameter')
+
+
+def _raw_sentinel_hits(source: str) -> dict[str, list[int]]:
+    """Map each offending needle found in ``source`` to its 1-based lines."""
+    source_lines = source.splitlines()
+    return {
+        needle: [i + 1 for i, line in enumerate(source_lines) if needle in line]
+        for needle in _RAW_SENTINEL_NEEDLES
+        if needle in source
+    }
+
+
+def test_this_module_spells_no_raw_envelope_literal():
+    """SELF-FILE (the idiom task 4696 promoted): this module's own source must
+    never contain a raw envelope literal — see the banner above for why.
+    """
+    source = Path(__file__).read_text(encoding='utf-8')
+
+    hits = _raw_sentinel_hits(source)
+    assert not hits, (
+        'A raw envelope literal was written into this test file. Build it from '
+        "shared.toolcall_markup's constants, as _absorbed() does, or spell it "
+        'with the \\x3c escape in prose — see the source-hygiene banner above '
+        f'this test for why. Offending needle(s): {hits!r}.'
+    )
