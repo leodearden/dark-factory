@@ -2322,8 +2322,9 @@ class TestCompareMergedBaselineFiles:
     def test_moves_on_different_paths_add_up_in_the_derived_total(
         self, tmp_path: Path
     ) -> None:
-        # The total is DERIVED from the bound, so it reads 1215. A per-measure
-        # max of the parents' own totals would read 1210 and refuse the merge.
+        # ONE side moved each path, so each move stands, and the total is
+        # DERIVED from the bound: 1215. A per-measure max of the parents' own
+        # totals would read 1210 and refuse the merge.
         ours = self._moved(('a.py', 'lines', 1005))
         theirs = self._moved(('b.py', 'lines', 210))
         merged = self._moved(('a.py', 'lines', 1005), ('b.py', 'lines', 210))

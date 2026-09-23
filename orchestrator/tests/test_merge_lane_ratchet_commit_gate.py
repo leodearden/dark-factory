@@ -264,6 +264,20 @@ def _record(raises: list[metrics.Violation], task_id: str = '5722') -> dict:
     )
 
 
+def _a_py_lines_raise(was: int, now: int, task_id: str) -> dict:
+    """The record `--authorize-raise` appends when a.py's `lines` rise *was* -> *now*."""
+    b_py_lines = synthetic_report()['files']['b.py']['lines']
+    return _record(
+        [
+            metrics.Violation.rose('lines', 'a.py', was, now),
+            metrics.Violation.rose(
+                'total:lines', metrics.CLUSTER_TOTAL_KEY, was + b_py_lines, now + b_py_lines
+            ),
+        ],
+        task_id,
+    )
+
+
 class TestTheStagedDiffIsAudited:
     """The gate's core arm: HEAD's baseline blob against the staged one."""
 
@@ -770,17 +784,7 @@ class TestAConflictedMergeLedgerIsAuditedAgainstBothParents:
         # Main RECORDED 1005 -> 1009 without taking it. Counted as "appended
         # vs HEAD", that record would license the merge to take the raise --
         # the standing permission LEDGER_README forbids.
-        recorded = _ledger_with(
-            _record(
-                [
-                    metrics.Violation.rose('lines', 'a.py', 1005, 1009),
-                    metrics.Violation.rose(
-                        'total:lines', metrics.CLUSTER_TOTAL_KEY, 1205, 1209
-                    ),
-                ],
-                '3620',
-            )
-        )
+        recorded = _ledger_with(_a_py_lines_raise(1005, 1009, '3620'))
         repo = _Repo.mid_merge(
             tmp_path, theirs=_with_a_py_lines(1005), theirs_ledger=recorded
         )
@@ -862,19 +866,7 @@ class TestAConflictedMergeBaselineIsBoundedByBothParents:
     ) -> None:
         repo = _Repo.mid_merge(tmp_path, theirs=_with_a_py_lines(1005))
         repo.write_baseline(_with_a_py_lines(1009))
-        repo.write_ledger(
-            _ledger_with(
-                _record(
-                    [
-                        metrics.Violation.rose('lines', 'a.py', 1005, 1009),
-                        metrics.Violation.rose(
-                            'total:lines', metrics.CLUSTER_TOTAL_KEY, 1205, 1209
-                        ),
-                    ],
-                    '5792',
-                )
-            )
-        )
+        repo.write_ledger(_ledger_with(_a_py_lines_raise(1005, 1009, '5792')))
         repo.stage(metrics.BASELINE_RELPATH, metrics.LEDGER_RELPATH)
 
         result = repo.gate()
@@ -910,7 +902,7 @@ class TestAConflictedMergeBaselineIsBoundedByBothParents:
         result = repo.gate()
 
         assert result.returncode == 1, result.stdout + result.stderr
-        assert 'restores the value this path held' not in result.stdout
+        assert 'a.py' in result.stderr
 
     def test_where_both_parents_moved_a_measure_the_higher_bounds_it(
         self, tmp_path: Path
@@ -924,6 +916,39 @@ class TestAConflictedMergeBaselineIsBoundedByBothParents:
         result = repo.gate()
 
         assert result.returncode == 0, result.stdout + result.stderr
+
+    def test_two_recorded_raises_of_one_measure_need_the_merges_own_entry(
+        self, tmp_path: Path
+    ) -> None:
+        # Each side RECORDED its raise of a.py, and the honest merge holds both:
+        # 1008. The bound is the higher side, not the sum -- a sum would refuse
+        # two sides that removed overlapping code -- so the excess is the
+        # merge's own raise, and only its own `--authorize-raise` covers it.
+        ours_own = _a_py_lines_raise(1000, 1005, '5722')
+        theirs_own = _a_py_lines_raise(1000, 1003, '3620')
+        repo = _Repo.mid_merge(
+            tmp_path,
+            ours=_with_a_py_lines(1005),
+            theirs=_with_a_py_lines(1003),
+            ours_ledger=_ledger_with(ours_own),
+            theirs_ledger=_ledger_with(theirs_own),
+        )
+        repo.write_baseline(_with_a_py_lines(1008))
+        repo.write_ledger(_ledger_with(ours_own, theirs_own))
+        repo.stage(metrics.BASELINE_RELPATH, metrics.LEDGER_RELPATH)
+
+        refused = repo.gate()
+
+        assert refused.returncode == 1, refused.stdout + refused.stderr
+        assert '1005' in refused.stderr and '1008' in refused.stderr
+
+        merge_own = _a_py_lines_raise(1005, 1008, '5792')
+        repo.write_ledger(_ledger_with(ours_own, theirs_own, merge_own))
+        repo.stage(metrics.LEDGER_RELPATH)
+
+        authorized = repo.gate()
+
+        assert authorized.returncode == 0, authorized.stdout + authorized.stderr
 
     def test_unrelated_histories_are_bounded_by_the_higher_parent(
         self, tmp_path: Path
@@ -963,6 +988,20 @@ class TestAConflictedMergeBaselineIsBoundedByBothParents:
         result = repo.gate()
 
         assert result.returncode == 0, result.stdout + result.stderr
+
+    def test_a_baseline_neither_parent_carries_is_an_announced_first_write(
+        self, tmp_path: Path
+    ) -> None:
+        # Nothing on either side to bound it by: the single-parent arm's
+        # documented first-write limit, which is announced, not passed over.
+        repo = _Repo.mid_merge(tmp_path, ours=_Baseline.REMOVED, theirs=_Baseline.REMOVED)
+        repo.write_baseline(synthetic_report())
+        repo.stage(metrics.BASELINE_RELPATH)
+
+        result = repo.gate()
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert 'absent from both parents' in result.stdout
 
 
 #: The four real files a miniature repo needs before its hooks mean anything.
