@@ -1088,7 +1088,7 @@ verify_admission_pytest_n: "8"
 #     `phase_enter verify` behind this one flock
 #   - backlog +16.6 pending/day (burndown.db 992 -> 1080 over 5.3d), median
 #     pending age 14.2d, 225 high-priority waiting
-# UNDER OBSERVATION, WITH A DATED REVERT: task 5817 fires 48h after this lands
+# UNDER OBSERVATION, WITH A DATED REVERT: task 5797 fires 48h after this lands
 # and re-measures; if median task duration or timeouts/day worsen, put this back
 # to 1. That is the same reversibility clause the 09-03 raise carried, which did
 # fire and was honoured.
@@ -1097,7 +1097,7 @@ verify_admission_pytest_n: "8"
 # carry only {base_sha, branch, passed, tip_sha} and NO duration, so task-lane
 # slot-hours are not derivable from the event store at all. Only the leg COUNT
 # is: 572 workflow_verify events in 14.4d versus the ~240/14d that figure was
-# computed from. Task 5818 closes that gap. Until it lands, this knob is being
+# computed from. Task 5798 closes that gap. Until it lands, this knob is being
 # tuned on merge-lane duration plus queue-depth observation, not on task-lane
 # slot utilisation.
 verify_admission_task_slots: 2
