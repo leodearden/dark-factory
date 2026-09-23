@@ -447,8 +447,32 @@ class AuditCoverage(NamedTuple):
     git_discovery_failed: bool = False
 
 
+class UnboundLabel(NamedTuple):
+    """A manifest-bearing task whose label its tracked sidecar does not declare.
+
+    The stamper binds nothing for such a task and copies it no
+    ``delivered_checks``. ``declared_labels`` are the labels the sidecar DOES
+    declare, in the sidecar's own order, so a reader never has to open the file
+    to see what the task's label failed to match.
+
+    A NamedTuple, like :class:`DescriptorDrift`, because ``_asdict()`` feeds the
+    JSON writer.
+    """
+
+    task_id: int
+    label: str
+    status: str
+    manifest: str
+    declared_labels: tuple[str, ...]
+
+
 class ProjectAudit(NamedTuple):
-    """One project's audit: what drifted, and what could be seen.
+    """One project's audit: what drifted, which labels bind nothing, and what
+    could be seen.
+
+    ``findings`` is the drift direction (sidecar -> task) and ``unbound_labels``
+    the label-binding direction (task -> sidecar); they are separate lists
+    because they are separate defects with separate remedies.
 
     ``project_root`` owns the tasks.db; ``manifest_root`` owns the sidecars.
     They are the SAME path by default and differ only under ``--manifest-root``
@@ -461,6 +485,7 @@ class ProjectAudit(NamedTuple):
     project_root: str
     manifest_root: str
     findings: list[DescriptorDrift]
+    unbound_labels: list[UnboundLabel]
     coverage: AuditCoverage
 
 
@@ -471,6 +496,60 @@ def _drift_sort_key(drift: DescriptorDrift) -> tuple[str, int, str]:
     cannot be diffed between runs.
     """
     return (drift.manifest, drift.task_id, drift.capability)
+
+
+def _unbound_sort_key(row: UnboundLabel) -> tuple[str, int]:
+    """Manifest path, then NUMERIC task id — for the reason given on
+    :func:`_drift_sort_key`."""
+    return (row.manifest, row.task_id)
+
+
+def _unbound_labels(
+    bindings: tuple[ManifestBinding, ...],
+    declared_by_manifest: dict[str, tuple[str, ...]],
+    unparseable_manifests: set[str],
+) -> list[UnboundLabel]:
+    """Every binding whose tracked, parsed sidecar does not declare its label.
+
+    Mirrors the stamper's own matching in
+    fused-memory/src/fused_memory/server/manifest_stamping.py::_stamp_capability_manifests_impl.
+    Step 2 opens only a sidecar that exists, so a task whose derived sidecar is
+    not among the tracked ones is promised nothing and is never a row. Step 4
+    matches on LABEL, by exact string equality, so a declared label is bound
+    whatever its entry's ``task_id`` says. A task on a sidecar that failed to
+    parse is never a row either: that sidecar declares nothing KNOWN, which is
+    not the same as declaring nothing, and the parse failure is already named in
+    the coverage details.
+
+    A ROW IS NOT BY ITSELF A DEFECT. A sidecar may deliberately omit a label;
+    the four "Unbound task labels (task 4907 adjudication)" sections in the
+    ``.capability-manifest.md`` twins record the 21 adjudicated cases. Fixing a
+    row is a separate, reviewed edit, and it is one of three:
+
+    - realign a misspelled or transliterated label to the declared entry, on the
+      task side (task 4590's precedent);
+    - clear ``prd_task_label``, keeping ``prd_path``, on a task filed against
+      the PRD from outside its decomposition plan;
+    - complete the sidecar, for a label the PRD's own decomposition plan
+      declares but the sidecar omits.
+
+    Never invent a sidecar entry for a label the plan does not declare.
+    """
+    rows = [
+        UnboundLabel(
+            task_id=binding.task_id,
+            label=binding.label,
+            status=binding.status,
+            manifest=binding.manifest,
+            declared_labels=declared_by_manifest[binding.manifest],
+        )
+        for binding in bindings
+        if binding.manifest not in unparseable_manifests
+        and binding.manifest in declared_by_manifest
+        and binding.label not in declared_by_manifest[binding.manifest]
+    ]
+    rows.sort(key=_unbound_sort_key)
+    return rows
 
 
 def audit_project(project_root: str, manifest_root: str | None = None) -> ProjectAudit:
@@ -498,6 +577,7 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
             project_root=root,
             manifest_root=manifests_root,
             findings=[],
+            unbound_labels=[],
             coverage=AuditCoverage(
                 manifests_swept=0,
                 mechanical_capabilities_compared=0,
@@ -524,6 +604,9 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
     orphaned_entries = 0
     parse_failure_details: list[str] = []
     uncomparable_details: list[str] = []
+    # Gathered here so the label-binding direction parses no sidecar twice.
+    declared_by_manifest: dict[str, tuple[str, ...]] = {}
+    unparseable_manifests: set[str] = set()
 
     for relpath in relpaths:
         try:
@@ -532,9 +615,11 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
             # NAMED, not merely counted: a sweep that could not read half the
             # corpus must never read as complete (no-silent-fail-soft).
             parse_failure_details.append(f"{relpath}: {exc}")
+            unparseable_manifests.add(relpath)
             continue
 
         manifests_swept += 1
+        declared_by_manifest[relpath] = tuple(task.label for task in doc.tasks)
         for task in doc.tasks:
             if task.task_id is None:
                 # Authoring time, before commit_planning stamps the id. It
@@ -635,6 +720,8 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
         project_root=root,
         manifest_root=manifests_root,
         findings=findings,
+        unbound_labels=_unbound_labels(
+            scan.manifest_bindings, declared_by_manifest, unparseable_manifests),
         coverage=AuditCoverage(
             manifests_swept=manifests_swept,
             mechanical_capabilities_compared=compared,
