@@ -417,6 +417,65 @@ def test_no_mcp_servers_config_is_truthy_and_emits_strict_flag() -> None:
         _cleanup(temp_files)
 
 
+def test_build_claude_argv_resume_keeps_mcp_config_and_strict_flag() -> None:
+    """The MCP scoping survives --resume, the path real runs actually exercise.
+
+    Every AgentLoop turn >= 2 and every cap-retry reaches the CLI through
+    ``--resume``, so the four strict_mcp_config cases above — all of which pass
+    ``resume_session_id=None`` — cover only the first turn of any real run.
+    The resume half of the invariant was asserted only in prose, in the
+    docstrings of
+    ``fused-memory/src/fused_memory/reconciliation/agent_loop.py::AgentLoop._call_claude_cli``
+    and ``fused-memory/src/fused_memory/reconciliation/judge.py::Judge._call_judge_cli``,
+    and prose cannot fail a suite.
+
+    What that prose claims, and what this pins: the ``if mcp_config:`` block of
+    ``shared/src/shared/cli_invoke.py::build_claude_argv`` sits OUTSIDE its
+    ``if resume_session_id: / elif session_id:`` conditional.  A refactor moving
+    that block into the ``elif session_id:`` branch would silently drop both
+    --mcp-config and --strict-mcp-config from every turn >= 2 — reinstating the
+    ambient ``.mcp.json`` merge under ``bypassPermissions``, where the wildcard
+    deny is no protection because an ``output_schema`` expands it into a
+    BUILT-INS-ONLY list carrying no MCP pattern — while the whole existing
+    suite stayed green.
+    """
+    cmd, temp_files = build_claude_argv(
+        model='opus',
+        max_budget_usd=5.0,
+        system_prompt='sys prompt text',
+        max_turns=50,
+        permission_mode='bypassPermissions',
+        allowed_tools=None,
+        disallowed_tools=['*'],
+        mcp_config=no_mcp_servers_config(),
+        output_schema={'type': 'object'},
+        effort=None,
+        resume_session_id='resume-abc',
+        session_id='sess-ignored',
+        strict_mcp_config=True,
+    )
+    try:
+        # We really are on the resume path, not merely passing the kwarg.
+        assert '--resume' in cmd, f'got {cmd!r}'
+        assert cmd[cmd.index('--resume') + 1] == 'resume-abc', f'got {cmd!r}'
+        assert '--session-id' not in cmd, f'got {cmd!r}'
+
+        assert '--mcp-config' in cmd, f'got {cmd!r}'
+        assert len(temp_files) == 2, f'expected sysprompt + mcp temp files; got {temp_files!r}'
+        _sysprompt_path, mcp_path = temp_files
+        assert cmd[cmd.index('--mcp-config') + 1] == mcp_path, f'got {cmd!r}'
+        # The on-disk artifact, not just the flag: zero MCP servers.
+        with open(mcp_path) as f:
+            assert json.load(f) == {'mcpServers': {}}
+
+        # The flag rides immediately after the --mcp-config <path> pair, so the
+        # ordering contract is pinned on the resume path too.
+        assert '--strict-mcp-config' in cmd, f'got {cmd!r}'
+        assert cmd.index('--strict-mcp-config') == cmd.index('--mcp-config') + 2, f'got {cmd!r}'
+    finally:
+        _cleanup(temp_files)
+
+
 # ── ARG_MAX / no-positional-prompt guard (task 3147) ─────────────────────────
 
 # Flags this builder emits with NO value of their own.  The walk below needs
