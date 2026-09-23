@@ -352,50 +352,54 @@ async def test_execute_mem0_write_journals_cancellation_as_failure(
 
 
 @pytest.mark.asyncio
-async def test_journaled_backend_call_records_cancellation_in_layer_2(
+async def test_a_cancelled_backend_call_still_leaves_a_layer_2_row(
     service, write_journal
 ):
     """A cancelled backend call must leave a Layer-2 row, not vanish.
 
-    ``_journaled_backend_call`` is the shared Layer-2 helper every
-    ``_execute_*`` path routes through, and its handler was ``except
-    Exception``. On a cancellation NEITHER branch ran, so no backend_ops row
-    was written at all — the cancelled call simply disappeared from Layer 2.
+    Every backend write routes through one shared Layer-2 helper, and its
+    handler was ``except Exception``. On a cancellation NEITHER branch ran,
+    so no backend_ops row was written at all — the cancelled call simply
+    disappeared from Layer 2. That is the row an operator is sent to when
+    deciding whether a write landed (DurableWriteQueue.get_dead_items), so a
+    missing one leaves the question unanswerable exactly when it is asked.
 
-    That is exactly the moment it is most needed: the write_ops schema tells
-    an operator to "check backend_ops (joined on write_op_id) before
-    replaying", so a missing Layer-2 row leaves the (now-truthful) Layer-1
-    row uncorroborated precisely when someone is deciding whether a write
-    landed. One fix here makes Layer 2 truthful for every ``_execute_*``
-    caller at once.
+    Driven through the public ``add_memory``, whose Mem0 leg is a direct
+    journaled call, and cancelled once that call is in flight — the way a
+    request timeout or a client disconnect cancels it.
     """
     cid = str(uuid.uuid4())
-    op_id = str(uuid.uuid4())
+    in_flight = asyncio.Event()
 
     async def _hang(*_args, **_kwargs):
+        in_flight.set()
         await asyncio.sleep(30)
 
     service.mem0.add = _hang
 
-    with pytest.raises(TimeoutError):
-        await asyncio.wait_for(
-            service._execute_mem0_write(
-                {
-                    'content': 'a fact cancelled mid-flight',
-                    'project_id': 'test',
-                    '_write_op_id': op_id,
-                    '_causation_id': cid,
-                    'metadata': {'category': 'preferences_and_norms'},
-                }
-            ),
-            0.2,
+    call = asyncio.create_task(
+        service.add_memory(
+            content='a fact cancelled mid-flight',
+            category='preferences_and_norms',
+            project_id='test',
+            causation_id=cid,
         )
+    )
+    try:
+        await asyncio.wait_for(in_flight.wait(), 10)
+    finally:
+        call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
 
     ops = await write_journal.get_ops_by_causation(cid)
-    backend_ops = [o for o in ops if o['layer'] == 'backend_op']
-    assert len(backend_ops) == 1, 'a cancelled backend call must still be journaled'
-    assert backend_ops[0]['success'] == 0
-    assert 'CancelledError' in (backend_ops[0]['error'] or '')
+    mem0_adds = [
+        o for o in ops
+        if o['layer'] == 'backend_op' and o['backend'] == 'mem0' and o['operation'] == 'add'
+    ]
+    assert len(mem0_adds) == 1, 'a cancelled backend call must still be journaled'
+    assert mem0_adds[0]['success'] == 0
+    assert 'CancelledError' in (mem0_adds[0]['error'] or '')
 
 
 @pytest.mark.asyncio

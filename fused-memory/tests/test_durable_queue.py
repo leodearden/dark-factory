@@ -2330,9 +2330,11 @@ CREATE TABLE IF NOT EXISTS write_queue (
 
 class TestExecutedColumnSchema:
     @staticmethod
-    async def _column_names(db) -> tuple[str, ...]:
-        cursor = await db.execute('PRAGMA table_info(write_queue)')
-        return tuple(row[1] for row in await cursor.fetchall())
+    async def _column_names(data_dir) -> tuple[str, ...]:
+        """The on-disk column order, read through a connection of our own."""
+        async with aiosqlite.connect(str(data_dir / 'write_queue.db')) as db:
+            cursor = await db.execute('PRAGMA table_info(write_queue)')
+            return tuple(row[1] for row in await cursor.fetchall())
 
     @pytest.mark.asyncio
     async def test_fresh_db_has_executed_column_in_slot_order(self, tmp_path):
@@ -2354,7 +2356,7 @@ class TestExecutedColumnSchema:
         )
         await q.initialize()
         try:
-            cols = await self._column_names(q._db)
+            cols = await self._column_names(tmp_path / 'queue')
             assert 'executed' in cols
             # Both facts in one assertion: the column exists, AND the SELECT *
             # order still lines up with the unpack.
@@ -2370,14 +2372,14 @@ class TestExecutedColumnSchema:
         a legacy DB needs an explicit ALTER — and ALTER can only APPEND. If the
         fresh CREATE put `executed` anywhere but last, migrated and fresh DBs
         would disagree on column order and one of them would corrupt every
-        QueueItem it unpacked. This pins that they agree, and that the
-        pre-existing row survives the migration readable.
+        QueueItem it unpacked. This pins that they agree, and that a row
+        pending at upgrade time still drains: the worker hands execute_write
+        the row's own operation and payload, and the item completes.
         """
         data_dir = tmp_path / 'queue'
         data_dir.mkdir(parents=True, exist_ok=True)
-        db_path = data_dir / 'write_queue.db'
 
-        async with aiosqlite.connect(str(db_path)) as legacy:
+        async with aiosqlite.connect(str(data_dir / 'write_queue.db')) as legacy:
             await legacy.execute(_LEGACY_CREATE_TABLE)
             await legacy.execute(
                 'INSERT INTO write_queue '
@@ -2388,31 +2390,25 @@ class TestExecutedColumnSchema:
             )
             await legacy.commit()
 
-        # workers_per_group=0 keeps this deterministic: _ensure_workers still
-        # creates the group lock _claim_next needs, but spawns no worker that
-        # could claim the row out from under the assertion below.
+        execute = AsyncMock(return_value={'episode_uuid': 'ep-1'})
         q = DurableWriteQueue(
             data_dir=data_dir,
-            execute_write=AsyncMock(return_value={'episode_uuid': 'ep-1'}),
-            workers_per_group=0,
+            execute_write=execute,
+            workers_per_group=1,
             semaphore_limit=5,
         )
         await q.initialize()
         try:
-            cols = await self._column_names(q._db)
+            cols = await self._column_names(data_dir)
             assert 'executed' in cols, 'a legacy DB must be migrated, not left behind'
             assert cols == tuple(dq_module.QueueItem.__slots__)
 
-            item = await q._claim_next('legacy-grp')
-            assert item is not None, 'the pre-existing row must survive the migration'
-            assert item.group_id == 'legacy-grp'
-            assert item.operation == 'add_episode'
-            assert item.parsed_payload() == {'content': 'pre-migration'}
-            assert item.executed is None, (
-                'a legacy row carries no evidence either way; pinning the '
-                'unknown here stops a future DEFAULT 0 on the ALTER from '
-                'silently manufacturing a false negative'
-            )
+            async def _completed():
+                stats = await q.get_stats(group_id='legacy-grp')
+                return stats['counts'].get('completed', 0) >= 1
+
+            await poll_until(_completed, timeout=20.0, interval=0.05)
+            execute.assert_awaited_once_with('add_episode', {'content': 'pre-migration'})
         finally:
             await q.close()
 
@@ -2425,8 +2421,8 @@ class TestExecutedColumnSchema:
         ``ALTER TABLE ... ADD COLUMN executed INTEGER`` backfills NULL, so
         every row written before task 4116 carries no evidence either way.
         Collapsing that into ``False`` asserts a negative the queue cannot
-        prove — and it is load-bearing, because write_journal.py now tells
-        operators to read this boolean IN PREFERENCE to
+        prove — and it is load-bearing, because get_dead_items' replay rule
+        has operators read this field IN PREFERENCE to
         POST_EXECUTE_DEAD_PREFIX.
 
         The failure scenario in full: a pre-4116 dead-letter whose backend
@@ -2471,44 +2467,39 @@ class TestExecutedColumnSchema:
             await q.close()
 
     @pytest.mark.asyncio
-    async def test_enqueue_records_an_explicit_not_executed_zero(self, tmp_path):
+    async def test_enqueue_batch_records_the_never_executed_negative(self, tmp_path):
         """A negative has to be RECORDED at insert time, not inferred.
 
         The unknown state above is only worth anything if the queue also
-        states the negative it CAN prove. If the producers left the column
-        NULL, a freshly-enqueued item the queue knows has never touched a
-        backend would be indistinguishable from a legacy row of unknown
-        history, and the honest ``None`` would swallow every genuinely
-        safe-to-replay item too. Both producers therefore write the 0.
+        states the negative it CAN prove. A producer that left the column
+        NULL would make an item the queue knows never touched a backend
+        indistinguishable from a legacy row of unknown history, and the honest
+        ``None`` would swallow every genuinely safe-to-replay item too.
+        ``enqueue`` is covered by TestTerminalHook's
+        test_get_dead_items_reports_whether_the_write_already_landed; this is
+        the same check for the batch producer.
         """
         q = DurableWriteQueue(
             data_dir=tmp_path / 'queue',
-            execute_write=AsyncMock(return_value={'episode_uuid': 'ep-1'}),
-            workers_per_group=0,  # no workers — nothing can claim these rows
+            execute_write=AsyncMock(side_effect=RuntimeError('never reached the backend')),
+            workers_per_group=1,
             semaphore_limit=5,
+            max_attempts=1,
+            write_timeout_seconds=2.0,
         )
         await q.initialize()
         try:
-            await q.enqueue(
-                group_id='grp', operation='add_episode',
-                payload={'content': 'via enqueue'},
-            )
             await q.enqueue_batch([
-                {'group_id': 'grp', 'operation': 'add_episode',
+                {'group_id': 'batch-grp', 'operation': 'add_episode',
                  'payload': {'content': 'via enqueue_batch'}},
             ])
-            assert q._db is not None
-            cursor = await q._db.execute(
-                'SELECT id, executed FROM write_queue ORDER BY id'
+            await _poll_until_dead(q, group_id='batch-grp', expected_dead=1, timeout=20.0)
+
+            dead = await q.get_dead_items(group_id='batch-grp')
+            assert dead[0]['executed'] is False, (
+                'the batch producer must record the negative, not leave it '
+                'indistinguishable from an unmigrated row'
             )
-            rows = [tuple(r) for r in await cursor.fetchall()]
-            assert len(rows) == 2
-            for item_id, executed in rows:
-                assert executed is not None, (
-                    f'item {item_id}: the producer must RECORD the negative, '
-                    'not leave it indistinguishable from an unmigrated row'
-                )
-                assert executed == 0
         finally:
             await q.close()
 
