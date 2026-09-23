@@ -41,30 +41,46 @@ snake_case slug alone because the operator would then also have to discover
 that this migration caused it.  So the two halves are planned as a pair and
 refused as a pair.
 
+On the live path that promise rests on the GATE CENSUS, not on an operator's
+memory of which topics are gated: ``census_consolidation_gates`` reads every
+gate block out of each named task store, and ``run`` refuses ``--apply``
+unless the census covers every swept project.  A store the census could not
+read is a gap it names, never a silent "no gates here".
+
 Dry run is the default — the operator runbook
 --------------------------------------------
-1. **Dry run**, from anywhere::
+1. **Dry run**, from anywhere, naming the checkout of EACH swept corpus::
 
        uv run --project fused-memory python \
-           fused-memory/scripts/normalize_topic_slugs.py
+           fused-memory/scripts/normalize_topic_slugs.py \
+           --project-root <dark-factory checkout> \
+           --project-root <reify checkout>
 
    Writes ``plans/topic-slug-normalization-report.{json,md}`` and prints the
-   markdown.  Nothing is modified.
+   markdown.  Nothing is modified.  ``--project-root`` REPLACES the default
+   (this checkout alone), so a swept corpus whose checkout is not named is a
+   ``gate_census_incomplete`` gap: the dry run exits 1 and names it.
 
 2. **Read the refusal buckets and resolve them BY HAND.**  ``slug_collision``,
-   ``canonical_collision`` and ``topic_unfoldable`` are the buckets this
-   script deliberately will not decide for you: the first two would merge two
-   topic namespaces (and, in the canonical case, manufacture the second
-   canonical ``_check_canonical_uniqueness`` exists to prevent), and the third
-   has no honest fold, so any value the script picked would be a guess written
-   across the whole corpus.  Also check ``under_enumerated`` /
-   ``scroll_budget_exhausted``: a run with either populated is a LOWER BOUND,
-   and a clean residue probe over it proves nothing.
+   ``canonical_collision``, ``topic_unfoldable`` and ``gate_ambiguous`` are
+   the buckets this script deliberately will not decide for you: the first two
+   would merge two topic namespaces (and, in the canonical case, manufacture
+   the second canonical ``_check_canonical_uniqueness`` exists to prevent),
+   the third has no honest fold, so any value the script picked would be a
+   guess written across the whole corpus, and the fourth is a slug carrying
+   more than one consolidation gate, where moving one gate would strand the
+   others.  Also check ``under_enumerated`` / ``scroll_budget_exhausted``: a
+   run with either populated is a LOWER BOUND, and a clean residue probe over
+   it proves nothing.
 
-3. **Apply**, as an OPERATOR::
+3. **Apply**, as an OPERATOR, with the same roots::
 
-       ... normalize_topic_slugs.py --apply
+       ... normalize_topic_slugs.py --apply \
+           --project-root <dark-factory checkout> \
+           --project-root <reify checkout>
 
+   ``--apply`` refuses before scrolling anything (``GateCensusIncomplete``)
+   while any swept project is uncovered or any named root failed to answer.
    This is an operator action, not an agent one.  The store-mutation preflight
    fails closed for any process that cannot write mem0's history directory,
    which is the normal posture inside an agent sandbox — so a dry run is what
@@ -94,6 +110,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import functools
 import json
 import logging
@@ -132,6 +149,7 @@ _CENSUS_SCRIPT_PATH = (
 __all__ = [
     'BASELINE_DISTINCT_NON_CONFORMING',
     'BASELINE_HISTORY',
+    'DEFAULT_GATE_ROOTS',
     'DEFAULT_JSON_OUT',
     'DEFAULT_MAX_PAGES',
     'DEFAULT_MD_OUT',
@@ -144,6 +162,9 @@ __all__ = [
     'assert_write_accepted',
     'census_consolidation_gates',
     'load_mcp_client_class',
+    'load_mcp_client_module',
+    'open_live_memory_service',
+    'open_mcp_client',
     'pair_gate_blocks',
     'rename_group',
     'WRITE_REASON',
@@ -167,8 +188,10 @@ __all__ = [
     'render_json',
     'render_markdown',
     'resolve_exit_code',
+    'resolve_gate_roots',
     'resolve_projects',
     'run',
+    'run_live',
     'rename_one',
     'verify_old_slugs_drained',
 ]
@@ -1354,13 +1377,22 @@ def load_mcp_client_class() -> type:
     with no HTTP dependency, and so the tests — which inject a double — never
     reach this function at all.
     """
+    return load_mcp_client_module().FusedMemoryClient
+
+
+def load_mcp_client_module() -> Any:
+    """The by-path-loaded ``strip_leaked_control_keys`` module itself.
+
+    Exposed so :func:`open_mcp_client` reads that module's ``DEFAULT_SERVER``
+    beside its client class, rather than restating the URL a third time.
+    """
     import importlib.util  # noqa: PLC0415
 
     sibling = Path(__file__).parent / 'strip_leaked_control_keys.py'
     mod_name = 'strip_leaked_control_keys'
     existing = sys.modules.get(mod_name)
     if existing is not None and hasattr(existing, 'FusedMemoryClient'):
-        return existing.FusedMemoryClient
+        return existing
     spec = importlib.util.spec_from_file_location(mod_name, sibling)
     if spec is None or spec.loader is None:
         raise ImportError(f'Cannot load the JSON-RPC client from {sibling}')
@@ -1371,7 +1403,7 @@ def load_mcp_client_class() -> type:
     except Exception:
         sys.modules.pop(mod_name, None)
         raise
-    return module.FusedMemoryClient
+    return module
 
 
 # ---------------------------------------------------------------------------
@@ -1512,6 +1544,13 @@ REMEASURE_COMMAND = (
 #: Both live corpora.  ``--project`` REPLACES this list; see
 #: :func:`resolve_projects` for why that matters.
 DEFAULT_PROJECTS: tuple[str, ...] = ('dark_factory', 'reify')
+
+#: The task stores the gate census reads when no ``--project-root`` is given:
+#: this checkout's own root, which the server normalizes to its main
+#: checkout.  ``--project-root`` REPLACES it, as ``--project`` replaces
+#: :data:`DEFAULT_PROJECTS` — so a sweep of reify must name reify's checkout,
+#: and ``run`` refuses ``--apply`` if it does not.
+DEFAULT_GATE_ROOTS: tuple[str, ...] = (str(_REPO_ROOT),)
 
 
 def _describe_gap(gap: dict) -> str:
@@ -2019,6 +2058,17 @@ def resolve_projects(args) -> tuple[str, ...]:
     return tuple(args.projects) if args.projects else DEFAULT_PROJECTS
 
 
+def resolve_gate_roots(args) -> tuple[str, ...]:
+    """``--project-root`` REPLACES :data:`DEFAULT_GATE_ROOTS`, deduplicated in order.
+
+    The rule :func:`resolve_projects` follows, for the same reason: naming
+    the task stores to read narrows the census and never silently widens it.
+    """
+    if not args.project_roots:
+        return DEFAULT_GATE_ROOTS
+    return tuple(dict.fromkeys(args.project_roots))
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -2037,6 +2087,17 @@ def _build_parser() -> argparse.ArgumentParser:
              f'({", ".join(DEFAULT_PROJECTS)}) rather than extending it.',
     )
     parser.add_argument(
+        '--project-root', dest='project_roots', action='append', default=None,
+        help=f'Checkout whose task store the consolidation-gate census reads; '
+             f'repeatable, one per swept project. Replaces the default '
+             f'({", ".join(DEFAULT_GATE_ROOTS)}) rather than extending it.',
+    )
+    parser.add_argument(
+        '--server-url', default=None,
+        help='Fused-memory MCP server URL for the gate census and the gate '
+             'patches (default: the JSON-RPC client module\'s DEFAULT_SERVER).',
+    )
+    parser.add_argument(
         '--json-out', dest='json_out', default=DEFAULT_JSON_OUT,
         help=f'Machine-readable report path (default: {DEFAULT_JSON_OUT}).',
     )
@@ -2051,8 +2112,69 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Build a live service, run the sweep, write both artifacts, exit graded."""
+@contextlib.asynccontextmanager
+async def open_live_memory_service():
+    """The production ``MemoryService``, initialized, and closed on the way out.
+
+    Imports deferred so importing this module — which the tests do, by path —
+    never constructs a backend.
+    """
+    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+
+    memory = MemoryService(FusedMemoryConfig())
+    try:
+        await memory.initialize()
+        yield memory
+    finally:
+        if hasattr(memory, 'close'):
+            await memory.close()
+
+
+def open_mcp_client(server_url: str | None) -> Any:
+    """The production task-store client, at *server_url* or the default.
+
+    ``FusedMemoryClient`` is itself an async context manager whose
+    ``__aenter__`` performs the initialize handshake, so it is returned as-is.
+    The default URL is the loaded client module's own ``DEFAULT_SERVER``.
+    """
+    url = load_mcp_client_module().DEFAULT_SERVER if server_url is None else server_url
+    return load_mcp_client_class()(url)
+
+
+async def run_live(args, *, open_memory_service, open_client) -> dict:
+    """Census the task stores, then sweep — the composition ``main`` runs.
+
+    The census comes FIRST, so an unreachable task service fails before any
+    store is touched.  A server that cannot even be opened fails the run in
+    both modes: that is an outage of the factory's own task service, not a
+    per-project gap, so it is not downgraded into a gap entry.  The one
+    client serves the census and the gate patches, so a run cannot pair
+    against one task store and patch another.
+    """
+    async with open_client(args.server_url) as client:
+        census = await census_consolidation_gates(client, resolve_gate_roots(args))
+        async with open_memory_service() as memory:
+            return await run(
+                memory,
+                projects=resolve_projects(args),
+                apply=args.apply,
+                client=client,
+                gates=census,
+            )
+
+
+def main(
+    argv: list[str] | None = None,
+    *,
+    open_memory_service=open_live_memory_service,
+    open_client=open_mcp_client,
+) -> int:
+    """Census, sweep, write both artifacts, exit graded.
+
+    The two I/O openers are parameters, defaulting to the production ones, so
+    this composition root is testable through its own public surface.
+    """
     # This script is otherwise print-based, so without this the module logger
     # carrying the fail-closed refusal and the coverage warnings would have no
     # handler and would reach the operator only through ``logging.lastResort``
@@ -2071,24 +2193,8 @@ def main(argv: list[str] | None = None) -> int:
 
         os.environ['CONFIG_PATH'] = str(args.config)
 
-    async def _run_live() -> dict:
-        # Deferred so importing this module -- which the tests do, by path --
-        # never constructs a backend.
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
-
-        config = FusedMemoryConfig()
-        memory = MemoryService(config)
-        try:
-            await memory.initialize()
-            return await run(
-                memory, projects=resolve_projects(args), apply=args.apply,
-            )
-        finally:
-            if hasattr(memory, 'close'):
-                await memory.close()
-
-    report = asyncio.run(_run_live())
+    report = asyncio.run(run_live(
+        args, open_memory_service=open_memory_service, open_client=open_client))
 
     Path(args.json_out).write_text(render_json(report), encoding='utf-8')
     Path(args.md_out).write_text(render_markdown(report), encoding='utf-8')
