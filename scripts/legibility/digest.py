@@ -742,11 +742,15 @@ INTERRUPT_PATTERN = 'request interrupted by user'
 def iter_not_found(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Detect NOT_FOUND_PATTERNS in tool_result content only.
 
-    A same-line ``# decoy-fail`` sentinel suppresses an otherwise-matching
-    line (PRD Sec 13.2 decoy-FAIL suppression).
+    A tool_result that is re-ingested machine content as a whole -- a coder
+    judgment, or foreign material carrying a harness prompt such as a dump
+    of another session's digest -- is dropped first
+    (:func:`_dialogue_text_sources`). A same-line ``# decoy-fail`` sentinel
+    suppresses an otherwise-matching line (PRD Sec 13.2 decoy-FAIL
+    suppression).
     """
     hits = []
-    for index, text in _signal_text_sources(records, tool_result=True):
+    for index, text in _dialogue_text_sources(records, tool_result=True):
         lowered = _strip_decoy_lines(text).lower()
         for pattern in NOT_FOUND_PATTERNS:
             if pattern in lowered:
@@ -759,11 +763,15 @@ def iter_df_guards(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     tool_result content, assistant text, and user-turn text (incl. isMeta
     system injections, excluding isSidechain subagent turns).
 
-    A same-line ``# decoy-fail`` sentinel suppresses an otherwise-matching
-    line (PRD Sec 13.2 decoy-FAIL suppression).
+    A carrier that is re-ingested machine content as a whole -- the
+    trickle-coder prompt embedding the digest it codes, or a coder judgment
+    quoting that digest back -- is dropped first
+    (:func:`_dialogue_text_sources`). A same-line ``# decoy-fail`` sentinel
+    suppresses an otherwise-matching line (PRD Sec 13.2 decoy-FAIL
+    suppression).
     """
     hits = []
-    for index, text in _signal_text_sources(
+    for index, text in _dialogue_text_sources(
         records, tool_result=True, assistant_text=True, user_text=True,
     ):
         lowered = _strip_decoy_lines(text).lower()
@@ -776,18 +784,16 @@ def iter_df_guards(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def iter_interrupts(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Detect the injected interrupt marker in non-sidechain user turns.
 
-    A same-line ``# decoy-fail`` sentinel suppresses an otherwise-matching
-    line, for parity with the other text-pattern detectors (not_found,
-    df_guard, self_correct) and PRD Sec 13.2's decoy-FAIL suppression
-    contract.
+    A user turn that is re-ingested machine content as a whole -- notably
+    the trickle-coder prompt, whose embedded digest lists earlier
+    '(turn N) request interrupted by user' hits -- is dropped first
+    (:func:`_dialogue_text_sources`). A same-line ``# decoy-fail`` sentinel
+    suppresses an otherwise-matching line, for parity with the other
+    text-pattern detectors (not_found, df_guard, self_correct) and PRD Sec
+    13.2's decoy-FAIL suppression contract.
     """
     hits = []
-    for index, record in enumerate(records):
-        if record.get('type') != 'user' or record.get('isSidechain'):
-            continue
-        text = _user_turn_text(_message_content(record))
-        if not text:
-            continue
+    for index, text in _dialogue_text_sources(records, user_text=True):
         if INTERRUPT_PATTERN in _strip_decoy_lines(text).lower():
             hits.append({'index': index, 'pattern': INTERRUPT_PATTERN})
     return hits
@@ -1283,6 +1289,12 @@ def classify_agent_class(
     alpha never guesses when the caller already knows. Otherwise: a
     genuinely empty transcript classifies as 'unknown'; a non-empty
     transcript with no marker match falls back to 'interactive'.
+
+    Unlike every signal detector, it reads the RAW carriers
+    (:func:`_signal_text_sources`), not :func:`_dialogue_text_sources`: it
+    classifies BY injected markers, so filtering them out would delete its
+    own evidence (pinned by
+    ``TestReingestedContentIsBucketAgnostic.test_classify_agent_class_still_reads_the_raw_carriers``).
     """
     if override is not None:
         return override
