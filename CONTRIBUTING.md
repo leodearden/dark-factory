@@ -246,10 +246,10 @@ Reversing this decision means updating this section, `CLAUDE.md` and
     registered stdlib dataclass (`VerifyResult` today), flagged in **any**
     syntactic position including `return MagicMock(...)`. Remedy:
     `_fake_verify_result(...)` or `MagicMock(spec=VerifyResult)`.
-    Eleven files carry pre-existing debt, grandfathered in the script's
-    `_DATACLASS_DOUBLE_DEBT` baseline. That list is **shrink-only** — entries
-    come off as files are migrated and must never be added. A new offending
-    file is covered by default and will fail the gate.
+    This rule has **no baseline** and is hot for every scanned file — the
+    transitional debt list was retired once its 95 grandfathered sites were
+    migrated (task 4354), so the per-site `# noqa: bare-dataclass-double —
+    <reason>` pragma above is its only suppression.
   - `wall-clock-deadline` — a **load-bearing** synchronisation point awaited on
     a wall-clock deadline: a `MergeRequest.result` future (`req.result`) or a
     `gate*.wait()` barrier, reached either through a bare
@@ -267,9 +267,9 @@ Reversing this decision means updating this section, `CLAUDE.md` and
     it cannot see. That gap is documented, not closed: `wait_responsive` lives
     in `orchestrator/tests/_orch_helpers.py` and three of the seven scanned
     packages cannot import it. See the script's Rule C docstring. Twenty files carry pre-existing debt, grandfathered in the script's
-    `_WALL_CLOCK_DEADLINE_DEBT` baseline; like Rule B's it is **shrink-only**
-    and opt-out, so a new offending file fails the gate by default. Unlike
-    Rule B's it is a **budget** rather than a bare list — a listed file is
+    `_WALL_CLOCK_DEADLINE_DEBT` baseline — the last surviving baseline, and
+    **shrink-only** and opt-out, so a new offending file fails the gate by
+    default. It is a **budget** rather than a bare list: a listed file is
     silent at or under its recorded count and reports its overrun above it, so
     a number may only be lowered, never raised.
 - **Formatting**: this repo runs `ruff check` only. **`ruff format` is not part

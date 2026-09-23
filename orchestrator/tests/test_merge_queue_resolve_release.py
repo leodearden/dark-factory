@@ -38,6 +38,7 @@ from _orch_helpers import MERGE_RESULT_TIMEOUT
 # Reuse the γ harness two-host fakes (established cross-test-module import
 # pattern — see test_concurrent_verify_boundary.py / test_merge_speculation.py).
 from test_merge_queue_concurrent_verify import (
+    _fake_verify_result,
     _gated_runner,
     _inject_two_host_allocator,
 )
@@ -900,17 +901,9 @@ class TestCascadeErrorChokepoint:
                 # N's verify: gate and fail.
                 gate_a_entered.set()
                 await gate_a_release.wait()
-                return MagicMock(
-                    passed=False, summary='test_failure', test_output='FAILED',
-                    lint_output='', type_output='', category='test_failure',
-                    timed_out=False, verify_skipped=False,
-                )
+                return _fake_verify_result(passed=False, summary='test_failure')
             # Any subsequent call (req_c's local verify) passes immediately.
-            return MagicMock(
-                passed=True, summary='ok', test_output='ok',
-                lint_output='', type_output='', category='',
-                timed_out=False, verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True)
 
         gate_b_release = asyncio.Event()
         gate_b_entered = asyncio.Event()
@@ -1105,17 +1098,9 @@ class TestCascadeErrorChokepoint:
                 # N's verify: gate and fail.
                 gate_a_entered.set()
                 await gate_a_release.wait()
-                return MagicMock(
-                    passed=False, summary='test_failure', test_output='FAILED',
-                    lint_output='', type_output='', category='test_failure',
-                    timed_out=False, verify_skipped=False,
-                )
+                return _fake_verify_result(passed=False, summary='test_failure')
             # Any subsequent call (req_c's local verify) passes immediately.
-            return MagicMock(
-                passed=True, summary='ok', test_output='ok',
-                lint_output='', type_output='', category='',
-                timed_out=False, verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True)
 
         gate_b_release = asyncio.Event()
         gate_b_entered = asyncio.Event()
@@ -1291,16 +1276,8 @@ class TestCascadeErrorChokepoint:
             if call == 0:
                 gate_a_entered.set()
                 await gate_a_release.wait()
-                return MagicMock(
-                    passed=False, summary='test_failure', test_output='FAILED',
-                    lint_output='', type_output='', category='test_failure',
-                    timed_out=False, verify_skipped=False,
-                )
-            return MagicMock(
-                passed=True, summary='ok', test_output='ok',
-                lint_output='', type_output='', category='',
-                timed_out=False, verify_skipped=False,
-            )
+                return _fake_verify_result(passed=False, summary='test_failure')
+            return _fake_verify_result(passed=True)
 
         gate_b_release = asyncio.Event()
         gate_b_entered = asyncio.Event()
@@ -1465,11 +1442,7 @@ class TestCascadeErrorChokepoint:
         async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
             gate_a_entered.set()
             await gate_a_release.wait()
-            return MagicMock(
-                passed=True, summary='ok', test_output='ok',
-                lint_output='', type_output='', category='',
-                timed_out=False, verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True)
 
         gated_remote = _gated_runner(
             gate_b_release, gate_b_entered, passed=True, name='laptop',
