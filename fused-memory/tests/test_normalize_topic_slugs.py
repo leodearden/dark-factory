@@ -18,9 +18,12 @@ constant and the tests pin the arithmetic against it, never the live number.
 """
 from __future__ import annotations
 
+import argparse
 import ast
+import contextlib
 import copy
 import dataclasses
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call
 
@@ -2771,10 +2774,21 @@ def _stateful_gate_client(tasks: list[dict]) -> MagicMock:
     idempotence claim is only meaningful if the first run's gate move is
     visible to it.  A client that acknowledged and forgot would let a sweep
     that never moved the block look idempotent.
+
+    It also answers ``get_tasks`` — in the measured live shape for its own
+    tasks' ``project_root``, with an error envelope for any other root — so
+    one double is the task store for both the census and the patch, as the
+    one injected client is in production.
     """
     by_id = {str(t['id']): t for t in tasks}
 
     async def _call_tool(name, payload):
+        if name == 'get_tasks':
+            root = payload['project_root']
+            listed = [t for t in tasks if t['project_root'] == root]
+            if not listed:
+                return {'error': f'no task store at {root}', 'error_type': 'ValidationError'}
+            return copy.deepcopy(_listing(listed[0]['project_id'], root, *listed))
         assert name == 'update_task', name
         task = by_id.get(str(payload['id']))
         if task is None:
@@ -2973,3 +2987,137 @@ class TestEndToEnd:
         assert '### topic_unfoldable: 1' in rendered
         assert 'gate-slug' in rendered
         assert _mod.render_json(report) == _mod.render_json(report)
+
+
+# ===========================================================================
+# main() — the live path's wiring, through its public entry point
+# ===========================================================================
+
+def _main_fixture() -> tuple[_FakeCorpus, list[dict], MagicMock]:
+    """One gated record, and one client double serving the census and the patch."""
+    corpus = _FakeCorpus({'dark_factory': [_crec('df7', 'gate_slug')]})
+    gates = [_gate_task('4220', 'gate_slug', project_id='dark_factory', project_root='/repo')]
+    return corpus, gates, _stateful_gate_client(gates)
+
+
+def _openers(corpus: _FakeCorpus, client: MagicMock) -> tuple[object, object, list]:
+    """The two I/O openers ``main`` is handed, recording every URL it passes."""
+    urls: list = []
+    service = corpus.service()
+
+    @contextlib.asynccontextmanager
+    async def open_memory_service():
+        yield service
+
+    @contextlib.asynccontextmanager
+    async def open_client(server_url):
+        urls.append(server_url)
+        yield client
+
+    return open_memory_service, open_client, urls
+
+
+def _argv(tmp_path: Path, *extra: str, project: str = 'dark_factory',
+          root: str = '/repo') -> list[str]:
+    return ['--project', project, '--project-root', root,
+            '--json-out', str(tmp_path / 'report.json'),
+            '--md-out', str(tmp_path / 'report.md'), *extra]
+
+
+def _written_report(tmp_path: Path) -> dict:
+    return json.loads((tmp_path / 'report.json').read_text(encoding='utf-8'))
+
+
+def _tools_called(client: MagicMock) -> list[str]:
+    return [awaited.args[0] for awaited in client.call_tool.await_args_list]
+
+
+class TestMainWiresTheGateLockstep:
+    """``main`` itself pairs a gated slug — the regression the review asked for.
+
+    The defect lived in ``main``'s wiring, so these tests drive ``main`` as an
+    operator's ``sys.exit(main())`` does, with only its two I/O openers
+    injected, and read the artifact it wrote.
+    """
+
+    def test_a_dry_run_pairs_the_gate_and_writes_nothing(self, tmp_path):
+        corpus, _gates, client = _main_fixture()
+        open_memory, open_client, _urls = _openers(corpus, client)
+
+        code = _mod.main(_argv(tmp_path),
+                         open_memory_service=open_memory, open_client=open_client)
+
+        report = _written_report(tmp_path)
+        assert [(row['gate_task_id'], row['outcome']) for row in report['gate_results']] == [
+            ('4220', 'would_patch_gate'),
+        ]
+        assert [awaited for awaited in client.call_tool.await_args_list
+                if awaited.args[0] == 'get_tasks'] == [
+            call('get_tasks', {'project_root': '/repo'}),
+        ]
+        assert 'update_task' not in _tools_called(client)
+        assert corpus.writes == []
+        assert code == 0
+
+    def test_apply_moves_the_record_and_its_gate_together(self, tmp_path):
+        corpus, gates, client = _main_fixture()
+        open_memory, open_client, _urls = _openers(corpus, client)
+
+        code = _mod.main(_argv(tmp_path, '--apply'),
+                         open_memory_service=open_memory, open_client=open_client)
+
+        report = _written_report(tmp_path)
+        assert [row['outcome'] for row in report['gate_results']] == ['gate_patched']
+        assert gates[0]['metadata'][_mod.GATE_METADATA_KEY]['topic'] == 'gate-slug'
+        assert corpus.topic_of('dark_factory', 'df7') == 'gate-slug'
+        assert code == 0
+
+    def test_apply_refuses_when_the_task_store_cannot_be_read(self, tmp_path):
+        corpus, gates, client = _main_fixture()
+        open_memory, open_client, _urls = _openers(corpus, client)
+
+        with pytest.raises(_mod.GateCensusIncomplete):
+            _mod.main(_argv(tmp_path, '--apply', root='/nowhere'),
+                      open_memory_service=open_memory, open_client=open_client)
+
+        assert corpus.scrolls == []
+        assert corpus.writes == []
+        assert 'update_task' not in _tools_called(client)
+        assert gates[0]['metadata'][_mod.GATE_METADATA_KEY]['topic'] == 'gate_slug'
+        assert not (tmp_path / 'report.json').exists()
+        assert not (tmp_path / 'report.md').exists()
+
+    def test_apply_refuses_a_swept_project_no_root_answered_for(self, tmp_path):
+        corpus, _gates, client = _main_fixture()
+        open_memory, open_client, _urls = _openers(corpus, client)
+
+        with pytest.raises(_mod.GateCensusIncomplete) as refused:
+            _mod.main(_argv(tmp_path, '--apply', project='reify'),
+                      open_memory_service=open_memory, open_client=open_client)
+
+        assert [gap.get('project_id') for gap in refused.value.gaps] == ['reify']
+        assert corpus.scrolls == []
+        assert corpus.writes == []
+
+    def test_the_server_url_reaches_the_client_factory_verbatim(self, tmp_path):
+        corpus, _gates, client = _main_fixture()
+        open_memory, open_client, urls = _openers(corpus, client)
+
+        _mod.main(_argv(tmp_path, '--server-url', 'http://x:1'),
+                  open_memory_service=open_memory, open_client=open_client)
+
+        assert urls == ['http://x:1']
+
+    def test_no_project_root_means_this_checkout(self):
+        """The server normalizes this checkout's root to its main checkout."""
+        args = argparse.Namespace(project_roots=None)
+        this_checkout = str(SCRIPT_PATH.resolve().parents[2])
+
+        assert _mod.resolve_gate_roots(args) == _mod.DEFAULT_GATE_ROOTS
+        assert _mod.resolve_gate_roots(args) == (this_checkout,)
+
+    def test_project_root_replaces_the_default_deduplicated_in_order(self):
+        """The rule ``--project`` already follows: naming one narrows, never widens."""
+        args = argparse.Namespace(project_roots=['/rf', '/df', '/rf'])
+
+        assert _mod.resolve_gate_roots(args) == ('/rf', '/df')
