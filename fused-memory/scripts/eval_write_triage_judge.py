@@ -925,6 +925,11 @@ CONTESTED_GROUND_TRUTH_REASON = (
 #: Prose the operator at the task-3169 flip gate has to read BEFORE acting on
 #: any number above it. Held as data rather than inlined into the renderer so
 #: the JSON and the markdown cannot drift apart.
+#:
+#: These three hold whatever the slate came from. The two that do NOT are in
+#: :data:`MODE_CAVEATS`: the control class and the population statement are
+#: both properties of how the slate was obtained, and the seeded readings of
+#: them are FALSE of a retrieved run.
 CAVEATS: tuple[str, ...] = (
     'No accuracy floor is asserted anywhere in this script or its tests (PRD '
     'D10). This artifact is evidence for a human decision, not a gate.',
@@ -944,22 +949,61 @@ CAVEATS: tuple[str, ...] = (
     'two therefore changes what an operator reads while leaving every '
     'accuracy above unmoved, so read this split as a behaviour selector '
     'rather than as noise.',
-    'The distractor class is a control this script constructs, not a curator '
-    'label: one case per cluster whose slate carries no correct attach target '
-    'at all. It is what distinguishes a judge that classifies from a judge '
-    'that attaches to whatever it is shown.',
-    'Every accuracy here is measured over the WHOLE labelled corpus, not over '
-    'the [t_low, t_high) middle band the production judge is actually '
-    'responsible for. `build_judge_cases` emits a case for every non-canonical '
-    'record and `run_judge_eval` calls the judge on each one directly — '
-    '`decide_band`, `t_high` and `t_low` never enter the picture, and the band '
-    'decision handed to `judge_write` is SYNTHESIZED as a middle-band one. So '
-    'these figures include records that in production are answered '
-    'deterministically without the judge ever seeing them, and whether the '
-    'middle band alone would score higher or lower is not measured here. '
-    'Filtering the cases to the band would need real per-record similarities '
-    'and is deliberately not done.',
 )
+
+
+#: The two caveats that depend on where the slate came from, keyed by mode.
+#: An artifact whose provenance names neither reads as ``seeded``, which is
+#: the only thing this script could do before the retrieved mode existed.
+MODE_CAVEATS: dict[str, tuple[str, ...]] = {
+    SLATE_SEEDED: (
+        'The distractor class is a control this script constructs, not a curator '
+        'label: one case per cluster whose slate carries no correct attach target '
+        'at all. It is what distinguishes a judge that classifies from a judge '
+        'that attaches to whatever it is shown.',
+        'Every accuracy here is measured over the WHOLE labelled corpus, not over '
+        'the [t_low, t_high) middle band the production judge is actually '
+        'responsible for. `build_judge_cases` emits a case for every non-canonical '
+        'record and `run_judge_eval` calls the judge on each one directly — '
+        '`decide_band`, `t_high` and `t_low` never enter the picture, and the band '
+        'decision handed to `judge_write` is SYNTHESIZED as a middle-band one. So '
+        'these figures include records that in production are answered '
+        'deterministically without the judge ever seeing them, and whether the '
+        'middle band alone would score higher or lower is not measured here. '
+        'Filtering the cases to the band would need real per-record similarities '
+        'and is deliberately not done.',
+    ),
+    SLATE_RETRIEVED: (
+        'There is NO distractor control class in this mode. A retrieved slate '
+        'carrying no correct attach target is the ORDINARY case here rather '
+        'than one this script constructs, so the control would measure nothing '
+        'the population does not already show. '
+        '`production_shape.canonical_in_slate` is the measured equivalent — '
+        "the share of cases whose own canonical reached the prompt at all — and "
+        '`canonical_absent` counts the cases whose canonical is no longer in '
+        'the corpus. Those are KEPT in the population, because production '
+        'meets them.',
+        'Every figure here is measured over the population production would '
+        'actually route: the slate, the attach target and the band all come '
+        'from a live retrieval through `retrieve_candidates` / `decide_band` / '
+        '`select_judge_candidates` at this config\'s `candidate_k`, `t_high` '
+        'and `t_low`, and the judge was asked ONLY for the middle band. So '
+        '`per_class` MIXES bands — a deterministic `restated` and a below-floor '
+        '`stored` are counted there without an LLM having seen the case — and '
+        '`production_shape.middle_band` is the judge\'s own accuracy. '
+        'A verdict that is correct for its curator label can still attach to '
+        'ANOTHER RECORD: `triage_write` files every non-`stored` outcome '
+        'against `decision.canonical_id`, the band\'s argmax, not against '
+        'whatever the judge reasoned about. '
+        '`production_shape.duplicate_attach.strict` is the figure that '
+        'accounts for that and `per_class` is not.',
+    ),
+}
+
+
+def caveats_for(slate_mode: Any) -> list[str]:
+    """The caveats a report assembled under *slate_mode* must carry."""
+    return [*CAVEATS, *MODE_CAVEATS.get(str(slate_mode), MODE_CAVEATS[SLATE_SEEDED])]
 
 
 def build_report(
@@ -1019,7 +1063,7 @@ def build_report(
             'available': False,
             'reason': CONTESTED_GROUND_TRUTH_REASON,
         },
-        'caveats': list(CAVEATS),
+        'caveats': caveats_for(run_provenance.get('slate_mode')),
         'provenance': run_provenance,
     }
 

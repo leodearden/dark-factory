@@ -1061,8 +1061,28 @@ class TestRenderMarkdown:
         on the way to the operator who reads the markdown, not the JSON.
         """
         md = self._md()
-        for caveat in _mod().CAVEATS:
+        for caveat in _mod().caveats_for(_mod().SLATE_SEEDED):
             assert f'- {caveat}' in md, caveat
+
+    def test_the_two_slate_modes_state_different_populations(self) -> None:
+        """The seeded population caveat is FALSE of a retrieved run.
+
+        It says `decide_band`, `t_high` and `t_low` never enter the picture
+        and the band handed to `judge_write` is synthesized — which is exactly
+        what the retrieved mode stops being true. A report carrying the wrong
+        one tells the task-3169 operator its numbers cover a population they
+        do not.
+        """
+        seeded = _mod().caveats_for(_mod().SLATE_SEEDED)
+        retrieved = _mod().caveats_for(_mod().SLATE_RETRIEVED)
+        assert seeded[:len(_mod().CAVEATS)] == retrieved[:len(_mod().CAVEATS)]
+        assert seeded[len(_mod().CAVEATS):] != retrieved[len(_mod().CAVEATS):]
+        assert not any('SYNTHESIZED' in c for c in retrieved)
+        assert not any('distractor class is a control' in c for c in retrieved)
+
+    def test_a_report_naming_no_mode_reads_as_seeded(self) -> None:
+        """Which is the only thing this script could do before retrieval."""
+        assert _mod().caveats_for(None) == _mod().caveats_for(_mod().SLATE_SEEDED)
 
     def test_renders_a_provenance_bullet_list(self) -> None:
         md = self._md()
