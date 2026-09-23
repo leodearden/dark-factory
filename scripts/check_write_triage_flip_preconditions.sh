@@ -67,12 +67,10 @@
 #               CONSTRUCTION -- announced target and attach target are the same
 #               expression -- not by a measured swap.
 #
-#           WHAT IT DOES NOT ASSERT. The probe stops at
-#           BandDecision.canonical_id -- the value tools.py::add_memory consumes
-#           verbatim as `attached_to`. It does not execute that stamp, so a
-#           later change to add_memory's own target selection would still pass
-#           here. The probe says so on its own PASS report; confirm it
-#           separately before flipping.
+#           WHAT IT DOES NOT ASSERT is listed on the probe's own PASS report
+#           (its _pass_scope_note, per branch): chiefly that it stops at
+#           BandDecision.canonical_id and never executes add_memory's stamp.
+#           Confirm those separately before flipping.
 #
 # Items 2 and 4 corrupt or churn the very artifact step 1 of the gate tells the
 # operator to read. Item 1 was re-raised as `correctness` in task 3128's fifth and

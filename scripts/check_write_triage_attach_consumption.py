@@ -171,10 +171,30 @@ _JUDGE_DRIVE_TIMEOUT = 5.0
 #: ASCII only, deliberately: the gate bounds the quoted text with a substring
 #: expansion, and a cut through a multi-byte character would emit a broken one.
 _BRANCH_PREFIX = 'ITEM5-BRANCH  '
-_BRANCH_SWAP = 'judge-side designation swap (option (a)) - a MEASURED consumption result'
-_BRANCH_JUDGE_TARGET = (
+
+
+class _Branch(NamedTuple):
+    """A way item 5 can hold: its name in the report, and what it cannot see.
+
+    *unchecked* is this branch's own addition to the PASS scope note, for a
+    premise the branch's claim rests on and the probe does not execute.
+    """
+
+    name: str
+    unchecked: tuple[str, ...] = ()
+
+
+_BRANCH_SWAP = _Branch(
+    'judge-side designation swap (option (a)) - a MEASURED consumption result',
+)
+_BRANCH_JUDGE_TARGET = _Branch(
     'judge-module attach target (option (b)) - holds BY CONSTRUCTION, '
-    'not by a measured swap'
+    'not by a measured swap',
+    unchecked=(
+        '      Nor does it check which judge add_memory injects: the construction',
+        "      holds only while tools.py::add_memory passes the judge module's own",
+        '      judge_write into triage_write, and the probe drives judge_write itself.',
+    ),
 )
 
 
@@ -1088,16 +1108,14 @@ def _search_spellings(
     return None, attempts
 
 
-def _pass_scope_note() -> list[str]:
-    """What a PASS deliberately does NOT prove.
+def _pass_scope_note(branch: _Branch) -> list[str]:
+    """What a PASS on *branch* deliberately does NOT prove.
 
     Item 5 asserts at ``BandDecision.canonical_id`` — the value
     ``tools.py::add_memory`` consumes verbatim as ``attached_to``. It stops
     there: the remaining hops live inline in that MCP tool body with no
     callable seam, and standing up a real ``memory_service`` is not something a
-    bounded before_done predicate can do. So a later change to add_memory's own
-    target selection would still pass this gate — an honest smaller claim, said
-    out loud rather than left for a reader to infer from the absence of one.
+    bounded before_done predicate can do.
 
     Emitted on the PASS path only. That is the run an operator acts on to flip
     a production flag, and it is also the report whose window is uncontended: a
@@ -1108,20 +1126,22 @@ def _pass_scope_note() -> list[str]:
         '      tools.py::add_memory consumes verbatim as `attached_to`. It does NOT',
         '      execute the stamp, so it does not show that the write puts that id in',
         "      PARENT_ID_KEY, and a later change to add_memory's own target selection",
-        '      would still pass here. Confirm that separately before flipping.',
+        '      would still pass here.',
+        *branch.unchecked,
+        '      Confirm that separately before flipping.',
     ]
 
 
-def _pass(out: list[str], branch: str) -> int:
+def _pass(out: list[str], branch: _Branch) -> int:
     """Report a satisfied invariant, NAMING the branch that satisfied it.
 
     One exit for both branches, so the marker the gate greps, the branch line
     it quotes and the scope note an operator reads can never be emitted by one
     branch and forgotten by the other.
     """
-    out.append(_BRANCH_PREFIX + branch)
+    out.append(_BRANCH_PREFIX + branch.name)
     out.append(_PASS_MARKER)
-    out.extend(_pass_scope_note())
+    out.extend(_pass_scope_note(branch))
     return EXIT_OK
 
 

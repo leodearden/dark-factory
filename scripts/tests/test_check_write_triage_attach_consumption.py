@@ -128,6 +128,9 @@ _TOLD_NOT_USED = 'did not use the target the judge was told about'
 _BRANCH_MARKER = 'ITEM5-BRANCH'
 _BRANCH_SWAP = 'judge-side designation swap'
 _BRANCH_JUDGE_TARGET = 'judge-module attach target'
+#: What only a judge-target PASS has to add to its scope note: the probe
+#: drives judge_write itself, so it never sees which judge add_memory injects.
+_WIRING_UNCHECKED = 'which judge add_memory injects'
 
 _BAND_CANONICAL = 'parent-1'
 #: The slate's evidence child: the top-scoring candidate, and the one
@@ -627,6 +630,29 @@ class TestThePassNamesItsBranch:
         ]
         assert len(named) == 1, proc.stdout
         assert branch in named[0], proc.stdout
+
+    def test_only_a_judge_target_pass_says_the_judge_wiring_is_unchecked(
+        self, tmp_path,
+    ):
+        """That branch's construction holds only for the judge add_memory injects.
+
+        The probe drives ``judge_write`` itself, so it never sees which judge
+        tools.py::add_memory actually hands ``triage_write``. If that wiring
+        moved to another judge, the prompt naming the target would never be
+        built and the PASS would rest on nothing. The swap branch does not
+        depend on it — the triage module's consumption was measured against
+        the probe's own judge — so it does not say it.
+        """
+        judged = _run_probe(_src_with(
+            tmp_path / 'judged', triage='band_top1', judge='feeds_attach_target',
+        ))
+        swapped = _run_probe(_src_with(
+            tmp_path / 'swapped', triage='consumes_designated_id',
+        ))
+        assert judged.returncode == 0, f'{judged.stdout}\n{judged.stderr}'
+        assert swapped.returncode == 0, f'{swapped.stdout}\n{swapped.stderr}'
+        assert _WIRING_UNCHECKED in judged.stdout, judged.stdout
+        assert _WIRING_UNCHECKED not in swapped.stdout, swapped.stdout
 
     def test_a_fail_names_no_branch(self, tmp_path):
         """The line is a PASS-path fact. A FAIL that carried one would read as
