@@ -40,7 +40,7 @@ Environment=PYTHONPATH=/home/leo/src/dark-factory/scripts
 # contain ~/.local/bin on 2026-08-18: the graphical login that imports
 # ~/.profile came 84 minutes later, and a bare name in ExecStart is
 # execvp-resolved against whatever PATH the manager happens to hold.
-ExecStart=/home/leo/.local/bin/uv run --frozen --project shared python scripts/legibility/check_trickle_health.py --project-id %i
+ExecStart=/home/leo/.local/bin/uv run --no-sync --project shared python scripts/legibility/check_trickle_health.py --project-id %i
 StandardOutput=journal
 StandardError=journal
 #
