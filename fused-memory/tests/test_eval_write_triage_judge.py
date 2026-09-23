@@ -32,6 +32,7 @@ from _fm_helpers import load_script_module
 from fused_memory.server.write_triage import (
     OUTCOME_AMENDED,
     OUTCOME_CONTESTED,
+    OUTCOME_JUDGE,
     OUTCOME_RESTATED,
     OUTCOME_STORED,
     TRIAGE_OUTCOMES,
@@ -759,11 +760,13 @@ def _run(
     provenance=None,
 ):
     return _mod().run_judge_eval(
-        records=corpus if corpus is not None else _corpus(),
+        plan=_mod().seeded_plan(
+            corpus if corpus is not None else _corpus(),
+            distractors=distractors,
+        ),
         judge_fn=judge if judge is not None else _fake_judge(),
         report_path=tmp_path / 'report.json',
         provenance=dict(_PROVENANCE if provenance is None else provenance),
-        distractors=distractors,
     )
 
 
@@ -1091,11 +1094,10 @@ class TestRunJudgeEval:
     @staticmethod
     def _sibling_run(tmp_path: Path, name: str):
         return _mod().run_judge_eval(
-            records=_corpus(),
+            plan=_mod().seeded_plan(_corpus(), distractors=2),
             judge_fn=_fake_judge(),
             report_path=tmp_path / name,
             provenance=dict(_PROVENANCE),
-            distractors=2,
         )
 
     def test_a_json_report_path_gets_a_dot_md_sibling(self, tmp_path: Path) -> None:
@@ -1162,11 +1164,10 @@ class TestRunJudgeEval:
         judge = _fake_judge()
         with pytest.raises(ValueError):
             _mod().run_judge_eval(
-                records=_corpus(),
+                plan=_mod().seeded_plan(_corpus(), distractors=2),
                 judge_fn=judge,
                 report_path=tmp_path / 'foo.md',
                 provenance=dict(_PROVENANCE),
-                distractors=2,
             )
         assert judge.calls == [], (
             f'the guard raised only after {len(judge.calls)} judge call(s); on a '
@@ -1176,11 +1177,10 @@ class TestRunJudgeEval:
     def test_creates_the_report_directory(self, tmp_path: Path) -> None:
         nested = tmp_path / 'calibration' / 'nested'
         _mod().run_judge_eval(
-            records=_corpus(),
+            plan=_mod().seeded_plan(_corpus(), distractors=2),
             judge_fn=_fake_judge(),
             report_path=nested / 'report.json',
             provenance=dict(_PROVENANCE),
-            distractors=2,
         )
         assert (nested / 'report.json').exists()
 
@@ -1400,6 +1400,11 @@ class TestRunResolvesTheJudgeConfigIntoProvenance:
             distractors=2,
             limit=None,
             dry_run=True,
+            slate_mode=_mod().SLATE_SEEDED,
+            project_id='reify',
+            field_chars=None,
+            judge_candidate_count=None,
+            cases_path=None,
         )
         assert _mod()._run(args) == 0
         return captured
@@ -1468,6 +1473,11 @@ class TestADotMdReportPathIsRejectedAtArgumentTime:
             distractors=2,
             limit=None,
             dry_run=True,
+            slate_mode=_mod().SLATE_SEEDED,
+            project_id='reify',
+            field_chars=None,
+            judge_candidate_count=None,
+            cases_path=None,
         )
 
     def test_run_refuses_it_before_it_even_reads_the_fixture(
@@ -1625,6 +1635,27 @@ class TestABareDryRunCannotReachTheCommittedArtifact:
         assert json.loads(redirected.read_text())['provenance'][
             'judge_provider'
         ] == 'dry-run'
+
+
+#: Provenance the committed artifact PREDATES, added 2026-09-23 with the
+#: retrieved slate mode and the per-field prompt budget override. The
+#: committed report is regenerated only by a paid live run, which this change
+#: deliberately does not perform against `calibration/`; until the operator
+#: re-runs it, these keys are absent from the file and that is staleness
+#: rather than a lie. Every OTHER key stays asserted, and
+#: `test_no_provenance_key_outside_the_vocabulary` keeps this set from
+#: hiding a rename.
+_ADDED_AFTER_THE_COMMITTED_RUN = frozenset({
+    'slate_mode',
+    'field_chars',
+    'project_id',
+    't_high',
+    't_low',
+    'candidate_k',
+    'canonical_absent',
+    'degraded_retrievals',
+    'self_retrieved',
+})
 
 
 class TestCommittedJudgeAccuracyReportIsTraceable:
@@ -1823,6 +1854,22 @@ class TestCommittedJudgeAccuracyReportIsTraceable:
             f'artifact was written by a stub, not measured'
         )
 
+    def test_no_provenance_key_outside_the_vocabulary(self) -> None:
+        """The other half of the ledger below: nothing stale may be UNKNOWN.
+
+        `_ADDED_AFTER_THE_COMMITTED_RUN` excuses keys the artifact predates. It
+        must not become a way for a RENAMED key to sit unnoticed in the
+        artifact under its old spelling, so every key the file does carry has
+        to still be vocabulary.
+        """
+        _block, report, _resolved = self._committed()
+        assert report is not None
+        stray = set(report['provenance']) - set(_mod().PROVENANCE_KEYS)
+        assert not stray, (
+            f'the committed report carries {sorted(stray)}, which PROVENANCE_KEYS '
+            f'no longer names — a renamed key reads as disclosed and is not'
+        )
+
     def test_the_committed_provenance_carries_the_whole_vocabulary(self) -> None:
         """A field added to `PROVENANCE_KEYS` must reach the artifact too.
 
@@ -1842,7 +1889,11 @@ class TestCommittedJudgeAccuracyReportIsTraceable:
         """
         _block, report, _resolved = self._committed()
         assert report is not None
-        missing = set(_mod().PROVENANCE_KEYS) - set(report['provenance'])
+        missing = (
+            set(_mod().PROVENANCE_KEYS)
+            - set(report['provenance'])
+            - _ADDED_AFTER_THE_COMMITTED_RUN
+        )
         assert not missing, (
             f'the committed report does not disclose {sorted(missing)} — either '
             f're-run the eval, or record the values the original run used and '
@@ -1930,3 +1981,316 @@ class TestCommittedJudgeAccuracyReportIsTraceable:
             f'the report measured {provenance["fixture_path"]!r}, not the '
             f'committed fixture'
         )
+
+
+# ---------------------------------------------------------------------------
+# Option C: the per-case dump, the field-width override, the retrieved slate
+# ---------------------------------------------------------------------------
+
+def _slate(memory_id: str, *, candidates, attach_target_id, band, similarity=0.7,
+           canonical_present=True):
+    """A `eval_write_triage_retrieval.Slate`-shaped stand-in.
+
+    Duck-typed rather than imported: the retrieval module reaches the live
+    server stack, and everything asserted here is the eval's own handling of
+    what that module RETURNS.
+    """
+    return types.SimpleNamespace(
+        memory_id=memory_id,
+        candidates=tuple(candidates),
+        attach_target_id=attach_target_id,
+        band=band,
+        similarity=similarity,
+        canonical_present=canonical_present,
+        retrieved_count=len(candidates),
+        degraded=False,
+        self_retrieved=False,
+    )
+
+
+def _live(memory_id: str, *, canonical_id: str | None = None, category='procedural_knowledge'):
+    """A retrieved store row in the eval's record shape."""
+    return {
+        'memory_id': memory_id,
+        'content': f'content of {memory_id}',
+        'category': category,
+        'canonical_id': canonical_id or memory_id,
+        'store_score': 0.7,
+        'metadata': {'store_score': 0.7},
+    }
+
+
+class TestTheCasesDump:
+    """Per-case evidence, written as it is bought."""
+
+    def _dump(self, tmp_path: Path, judge=None) -> list[dict]:
+        _mod().run_judge_eval(
+            plan=_mod().seeded_plan(_corpus(), distractors=2),
+            judge_fn=judge if judge is not None else _fake_judge(),
+            report_path=tmp_path / 'report.json',
+            provenance=dict(_PROVENANCE),
+            cases_path=tmp_path / 'cases.jsonl',
+        )
+        return [
+            json.loads(line)
+            for line in (tmp_path / 'cases.jsonl').read_text().splitlines()
+            if line.strip()
+        ]
+
+    def test_one_line_per_case(self, tmp_path: Path) -> None:
+        rows = self._dump(tmp_path)
+        assert len(rows) == len(_mod().build_judge_cases(_corpus(), distractors=2))
+
+    def test_a_row_carries_what_the_aggregates_cannot_be_reread_from(
+        self, tmp_path: Path,
+    ) -> None:
+        row = self._dump(tmp_path)[0]
+        assert set(row) >= {
+            'memory_id', 'cluster_id', 'expected_class', 'candidates',
+            'attach_target_id', 'attach_target_is_canonical', 'verdict',
+            'outcome', 'band', 'similarity', 'canonical_in_slate',
+            'canonical_present', 'entry_elided', 'candidates_elided',
+        }
+
+    def test_the_slate_is_recorded_in_prompt_order(self, tmp_path: Path) -> None:
+        rows = {r['memory_id']: r for r in self._dump(tmp_path)
+                if r['expected_class'] == 'duplicate'}
+        row = rows['c1-dup-1']
+        assert row['candidates'][0] == 'c1-canon'
+        assert row['attach_target_id'] == 'c1-canon'
+        assert row['attach_target_is_canonical'] is True
+        assert row['canonical_in_slate'] is True
+
+    def test_a_control_case_records_that_no_correct_target_was_shown(
+        self, tmp_path: Path,
+    ) -> None:
+        control = [
+            r for r in self._dump(tmp_path)
+            if r['expected_class'] == _mod().CLASS_DISTRACTOR
+        ][0]
+        assert control['canonical_in_slate'] is False
+        assert control['attach_target_is_canonical'] is False
+
+    def test_each_row_lands_before_the_next_case_is_asked(
+        self, tmp_path: Path,
+    ) -> None:
+        """A 429 partway through must not cost the cases already paid for."""
+        seen: list[int] = []
+
+        def judge_fn(case, candidates):
+            path = tmp_path / 'cases.jsonl'
+            seen.append(
+                len(path.read_text().splitlines()) if path.exists() else 0,
+            )
+            return OUTCOME_RESTATED
+
+        self._dump(tmp_path, judge=judge_fn)
+        assert seen == list(range(len(seen))), (
+            f'rows were buffered rather than flushed per case: {seen}'
+        )
+
+    def test_no_dump_is_written_without_a_cases_path(self, tmp_path: Path) -> None:
+        _run(tmp_path)
+        assert list(tmp_path.glob('*.jsonl')) == []
+
+
+class TestScoreAttachments:
+    """WHERE a case attached, which `score_cases` cannot see."""
+
+    @staticmethod
+    def _row(**kwargs) -> dict:
+        row = {
+            'memory_id': 'm', 'cluster_id': 'c', 'expected_class': 'duplicate',
+            'candidates': ['c'], 'attach_target_id': 'c',
+            'attach_target_cluster_id': None, 'attach_target_category': None,
+            'attach_target_label': None, 'attach_target_is_canonical': True,
+            'canonical_in_slate': True, 'canonical_present': True,
+            'band': OUTCOME_JUDGE, 'similarity': 0.7, 'verdict': OUTCOME_AMENDED,
+            'outcome': OUTCOME_AMENDED, 'correct': True, 'entry_elided': False,
+            'candidates_elided': {}, 'usage': None,
+        }
+        row.update(kwargs)
+        return row
+
+    def test_an_attach_to_another_record_is_not_a_strict_attach(self) -> None:
+        scored = _mod().score_attachments([
+            self._row(),
+            self._row(memory_id='m2', attach_target_id='other',
+                      attach_target_is_canonical=False),
+        ])
+        assert scored['duplicate_attach'] == {
+            'n': 2, 'strict': 1, 'strict_rate': 0.5, 'any': 2, 'any_rate': 1.0,
+        }
+
+    def test_a_wrong_record_attach_names_where_it_landed(self) -> None:
+        scored = _mod().score_attachments([
+            self._row(attach_target_id='other', attach_target_is_canonical=False,
+                      attach_target_cluster_id='c9',
+                      attach_target_category='preferences_and_norms'),
+        ])
+        wrong = scored['wrong_record_attach']
+        assert wrong['n'] == 1 and wrong['rate_of_attaches'] == 1.0
+        assert wrong['cases'][0]['attach_target_cluster_id'] == 'c9'
+        assert wrong['cases'][0]['attach_target_category'] == 'preferences_and_norms'
+
+    def test_stored_attaches_to_nothing(self) -> None:
+        """`triage_write` nulls the canonical on `stored`, so it is no attach."""
+        scored = _mod().score_attachments([
+            self._row(outcome=OUTCOME_STORED, verdict=OUTCOME_STORED, correct=False),
+        ])
+        assert scored['duplicate_attach']['any'] == 0
+        assert scored['wrong_record_attach']['n'] == 0
+
+    def test_a_deterministic_band_is_not_a_judge_call(self) -> None:
+        scored = _mod().score_attachments([
+            self._row(band=OUTCOME_RESTATED, verdict=None, outcome=OUTCOME_RESTATED),
+            self._row(memory_id='m2'),
+        ])
+        assert scored['judge_calls'] == 1
+        assert scored['middle_band']['n'] == 1
+        assert scored['band_split_all'] == {
+            OUTCOME_RESTATED: 1, OUTCOME_JUDGE: 1, OUTCOME_STORED: 0,
+        }
+
+    def test_the_middle_band_accuracy_reads_the_same_correctness_rule(self) -> None:
+        scored = _mod().score_attachments([
+            self._row(), self._row(memory_id='m2', correct=False),
+        ])
+        assert scored['middle_band'] == {'n': 2, 'correct': 1, 'accuracy': 0.5}
+
+    def test_an_unmeasured_rate_is_none_never_zero(self) -> None:
+        scored = _mod().score_attachments([
+            self._row(outcome=OUTCOME_STORED, verdict=OUTCOME_STORED),
+        ])
+        assert scored['wrong_record_attach']['rate_of_attaches'] is None
+
+    def test_a_band_outside_the_vocabulary_raises(self) -> None:
+        with pytest.raises(ValueError, match='outside'):
+            _mod().score_attachments([self._row(band='sideways')])
+
+    def test_the_result_round_trips_through_json(self) -> None:
+        scored = _mod().score_attachments([self._row()])
+        assert json.loads(json.dumps(scored)) == scored
+
+
+class TestPlanFromSlates:
+    """The retrieved mode's case construction, with the live edge stubbed."""
+
+    @staticmethod
+    def _records() -> list[dict]:
+        return [
+            _rec('c1-canon', 'c1-canon', 'canonical'),
+            _rec('c1-dup-1', 'c1-canon', 'duplicate'),
+            _rec('c2-distinct', 'c2-canon', 'distinct'),
+        ]
+
+    def _plan(self, **overrides):
+        slates = [
+            _slate('c1-dup-1', candidates=[_live('c1-canon'), _live('zz')],
+                   attach_target_id='c1-canon', band=OUTCOME_JUDGE),
+            _slate('c2-distinct', candidates=[_live('zz')],
+                   attach_target_id='zz', band=OUTCOME_RESTATED,
+                   canonical_present=False),
+        ]
+        return _mod().plan_from_slates(
+            self._records(), slates, provenance=overrides or {'t_low': 0.5},
+        )
+
+    def test_one_case_per_non_canonical_record_and_no_control(self) -> None:
+        plan = self._plan()
+        assert [c['memory_id'] for c in plan.cases] == ['c1-dup-1', 'c2-distinct']
+        assert not [
+            c for c in plan.cases
+            if c['expected_class'] == _mod().CLASS_DISTRACTOR
+        ]
+
+    def test_the_expected_class_stays_the_curator_label(self) -> None:
+        plan = self._plan()
+        assert [c['expected_class'] for c in plan.cases] == ['duplicate', 'distinct']
+
+    def test_the_band_and_attach_target_come_from_the_retrieval(self) -> None:
+        plan = self._plan()
+        judged, deterministic = plan.cases
+        assert judged['band'] == OUTCOME_JUDGE
+        assert judged['attach_target_id'] == 'c1-canon'
+        assert deterministic['band'] == OUTCOME_RESTATED
+        assert deterministic['attach_target_id'] == 'zz'
+
+    def test_a_record_whose_canonical_is_gone_stays_in_the_population(self) -> None:
+        """They are production reality, so dropping them would flatter the run."""
+        plan = self._plan()
+        assert plan.cases[1]['canonical_present'] is False
+        assert len(plan.cases) == 2
+
+    def test_every_slate_id_resolves_to_a_record(self) -> None:
+        plan = self._plan()
+        for case in plan.cases:
+            for candidate_id in case['candidates']:
+                assert candidate_id in plan.records_by_id
+
+    def test_the_plan_discloses_its_own_mode(self) -> None:
+        assert self._plan().provenance['slate_mode'] == _mod().SLATE_RETRIEVED
+        assert _mod().seeded_plan(
+            _corpus(), distractors=2,
+        ).provenance['slate_mode'] == _mod().SLATE_SEEDED
+
+    def test_a_slate_count_mismatch_raises(self) -> None:
+        with pytest.raises(ValueError, match='positional'):
+            _mod().plan_from_slates(self._records(), [], provenance={})
+
+    def test_a_hoisted_child_counts_as_the_canonical_on_the_slate(self) -> None:
+        """`_canonical_id_of` hoists a sighting to its parent, so a slate
+        holding only the CHILD still shows the model the match."""
+        slates = [
+            _slate('c1-dup-1', candidates=[_live('child', canonical_id='c1-canon')],
+                   attach_target_id='c1-canon', band=OUTCOME_JUDGE),
+            _slate('c2-distinct', candidates=[_live('zz')],
+                   attach_target_id='zz', band=OUTCOME_JUDGE),
+        ]
+        plan = _mod().plan_from_slates(self._records(), slates, provenance={})
+        row = _mod().case_row(
+            1, plan.cases[0], _mod().JudgeAnswer(outcome=OUTCOME_AMENDED),
+            plan.records_by_id,
+        )
+        assert row['canonical_in_slate'] is True
+
+
+class TestFieldCharsOverride:
+    """The per-field prompt budget, and its restoration."""
+
+    @staticmethod
+    def _judge():
+        from fused_memory.server import write_triage_judge  # noqa: PLC0415
+
+        return write_triage_judge
+
+    def test_it_sets_the_width_in_force(self) -> None:
+        with _mod().field_chars_override(40) as in_force:
+            assert in_force == 40
+            assert self._judge()._FIELD_CHARS == 40
+
+    def test_zero_means_no_elision_rather_than_everything_elided(self) -> None:
+        text = 'x' * 20_000
+        with _mod().field_chars_override(0):
+            assert self._judge()._elide(text) == text
+
+    def test_none_overrides_nothing_and_reports_the_shipped_width(self) -> None:
+        shipped = self._judge()._FIELD_CHARS
+        with _mod().field_chars_override(None) as in_force:
+            in_effect = self._judge()._FIELD_CHARS
+        assert (in_force, in_effect) == (shipped, shipped)
+
+    def test_the_shipped_width_is_restored_even_on_a_failure(self) -> None:
+        shipped = self._judge()._FIELD_CHARS
+        with pytest.raises(RuntimeError), _mod().field_chars_override(40):
+            raise RuntimeError('mid-run')
+        restored = self._judge()._FIELD_CHARS
+        assert restored == shipped
+
+    def test_the_elision_flags_follow_the_width(self) -> None:
+        long_text = 'y' * 5_000
+        slate = [types.SimpleNamespace(id='a', content=long_text)]
+        with _mod().field_chars_override(1_200):
+            assert _mod()._elision_flags(long_text, slate) == (True, {'a': True})
+        with _mod().field_chars_override(0):
+            assert _mod()._elision_flags(long_text, slate) == (False, {'a': False})
