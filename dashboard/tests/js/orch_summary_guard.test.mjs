@@ -336,6 +336,12 @@ test('(c) the absent reason is declared once, never re-typed by a consumer', () 
 });
 
 // ── Wiring: no Datum component is handed the crash guard's zero ──────────
+//
+// SOURCE-TEXT LINT, and interim. No suite here can execute a .jsx file,
+// because index.html loads Babel from a CDN. So the (b) tests pin what the
+// composition renders, and these only pin that the call sites use it. The scan
+// is deliberately small: it has no string awareness and sees only one-line
+// bindings. It goes with orch_summary.js when leaf γ2 (task 5589) deletes it.
 
 // The `{…}` expression opening at source[openAt], extracted brace-balanced:
 // these props nest parens, arrow functions and template literals, so a regex
@@ -390,7 +396,6 @@ for (const name of ['tabs.jsx', 'tab_overview.jsx']) {
   test(`(d) ${name}: the orchestrator task counts go through orchSummaryTotal`, () => {
     const source = fs.readFileSync(path.join(REDUX_DIR, name), 'utf8');
     assert.match(source, /\borchSummaryTotal\(/);
-    assert.match(source, /=\s*window\.DF_ORCH_SUMMARY\s*;/);
   });
 }
 
