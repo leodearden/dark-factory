@@ -22,12 +22,11 @@ const { orchEmptyLabel } = window.DF_ORCH_FILTER || { orchEmptyLabel: () => 'No 
 const { strandBadgeState, agentCellState, locksCellState } = window.DF_TASK_ROW_CELLS;
 // The Datum readers. Module scope, no fallback, bound under datum.js's own
 // names — see the CANONICAL note in datum.js's header.
-const { plainDatum, derivedDatum, unknownDatum } = window.DF_DATUM;
+const { plainDatum, derivedDatum, unknownDatum, EM_DASH } = window.DF_DATUM;
 const { burndownStacks, burndownLegend, parityBannerState } = window.DF_BURNDOWN_BANDS;
 const { reconRunCounts, reconSuccessPct, reconStatusTone } = window.DF_RECON_STATUS;
-// Interim, deleted by task 5589 (γ2) — orch_summary.js's header says why.
-const { hasOrchSummary, orchSummary } = window.DF_ORCH_SUMMARY;
-// Interim too, deleted by γ2 — task_done_count.js's header says why.
+// Interim, deleted by task 5589 (γ2) — orch_summary.js's and task_done_count.js's headers say why.
+const { hasOrchSummary, orchSummary, orchSummaryTotal, ORCH_SUMMARY_ABSENT_REASON } = window.DF_ORCH_SUMMARY;
 const { doneCount } = window.DF_TASK_DONE_COUNT;
 const { useState: uS, useEffect: uE } = React;
 
@@ -45,6 +44,7 @@ const EP = Object.freeze({
   costs:         '/api/v2/dashboard/costs',         burndown:     '/api/v2/dashboard/burndown',
   scheduler:     '/api/v2/dashboard/scheduler',
 });
+const orchTotalDatum = (orchs, key) => derivedDatum(orchSummaryTotal(orchs, key), EP.orchestrators, ORCH_SUMMARY_ABSENT_REASON);
 
 // Formatters the tiles hand to StatTile/Pip. Each is given a value that was
 // actually MEASURED — plainDatum answers the absent case itself — so none
@@ -274,9 +274,9 @@ function OrchTab({ projectFilter, search }) {
     <div className="grid cols-12" style={{ gap: 12 }}>
       <div className="col-span-12 grid cols-4">
         <ST label="Orchestrators" datum={plainDatum(matches.length, EP.orchestrators)} hint={`${matches.filter(o=>o.running).length} running`} history={(DF.ORCHESTRATORS_SPARK?.values || []).slice(-30)} sparkColor={CP.accent} />
-        <ST label="Tasks in flight" datum={plainDatum(matches.reduce((s,o)=>s+orchSummary(o).in_progress,0), EP.orchestrators)} history={DF.BURNDOWN.in_progress} sparkColor={CP.accent} hint="30d" />
-        <ST label="Blocked" datum={plainDatum(matches.reduce((s,o)=>s+orchSummary(o).blocked,0), EP.orchestrators)} history={DF.BURNDOWN.blocked} sparkColor={CP.bad} hint="30d" />
-        <ST label="Pending" datum={plainDatum(matches.reduce((s,o)=>s+orchSummary(o).pending,0), EP.orchestrators)} history={DF.BURNDOWN.pending} sparkColor={CP.warn} hint="30d" />
+        <ST label="Tasks in flight" datum={orchTotalDatum(matches, 'in_progress')} history={DF.BURNDOWN.in_progress} sparkColor={CP.accent} hint="30d" />
+        <ST label="Blocked" datum={orchTotalDatum(matches, 'blocked')} history={DF.BURNDOWN.blocked} sparkColor={CP.bad} hint="30d" />
+        <ST label="Pending" datum={orchTotalDatum(matches, 'pending')} history={DF.BURNDOWN.pending} sparkColor={CP.warn} hint="30d" />
       </div>
 
       <div className="col-span-12"><GroupAllToggle allOpen={allOpen} onSetAll={setAll} /></div>
@@ -309,9 +309,9 @@ function OrchTab({ projectFilter, search }) {
                 producer, so a malformed entry with both set reads as the stronger, proven one. */}
             {o.offline && <span className="pip" title={o.error || undefined}><span className="pip-dot" style={{ background: CP.bad }}></span>offline</span>}
             {!o.offline && o.degraded && <span className="pip" title={o.error || undefined}><span className="pip-dot" style={{ background: CP.warn }}></span>state unknown</span>}
-            <Pip datum={plainDatum(orchCounts.done, EP.orchestrators)} color={CP.ok} format={done => `${done}/${total}`} />
-            {orchCounts.in_progress > 0 && <Pip datum={plainDatum(orchCounts.in_progress, EP.orchestrators)} color={CP.accent} label="active" />}
-            {orchCounts.blocked > 0 && <Pip datum={plainDatum(orchCounts.blocked, EP.orchestrators)} color={CP.bad} label="blocked" />}
+            <Pip datum={orchTotalDatum([o], 'done')} color={CP.ok} format={done => `${done}/${total}`} />
+            {orchCounts.in_progress > 0 && <Pip datum={orchTotalDatum([o], 'in_progress')} color={CP.accent} label="active" />}
+            {orchCounts.blocked > 0 && <Pip datum={orchTotalDatum([o], 'blocked')} color={CP.bad} label="blocked" />}
             <span className="mono" style={{ color: 'var(--fg-3)', fontSize: 10 }}>PID {o.pid}</span>
           </>
         );
@@ -405,7 +405,7 @@ function OrchTab({ projectFilter, search }) {
                   <div>
                     <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: 'var(--fg-3)', marginBottom: 4 }}>
                       <span>Progress</span>
-                      <span className="mono" style={{ color: 'var(--fg-1)' }}>{hasOrchSummary(o) ? `${orchCounts.done}/${total}` : '—'}</span>
+                      <span className="mono" style={{ color: 'var(--fg-1)' }}>{hasOrchSummary(o) ? `${orchCounts.done}/${total}` : EM_DASH}</span>
                     </div>
                     <div className="stack-bar" style={{ height: 12 }}>
                       <span style={{ width: `${orchCounts.done/total*100}%`, background: CP.ok }} />

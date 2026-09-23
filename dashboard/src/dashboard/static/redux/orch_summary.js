@@ -24,9 +24,15 @@
 // PRD's degradation story. `dashboard-one-datum-one-path-prd.md` decision 2
 // says a number that was never measured must render `—` with a reason, never a
 // confident `0` — a confident zero is the "0/1 vs Active 33" class of bug the
-// PRD exists to remove. Sites whose whole rendered content is the count pair
-// take `—` via `hasOrchSummary` instead; the aggregate reduces cannot without
-// reworking displays γ2 is about to rewrite, so they take the zero for now.
+// PRD exists to remove. So the zero reaches as few sites as possible:
+//   · sites whose whole rendered content is the count pair take `—` via
+//     `hasOrchSummary`;
+//   · the Datum tiles and pips take `orchSummaryTotal`, whose null
+//     derivedDatum turns into an unknown Datum carrying
+//     ORCH_SUMMARY_ABSENT_REASON, drawn as `—` with that reason as its title;
+//   · only the plain-number sites still take the zero: app.jsx's topbar, the
+//     Overview pipeline block, and the Progress bar and legend. They cannot
+//     show a hole without reworking displays γ2 is about to rewrite.
 //
 // Plain-JS module, no JSX/Babel — loaded in the browser by a classic
 // `<script>` tag in index.html (assigning `window.DF_ORCH_SUMMARY`) and in node
@@ -61,12 +67,37 @@ function orchSummary(o) {
   return out;
 }
 
+// The total of *key* across *orchs*, or null when ANY entry did not measure
+// it. A partial sum would be an under-count passed off as a total. An empty
+// list totals 0: nothing in it went unmeasured.
+function orchSummaryTotal(orchs, key) {
+  let total = 0;
+  for (const o of orchs) {
+    const value = hasOrchSummary(o) ? o.summary[key] : undefined;
+    if (typeof value !== 'number' || !Number.isFinite(value)) return null;
+    total += value;
+  }
+  return total;
+}
+
+// Why a Datum tile shows `—` for an orchestrator task count. Declared once,
+// here, for every consumer.
+const ORCH_SUMMARY_ABSENT_REASON =
+  'task counts are not measured by /orchestrators; they now live in the ' +
+  '/tasks census (TASKS_SNAPSHOT)';
+
 // Module-unique export const, never a bare `API` — classic scripts share ONE
 // top-level lexical scope, so a collision would kill this file before its
 // trailing assignment and leave window.DF_ORCH_SUMMARY undefined. Enforced by
 // dashboard/tests/js/classic_script_scope.test.mjs; see graph_layout.js's
 // header for the full note.
-const ORCH_SUMMARY_API = { ORCH_SUMMARY_KEYS, hasOrchSummary, orchSummary };
+const ORCH_SUMMARY_API = {
+  ORCH_SUMMARY_KEYS,
+  hasOrchSummary,
+  orchSummary,
+  orchSummaryTotal,
+  ORCH_SUMMARY_ABSENT_REASON,
+};
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = ORCH_SUMMARY_API;
