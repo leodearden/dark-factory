@@ -999,6 +999,7 @@ def _fed_target(
     builder: Any,
     writer: Any,
     targets: list[str],
+    wanted: str,
     decision: Any,
     slate: list[Any],
 ) -> _Fed | None:
@@ -1011,7 +1012,6 @@ def _fed_target(
     one only where the dynamic route never saw a render, so a module that
     demonstrably renders is judged on what it actually passed.
     """
-    wanted = getattr(decision, _CANONICAL_ATTR, None)
     recorder = _PromptRecorder()
     setattr(judge_module, _BUILDER_NAME, recorder)
     try:
@@ -1093,7 +1093,9 @@ def _judge_target_branch(
             'cannot be told which candidate the attach will touch'
         )
     decision = _judge_decision(triage_module, band_canonical)
-    fed = _fed_target(judge_module, builder, writer, targets, decision, slate)
+    fed = _fed_target(
+        judge_module, builder, writer, targets, band_canonical, decision, slate,
+    )
     if fed is None:
         return False, (
             f'{_JUDGE_TARGET_BRANCH}: {_BUILDER_NAME} accepts {targets!r}, but '
