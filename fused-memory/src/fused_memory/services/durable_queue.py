@@ -197,25 +197,10 @@ CREATE TABLE IF NOT EXISTS write_queue (
     created_at  REAL    NOT NULL,
     completed_at REAL,
     error       TEXT,
-    -- executed (task 4116): whether "a backend write for this item LANDED at
-    -- some point" — an ITEM-level fact, not a per-attempt one, which is what
-    -- POST_EXECUTE_DEAD_PREFIX has always claimed to report. THREE-valued:
-    --   1    it landed; replaying duplicates it
-    --   0    the queue recorded that no backend write landed; safe to replay
-    --   NULL unknown — the row predates this column
-    --
-    -- Declared bare NULLable, and appended LAST, deliberately: ALTER TABLE can
-    -- only append, so an identical declaration in both paths is what keeps a
-    -- migrated DB's column ORDER identical to a fresh one's. That matters more
-    -- here than in the other tables using this idiom, because QueueItem
-    -- positionally unpacks `SELECT *` — a divergence would corrupt every field
-    -- silently rather than fail loudly.
-    --
-    -- No DEFAULT 0, which would otherwise be the tidier way to get the
-    -- explicit negative: SQLite's `ALTER TABLE ... ADD COLUMN ... DEFAULT 0`
-    -- BACKFILLS existing rows with the default, stamping "provably never
-    -- landed" onto exactly the legacy population whose history is unknown.
-    -- enqueue/enqueue_batch write the 0 themselves instead.
+    -- executed (task 4116): did a backend write for this item land, in any
+    -- attempt; domain on DurableWriteQueue.get_dead_items. Bare NULLable and
+    -- LAST on purpose: ALTER can only append (see QueueItem), and a DEFAULT
+    -- would backfill legacy rows with a false "never landed".
     executed    INTEGER
 );
 """
@@ -231,11 +216,9 @@ CREATE INDEX IF NOT EXISTS idx_wq_status_group
 class QueueItem:
     """Lightweight representation of a row."""
 
-    # ORDER IS LOAD-BEARING: __init__ positionally unpacks a `SELECT *` row,
-    # so this sequence must stay identical to write_queue's column order.
-    # Nothing in the schema references this tuple and nothing here references
-    # the schema, so a mismatch shifts every field silently instead of
-    # raising. TestExecutedColumnSchema pins the two together.
+    # Order must match write_queue's column order: __init__ unpacks a
+    # `SELECT *` row positionally, so a mismatch shifts every field silently.
+    # TestExecutedColumnSchema pins the two together.
     __slots__ = (
         'id', 'group_id', 'operation', 'payload', 'callback_type',
         'status', 'attempts', 'max_attempts', 'next_retry_at',
@@ -303,23 +286,14 @@ class DeadLetterEvent:
 # keeping this module free of any fused-memory-specific import.
 DeadLetterHookFn = Callable[[DeadLetterEvent], Coroutine[Any, Any, None]]
 
-# Prefix applied to the reported error when an item dead-letters AFTER
-# _execute_write already returned — i.e. the registered callback (or the
-# completion commit) is what kept failing, not the backend write. 'dead' alone
-# means only "the queue exhausted its attempts"; it does NOT imply the write
-# never happened, and blind-replaying such an item DUPLICATES it. Reported so
-# the two cases are separable in whatever the hook writes them to.
-#
-# The underlying fact is PERSISTED on the row (write_queue.executed), not
-# recomputed per attempt, so it survives a retry into a later attempt that
-# never reached the backend, and is deliberately STICKY across replay_dead
-# (see that method). It is also surfaced structurally as
-# get_dead_items()['executed'], so a replay decision can read a value instead
-# of string-matching this prefix against error prose — but that value is
-# THREE-valued and only as old as the column: True landed, False the queue
-# recorded that nothing landed, None unknown because the row predates task
-# 4116. For a None row this prefix and backend_ops are the only evidence
-# there is.
+# Prefix applied to the reported error when an item dead-letters after a
+# backend write for it LANDED, in this attempt or an earlier one — i.e. the
+# registered callback (or the completion commit) is what kept failing, not the
+# backend write. 'dead' alone means only "the queue exhausted its attempts"; it
+# does NOT imply the write never happened, and blind-replaying such an item
+# DUPLICATES it. Reported so the two cases are separable in whatever the hook
+# writes them to. The fact itself is the row's `executed` column, reported by
+# DurableWriteQueue.get_dead_items.
 POST_EXECUTE_DEAD_PREFIX = (
     'post-execute failure (the backend write LANDED; do not blind-replay): '
 )
@@ -478,10 +452,8 @@ class DurableWriteQueue:
         assert self._db is not None
         now = time.time()
         cursor = await self._db.execute(
-            # `executed` is written explicitly as 0, not left to the column
-            # default: a negative has to be RECORDED, otherwise a row the
-            # queue knows never reached a backend is indistinguishable from a
-            # pre-4116 row whose history is genuinely unknown (NULL).
+            # `executed` = 0 is a RECORDED negative, distinct from a legacy
+            # row's NULL (unknown); see get_dead_items.
             'INSERT INTO write_queue '
             '(group_id, operation, payload, callback_type, status, attempts, '
             ' max_attempts, next_retry_at, created_at, executed) '
@@ -607,17 +579,9 @@ class DurableWriteQueue:
         """
         terminal: tuple[str, str | None] | None = None
         write_op_id: str | None = None
-        # Seeded from the freshly-SELECTed row, not reset to False: "a backend
-        # write for this item landed" is an ITEM-level fact (see
-        # POST_EXECUTE_DEAD_PREFIX), so an earlier attempt's landing must still
-        # be known to the attempt that finally dead-letters.
-        #
-        # bool() deliberately collapses the column's third value, NULL, into
-        # False here — unlike get_dead_items, which reports it as None. The
-        # prefix is a POSITIVE assertion ("the backend write LANDED"), made
-        # only on positive evidence, so an unknown row simply gets no prefix:
-        # the pre-4116 status quo, not a regression. The honest statement of
-        # the negative belongs in the reported field, not in the prefix.
+        # Seeded from the row, since an earlier attempt may already have
+        # landed. A NULL (unknown) row seeds False: the prefix asserts a
+        # landing, so it needs positive evidence.
         executed = bool(item.executed)
         async with self._semaphore:
             try:
@@ -955,11 +919,7 @@ class DurableWriteQueue:
         for the life of the row. "A backend write for this item landed at some
         point" does not stop being true because an operator pressed replay —
         and it is exactly the fact that makes a SECOND blind replay dangerous.
-        The asymmetry with the fields below is intentional, not an oversight.
-
-        A NULL ``executed`` is UNKNOWN, not "did not land" — the row predates
-        the column — so replaying a legacy dead row still warrants a
-        ``backend_ops`` check first.
+        Read it before replaying; the rule per value is on get_dead_items.
         """
         assert self._db is not None
         if group_id:
@@ -1205,9 +1165,12 @@ class DurableWriteQueue:
           DUPLICATES that write.
         * ``False`` — the queue recorded that no backend write landed, so the
           item is safe to replay.
-        * ``None`` — unknown: the row predates the column (task 4116), so this
-          field knows nothing about it. Fall back to the terminal error's
-          POST_EXECUTE_DEAD_PREFIX and to ``backend_ops``.
+        * ``None`` — unknown: the row predates the column (task 4116). Check
+          ``backend_ops`` (joined on the payload's ``_write_op_id``) before
+          replaying. POST_EXECUTE_DEAD_PREFIX on the error reported to
+          ``on_terminal`` can confirm a landing (``error`` here never carries
+          it), but its absence proves nothing: before 4116 the prefix was
+          recomputed per attempt and was lost whenever a landed item retried.
 
         ``None`` is FALSY, so ``if not row['executed']`` is the wrong test —
         it reads "unknown" as "safe". Only an explicit ``is False`` licenses a
@@ -1246,11 +1209,6 @@ class DurableWriteQueue:
                 'attempts': item.attempts,
                 'error': item.error,
                 'created_at': item.created_at,
-                # The same fact POST_EXECUTE_DEAD_PREFIX encodes in prose on
-                # the error string, exposed structurally so a replay decision
-                # does not have to string-match an error message. NULL is
-                # passed through as None rather than collapsed to False: see
-                # the three-valued domain in the docstring.
                 'executed': None if item.executed is None else bool(item.executed),
             })
         return results

@@ -7795,15 +7795,7 @@ def create_mcp_server(
                     'error': row.get('error'),
                     'timestamp': row.get('created_at'),
                     'attempts': row.get('attempts'),
-                    # The fact a replay decision turns on, three-valued:
-                    # True = the backend write landed, so replaying duplicates
-                    # it; False = the queue recorded that none landed, safe to
-                    # replay; None = unknown, the queue row predates task
-                    # 4116's column, so consult write_ops.terminal_error /
-                    # backend_ops first. None must NOT be read as False.
-                    # `.get` rather than `[...]`, so an older or stubbed row
-                    # shape yields None instead of raising inside a read-only
-                    # triage tool.
+                    # Three-valued; see services/durable_queue.py::DurableWriteQueue.get_dead_items
                     'executed': row.get('executed'),
                 }
                 if truncated:
