@@ -862,3 +862,40 @@ class TestSnapshotDegradation:
         assert (unit.in_progress_live, unit.in_progress_stranded) == (None, None)
         assert unit.skew_seconds is None
         assert unit.failure is SnapshotFailure.BUDGET
+
+    async def test_a_last_good_newer_than_this_render_is_served_stale(
+        self, project_root, dashboard_config, dummy_client
+    ):
+        """(j) A sibling render refreshed this root at a LATER instant than this one's.
+
+        The unit cache and the last-good store are shared across renders. A
+        render whose share of the budget ran out while a render with a later
+        instant refreshed the root finds a last good stamped after its own
+        ``now``. That value is seconds old, so it is served stale at its own
+        instant with the caller's reason verbatim. It used to be discarded as
+        "past the retention bound", with a negative age in the reason.
+        """
+        from dashboard.data.datum import DatumState
+        from dashboard.data.task_snapshot import (
+            SnapshotFailure,
+            SnapshotHealth,
+            classify,
+            unmeasured_snapshot,
+        )
+
+        rows, status_map = _tree()
+        canned = CannedMCP(rows=rows, status_map=status_map, status_page_size=2000)
+        sibling_at = NOW + timedelta(seconds=5)
+        good = await self._acquire(canned, dummy_client, dashboard_config,
+                                   project_root, now=sibling_at)
+
+        reason = 'exceeded its share of the Tasks budget'
+        unit = unmeasured_snapshot(
+            project_root, now=NOW, reason=reason, failure=SnapshotFailure.BUDGET,
+        )
+
+        assert unit.census.state is DatumState.STALE, unit.census
+        assert unit.census.value == good.census.value
+        assert unit.census.as_of == sibling_at
+        assert unit.census.reason == reason
+        assert classify(unit) is SnapshotHealth.DEGRADED

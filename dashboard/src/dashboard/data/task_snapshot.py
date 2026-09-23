@@ -346,7 +346,13 @@ def _datum(
     * measured now — ``fresh``, and the last good is updated;
     * failed, with a last good inside the retention bound — ``stale``, carrying
       that value at ITS original instant so the consumer can see how old it is,
-      and the producer's failure text verbatim as the reason;
+      and the producer's failure text verbatim as the reason. A last good
+      stamped AFTER *now* is inside the bound too. The store is shared across
+      renders, so a render with a later instant can refresh this root while
+      this one is still waiting on it. That value is the newest evidence there
+      is, and its age is negative only against this render's own instant. On
+      the wire it precedes ``served_at``, which ``api_tasks`` resolves after
+      its fan-out, so no retention bound applies to it;
     * failed with nothing to fall back on — ``unknown``, carrying the
       producer's failure VERBATIM and nothing else: there is no previous value
       and so nothing more to explain;
@@ -373,7 +379,7 @@ def _datum(
             None, None, DatumState.UNKNOWN, reason, FRESHNESS_BOUND_SECONDS,
         )
     age = (now - previous.as_of).total_seconds()
-    if not 0 <= age <= _RETENTION_BOUND_SECONDS:
+    if age > _RETENTION_BOUND_SECONDS:
         # Past the bound a last good stops being evidence about the present.
         # Serving it would put a day-old census behind a stale badge that
         # reads the same as a twenty-second-old one.
