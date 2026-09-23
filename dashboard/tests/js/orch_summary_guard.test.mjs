@@ -32,11 +32,19 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
 import orchSummaryModule from '../../src/dashboard/static/redux/orch_summary.js';
+import staleness from '../../src/dashboard/static/redux/endpoint_staleness.js';
 
-const { ORCH_SUMMARY_KEYS, hasOrchSummary, orchSummary } = orchSummaryModule;
+const {
+  ORCH_SUMMARY_KEYS,
+  hasOrchSummary,
+  orchSummary,
+  orchSummaryTotal,
+  ORCH_SUMMARY_ABSENT_REASON,
+} = orchSummaryModule;
 
 const REDUX_DIR = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -61,7 +69,7 @@ const WIRE_ENTRY = {
 };
 
 test('default-imported module exposes the guard functions', () => {
-  for (const name of ['hasOrchSummary', 'orchSummary']) {
+  for (const name of ['hasOrchSummary', 'orchSummary', 'orchSummaryTotal']) {
     assert.equal(
       typeof orchSummaryModule[name],
       'function',
@@ -232,6 +240,187 @@ test('index.html loads orch_summary.js before every consumer', () => {
       guardAt < consumerAt,
       `index.html loads ${name} before orch_summary.js, so its top-level ` +
         'destructure of window.DF_ORCH_SUMMARY throws and blanks the SPA',
+    );
+  }
+});
+
+// ── A total, or no total: what a Datum tile may be handed ─────────────────
+//
+// The aggregate tiles and the per-entry pips are γ1 Datum components, and
+// plainDatum(<the guard's zero>) renders a confident 0 stamped fresh at
+// served_at: the fabricated zero PRD decision 2 forbids, now with false
+// provenance on top. orchSummaryTotal answers null instead, and derivedDatum
+// turns that null into an unknown Datum with a reason.
+
+const MEASURED_ENTRY = {
+  ...WIRE_ENTRY,
+  summary: { total: 40, done: 31, in_progress: 5, blocked: 2, pending: 2 },
+};
+
+test('(a) orchSummaryTotal sums a key across entries that all measured it', () => {
+  assert.equal(orchSummaryTotal([MEASURED_ENTRY, { ...MEASURED_ENTRY, pid: 4243 }], 'in_progress'), 10);
+  assert.equal(orchSummaryTotal([MEASURED_ENTRY], 'done'), 31);
+});
+
+test('(a) orchSummaryTotal is null when ANY entry lacks a measured summary', () => {
+  // A partial sum is an under-count passed off as a total.
+  assert.equal(orchSummaryTotal([MEASURED_ENTRY, WIRE_ENTRY], 'in_progress'), null);
+  assert.equal(orchSummaryTotal([WIRE_ENTRY], 'done'), null);
+  assert.equal(orchSummaryTotal([{ ...WIRE_ENTRY, summary: null }], 'done'), null);
+});
+
+test('(a) orchSummaryTotal is null when an entry has no finite value for the key', () => {
+  for (const summary of [{ done: 3 }, { in_progress: NaN }, { in_progress: '5' }, { in_progress: null }]) {
+    assert.equal(
+      orchSummaryTotal([{ ...WIRE_ENTRY, summary }], 'in_progress'),
+      null,
+      `summary ${JSON.stringify(summary)} was totalled`,
+    );
+  }
+});
+
+test('(a) an empty list totals 0: nothing to measure is a measured nothing', () => {
+  assert.equal(orchSummaryTotal([], 'in_progress'), 0);
+});
+
+// datum.js loaded for real, through the same window shim index.html's order
+// provides: endpoint_staleness.js first, because datum.js destructures its
+// formatAge at module scope.
+function loadDatum() {
+  globalThis.window = { DF_ENDPOINT_STALENESS: staleness };
+  const require = createRequire(import.meta.url);
+  const specifier = '../../src/dashboard/static/redux/datum.js';
+  delete require.cache[require.resolve(specifier)];
+  return require(specifier);
+}
+
+const ORCHESTRATORS_PATH = '/api/v2/dashboard/orchestrators';
+
+test('(b) an unmeasured total reaches a tile as an unknown Datum carrying the reason', () => {
+  const { derivedDatum, datumView, EM_DASH } = loadDatum();
+  const receipts = { [ORCHESTRATORS_PATH]: { servedAt: '2026-09-22T12:00:00+00:00', receivedAt: 1000 } };
+
+  const datum = derivedDatum(
+    orchSummaryTotal([WIRE_ENTRY], 'in_progress'), ORCHESTRATORS_PATH, ORCH_SUMMARY_ABSENT_REASON, receipts,
+  );
+
+  assert.equal(datum.state, 'unknown');
+  assert.equal(datum.reason, ORCH_SUMMARY_ABSENT_REASON);
+  let formatted = false;
+  const view = datumView(datum, { now: 2000, format: () => { formatted = true; return '0'; } });
+  assert.equal(view.text, EM_DASH);
+  assert.equal(view.title, ORCH_SUMMARY_ABSENT_REASON);
+  assert.equal(formatted, false, "a hole must never reach the caller's format");
+});
+
+test('(b) before the first /orchestrators receipt the hole says not yet fetched', () => {
+  const { derivedDatum } = loadDatum();
+
+  const datum = derivedDatum(
+    orchSummaryTotal([WIRE_ENTRY], 'in_progress'), ORCHESTRATORS_PATH, ORCH_SUMMARY_ABSENT_REASON, {},
+  );
+
+  assert.equal(datum.state, 'unknown');
+  assert.equal(datum.reason, 'not yet fetched');
+});
+
+test('(c) the absent reason says who stopped measuring the count and where it lives now', () => {
+  assert.equal(typeof ORCH_SUMMARY_ABSENT_REASON, 'string');
+  assert.ok(ORCH_SUMMARY_ABSENT_REASON.trim().length > 0);
+  assert.match(ORCH_SUMMARY_ABSENT_REASON, /\/orchestrators/);
+  assert.match(ORCH_SUMMARY_ABSENT_REASON, /TASKS_SNAPSHOT|\/tasks/);
+});
+
+test('(c) the absent reason is declared once, never re-typed by a consumer', () => {
+  assert.equal(typeof ORCH_SUMMARY_ABSENT_REASON, 'string', 'orch_summary.js exports no absent reason');
+  for (const name of ['tabs.jsx', 'tab_overview.jsx']) {
+    const source = fs.readFileSync(path.join(REDUX_DIR, name), 'utf8');
+    assert.ok(
+      !source.includes(ORCH_SUMMARY_ABSENT_REASON),
+      `${name} hand-copies the absent reason; take ORCH_SUMMARY_ABSENT_REASON off window.DF_ORCH_SUMMARY`,
+    );
+  }
+});
+
+// ── Wiring: no Datum component is handed the crash guard's zero ──────────
+
+// The `{…}` expression opening at source[openAt], extracted brace-balanced:
+// these props nest parens, arrow functions and template literals, so a regex
+// to the first `}` would stop inside one.
+function balancedFrom(source, openAt) {
+  let depth = 0;
+  for (let i = openAt; i < source.length; i++) {
+    if (source[i] === '{') depth++;
+    else if (source[i] === '}' && --depth === 0) return source.slice(openAt + 1, i);
+  }
+  throw new Error(`unbalanced expression at offset ${openAt}`);
+}
+
+function attributeExpressions(source, attribute) {
+  const re = new RegExp(`\\b${attribute}=\\{`, 'g');
+  return [...source.matchAll(re)].map(m => balancedFrom(source, m.index + m[0].length - 1));
+}
+
+// Locals a file binds straight from the crash guard (`const x = …orchSummary(…`
+// on one line), read off the source rather than listed here, so a rename
+// cannot slip past. They hold the guard's zero whenever /orchestrators did not
+// measure the count, which is always, today.
+function guardZeroNames(source) {
+  return [...source.matchAll(/const\s+(\w+)\s*=[^;\n]*\borchSummary\(/g)].map(m => m[1]);
+}
+
+function readsAny(expression, names) {
+  return names.filter(name => new RegExp(`\\b${name}\\b`).test(expression));
+}
+
+for (const name of ['tabs.jsx', 'tab_overview.jsx']) {
+  test(`(d) ${name}: no datum= expression carries the crash guard's zero`, () => {
+    const source = fs.readFileSync(path.join(REDUX_DIR, name), 'utf8');
+    const tainted = guardZeroNames(source);
+    const expressions = attributeExpressions(source, 'datum');
+    assert.ok(expressions.length > 0, `found no datum= expression in ${name}`);
+
+    for (const expression of expressions) {
+      assert.ok(
+        !/\b(?:hasOrchSummary|orchSummary)\(/.test(expression),
+        `${name} builds a Datum straight from the crash guard: datum={${expression}}. ` +
+          'Hand it derivedDatum(orchSummaryTotal(...), <orchestrators path>, ORCH_SUMMARY_ABSENT_REASON).',
+      );
+      assert.deepEqual(
+        readsAny(expression, tainted),
+        [],
+        `${name} hands a Datum a local holding the guard's zero: datum={${expression}}`,
+      );
+    }
+  });
+
+  test(`(d) ${name}: the orchestrator task counts go through orchSummaryTotal`, () => {
+    const source = fs.readFileSync(path.join(REDUX_DIR, name), 'utf8');
+    assert.match(source, /\borchSummaryTotal\(/);
+    assert.match(source, /=\s*window\.DF_ORCH_SUMMARY\s*;/);
+  });
+}
+
+test("(e) the Overview 'Active tasks' tile puts no guard zero beside its em-dash", () => {
+  const source = fs.readFileSync(path.join(REDUX_DIR, 'tab_overview.jsx'), 'utf8');
+  const openAt = source.indexOf('<StatTile label="Active tasks"');
+  assert.notEqual(openAt, -1, "tab_overview.jsx has no 'Active tasks' StatTile");
+  const closeAt = source.indexOf('/>', openAt);
+  const tile = source.slice(openAt, closeAt + 2);
+
+  assert.deepEqual(
+    readsAny(tile, guardZeroNames(source)),
+    [],
+    "the tile's unit or hint still reads the guard's totals, so '/ 0' or '0 done' " +
+      'renders beside the em-dash',
+  );
+  for (const attribute of ['unit', 'hint']) {
+    const [expression] = attributeExpressions(tile, attribute);
+    assert.ok(expression !== undefined, `the tile has no ${attribute}={…} expression`);
+    assert.match(
+      expression,
+      /[!=]=\s*null/,
+      `${attribute}={${expression}} must be omitted when its total is unknown`,
     );
   }
 });
