@@ -105,8 +105,8 @@ def _prompt_ids(create: AsyncMock) -> list[list[str]]:
     return [re.findall(r'^- id: (\S+)$', prompt, re.MULTILINE) for prompt in prompts]
 
 
-def _resolved(plan, case) -> list:
-    return [plan.records_by_id[cid] for cid in case['candidates']]
+def _resolved(plan, index: int) -> list:
+    return list(plan.candidate_records[index])
 
 
 class TestTheSeededLiveEdge:
@@ -134,7 +134,7 @@ class TestTheSeededLiveEdge:
         plan = self._plan()
         case = plan.cases[0]
         with patch('openai.AsyncOpenAI', return_value=_openai('amends')):
-            answer = _mod().build_judge_fn(_judge_config())(case, _resolved(plan, case))
+            answer = _mod().build_judge_fn(_judge_config())(case, _resolved(plan, 0))
         assert (answer.outcome, answer.verdict) == (JUDGE_VERDICTS['amends'],) * 2
 
     def test_a_recorded_run_reports_what_the_provider_billed(self) -> None:
@@ -145,19 +145,42 @@ class TestTheSeededLiveEdge:
             _mod().usage_recording_openai() as recorded,
         ):
             answer = _mod().build_judge_fn(_judge_config(), recorded)(
-                case, _resolved(plan, case),
+                case, _resolved(plan, 0),
             )
         assert answer.usage == _USAGE
 
 
-class _Store:
-    """The two reads the retrieval edge makes: one search, one liveness probe."""
+def _hit(memory_id: str, cosine: float) -> MemoryResult:
+    """A store row as `MemoryService.search` returns it, scored for one query."""
+    return MemoryResult(
+        id=memory_id, content=f'content of {memory_id}', source_store=SourceStore.mem0,
+        metadata={'store_score': cosine},
+    )
 
-    def __init__(self, rows: list[MemoryResult]) -> None:
-        self.search = AsyncMock(return_value=SearchResults(rows))
+
+class _Store:
+    """The two reads the retrieval edge makes: one search per query, one liveness probe."""
+
+    def __init__(self, rows_by_query: dict[str, list[MemoryResult]]) -> None:
+        self.search = AsyncMock(
+            side_effect=lambda **kwargs: SearchResults(rows_by_query[kwargs['query']]),
+        )
 
     async def get_memory_by_id(self, project_id: str, memory_id: str) -> dict:
         return {'id': memory_id}
+
+
+def _shipped_plan(records: list[dict], rows_by_query: dict[str, list[MemoryResult]]):
+    """The shipped retrieval, bands and trim over *rows_by_query*, paired with the labels."""
+    retrieval = _mod().load_retrieval()
+    labelled = [record for record in records if record['label'] != 'canonical']
+    retrievals = asyncio.run(retrieval.prefetch_retrievals(
+        _Store(rows_by_query), labelled, project_id='reify', k=5,
+    ))
+    slates = retrieval.retrieved_slates(
+        labelled, retrievals, t_high=T_HIGH, t_low=T_LOW, judge_candidate_count=5,
+    )
+    return _mod().plan_from_slates(records, slates, provenance={})
 
 
 class TestTheRetrievedLiveEdge:
@@ -166,22 +189,12 @@ class TestTheRetrievedLiveEdge:
     @staticmethod
     def _case(cosine: float) -> tuple[dict, list]:
         """A duplicate retrieving its canonical at *cosine*, routed by the shipped bands."""
-        retrieval = _mod().load_retrieval()
-        records = [_rec('canon', 'canon', 'canonical'), _rec('dup', 'canon', 'duplicate')]
-        labelled = records[1:]
-        store = _Store([MemoryResult(
-            id='canon', content='content of canon', source_store=SourceStore.mem0,
-            metadata={'store_score': cosine},
-        )])
-        retrievals = asyncio.run(
-            retrieval.prefetch_retrievals(store, labelled, project_id='reify', k=5),
+        plan = _shipped_plan(
+            [_rec('canon', 'canon', 'canonical'), _rec('dup', 'canon', 'duplicate')],
+            {'content of dup': [_hit('canon', cosine)]},
         )
-        slates = retrieval.retrieved_slates(
-            labelled, retrievals, t_high=T_HIGH, t_low=T_LOW, judge_candidate_count=5,
-        )
-        plan = _mod().plan_from_slates(records, slates, provenance={})
         [case] = plan.cases
-        return case, _resolved(plan, case)
+        return case, _resolved(plan, 0)
 
     @pytest.mark.parametrize(('cosine', 'band'), [
         (0.95, OUTCOME_RESTATED),
@@ -206,6 +219,44 @@ class TestTheRetrievedLiveEdge:
             answer = _mod().build_retrieved_judge_fn(_judge_config())(case, candidates)
         assert client.chat.completions.create.await_count == 1
         assert (answer.outcome, answer.verdict) == (JUDGE_VERDICTS['amends'],) * 2
+
+
+class TestEachPromptRendersItsOwnRetrieval:
+    """The `MemoryResult`s handed to `judge_write` carry each case's own cosines.
+
+    `judge_write` re-sorts its slate by `store_score`, so the order the provider
+    sees is decided by whichever query's cosine a row carries. Two duplicates
+    retrieving the same two records at opposite cosines make a borrowed row
+    visible in the rendered prompt.
+    """
+
+    def test_each_prompt_names_its_own_slate_in_its_own_order(self, tmp_path: Path) -> None:
+        plan = _shipped_plan(
+            [
+                _rec('canon', 'canon', 'canonical'),
+                _rec('dup-a', 'canon', 'duplicate'),
+                _rec('dup-b', 'canon', 'duplicate'),
+            ],
+            {
+                'content of dup-a': [_hit('canon', 0.80), _hit('other', 0.70)],
+                'content of dup-b': [_hit('other', 0.85), _hit('canon', 0.75)],
+            },
+        )
+        assert [case['band'] for case in plan.cases] == [OUTCOME_JUDGE, OUTCOME_JUDGE], (
+            'precondition: the shipped bands routed both to the judge'
+        )
+        assert [case['candidates'] for case in plan.cases] == [
+            ['canon', 'other'], ['other', 'canon'],
+        ], 'precondition: each retrieval ranked its own slate'
+        client = _openai('amends')
+        with patch('openai.AsyncOpenAI', return_value=client):
+            _mod().run_judge_eval(
+                plan=plan, judge_fn=_mod().build_retrieved_judge_fn(_judge_config()),
+                report_path=tmp_path / 'r.json', provenance={},
+            )
+        assert _prompt_ids(client.chat.completions.create) == [
+            case['candidates'] for case in plan.cases
+        ]
 
 
 class TestTheLimitedCli:

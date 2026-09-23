@@ -1080,8 +1080,7 @@ class TestRenderMarkdown:
         retrieved = _mod().caveats_for(_mod().SLATE_RETRIEVED)
         assert seeded[:len(_mod().CAVEATS)] == retrieved[:len(_mod().CAVEATS)]
         assert seeded[len(_mod().CAVEATS):] != retrieved[len(_mod().CAVEATS):]
-        assert not any('SYNTHESIZED' in c for c in retrieved)
-        assert not any('distractor class is a control' in c for c in retrieved)
+        assert set(_mod().MODE_CAVEATS[_mod().SLATE_SEEDED]).isdisjoint(retrieved)
 
     def test_a_report_naming_no_mode_reads_as_seeded(self) -> None:
         """Which is the only thing this script could do before retrieval."""
@@ -2170,15 +2169,18 @@ def _slate(memory_id: str, *, candidates, attach_target_id, band,
     )
 
 
-def _live(memory_id: str, *, canonical_id: str | None = None, category='procedural_knowledge'):
-    """A retrieved store row in the eval's record shape."""
+def _live(
+    memory_id: str, *, canonical_id: str | None = None, category='procedural_knowledge',
+    store_score: float = 0.7,
+):
+    """A retrieved store row in the eval's record shape, scored by ITS query."""
     return {
         'memory_id': memory_id,
         'content': f'content of {memory_id}',
         'category': category,
         'canonical_id': canonical_id or memory_id,
-        'store_score': 0.7,
-        'metadata': {'store_score': 0.7},
+        'store_score': store_score,
+        'metadata': {'store_score': store_score},
     }
 
 
@@ -2197,7 +2199,7 @@ def _aliased_row(candidates, attach_target_id) -> dict:
     return _mod().case_row(
         0, plan.cases[0],
         _mod().JudgeAnswer(outcome=OUTCOME_AMENDED, verdict=OUTCOME_AMENDED),
-        plan.records_by_id,
+        plan.candidate_records[0],
     )
 
 
@@ -2324,7 +2326,7 @@ class TestTheCasesDump:
         row = _mod().case_row(
             3, plan.cases[0],
             _mod().JudgeAnswer(outcome=OUTCOME_AMENDED, verdict=OUTCOME_AMENDED),
-            plan.records_by_id,
+            plan.candidate_records[0],
         )
         assert row == {
             'index': 3,
@@ -2489,12 +2491,6 @@ class TestPlanFromSlates:
         assert plan.cases[1]['canonical_present'] is False
         assert len(plan.cases) == 2
 
-    def test_every_slate_id_resolves_to_a_record(self) -> None:
-        plan = self._plan()
-        for case in plan.cases:
-            for candidate_id in case['candidates']:
-                assert candidate_id in plan.records_by_id
-
     def test_the_plan_discloses_its_own_mode(self) -> None:
         assert self._plan().provenance['slate_mode'] == _mod().SLATE_RETRIEVED
         assert _mod().seeded_plan(
@@ -2517,7 +2513,7 @@ class TestPlanFromSlates:
         plan = _mod().plan_from_slates(self._records(), slates, provenance={})
         row = _mod().case_row(
             1, plan.cases[0], _mod().JudgeAnswer(outcome=OUTCOME_AMENDED),
-            plan.records_by_id,
+            plan.candidate_records[0],
         )
         assert row['canonical_in_slate'] is True
 
@@ -2539,6 +2535,82 @@ class TestPlanFromSlates:
         assert _mod().CLASS_DISTRACTOR in {
             c['expected_class'] for c in plan.cases if c['canonical_alias_id']
         }, 'the control case of an aliased cluster carries the alias too'
+
+
+class TestEachCaseIsShownItsOwnRetrieval:
+    """A retrieved row carries ITS query's cosine, so rows are never pooled.
+
+    `judge_write` re-sorts every slate by that cosine (`select_judge_candidates`),
+    so a row borrowed from another case's retrieval hands this case's prompt an
+    order that another query produced. Two duplicates retrieving the same two
+    records at opposite cosines make the borrowing observable.
+    """
+
+    @staticmethod
+    def _plan():
+        records = [
+            _rec('canon', 'canon', 'canonical'),
+            _rec('dup-a', 'canon', 'duplicate'),
+            _rec('dup-b', 'canon', 'duplicate'),
+        ]
+        slates = [
+            _slate('dup-a', candidates=[_live('canon', store_score=0.80),
+                                        _live('other', store_score=0.70)],
+                   attach_target_id='canon', band=OUTCOME_JUDGE),
+            _slate('dup-b', candidates=[_live('other', store_score=0.85),
+                                        _live('canon', store_score=0.75)],
+                   attach_target_id='other', band=OUTCOME_JUDGE),
+        ]
+        return _mod().plan_from_slates(records, slates, provenance={}), slates
+
+    @staticmethod
+    def _scored(rows) -> list[tuple[str, float]]:
+        return [(row['memory_id'], row['metadata']['store_score']) for row in rows]
+
+    def test_each_case_is_handed_its_own_rows(self, tmp_path: Path) -> None:
+        plan, _ = self._plan()
+        handed: list[list[tuple[str, float]]] = []
+
+        def judge_fn(case, candidates):
+            handed.append(self._scored(candidates))
+            return OUTCOME_AMENDED
+
+        _mod().run_judge_eval(
+            plan=plan, judge_fn=judge_fn,
+            report_path=tmp_path / 'report.json', provenance=dict(_PROVENANCE),
+        )
+        assert handed == [
+            [('canon', 0.80), ('other', 0.70)],
+            [('other', 0.85), ('canon', 0.75)],
+        ]
+
+    def test_the_plan_resolves_each_case_to_its_own_slate(self) -> None:
+        plan, slates = self._plan()
+        for case, rows, slate in zip(plan.cases, plan.candidate_records, slates, strict=True):
+            assert [row['memory_id'] for row in rows] == case['candidates']
+            assert self._scored(rows) == self._scored(slate.candidates)
+
+        corpus = _corpus()
+        fixture_record = {record['memory_id']: record for record in corpus}
+        seeded = _mod().seeded_plan(corpus, distractors=2)
+        for case, rows in zip(seeded.cases, seeded.candidate_records, strict=True):
+            assert [row['memory_id'] for row in rows] == case['candidates']
+            assert list(rows) == [fixture_record[cid] for cid in case['candidates']]
+
+    def test_records_that_do_not_resolve_the_slates_are_refused(self) -> None:
+        plan, _ = self._plan()
+
+        def rebuilt(candidate_records):
+            return _mod().EvalPlan(
+                cases=plan.cases, candidate_records=candidate_records,
+                record_count=plan.record_count, provenance=plan.provenance,
+            )
+
+        with pytest.raises(ValueError, match='dup-b') as excinfo:
+            rebuilt((plan.candidate_records[0], plan.candidate_records[0]))
+        assert 'dup-a' not in str(excinfo.value), 'only the unresolved case is named'
+        with pytest.raises(ValueError):
+            rebuilt(plan.candidate_records[:1])
 
 
 class TestAJudgeBandCaseIsNeverShownAnEmptySlate:
