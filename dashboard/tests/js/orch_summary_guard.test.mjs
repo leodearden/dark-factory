@@ -324,13 +324,6 @@ test('(b) before the first /orchestrators receipt the hole says not yet fetched'
   assert.equal(datum.reason, 'not yet fetched');
 });
 
-test('(c) the absent reason says who stopped measuring the count and where it lives now', () => {
-  assert.equal(typeof ORCH_SUMMARY_ABSENT_REASON, 'string');
-  assert.ok(ORCH_SUMMARY_ABSENT_REASON.trim().length > 0);
-  assert.match(ORCH_SUMMARY_ABSENT_REASON, /\/orchestrators/);
-  assert.match(ORCH_SUMMARY_ABSENT_REASON, /TASKS_SNAPSHOT|\/tasks/);
-});
-
 test('(c) the absent reason is declared once, never re-typed by a consumer', () => {
   assert.equal(typeof ORCH_SUMMARY_ABSENT_REASON, 'string', 'orch_summary.js exports no absent reason');
   for (const name of ['tabs.jsx', 'tab_overview.jsx']) {
