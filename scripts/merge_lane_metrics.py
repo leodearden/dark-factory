@@ -1,0 +1,2286 @@
+#!/usr/bin/env python3
+"""Measure the merge-lane cluster, and ratchet every measure against a committed baseline.
+
+PRD ``plans/merge-lane-quality-prd.md`` task alpha. The measures are the ones
+the PRD's Background table quotes -- file lines and prose lines, per-function
+cognitive complexity, function-local (reach-back) imports, re-export shim names,
+distinct test patch targets into lane internals, and private-attribute reads
+from tests. The committed baseline lives at
+``orchestrator/tests/merge_lane_ratchet_baseline.json`` and the gate that
+enforces it is ``orchestrator/tests/test_merge_lane_ratchet.py``.
+
+Ratchet contract, and it has two sides. An UNAUTHORIZED raise is refused: by
+``--check``, and decisively by ``--write-baseline`` itself, so a raise cannot be
+absorbed by regenerating the file that would have caught it. An AUTHORIZED one
+is permitted and recorded -- ``--authorize-raise <task-id> --reason <text>``
+appends the exact per-measure delta to ``LEDGER_RELPATH``, so net-additive work
+lands as a reviewed diff rather than as a number nobody saw move. Lowering needs
+no ceremony and equality is permitted -- this is a ratchet, not a day-one gate.
+The two ceilings (``FILE_LINE_CEILING``, ``NEW_FUNCTION_COGNITIVE_CEILING``)
+apply only to paths and qualnames ABSENT from the baseline, so the
+grandfathering can only ever shrink.
+
+INV-11, no silent fail-soft -- and note the polarity
+----------------------------------------------------
+The sibling guards under ``orchestrator/tests/`` all fail SOFT on an
+unparseable file (``_find_merge_queue_private_patches`` returns ``[]``;
+``_scans_whole_tree_py`` returns False), deliberately: they sweep the whole
+tree, so a mid-edit or intentionally malformed fixture file must not redden a
+guard about something else. This instrument does the OPPOSITE for its own
+cluster, and the difference is not an oversight to be "fixed" by copying the
+neighbours. Those guards measure OTHER people's files; this one measures a
+fixed, named cluster where a path it cannot read IS the finding. Concretely:
+
+* a ``CLUSTER_PATHS`` LITERAL that is missing, unreadable or unparseable ->
+  ``MetricsError`` naming the path and the cause;
+* a ``CLUSTER_PATHS`` GLOB expanding to zero -> fine (that is
+  ``merge_lane/**`` until PRD task zeta1 lands);
+* complexipy absent, or resolving outside ``COMPLEXIPY_REQUIRED`` ->
+  ``MetricsError`` naming the tool and the version found;
+* the whole-of-``orchestrator/tests`` sweep keeps the siblings' per-file
+  fail-soft polarity, but records every skipped file in
+  ``Enumeration.unreadable`` and marks the enumeration incomplete, and
+  ``check_against_baseline`` REFUSES to compare an incomplete enumeration.
+
+That last clause is what makes "a partial enumeration is distinguishable from a
+complete one in the RESULT, not only in a log line" true rather than aspirational.
+The block carrying it is split by KIND, and the two halves are stored
+differently. ``unreadable`` (both halves, by name) and ``complete`` travel in
+the report AND in the committed baseline, as do the cluster's ``requested`` and
+``resolved`` paths -- that is the named manifest where a path the instrument
+cannot read IS the finding. The test tree's breadth travels as ``test_tree``'s
+two counts in the report ONLY: both reach ``--json`` verbatim and both are
+legible under ``--report`` -- the numerator under its own ``test suite --``
+label, since it is ``len(tests)`` and one number gets one place -- but neither
+is ever ratcheted, because ``check_against_baseline`` reads completeness from
+the CURRENT report and freezing a number nothing enforces would only churn the
+file on every unrelated test file the repo gains (esc-5021-7).
+
+Exit codes
+----------
+0  clean -- measures taken, and (under ``--check``) no ratchet violation.
+1  ratchet violations -- one or more measures rose above the baseline, or a new
+   file/function exceeded a ceiling. Violations are printed to stderr. This
+   covers BOTH faces of the gate: ``--check`` finding a raise, and
+   ``--write-baseline`` REFUSING to absorb one for want of an
+   ``--authorize-raise`` (``UnauthorizedRaise``, which deliberately does not
+   subclass ``MetricsError`` so it cannot be reclassified as a broken tool).
+2  instrument failure (``MetricsError``) -- an unparseable cluster file,
+   complexipy missing or out of range, a missing/malformed baseline, or a
+   baseline whose recorded parameters no longer match this tree. Deliberately
+   distinct from 1 so a broken instrument is never mistaken either for a clean
+   tree or for a real regression.
+"""
+from __future__ import annotations
+
+import argparse
+import ast
+import dataclasses
+import json
+import sys
+import tokenize
+from collections.abc import Sequence
+from io import StringIO
+from pathlib import Path
+
+from shared import safe_io
+
+# NOTE: module scope imports only the stdlib and the ``shared`` workspace member
+# (present in every project venv) ON PURPOSE. complexipy and radon are
+# imported lazily inside the functions that need them (see
+# ``_import_complexipy``), so this module stays importable and type-checkable in
+# environments whose dev group does not carry them -- notably the ``shared``
+# project, which owns the ``ruff check scripts/`` and ``pyright scripts/`` gates
+# for this file. Laziness is not softness: the moment a measure actually needs
+# the tool, a missing or wrong-version one raises MetricsError with a named
+# cause (INV-11).
+
+
+class MetricsError(Exception):
+    """The instrument could not take a measurement it was asked for.
+
+    Always raised with the offending path / tool / version named in the message.
+    Mapped to exit code 2 at the ``main()`` boundary, categorically apart from
+    the exit-1 "the tree regressed" outcome. ``AppendOnlyViolation`` is the one
+    subclass that is a VERDICT rather than a fault, and it says so itself.
+    """
+
+
+class AppendOnlyViolation(MetricsError):
+    """The ledger's recorded history was REWRITTEN -- a verdict, not a fault.
+
+    A ``MetricsError`` subclass, so nothing that already catches one changes
+    behaviour; a DISTINCT type, because the two are read differently at a
+    boundary. ``scripts/check_staged_ratchet_raise.py`` exits 1 for this (the
+    committer did something the ratchet forbids and can fix) and 2 for its
+    siblings (the gate could not do its job). Collapsing them would leave a
+    caller that reasonably treats 2 as "instrument down, retry or ignore"
+    waving a rewritten ledger through.
+    """
+
+
+# ---------------------------------------------------------------------------
+# The cluster spec -- SPOT for PRD Appendix A.
+
+#: Repo-relative literal paths and glob patterns naming the merge-lane cluster.
+#: This tuple IS Appendix A; editing it forces a deliberate baseline
+#: regeneration, because ``check_against_baseline`` compares the baseline's
+#: recorded ``params.cluster_paths`` against it and raises on a mismatch.
+CLUSTER_PATHS: tuple[str, ...] = (
+    'orchestrator/src/orchestrator/merge_queue.py',
+    'orchestrator/src/orchestrator/merge_gates.py',
+    'orchestrator/src/orchestrator/merge_types.py',
+    'orchestrator/src/orchestrator/merge_shadow.py',
+    'orchestrator/src/orchestrator/merge_liveness.py',
+    'orchestrator/src/orchestrator/merge_disposition.py',
+    'orchestrator/src/orchestrator/merge_queue_store.py',
+    'orchestrator/src/orchestrator/merge_completion.py',
+    'orchestrator/src/orchestrator/merge_drift.py',
+    'orchestrator/src/orchestrator/merge_speculation_controller.py',
+    'orchestrator/src/orchestrator/merge_request_ledger.py',
+    'orchestrator/src/orchestrator/merge_skew_tripwire.py',
+    'orchestrator/src/orchestrator/lane_lifecycle.py',
+    'orchestrator/src/orchestrator/offline_lane.py',
+    'orchestrator/src/orchestrator/warm_lane_pool.py',
+    'orchestrator/src/orchestrator/landing_evidence.py',
+    'orchestrator/src/orchestrator/landed_outbox.py',
+    'orchestrator/src/orchestrator/recover_main.py',
+    # Measured (lines, cognitive) but exempt from the file-size ceiling -- see
+    # SIZE_CEILING_EXEMPT.
+    'orchestrator/src/orchestrator/git_ops.py',
+    # Empty until PRD task zeta1 creates the package. A glob matching nothing is
+    # NOT a failure; a literal matching nothing is.
+    'orchestrator/src/orchestrator/merge_lane/**/*.py',
+    'orchestrator/tests/_serial_merge_worker.py',
+    'orchestrator/tests/_merge_queue_harness.py',
+    'orchestrator/tests/conftest.py',
+)
+
+#: Paths measured and ratcheted, but exempt from ``FILE_LINE_CEILING``.
+#: PRD decision 9: ``git_ops.py`` is the git engine for warm lanes, the
+#: scheduler and recovery -- not only the merge lane -- and its split is a
+#: follow-up PRD. The exemption is scoped to the CEILING alone: git_ops.py's
+#: 14,721 lines are still frozen by the ratchet, so they cannot grow unwatched.
+SIZE_CEILING_EXEMPT: frozenset[str] = frozenset(
+    {'orchestrator/src/orchestrator/git_ops.py'}
+)
+
+#: A file ABSENT from the baseline may not exceed this many lines.
+FILE_LINE_CEILING = 1500
+
+#: A function ABSENT from the baseline may not exceed this cognitive complexity.
+NEW_FUNCTION_COGNITIVE_CEILING = 15
+
+
+# ---------------------------------------------------------------------------
+# Enumeration -- completeness carried in the RESULT, per INV-11.
+
+
+@dataclasses.dataclass(frozen=True)
+class Enumeration:
+    """Which paths were asked for, which were measured, and which were skipped.
+
+    ``complete`` is the single signal every consumer checks. It is False
+    whenever anything landed in ``unreadable``, and ``check_against_baseline``
+    raises rather than compares when it is False -- so a degraded sweep can
+    never masquerade as a clean tree.
+    """
+
+    requested: tuple[str, ...]
+    resolved: tuple[str, ...]
+    unreadable: tuple[str, ...]
+    complete: bool
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            'requested': list(self.requested),
+            'resolved': list(self.resolved),
+            'unreadable': list(self.unreadable),
+            'complete': self.complete,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class TestTreeCoverage:
+    """How many .py files the test-tree sweep asked for, and how many it measured.
+
+    The test tree's counterpart to ``Enumeration``, and deliberately NOT more
+    fields on it: the cluster is a named manifest where an unresolved path IS
+    the finding and must be shown by name, while this is an open sweep of other
+    people's files where only the coverage ratio carries information. The
+    ``unreadable`` paths of BOTH halves still travel by name -- that is INV-11's
+    payload and it is never reduced to a count.
+    """
+
+    requested: int
+    resolved: int
+
+    def to_dict(self) -> dict[str, int]:
+        return {'requested': self.requested, 'resolved': self.resolved}
+
+
+def resolve_cluster_paths(root: Path) -> Enumeration:
+    """Resolve ``CLUSTER_PATHS`` against *root* into a complete Enumeration.
+
+    Raises ``MetricsError`` naming the path when a LITERAL entry is missing, is
+    not a regular file, or cannot be read. A GLOB entry expanding to zero paths
+    is accepted (that is ``merge_lane/**`` until PRD task zeta1).
+    """
+    resolved: list[str] = []
+    for entry in CLUSTER_PATHS:
+        if '*' in entry:
+            for match in sorted(root.glob(entry)):
+                if match.is_file():
+                    resolved.append(match.relative_to(root).as_posix())
+            continue
+        candidate = root / entry
+        if not candidate.exists():
+            raise MetricsError(
+                f'cluster path {entry!r} does not exist under {root} -- '
+                'CLUSTER_PATHS is the SPOT source of PRD Appendix A; if the '
+                'file was renamed or removed, update CLUSTER_PATHS and '
+                'regenerate the baseline in the same commit'
+            )
+        if not candidate.is_file():
+            raise MetricsError(
+                f'cluster path {entry!r} is not a regular file under {root}'
+            )
+        try:
+            candidate.read_text(encoding='utf-8')
+        except (OSError, UnicodeDecodeError) as exc:
+            raise MetricsError(
+                f'cluster path {entry!r} could not be read: {exc.__class__.__name__}: {exc}'
+            ) from exc
+        resolved.append(entry)
+    return Enumeration(
+        requested=CLUSTER_PATHS,
+        resolved=tuple(resolved),
+        unreadable=(),
+        complete=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Source helpers shared by the per-file measures.
+
+
+def _parse(source: str, *, path: str) -> ast.Module:
+    """Parse *source*, translating a SyntaxError into a named MetricsError.
+
+    INV-11: an unparseable CLUSTER file is the finding, never a skipped measure.
+    Callers sweeping files OUTSIDE the cluster (the whole test tree) catch
+    this and record the path in ``Enumeration.unreadable`` instead.
+    """
+    try:
+        return ast.parse(source)
+    except SyntaxError as exc:
+        raise MetricsError(
+            f'{path}: could not be parsed -- SyntaxError: {exc}'
+        ) from exc
+    except ValueError as exc:  # e.g. source containing a null byte
+        raise MetricsError(
+            f'{path}: could not be parsed -- {exc.__class__.__name__}: {exc}'
+        ) from exc
+
+
+def _read_source(root: Path, relpath: str) -> str:
+    try:
+        return (root / relpath).read_text(encoding='utf-8')
+    except (OSError, UnicodeDecodeError) as exc:
+        raise MetricsError(
+            f'{relpath}: could not be read -- {exc.__class__.__name__}: {exc}'
+        ) from exc
+
+
+def _comment_lines(source: str, *, path: str) -> set[int]:
+    """Line numbers carrying a COMMENT token, via stdlib ``tokenize``.
+
+    Token-based rather than regex-based on purpose: a string literal that merely
+    mentions ``#`` is not a comment, and no regex over source text gets that
+    right.
+    """
+    lines: set[int] = set()
+    try:
+        for token in tokenize.generate_tokens(StringIO(source).readline):
+            if token.type == tokenize.COMMENT:
+                lines.add(token.start[0])
+    except (tokenize.TokenError, IndentationError, SyntaxError) as exc:
+        raise MetricsError(
+            f'{path}: could not be tokenized -- {exc.__class__.__name__}: {exc}'
+        ) from exc
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Per-file size measures.
+
+
+@dataclasses.dataclass(frozen=True)
+class FileSizeMeasures:
+    """Physical lines, and how many of them are docstring or comment."""
+
+    lines: int
+    prose_lines: int
+
+
+def _docstring_lines(tree: ast.Module) -> set[int]:
+    """Line numbers spanned by every docstring in *tree*.
+
+    A docstring is the FIRST body element of a module, class or function when it
+    is a bare string expression -- exactly Python's own rule, so a second string
+    expression in the same body is code, not prose.
+    """
+    lines: set[int] = set()
+    holders: tuple[type[ast.AST], ...] = (
+        ast.Module,
+        ast.FunctionDef,
+        ast.AsyncFunctionDef,
+        ast.ClassDef,
+    )
+    for node in ast.walk(tree):
+        if not isinstance(node, holders):
+            continue
+        body = getattr(node, 'body', None)
+        if not body:
+            continue
+        first = body[0]
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            end = first.end_lineno if first.end_lineno is not None else first.lineno
+            lines.update(range(first.lineno, end + 1))
+    return lines
+
+
+def file_size_measures(source: str, *, path: str) -> FileSizeMeasures:
+    """Measure *source*'s physical and prose line counts.
+
+    ``prose_lines`` is the UNION of two line-number sets -- docstring spans
+    (from the AST) and COMMENT-token lines (from stdlib ``tokenize``) -- so a
+    line that is both counts once. Token-based comment detection is what makes
+    ``url = 'http://x/#frag'`` correctly zero prose lines; a regex over source
+    text cannot.
+
+    Raises ``MetricsError`` naming *path* when the source cannot be parsed or
+    tokenized. INV-11: never a zero or None measure for a file we failed to read.
+    """
+    tree = _parse(source, path=path)
+    prose = _docstring_lines(tree) | _comment_lines(source, path=path)
+    return FileSizeMeasures(lines=len(source.splitlines()), prose_lines=len(prose))
+
+
+# ---------------------------------------------------------------------------
+# Structural import measures.
+
+_FUNCTION_NODES: tuple[type[ast.AST], ...] = (ast.FunctionDef, ast.AsyncFunctionDef)
+
+
+def function_local_imports(source: str, *, path: str) -> int:
+    """Count import statements that live inside a function body.
+
+    These are the lane's reach-back imports -- the function-local
+    ``from orchestrator.merge_queue import ...`` sites that exist to break
+    import cycles, plus every other deferred import in the same shape. The PRD's
+    ceiling for this measure is zero.
+
+    Counted per STATEMENT, not per bound name, and deduped by node identity so a
+    nested function's import is counted once rather than once per enclosing
+    function. AST-based, so a docstring quoting an import statement -- which the
+    satellite modules' reach-back notes do verbatim -- is never counted.
+    """
+    tree = _parse(source, path=path)
+    seen: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, _FUNCTION_NODES):
+            continue
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.Import | ast.ImportFrom):
+                seen.add(id(inner))
+    return len(seen)
+
+
+def reexport_names(source: str, *, path: str) -> list[str]:
+    """Names a module imports at module level and never itself references.
+
+    This is the STRUCTURAL reading of a re-export shim, and deliberately not a
+    scan for the ``# noqa: F401  re-export shim`` comment: comments do not exist
+    in the AST at all, and a comment-based detector would zero out on a purely
+    cosmetic edit. The structural predicate is exactly what ruff's F401 computes
+    -- which is precisely why those blocks carry the suppression -- so it agrees
+    with the annotated set while being ungameable.
+
+    Scoped to MODULE-LEVEL ``from X import ...`` bindings: a bare ``import x``
+    binds a module rather than re-exporting a name, a function-local import is
+    the ``function_local_imports`` measure's business, and ``import *`` binds
+    nothing nameable. ``from __future__ import ...`` is likewise excluded: it is
+    a compiler directive, not a name a downstream module could import, and ruff
+    explicitly never flags it under F401 -- counting it would both inflate every
+    baseline and make the ratchet REWARD deleting a future import, which silently
+    changes runtime annotation semantics. Returns the bound names
+    (``asname or name``) sorted and deduped.
+    """
+    tree = _parse(source, path=path)
+    used = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+    # An attribute chain rooted at the binding (`B.attr`) also uses it, and so
+    # does an `__all__` listing -- but `__all__` entries are string constants,
+    # not Names, and a module that re-exports via `__all__` is still a shim by
+    # this measure's definition, which is the reading the PRD's ceiling wants.
+    names: set[str] = set()
+    for node in tree.body:
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        if node.module == '__future__':
+            continue
+        for alias in node.names:
+            if alias.name == '*':
+                continue
+            bound = alias.asname or alias.name
+            if bound not in used:
+                names.add(bound)
+    return sorted(names)
+
+
+# ---------------------------------------------------------------------------
+# The complexipy adapter, and the tool-availability half of INV-11.
+#
+# WHY BOTH BOUNDS EXIST, measured 2026-09-03 against merge_queue.py (21,550
+# lines) in this worktree:
+#
+#   version | wall clock | file total | _verifier_loop | _run_post_merge_verify
+#   3.0.0   |     4.63s  |      2031  |  186           |  183
+#   4.0.0   |     4.31s  |      2124  |  188           |  183
+#   5.0.0   |     4.81s  |      2092  |  192           |  188
+#   6.0.0   |     5.18s  |      2133  |  245           |  175
+#   6.2.0   |     4.75s  |      2133  |  245           |  175
+#   7.0.1   |   247.00s  |      2133  |  245           |  175
+#
+# FLOOR (>=6.2) is CORRECTNESS: the algorithm changed across majors, so 3/4/5
+# compute different numbers for the identical file. An unpinned complexipy would
+# silently rewrite every baseline figure on upgrade, turning a ratchet into
+# noise. 6.x and 7.0.1 agree, and reproduce exactly the numbers the PRD
+# Background table quotes; 6.2.0 is the newest 6.x and the version every
+# committed baseline number was measured with.
+#
+# CEILING (<7) is PERFORMANCE, and it is not hygiene -- it is what keeps this
+# instrument from becoming a suite-truncating landmine. 7.0.1's cost grows
+# roughly cubically in file size (2,800 lines = 0.31s; 21,550 lines = 247s), so
+# the whole 22-path cluster costs ~330s+ at 7.0.1 against 9.52s at 6.2.0. The
+# ratchet carries pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT) = 300s, and
+# exceeding it does not merely fail the test: pytest-timeout's thread method
+# os._exit()s the xdist worker and --max-worker-restart=0 then truncates the
+# ENTIRE orchestrator suite, reporting against an innocent test (the esc-3980-1
+# / esc-3787-1 mode documented at orchestrator/tests/_orch_helpers.py::
+# WHOLE_TREE_SCAN_TEST_TIMEOUT).
+#
+# The tuples are the source of truth; the human-readable specifier is derived
+# from them, so the message and the check can never disagree. The same string
+# is pinned against orchestrator/pyproject.toml's dev-group entry by
+# test_pyproject_pin_matches_the_scripts_requirement.
+COMPLEXIPY_MIN: tuple[int, ...] = (6, 2)
+COMPLEXIPY_MAX_EXCLUSIVE: tuple[int, ...] = (7,)
+COMPLEXIPY_REQUIRED = '>={},<{}'.format(
+    '.'.join(str(part) for part in COMPLEXIPY_MIN),
+    '.'.join(str(part) for part in COMPLEXIPY_MAX_EXCLUSIVE),
+)
+
+_COMPLEXIPY_RANGE_REASON = (
+    'complexipy majors compute DIFFERENT cognitive numbers for the same file '
+    '(merge_queue.py totals 2031 at 3.0.0, 2092 at 5.0.0, 2133 at 6.x/7.x), so '
+    'an unpinned engine would silently rewrite every baseline figure; and 7.x '
+    'is ~48x slower on the monolith (247.0s vs 4.75s at 6.2.0, ~330s+ vs 9.52s '
+    'cluster-wide) against the ratchet test\'s 300s timeout, which pytest-'
+    'timeout enforces by os._exit()ing the xdist worker and truncating the '
+    'whole suite. Install the pinned version: `uv sync --all-packages`.'
+)
+
+
+def _version_parts(version: str) -> tuple[int, ...]:
+    """Leading numeric release segments of *version*, e.g. '6.2.0rc1' -> (6, 2, 0).
+
+    Deliberately hand-rolled rather than reaching for ``packaging``: this module
+    imports no third-party package at import time (see the note at the top), and a two-clause
+    ``>=X,<Y`` range over release segments needs nothing more.
+    """
+    parts: list[int] = []
+    for segment in version.split('.'):
+        digits = ''
+        for char in segment:
+            if not char.isdigit():
+                break
+            digits += char
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts)
+
+
+def satisfies_complexipy_requirement(version: str) -> bool:
+    """True when *version* falls inside ``COMPLEXIPY_REQUIRED``."""
+    parts = _version_parts(version)
+    if not parts:
+        return False
+    return COMPLEXIPY_MIN <= parts < COMPLEXIPY_MAX_EXCLUSIVE
+
+
+def complexipy_version() -> str:
+    """The installed complexipy version, or ``MetricsError`` naming the tool."""
+    import importlib.metadata
+
+    try:
+        return importlib.metadata.version('complexipy')
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise MetricsError(
+            'complexipy is not installed, so cognitive complexity cannot be '
+            'measured. It belongs to orchestrator/pyproject.toml '
+            '[dependency-groups] dev, pinned '
+            f'{COMPLEXIPY_REQUIRED}. Run `uv sync --all-packages`.'
+        ) from exc
+
+
+def require_complexipy() -> str:
+    """Assert the installed complexipy is inside ``COMPLEXIPY_REQUIRED``.
+
+    Called once up front by ``build_report`` so a wrong-version environment
+    fails immediately with a named cause rather than after a 250-second
+    measurement whose numbers would be wrong anyway.
+    """
+    # Looked up through the module namespace on purpose, so a test can seed a
+    # version without installing one.
+    version = globals()['complexipy_version']()
+    if not satisfies_complexipy_requirement(version):
+        raise MetricsError(
+            f'complexipy {version} is installed but this instrument requires '
+            f'{COMPLEXIPY_REQUIRED}. {_COMPLEXIPY_RANGE_REASON}'
+        )
+    return version
+
+
+def _import_complexipy():  # noqa: ANN202 - third-party module object
+    """Import complexipy LAZILY, naming it in the failure.
+
+    Lazy so ``scripts/merge_lane_metrics.py`` stays importable and
+    type-checkable under the ``shared`` project that owns its ruff/pyright
+    gates, whose dev group carries neither complexipy nor radon. Lazy is not
+    soft: the moment a measure actually needs the tool, a missing one is an
+    instrument failure with a named cause.
+    """
+    try:
+        import complexipy  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise MetricsError(
+            'complexipy could not be imported, so cognitive complexity cannot '
+            'be measured. It belongs to orchestrator/pyproject.toml '
+            f'[dependency-groups] dev, pinned {COMPLEXIPY_REQUIRED}. '
+            f'Run `uv sync --all-packages`. ({exc})'
+        ) from exc
+    return complexipy
+
+
+def _file_complexity(path: Path):  # noqa: ANN202 - complexipy.FileComplexity
+    complexipy = _import_complexipy()
+    try:
+        return complexipy.file_complexity(str(path))
+    except MetricsError:
+        raise
+    except Exception as exc:
+        raise MetricsError(
+            f'{path}: complexipy could not measure this file -- '
+            f'{exc.__class__.__name__}: {exc}'
+        ) from exc
+
+
+@dataclasses.dataclass(frozen=True)
+class FileCognitive:
+    """Both cognitive projections of ONE complexipy measurement of one file."""
+
+    total: int
+    per_function: dict[str, int]
+
+
+def file_cognitive_measures(path: Path) -> FileCognitive:
+    """Measure *path* with complexipy ONCE and derive both projections from it.
+
+    The file total and the per-function map are two VIEWS of a single
+    ``FileComplexity``, so one call answers both and ``build_report`` -- the
+    only caller -- asks once per file. There are deliberately no separate
+    ``cognitive_complexity`` / ``file_cognitive_total`` accessors: with one
+    call site, a named half per projection would be surface kept alive by its
+    own tests. Deliberately NOT a cache either: a memo keyed on a path would
+    return the file as it WAS, would retain every result for the life of a
+    process the merge lane runs on every verify leg, and would need a carve-out
+    to keep ``_file_complexity``'s MetricsError from being swallowed.
+
+    ``total`` is reported and ratcheted alongside ``per_function`` because it
+    also counts module-level control flow belonging to no function. complexipy
+    already emits ``Class::method`` for methods, so the keys need no
+    post-processing, and a module with no functions yields an empty map -- a
+    real measurement, not a skipped one.
+    """
+    result = _file_complexity(path)
+    return FileCognitive(
+        total=int(result.complexity),
+        per_function={
+            function.name: function.complexity for function in result.functions
+        },
+    )
+
+
+def maintainability_index(source: str, *, path: str) -> float:
+    """radon's maintainability index for *source*, in [0, 100].
+
+    REPORTED, never ratcheted: MI is a derived composite (Halstead volume,
+    cyclomatic complexity, SLOC, comment ratio) that already reads 0.00 for both
+    merge_queue.py and git_ops.py, so it has no headroom left to ratchet against
+    and would only ever restate what the line and cognitive measures already
+    say. It earns its place in ``--report`` as the PRD Background table's
+    "Maintainability index (radon) | 0" row -- and it is what makes the `radon`
+    dev-group entry genuinely exercised rather than dead weight.
+    """
+    try:
+        from radon.metrics import mi_visit  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise MetricsError(
+            'radon could not be imported, so the maintainability index cannot '
+            'be reported. It belongs to orchestrator/pyproject.toml '
+            f'[dependency-groups] dev. Run `uv sync --all-packages`. ({exc})'
+        ) from exc
+    try:
+        return float(mi_visit(source, True))
+    except Exception as exc:
+        raise MetricsError(
+            f'{path}: radon could not compute a maintainability index -- '
+            f'{exc.__class__.__name__}: {exc}'
+        ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Test-suite patch targets into lane internals.
+#
+# The two detector shapes below are PORTED from
+# orchestrator/tests/test_merge_queue_reachback_patch_guard.py --
+# `_merge_queue_module_aliases()` and the is_setattr / is_dotted_patch /
+# is_bare_patch / is_patch_object call classification inside
+# `_find_merge_queue_private_patches()` -- with two deliberate generalisations:
+# the alias helper takes a SET of lane module paths rather than the single
+# hardcoded `orchestrator.merge_queue`, and that guard's `forbidden` filter is
+# dropped so ALL leaves are counted rather than only the satellite-private ones.
+# This measure therefore subsumes the guard's allowlist as a COUNT, which is
+# what lets PRD task delta delete the guard once the count reaches zero.
+
+#: Dotted module paths whose attributes count as lane internals when patched.
+#: `merge_lane` is here from day one, before the package exists, precisely so
+#: PRD task zeta2's `git mv` cannot make the count read 0 by relocation.
+LANE_PATCH_MODULES: tuple[str, ...] = (
+    'orchestrator.merge_queue',
+    'orchestrator.merge_lane',
+)
+
+
+def _lane_module_aliases(tree: ast.AST) -> set[str]:
+    """Names bound directly to a lane module object anywhere in *tree*.
+
+    e.g. ``import orchestrator.merge_queue as mq`` or
+    ``from orchestrator import merge_lane``. Used to recognise the object-path
+    idiom, which targets the identical lookup site as the string-path form
+    without embedding the module path as a string constant.
+    """
+    leaves = {path.rsplit('.', 1)[-1] for path in LANE_PATCH_MODULES}
+    aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in LANE_PATCH_MODULES and alias.asname:
+                    aliases.add(alias.asname)
+        elif (
+            isinstance(node, ast.ImportFrom)
+            and node.module == 'orchestrator'
+            and not node.level
+        ):
+            for alias in node.names:
+                if alias.name in leaves:
+                    aliases.add(alias.asname or alias.name)
+    return aliases
+
+
+def patch_targets(source: str, *, path: str = '<source>') -> set[str]:
+    """Distinct leaf names patched through a lane module path in *source*.
+
+    Distinct NAMES, not call sites: the PRD's measure is "79 distinct names"
+    across "1,111 call sites", and the ratchet freezes the former.
+
+    AST-based, so a docstring or comment quoting the dotted path -- which the
+    satellite module docstrings and the reachback guard's own ALLOWLIST literal
+    both do -- is never mistaken for a real patch site.
+    """
+    tree = _parse(source, path=path)
+    aliases = _lane_module_aliases(tree)
+    leaves = {module.rsplit('.', 1)[-1] for module in LANE_PATCH_MODULES}
+
+    def _is_lane_ref(expr: ast.expr) -> bool:
+        if isinstance(expr, ast.Name):
+            return expr.id in aliases
+        # The bare attribute chain `orchestrator.merge_queue`. Anchored on the
+        # `orchestrator` root so an unrelated `workflow.merge_queue` attribute
+        # that merely shares the leaf name is not counted.
+        return (
+            isinstance(expr, ast.Attribute)
+            and expr.attr in leaves
+            and isinstance(expr.value, ast.Name)
+            and expr.value.id == 'orchestrator'
+        )
+
+    targets: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        func = node.func
+        is_setattr = isinstance(func, ast.Attribute) and func.attr == 'setattr'
+        is_dotted_patch = isinstance(func, ast.Attribute) and func.attr == 'patch'
+        is_bare_patch = isinstance(func, ast.Name) and func.id == 'patch'
+        is_patch_object = (
+            isinstance(func, ast.Attribute)
+            and func.attr == 'object'
+            and (
+                (isinstance(func.value, ast.Name) and func.value.id == 'patch')
+                or (isinstance(func.value, ast.Attribute) and func.value.attr == 'patch')
+            )
+        )
+
+        leaf: str | None = None
+
+        # String-path form: the dotted path IS the first positional argument.
+        if is_setattr or is_dotted_patch or is_bare_patch:
+            first = node.args[0]
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                for module in LANE_PATCH_MODULES:
+                    prefix = module + '.'
+                    if first.value.startswith(prefix):
+                        leaf = first.value[len(prefix):]
+                        break
+
+        # Object-path form: first arg is a lane module reference, second is the
+        # leaf name string.
+        if leaf is None and (is_setattr or is_patch_object) and len(node.args) >= 2:
+            target, name_arg = node.args[0], node.args[1]
+            if (
+                _is_lane_ref(target)
+                and isinstance(name_arg, ast.Constant)
+                and isinstance(name_arg.value, str)
+            ):
+                leaf = name_arg.value
+
+        if leaf:
+            targets.add(leaf)
+    return targets
+
+
+# ---------------------------------------------------------------------------
+# Private-attribute reads from tests.
+#
+# THIS MEASURE IS DELIBERATELY RECEIVER-AGNOSTIC. It counts every `_x` attribute
+# access in a lane-importing test file except on the bare `self`/`cls`, and it
+# does NOT maintain a list of blessed receiver variable names (`worker`, `mq`,
+# ...). Two reasons, and the first is the decisive one:
+#
+# (1) A receiver-name allowlist is a single SHARED list that all ten of PRD
+#     gamma1..gamma10 would have to edit concurrently -- the same rebase-conflict
+#     hazard the per-path baseline format exists to avoid.
+# (2) It silently UNDER-counts the moment a test uses a receiver name nobody
+#     listed, which is how a ratchet rots into a vacuous pass. Over-counting is
+#     the safe direction here: a ratchet only ever refuses to let a number RISE,
+#     so a superset costs a little extra friction and never lets a regression
+#     through.
+#
+# The `self`/`cls` exclusion is a STRUCTURAL predicate, not a name list: a test
+# class's own helpers are not lane internals, which is the distinction the
+# measure is actually about. Note it excludes only the BARE receiver, so
+# `self.worker._x` still counts.
+#
+# Measured magnitudes on this tree: 18,952 private attribute nodes across all
+# 559 test files, 9,355 restricted to the 167 lane-importing ones. (The PRD
+# Background table's 5,735 came from a narrower ad-hoc receiver set.)
+
+_SELF_RECEIVERS = frozenset({'self', 'cls'})
+
+
+def lane_module_names() -> frozenset[str]:
+    """Dotted module names of the cluster, DERIVED from ``CLUSTER_PATHS``.
+
+    Derived rather than hand-listed so the lane-importing predicate and
+    Appendix A can never drift apart.
+    """
+    names: set[str] = set()
+    for entry in CLUSTER_PATHS:
+        if '*' in entry or not entry.endswith('.py'):
+            continue
+        parts = entry[: -len('.py')].split('/')
+        if 'src' in parts:
+            names.add('.'.join(parts[parts.index('src') + 1:]))
+    return frozenset(names)
+
+
+def imports_lane_module(source: str, *, path: str) -> bool:
+    """True when *source* imports any cluster module, or anything under
+    ``orchestrator.merge_lane``."""
+    tree = _parse(source, path=path)
+    lane_names = lane_module_names()
+    lane_leaves = {name.rsplit('.', 1)[-1] for name in lane_names}
+
+    def _is_lane(dotted: str) -> bool:
+        return dotted in lane_names or dotted == 'orchestrator.merge_lane' or dotted.startswith(
+            'orchestrator.merge_lane.'
+        )
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            if any(_is_lane(alias.name) for alias in node.names):
+                return True
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            if _is_lane(node.module):
+                return True
+            # `from orchestrator import merge_gates` binds the module itself.
+            if node.module == 'orchestrator' and any(
+                alias.name in lane_leaves or alias.name == 'merge_lane'
+                for alias in node.names
+            ):
+                return True
+    return False
+
+
+def private_reads(source: str, *, path: str) -> int:
+    """Count accesses of a single-underscore attribute in *source*.
+
+    Writes count too: both directions couple the test to an internal name, which
+    is the coupling the measure exists to shrink. Dunders are excluded (Python
+    protocol, not lane internals) and so is the bare ``self``/``cls`` receiver.
+    """
+    tree = _parse(source, path=path)
+    count = 0
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Attribute):
+            continue
+        if not node.attr.startswith('_') or node.attr.startswith('__'):
+            continue
+        receiver = node.value
+        if isinstance(receiver, ast.Name) and receiver.id in _SELF_RECEIVERS:
+            continue
+        count += 1
+    return count
+
+
+def test_file_measures(source: str, *, path: str) -> dict[str, object] | None:
+    """The two test-suite measures for *source*, or None when it is not
+    lane-importing.
+
+    Returning None rather than a zeroed dict makes the exclusion a property of
+    the MEASURE rather than of the caller, so a non-lane-importing file can
+    never be summed into the report by accident.
+    """
+    if not imports_lane_module(source, path=path):
+        return None
+    return {
+        'patch_targets': sorted(patch_targets(source, path=path)),
+        'private_reads': private_reads(source, path=path),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Report assembly, and DERIVED totals.
+
+SCHEMA_VERSION = 1
+
+#: Subdirectory swept for the two test-suite measures.
+TESTS_ROOT = 'orchestrator/tests'
+
+
+def build_report(root: Path) -> dict[str, object]:
+    """Measure the whole cluster plus the test suite under *root*.
+
+    Note there is NO ``totals`` key: cluster-wide totals are DERIVED at check
+    time by ``derive_totals`` from the stored per-path maps. PRD gamma1..gamma10
+    run in parallel and each lowers only its own group's contribution, so a
+    shared totals line would conflict on every one of ten rebases -- while
+    deriving preserves the anti-rename-gaming property in full (see
+    ``derive_totals``) and keeps one number in one place.
+
+    The ``enumeration`` block obeys that same constraint, which it did not when
+    the argument above was first written: the cluster half is a fixed manifest
+    that moves only when ``CLUSTER_PATHS`` does, and the test tree's size is
+    reported rather than stored, so nothing here is a shared line ten branches
+    would each rewrite (see ``_stored_enumeration``).
+    """
+    # Up front, before any measurement: a wrong-version engine must fail
+    # immediately with a named cause rather than after a 250-second run whose
+    # numbers would be wrong anyway.
+    version = require_complexipy()
+    enumeration = resolve_cluster_paths(root)
+
+    files: dict[str, object] = {}
+    functions: dict[str, int] = {}
+    for relpath in enumeration.resolved:
+        source = _read_source(root, relpath)
+        size = file_size_measures(source, path=relpath)
+        target = root / relpath
+        cognitive = file_cognitive_measures(target)
+        files[relpath] = {
+            'lines': size.lines,
+            'prose_lines': size.prose_lines,
+            'cognitive': cognitive.total,
+            'function_local_imports': function_local_imports(source, path=relpath),
+            'reexport_names': len(reexport_names(source, path=relpath)),
+        }
+        for qualname, score in cognitive.per_function.items():
+            functions[f'{relpath}::{qualname}'] = score
+
+    tests, test_unreadable, coverage = _sweep_test_tree(root)
+
+    return {
+        'schema_version': SCHEMA_VERSION,
+        'params': {
+            'complexipy_version': version,
+            'cluster_paths': list(CLUSTER_PATHS),
+            'file_line_ceiling': FILE_LINE_CEILING,
+            'new_function_cognitive_ceiling': NEW_FUNCTION_COGNITIVE_CEILING,
+        },
+        'enumeration': _report_enumeration(enumeration, test_unreadable, coverage),
+        'files': dict(sorted(files.items())),
+        'functions': dict(sorted(functions.items())),
+        'tests': dict(sorted(tests.items())),
+    }
+
+
+def _sweep_test_tree(
+    root: Path,
+) -> tuple[dict[str, object], tuple[str, ...], TestTreeCoverage]:
+    """Measure every lane-importing file under ``orchestrator/tests``.
+
+    Returns the measures, the paths SKIPPED (by name, verbatim), and how broad
+    the sweep was as counts. The swept paths themselves are deliberately not
+    accumulated: the caller has no use for a 568-entry manifest of other
+    people's test files, and building one is how it ended up frozen in the
+    committed baseline (esc-5021-7).
+
+    THIS sweep keeps the sibling guards' per-file fail-SOFT polarity -- an
+    unrelated mid-edit test file must not redden the ratchet, which is the
+    misattribution every neighbouring guard exists to avoid. What is NOT soft is
+    the record: each skipped file lands in ``Enumeration.unreadable``, the
+    enumeration goes incomplete, and ``check_against_baseline`` then refuses to
+    compare at all. That split is the INV-11 seam between "this cluster file is
+    unmeasurable, which IS the finding" and "some unrelated test file is
+    mid-edit".
+    """
+    tests: dict[str, object] = {}
+    requested = 0
+    unreadable: list[str] = []
+    for path in sorted((root / TESTS_ROOT).rglob('*.py')):
+        relpath = path.relative_to(root).as_posix()
+        requested += 1
+        try:
+            source = path.read_text(encoding='utf-8')
+        except (OSError, UnicodeDecodeError):
+            unreadable.append(relpath)
+            continue
+        try:
+            measures = test_file_measures(source, path=relpath)
+        except MetricsError:
+            unreadable.append(relpath)
+            continue
+        if measures is not None:
+            tests[relpath] = measures
+    return (
+        tests,
+        tuple(unreadable),
+        TestTreeCoverage(requested=requested, resolved=len(tests)),
+    )
+
+
+def _report_enumeration(
+    cluster: Enumeration,
+    test_unreadable: tuple[str, ...],
+    coverage: TestTreeCoverage,
+) -> dict[str, object]:
+    """The report's enumeration block: cluster paths, test-tree counts, INV-11.
+
+    The two halves stay APART rather than being flattened into one pair of
+    lists. Flattening cost information as well as bytes: the three CLUSTER_PATHS
+    literals that live under ``orchestrator/tests`` appeared in both halves, so
+    the merged lists carried three duplicate entries each, and any later attempt
+    to separate them again by set membership against CLUSTER_PATHS would drop a
+    ``merge_lane/**`` file once PRD task zeta1 makes that glob expand -- a
+    silent completeness hole in the instrument whose whole job is completeness.
+
+    Key order is fixed here, not incidental: ``render_baseline`` emits this block
+    with ``json.dumps(..., indent=2)``, so insertion order IS the committed
+    bytes.
+    """
+    return {
+        'requested': list(cluster.requested),
+        'resolved': list(cluster.resolved),
+        'test_tree': coverage.to_dict(),
+        'unreadable': list(cluster.unreadable) + list(test_unreadable),
+        'complete': cluster.complete and not test_unreadable,
+    }
+
+
+#: Per-file measures summed into a cluster total by ``derive_totals``.
+_SUMMED_FILE_MEASURES = (
+    'lines',
+    'prose_lines',
+    'cognitive',
+    'function_local_imports',
+    'reexport_names',
+)
+
+
+def derive_totals(report: dict) -> dict[str, int]:
+    """Cluster-wide totals, DERIVED by summing *report*'s per-path maps.
+
+    Pure: *report* is never mutated.
+
+    Deriving rather than storing is what makes the ten parallel gamma branches
+    rebase cleanly, AND it preserves the anti-rename-gaming property exactly. A
+    total computed by summing stored per-path baselines is unchanged when 500
+    lines move from ``merge_queue.py`` to a brand-new path, so the ratchet still
+    catches the move -- which a per-path-only comparison would not, since the
+    new path is simply absent from the baseline.
+
+    ``patch_targets`` is the size of the UNION across files, matching the PRD's
+    "distinct names" measure rather than a sum of per-file counts.
+    """
+    files = report.get('files', {})
+    totals = {
+        measure: sum(int(entry.get(measure, 0)) for entry in files.values())
+        for measure in _SUMMED_FILE_MEASURES
+    }
+    tests = report.get('tests', {})
+    totals['private_reads'] = sum(
+        int(entry.get('private_reads', 0)) for entry in tests.values()
+    )
+    union: set[str] = set()
+    for entry in tests.values():
+        union.update(entry.get('patch_targets', ()))
+    totals['patch_targets'] = len(union)
+    return totals
+
+
+# ---------------------------------------------------------------------------
+# Baseline serialization.
+#
+# WHY A HAND-ROLLED WRITER instead of json.dumps(indent=2). PRD gamma1..gamma10
+# run in PARALLEL, each lowering only its own group's numbers and rebasing
+# through the merge lane. indent=2 spreads one path's five measures across six
+# lines, so two branches editing two unrelated paths land inside one diff hunk
+# and conflict. Emitting each files/functions/tests entry on exactly ONE line
+# makes those ten edits disjoint hunks that rebase cleanly. The property is
+# asserted by a test rather than left to formatting habit -- see
+# ``TestRenderBaseline::test_every_per_path_entry_occupies_exactly_one_line``.
+
+# The ratchet's two COMMITTED ARTIFACTS, relative to the repo root. The
+# baseline holds the frozen measures; its sidecar ledger holds the provenance of
+# every raise that was ever authorized against them. Both paths are named here,
+# above the README that cites them, because the remedy text an agent reads when
+# the gate goes red is composed from them.
+BASELINE_RELPATH = 'orchestrator/tests/merge_lane_ratchet_baseline.json'
+LEDGER_RELPATH = 'orchestrator/tests/merge_lane_ratchet_authorized_raises.json'
+
+#: The commit-time auditor the remedy tells a blocked agent about, named here
+#: rather than spelled into the prose. It is a REAL PATH a reader is sent to
+#: grep, it is frozen into the committed baseline's ``_README`` verbatim, and
+#: this instrument -- having no git dependency -- cannot notice it going stale.
+#: As a constant, ``TestTheBlockMessageNamesTheAuthorizedPath`` can assert it
+#: RESOLVES, which a bare string literal in the prose left unchecked.
+COMMIT_GATE_RELPATH = 'scripts/check_staged_ratchet_raise.py'
+
+#: THE ONE COPY of what to do when a measure rose. Composed into every site
+#: that tells an agent it may not raise -- ``BASELINE_README`` (and so the
+#: committed bytes a blocked reader opens), ``main()``'s ``--check`` trailer,
+#: and the pytest gate's assertion message. Three near-copies used to say only
+#: that raising was forbidden, and the copy that mattered sent an implementer to
+#: escalation rather than to a sanctioned path (task 5342, esc-5342-1).
+RAISE_REMEDY = (
+    'Remedy: LOWER the measure. A task that legitimately lowers one regenerates '
+    'the baseline in the SAME commit:\n'
+    f'  python scripts/merge_lane_metrics.py --write-baseline {BASELINE_RELPATH}\n'
+    'RAISING a measure is not forbidden -- it is never SILENT. Net-additive '
+    'work (a bug fix that adds a guard, a widened CLUSTER_PATHS) records the '
+    'raise as a reviewed diff:\n'
+    f'  python scripts/merge_lane_metrics.py --write-baseline {BASELINE_RELPATH} '
+    '--authorize-raise <task-id> '
+    '--reason "<why this is net-additive work, not a refactor that failed>"\n'
+    f'That appends the exact per-measure delta to {LEDGER_RELPATH}, naming the '
+    'task and the reason, so the raise lands as a diff a reviewer reads rather '
+    'than as a number nobody saw move. Without those flags --write-baseline '
+    'REFUSES to absorb a raise over an EXISTING baseline, so regenerating in '
+    'place cannot widen the ratchet. Nor can going around it: '
+    f'{COMMIT_GATE_RELPATH} runs in pre-commit on EVERY branch '
+    'and compares the STAGED baseline against the one in git HEAD, so a '
+    'baseline deleted first, written elsewhere and copied over, or hand-edited '
+    'is refused on the same terms as a regeneration -- and so is a commit that '
+    'drops or rewrites a recorded entry in the ledger. The one thing it lets '
+    'through deliberately is UNDOING THE LAST CHANGE to the baseline: staging '
+    'the value this path held one commit ago, and nothing further back. That '
+    'is the state the tree was just running with, so putting it back re-raises '
+    'nothing new, and needing an authorization to undo a revert would make the '
+    'honest move the expensive one. Reaching FURTHER back is refused, because '
+    'every image in between is a value the ratchet moved through and returning '
+    'behind them re-absorbs every measure they lowered.\n'
+    'RESIDUAL, so you do not trust more than is true: `git rebase` and merge '
+    'commits do not run pre-commit at all, and the merge worker advances main '
+    'with `git update-ref`, which runs no hooks. A raise introduced before this '
+    'guard existed and replayed across its introduction still reaches main '
+    'unexamined. Closing that needs a merge-lane or reference-transaction gate, '
+    'not this one. --authorize-raise is the way past.'
+)
+
+#: Emitted as the baseline's leading key, so the rule is in the file a reader
+#: is about to "fix" rather than only in a docstring they will not open.
+BASELINE_README = (
+    'This is a committed RATCHET BASELINE for the merge-lane cluster '
+    '(PRD plans/merge-lane-quality-prd.md, task alpha). Every measure here is '
+    'frozen at its value on the commit that recorded it: the gate '
+    'orchestrator/tests/test_merge_lane_ratchet.py FAILS on any measure that '
+    'RISES above these numbers. Equality is fine, lowering is the point. The '
+    'enumeration block below is the CLUSTER half only: the instrument also '
+    'sweeps every .py under '
+    'orchestrator/tests for the measures in the tests section, and that sweep '
+    'is sized by --report rather than ratcheted here, so an unrelated test file '
+    'arriving never touches these bytes.\n'
+    # Composed, never paraphrased: this is the one string in the instrument that
+    # changes what a blocked agent does next, and the copy that mattered was
+    # always the one in THIS file.
+    + RAISE_REMEDY
+)
+
+#: The three per-path maps whose entries get one line each.
+_PER_PATH_SECTIONS: tuple[str, ...] = ('files', 'functions', 'tests')
+
+
+def _stored_enumeration(enumeration: dict) -> dict:
+    """Strip the live-only test-tree counts; the baseline stores the cluster half.
+
+    WHY THE TEST TREE IS NOT STORED AT ALL, in paths OR in counts (esc-5021-7).
+    ``_sweep_test_tree`` walks every ``*.py`` under ``orchestrator/tests`` -- 568
+    paths, of which only the lane-importing ones are ever measured. Freezing that
+    manifest in the committed baseline made this gate a hair trigger: any task
+    ANYWHERE in the repo that added, removed or renamed a single test file
+    reddened ``test_baseline_matches_a_fresh_measurement`` even though no lane
+    measure moved, and the failure it printed ("Regenerate it in this commit if
+    you lowered a measure") invited a blind regeneration of a baseline that task
+    had never inspected -- exactly the silent widening ``BASELINE_README`` and
+    that test exist to prevent. Observed live: an unrelated file arriving via
+    rebase (``test_roles_error_remedy_hint.py``, task 4964) produced a ONE-LINE
+    baseline diff and a red gate.
+
+    It also cut against this task's decompose-time baseline-format constraint,
+    which rejected even a single shared ``totals`` line because ten parallel
+    gamma branches "would conflict on every rebase". A frozen 568-entry list is
+    strictly MORE rebase-sensitive than the line that constraint rejected, and it
+    is sensitive to churn outside the lane entirely.
+
+    STORING THE COUNTS INSTEAD WOULD BE WORSE, NOT BETTER, which is why this
+    function drops them rather than reducing them. The denominator moves on any
+    ``.py`` arriving anywhere under ``orchestrator/tests``, so it is the same
+    hair trigger with a shorter diff. The numerator is exactly
+    ``len(report['tests'])``, already in the file line-locally, so storing it is
+    a second copy of one number (SPOT) -- and it is a single SHARED line that
+    every gamma branch deleting a lane-importing test would rewrite, which is the
+    guaranteed one-line conflict the ``totals`` constraint rejected. Neither is
+    ratcheted by anything: ``check_against_baseline`` reads completeness from the
+    CURRENT report, never from the stored block.
+
+    INV-11 IS UNAFFECTED, and deliberately so: ``unreadable`` keeps every skipped
+    path from BOTH halves verbatim and ``complete`` is untouched, so a skipped
+    test-tree file is still named in the committed file and still makes
+    ``check_against_baseline`` refuse to compare. The sweep's breadth is reported
+    by ``--report`` and ``--json``, and a COLLAPSED sweep still fails loudly via
+    ``test_the_live_sweep_denominator_covers_the_whole_test_tree`` rather than
+    quietly shrinking anything.
+
+    Idempotent, which ``render_baseline``'s round-trip contract requires:
+    dropping an absent key is a no-op.
+    """
+    return {key: value for key, value in enumeration.items() if key != 'test_tree'}
+
+
+def _render_section(name: str, mapping: dict) -> str:
+    """Render one per-path map with exactly one line per entry, key-sorted."""
+    if not mapping:
+        return f'  {json.dumps(name)}: {{}}'
+    rows = ',\n'.join(
+        f'    {json.dumps(key)}: {json.dumps(mapping[key], sort_keys=True)}'
+        for key in sorted(mapping)
+    )
+    return f'  {json.dumps(name)}: {{\n{rows}\n  }}'
+
+
+def render_baseline(report: dict) -> str:
+    """Serialize *report* as the committed baseline's exact bytes.
+
+    Idempotent: ``render_baseline(json.loads(render_baseline(r)))`` reproduces
+    the same text, so regenerating a baseline from a baseline is a no-op rather
+    than a churned file full of manufactured conflicts. The ``_README`` key is
+    emitted from ``BASELINE_README`` and any inbound one is dropped, which is
+    what makes that hold across a round trip.
+    """
+    entries = [f'  "_README": {json.dumps(BASELINE_README)}']
+    for key, value in report.items():
+        if key == '_README':
+            continue
+        if key in _PER_PATH_SECTIONS and isinstance(value, dict):
+            entries.append(_render_section(key, value))
+        else:
+            # Top-level scalars and the small params/enumeration blocks are
+            # ordinary pretty-printed JSON, shifted one level in. The
+            # `enumeration` block sheds its live-only test-tree counts first --
+            # see _stored_enumeration for why neither the test tree's paths nor
+            # its numbers belong in a committed baseline (esc-5021-7).
+            if key == 'enumeration' and isinstance(value, dict):
+                value = _stored_enumeration(value)
+            block = json.dumps(value, indent=2).replace('\n', '\n  ')
+            entries.append(f'  {json.dumps(key)}: {block}')
+    return '{\n' + ',\n'.join(entries) + '\n}\n'
+
+
+class UnauthorizedRaise(Exception):
+    """``write_baseline`` refused to absorb a raise nobody authorized.
+
+    NOT a ``MetricsError``, deliberately. ``main()`` maps every MetricsError to
+    exit 2 ("the instrument is broken"), and a refused regeneration is not a
+    broken instrument -- it is a measure that rose, discovered at write time
+    instead of at check time, which is squarely exit 1. Subclassing would
+    silently reclassify a real regression as a broken tool, collapsing the one
+    distinction the exit ladder exists to keep.
+
+    Carries the measured ``violations`` so ``main()`` can print the same
+    per-violation lines ``--check`` prints, and so the ledger record for an
+    AUTHORIZED raise is derived from the same comparison that would have
+    refused it.
+    """
+
+    def __init__(self, violations: Sequence[Violation]) -> None:
+        self.violations: tuple[Violation, ...] = tuple(violations)
+        super().__init__(
+            f'refusing to write a baseline that RAISES {len(self.violations)} '
+            'measure(s):\n'
+            + '\n'.join(f'  {v.message}' for v in self.violations)
+            + f'\n{RAISE_REMEDY}'
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class BaselineWrite:
+    """What one write actually did: where the bytes landed, and what it recorded.
+
+    ``record`` is the ledger entry this write appended, or None when it appended
+    none -- which is every unauthorized write, and an authorized one over a
+    report that raised nothing. Returning it is what lets a caller REPORT the
+    outcome instead of re-deriving it: the alternative is reading the ledger
+    before and after and diffing the lengths, which is three reads of one file
+    and misreports the moment anything else appends concurrently.
+    """
+
+    path: Path
+    record: dict | None
+
+
+def write_baseline(
+    path: Path,
+    report: dict,
+    *,
+    authorization: RaiseAuthorization | None = None,
+    ledger: Path | None = None,
+) -> BaselineWrite:
+    """Render *report* and write it to *path* atomically, refusing silent raises.
+
+    THE TEXT IS RENDERED BEFORE THE DESTINATION IS TOUCHED, so a rendering
+    failure leaves the committed baseline byte-for-byte intact instead of
+    truncated -- a truncated baseline would be a *widened* ratchet, the one
+    failure mode this instrument must never produce silently.
+
+    THE WRITE GATE, and why it lives here rather than in the comparator. The
+    pytest gate pins the committed baseline to equal a fresh measurement of the
+    tree, so in every COMMITTED state the comparator is trivially clean; a raise
+    is red only between editing the code and regenerating, and regeneration used
+    to absorb it silently because this function read nothing before overwriting.
+    Regeneration is therefore the ratchet's real enforcement point. If the
+    destination already holds a baseline, the raises this report would introduce
+    are measured against it, and without an *authorization* the write is REFUSED
+    with ``UnauthorizedRaise`` -- the destination untouched, exit 1 at the CLI.
+
+    DELIBERATELY NOT APPLIED here: ``_require_matching_params``. Both it and
+    ``resolve_cluster_paths`` instruct the reader to edit ``CLUSTER_PATHS`` and
+    regenerate the baseline in one commit, so routing regeneration through that
+    precondition would break the one workflow those messages prescribe. Widening
+    the cluster still raises the derived totals, so it still needs an
+    authorization -- which is honest, the totals really did rise.
+
+    THE OTHER ARM OF THAT PRECONDITION, complexipy version drift, reaches this
+    gate the same way and is easy to misread. A new version re-reads every
+    cognitive number at once -- the same merge_queue.py measures 2031 at 3.0.0,
+    2092 at 5.0.0 and 2133 at 6.x/7.x -- so a post-drift regeneration arrives as
+    a wall of raises and needs one authorization. It is recorded as a raise
+    because that is what the numbers did; the ledger reason is what tells a
+    reviewer the INSTRUMENT moved rather than the code, which is why
+    ``_require_matching_params`` asks for the version in it.
+
+    With an *authorization*, the raises are recorded in the append-only ledger
+    at *ledger* (default ``repo_root() / LEDGER_RELPATH``) and the write goes
+    ahead. WRITE ORDER PICKS THE SURVIVABLE FAILURE: the ledger lands FIRST, so
+    a crash between the two writes leaves a recorded authorization over an
+    unchanged baseline -- the gate stays red, nothing was widened, and the
+    orphaned record is visible -- rather than an unrecorded raise sitting in the
+    committed baseline, which is the exact silent widening this prevents. Both
+    texts are rendered before either file is touched, extending the
+    render-before-write property above across the pair.
+
+    An authorization over a report that raises NOTHING is ignored and appends no
+    record: the ledger holds raises, not intentions. The returned
+    ``BaselineWrite`` says which of the two happened, so a caller reports the
+    outcome from the write itself rather than re-reading the ledger to guess.
+
+    A MISSING destination is a first write with nothing to compare against, and
+    that is THIS function's exact limit. Deleting the committed baseline, or
+    writing to a scratch path and copying it over, resets every frozen measure
+    and re-grandfathers every ceiling, and no amount of reading the destination
+    can see it.
+
+    THAT HOLE IS NOW CLOSED ELSEWHERE, and deliberately elsewhere. Closing it
+    means comparing against the copy in git HEAD, which is a git dependency this
+    instrument still does not have: ``scripts/check_staged_ratchet_raise.py``
+    holds every git invocation, runs in pre-commit on every branch, and calls
+    ``compare_baseline_files`` here for the comparison itself, so there is one
+    definition of "did a measure rise" and only one file that knows what a
+    commit is. The boundary is still drawn rather than overclaimed -- the write
+    gate stops a raise being ABSORBED, the commit gate stops one being STAGED,
+    and neither sees a raise replayed by a rebase or landed by the merge
+    worker's hook-free ``update-ref``.
+
+    A MALFORMED destination propagates ``load_baseline``'s ``MetricsError``
+    rather than being overwritten: a previous baseline you cannot read is one
+    whose raises you cannot see.
+    """
+    text = render_baseline(report)
+    target = Path(path)
+    raises = (
+        _measure_raises(report, load_baseline(target)) if target.exists() else []
+    )
+    record = None
+    if raises:
+        if authorization is None:
+            raise UnauthorizedRaise(raises)
+        record = authorization_record(authorization, raises)
+        append_authorization(
+            Path(ledger) if ledger is not None else repo_root() / LEDGER_RELPATH,
+            record,
+        )
+    safe_io.atomic_write_text(target, text, mkdir=True)
+    return BaselineWrite(path=target, record=record)
+
+
+def load_baseline(path: Path) -> dict:
+    """Load the committed baseline, failing HARD and by name (INV-11).
+
+    A missing or malformed baseline is never an empty-baseline PASS. An empty
+    baseline compares clean against every measure, which would disarm the
+    ratchet for all twenty downstream PRD tasks while every gate stayed green --
+    exactly the silent fail-soft INV-11 forbids.
+    """
+    target = Path(path)
+    try:
+        text = target.read_text(encoding='utf-8')
+    except FileNotFoundError as exc:
+        raise MetricsError(
+            f'ratchet baseline {target} does not exist -- a missing baseline is '
+            'a hard failure, never an empty-baseline pass; regenerate it with '
+            '--write-baseline if this is the commit that introduces it'
+        ) from exc
+    except (OSError, UnicodeDecodeError) as exc:
+        raise MetricsError(
+            f'ratchet baseline {target} could not be read: '
+            f'{exc.__class__.__name__}: {exc}'
+        ) from exc
+    try:
+        loaded = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise MetricsError(
+            f'ratchet baseline {target} is not valid JSON: {exc}'
+        ) from exc
+    if not isinstance(loaded, dict):
+        raise MetricsError(
+            f'ratchet baseline {target} holds a '
+            f'{type(loaded).__name__} at top level, expected a JSON object'
+        )
+    return loaded
+
+
+# ---------------------------------------------------------------------------
+# Authorized raises -- the ratchet's reviewed escape hatch.
+#
+# Placed here, immediately after the baseline's own rule, because a reader who
+# opens this file to find out why a regeneration was refused must meet the rule
+# and its escape hatch together. Splitting the enforcement away from the thing
+# it enforces to keep a line count down is precisely the move this mechanism
+# exists to stop rewarding.
+
+
+def _require_non_blank(authorization: RaiseAuthorization, field: str) -> None:
+    value = getattr(authorization, field)
+    if not isinstance(value, str) or not value.strip():
+        raise MetricsError(
+            f'authorized raise is missing {field}: {value!r}. An authorization '
+            f'with no {field} is not an authorization -- the ledger entry exists '
+            'to tell a reviewer WHO raised a measure and WHY, and an entry that '
+            'answers neither is worse than no entry at all.'
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class RaiseAuthorization:
+    """Permission to record ONE set of raises, granted by one invocation.
+
+    An ACT, not a standing permission. It authorizes exactly the raises present
+    in the report it accompanies and nothing else; the ledger entry it produces
+    is provenance a reviewer reads, never an ACL this instrument consults. If a
+    landed record could license a later raise, the natural next move -- pre-write
+    a record, then regenerate -- would be indistinguishable from the silent
+    widening the ratchet exists to prevent. Per-invocation means the default is
+    always refusal, a stale record licenses nothing, and each raise costs one
+    deliberate, attributed command.
+
+    BOTH FIELDS ARE CHECKED AT CONSTRUCTION, so an unattributed authorization
+    never exists to be passed anywhere. Enforcing it further down -- where the
+    record is rendered -- would make the same value valid or invalid depending
+    on whether the report it accompanied happened to raise anything, and a blank
+    ``--reason`` over a lowering run would pass unremarked (heuristic 10).
+    """
+
+    task_id: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        _require_non_blank(self, 'task_id')
+        _require_non_blank(self, 'reason')
+
+
+#: Bumped only if an entry's SHAPE changes; the file is append-only otherwise.
+LEDGER_SCHEMA_VERSION = 1
+
+#: Emitted as the ledger's leading key, for the same reason BASELINE_README is:
+#: the rule belongs in the file a reader has open.
+LEDGER_README = (
+    'This is the APPEND-ONLY provenance of every raise ever authorized against '
+    'the merge-lane ratchet baseline '
+    '(orchestrator/tests/merge_lane_ratchet_baseline.json). It is NOT a '
+    'permission list: nothing in this file grants a future raise, and no entry '
+    'here will ever let --write-baseline absorb one. Authorization is an act, '
+    'not a standing entry -- rerun --authorize-raise for each raise, and it '
+    'appends one more record. Each entry\'s "measures" block is DERIVED from the '
+    'measured raises the write gate computed, never hand-written, so it is '
+    'mechanically incapable of disagreeing with the baseline diff it '
+    'accompanies. There is no timestamp: git already carries the date, and a '
+    'clock would churn this file on every rewrite. Written by '
+    'scripts/merge_lane_metrics.py --write-baseline '
+    'orchestrator/tests/merge_lane_ratchet_baseline.json --authorize-raise '
+    '<task-id> --reason "<why>".'
+)
+
+
+def authorization_record(
+    authorization: RaiseAuthorization, raises: Sequence[Violation]
+) -> dict:
+    """One ledger entry: who authorized it, why, and exactly what rose.
+
+    A PURE PROJECTION -- it validates nothing, because a ``RaiseAuthorization``
+    that exists is already attributed. ``measures`` is projected off the
+    Violations the write gate measured, in their already-sorted order, reusing
+    ``Violation``'s field names so the audit record and the failure message
+    describe a raise in one vocabulary. Nothing here is typed by the agent, so
+    the record cannot drift from the diff.
+    """
+    return {
+        'task_id': authorization.task_id,
+        'reason': authorization.reason,
+        'measures': [
+            {
+                'measure': violation.measure,
+                'key': violation.key,
+                'baseline': violation.baseline,
+                'current': violation.current,
+            }
+            for violation in raises
+        ],
+    }
+
+
+
+def _record_measures(record: dict) -> list[dict]:
+    measures = record.get('measures')
+    if not isinstance(measures, list):
+        return []
+    return [measure for measure in measures if isinstance(measure, dict)]
+
+
+def unrecorded_raises(
+    raises: Sequence[Violation], records: Sequence[dict]
+) -> list[Violation]:
+    """The raises in *raises* that no entry in *records* names. Pure.
+
+    The inverse of ``authorization_record``, and placed beside it so the writer
+    and the auditor read a raise out of one field vocabulary (SPOT) rather than
+    two that can drift. Coverage is the triple ``(measure, key, current)``.
+
+    ``current`` is in the triple because it is the discriminator that actually
+    catches a stale or hand-written entry: such an entry names the right measure
+    and the right key while the baseline it accompanies landed somewhere else,
+    so a ``(measure, key)`` check would wave it through. ``baseline`` is
+    deliberately OUT of it: an agent who runs ``--write-baseline
+    --authorize-raise`` twice in one commit records ``b -> m`` and ``m -> f``,
+    while the HEAD-to-staged delta reads ``b -> f``, so requiring it to match
+    would refuse a correctly authorized commit.
+
+    A record whose ``measures`` is missing or not a list simply covers nothing:
+    a badly hand-edited ledger must REFUSE the commit, not crash the gate.
+    """
+    covered = {
+        (measure.get('measure'), measure.get('key'), measure.get('current'))
+        for record in records
+        for measure in _record_measures(record)
+    }
+    return [
+        violation
+        for violation in raises
+        if (violation.measure, violation.key, violation.current) not in covered
+    ]
+
+
+
+def empty_ledger() -> dict:
+    """A ledger that has authorized nothing -- the day-one and fail-closed state."""
+    return {
+        '_README': LEDGER_README,
+        'schema_version': LEDGER_SCHEMA_VERSION,
+        'raises': [],
+    }
+
+
+def render_ledger(ledger: dict) -> str:
+    """Serialize *ledger* as the committed file's exact bytes.
+
+    Idempotent, like ``render_baseline``: the ``_README`` is re-emitted from
+    ``LEDGER_README`` and any inbound one dropped, so a round trip is a no-op
+    rather than a churned file.
+
+    Plain ``json.dumps(indent=2)`` rather than the baseline's hand-rolled
+    one-line-per-entry writer. That writer exists for one stated reason -- ten
+    parallel PRD gamma branches each editing different per-path measures would
+    conflict inside indent=2's six-line-per-path hunks. An append-only file
+    gaining one entry per authorizing task has no such shape, so inheriting the
+    custom writer would cargo-cult a constraint that does not apply and cost
+    legibility for it.
+    """
+    body = {key: value for key, value in ledger.items() if key != '_README'}
+    return json.dumps({'_README': LEDGER_README, **body}, indent=2) + '\n'
+
+
+def load_ledger(path: Path) -> dict:
+    """Load the authorized-raise ledger. ABSENT is empty; MALFORMED is fatal.
+
+    THE POLARITY IS THE OPPOSITE OF ``load_baseline``'s on absence, deliberately,
+    because absence means opposite things. An absent BASELINE would compare clean
+    against every measure -- a silent disarming, so it must fail hard (INV-11).
+    An absent LEDGER means no raise was ever authorized, which is the fail-CLOSED
+    state: nothing is permitted by it, and hard-failing would only break the
+    day-one and fresh-tmp-path cases for no safety gain.
+
+    Corruption is different in kind. A ledger that cannot be parsed is one whose
+    entries cannot be audited, and reading it as empty would hide history, so
+    every malformed shape fails hard and names the file. Do not "fix" the split
+    by copying the neighbour -- this module already carries one deliberate
+    fail-soft/fail-hard seam that neighbours were tempted to flatten.
+    """
+    target = Path(path)
+    try:
+        text = target.read_text(encoding='utf-8')
+    except FileNotFoundError:
+        return empty_ledger()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise MetricsError(
+            f'authorized-raise ledger {target} could not be read: '
+            f'{exc.__class__.__name__}: {exc}'
+        ) from exc
+    try:
+        loaded = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise MetricsError(
+            f'authorized-raise ledger {target} is not valid JSON: {exc}'
+        ) from exc
+    if not isinstance(loaded, dict):
+        raise MetricsError(
+            f'authorized-raise ledger {target} holds a '
+            f'{type(loaded).__name__} at top level, expected a JSON object'
+        )
+    if not isinstance(loaded.get('raises'), list):
+        raise MetricsError(
+            f'authorized-raise ledger {target} has no "raises" list -- a ledger '
+            'whose entries cannot be read is one whose history cannot be '
+            'audited, which must never read as "nothing was authorized"'
+        )
+    return loaded
+
+
+def append_authorization(path: Path, record: dict) -> Path:
+    """Append one record to the ledger at *path*, preserving every prior entry.
+
+    Append-only: history is never rewritten, so a reviewer reading the file
+    reads every raise this baseline has ever absorbed. That promise is about
+    every writer of the file, not only about this function, so it is CHECKED
+    rather than merely asserted -- ``ledger_appended_entries`` below is what
+    reads a staged ledger against its committed predecessor and refuses a
+    commit that dropped, rewrote or reordered any of it.
+    """
+    target = Path(path)
+    ledger = load_ledger(target)
+    ledger['schema_version'] = LEDGER_SCHEMA_VERSION
+    ledger['raises'] = [*ledger['raises'], record]
+    safe_io.atomic_write_text(target, render_ledger(ledger), mkdir=True)
+    return target
+
+
+def _common_prefix_length(previous: list, current: list) -> int:
+    """How many leading entries the two lists still agree on."""
+    return next(
+        (
+            index
+            # strict=False deliberately: the two lists have DIFFERENT
+            # lengths in every case this is asked about.
+            for index, (was, now) in enumerate(
+                zip(previous, current, strict=False)
+            )
+            if was != now
+        ),
+        min(len(previous), len(current)),
+    )
+
+
+def ledger_appended_entries(previous: dict, current: dict) -> list[dict]:
+    """The entries *current* adds to *previous*, refusing any rewrite of history.
+
+    The reader half of ``append_authorization``'s append-only promise, and the
+    only thing that makes that promise checkable: the writer can only keep it
+    for its own writes, while the file is edited by rebases, merges and hands.
+    *previous* must be a PREFIX of *current* -- length equality is not prefix
+    equality, so an entry rewritten in place is refused exactly like a dropped
+    one, and a reorder like both. The refusal is an ``AppendOnlyViolation``
+    rather than a bare ``MetricsError`` so a caller can tell this VERDICT apart
+    from an instrument failure at its own exit boundary.
+
+    Pure: two loaded dicts in, the suffix out. The caller decides where the two
+    images came from, which is what keeps every git invocation in
+    ``scripts/check_staged_ratchet_raise.py`` and none of it here.
+    """
+    previous_raises = list(previous.get('raises', ()))
+    current_raises = list(current.get('raises', ()))
+    if current_raises[: len(previous_raises)] != previous_raises:
+        kept = _common_prefix_length(previous_raises, current_raises)
+        raise AppendOnlyViolation(
+            'the authorized-raise ledger is append-only, and this change '
+            f'rewrites its history: {len(previous_raises) - kept} of its '
+            f'{len(previous_raises)} recorded entr(ies) are no longer where '
+            f'they were recorded (the staged file holds {len(current_raises)}). '
+            'Dropping, editing or reordering a recorded raise is what makes the '
+            'ledger stop reading as the provenance of every raise this baseline '
+            'has ever absorbed. Append a new entry with --authorize-raise '
+            'instead of touching a recorded one.'
+        )
+    return current_raises[len(previous_raises) :]
+
+
+# ---------------------------------------------------------------------------
+# The ratchet comparator.
+#
+# PURE: two plain dicts in, a list of Violations out. No filesystem, no
+# complexipy, no clock. That is what lets the pytest gate and the CLI's --check
+# share ONE ratchet implementation (SPOT), and what lets the seeded-fixture
+# self-test in test_merge_lane_ratchet.py pin every branch in microseconds
+# instead of only ever reaching them through a 40-second measurement.
+
+#: The synthetic key derived totals are reported under, so a totals violation
+#: reads the same way a per-path one does.
+CLUSTER_TOTAL_KEY = '<cluster>'
+
+
+@dataclasses.dataclass(frozen=True, order=True)
+class Violation:
+    """One measure that rose above its baseline, or breached a ceiling."""
+
+    measure: str
+    key: str
+    baseline: int
+    current: int
+    message: str
+
+    @classmethod
+    def rose(
+        cls, measure: str, key: str, baseline: int, current: int
+    ) -> Violation:
+        """THE canonical constructor for a measured raise -- public, and on the type.
+
+        ``message`` is composed HERE and nowhere else (SPOT), which is what
+        makes it the only honest way to build one: the ledger's ``measures``
+        vocabulary, ``unrecorded_raises``' coverage triple and the gate's
+        refusal lines all describe a raise in these terms, so a caller that
+        could not reach this would re-derive the wording and drift from it.
+        It was ``_violation`` until task 5722 -- a leading underscore on the
+        only constructor of a type this module hands out, which made every
+        test of the auditor reach past the module's public face.
+
+        A CLASSMETHOD rather than a module-level ``violation()``: ``main`` and
+        several siblings bind ``violation`` as a loop variable over a list of
+        them, so a module-level factory of that name would be shadowed inside
+        exactly the scopes most likely to want it.
+        """
+        return cls(
+            measure=measure,
+            key=key,
+            baseline=baseline,
+            current=current,
+            message=(
+                f'{measure} rose {baseline} -> {current} for {key} -- the '
+                'merge-lane ratchet permits a measure to fall or hold, never '
+                'to rise'
+            ),
+        )
+
+
+def _total_violation(measure: str, baseline: int, current: int) -> Violation:
+    name = f'total:{measure}'
+    return Violation(
+        measure=name,
+        key=CLUSTER_TOTAL_KEY,
+        baseline=baseline,
+        current=current,
+        message=(
+            f'{name} rose {baseline} -> {current} for {CLUSTER_TOTAL_KEY} -- totals '
+            'are DERIVED by summing the per-path baseline, so moving code to a '
+            'new path does not lower them'
+        ),
+    )
+
+
+def _section(report: dict, name: str) -> dict:
+    value = report.get(name)
+    return value if isinstance(value, dict) else {}
+
+
+def _params(report: dict, which: str) -> dict:
+    params = report.get('params')
+    if not isinstance(params, dict):
+        raise MetricsError(
+            f'{which} report has no "params" block -- it was not produced by '
+            'build_report, so there is nothing to state how it was measured'
+        )
+    return params
+
+
+def _require_complete_enumeration(current: dict) -> None:
+    enumeration = current.get('enumeration')
+    if not isinstance(enumeration, dict):
+        raise MetricsError(
+            'current report has no "enumeration" block -- completeness must be '
+            'legible in the RESULT, not only in a log line (INV-11)'
+        )
+    if enumeration.get('complete') is True:
+        return
+    unreadable = list(enumeration.get('unreadable', ()))
+    raise MetricsError(
+        'refusing to compare a PARTIAL measurement against the baseline: '
+        f'{len(unreadable)} path(s) were skipped -- {unreadable}. A sweep that '
+        'skipped files measures LOWER than the truth, so comparing it would '
+        'read as a clean tree, or worse as an improvement worth writing into '
+        'the baseline (INV-11).'
+    )
+
+
+def _require_matching_params(current: dict, baseline: dict) -> None:
+    current_version = _params(current, 'current').get('complexipy_version')
+    baseline_version = _params(baseline, 'baseline').get('complexipy_version')
+    if current_version != baseline_version:
+        raise MetricsError(
+            f'complexipy version drift: the baseline was measured with '
+            f'{baseline_version!r}, this run used {current_version!r}. Cognitive '
+            'numbers are version-dependent -- the same merge_queue.py measures '
+            '2031 at 3.0.0, 2092 at 5.0.0 and 2133 at 6.x/7.x -- so a silent '
+            'drift rewrites every number at once and leaves the ratchet '
+            'comparing two incomparable measurements. Pin the dev group '
+            f'({COMPLEXIPY_REQUIRED}), or regenerate the baseline deliberately '
+            '-- which is a RE-MEASUREMENT, not code growth, and the write gate '
+            'cannot tell the difference: every number the new version reads '
+            'higher is a raise it will refuse. Pass --authorize-raise with a '
+            f'--reason naming the version change, so the {LEDGER_RELPATH} entry '
+            'reads as a change of instrument rather than as a task that grew '
+            'the cluster.'
+        )
+
+    recorded = list(_params(baseline, 'baseline').get('cluster_paths', ()))
+    live = list(CLUSTER_PATHS)
+    if recorded != live:
+        added = [p for p in recorded if p not in live]
+        removed = [p for p in live if p not in recorded]
+        raise MetricsError(
+            'the baseline\'s recorded cluster_paths no longer match '
+            f'CLUSTER_PATHS. Recorded but no longer in the cluster: {added}. '
+            f'In the cluster but not recorded: {removed}. Editing PRD Appendix A '
+            'forces a deliberate baseline regeneration, so a path can never '
+            'leave the cluster and take its frozen numbers with it.'
+        )
+
+
+def _check_files(current: dict, baseline: dict) -> list[Violation]:
+    violations: list[Violation] = []
+    current_files = _section(current, 'files')
+    for path, base_entry in _section(baseline, 'files').items():
+        entry = current_files.get(path)
+        if entry is None:
+            # The path is gone (deleted, or renamed by a task that moved code).
+            # Not a per-path violation -- lowering is the point -- and the
+            # derived totals are what catch a move that only relocated the mass.
+            continue
+        for measure in _SUMMED_FILE_MEASURES:
+            was, now = int(base_entry.get(measure, 0)), int(entry.get(measure, 0))
+            if now > was:
+                violations.append(Violation.rose(measure, path, was, now))
+    return violations
+
+
+def _check_functions(current: dict, baseline: dict) -> list[Violation]:
+    current_functions = _section(current, 'functions')
+    return [
+        Violation.rose('cognitive', key, int(was), int(current_functions[key]))
+        for key, was in _section(baseline, 'functions').items()
+        if key in current_functions and int(current_functions[key]) > int(was)
+    ]
+
+
+def _check_tests(current: dict, baseline: dict) -> list[Violation]:
+    violations: list[Violation] = []
+    current_tests = _section(current, 'tests')
+    for path, base_entry in _section(baseline, 'tests').items():
+        entry = current_tests.get(path)
+        if entry is None:
+            continue
+        was = int(base_entry.get('private_reads', 0))
+        now = int(entry.get('private_reads', 0))
+        if now > was:
+            violations.append(Violation.rose('private_reads', path, was, now))
+        # DISTINCT names, matching the PRD's measure: re-patching the same leaf
+        # twice more in one file is not a new reach into lane internals.
+        was_targets = len(set(base_entry.get('patch_targets', ())))
+        now_targets = len(set(entry.get('patch_targets', ())))
+        if now_targets > was_targets:
+            violations.append(
+                Violation.rose('patch_targets', path, was_targets, now_targets)
+            )
+    return violations
+
+
+def _check_totals(current: dict, baseline: dict) -> list[Violation]:
+    current_totals = derive_totals(current)
+    baseline_totals = derive_totals(baseline)
+    return [
+        _total_violation(measure, was, current_totals[measure])
+        for measure, was in sorted(baseline_totals.items())
+        if current_totals.get(measure, 0) > was
+    ]
+
+
+def _check_ceilings(current: dict, baseline: dict) -> list[Violation]:
+    """The two ceilings, applied ONLY to keys absent from the baseline.
+
+    Ceilings-on-new-only is what makes this a ratchet rather than a day-one
+    gate: 62 lane functions already exceed cognitive 15 and merge_queue.py is
+    fourteen times the line ceiling on the introducing commit. Grandfathering
+    can only ever shrink, because every new key is held to the ceiling.
+    """
+    violations: list[Violation] = []
+    baseline_files = _section(baseline, 'files')
+    for path, entry in _section(current, 'files').items():
+        if path in baseline_files or path in SIZE_CEILING_EXEMPT:
+            continue
+        lines = int(entry.get('lines', 0))
+        if lines > FILE_LINE_CEILING:
+            violations.append(
+                Violation(
+                    measure='new_file_over_ceiling',
+                    key=path,
+                    baseline=FILE_LINE_CEILING,
+                    current=lines,
+                    message=(
+                        f'new_file_over_ceiling: {path} is {lines} lines, above '
+                        f'the {FILE_LINE_CEILING}-line ceiling that applies to '
+                        'paths absent from the baseline'
+                    ),
+                )
+            )
+
+    baseline_functions = _section(baseline, 'functions')
+    for key, score in _section(current, 'functions').items():
+        if key in baseline_functions:
+            continue
+        score = int(score)
+        if score > NEW_FUNCTION_COGNITIVE_CEILING:
+            violations.append(
+                Violation(
+                    measure='new_function_over_ceiling',
+                    key=key,
+                    baseline=NEW_FUNCTION_COGNITIVE_CEILING,
+                    current=score,
+                    message=(
+                        f'new_function_over_ceiling: {key} has cognitive '
+                        f'complexity {score}, above the '
+                        f'{NEW_FUNCTION_COGNITIVE_CEILING} ceiling that applies '
+                        'to functions absent from the baseline'
+                    ),
+                )
+            )
+    return violations
+
+
+def _measure_raises(current: dict, previous: dict) -> list[Violation]:
+    """Every RAISE *current* introduces over *previous*, sorted by (measure, key).
+
+    A "raise" is any state the baseline may not silently acquire. That is the
+    four rise arms, and it is also a CEILING BREACH -- a new path over
+    ``FILE_LINE_CEILING`` or a new function over
+    ``NEW_FUNCTION_COGNITIVE_CEILING``. The two belong together because
+    regeneration is *how* a ceiling breach would be acquired: ceilings apply
+    only to keys ABSENT from the baseline, so writing an oversized new file into
+    the baseline exempts it from that moment on. Absorbed by a blind
+    regeneration, the two are indistinguishable.
+
+    The comparison arms only -- no preconditions, no policy. TWO callers run
+    this one implementation (SPOT): ``check_against_baseline``, which is what
+    ``--check`` and the pytest gate compare with, and ``write_baseline``'s gate,
+    which is what stops a regeneration absorbing a raise nobody reviewed. Two
+    implementations of "did a measure rise" would eventually disagree, and the
+    one that disagreed quietly would be the write path.
+    """
+    violations = [
+        *_check_files(current, previous),
+        *_check_functions(current, previous),
+        *_check_tests(current, previous),
+        *_check_totals(current, previous),
+        *_check_ceilings(current, previous),
+    ]
+    return sorted(violations, key=lambda v: (v.measure, v.key))
+
+
+def check_against_baseline(current: dict, baseline: dict) -> list[Violation]:
+    """Compare a fresh report against the committed baseline. Pure.
+
+    Order of operations is deliberate. The three hard-failure preconditions run
+    FIRST and raise ``MetricsError``, so a wrong-version or partial measurement
+    reports its own named cause instead of a wall of downstream violations that
+    would send the reader hunting a regression which does not exist.
+
+    Returns violations sorted by ``(measure, key)`` so a failure message is
+    diffable run to run.
+    """
+    _require_complete_enumeration(current)
+    _require_matching_params(current, baseline)
+    return _measure_raises(current, baseline)
+
+
+def compare_baseline_files(previous: Path, current: Path) -> list[Violation]:
+    """Every raise the move from the *previous* baseline image to *current* makes.
+
+    THE ENFORCEMENT POINT THE WRITER CANNOT BE. ``write_baseline``'s gate
+    compares a fresh report against whatever sits at the destination, so a
+    baseline deleted first, or rendered elsewhere and copied over, leaves it
+    nothing to compare and resets every frozen measure. This face compares two
+    committed IMAGES instead, which is the shape a raise actually arrives in:
+    a diff. It is what ``scripts/check_staged_ratchet_raise.py`` audits a staged
+    commit with -- and being two images rather than a measurement, it runs no
+    complexipy, reads no tree, and still consults no git.
+
+    Both images load through ``load_baseline``, so a missing or malformed one is
+    that function's named hard failure rather than a silent empty-baseline pass.
+
+    DELIBERATELY NOT APPLIED here, as in ``write_baseline`` and for the same
+    stated reason: ``_require_matching_params``. A commit that widens
+    ``CLUSTER_PATHS`` legitimately changes the recorded params, and that is the
+    one workflow ``resolve_cluster_paths`` prescribes.
+    """
+    return _measure_raises(load_baseline(Path(current)), load_baseline(Path(previous)))
+
+
+
+# ---------------------------------------------------------------------------
+# CLI, in the house shape of scripts/scan_task_toolcall_leaks.py: _build_parser()
+# / _render_table() / main(argv) -> int, with the exit ladder documented in the
+# module docstring above (0 clean, 1 ratchet violations, 2 instrument failure).
+
+
+def repo_root() -> Path:
+    """The repo root, derived from this file's location (``<root>/scripts/``)."""
+    return Path(__file__).resolve().parents[1]
+
+
+def _render_table(report: dict, root: Path) -> str:
+    """The human-readable measure table printed by ``--report``.
+
+    ``mi`` (radon's maintainability index) is computed HERE rather than stored in
+    the report: it is reported, never ratcheted, so putting it in the baseline
+    would freeze a number nothing enforces and churn the file whenever radon
+    changed its formula.
+    """
+    files = report.get('files', {})
+    totals = derive_totals(report)
+    params = report.get('params', {})
+    width = max([len(p) for p in files] + [len('TOTALS')])
+
+    lines = [
+        f'merge-lane metrics -- {len(files)} cluster paths, '
+        f'complexipy {params.get("complexipy_version")}',
+        '',
+        f'{"path":<{width}}  {"lines":>7}  {"prose":>7}  {"cognitive":>9}  {"mi":>6}',
+        '-' * (width + 36),
+    ]
+    for path, entry in sorted(files.items()):
+        mi = maintainability_index(_read_source(root, path), path=path)
+        lines.append(
+            f'{path:<{width}}  {entry["lines"]:>7}  {entry["prose_lines"]:>7}  '
+            f'{entry["cognitive"]:>9}  {mi:>6.2f}'
+        )
+    lines.extend(
+        [
+            '-' * (width + 36),
+            f'{"TOTALS":<{width}}  {totals["lines"]:>7}  {totals["prose_lines"]:>7}  '
+            f'{totals["cognitive"]:>9}',
+            '',
+            f'function_local_imports  {totals["function_local_imports"]:>7}',
+            f'reexport_names          {totals["reexport_names"]:>7}',
+            '',
+            f'test suite -- {len(report.get("tests", {}))} lane-importing files '
+            f'under {TESTS_ROOT}',
+            f'  patch_targets (distinct)  {totals["patch_targets"]:>7}',
+            f'  private_reads             {totals["private_reads"]:>7}',
+            '',
+        ]
+    )
+
+    # INV-11's user-observable signal: completeness is legible in the RESULT,
+    # not only in a log line. A partial sweep measures LOW, so a reader who
+    # cannot see this row cannot tell an improvement from a skipped file.
+    #
+    # THE TEST-TREE DENOMINATOR IS ONLY HERE. It is reported, never ratcheted --
+    # the same call this function already makes for `mi` -- so the committed
+    # baseline carries no test-tree number at all and this row is the one place
+    # the sweep's breadth is visible. Its NUMERATOR is deliberately absent: that
+    # is ``len(report['tests'])``, already rendered under a better label by the
+    # "test suite --" line above, and two copies of one number in one table only
+    # invite a reader to wonder whether they can disagree (SPOT). `.get` is
+    # tolerant on purpose: a stored baseline block has no `test_tree` key, and
+    # rendering one must not raise.
+    enumeration = report.get('enumeration', {})
+    unreadable = list(enumeration.get('unreadable', ()))
+    test_tree = enumeration.get('test_tree', {})
+    lines.append(
+        f'enumeration: complete={enumeration.get("complete")}  '
+        f'cluster requested={len(enumeration.get("requested", ()))} '
+        f'resolved={len(enumeration.get("resolved", ()))}  '
+        f'test tree requested={test_tree.get("requested")}  '
+        f'unreadable={len(unreadable)}'
+    )
+    if unreadable:
+        lines.extend(f'  UNREADABLE: {path}' for path in unreadable)
+    return '\n'.join(lines)
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            'Measure the merge-lane cluster (PRD plans/merge-lane-quality-prd.md '
+            'task alpha) and ratchet every measure against the committed '
+            'baseline. READ-ONLY except under --write-baseline.'
+        ),
+        epilog=(
+            'Exit codes: 0 clean; 1 ratchet violations (a measure rose above '
+            'the baseline, or a new file/function breached a ceiling); '
+            '2 instrument failure (an unparseable cluster file, complexipy '
+            f'missing or outside {COMPLEXIPY_REQUIRED}, a missing or malformed '
+            'baseline, or a baseline whose recorded parameters no longer match '
+            'this tree). 1 and 2 are deliberately distinct: a broken instrument '
+            'must never read as a clean tree or as a real regression.'
+        ),
+    )
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
+        '--report', action='store_true', help='Print the measure table.'
+    )
+    mode.add_argument(
+        '--json', action='store_true', help='Print the report as JSON.'
+    )
+    mode.add_argument(
+        '--check', action='store_true',
+        help='Compare a fresh measurement against --baseline (the ratchet).',
+    )
+    mode.add_argument(
+        '--write-baseline', metavar='PATH',
+        help='Measure and write a baseline to PATH. REFUSES (exit 1) to absorb '
+        'a measure that rose unless --authorize-raise names the task doing it, '
+        'so a regeneration can never silently widen the ratchet for every '
+        'downstream task -- see the file\'s own _README.',
+    )
+    parser.add_argument(
+        '--root', default=str(repo_root()),
+        help='Repo root to measure (default: this script\'s own checkout). '
+        'Pair it with --baseline; on its own it would compare another tree '
+        'against THIS checkout\'s baseline.',
+    )
+    parser.add_argument(
+        '--baseline', default=str(repo_root() / BASELINE_RELPATH),
+        help='Baseline JSON for --check (default: %(default)s).',
+    )
+    parser.add_argument(
+        '--authorize-raise', metavar='TASK_ID',
+        help='Permit --write-baseline to absorb the raises in THIS measurement, '
+        'recording them in --ledger against this task id. Requires --reason. '
+        'Authorization is an act, not a standing entry: a recorded raise never '
+        'permits a later one.',
+    )
+    parser.add_argument(
+        '--reason', metavar='TEXT',
+        help='Why this raise is net-additive work rather than a refactor that '
+        'failed. Requires --authorize-raise; recorded verbatim in the ledger.',
+    )
+    parser.add_argument(
+        '--ledger', default=str(repo_root() / LEDGER_RELPATH),
+        help='Authorized-raise ledger appended by --authorize-raise (default: '
+        '%(default)s). Pair it with --write-baseline when writing outside this '
+        'checkout; on its own it would append to THIS checkout\'s ledger.',
+    )
+    return parser
+
+
+def _resolve_authorization(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> RaiseAuthorization | None:
+    """Validate the authorization flags against each other, or exit 2 saying why.
+
+    argparse cannot express "these two imply each other, and both require that
+    mode", so it is done here rather than left unchecked. A flag that silently
+    did nothing would read, to the agent who typed it, exactly like an
+    authorization that was granted.
+
+    The value object's own non-blank invariant lands here as the THIRD usage
+    error rather than as a broken instrument: ``--reason ""`` is a flag typed
+    wrong, so it prints like the two above and exits on the same code, before
+    anything is measured.
+    """
+    if (args.authorize_raise is None) != (args.reason is None):
+        parser.error(
+            '--authorize-raise and --reason require each other: a raise with no '
+            'recorded reason is not an authorized raise, it is an unattributed '
+            'one'
+        )
+    if args.authorize_raise is None:
+        return None
+    if not args.write_baseline:
+        parser.error(
+            '--authorize-raise is a modifier of --write-baseline, which is the '
+            'only mode that can absorb a raise. --check reports raises; it '
+            'never records them'
+        )
+    try:
+        return RaiseAuthorization(task_id=args.authorize_raise, reason=args.reason)
+    except MetricsError as exc:
+        parser.error(str(exc))
+
+
+def _write(
+    args: argparse.Namespace, report: dict, authorization: RaiseAuthorization | None
+) -> int:
+    """The --write-baseline arm, reporting what this invocation actually did.
+
+    Without an authorization the ledger is neither read nor written -- an
+    unauthorized raise is refused before it is reached -- so a plain
+    regeneration never depends on that file's health, and --ledger can be passed
+    through unconditionally to keep one call site rather than two arms.
+
+    WHAT IS PRINTED COMES FROM THE WRITE, never from re-reading the ledger, so
+    the operator's log cannot claim a raise the committed file does not carry.
+    """
+    ledger = Path(args.ledger)
+    written = write_baseline(
+        Path(args.write_baseline), report, authorization=authorization, ledger=ledger
+    )
+    print(f'wrote {written.path}')
+    if authorization is None:
+        return 0
+    if written.record is None:
+        # An authorization that recorded nothing must SAY so. Printing only
+        # "wrote ..." would read, to the agent who typed --authorize-raise,
+        # exactly like an authorization that was granted and recorded -- the
+        # very failure _resolve_authorization rejects flag shapes to avoid
+        # (INV-11, no silent fail-soft).
+        print(f'no measure rose; nothing recorded in {ledger}')
+        return 0
+    print(
+        f'recorded {len(written.record["measures"])} authorized raise(s) for '
+        f'task {written.record["task_id"]} in {ledger}'
+    )
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point. See the module docstring for the exit-code contract."""
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    authorization = _resolve_authorization(parser, args)
+    root = Path(args.root)
+    try:
+        report = build_report(root)
+        if args.json:
+            print(json.dumps(report))
+            return 0
+        if args.report:
+            print(_render_table(report, root))
+            return 0
+        if args.write_baseline:
+            return _write(args, report, authorization)
+        violations = check_against_baseline(report, load_baseline(Path(args.baseline)))
+        if not violations:
+            return 0
+        print(
+            f'{len(violations)} merge-lane ratchet violation(s) against '
+            f'{args.baseline}:',
+            file=sys.stderr,
+        )
+        for violation in violations:
+            print(f'  {violation.message}', file=sys.stderr)
+        print(RAISE_REMEDY, file=sys.stderr)
+        return 1
+    except UnauthorizedRaise as exc:
+        # Exit 1, not 2: a refused regeneration is a measure that ROSE, found at
+        # write time instead of at check time. Exit 2 stays reserved for a
+        # broken instrument, and both faces of the gate print the same lines.
+        print(
+            f'{len(exc.violations)} merge-lane ratchet violation(s) would be '
+            f'absorbed by writing {args.write_baseline}:',
+            file=sys.stderr,
+        )
+        for violation in exc.violations:
+            print(f'  {violation.message}', file=sys.stderr)
+        print(RAISE_REMEDY, file=sys.stderr)
+        return 1
+    except MetricsError as exc:
+        print(f'merge_lane_metrics: {exc}', file=sys.stderr)
+        return 2
+
+
+
+
+if __name__ == '__main__':
+    sys.exit(main())

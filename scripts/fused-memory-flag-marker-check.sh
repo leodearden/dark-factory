@@ -61,10 +61,16 @@
 #
 # Unlike the nightly sweep wrapper this performs NO deletions (--check
 # without --apply is a dry-run census + verdict), so resolve/resume re-runs
-# are harmless. NOTE the sweep script's own caveat: undated markers can never
-# be drained by age, so a --max-backlog 0 predicate against a population
-# containing undated markers fails forever -- verify the census first or set
-# the ceiling accordingly. Historical narrative for the retired 2902 watch:
+# are harmless. It also means the verdict HERE compares before.total_source
+# -- the WHOLE enumerated residual, since nothing is deleted -- so a ceiling
+# tuned to the structural floor alone is not enough for this wrapper.
+# NOTE that floor: part of the enumerated population cannot be drained by
+# ANY invocation of the sweep, and since task 4436 the sweep CHECKS it
+# (structural_floor.gate_unsatisfiable in the JSON, plus an ERROR naming the
+# floor, the ceiling and the per-arm remedy) instead of merely warning. The
+# arms, their remedies and the sufficient ceiling are stated once in
+# docs/flag-marker-sweep-recurring.md -- don't restate them here.
+# Historical narrative for the retired 2902 watch:
 # plans/reify-flag-marker-backlog-rca-2026-07-22.md §6a.
 #
 # Task 4591 -- `uv` is resolved to an ABSOLUTE path below rather than trusted

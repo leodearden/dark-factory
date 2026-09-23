@@ -22,6 +22,7 @@ systemd ``legibility-trickle@.service`` template runs nightly, and what
 from __future__ import annotations
 
 import argparse
+import functools
 import logging
 import os
 import subprocess
@@ -42,6 +43,7 @@ if __name__ == '__main__':
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from legibility import (  # noqa: E402
+    account_pool,
     census_trigger,
     codebook,
     coder,
@@ -593,7 +595,7 @@ def _default_entrypoint_exists() -> bool:
     return (Path(__file__).resolve().parent / _CENSUS_ENTRYPOINT_NAME).exists()
 
 
-def _default_census_launcher() -> None:
+def _default_census_launcher(env=None) -> None:
     """Best-effort subprocess launch of the census entrypoint (task η).
 
     Captures the census exit code and, on a NON-ZERO exit, emits ONE loud
@@ -603,10 +605,18 @@ def _default_census_launcher() -> None:
     is never invisible in the nightly's own journal. Keeps ``check=False`` and
     never raises: census runs AFTER the trickle's own commit work, so a census
     failure must never crash or fail the nightly run.
+
+    *env*, when given, is the environment the census runs in -- an account
+    drawn from the night's own pool (``account_pool.subprocess_env``), bound by
+    ``run_nightly``. ``None`` is subprocess's own "inherit the parent
+    unchanged", which is what this launcher did before the parameter existed
+    and what it must keep doing whenever no account is available: a census
+    launch is best-effort, so a pool problem must never be able to block one.
     """
     result = subprocess.run(
         [sys.executable, str(Path(__file__).resolve().parent / _CENSUS_ENTRYPOINT_NAME)],
         check=False,
+        env=env,
     )
     if result.returncode != 0:
         logger.warning(
@@ -1144,6 +1154,13 @@ def run_nightly(
     condition dead on the production path (task 4148). A test wanting the
     fail-safe path injects a raising/empty fake instead.
 
+    *invoke* reads the same way (task 5488): ``None`` means "build the
+    shared multi-account pool and draw every one-shot from it"
+    (:func:`account_pool.build_pool` + :func:`account_pool.pool_invoke`),
+    not "no invoker". Left unresolved it reached ``coder.code_digest``'s
+    ``invoke or _invoke_cli`` fallback, which authenticates as whatever
+    login ``~/.claude`` holds -- one account for the whole fleet.
+
     *recorder* (default :func:`trickle_state.record_run`) is the run-state
     seam, alongside the existing ``invoke``/``status_fetcher``/``poster``/
     ``committer`` ones. Called exactly once per run from a ``finally``
@@ -1210,6 +1227,27 @@ def run_nightly(
         status_fetcher if status_fetcher is not None
         else census_trigger.default_status_fetcher(cfg.project_root)
     )
+
+    # Task 5488, and the SAME lesson one seam over: `invoke` was the last seam
+    # here resolving None to nothing. main() holds nothing to build a gate
+    # from, so `invoke=None` reached coder.code_digest, hit its
+    # `invoke or _invoke_cli` fallback, and every one of the night's one-shots
+    # authenticated as whatever login ~/.claude happened to hold -- so ONE
+    # capped login deferred a whole night while six live accounts in
+    # config/usage-accounts.yaml sat idle, and a 2026-09-14 drop-in pinned the
+    # unit to a single account to paper over it. Resolved HERE, beside
+    # status_fetcher, so the next reader sees every seam defaulted in one
+    # place and this one is no longer the odd one out.
+    #
+    # ONE gate for the whole night. Cap state lives in the gate's memory and
+    # only there, so a per-digest pool would forget every cap it had just
+    # learned and re-try capped accounts for all 33 digests. Held in a local
+    # because the night's other subprocess -- the census launched below --
+    # needs an account from this same pool.
+    gate = None
+    if invoke is None:
+        gate = account_pool.build_pool()
+        invoke = account_pool.pool_invoke(gate, reverse=True)
 
     # One render cache for the whole run: select_digest_sessions renders each
     # candidate to CHARGE it against the byte budget, and build_digests reuses
@@ -1491,7 +1529,23 @@ def run_nightly(
         # reach the journal after the whole census subprocess finished -- see
         # the log site inside that function for the full reasoning. Do not
         # re-add one here; that would double the line, not advance it.
-        census_line, census_fire = evaluate_census_step(cfg, now=now, status_fetcher=status_fetcher)
+        # Task 5488. census.py is a GRANDCHILD -- it re-invokes the CLI itself
+        # and never passes through this process's gate -- so the only way it
+        # can authenticate as a pool account is for the launcher to hand it
+        # one. Bound HERE rather than beside the pool itself, so the account
+        # chosen reflects the cap state the night has actually learned by now
+        # (the trickle's own digests run first and may well have capped the
+        # account that looked live at 03:00).
+        census_line, census_fire = evaluate_census_step(
+            cfg, now=now, status_fetcher=status_fetcher,
+            launcher=(
+                None if gate is None
+                else functools.partial(
+                    _default_census_launcher,
+                    env=account_pool.subprocess_env(gate),
+                )
+            ),
+        )
 
         result = NightlyResult(
             exit_code=0,

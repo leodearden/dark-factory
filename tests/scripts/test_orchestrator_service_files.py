@@ -125,15 +125,18 @@ def test_dark_factory_orchestrator_service_structure() -> None:
         in content
     ), "Missing ExecStartPre wait-for-port gate on fused-memory's port"
     assert (
-        "uv run --frozen --project orchestrator orchestrator run --config /home/leo/src/dark-factory/dark-factory-orchestrator.yaml"
+        "uv run --no-sync --project orchestrator orchestrator run --config /home/leo/src/dark-factory/dark-factory-orchestrator.yaml"
         in content
-    ), "ExecStart must invoke the orchestrator with the df config, frozen"
-    # --frozen: process start must NEVER implicitly re-sync the shared
-    # dark-factory/.venv (the 2026-05-29 ghost-venv fix — a frozen start fails
-    # fast instead of bootstrapping/mutating the runtime interpreter).
-    assert "uv run --frozen" in content, (
-        "ExecStart must pass --frozen so unit start never re-syncs the shared venv"
-    )
+    ), "ExecStart must invoke the orchestrator with the df config, no-sync"
+    # --no-sync, and its position before the command token, are pinned by the
+    # contiguous substring above. CORRECTION (task 5553): this pinned --frozen
+    # from the 2026-05-29 ghost-venv fix until then, believing a frozen start
+    # could not bootstrap the runtime interpreter — measured false; --frozen is
+    # a lockfile option (scripts/orchestrator-autopilot-video.service holds the
+    # measurement). The INVARIANT now lives fleet-wide in
+    # tests/scripts/test_uv_run_venv_isolation.py, which checks both arms
+    # (--no-sync present, no lockfile flag) against every committed unit; what
+    # stays here is this unit's config path, which no sweep can know.
     assert "Restart=on-failure" in content
     assert "RestartSec=10" in content
     assert "RestartMaxDelaySec=60" in content
@@ -208,14 +211,11 @@ def test_reify_orchestrator_service_structure() -> None:
         in content
     ), "Missing ExecStartPre wait-for-port gate on fused-memory's port"
     assert (
-        "uv run --frozen --project orchestrator orchestrator run --config /home/leo/src/reify/dark-factory-orchestrator.yaml"
+        "uv run --no-sync --project orchestrator orchestrator run --config /home/leo/src/reify/dark-factory-orchestrator.yaml"
         in content
-    ), "ExecStart must invoke the orchestrator with the reify config, frozen"
-    # --frozen: see the df structure test — unit start must never re-sync the
-    # shared dark-factory/.venv that the reify orchestrator also runs under.
-    assert "uv run --frozen" in content, (
-        "ExecStart must pass --frozen so unit start never re-syncs the shared venv"
-    )
+    ), "ExecStart must invoke the orchestrator with the reify config, no-sync"
+    # --no-sync: see the df structure test above, and
+    # tests/scripts/test_uv_run_venv_isolation.py for the fleet-wide arm.
     assert "Restart=on-failure" in content
     assert "RestartSec=10" in content
     assert "RestartMaxDelaySec=60" in content
@@ -346,8 +346,9 @@ def test_autopilot_video_service_exists_and_structure() -> None:
 
     Until the 2026-05-29 venv-isolation fix this unit was live in
     ~/.config/systemd/user/ but had NO source template in scripts/ — so
-    setup-host.sh would never reinstall it and it could not pick up --frozen.
-    This test guards the now-tracked template going forward.
+    setup-host.sh would never reinstall it and it could not pick up a fleet-wide
+    ExecStart change at all. This test guards the now-tracked template going
+    forward.
     """
     assert AUTOPILOT_SERVICE.exists(), (
         "scripts/orchestrator-autopilot-video.service must exist as a tracked "
@@ -381,10 +382,9 @@ def test_autopilot_video_service_exists_and_structure() -> None:
         in content
     )
     assert (
-        "uv run --frozen --project orchestrator orchestrator run --config /home/leo/src/autopilot-video/dark-factory-orchestrator.yaml"
+        "uv run --no-sync --project orchestrator orchestrator run --config /home/leo/src/autopilot-video/dark-factory-orchestrator.yaml"
         in content
-    ), "ExecStart must invoke the orchestrator with the autopilot-video config, frozen"
-    assert "uv run --frozen" in content
+    ), "ExecStart must invoke the orchestrator with the autopilot-video config, no-sync"
     assert "Restart=on-failure" in content
     assert "StartLimitIntervalSec=600" in content
     assert "StartLimitBurst=10" in content

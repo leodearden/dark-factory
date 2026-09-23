@@ -3,6 +3,9 @@
 from fused_memory.reconciliation.consolidation_gate import (
     render_consolidation_gate_section,
 )
+from fused_memory.reconciliation.gate_owned_finding_phrasing import (
+    render_gate_owned_action_norm,
+)
 from fused_memory.reconciliation.internal_writers import (
     INTERNAL_WRITER_POPULATION_NOTE,
 )
@@ -10,6 +13,7 @@ from fused_memory.reconciliation.prompts import (
     _STAGE1_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE1_PROJECT_ID_GUIDELINE,
     AMEND_AND_EPISODE_TOOLS_BLOCK,
+    CITATION_REPAIR_TOOL_BLOCK,
     DUPLICATE_FINDING_SALVAGE_GUIDANCE,
     STALE_KNOWLEDGE_ANNOTATION_NORM,
     get_recon_report_tool_guidance,
@@ -22,6 +26,20 @@ from fused_memory.reconciliation.recon_self_model import (
     render_source_completion_section,
     render_suppression_schema_section,
 )
+from fused_memory.reconciliation.stage1_stall_detector import (
+    STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS,
+)
+
+_STAGE1_GATE_STALL_THRESHOLD_HOURS = int(
+    STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS // 3600
+)
+"""Stall threshold in whole hours, for the Escalation-Probe Precondition below.
+
+Derived from ``stage1_stall_detector.py::STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS``
+rather than restated, so the detector stays the single owner of the number and a
+future change to it cannot leave stale prompt text behind.  Pinned by
+``tests/test_recon_escalation_probe_precondition.py``.
+"""
 
 #: The cluster-fold execution section's title and heading (task 3134), exported
 #: so a rename moves the prompt and the wiring pins in
@@ -196,6 +214,8 @@ weaken the guidance above — still prefer `update_edge`/`refresh_entity_summary
 (including cross-project scope mismatches flagged to Stage 2): \
 {get_recon_report_tool_guidance()}
 
+{CITATION_REPAIR_TOOL_BLOCK}
+
 {STALE_KNOWLEDGE_ANNOTATION_NORM}
 
 ## UUID Resolution Discipline
@@ -285,6 +305,43 @@ and does not violate the Stage 1 / Stage 2 separation.**
 
 Skipping this check risks persisting temporal facts that contradict Taskmaster's live \
 state, which misleads Stage 2 task reconciliation.
+
+## Escalation-Probe Precondition (task 3052)
+A STANDING PRECONDITION on a whole class of finding, in the same shape as the \
+Terminal-State Pre-Check above: it names the check you must pass before you are \
+entitled to write the claim at all.
+
+**PROHIBITION — never file an escalation-missing finding.** Do not write a memory, a \
+finding, or a flagged item asserting that no escalation was filed for some task, that \
+the escalation channel is dead, that a filing path yields zero records, or any \
+equivalent "the record does not exist" claim. The reason — stated as a reason, not as \
+an invitation to go looking — is that all four escalation READ tools \
+(`get_pending_escalations`, `get_escalation`, `get_task_escalations`, \
+`get_task_escalation_history`) are DENIED to you here, via \
+`cli_stage_runner.py::STAGE1_DISALLOWED` -> `DISALLOW_ESCALATION_READS`. You are \
+structurally blind to the escalation queue and can never hold evidence for such a \
+claim; an absence you cannot observe is not an absence you may report. If the \
+condition nevertheless looks real, emit an ORDINARY flag for Stage 2 describing only \
+what you did observe, rather than asserting the channel is dead.
+
+Two facts recorded here for a downstream reader who DOES hold the tools, so the \
+historical findings are not re-derived by someone able to run the probe:
+
+1. Reconciliation-filed gate escalations are born at **level 1**. A probe filtered to \
+   `level=2` structurally cannot see them, and returns an empty result for reasons \
+   that have nothing to do with whether the record exists. (Verified live 2026-09-02: \
+   124 of 124 pending `reconciliation_stale_gate_backlog` records were `level=1`.)
+2. An existence check must be ARCHIVE-AWARE. Resolving a record moves it out of the \
+   queue root, and `queue.py::EscalationQueue.get_pending` globs the root only — so a \
+   record that was written and then closed reads as "never filed" to a root-only \
+   lookup.
+
+**The one clause you CAN execute.** Before describing a human-decision gate as \
+"stalled", read the task record and confirm that `metadata.gate_escalated_at` is \
+genuinely older than the {_STAGE1_GATE_STALL_THRESHOLD_HOURS}h stall threshold \
+(`stage1_stall_detector.py::STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS`). A gate stamped \
+more recently than that is NOT stalled and must not be reported as such. This check \
+needs no escalation read at all: the stamp lives on the task record, which you do hold.
 
 ## Verifying Writes
 After calling `mcp__fused-memory__add_memory`, inspect the `memory_ids` field in the \
@@ -827,6 +884,8 @@ This directive mirrors the code-side enforcement: see the completion-marker \
 same-cycle self-delete branch in `flag_dedup.dedup_flags` (task 2312), gated on \
 the same present-and-false `flag_for_stage2` signal.
 
+{render_gate_owned_action_norm()}
+
 ## Stage 2 Flag Relay (FIX B)
 When you write a flag to Mem0 with `metadata.flag_for_stage2=true`, you MUST ALSO include \
 the same flag content in the `flagged_items` field of your structured-output report — the \
@@ -918,4 +977,33 @@ genuinely stranded case that legitimately needs operator attention.
 If `### Live-Workflow Signals` is absent from the payload, all three signals are False \
 for every task; no live-workflow suppression applies, and stranded/blocked-escalation \
 flags may be emitted normally.
+
+## Preserved-Specimen Corroboration
+Absence of a live-workflow signal is necessary for the stranded claim but it is NOT \
+sufficient. Some tasks are left `in-progress` with a null claimant and a null heartbeat \
+DELIBERATELY, because that state is itself the evidence something else is waiting on — \
+a preserved validation specimen. Such a task looks identical to a stranded one from the \
+signals alone, and a reset would destroy the very thing it is being kept for.
+
+**Before asserting that a no-claimant / dead-heartbeat `in-progress` task is stranded, \
+corroborate that its state is unintentional.** Two places already hold the answer:
+1. `get_entity('Task <id>')` — a preserved specimen usually has an edge saying so.
+2. the task's `investigation_outcome` memories — a prior cycle that adjudicated this \
+   exact question records its verdict there.
+
+If either names the task as a preserved / validation specimen, do NOT recommend a status \
+reset, a redispatch, or an operator gate task. Emit the finding at `severity='info'` with \
+`actionable=false`, or omit it, and say in the description which citation you read.
+
+**The deterministic gate is enforced in code** by \
+`preservation_specimen_guard.filter_preservation_specimen_flags`, which corroborates the \
+task against both stores and drops such a flag regardless of how it is worded — so a \
+stranded flag for a corroborated specimen will be dropped whatever you call it. It keeps \
+the flag whenever no citation exists or the corroboration could not be read.
+
+This rule exists because of a real incident: dark_factory task 3105 is the sole preserved \
+live validation specimen for gate task 3546, and this re-flag twice became an operator \
+gate task asking for it to be reset — tasks 5080 and 5104, the second born-at-L2 critical. \
+Both were declined by hand. The same false positive has already appeared under three \
+different `flag_type` namings, so renaming it does not make it a new finding.
 """

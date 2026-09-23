@@ -44,12 +44,13 @@ import tempfile
 from collections.abc import Iterator
 from pathlib import Path
 from typing import IO, Any
+from unittest.mock import patch
 
 import pytest
 import startup_completion_fixtures as scf
 import startup_completion_probe as probe
 
-from shared.config_dir import _PID_SUFFIX_RE, CONFIG_DIR_PREFIX
+from shared.config_dir import _PID_SUFFIX_RE, CONFIG_DIR_PREFIX, reset_sweep_once_state
 
 #: A long base64url run: 70 chars, no ``/`` neighbours, so it trips
 #: ``GENERIC_CREDENTIAL_PATTERNS`` exactly as a raw pasted token would.
@@ -59,6 +60,31 @@ _LONG_RUN = 'A' * 70
 #: hold it and the sweep's PID-liveness guard is guaranteed to read it as dead.
 #: A merely "probably free" PID would make the sweep tests flaky by reuse.
 _DEAD_PID = 4194305
+
+
+def _corpus_probe_run_ids() -> list[str]:
+    """Every distinct ``probe_run_id`` the committed raw capture actually holds.
+
+    DERIVED, never retyped: a hand-copied list would keep validating retired ids
+    and report green after a regeneration, which is precisely the drift the test
+    that consumes it claims to catch.  Read at import time because it feeds a
+    ``parametrize``, and read straight off ``scf.RAW_CAPTURE_PATH`` — the same
+    path and the same per-line parse
+    ``test_every_row_is_linked_to_a_raw_probe_run`` joins the curated corpus on,
+    so the two cannot disagree about what a run id is.
+    """
+    seen = {
+        json.loads(line)['probe_run_id']
+        for line in scf.RAW_CAPTURE_PATH.read_text(encoding='utf-8').splitlines()
+        if line.strip()
+    }
+    if not seen:
+        raise AssertionError(
+            f'{scf.RAW_CAPTURE_PATH.name} carries no probe_run_id: an empty '
+            f'parametrize collects ZERO cases and reports green, so the vacuity '
+            f'has to fail collection instead'
+        )
+    return sorted(seen)
 
 
 def _minimal_observation(**overrides: Any) -> dict[str, Any]:
@@ -94,7 +120,7 @@ def sweep_root(tmp_path) -> Path:
 
 
 @pytest.fixture(autouse=True)
-def _confine_stale_dir_sweep(monkeypatch, sweep_root) -> None:
+def _confine_stale_dir_sweep(monkeypatch, sweep_root) -> Iterator[None]:
     """Re-base the dead-PID sweep under ``tmp_path`` for EVERY test in this module.
 
     ``run_live_probe``'s first statement is ``_sweep_stale_probe_dirs_once()``,
@@ -117,8 +143,21 @@ def _confine_stale_dir_sweep(monkeypatch, sweep_root) -> None:
     anything it did not create.  ``sweep_calls`` layers its recording stub on top
     for the tests that assert on call counts.
 
-    The ``_probe_dir_sweep_done`` reset keeps the once-per-process flag from
-    making a test's behaviour depend on which test ran first.
+    The ``reset_sweep_once_state`` calls keep the once-per-process mark from
+    making a test's behaviour depend on which test ran first.  Cleared on the way
+    out as well as in, because the mark lives in ``shared.config_dir`` and would
+    otherwise leak past this module entirely.
+
+    SCOPED to this module's OWN prefix, never the bare ``reset_sweep_once_state()``
+    that clears every prefix.  The bare form also drops
+    ``claude-config-usage-gate-probe-``, which this module neither owns nor
+    protects: ``UsageGate.__init__`` sweeps at construction, and the mark left by
+    an earlier module is what keeps a LATER module's first gate from scandir-ing
+    and rmtree-ing the real /tmp.  Only ``test_usage_gate.py`` is autouse-guarded
+    against that (``_keep_gates_off_the_real_tmp``) — ``test_usage_gate_exhaustive
+    .py``, ``test_concurrency.py`` and four others build gates unprotected — so
+    clearing a prefix this module does not own would make whether they hit real
+    /tmp depend on pytest collection order.
     """
     real_sweep = probe.sweep_stale_pid_dirs
 
@@ -130,7 +169,9 @@ def _confine_stale_dir_sweep(monkeypatch, sweep_root) -> None:
         return real_sweep(prefix, **kwargs)
 
     monkeypatch.setattr(probe, 'sweep_stale_pid_dirs', _confined_sweep, raising=False)
-    monkeypatch.setattr(probe, '_probe_dir_sweep_done', False, raising=False)
+    reset_sweep_once_state(probe._PROBE_DIR_PREFIX)
+    yield
+    reset_sweep_once_state(probe._PROBE_DIR_PREFIX)
 
 
 def _encoded_is_clean(value: Any) -> bool:
@@ -290,6 +331,65 @@ class TestScrubbedKeysDoNotCollide:
 _ENCODING_EXTENDED_LEAF = '\t' + 'A' * 63
 
 
+class TestUnencodableValuesAnswerClean:
+    """``_encodes_clean``'s ``except (TypeError, ValueError): return True`` branch.
+
+    PREMISE — this is a DEFENSIVE contract, not a live path.  ``_gate`` cannot
+    deliver an unencodable value here: it does ``json.dumps(observation)`` on the
+    whole document before any scrub runs, so an observation carrying one raises
+    there and never reaches ``_scrub_value``.  The branch exists so
+    ``_encodes_clean`` stays safe for DIRECT callers — this test is one, and a
+    future sampler could be another.
+
+    Pinned because the branch is load-bearing the moment it does fire, and its
+    correct answer is counter-intuitive: True means "clean", i.e. an unencodable
+    value is CARRIED rather than redacted.  That is right — it can never appear
+    in the encoded document at all, so it cannot contribute a match there — but
+    it reads like a fail-open, which is exactly the shape a future edit would
+    "fix" by turning the ``except`` into a ``raise``.  Mutation-checked: doing
+    that turns these tests red and nothing else.
+    """
+
+    @staticmethod
+    def _circular() -> dict:
+        """A structure ``json.dumps`` rejects with ValueError, not TypeError."""
+        d: dict[str, Any] = {}
+        d['self'] = d
+        return d
+
+    def test_an_unserializable_object_encodes_clean(self):
+        # TypeError: Object of type object is not JSON serializable.
+        assert (
+            probe._encodes_clean(object(), probe._GENERIC_CREDENTIAL_PATTERNS) is True
+        ), (
+            'an unencodable value must answer True (clean): it cannot appear in the '
+            'encoded document, so it cannot contribute a match there'
+        )
+
+    def test_a_circular_structure_encodes_clean(self):
+        # ValueError: Circular reference detected — the OTHER excepted class, and
+        # the one a `except TypeError` narrowed by a future edit would drop.
+        assert (
+            probe._encodes_clean(self._circular(), probe._GENERIC_CREDENTIAL_PATTERNS)
+            is True
+        )
+
+    def test_scrub_value_carries_an_unserializable_scalar_through(self):
+        # The composition, not just the leaf: _scrub_value's non-str/non-container
+        # branch routes through _encodes_clean, so a raising _encodes_clean would
+        # surface HERE — inside the scrub the gate calls — rather than in isolation.
+        sentinel = object()
+        assert (
+            probe._scrub_value(sentinel, probe._GENERIC_CREDENTIAL_PATTERNS)
+            is sentinel
+        ), 'the value must be carried through unchanged, not replaced by <redacted>'
+
+    # No _scrub_value case for the circular structure: a dict is a CONTAINER, so
+    # _scrub_value recurses into it and never reaches the scalar branch that
+    # consults _encodes_clean.  Its ValueError half is therefore pinned at the
+    # leaf (test_a_circular_structure_encodes_clean) and only there.
+
+
 class TestEncodedDomainParity:
     """``_scrub_value`` must produce a value clean in its JSON-ENCODED form.
 
@@ -390,11 +490,13 @@ _POISONED_KEYS = frozenset(
         'redaction_failed',
         'redaction_failure_pattern',
         'mode',
+        'wedge_shape',
         'sample_kind',
         'sample_index',
         'sample_offset_secs',
         'captured_at',
         'session_id',
+        'probe_run_id',
         'substrate_returns',
     }
 )
@@ -474,6 +576,64 @@ class TestGateNeverRaisesOnGenericHit:
                 f'nulled it out'
             )
 
+    @pytest.mark.parametrize('wedge_shape', sorted(set(probe.MODE_WEDGE_SHAPE.values()), key=str))
+    def test_every_declared_wedge_shape_survives(self, monkeypatch, wedge_shape):
+        """A member of the probe's own closed wedge-shape set is carried through.
+
+        Parametrized off ``MODE_WEDGE_SHAPE`` rather than a hand-written list, so
+        adding a mode cannot leave this test agreeing with the old constant.
+        ``None`` is a LEGITIMATE member (the healthy and replay regimes), which is
+        why the filter has to be a membership test and not a truthiness one.
+        """
+        monkeypatch.setattr(probe, '_scrub_value', lambda value, patterns: value)
+        result = probe._gate(self._dirty_observation(wedge_shape=wedge_shape))
+        assert result['wedge_shape'] == wedge_shape, (
+            f'{wedge_shape!r} is a declared MODE_WEDGE_SHAPE value but the degraded '
+            f'row nulled it out'
+        )
+
+    @pytest.mark.parametrize(
+        'wedge_shape',
+        # The last two are UNHASHABLE, and they are the ones with teeth: a
+        # frozenset closed set would raise `TypeError: unhashable type` on them
+        # from inside `_poisoned_observation` — i.e. from the never-raise path
+        # itself, losing the whole capture the degraded row exists to save.  The
+        # hashable non-members alone cannot catch that, which is why they are not
+        # the whole list.
+        [_LONG_RUN, 'not-a-wedge-shape', 7, {'a': 1}, ['x']],
+    )
+    def test_a_non_member_wedge_shape_degrades_to_none(self, monkeypatch, wedge_shape):
+        # Same reasoning as `mode`: an arbitrary string in a closed-set field is
+        # the route by which credential material would ride back into a row whose
+        # whole claim is that it is clean BY CONSTRUCTION.
+        monkeypatch.setattr(probe, '_scrub_value', lambda value, patterns: value)
+        result = probe._gate(self._dirty_observation(wedge_shape=wedge_shape))
+        assert result['wedge_shape'] is None
+        scf.assert_no_credential_material(
+            json.dumps(result), source='synthetic:poisoned-row-wedge-shape'
+        )
+
+    @pytest.mark.parametrize('probe_run_id', _corpus_probe_run_ids())
+    def test_a_probe_authored_run_id_survives(self, monkeypatch, probe_run_id):
+        """``probe_run_id`` is the key the curated corpus JOINS on.
+
+        ``test_every_row_is_linked_to_a_raw_probe_run`` fails any curated row
+        whose ``probe_run_id`` is absent from the raw capture, and ``session_id``
+        does not stand in for it — so a degraded row without one is unjoinable
+        even though it is attributable.
+
+        Parametrized off the REAL capture rather than a hand-copied list, so the
+        validator is pinned against what the probe has actually written rather
+        than against the regex's own assumptions — and stays pinned: regenerate
+        or extend the raw capture with an id this validator rejects (a new mode
+        whose slug the regex does not admit, an operator-supplied
+        ``--probe-run-id``) and this test turns RED instead of quietly going on
+        to validate five retired ids.
+        """
+        monkeypatch.setattr(probe, '_scrub_value', lambda value, patterns: value)
+        result = probe._gate(self._dirty_observation(probe_run_id=probe_run_id))
+        assert result['probe_run_id'] == probe_run_id
+
     def test_substrate_returns_is_carried_and_scalar_filtered(self, monkeypatch):
         monkeypatch.setattr(probe, '_scrub_value', lambda value, patterns: value)
         # run_live_probe subscripts candidate['substrate_returns']
@@ -525,10 +685,12 @@ class TestGateNeverRaisesOnGenericHit:
         )
         for leaked in (
             'transcript_records', 'config_dir_tree', 'run_exit', 'spawn_argv',
-            # Neither is probe-authored: cli_version is `claude --version` output
-            # and probe_run_id can come straight from --probe-run-id, so neither
-            # has a shape that could be validated the way captured_at/session_id are.
-            'cli_version', 'probe_run_id',
+            # cli_version is `claude --version` output: not probe-authored, and
+            # with no probe-owned shape it could be validated against.
+            # (probe_run_id is NOT here — its default IS probe-authored and
+            # anchored-validatable, and it is the corpus join key; see
+            # test_a_probe_authored_run_id_survives.)
+            'cli_version',
         ):
             assert leaked not in result
 
@@ -584,6 +746,14 @@ class TestGateNeverRaisesOnGenericHit:
             ('session_id', f'3f1c9a6e-2b4d-4c8a-9f77-0a1b2c3d4e5f{_LONG_RUN}'),
             ('session_id', 'abc'),
             ('session_id', None),
+            # The DEFAULT probe_run_id is probe-authored — main() builds
+            # f'{mode}-{uuid4().hex[:12]}' — so it has an anchored shape.  An
+            # operator-supplied --probe-run-id simply will not fullmatch and
+            # degrades here, which is exactly the behaviour before it was carried.
+            ('probe_run_id', f'healthy-171d92bec337{_LONG_RUN}'),
+            ('probe_run_id', 'operator-supplied-label'),
+            ('probe_run_id', 'healthy-deadbeef'),  # 8 hex, not 12
+            ('probe_run_id', None),
         ],
     )
     def test_unshaped_attribution_fields_degrade_to_none(self, monkeypatch, field, value):
@@ -597,21 +767,27 @@ class TestGateNeverRaisesOnGenericHit:
             json.dumps(result), source='synthetic:poisoned-row-attribution'
         )
 
-    def test_a_real_observation_survives_both_shape_validators(self, monkeypatch, tmp_path):
+    @pytest.mark.parametrize('mode', probe.MODES)
+    def test_a_real_observation_survives_all_shape_validators(
+        self, monkeypatch, tmp_path, mode
+    ):
         """The validators must accept what :func:`probe.observe` actually stamps.
 
-        Pinned against a REAL assembled observation, not against a hand-written
-        literal: a validator too strict for the probe's own output would null both
-        fields on every degraded row, and no test written from the same
-        assumptions as the regex would ever notice.
+        Pinned against a REAL assembled observation, not against hand-written
+        literals: a validator too strict for the probe's own output would null the
+        field on every degraded row, and no test written from the same assumptions
+        as the regex would ever notice.  Parametrized over every mode so each
+        ``MODE_WEDGE_SHAPE`` value the probe can actually stamp is covered, and
+        ``probe_run_id`` is built exactly the way ``main()`` builds its default.
         """
         monkeypatch.setattr(probe, '_scrub_value', lambda value, patterns: value)
         session_id = str(probe.uuid.uuid4())
+        probe_run_id = f'{mode}-{probe.uuid.uuid4().hex[:12]}'
         observation = probe.observe(
             config_dir=tmp_path,
             session_id=session_id,
-            probe_run_id='healthy-deadbeef',
-            mode='healthy',
+            probe_run_id=probe_run_id,
+            mode=mode,
             sample_index=0,
             sample_kind='scheduled',
             sample_offset_secs=0.25,
@@ -627,6 +803,8 @@ class TestGateNeverRaisesOnGenericHit:
         assert result['redaction_failed'] is True, 'the degradation path never ran'
         assert result['captured_at'] == observation['captured_at']
         assert result['session_id'] == session_id
+        assert result['probe_run_id'] == probe_run_id
+        assert result['wedge_shape'] == observation['wedge_shape']
 
 
 def _sample_kind_literals_in_probe_source() -> set[str]:
@@ -1195,8 +1373,8 @@ class TestConfigDirLifetime:
         for planted in (kept, stale):
             os.utime(planted, (0, 0))
 
-        # run_live_probe already consumed the once-per-process flag above.
-        monkeypatch.setattr(probe, '_probe_dir_sweep_done', False)
+        # run_live_probe already consumed the once-per-process mark above.
+        reset_sweep_once_state(probe._PROBE_DIR_PREFIX)
         assert probe._sweep_stale_probe_dirs_once() == 1, (
             'the control dir was not reclaimed — this sweep did nothing, so it '
             'says nothing about the kept dir'
@@ -1210,11 +1388,12 @@ class TestConfigDirLifetime:
 
 @pytest.fixture
 def sweep_calls(monkeypatch, probe_recorder) -> list[str]:
-    """Record ``sweep_stale_pid_dirs`` calls and reset the once-per-process flag.
+    """Record ``sweep_stale_pid_dirs`` calls and reset the once-per-process mark.
 
-    The reset matters: without it the flag's value would depend on whether an
+    The reset matters: without it the mark's presence would depend on whether an
     earlier test in this process already consumed it, and these tests would pass
-    or fail by ordering rather than by behaviour.
+    or fail by ordering rather than by behaviour.  Scoped to the probe's own
+    prefix for the reason ``_confine_stale_dir_sweep``'s docstring gives.
     """
     calls: list[str] = []
 
@@ -1222,8 +1401,8 @@ def sweep_calls(monkeypatch, probe_recorder) -> list[str]:
         calls.append(prefix)
         return 0
 
-    monkeypatch.setattr(probe, '_probe_dir_sweep_done', False, raising=False)
     monkeypatch.setattr(probe, 'sweep_stale_pid_dirs', _recording_sweep, raising=False)
+    reset_sweep_once_state(probe._PROBE_DIR_PREFIX)
     return calls
 
 
@@ -1241,6 +1420,59 @@ class TestStaleProbeDirSweep:
     inventing one: same constant pair, same once-per-process flag set BEFORE the
     call, same never-raise contract.
     """
+
+    def test_the_probe_delegates_to_the_shared_once_helper(self):
+        """The once-per-process bookkeeping lives in shared.config_dir now.
+
+        Its twin used to live here in ~45 near-verbatim lines alongside
+        ``usage_gate``'s — same one-shot flag, same set-before-call ordering,
+        same broad except, same silent-on-zero rule — and the two could drift
+        apart with nothing to notice.
+        """
+        with patch.object(probe, 'sweep_stale_pid_dirs_once', return_value=0) as once:
+            probe._sweep_stale_probe_dirs_once()
+
+        once.assert_called_once()
+        assert once.call_args.args[0] == probe._PROBE_DIR_PREFIX
+
+    def test_the_module_level_sweep_name_is_still_the_interception_point(
+        self, monkeypatch
+    ):
+        """`probe.sweep_stale_pid_dirs` must stay what actually runs.
+
+        The stakes here are higher than in ``usage_gate``. The AUTOUSE,
+        module-wide ``_confine_stale_dir_sweep`` fixture is the ONLY thing
+        keeping every test in this file from rmtree-ing real
+        ``/tmp/claude-config-startup-probe-*`` dirs — its docstring records that
+        this was MEASURED, not theorised (a planted
+        ``/tmp/claude-config-startup-probe-healthy-999999`` was gone after one
+        pytest run), and names the plausible victim: a dir an operator
+        deliberately kept with ``--keep-config-dir``, which costs a real-money
+        live run to retake.
+
+        That confinement works by monkeypatching THIS module-level name. If the
+        hoisted helper ever resolved the sweep out of ``shared.config_dir``'s own
+        globals instead — whether by a def-time default parameter, which cannot
+        be intercepted at all, or by calling that module's global by name, which
+        merely moves the single interception point there — the fixture would
+        silently stop intercepting: green tests, real deletions.  Both routes and
+        why each was rejected are in ``sweep_stale_pid_dirs_once``'s docstring.
+        """
+        calls: list[str] = []
+
+        def _recording_sweep(prefix: str, **kwargs) -> int:
+            calls.append(prefix)
+            return 0
+
+        monkeypatch.setattr(probe, 'sweep_stale_pid_dirs', _recording_sweep)
+        probe._sweep_stale_probe_dirs_once()
+
+        assert calls == [probe._PROBE_DIR_PREFIX], (
+            'the sweep patched onto probe.sweep_stale_pid_dirs was not what ran — '
+            '_confine_stale_dir_sweep has stopped intercepting, and this module '
+            'is now deleting real /tmp/claude-config-startup-probe-* dirs, '
+            'including any an operator kept with --keep-config-dir'
+        )
 
     def test_swept_prefix_and_created_names_are_the_same_string(self):
         # Not a tautology: it pins that the sweep key is DERIVED from the task-id
@@ -1326,8 +1558,12 @@ class TestStaleProbeDirSweep:
         with pytest.raises(RuntimeError, match='injected: _build_argv'):
             _run_probe(tmp_path)
         assert sweep_calls == [probe._PROBE_DIR_PREFIX]
-        assert probe._probe_dir_sweep_done is True, (
-            'the flag must be set BEFORE the call, or a raising sweep re-runs on '
+        # The mark is set BEFORE the call, so a sweep that raises every time
+        # still cannot re-run.  Asserted BEHAVIOURALLY now that the flag it used
+        # to read is gone: calling again must not reach the sweep.
+        probe._sweep_stale_probe_dirs_once()
+        assert sweep_calls == [probe._PROBE_DIR_PREFIX], (
+            'the mark must be set BEFORE the call, or a raising sweep re-runs on '
             'every subsequent probe'
         )
 

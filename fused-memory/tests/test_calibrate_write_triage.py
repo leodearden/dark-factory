@@ -13,7 +13,6 @@ and retrievals are injected.
 from __future__ import annotations
 
 import functools
-import importlib.util
 import json
 import re
 import types
@@ -21,6 +20,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 import pytest
+from _fm_helpers import load_script_module
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'calibrate_write_triage.py'
 FIXTURE_PATH = Path(__file__).parent / 'fixtures' / 'write_triage_calibration.jsonl'
@@ -45,32 +45,9 @@ CANONICAL_5626 = '70fd0700'
 EXCLUDED_IDS = ('8d79e0e4', '43a47400')
 
 
-def _load_module() -> types.ModuleType:
-    """Load calibrate_write_triage.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    @dataclass and other reflection-based decorators work correctly
-    (they call sys.modules.get(cls.__module__)).
-    """
-    import sys  # noqa: PLC0415
-
-    mod_name = 'calibrate_write_triage'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
 @functools.cache
 def _mod() -> types.ModuleType:
-    return _load_module()
+    return load_script_module(SCRIPT_PATH, mod_name='calibrate_write_triage')
 
 
 # ---------------------------------------------------------------------------

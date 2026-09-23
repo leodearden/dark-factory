@@ -125,17 +125,19 @@ tasks:
       expect: present
 - label: r6
   task_id: 4681
-  title: 'Seed the first two chains: closure-staleness predicate variant + transcript-check;
+  title: 'Seed the first two chains: orphaned-worktree reclaim predicate variant + transcript-check;
     demonstrate link->successor end-to-end'
   capabilities:
   - name: predicate-variant-script-exists
-    binding: capability→producer (this task) — sweep wrapper verified (always-exit-0,
-      rcs captured in vars, stdlib-only); transcript-check command verified runnable;
-      0-today
+    binding: capability→producer (this task) — reclaim wrapper verified (executable,
+      stdlib-only, single `return 0` path so success is unconditional, structured JSON
+      report with a `failed` counter plus a `--check` mode as the predicate input);
+      transcript-check command verified runnable; 0-today. Re-pointed from the reify
+      closure-staleness sweep, retired by task 5247.
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: reify-closure-staleness-predicate
+      pattern: reclaim-orphaned-worktrees-predicate
       paths:
       - scripts/
       expect: present

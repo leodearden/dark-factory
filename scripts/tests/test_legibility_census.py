@@ -1088,51 +1088,49 @@ def _sample_mining_result():
     )
 
 
-def test_render_report_contains_dated_header_and_all_sections():
-    report = mod.render_report(
-        date="2026-07-14",
-        project_id="dark_factory",
-        force=False,
-        matrix_md="| origin \\ manifested | merge |\n| --- | --- |\n| implement | 2 |\n",
-        mining_result=_sample_mining_result(),
+def test_render_report_carries_each_piece_in_its_own_section():
+    matrix_md = "| origin \\ manifested | merge |\n| --- | --- |\n| implement | 2 |\n"
+    sections = _sections(
+        matrix_md=matrix_md,
         synthesis_md="Fable synthesis prose goes here.",
         filed_task_ids=["1234", "1235"],
         cost_note="~$3.42 across 20 Sonnet calls + 1 Fable call.",
     )
 
-    assert "# confusion census 2026-07-14" in report
-    assert "dark_factory" in report
-    # matrix embedded verbatim
-    assert "| origin \\ manifested | merge |\n| --- | --- |\n| implement | 2 |\n" in report
-    # saturation-stats section: batch count, per-batch dup rates, stop_reason
-    assert "saturated" in report
-    assert "2" in report  # batch count
-    assert "0.5" in report
-    assert "0.9" in report
-    # filed task ids
-    assert "1234" in report
-    assert "1235" in report
-    # cost note
-    assert "~$3.42 across 20 Sonnet calls + 1 Fable call." in report
-    # synthesis prose
-    assert "Fable synthesis prose goes here." in report
-    # no force marker on a non-forced run
-    assert "--force" not in report
+    # The key set doubles as the force-marker absence check this test used to
+    # spell `"--force" not in report`.
+    assert [section.key for section in sections] == [
+        mod.SECTION_HEADER,
+        mod.SECTION_SATURATION,
+        mod.SECTION_MATRIX,
+        mod.SECTION_SYNTHESIS,
+        mod.SECTION_FILED_TASKS,
+        mod.SECTION_COST,
+    ]
 
-
-def test_render_report_force_marker_present_when_forced():
-    report = mod.render_report(
-        date="2026-07-14",
-        project_id="dark_factory",
-        force=True,
-        matrix_md="matrix",
-        mining_result=_sample_mining_result(),
-        synthesis_md="prose",
-        filed_task_ids=[],
-        cost_note="cost",
+    # Each piece in its OWN section -- strictly stronger than `in report`,
+    # which passed if a piece landed anywhere in the blob, including under the
+    # wrong heading.
+    header = _section_text(sections, mod.SECTION_HEADER)
+    assert "# confusion census 2026-07-14" in header
+    assert "Project: dark_factory" in header
+    assert matrix_md in _section_text(sections, mod.SECTION_MATRIX), "embedded verbatim"
+    assert "Fable synthesis prose goes here." in _section_text(sections, mod.SECTION_SYNTHESIS)
+    filed = _section_text(sections, mod.SECTION_FILED_TASKS)
+    assert "- 1234" in filed
+    assert "- 1235" in filed
+    assert "~$3.42 across 20 Sonnet calls + 1 Fable call." in _section_text(
+        sections, mod.SECTION_COST
     )
-    assert "--force" in report
-    assert "operator-initiated" in report.lower()
+
+    # The saturation tallies as whole lines, not bare digits: the old
+    # `"2" in report` / `"0.5" in report` checks passed against a rendering
+    # that had dropped the batch index or transposed the fields.
+    saturation = _section(sections, mod.SECTION_SATURATION).lines
+    assert "- batches: 2" in saturation
+    assert "- stop reason: saturated" in saturation
+    assert any("batch 0:" in line and "dup_rate=0.50" in line for line in saturation)
+    assert any("batch 1:" in line and "dup_rate=0.90" in line for line in saturation)
 
 
 def test_render_report_is_deterministic_no_clock():
@@ -1226,29 +1224,81 @@ def _storm_capped_mining_result():
     )
 
 
-def _coverage_line(report):
-    """Isolate the single "- coverage:" line inside "## Saturation" from the
-    rest of the section. The per-batch bullets rendered below it already
-    contain digit-bearing substrings like "total=10 ... succeeded=4", so
-    asserting against the whole section (the same trap
-    test_render_report_capped_run_names_cap_and_partial_coverage's own
-    precision comment below calls out for the bare cap digit) would pass
-    even against unfixed code and prove nothing. Assert only against what
-    this returns."""
-    saturation_section = report.split("## Saturation", 1)[1].split("##", 1)[0]
-    coverage_lines = [
-        line for line in saturation_section.splitlines() if line.strip().startswith("- coverage:")
+def _section(sections, key):
+    """The section keyed *key*, or a legible AssertionError naming the key and
+    the keys actually present.
+
+    Replaces `report.split("## Saturation", 1)[1]`, whose IndexError on an
+    absent section is the illegible failure the convention memory explicitly
+    calls out: it names neither what was looked for nor what was there. THE
+    single lookup -- `_section_text` and `_saturation_lines` both go through
+    it, so there is one failure message to get right."""
+    matches = [section for section in sections if section.key == key]
+    assert len(matches) == 1, (
+        f"expected exactly one {key!r} section; keys present: "
+        f"{[section.key for section in sections]}"
+    )
+    return matches[0]
+
+
+def _section_text(sections, key):
+    """The rendered text of the section keyed *key*."""
+    return _section(sections, key).text
+
+
+def _section_keys(**overrides):
+    return [section.key for section in _sections(**overrides)]
+
+
+def _saturation_lines(sections, prefix):
+    """Every `SECTION_SATURATION` line whose stable leading field is *prefix*.
+
+    The section is found by KEY and the line by its leading field, never by a
+    prose substring. Isolating the line also matters for precision: the
+    per-batch bullets below the coverage line already carry digit-bearing
+    substrings like "total=10 ... succeeded=4", so asserting against the whole
+    section would pass even against unfixed code."""
+    return [
+        line for line in _section(sections, mod.SECTION_SATURATION).lines
+        if line.strip().startswith(prefix)
     ]
+
+
+def _coverage_line_among(lines):
+    """The single "- coverage:" line among *lines*, found by its stable leading
+    field."""
+    coverage_lines = [line for line in lines if line.strip().startswith("- coverage:")]
     assert len(coverage_lines) == 1, (
         f"expected exactly one '- coverage:' line, found {coverage_lines!r}"
     )
     return coverage_lines[0]
 
 
-def _render(**overrides):
-    # Annotated for the same reason as _run_census_kwargs: a heterogeneous
-    # dict whose inferred value union would otherwise be re-reported once per
-    # union member per render_report parameter.
+def _coverage_line(sections):
+    """The coverage line the CAPPED branch renders into `SECTION_SATURATION`."""
+    return _coverage_line_among(_saturation_lines(sections, "- coverage:"))
+
+
+def _persisted_coverage_line(report):
+    """The coverage line of a PERSISTED report artifact -- for the `run_census`
+    end-to-end tests, which hold the written text and not the render kwargs.
+
+    Scans for the line by its stable leading field rather than splitting on
+    "## Saturation", so an absent line fails naming what was looked for instead
+    of raising IndexError out of a string split."""
+    return _coverage_line_among(report.splitlines())
+
+
+def _render_kwargs(**overrides) -> dict[str, Any]:
+    """The flagless `render_report` keyword set, with *overrides* applied.
+
+    Split out of `_render` so the same kwargs can drive BOTH `render_report`
+    and `census_report_sections` -- the pure-join identity is only meaningful
+    when the two views are asked the same question.
+
+    Annotated for the same reason as _run_census_kwargs: a heterogeneous
+    dict whose inferred value union would otherwise be re-reported once per
+    union member per render_report parameter."""
     kwargs: dict[str, Any] = dict(
         date="2026-07-14",
         project_id="dark_factory",
@@ -1260,26 +1310,34 @@ def _render(**overrides):
         cost_note="cost",
     )
     kwargs.update(overrides)
-    return mod.render_report(**kwargs)
+    return kwargs
+
+
+def _render(**overrides):
+    return mod.render_report(**_render_kwargs(**overrides))
+
+
+def _sections(**overrides):
+    return mod.census_report_sections(**_render_kwargs(**overrides))
 
 
 def test_render_report_capped_run_names_cap_and_partial_coverage():
-    report = _render(
+    sections = _sections(
         mining_result=_capped_mining_result(stop_reason="capped", max_batches=2),
     )
 
-    saturation_section = report.split("## Saturation", 1)[1].split("##", 1)[0]
-    lowered = saturation_section.lower()
-    assert "20" in saturation_section, "sessions actually mined (2 batches x 10) must be stated"
-    # Assert the substantive substring, not a bare "2": the section always
-    # carries "- batches: 2" and digit-bearing per-batch bullets, so a bare
-    # digit check passes even if the cap VALUE stopped being rendered --
-    # exactly the regression this line claims to guard.
-    assert "operator batch cap = 2" in saturation_section
-    assert "cap" in lowered, "the operator cap must be named, never applied silently"
-    # A capped report must be unreadable as full coverage.
-    assert "partial" in lowered
-    assert "not mined" in lowered
+    coverage_line = _coverage_line(sections)
+    # Assert the substantive NUMBERS with enough anchor to order them, not bare
+    # digits: the section always carries "- batches: 2" and digit-bearing
+    # per-batch bullets, so a bare digit check passes even if the cap VALUE
+    # stopped being rendered -- exactly the regression this line guards.
+    assert "coded 20 of 20 session digest(s) drawn" in coverage_line, (
+        "sessions actually mined (2 batches x 10) must be stated"
+    )
+    assert "operator batch cap = 2 batch(es)" in coverage_line
+    # The partial-coverage disclosure is its own line, and a capped run is the
+    # only run that carries it (see ..._no_cap_renders_no_coverage_line).
+    assert len(_saturation_lines(sections, "- NOT PICKED UP LATER:")) == 1
 
 
 def test_render_report_capped_coverage_states_coded_digests_not_drawn_digests():
@@ -1290,9 +1348,7 @@ def test_render_report_capped_coverage_states_coded_digests_not_drawn_digests():
     # bounded run is never read as fuller coverage than it actually was --
     # so it must lead with what was CODED (succeeded), not merely what was
     # DRAWN (total).
-    report = _render(mining_result=_storm_capped_mining_result())
-
-    coverage_line = _coverage_line(report)
+    coverage_line = _coverage_line(_sections(mining_result=_storm_capped_mining_result()))
     # One ordered-substring assertion, not separate bare-digit checks: two
     # independent "14 in line" / "20 in line" checks would both still pass
     # against a transposed rendering ("coded 20 of 14 ... drawn") -- exactly
@@ -1312,13 +1368,13 @@ def test_render_report_capped_coverage_names_the_uncoded_digests_when_coding_fel
     # merely inferable by subtracting the per-batch bullets rendered below
     # it -- an operator deciding whether to roll last_census_at back reads
     # THIS line, and it is the one line whose job is the coverage claim.
-    report = _render(mining_result=_storm_capped_mining_result())
-
-    coverage_line = _coverage_line(report)
-    lowered = coverage_line.lower()
-    assert "6" in coverage_line, "the 6 digests that failed to code must be named"
-    assert "failed to code" in lowered
-    assert "no signal" in lowered, "the shortfall must say these digests contributed nothing"
+    coverage_line = _coverage_line(_sections(mining_result=_storm_capped_mining_result()))
+    # The shortfall COUNT attached to the claim it qualifies, not a bare "6":
+    # the line legitimately carries 14 and 20, each of which a bare digit check
+    # would also match.
+    assert "6 digest(s) FAILED TO CODE" in coverage_line, (
+        "the 6 digests that failed to code must be named on this line"
+    )
 
 
 def test_render_report_capped_coverage_omits_the_shortfall_clause_when_every_digest_coded():
@@ -1326,18 +1382,18 @@ def test_render_report_capped_coverage_omits_the_shortfall_clause_when_every_dig
     # line trained to be ignored is a line that will be ignored on the run
     # that matters. This is the branch guard for the shortfall clause: it
     # must render ONLY when coding actually fell short of what was drawn.
-    report = _render(
+    coverage_line = _coverage_line(_sections(
         mining_result=_capped_mining_result(stop_reason="capped", max_batches=2),
-    )
-
-    coverage_line = _coverage_line(report)
-    lowered = coverage_line.lower()
-    assert "failed to code" not in lowered
-    assert "no signal" not in lowered
+    ))
+    # The precondition asserted rather than assumed: coded == drawn is what
+    # makes the clause inapplicable.
+    assert "coded 20 of 20 session digest(s) drawn" in coverage_line
     # Not a bare "0" check (a healthy run's line legitimately contains "20",
-    # which itself contains "0") -- assert the shortfall-clause SHAPE is
+    # which itself contains "0") -- assert the shortfall-clause MARKER is
     # absent, not merely that some unrelated digit is.
-    assert "0 digest" not in coverage_line, "a healthy run must not render a 0-failure clause"
+    assert "FAILED TO CODE" not in coverage_line, (
+        "a healthy run must not render a 0-failure clause"
+    )
 
 
 def test_render_report_capped_run_says_the_skipped_sessions_are_not_re_mined():
@@ -1346,152 +1402,352 @@ def test_render_report_capped_run_says_the_skipped_sessions_are_not_re_mined():
     # anchors the NEXT window there, so the capped-away sessions fall outside
     # every future window -- the same dead-recovery-path hazard the dry-run
     # WARNING is written to avoid.
-    report = _render(
+    sections = _sections(
         mining_result=_capped_mining_result(stop_reason="capped", max_batches=2),
     )
 
-    saturation_section = report.split("## Saturation", 1)[1].split("##", 1)[0]
-    lowered = saturation_section.lower()
-    assert "last_census_at" in lowered, "the re-anchoring mechanism must be named"
-    assert "next census window starts here" in lowered
-    assert "never re-enumerated" in lowered, (
-        "the report must say the capped-away sessions are not swept later"
+    disclosure = _saturation_lines(sections, "- NOT PICKED UP LATER:")
+    assert len(disclosure) == 1, "the disclosure is one line of its own"
+    # The two IDENTIFIERS an operator needs to act: the field that re-anchors
+    # the window, and the file holding it. Asserted because they are machine
+    # names a reader can look up, not because of the prose around them.
+    assert "last_census_at" in disclosure[0], "the re-anchoring mechanism must be named"
+    assert "docs/legibility/census-state.json" in disclosure[0], (
+        "the one real recovery lever is named, so a plain re-run is not read as it"
     )
-    # ...and must not leave a re-run reading as the recovery path.
-    assert "census-state.json" in lowered, "the one real recovery lever is named"
 
 
 def test_render_report_cap_not_reached_makes_no_re_anchor_claim():
     # The re-anchor disclosure belongs to the CAPPED branch only: a cap that
     # was set but never reached mined exactly what an uncapped run would.
-    report = _render(
+    sections = _sections(
         mining_result=_capped_mining_result(stop_reason="saturated", max_batches=99),
     )
 
-    saturation_section = report.split("## Saturation", 1)[1].split("##", 1)[0]
-    lowered = saturation_section.lower()
-    assert "last_census_at" not in lowered
-    assert "never re-enumerated" not in lowered
+    assert _saturation_lines(sections, "- NOT PICKED UP LATER:") == []
+    assert _saturation_lines(sections, "- coverage:") == []
 
 
 def test_render_report_cap_set_but_not_reached_is_reported_distinctly():
-    report = _render(
+    sections = _sections(
         mining_result=_capped_mining_result(stop_reason="saturated", max_batches=99),
     )
 
-    saturation_section = report.split("## Saturation", 1)[1].split("##", 1)[0]
-    lowered = saturation_section.lower()
-    assert "99" in saturation_section, "the cap is still named for the operator's record"
-    assert "cap" in lowered
-    assert "not reached" in lowered
+    # DISTINCTLY: a different line shape from the capped branch's
+    # "- coverage:", carrying the cap value and why it did not bind.
+    not_reached = _saturation_lines(sections, "- operator batch cap:")
+    assert len(not_reached) == 1
+    assert "99 batch(es)" in not_reached[0], "the cap is still named for the operator's record"
+    assert "not reached -- mining stopped by: saturated" in not_reached[0]
     # No partial-coverage claim: the run stopped on its own terms.
-    assert "partial" not in lowered
-    assert "not mined" not in lowered
+    assert _saturation_lines(sections, "- coverage:") == []
+    assert _saturation_lines(sections, "- NOT PICKED UP LATER:") == []
 
 
 def test_render_report_no_cap_renders_no_coverage_line():
-    report = _render(
+    sections = _sections(
         mining_result=_capped_mining_result(stop_reason="exhausted", max_batches=None),
     )
 
-    saturation_section = report.split("## Saturation", 1)[1].split("##", 1)[0]
-    lowered = saturation_section.lower()
-    assert "cap" not in lowered, "an uncapped run must render no cap text at all"
-    assert "coverage" not in lowered
-    assert "partial" not in lowered
+    # None of the three cap line shapes, and -- stronger than any absence
+    # check -- the whole section locked to the header plus the two tallies
+    # plus the per-batch bullets, so no cap text can appear anywhere in it.
+    assert _saturation_lines(sections, "- coverage:") == []
+    assert _saturation_lines(sections, "- operator batch cap:") == []
+    assert _saturation_lines(sections, "- NOT PICKED UP LATER:") == []
+    assert _section(sections, mod.SECTION_SATURATION).lines == (
+        "",
+        "## Saturation",
+        "",
+        "- batches: 2",
+        "- stop reason: exhausted",
+        "  - batch 0: dup_rate=0.10 (total=10, succeeded=10, failed=0, saturated=False)",
+        "  - batch 1: dup_rate=0.10 (total=10, succeeded=10, failed=0, saturated=False)",
+    )
+
+
+def _verification_bullets(sections):
+    """The `SECTION_VERIFICATION` bullets, i.e. the section minus its heading
+    and the blank lines framing it."""
+    return [
+        line for line in _section(sections, mod.SECTION_VERIFICATION).lines
+        if line.startswith("- ")
+    ]
 
 
 def test_render_report_verify_cap_states_verified_of_novel_and_deferred():
-    report = _render(
-        verify_coverage=mod.VerifyCoverage(novel=812, verified=150, cap=150),
+    sections = _sections(verify_coverage=mod.VerifyCoverage(novel=812, offered=150, cap=150))
+
+    bullets = _verification_bullets(sections)
+    # TWO bullets: the deferral counts, and the conditional-pickup caveat that
+    # "a later census" is not automatic. Counting them is the structural form
+    # of "the caveat is disclosed" -- the caveat's prose is free to be
+    # reworded, its presence is not.
+    assert len(bullets) == 2, f"expected the counts line and the caveat line; got {bullets!r}"
+    # One ordered assertion, not three independent bare-digit checks: separate
+    # "150 in section" / "812 in section" checks would both still pass against
+    # a transposed rendering.
+    #
+    # "handed", not "verified": the field counts verify_fn calls MADE, and a
+    # handed cluster may come back FALSE -- under the mass-rejection notice an
+    # outcome claim here would contradict it outright.
+    assert "handed 150 of 812 novel clusters" in bullets[0]
+    assert "verified 150 of 812" not in bullets[0]
+    assert "operator verify cap: 150" in bullets[0]
+    assert "662 deferred" in bullets[0], (
+        "the deferred remainder must be STATED, not left to the reader's arithmetic"
     )
-
-    assert "## Verification" in report
-    section = report.split("## Verification", 1)[1].split("##", 1)[0]
-    assert "150" in section
-    assert "812" in section
-    assert "662" in section, "the deferred remainder must be stated, not left to arithmetic"
-    lowered = section.lower()
-    assert "verified 150 of 812" in lowered
-    # Deferred means "not yet adjudicated", never "dropped": the deferred
-    # clusters still merged into the codebook as pending candidates.
-    assert "pending candidate" in lowered
-    assert "deferred" in lowered
-    assert "dropped" not in lowered
-    # "a later census picks it up" is CONDITIONAL: this window's sightings are
-    # never re-mined, so a deferred cluster is re-adjudicated only on a
-    # recurrence. Say so, exactly as the batch-cap and dry-run paths do.
-    assert "recurs" in lowered, "the later-census pickup must be stated as conditional"
-    assert "not re-mined" in lowered or "never re-mined" in lowered
-
-    # Placement: between Saturation and the matrix.
-    assert report.index("## Saturation") < report.index("## Verification")
-    assert report.index("## Verification") < report.index("## Origin x Manifestation Matrix")
+    # Placement is asserted structurally by
+    # test_census_report_sections_verification_is_gated_and_positioned.
 
 
 def test_render_report_verify_cap_set_but_not_reached_claims_no_deferral():
     # Mirror of the batch cap's "not reached" branch. With novel == verified
     # nothing was deferred and nothing went unverified, so the deferral clause
     # would be a false statement about this run.
-    report = _render(verify_coverage=mod.VerifyCoverage(novel=3, verified=3, cap=5))
+    sections = _sections(verify_coverage=mod.VerifyCoverage(novel=3, offered=3, cap=5))
 
-    assert "## Verification" in report
-    section = report.split("## Verification", 1)[1].split("##", 1)[0]
-    lowered = section.lower()
-    assert "verified all 3 novel cluster" in lowered
-    assert "5" in section, "the cap is still named for the operator's record"
-    assert "not reached" in lowered
-    # Nothing was deferred -- the deferral wording must be absent entirely.
-    assert "deferred" not in lowered
-    assert "0 deferred" not in lowered
-    assert "pending candidate" not in lowered
+    bullets = _verification_bullets(sections)
+    # ONE bullet, not two: nothing was deferred, so the deferral counts line
+    # and its conditional-pickup caveat are both absent. Asserted as a count
+    # rather than as the absence of the word "deferred", which a reworded
+    # deferral clause would slip past.
+    assert len(bullets) == 1, f"a not-reached cap defers nothing; got {bullets!r}"
+    assert "handed all 3 novel cluster(s) to the verifier" in bullets[0]
+    assert "verified all" not in bullets[0]
+    assert "operator verify cap: 5 (not reached)" in bullets[0], (
+        "the cap is still named for the operator's record"
+    )
 
 
 def test_render_report_without_verify_coverage_renders_no_verification_section():
-    assert "## Verification" not in _render()
-    assert "## Verification" not in _render(verify_coverage=None)
+    assert mod.SECTION_VERIFICATION not in _section_keys()
+    assert mod.SECTION_VERIFICATION not in _section_keys(verify_coverage=None)
 
 
 _PAYLOADS_PATH = "/p/plans/confusion-census-2026-07-30-payloads.json"
 
 
 def test_render_report_dry_run_filing_section_names_count_and_path():
-    report = _render(
+    sections = _sections(
         filed_task_ids=[],
         dry_run=mod.DryRunFiling(path=_PAYLOADS_PATH, payload_count=12),
     )
 
-    section = report.split("## Filed Tasks", 1)[1].split("##", 1)[0]
-    assert "dry-run: 12 payload" in section
-    assert _PAYLOADS_PATH in section
-    assert "_none filed._" not in section
+    # The two VALUES a reviewer needs, on one line, ordered: the count and the
+    # file it was written to.
+    assert f"12 payload(s) written to {_PAYLOADS_PATH}" in _section_text(
+        sections, mod.SECTION_FILED_TASKS
+    )
 
 
 def test_render_report_dry_run_takes_precedence_over_empty_filed_ids():
     # An empty filed list plus a dry run must never read as "a normal run
-    # that happened to file nothing" -- the dry-run wording wins.
-    report = _render(
-        filed_task_ids=[],
-        dry_run=mod.DryRunFiling(path=_PAYLOADS_PATH, payload_count=3),
+    # that happened to file nothing" -- so the two renderings must DIFFER.
+    # Asserted as a difference against the plain rendering rather than as the
+    # absence of a hand-picked phrase, which a reworded placeholder would slip
+    # past.
+    dry_run_text = _section_text(
+        _sections(
+            filed_task_ids=[],
+            dry_run=mod.DryRunFiling(path=_PAYLOADS_PATH, payload_count=3),
+        ),
+        mod.SECTION_FILED_TASKS,
     )
+    plain_text = _section_text(_sections(filed_task_ids=[]), mod.SECTION_FILED_TASKS)
 
-    section = report.split("## Filed Tasks", 1)[1].split("##", 1)[0]
-    assert "_none filed._" not in section
-    assert "dry-run" in section.lower()
-    assert "nothing filed" in section.lower()
+    assert dry_run_text != plain_text
+    assert f"3 payload(s) written to {_PAYLOADS_PATH}" in dry_run_text
 
 
 def test_render_report_without_dry_run_filed_tasks_section_unchanged():
-    filed = _render(filed_task_ids=["1234", "1235"])
-    filed_section = filed.split("## Filed Tasks", 1)[1].split("##", 1)[0]
-    assert "- 1234" in filed_section
-    assert "- 1235" in filed_section
-    assert "dry-run" not in filed_section.lower()
+    # Whole-section locks rather than substring probes: every line the section
+    # renders is pinned, so a dry-run clause cannot leak into either branch
+    # and no `"dry-run" not in ...` probe has to anticipate its wording.
+    assert _section(
+        _sections(filed_task_ids=["1234", "1235"]), mod.SECTION_FILED_TASKS
+    ).lines == ("", "## Filed Tasks", "", "- 1234", "- 1235")
 
-    none_filed = _render(filed_task_ids=[])
-    none_section = none_filed.split("## Filed Tasks", 1)[1].split("##", 1)[0]
-    assert "_none filed._" in none_section
-    assert "dry-run" not in none_section.lower()
+    assert _section(
+        _sections(filed_task_ids=[]), mod.SECTION_FILED_TASKS
+    ).lines == ("", "## Filed Tasks", "", "_none filed._")
+
+
+# ---------------------------------------------------------------------------
+# task 5279 W3: the report's STRUCTURE is the thing to assert on, not the
+# English inside it.
+#
+# The esc-3208-4 convention (memories 53e61951-0704-4436-94bd-bf12ae66c23b and
+# 538183c6-6a83-44b6-8a2f-290b75a545d6), already shipped in
+# fused-memory/scripts/memory_eval_retrieval_probe.py and
+# memory_eval_staleness_sweep.py: module-level SECTION_* keys, a frozen
+# ReportSection(key, lines) with a .text property, a
+# *_report_sections(...) -> tuple[ReportSection, ...] builder, and a pure
+# join. Prose is the part of this module expected to be reworded; a check
+# keyed on prose constrains wording rather than behaviour, while a check keyed
+# on structure keeps the disclosure guarantees falsifiable -- a section that
+# stops being emitted, is emitted on the wrong run, or lands below the thing
+# it qualifies, fails, and a copy edit does not.
+# ---------------------------------------------------------------------------
+
+# Every flag combination render_report gates a section on, so no branch can
+# render outside the structure.
+def _sample_dropped_verdicts() -> tuple:
+    """Two drop records covering the two shapes the section renders
+    differently: one with a standing record, one without."""
+    return (
+        mod.DroppedVerdict(
+            verdict="rejected",
+            title="Spurious pattern",
+            kind=mod.DROP_CONTRADICTION,
+            standing_id="cand-20260701-7",
+            standing_disposition="promoted",
+            standing_first_seen="2026-07-01",
+        ),
+        mod.DroppedVerdict(
+            verdict="verified",
+            title="A title the merge never saw",
+            kind=mod.DROP_NO_STANDING,
+        ),
+    )
+
+
+_REPORT_FLAG_CASES: dict[str, dict[str, Any]] = {
+    "flagless": {},
+    "forced": {"force": True},
+    "capped": {"mining_result": _capped_mining_result(stop_reason="capped", max_batches=2)},
+    "verify_capped": {"verify_coverage": mod.VerifyCoverage(novel=5, offered=2, cap=2)},
+    "dry_run_filing": {
+        "filed_task_ids": [],
+        "dry_run": mod.DryRunFiling(path=_PAYLOADS_PATH, payload_count=12),
+    },
+    "unresolved_verdicts": {"dropped_verdicts": _sample_dropped_verdicts()},
+}
+
+
+def test_census_report_sections_returns_keyed_sections_of_lines():
+    sections = mod.census_report_sections(**_render_kwargs())
+
+    assert isinstance(sections, tuple)
+    assert sections, "a report always carries at least a header"
+    for section in sections:
+        assert isinstance(section, mod.ReportSection)
+        assert isinstance(section.key, str) and section.key
+        assert isinstance(section.lines, tuple)
+        assert all(isinstance(line, str) for line in section.lines)
+        assert section.text == "\n".join(section.lines)
+
+
+@pytest.mark.parametrize("case", sorted(_REPORT_FLAG_CASES))
+def test_render_report_is_the_pure_join_of_its_sections(case):
+    """THE identity that stops the structural view and the operator's text
+    from drifting: the markdown is a plain concatenation of the sections, so a
+    section present in one view is present in the other by construction.
+
+    Asserted across every gated flag combination -- a branch that rendered
+    outside the structure would pass on the flagless case alone."""
+    kwargs = _render_kwargs(**_REPORT_FLAG_CASES[case])
+
+    assert mod.render_report(**kwargs) == mod.join_report_sections(
+        mod.census_report_sections(**kwargs)
+    )
+
+
+def test_census_report_sections_flagless_key_set_and_order():
+    assert _section_keys() == [
+        mod.SECTION_HEADER,
+        mod.SECTION_SATURATION,
+        mod.SECTION_MATRIX,
+        mod.SECTION_SYNTHESIS,
+        mod.SECTION_FILED_TASKS,
+        mod.SECTION_COST,
+    ]
+
+
+def test_census_report_sections_force_marker_is_gated_and_positioned():
+    """Positioned, not merely present: the marker qualifies the header, so it
+    belongs immediately below it."""
+    assert mod.SECTION_FORCE_MARKER not in _section_keys()
+
+    forced = _section_keys(force=True)
+    assert forced.index(mod.SECTION_FORCE_MARKER) == forced.index(mod.SECTION_HEADER) + 1
+
+
+def test_census_report_sections_verification_is_gated_and_positioned():
+    """The verification section reports what the verify cap deferred, so it
+    belongs between the mining report and the matrix built from what survived
+    -- strictly after SATURATION and strictly before MATRIX."""
+    assert mod.SECTION_VERIFICATION not in _section_keys()
+
+    keys = _section_keys(verify_coverage=mod.VerifyCoverage(novel=5, offered=2, cap=2))
+    assert keys.index(mod.SECTION_SATURATION) < keys.index(mod.SECTION_VERIFICATION)
+    assert keys.index(mod.SECTION_VERIFICATION) < keys.index(mod.SECTION_MATRIX)
+
+
+def test_census_report_sections_unresolved_verdicts_is_gated_and_positioned():
+    """The durable channel carries the signal too.
+
+    stdout and the WARNING log of an unattended nightly run are ephemeral;
+    the dated report is what an operator reads afterwards, so "this run paid
+    for N adjudications that went nowhere" has to survive there. Gated on
+    there being any, positioned with the other coverage disclosures -- after
+    SATURATION and VERIFICATION, before the MATRIX built from what survived.
+    """
+    assert mod.SECTION_UNRESOLVED_VERDICTS not in _section_keys()
+    assert mod.SECTION_UNRESOLVED_VERDICTS not in _section_keys(dropped_verdicts=())
+
+    keys = _section_keys(dropped_verdicts=_sample_dropped_verdicts())
+    assert keys.index(mod.SECTION_SATURATION) < keys.index(mod.SECTION_UNRESOLVED_VERDICTS)
+    assert keys.index(mod.SECTION_UNRESOLVED_VERDICTS) < keys.index(mod.SECTION_MATRIX)
+
+    keys = _section_keys(
+        dropped_verdicts=_sample_dropped_verdicts(),
+        verify_coverage=mod.VerifyCoverage(novel=5, offered=2, cap=2),
+    )
+    assert keys.index(mod.SECTION_VERIFICATION) < keys.index(mod.SECTION_UNRESOLVED_VERDICTS)
+
+
+def test_census_report_unresolved_verdicts_section_names_every_record():
+    """Every dropped record is named, not just counted: a count tells an
+    operator that something went nowhere, the titles tell them WHERE to look.
+
+    Asserted against the records' own field values rather than a hand-picked
+    phrase, exactly as the WARNING is."""
+    records = _sample_dropped_verdicts()
+    text = _section_text(
+        _sections(dropped_verdicts=records), mod.SECTION_UNRESOLVED_VERDICTS,
+    )
+
+    assert str(len(records)) in text, "the section must size the run"
+    for record in records:
+        for value in (record.title, record.standing_id, record.standing_disposition):
+            if value is None:
+                continue
+            assert value in text, f"{value!r} missing from:\n{text}"
+
+
+def test_section_text_names_the_key_and_the_keys_present_when_absent():
+    """The helper's own failure mode is part of what this workstream buys: an
+    absent section fails naming what was looked for AND what was there,
+    instead of raising a bare IndexError from a string split."""
+    sections = mod.census_report_sections(**_render_kwargs())
+
+    with pytest.raises(AssertionError) as excinfo:
+        _section_text(sections, mod.SECTION_VERIFICATION)
+
+    message = str(excinfo.value)
+    assert mod.SECTION_VERIFICATION in message
+    assert mod.SECTION_SATURATION in message, "the keys actually present must be named"
+
+
+def test_census_report_sections_joined_are_byte_identical_to_the_golden():
+    """The whole-artifact lock, read through the new structure, so the two
+    views cannot drift: whatever
+    test_render_report_flagless_output_is_byte_identical_golden pins for the
+    prose, this pins for the partition."""
+    assert mod.join_report_sections(
+        mod.census_report_sections(**_render_kwargs())
+    ) == _GOLDEN_FLAGLESS_REPORT
 
 
 def test_render_report_flagless_output_is_byte_identical_golden():
@@ -1824,6 +2080,744 @@ def test_run_census_happy_path_full_seam_wiring(tmp_path):
     assert outcome.report_path == str(kwargs["report_path"])
     assert outcome.filed_task_ids == ["task-1"]
     assert outcome.stop_reason == "exhausted"
+
+
+# ---------------------------------------------------------------------------
+# task 5279 W2: a REJECT verdict that resolves to no pending candidate must
+# name itself.
+#
+# Post-4144 `_find_pending_candidate_id` returning None is a NORMAL outcome:
+# when a re-mined title's only same-title candidate is already adjudicated,
+# `codebook.apply_coding_record` deliberately declines to fabricate a pending
+# twin (codebook.py:429-455 -- fabricating one is how rejected
+# cand-20260722-28 came back as pending cand-20260724-2 in the live codebook).
+# The prior verdict standing is CORRECT. The defect is the silence: the
+# `for cluster in rejected:` loop's implicit else discarded a verdict this run
+# PAID a Sonnet call for and said nothing.
+#
+# Seeding an already-adjudicated same-title candidate is sufficient to drive
+# that None through the REAL merge path, so these tests need no hand-built
+# codebook state the merger would never produce.
+# ---------------------------------------------------------------------------
+
+_REJECTED_TITLE = "Spurious pattern"
+"""The title `_happy_invoke_response`'s "novel-rejected" digest proposes, so a
+seeded same-title candidate collides with this run's own mining record."""
+
+
+def _codebook_with_adjudicated_candidate(disposition, *, promoted_to=None, extra_entry=None):
+    """A valid v2 codebook whose only `_REJECTED_TITLE` candidate is ALREADY
+    adjudicated -- the state that makes the merger decline to create a pending
+    twin. `first_seen`/`disposition` are `_CANDIDATE_SCHEMA`-REQUIRED
+    (codebook.py:126), which is why the warning under test can always name
+    them without optional-reading `.get` fallbacks."""
+    cb = _minimal_v2_codebook()
+    if extra_entry is not None:
+        cb["entries"].append(extra_entry)
+    candidate = {
+        "id": "cand-20260701-7",
+        "title": _REJECTED_TITLE,
+        "first_seen": "2026-07-01",
+        "disposition": disposition,
+        "sightings": [],
+    }
+    if promoted_to is not None:
+        candidate["promoted_to"] = promoted_to
+    cb["candidates"].append(candidate)
+    return cb
+
+
+def _rejected_run_kwargs(tmp_path, codebook_dict, **overrides):
+    """`run_census` kwargs for a single-cluster run over the `_REJECTED_TITLE`
+    cluster, whose DEFAULT `verify_fn` rejects it.
+
+    The verdict is chosen by `verify_fn` alone, not by this builder --
+    *overrides* win, so `_verified_run_kwargs` below is this same run with the
+    opposite verdict and a caller can substitute any verifier at all."""
+    defaults = dict(
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[[_hand_digest("novel-rejected", "a spurious one-off")]],
+        verify_fn=_make_fake_verify_fn(rejected_titles={_REJECTED_TITLE}),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        commit=_make_fake_commit(),
+        codebook_dict=codebook_dict,
+    )
+    return _run_census_kwargs(tmp_path, **{**defaults, **overrides})
+
+
+def _verified_run_kwargs(tmp_path, codebook_dict, **overrides):
+    """The same single-cluster run with the OPPOSITE verdict: the verifier
+    VERIFIES `_REJECTED_TITLE`. A thin call of `_rejected_run_kwargs` rather
+    than a second defaults dict -- only `verify_fn` differs, and a fork of the
+    defaults would drift."""
+    return _rejected_run_kwargs(
+        tmp_path, codebook_dict,
+        **{"verify_fn": _make_fake_verify_fn(verified_titles={_REJECTED_TITLE}), **overrides},
+    )
+
+
+def _promoted_entry() -> dict:
+    """The live codebook ENTRY a `promoted` standing candidate points at.
+    Seeded alongside the candidate so `promoted_to` resolves and the codebook
+    stays valid."""
+    return {
+        "id": "entry-spurious",
+        "title": _REJECTED_TITLE,
+        "severity": "medium",
+        "status": "open",
+        "origin_phase": "review",
+        "manifested_phase": "merge",
+        "sightings": [],
+    }
+
+
+def _codebook_with_standing(disposition):
+    """`_codebook_with_adjudicated_candidate` with the `promoted` case's
+    required live entry supplied, so the two dispositions differ only in the
+    word. That is exactly what the inversion test needs: the same run, the
+    same seeding, one word changed, the opposite marker expected."""
+    if disposition == "promoted":
+        return _codebook_with_adjudicated_candidate(
+            "promoted", promoted_to="entry-spurious", extra_entry=_promoted_entry(),
+        )
+    return _codebook_with_adjudicated_candidate(disposition)
+
+
+def _codebook_with_duplicate_standing_candidates(*, promoted_to="entry-spurious"):
+    """The live codebook's KNOWN duplicate-title shape: a `promoted`
+    same-title candidate followed by a `rejected` one (the task-4144
+    cand-20260722-28 / cand-20260724-2 pair the module docstrings cite).
+
+    Order is the whole point -- `rejected` is LAST, so a bare "last same-title
+    match" tie-break picks it while the merger routes the recurrence sighting
+    to the promoted record's live ENTRY. *promoted_to* is parameterised so the
+    same shape can be built with a `promoted_to` that resolves to NO entry,
+    which is the case the merger itself falls through on."""
+    cb = _codebook_with_adjudicated_candidate(
+        "promoted", promoted_to=promoted_to, extra_entry=_promoted_entry(),
+    )
+    cb["candidates"].append({
+        "id": "cand-20260724-2",
+        "title": _REJECTED_TITLE,
+        "first_seen": "2026-07-24",
+        "disposition": "rejected",
+        "sightings": [],
+    })
+    return cb
+
+
+def _verify_fn_with_unknown_titles(*, verified=(), rejected=()):
+    """A verifier whose verdicts name titles the merge never saw -- the
+    shortest route to N dropped verdicts in one run, on EITHER adjudication
+    loop or both at once, independent of any codebook seeding."""
+    def fake_verify_fn(clusters, *, model):
+        return {
+            "verified": [{"title": t, "sightings": []} for t in verified],
+            "rejected": [{"title": t, "sightings": []} for t in rejected],
+            "fixed": [],
+        }
+
+    return fake_verify_fn
+
+
+def _dropped_verdict_warnings(caplog):
+    """Every WARNING naming `_REJECTED_TITLE` as a dropped verdict -- either
+    loop's, since both name the title and both say DROPPED.
+
+    Used to assert the drop is ANNOUNCED at all (a silent drop is the whole
+    defect) and, in one place, that the announcement names the record it came
+    from. What KIND of drop it is comes off
+    `CensusOutcome.dropped_verdicts`, not out of this English."""
+    return [
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.WARNING
+        and _REJECTED_TITLE in r.getMessage()
+        and "DROPPED" in r.getMessage()
+    ]
+
+
+def _drop_warnings_naming(caplog, title):
+    """Every dropped-verdict WARNING naming *title* -- the general form of
+    `_dropped_verdict_warnings`, for the ghost-title runs."""
+    return [
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.WARNING
+        and title in r.getMessage()
+        and "DROPPED" in r.getMessage()
+    ]
+
+
+def _one_dropped(outcome):
+    """The run's single dropped-verdict record, or a legible failure naming
+    what was actually carried.
+
+    THE structure these tests assert on: `kind` is a closed set of machine
+    keys, so the contradiction/agreement distinction an operator acts on is
+    checked as data instead of by matching "CONTRADICT" inside a sentence
+    that is free to be reworded."""
+    records = outcome.dropped_verdicts
+    assert len(records) == 1, f"expected exactly one dropped verdict; got: {records}"
+    return records[0]
+
+
+def test_run_census_dropped_reject_over_a_promoted_candidate_is_a_contradiction(
+    tmp_path, caplog,
+):
+    """The worse case this workstream exists for: a LIVE codebook entry stands
+    while the census's fresh reject verdict is discarded.
+
+    An operator has to know, because only a hand re-open will change it --
+    nothing in the system reconciles a standing promotion against a later
+    verdict that the title is unfounded."""
+    kwargs = _rejected_run_kwargs(tmp_path, _codebook_with_standing("promoted"))
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    record = _one_dropped(outcome)
+    assert record.verdict == "rejected"
+    assert record.title == _REJECTED_TITLE
+    # The marker that separates this from the agreement case below. A live
+    # ENTRY standing against a fresh reject is the thing to act on.
+    assert record.kind == mod.DROP_CONTRADICTION
+    # All three facts an operator needs to find the standing record by hand.
+    assert record.standing_id == "cand-20260701-7"
+    assert record.standing_disposition == "promoted"
+    assert record.standing_first_seen == "2026-07-01"
+    assert len(_dropped_verdict_warnings(caplog)) == 1, "the drop must be announced"
+
+    # Surfacing the drop must not change what is persisted.
+    assert outcome.status == "done"
+    assert codebook.validate(codebook.load(kwargs["codebook_path"])) == []
+
+
+def test_run_census_dropped_reject_over_a_rejected_candidate_is_agreement(
+    tmp_path, caplog,
+):
+    """The agreement case: the standing verdict already says rejected, so the
+    fresh one is a genuine no-op and only the paid-for Sonnet call was wasted.
+
+    It still gets a line -- a recurring non-zero count is the cue that a title
+    keeps being re-mined and re-verified against a verdict that will never
+    change -- but it must be DISTINGUISHABLE from the contradiction above, or
+    an operator scanning the journal cannot tell "nothing to do" from "a live
+    entry was just judged unfounded"."""
+    codebook_dict = _codebook_with_adjudicated_candidate("rejected")
+    kwargs = _rejected_run_kwargs(tmp_path, codebook_dict)
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    record = _one_dropped(outcome)
+    assert record.verdict == "rejected"
+    assert record.title == _REJECTED_TITLE
+    # Asserted against the key the promoted case asserts, so the two cases
+    # cannot converge on one classification later.
+    assert record.kind == mod.DROP_AGREEMENT
+    assert record.standing_id == "cand-20260701-7"
+    assert record.standing_disposition == "rejected"
+    assert record.standing_first_seen == "2026-07-01"
+    assert len(_dropped_verdict_warnings(caplog)) == 1, "the drop must be announced"
+
+    assert outcome.status == "done"
+    assert codebook.validate(codebook.load(kwargs["codebook_path"])) == []
+
+
+def test_run_census_dropped_reject_with_no_standing_candidate_says_so_plainly(
+    tmp_path, caplog,
+):
+    """The stranger case: no same-title candidate exists at all, so there is
+    no standing verdict to explain the drop -- the merge and this run's cluster
+    list disagree about the title. Reached here by a verifier that returns a
+    title the merge never saw.
+
+    The message must say that plainly rather than inventing a standing record;
+    an explanation that is fabricated is worse than an admitted gap."""
+    def verify_fn_inventing_a_title(clusters, *, model):
+        return {
+            "verified": [],
+            "rejected": [{"title": "A title the merge never saw", "sightings": []}],
+            "fixed": [],
+        }
+
+    kwargs = _rejected_run_kwargs(
+        tmp_path, _minimal_v2_codebook(), verify_fn=verify_fn_inventing_a_title,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    record = _one_dropped(outcome)
+    assert record.verdict == "rejected"
+    assert record.title == "A title the merge never saw"
+    assert record.kind == mod.DROP_NO_STANDING
+    # All three standing fields are None exactly when there is no standing
+    # record -- the absence is carried, not explained away with a fabricated
+    # one.
+    assert (
+        record.standing_id,
+        record.standing_disposition,
+        record.standing_first_seen,
+    ) == (None, None, None)
+    assert _drop_warnings_naming(caplog, record.title), "the drop must be announced"
+
+    assert outcome.status == "done"
+    assert codebook.validate(codebook.load(kwargs["codebook_path"])) == []
+
+
+# ---------------------------------------------------------------------------
+# task 5279 review remedy (a): the SAME drop on the `verified` loop.
+#
+# The reject loop above got its three branches; the verified loop kept a bare
+# `if cand_id is None: continue`. That half is the more consequential one: a
+# confusion pattern the census just paid a Sonnet call to CONFIRM never enters
+# the codebook, no entry records it, and the operator-facing tally reports a
+# clean run. Every later census codes against ENTRIES, so a confirmed pattern
+# with no entry is invisible from then on.
+#
+# `promoted` and `rejected` swap roles between the two loops -- see
+# `test_dropped_verdict_contradiction_marker_inverts_between_the_loops`, which
+# pins both directions so the two branch ladders can never be "unified".
+# ---------------------------------------------------------------------------
+
+def test_run_census_dropped_verify_over_a_rejected_candidate_is_a_contradiction(
+    tmp_path, caplog,
+):
+    """A standing REJECT holds against a fresh VERIFY: this run PAID to
+    confirm the pattern and the confirmation is discarded.
+
+    Only a hand re-open changes it -- nothing reconciles a standing rejection
+    against a later verdict that the title is real."""
+    kwargs = _verified_run_kwargs(tmp_path, _codebook_with_standing("rejected"))
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    record = _one_dropped(outcome)
+    assert record.verdict == "verified"
+    assert record.title == _REJECTED_TITLE
+    assert record.kind == mod.DROP_CONTRADICTION
+    # The same three facts the reject branches carry, so an operator finds the
+    # standing record by hand from either loop's drop.
+    assert record.standing_id == "cand-20260701-7"
+    assert record.standing_disposition == "rejected"
+    assert record.standing_first_seen == "2026-07-01"
+    assert len(_dropped_verdict_warnings(caplog)) == 1, "the drop must be announced"
+
+    # WHAT WAS ACTUALLY LOST. The reject-side trio has no analogue for this
+    # assertion, and it is the one that would have caught the silence: a
+    # pattern this run CONFIRMED never became a codebook entry.
+    persisted = codebook.load(kwargs["codebook_path"])
+    assert [e["id"] for e in persisted["entries"]] == ["entry-a"], (
+        "the confirmed pattern silently failed to enter the codebook -- that "
+        "loss is exactly what the WARNING has to announce"
+    )
+    assert outcome.status == "done"
+    assert codebook.validate(persisted) == []
+
+
+def test_run_census_dropped_verify_over_a_promoted_candidate_is_agreement(
+    tmp_path, caplog,
+):
+    """The agreement case on this loop: the title is ALREADY a live codebook
+    entry, so a fresh VERIFY confirms what stands. Nothing is lost but the
+    verify call.
+
+    It still gets a line -- a recurring count is the cue that a title keeps
+    being re-mined and re-confirmed against an entry that already records it
+    -- but it must be DISTINGUISHABLE from the contradiction above."""
+    kwargs = _verified_run_kwargs(tmp_path, _codebook_with_standing("promoted"))
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    record = _one_dropped(outcome)
+    assert record.verdict == "verified"
+    assert record.title == _REJECTED_TITLE
+    # Asserted against the key the contradiction case asserts, so the two
+    # cases cannot converge on one classification later.
+    assert record.kind == mod.DROP_AGREEMENT
+    assert record.standing_id == "cand-20260701-7"
+    assert record.standing_disposition == "promoted"
+    assert record.standing_first_seen == "2026-07-01"
+    assert len(_dropped_verdict_warnings(caplog)) == 1, "the drop must be announced"
+
+    assert outcome.status == "done"
+    assert codebook.validate(codebook.load(kwargs["codebook_path"])) == []
+
+
+def test_dropped_verdict_contradiction_marker_inverts_between_the_loops(tmp_path, caplog):
+    """`promoted` and `rejected` swap roles between the two adjudication
+    loops: a standing PROMOTION contradicts a fresh REJECT, and a standing
+    REJECT contradicts a fresh VERIFY.
+
+    Both directions pinned in ONE test, because the failure this guards
+    against is an edit that copies one loop's branch conditions verbatim into
+    the other -- which passes every single-direction test while mislabelling
+    every drop it touches. Asserted here so that edit fails at the inversion
+    rather than in an operator's journal."""
+    cases = [
+        ("fresh VERIFY vs standing reject",
+         _verified_run_kwargs, "rejected", mod.DROP_CONTRADICTION),
+        ("fresh VERIFY vs standing promotion",
+         _verified_run_kwargs, "promoted", mod.DROP_AGREEMENT),
+        ("fresh REJECT vs standing promotion",
+         _rejected_run_kwargs, "promoted", mod.DROP_CONTRADICTION),
+        ("fresh REJECT vs standing reject",
+         _rejected_run_kwargs, "rejected", mod.DROP_AGREEMENT),
+    ]
+    for label, build_kwargs, standing, expected_kind in cases:
+        caplog.clear()
+        kwargs = build_kwargs(
+            tmp_path / label.replace(" ", "-"), _codebook_with_standing(standing),
+        )
+        with caplog.at_level(logging.WARNING):
+            outcome = mod.run_census(**kwargs)
+
+        record = _one_dropped(outcome)
+        assert record.kind == expected_kind, (
+            f"{label}: classified {record.kind!r}, expected {expected_kind!r} -- "
+            f"the two loops invert; `contradicting_disposition` at the call site "
+            f"is the one value that inverts. Record: {record}"
+        )
+        assert record.standing_disposition == standing
+        assert outcome.status == "done"
+        assert codebook.validate(codebook.load(kwargs["codebook_path"])) == []
+
+
+def test_standing_candidate_follows_the_mergers_promoted_first_precedence(
+    tmp_path, caplog,
+):
+    """When TWO adjudicated candidates share a title, the one that stands is
+    the one the MERGER treats as authoritative -- a `promoted` record whose
+    entry exists wins over a later `rejected` one.
+
+    Reading the list-order last match instead inverts the label on exactly
+    this shape: a live codebook entry stands while the census's fresh REJECT
+    is discarded (the CONTRADICTION an operator must act on), and the drop
+    would be announced as an AGREEMENT with a standing rejection. Seeded in
+    the order that makes the two answers differ, which is the order the live
+    codebook is known to carry (task 4144).
+
+    The second case pins the fall-through the merger also performs: a
+    `promoted` record whose `promoted_to` names no existing entry is NOT
+    authoritative, because no entry exists to carry the signal -- so the
+    later `rejected` record stands and the drop really is an agreement."""
+    cases = [
+        ("promoted_to resolves",
+         "entry-spurious", "cand-20260701-7", mod.DROP_CONTRADICTION),
+        ("promoted_to dangles",
+         "entry-that-never-existed", "cand-20260724-2", mod.DROP_AGREEMENT),
+    ]
+    for label, promoted_to, expected_id, expected_kind in cases:
+        caplog.clear()
+        kwargs = _rejected_run_kwargs(
+            tmp_path / label.replace(" ", "-"),
+            _codebook_with_duplicate_standing_candidates(promoted_to=promoted_to),
+        )
+        with caplog.at_level(logging.WARNING):
+            outcome = mod.run_census(**kwargs)
+
+        record = _one_dropped(outcome)
+        assert record.standing_id == expected_id, (
+            f"{label}: the standing record must be the one the merger routes "
+            f"to ({expected_id}); record: {record}"
+        )
+        assert record.kind == expected_kind, (
+            f"{label}: classified {record.kind!r}, expected {expected_kind!r} -- "
+            f"record: {record}"
+        )
+        assert outcome.status == "done"
+        assert codebook.validate(codebook.load(kwargs["codebook_path"])) == []
+
+
+def test_run_census_dropped_verify_with_no_standing_candidate_says_so_plainly(
+    tmp_path, caplog,
+):
+    """No same-title candidate exists at all, so there is no standing verdict
+    to explain the drop -- the merge and this run's cluster list disagree about
+    the title.
+
+    The message must say that plainly rather than inventing a standing record;
+    an explanation that is fabricated is worse than an admitted gap."""
+    ghost = "A verified title the merge never saw"
+    kwargs = _rejected_run_kwargs(
+        tmp_path, _minimal_v2_codebook(),
+        verify_fn=_verify_fn_with_unknown_titles(verified=(ghost,)),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    record = _one_dropped(outcome)
+    assert record.verdict == "verified"
+    assert record.title == ghost
+    assert record.kind == mod.DROP_NO_STANDING
+    assert (
+        record.standing_id,
+        record.standing_disposition,
+        record.standing_first_seen,
+    ) == (None, None, None)
+    assert _drop_warnings_naming(caplog, ghost), "the drop must be announced"
+
+    assert outcome.status == "done"
+    assert codebook.validate(codebook.load(kwargs["codebook_path"])) == []
+
+
+def _verify_fn_rejecting_unknown_titles(*titles):
+    """The reject-only spelling of `_verify_fn_with_unknown_titles`, kept
+    because its call sites read better named for the verdict they drive."""
+    return _verify_fn_with_unknown_titles(rejected=titles)
+
+
+def _run_summary_records(caplog):
+    """The run-summary WARNING(s) sizing the run, as distinct from the
+    per-cluster warnings (which say "resolved to no pending candidate")."""
+    return [
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.WARNING and "unresolved verdict(s)" in r.getMessage()
+    ]
+
+
+def test_run_census_dropped_rejects_emit_exactly_one_run_summary(tmp_path, caplog):
+    """Dropped reject verdicts are COUNTED, not just individually logged -- an
+    operator needs to know how much of the run went nowhere without tallying
+    per-cluster lines by hand.
+
+    Exactly one summary record, asserted as an exact count rather than a
+    presence, so a second summary mechanism added later fails here rather than
+    quietly doubling the line."""
+    kwargs = _rejected_run_kwargs(
+        tmp_path, _minimal_v2_codebook(),
+        verify_fn=_verify_fn_rejecting_unknown_titles("Ghost title one", "Ghost title two"),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    summaries = _run_summary_records(caplog)
+    assert len(summaries) == 1, (
+        f"exactly one run-summary WARNING, not one per mechanism; got: {summaries}"
+    )
+    assert "2 unresolved verdict(s)" in summaries[0]
+    # The per-cluster warnings are still there -- the summary sizes the run,
+    # they say WHICH titles. Neither replaces the other.
+    per_cluster = [
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.WARNING and "resolved to no pending candidate" in r.getMessage()
+    ]
+    assert len(per_cluster) == 2
+    assert outcome.status == "done"
+
+
+def test_run_census_clean_reject_run_emits_no_run_summary(tmp_path, caplog):
+    """Silence on a clean run is what keeps the line worth reading: a line
+    trained to be ignored is a line that will be ignored on the run that
+    matters. Here the mined title is genuinely new, so the merge assigns it a
+    pending candidate and the reject verdict lands."""
+    kwargs = _rejected_run_kwargs(tmp_path, _minimal_v2_codebook())
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    assert _run_summary_records(caplog) == []
+    # Proves the run really did adjudicate rather than drop silently.
+    persisted = codebook.load(kwargs["codebook_path"])
+    rejected_candidate = next(c for c in persisted["candidates"] if c["title"] == _REJECTED_TITLE)
+    assert rejected_candidate["disposition"] == "rejected"
+    assert outcome.status == "done"
+
+
+def test_run_census_carries_unresolved_verdicts_as_an_outcome_field(tmp_path, caplog):
+    """The count is a FIELD on `CensusOutcome`, not something to be parsed out
+    of log prose -- assertable structurally, exactly like
+    `unverified_clusters`. Asserted on both a dropping and a clean run so the
+    field cannot be a constant."""
+    dropping = _rejected_run_kwargs(
+        tmp_path / "dropping", _minimal_v2_codebook(),
+        verify_fn=_verify_fn_rejecting_unknown_titles("Ghost title one", "Ghost title two"),
+    )
+    clean = _rejected_run_kwargs(tmp_path / "clean", _minimal_v2_codebook())
+
+    with caplog.at_level(logging.WARNING):
+        dropping_outcome = mod.run_census(**dropping)
+        clean_outcome = mod.run_census(**clean)
+
+    assert dropping_outcome.unresolved_verdicts == 2
+    assert clean_outcome.unresolved_verdicts == 0
+    # The count is the records' length, always -- two fields that can disagree
+    # are two sources of truth, and `main`'s summary line reads the count while
+    # the report reads the records.
+    assert dropping_outcome.unresolved_verdicts == len(dropping_outcome.dropped_verdicts)
+    assert clean_outcome.unresolved_verdicts == len(clean_outcome.dropped_verdicts)
+    assert clean_outcome.dropped_verdicts == ()
+
+
+def test_run_census_persists_the_dropped_verdicts_in_the_report(tmp_path, caplog):
+    """The plumbing, end to end: `run_census` hands its drop records to the
+    report, so the DURABLE artifact carries the signal and not only stdout and
+    the log.
+
+    That is the whole point of the section -- an unattended nightly run's
+    stdout and WARNING records are gone by morning, and the dated report is
+    what an operator reads afterwards. A `render_report` that renders the
+    section correctly while `run_census` passes it nothing satisfies every
+    other test in this file."""
+    kwargs = _rejected_run_kwargs(
+        tmp_path, _codebook_with_standing("promoted"),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    record = _one_dropped(outcome)
+    report = kwargs["report_path"].read_text(encoding="utf-8")
+    assert "## Unresolved Verdicts" in report
+    for value in (record.title, record.standing_id, record.standing_disposition):
+        assert value in report, f"{value!r} missing from the persisted report"
+
+
+def test_run_census_clean_report_carries_no_unresolved_verdicts_section(tmp_path):
+    """Gated in the artifact too, not just in the builder: a run that dropped
+    nothing must not grow a section saying so. Same reasoning as the summary
+    line's silence -- a section trained to be ignored will be ignored on the
+    run that matters."""
+    kwargs = _rejected_run_kwargs(tmp_path, _minimal_v2_codebook())
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.dropped_verdicts == ()
+    report = kwargs["report_path"].read_text(encoding="utf-8")
+    assert "Unresolved Verdicts" not in report
+
+
+def test_dropped_verdict_warning_is_rendered_from_the_record(tmp_path, caplog):
+    """THE one place the operator-facing drop prose is checked, and it is
+    checked against the RECORD's own field values rather than a hand-picked
+    phrase.
+
+    What must hold is that a drop is announced and names the standing record
+    an operator would have to go and find; every other word is free to be
+    reworded, which is the point of moving the contradiction/agreement
+    distinction onto `kind`. Covers all three kinds and both loops, since the
+    message builder branches on exactly those."""
+    ghost = "A title the merge never saw"
+    cases = {
+        "contradiction": _rejected_run_kwargs(
+            tmp_path / "contradiction", _codebook_with_standing("promoted"),
+        ),
+        "agreement": _verified_run_kwargs(
+            tmp_path / "agreement", _codebook_with_standing("promoted"),
+        ),
+        "no-standing": _rejected_run_kwargs(
+            tmp_path / "no-standing", _minimal_v2_codebook(),
+            verify_fn=_verify_fn_rejecting_unknown_titles(ghost),
+        ),
+    }
+    seen_kinds = set()
+    for label, kwargs in cases.items():
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            outcome = mod.run_census(**kwargs)
+
+        record = _one_dropped(outcome)
+        seen_kinds.add(record.kind)
+        messages = _drop_warnings_naming(caplog, record.title)
+        assert len(messages) == 1, f"{label}: expected one WARNING; got: {messages}"
+        for field_name in (
+            "verdict", "title", "standing_id",
+            "standing_disposition", "standing_first_seen",
+        ):
+            value = getattr(record, field_name)
+            if value is None:
+                continue
+            assert str(value) in messages[0], (
+                f"{label}: the WARNING does not name {field_name}={value!r}, so an "
+                f"operator cannot find the record it is about. Message: {messages[0]}"
+            )
+
+    assert seen_kinds == {
+        mod.DROP_CONTRADICTION, mod.DROP_AGREEMENT, mod.DROP_NO_STANDING,
+    }, f"every kind must be exercised; reached: {seen_kinds}"
+
+
+def test_unresolved_verdicts_is_one_counter_reached_by_both_loops(tmp_path, caplog):
+    """The counter's own comment claims it is "shared by both adjudication
+    loops" and `CensusOutcome.unresolved_verdicts` says "verify verdicts",
+    loop-agnostically. This is what makes those two statements TRUE rather
+    than aspirational.
+
+    A reject-only counter satisfies every other test in this block, so the
+    mixed run is the only shape that can tell the two apart: one dropped
+    VERIFY plus one dropped REJECT must tally to 2 on ONE counter and emit ONE
+    summary line, and a verify-only run must reach a non-zero count at all."""
+    mixed = _rejected_run_kwargs(
+        tmp_path / "mixed", _minimal_v2_codebook(),
+        verify_fn=_verify_fn_with_unknown_titles(
+            verified=("Ghost verified",), rejected=("Ghost rejected",),
+        ),
+    )
+    verify_only = _rejected_run_kwargs(
+        tmp_path / "verify-only", _minimal_v2_codebook(),
+        verify_fn=_verify_fn_with_unknown_titles(
+            verified=("Ghost verified one", "Ghost verified two"),
+        ),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        mixed_outcome = mod.run_census(**mixed)
+    summaries = _run_summary_records(caplog)
+    assert len(summaries) == 1, (
+        f"one summary for the whole run, not one per loop; got: {summaries}"
+    )
+    assert "2 unresolved verdict(s)" in summaries[0], (
+        "a reject-only tally reports 1 here -- the verify-loop drop must land "
+        f"on the same counter. Got: {summaries[0]}"
+    )
+    assert mixed_outcome.unresolved_verdicts == 2
+    # The structural form of the same claim, and the stronger one: a count of
+    # 2 is reachable from one loop, a record from EACH loop is not.
+    assert {r.verdict for r in mixed_outcome.dropped_verdicts} == {"verified", "rejected"}
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        verify_only_outcome = mod.run_census(**verify_only)
+    assert verify_only_outcome.unresolved_verdicts == 2, (
+        "the field is not reject-only: two dropped VERIFY verdicts and no "
+        "dropped reject must still count"
+    )
+    assert len(_run_summary_records(caplog)) == 1
+
+
+def test_main_done_line_names_unresolved_verdicts_only_when_non_zero(
+    tmp_path, monkeypatch, capsys,
+):
+    """The CLI clause appears exactly when it carries information, so a normal
+    run's summary line stays BYTE-unchanged -- same gating reasoning as
+    render_report's coverage-shortfall clause."""
+    _write_legibility_yaml(_default_config_path(tmp_path))
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+
+    def _run_main(unresolved):
+        monkeypatch.setattr(mod, "run_census", _make_fake_main_run_census(
+            outcome=mod.CensusOutcome(
+                status="done", report_path="plans/confusion-census-2026-01-02.md",
+                filed_task_ids=["1234"], stop_reason="exhausted",
+                unresolved_verdicts=unresolved,
+            ),
+        ))
+        assert mod.main(["--project-root", str(tmp_path), "--force"]) == 0
+        return capsys.readouterr().out
+
+    noisy = _run_main(3)
+    assert "unresolved_verdicts=3" in noisy
+
+    quiet = _run_main(0)
+    assert "unresolved_verdicts" not in quiet
+    # Byte-identical to the line minus the clause -- not merely "the substring
+    # is absent", which a reworded line would also satisfy.
+    assert quiet == noisy.replace(" unresolved_verdicts=3", "")
 
 
 # ---------------------------------------------------------------------------
@@ -2168,7 +3162,7 @@ def test_run_census_storm_batch_capped_reports_coded_of_drawn_end_to_end(tmp_pat
     # (now-empty) source is ever polled again -- "capped", not "exhausted".
     assert outcome.stop_reason == "capped"
     report_text = kwargs["report_path"].read_text(encoding="utf-8")
-    coverage_line = _coverage_line(report_text)
+    coverage_line = _persisted_coverage_line(report_text)
     assert "coded 1 of 3 session digest(s) drawn" in coverage_line, (
         "only dup-1 coded successfully; bad-1 and bad-2 failed to parse -- "
         "this count must come from a real coder.code_digests run, not a "
@@ -2350,7 +3344,7 @@ def test_run_census_max_verify_clusters_defers_the_rest_as_pending_candidates(tm
     # (c) the report states the split
     report_text = kwargs["report_path"].read_text(encoding="utf-8")
     lowered = report_text.lower()
-    assert "verified 1 of 3 novel clusters" in lowered
+    assert "handed 1 of 3 novel clusters to the verifier" in lowered
     assert "2 deferred" in lowered
     assert "pending candidate" in lowered
 
@@ -2836,7 +3830,7 @@ def test_run_census_all_three_cost_control_flags_interact_end_to_end(tmp_path, c
     # (none configured to fail to parse), so coded == drawn == 3 here -- no
     # shortfall clause is expected from THIS combination; step-5's extension
     # of the storm test already locks that clause separately.
-    coverage_line = _coverage_line(report_text)
+    coverage_line = _persisted_coverage_line(report_text)
     assert "coded 3 of 3" in coverage_line
     assert "operator batch cap = 1" in coverage_line
     assert "failed to code" not in coverage_line.lower()
@@ -2858,7 +3852,7 @@ def test_run_census_all_three_cost_control_flags_interact_end_to_end(tmp_path, c
     assert "## Verification" in report_text
     verification_section = report_text.split("## Verification", 1)[1].split("##", 1)[0]
     verification_lowered = verification_section.lower()
-    assert "verified 1 of 2 novel clusters" in verification_lowered
+    assert "handed 1 of 2 novel clusters to the verifier" in verification_lowered
     assert "1 deferred" in verification_lowered
     assert "pending candidate" in verification_lowered
 
@@ -3368,7 +4362,7 @@ class _FakeHttpxResponse:
         return self._payload
 
 
-def test_post_mcp_tool_call_sends_streamable_http_accept_headers(install_fake_httpx):
+def test_post_mcp_tool_call_sends_streamable_http_accept_headers(install_fake_httpx, monkeypatch):
     """Task 2953: the streamable-HTTP MCP transport 406s any tools/call POST
     lacking an Accept header covering both application/json and
     text/event-stream (verified live against a local MCP /mcp endpoint --
@@ -3391,7 +4385,15 @@ def test_post_mcp_tool_call_sends_streamable_http_accept_headers(install_fake_ht
 
     install_fake_httpx(_fake_post)
 
-    result = mod._post_mcp_tool_call("http://localhost:8002/mcp", "submit_task", {"a": 1})
+    # ENTITLED to reach census's real delegate: this test owns the endpoint --
+    # `install_fake_httpx` substitutes a stub httpx BELOW the transport, so
+    # nothing leaves the process, and the whole point is to assert the real
+    # outbound request shape. Declared around the call rather than inferred
+    # (task 5279 W1).
+    with mod.own_endpoint():
+        result = mod._post_mcp_tool_call(
+            "http://localhost:8002/mcp", "submit_task", {"a": 1},
+        )
 
     assert result == {"ok": True}
     headers = captured_kwargs.get("headers") or {}
@@ -3405,6 +4407,162 @@ def test_post_mcp_tool_call_sends_streamable_http_accept_headers(install_fake_ht
     assert envelope.get("method") == "tools/call"
     assert envelope.get("params", {}).get("name") == "submit_task"
     assert envelope.get("params", {}).get("arguments") == {"a": 1}
+
+
+
+
+# ---------------------------------------------------------------------------
+# task 5279 W1: a pytest process never POSTs to a real MCP endpoint through
+# this module. `_post_mcp_tool_call` is the single transport boundary for BOTH
+# `escalate_info` (:8103) and `submit_task` (:8002), and `main()`'s fail-loud
+# catch-all reaches it with no test-mode gate -- so a main()-level test whose
+# monkeypatched `run_census` raises UNEXPECTEDLY files a real escalation into
+# the live operator queue. The recorder below is installed on
+# `census_trigger.post_mcp_tool_call` -- the layer BELOW census's delegate --
+# precisely so the guard under test cannot be the thing that hides the
+# evidence.
+# ---------------------------------------------------------------------------
+
+def _make_transport_recorder():
+    """Record every call that reaches `census_trigger.post_mcp_tool_call`,
+    the real transport below `census._post_mcp_tool_call`.
+
+    A RECORDER, never a raiser: `_build_default_escalate_fn`'s best-effort
+    `except Exception` would swallow a raise and turn a leak into a passing
+    test. Recording makes the leak assertable on the calls list instead."""
+    calls = []
+
+    def _recorder(url, tool_name, arguments, **kwargs):
+        calls.append((url, tool_name, arguments))
+        return {}
+
+    _recorder.calls = calls
+    return _recorder
+
+
+def test_main_hard_failure_under_pytest_reaches_no_real_mcp_endpoint(tmp_path, monkeypatch):
+    """The live leak, reproduced through the path it actually travelled:
+    `main()` --force -> `run_census` raises UNEXPECTEDLY -> the fail-loud
+    catch-all calls the REAL `_build_default_escalate_fn` poster, which POSTs
+    `escalate_info` to `http://localhost:8103/mcp` -- the production
+    escalation queue, because `_write_legibility_yaml` writes the production
+    `escalation_port: 8103` into its tmp_path config.
+
+    `mod._post_mcp_tool_call` is deliberately NOT monkeypatched here (unlike
+    `test_main_failure_files_escalation`, which fakes it): the real poster
+    must run, so that what is pinned is the GUARD rather than the test's own
+    fixture discipline. A test-minted escalation is indistinguishable at
+    triage from a genuine census failure -- same synthetic `task_id`, same
+    `agent_role` -- which is how `esc-legibility-census-dark_factory-2`
+    reached dedupe_count=21.
+
+    The exit contract is asserted alongside: refusing the POST must not
+    change `main()`'s authoritative signal (tasks 2951/2952/3644)."""
+    _write_legibility_yaml(_default_config_path(tmp_path))
+
+    def raising_run_census(**kwargs):
+        raise RuntimeError("codebook merge produced an invalid codebook")
+
+    monkeypatch.setattr(mod, "run_census", raising_run_census)
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+
+    recorder = _make_transport_recorder()
+    monkeypatch.setattr(census_trigger, "post_mcp_tool_call", recorder)
+
+    exit_code = mod.main(["--project-root", str(tmp_path), "--force"])
+
+    assert recorder.calls == [], (
+        "a pytest run must reach no real MCP endpoint through census.py; "
+        f"these POSTs escaped: {recorder.calls}"
+    )
+    assert exit_code == 1, "refusing the POST must not change main()'s exit contract"
+
+
+def test_post_mcp_tool_call_outside_pytest_still_reaches_the_transport(monkeypatch):
+    """The production path is untouched: with no `PYTEST_CURRENT_TEST` in the
+    environment the guard no-ops and the delegate forwards url, tool name and
+    arguments to `census_trigger.post_mcp_tool_call` verbatim.
+
+    This is the half of the contract that keeps tasks 2951/2952/3644 intact --
+    a real census hard failure on a real run must still file its escalation."""
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    recorder = _make_transport_recorder()
+    monkeypatch.setattr(census_trigger, "post_mcp_tool_call", recorder)
+
+    mod._post_mcp_tool_call("http://localhost:9/mcp", "escalate_info", {"a": 1})
+
+    assert recorder.calls == [("http://localhost:9/mcp", "escalate_info", {"a": 1})]
+    # Pin the GUARD as the no-op, not just the reachability of the transport:
+    # asserting only on `recorder.calls` would pass equally against a guard
+    # that had simply been deleted, which is the regression this test exists
+    # to be the counterweight to.
+    assert mod._refuse_real_post_under_test("http://localhost:9/mcp", "escalate_info") is None
+
+
+def test_own_endpoint_is_the_declared_escape_hatch(monkeypatch):
+    """Entitlement to post for real under pytest is DECLARED, not inferred.
+
+    No automatic signal separates "a server this test brought up on an
+    ephemeral port" from "the ambient production server on 8103" -- the
+    leaking tests use 8103 too. So a caller that serves or fakes its OWN
+    endpoint says so by wrapping the call in `mod.own_endpoint()`, which is
+    what `escalation/tests/test_legibility_census_escalation_e2e.py` (task
+    3644's live-server acceptance suite) does. Pinning the seam is what keeps
+    that opt-out from silently turning into "the guard stopped working"."""
+    recorder = _make_transport_recorder()
+    monkeypatch.setattr(census_trigger, "post_mcp_tool_call", recorder)
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "test_own_endpoint (call)")
+
+    # Without the declaration: refused, and the refusal explains itself.
+    with pytest.raises(mod.CensusPostRefusedUnderTest) as excinfo:
+        mod._post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {"a": 1})
+    assert recorder.calls == []
+    message = str(excinfo.value)
+    # A future e2e author gets a self-explaining failure, not a mystery: the
+    # tool, the target and the way out are all named in the message itself.
+    assert "escalate_info" in message
+    assert "http://localhost:8103/mcp" in message
+    assert "own_endpoint" in message
+
+    # With the declaration around the call: the transport is reached.
+    with mod.own_endpoint():
+        mod._post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {"a": 1})
+    assert recorder.calls == [("http://localhost:8103/mcp", "escalate_info", {"a": 1})]
+
+
+def test_own_endpoint_grant_does_not_outlive_its_block(monkeypatch):
+    """The grant is CALL-scoped, which is the whole reason it is a context
+    manager rather than a rebind that lasts a test or a fixture.
+
+    census posts to two endpoints -- `escalate_info` on the project's
+    escalation server and `submit_task` on fused-memory -- and a test that
+    owns one of them owns only that one. A grant that leaked past the `with`
+    would quietly entitle the other, which is strictly more than the
+    declaration claims. Also pinned: the grant is released even when the
+    entitled call RAISES, since an e2e test asserting on a failure is exactly
+    the shape that would otherwise leave it set."""
+    recorder = _make_transport_recorder()
+    monkeypatch.setattr(census_trigger, "post_mcp_tool_call", recorder)
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "test_own_endpoint_scope (call)")
+
+    with mod.own_endpoint():
+        mod._post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {"a": 1})
+    with pytest.raises(mod.CensusPostRefusedUnderTest):
+        mod._post_mcp_tool_call("http://localhost:8002/mcp", "submit_task", {"a": 1})
+
+    def _boom(url, tool_name, arguments, timeout=None):
+        raise RuntimeError("the entitled call itself failed")
+
+    monkeypatch.setattr(census_trigger, "post_mcp_tool_call", _boom)
+    with pytest.raises(RuntimeError), mod.own_endpoint():
+        mod._post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {})
+
+    monkeypatch.setattr(census_trigger, "post_mcp_tool_call", recorder)
+    with pytest.raises(mod.CensusPostRefusedUnderTest):
+        mod._post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {"a": 1})
+    assert recorder.calls == [("http://localhost:8103/mcp", "escalate_info", {"a": 1})], (
+        "only the one entitled POST may have reached the transport"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -4358,3 +5516,807 @@ def test_default_verify_fn_unparseable_banner_treats_a_raising_probe_as_no_headr
     assert exc.verified == 1
     assert exc.unverified == 3
     assert "raised" in (exc.reason or "").lower()
+
+
+# ---------------------------------------------------------------------------
+# task 4879 step-1: RED — W-A. `mine_to_saturation` must surface ONE
+# aggregated WARNING per FAILING batch. Today it surfaces nothing per batch:
+# the only trace of a failed digest is `coder.code_digests`' per-digest line,
+# which floods one WARNING per failure and is emitted by a module this task
+# is locked out of. The aggregate is the caller-side signal that says how
+# many digests failed, how many DISTINCT reasons there were, and which
+# sessions to look at — grouped by EXACT reason string, because the whole
+# point of the per-digest lines is telling N identical ENOENTs apart from N
+# genuinely distinct model errors, and any normalization is a guess that can
+# collapse the two.
+# ---------------------------------------------------------------------------
+
+_MINING_FAIL_REPLY_A = "this is not JSON and will fail to parse"
+_MINING_FAIL_REPLY_B = "[]"
+
+
+def _mining_response_fn_with_two_failure_reasons(novel_sessions, fail_a, fail_b):
+    """Like `_mining_response_fn_with_failures`, but splits the failing
+    sessions across TWO replies that fail to parse in DIFFERENT ways, so
+    `coder.code_digests` comes back with exactly two DISTINCT reason
+    strings ("could not parse a JSON object from coder output: ..." vs
+    "coder output parsed as list, expected a JSON object"). One reason
+    string cannot show that the aggregate groups rather than merely
+    counts."""
+    def _fn(prompt, model):
+        for session_id in fail_a:
+            if session_id in prompt:
+                return _MINING_FAIL_REPLY_A
+        for session_id in fail_b:
+            if session_id in prompt:
+                return _MINING_FAIL_REPLY_B
+        for session_id in novel_sessions:
+            if session_id in prompt:
+                return json.dumps(
+                    {"matches": [], "candidates": [{"title": f"novel shape {session_id}"}]}
+                )
+        return json.dumps({"matches": [{"entry_id": "entry-a"}], "candidates": []})
+
+    return _fn
+
+
+def _two_batch_source_with_a_failing_second_batch():
+    """batch 0: 10/10 code cleanly (a HEALTHY batch — it must stay silent).
+    batch 1: 6 of 10 digests fail, 4 with reply A and 2 with reply B, giving
+    exactly two distinct reason strings with counts 4 and 2. Returns
+    (source, invoke, saturation, fail_a, fail_b)."""
+    batch0 = _batch_digests(10, "h0")
+    batch1 = _batch_digests(10, "f1")
+    fail_a = {f"f1-{i}" for i in range(4)}
+    fail_b = {f"f1-{i}" for i in range(4, 6)}
+    source = _TrackingBatchSource([batch0, batch1])
+    # dup_rate 0.9 / consecutive 3 with an all-duplicate healthy batch would
+    # saturate at batch 2; consecutive_batches=3 keeps both batches consumed.
+    saturation = config_mod.Saturation(dup_rate=0.9, consecutive_batches=3)
+    fake_invoke = _make_fake_invoke(
+        _mining_response_fn_with_two_failure_reasons(set(), fail_a, fail_b)
+    )
+    return source, fake_invoke, saturation, fail_a, fail_b
+
+
+def _census_warnings(caplog):
+    """Only this module's own WARNING records — never `legibility.coder`'s
+    per-digest lines, which a bare substring match would happily pick up."""
+    return [
+        r for r in caplog.records
+        if r.name == "legibility.census" and r.levelno == logging.WARNING
+    ]
+
+
+def test_mine_to_saturation_emits_one_aggregated_warning_per_failing_batch(caplog):
+    live_codebook = _minimal_v2_codebook()
+    source, fake_invoke, saturation, fail_a, fail_b = (
+        _two_batch_source_with_a_failing_second_batch()
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = mod.mine_to_saturation(
+            source, live_codebook, project="dark_factory", model="sonnet",
+            config=saturation, invoke=fake_invoke,
+        )
+
+    assert [s.failed for s in result.batch_stats] == [0, 6], "fixture sanity"
+
+    census_warnings = _census_warnings(caplog)
+    batch1_lines = [r for r in census_warnings if "batch 1" in r.getMessage()]
+    assert len(batch1_lines) == 1, (
+        "exactly ONE aggregated census line for the failing batch, not one per "
+        f"failed digest; got {[r.getMessage() for r in census_warnings]}"
+    )
+    message = batch1_lines[0].getMessage()
+
+    # (b) how much of the batch failed, and how many distinct reasons
+    assert "6/10" in message, f"must name failed/total; got {message!r}"
+    assert "2 distinct" in message, f"must name the distinct-reason count; got {message!r}"
+
+    # (c) both reason texts, each with its own count and an example session
+    assert "could not parse a JSON object from coder output" in message
+    assert "coder output parsed as list, expected a JSON object" in message
+    assert "4" in message and "2" in message, "each reason's own count"
+    assert any(s in message for s in fail_a), f"an example session for reason A; got {message!r}"
+    assert any(s in message for s in fail_b), f"an example session for reason B; got {message!r}"
+
+    # (d) a healthy batch stays silent
+    assert not [r for r in census_warnings if "batch 0" in r.getMessage()], (
+        "a batch with zero failures must emit no aggregate line at all"
+    )
+
+
+# ---------------------------------------------------------------------------
+# task 4879 step-3: RED — W-A, the BOUND. The aggregate above is the census's
+# own signal; it does not by itself reduce the flood, it adds to it. The
+# per-digest `legibility.coder` lines must ALSO be capped for the duration of
+# census's own `code_digests` call — capped, not silenced: a small non-zero
+# exemplar allowance keeps the raw line shape visible for the common
+# one-or-two-failure batch and makes the suppression obviously partial, and
+# the aggregate says how many lines were dropped so the drop is loud rather
+# than silent. The bound must be CALLER-SCOPED: `nightly.run_nightly`'s
+# trickle is the one sink some failures ever reach, so a filter must never
+# outlive census's own call — including when the loop unwinds abnormally.
+# ---------------------------------------------------------------------------
+
+def _coder_warnings(caplog):
+    return [
+        r for r in caplog.records
+        if r.name == "legibility.coder" and r.levelno == logging.WARNING
+    ]
+
+
+def test_mine_to_saturation_bounds_the_coder_per_digest_flood_without_silencing_other_callers(
+    caplog,
+):
+    live_codebook = _minimal_v2_codebook()
+    source, fake_invoke, saturation, fail_a, fail_b = (
+        _two_batch_source_with_a_failing_second_batch()
+    )
+    limit = mod._MAX_PER_DIGEST_CODER_WARNINGS_PER_BATCH
+
+    with caplog.at_level(logging.WARNING):
+        result = mod.mine_to_saturation(
+            source, live_codebook, project="dark_factory", model="sonnet",
+            config=saturation, invoke=fake_invoke,
+        )
+
+    assert [s.failed for s in result.batch_stats] == [0, 6], "fixture sanity"
+
+    # (a) the flood really is bounded
+    coder_lines = _coder_warnings(caplog)
+    assert len(coder_lines) <= limit, (
+        f"at most {limit} per-digest lines may survive the batch; got {len(coder_lines)}"
+    )
+    assert len(coder_lines) < 6, "strictly fewer lines than the 6 failures — a real bound"
+    assert coder_lines, "the allowance is non-zero: exemplar lines must still get through"
+
+    # (b) the drop is LOUD — the aggregate names how many lines were suppressed
+    batch1_lines = [
+        r for r in _census_warnings(caplog) if "batch 1" in r.getMessage()
+    ]
+    assert len(batch1_lines) == 1
+    message = batch1_lines[0].getMessage()
+    suppressed = 6 - len(coder_lines)
+    assert "suppress" in message.lower(), (
+        f"the aggregate must state that lines were bounded; got {message!r}"
+    )
+    assert str(suppressed) in message, (
+        f"and how many ({suppressed}); got {message!r}"
+    )
+
+    # (c) caller-scoped, not global: nothing survives the call
+    assert logging.getLogger("legibility.coder").filters == [], (
+        "the bound must be removed when mine_to_saturation returns"
+    )
+
+
+def test_mine_to_saturation_bound_leaves_a_later_direct_code_digests_call_untouched(caplog):
+    """(d) The nightly trickle's per-digest visibility is the whole reason the
+    bound is caller-scoped: a `coder.code_digests` call made outside census
+    must still emit ONE WARNING per failed digest."""
+    live_codebook = _minimal_v2_codebook()
+    source, fake_invoke, saturation, fail_a, fail_b = (
+        _two_batch_source_with_a_failing_second_batch()
+    )
+
+    with caplog.at_level(logging.WARNING):
+        mod.mine_to_saturation(
+            source, live_codebook, project="dark_factory", model="sonnet",
+            config=saturation, invoke=fake_invoke,
+        )
+        caplog.clear()
+        # The same failing fixture, called directly — as nightly.run_nightly does.
+        direct = coder.code_digests(
+            _batch_digests(10, "f1"), live_codebook,
+            project="dark_factory", model="sonnet", invoke=fake_invoke,
+        )
+
+    assert direct.failed == 6, "fixture sanity"
+    assert len(_coder_warnings(caplog)) == 6, (
+        "a direct caller must still get one WARNING per failed digest"
+    )
+
+
+def test_mine_to_saturation_bound_is_removed_when_the_batch_loop_unwinds(caplog):
+    """(e) An exception mid-iteration must not leave the filter attached — a
+    leaked filter would silently bound another caller's logging forever."""
+    live_codebook = _minimal_v2_codebook()
+    _, fake_invoke, saturation, _, _ = _two_batch_source_with_a_failing_second_batch()
+
+    class _RaisingBatchSource:
+        def __iter__(self):
+            yield _batch_digests(10, "f1")   # a batch that fails 6/10
+            raise RuntimeError("batch source blew up mid-iteration")
+
+    with pytest.raises(RuntimeError, match="blew up mid-iteration"):
+        mod.mine_to_saturation(
+            _RaisingBatchSource(), live_codebook, project="dark_factory",
+            model="sonnet", config=saturation, invoke=fake_invoke,
+        )
+
+    assert logging.getLogger("legibility.coder").filters == [], (
+        "the bound must be removed even when the loop unwinds abnormally"
+    )
+
+
+def test_mine_to_saturation_bound_is_spent_only_on_warnings_not_on_chatter(caplog):
+    """(f) The bound is a WARNING bound — its names say so and the filter must
+    enforce it. A future `logger.info`/`logger.debug` in coder.py (simulated
+    here by logging on that logger from inside the invoke seam, which runs
+    inside census's own `code_digests` call) must pass through unbounded AND
+    must not consume the per-digest WARNING allowance."""
+    live_codebook = _minimal_v2_codebook()
+    source, fake_invoke, saturation, _, _ = (
+        _two_batch_source_with_a_failing_second_batch()
+    )
+    coder_logger = logging.getLogger("legibility.coder")
+    chatter = 0
+
+    def chatty_invoke(prompt, model):
+        nonlocal chatter
+        chatter += 1
+        coder_logger.info("coder: hypothetical future per-digest progress line")
+        coder_logger.debug("coder: hypothetical future debug line")
+        return fake_invoke(prompt, model)
+
+    with caplog.at_level(logging.DEBUG):
+        mod.mine_to_saturation(
+            source, live_codebook, project="dark_factory", model="sonnet",
+            config=saturation, invoke=chatty_invoke,
+        )
+
+    assert chatter == 20, "fixture sanity: two batches of ten digests each"
+    sub_warning = [
+        r for r in caplog.records
+        if r.name == "legibility.coder" and r.levelno < logging.WARNING
+    ]
+    assert len(sub_warning) == 2 * chatter, (
+        f"every sub-WARNING record must pass through unbounded; got {len(sub_warning)}"
+    )
+
+    # And the real per-digest WARNINGs still get their full allowance: the
+    # chatter did not eat the budget out from under them.
+    limit = mod._MAX_PER_DIGEST_CODER_WARNINGS_PER_BATCH
+    assert len(_coder_warnings(caplog)) == limit
+    batch1 = [r for r in _census_warnings(caplog) if "batch 1" in r.getMessage()]
+    assert len(batch1) == 1
+    assert f"{6 - limit} " in batch1[0].getMessage(), (
+        "and the reported suppressed count still counts only WARNINGs; got "
+        f"{batch1[0].getMessage()!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# task 4879 step-5: RED — W-B. `CensusHeadroomExhausted` carries `verified`
+# and `unverified` but NOT `rejected`, so on any run where a cluster was
+# rejected before the hit the two counts silently fail to account for the
+# whole run: an operator reading "1 verified, 3 unverified" of a 5-cluster
+# run cannot tell whether the missing cluster was work already spent or a
+# bookkeeping bug. A rejection is real, paid-for adjudication, not an
+# absence. Every case below drives the REAL `_build_default_verify_fn` (never
+# a hand-raised exception) and arranges at least one PRECEDING rejection, so
+# the divergence the current two counts hide is actually present.
+# ---------------------------------------------------------------------------
+
+_UNPARSEABLE_PLAIN_PROSE = (
+    "The rotation looks fine to me and I have nothing further to add about it."
+)
+_UNPARSEABLE_BANNERED_PROSE = (
+    "I cannot answer right now: this account has hit its weekly limit."
+)
+
+
+def _no_headroom(reason="probe reports no capacity"):
+    return mod.HeadroomResult(ok=False, reason=reason)
+
+
+def test_census_headroom_exhausted_counts_account_for_every_offered_cluster_at_the_backstop():
+    """(a) The periodic backstop site, with the hitting cluster ALREADY
+    adjudicated (so `unverified == remaining - 1`)."""
+    calls = []
+
+    def invoke(prompt, model):
+        calls.append(prompt)
+        if len(calls) == 1:
+            return _UNPARSEABLE_PLAIN_PROSE   # cluster 0 rejects, no banner, no probe
+        return _verdict()                      # clusters 1 and 2 verify
+
+    clusters = _clusters(5)
+    verify_fn = mod._build_default_verify_fn(
+        "/tmp/root", invoke,
+        headroom_probe=_make_recording_probe(_no_headroom()),
+        probe_every=3,
+    )
+
+    with pytest.raises(mod.CensusHeadroomExhausted) as excinfo:
+        verify_fn(clusters, model="sonnet")
+
+    exc = excinfo.value
+    assert exc.verified == 2, "clusters 1 and 2 came back verified"
+    assert exc.rejected == 1, "cluster 0's unparseable verdict is real work already spent"
+    assert exc.unverified == 2, "clusters 3 and 4 were never attempted"
+    assert exc.verified + exc.rejected + exc.unverified == len(clusters)
+
+
+def test_census_headroom_exhausted_counts_account_for_every_offered_cluster_at_the_invoke_error():
+    """(b) The invocation-error site, where the hitting cluster is NOT yet
+    appended (so `unverified == remaining`)."""
+    calls = []
+
+    def invoke(prompt, model):
+        calls.append(prompt)
+        if len(calls) == 1:
+            return _verdict()                  # cluster 0 verifies
+        if len(calls) == 2:
+            return _UNPARSEABLE_PLAIN_PROSE    # cluster 1 rejects
+        raise coder.CoderInvocationError("claude CLI exited 1: simulated cap")
+
+    clusters = _clusters(5)
+    verify_fn = mod._build_default_verify_fn(
+        "/tmp/root", invoke,
+        headroom_probe=_make_recording_probe(_no_headroom()),
+        probe_every=100,                       # no backstop — isolate this site
+    )
+
+    with pytest.raises(mod.CensusHeadroomExhausted) as excinfo:
+        verify_fn(clusters, model="sonnet")
+
+    exc = excinfo.value
+    assert exc.verified == 1
+    assert exc.rejected == 1
+    assert exc.unverified == 3, "the hitting cluster 2, plus 3 and 4"
+    assert exc.verified + exc.rejected + exc.unverified == len(clusters)
+
+
+def test_census_headroom_exhausted_counts_account_for_every_offered_cluster_at_the_banner():
+    """(c) The unparseable-banner site — also a not-yet-appended site."""
+    assert mod.looks_like_blocking_banner(_UNPARSEABLE_BANNERED_PROSE) is not None, (
+        "fixture sanity: the bannered reply must actually match a marker"
+    )
+    assert mod.looks_like_blocking_banner(_UNPARSEABLE_PLAIN_PROSE) is None, (
+        "fixture sanity: the plain reply must NOT match, so it spends no probe"
+    )
+    calls = []
+
+    def invoke(prompt, model):
+        calls.append(prompt)
+        if len(calls) == 1:
+            return _verdict()                  # cluster 0 verifies
+        if len(calls) == 2:
+            return _UNPARSEABLE_PLAIN_PROSE    # cluster 1 rejects, no probe spent
+        return _UNPARSEABLE_BANNERED_PROSE     # cluster 2: unparseable WITH a marker
+
+    clusters = _clusters(5)
+    verify_fn = mod._build_default_verify_fn(
+        "/tmp/root", invoke,
+        headroom_probe=_make_recording_probe(_no_headroom()),
+        probe_every=100,
+    )
+
+    with pytest.raises(mod.CensusHeadroomExhausted) as excinfo:
+        verify_fn(clusters, model="sonnet")
+
+    exc = excinfo.value
+    assert "banner" in exc.reason, "this must be the banner site, not the backstop"
+    assert exc.verified == 1
+    assert exc.rejected == 1
+    assert exc.unverified == 3
+    assert exc.verified + exc.rejected + exc.unverified == len(clusters)
+
+
+# ---------------------------------------------------------------------------
+# task 4879 step-7: RED — W-B, the MESSAGE. Step-6 put the rejected count on
+# the exception; nothing reads it yet. `_defer` still renders two counts that
+# do not account for the run, so the escalation an operator actually reads is
+# still the one that cannot say how much of an expensive run had completed.
+# ---------------------------------------------------------------------------
+
+def _defer_blob(escalate_fn):
+    assert len(escalate_fn.calls) == 1, escalate_fn.calls
+    call = escalate_fn.calls[0]
+    return (call.get("summary") or "") + (call.get("detail") or "")
+
+
+def test_run_census_defer_message_accounts_for_the_whole_run(tmp_path):
+    """5 clusters offered, 2 already adjudicated (1 verified + 1 rejected),
+    3 never reached. The message must name all three counts AND the total."""
+    def raising_verify_fn(clusters, *, model):
+        raise mod.CensusHeadroomExhausted(
+            stage="verify",
+            reason="probe reports no capacity",
+            verified=1, rejected=1, unverified=3,
+        )
+
+    fake_escalate_fn = _make_fake_escalate_fn()
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_three_novel_invoke),
+        batch_source=[_three_novel_batch()],
+        verify_fn=raising_verify_fn,
+        synthesize_fn=_poison("synthesize_fn"),
+        escalate_fn=fake_escalate_fn,
+        commit=_poison("commit"),
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "deferred"
+
+    # Structurally first: all three counts are FIELDS, so what the operator is
+    # asked to trust is assertable without grepping digits out of prose.
+    counts = (
+        outcome.verified_clusters,
+        outcome.rejected_clusters,
+        outcome.unverified_clusters,
+    )
+    assert counts == (1, 1, 3)
+
+    blob = _defer_blob(fake_escalate_fn)
+
+    # The legacy pin, kept intact rather than re-spelled — see the design
+    # decision. `test_run_census_verify_headroom_abort_persists_nothing`
+    # asserts this exact substring and must not silently rot.
+    assert "1 cluster(s) verified" in blob
+
+    # The rendered CLAUSE, not incidental digits: a bare `"3" in blob` passes
+    # on any stray digit anywhere in the reason, summary or recovery prose.
+    assert "1 were verified before the cap" in blob
+    assert "1 were rejected before it" in blob, (
+        f"the REJECTED count must be named — it is work already spent; got {blob!r}"
+    )
+    assert "3 were NOT verified" in blob
+
+    # And the stated total is the SUM of those three, not an independent
+    # fourth number: this is the arithmetic the operator is asked to trust.
+    assert f"Of {sum(counts)} novel cluster(s) offered" in blob
+    assert "of 5 offered" in blob, "the summary line carries the total too"
+
+    # The sunk-work phrasing an operator needs to size what completed.
+    assert "sunk" in blob.lower(), f"the message must say the spend is sunk; got {blob!r}"
+
+
+def test_run_census_preflight_defer_message_carries_no_counts_clause(tmp_path):
+    """Companion: a PREFLIGHT defer spent nothing, so `_defer` still skips the
+    counts clause entirely. Adding `rejected` must not leak a count into a
+    message about a run that never adjudicated anything."""
+    fake_escalate_fn = _make_fake_escalate_fn()
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(default="I cannot answer: you have hit your weekly limit."),
+        batch_source=_poison("batch_source"),
+        verify_fn=_poison("verify_fn"),
+        escalate_fn=fake_escalate_fn,
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "deferred"
+    assert outcome.deferred_stage == "preflight"
+    blob = _defer_blob(fake_escalate_fn)
+    assert "cluster(s) verified" not in blob, (
+        f"a preflight defer must carry no counts clause at all; got {blob!r}"
+    )
+    assert "rejected" not in blob.lower()
+
+
+# ---------------------------------------------------------------------------
+# task 4879 step-9: RED — W-C. `render_report`'s `## Verification` section is
+# gated on `verify_coverage is not None`, and `run_census` leaves that None
+# whenever `--max-verify-clusters` is absent. So an UNCAPPED run in which
+# every offered cluster was rejected — the observable signature of the
+# 2026-08-03 sandbox incident — commits a dated report byte-identical to a
+# clean census. The log line and the info escalation are ephemeral; the
+# markdown is what an operator reads weeks later, and it must not be silent.
+# ---------------------------------------------------------------------------
+
+def test_render_report_states_the_all_rejected_outcome_without_a_verify_cap():
+    report = _render(verify_coverage=None, mass_rejection=mod.MassRejection(offered=3))
+
+    assert "## Verification" in report, (
+        "the section must render on the mass-rejection path even with no cap"
+    )
+    section = report.split("## Verification", 1)[1].split("\n## ", 1)[0]
+    assert "3" in section, "the offered count"
+    lowered = section.lower()
+    assert "reject" in lowered, "that they were rejected"
+    assert "none" in lowered or "no cluster" in lowered, "and that none survived"
+    # The same voice as the existing `suspect` log string at the detector.
+    assert "systemic" in lowered
+    assert any(
+        phrase in lowered
+        for phrase in ("model unreachable", "tool access denied", "unparseable verdict")
+    ), f"the report must name what to suspect, not merely that something is off; got {section!r}"
+
+    assert report != _render(verify_coverage=None, mass_rejection=None), (
+        "the notice must actually change the rendered bytes"
+    )
+
+
+def test_render_report_renders_the_all_rejected_notice_before_an_existing_cap_line():
+    report = _render(
+        verify_coverage=mod.VerifyCoverage(novel=3, offered=3, cap=3),
+        mass_rejection=mod.MassRejection(offered=3),
+    )
+
+    section = report.split("## Verification", 1)[1].split("\n## ", 1)[0]
+    assert "systemic" in section.lower(), "the all-rejected notice renders"
+    assert "verify cap: 3" in section, "and the existing cap line still renders too"
+    assert section.lower().index("systemic") < section.index("verify cap: 3"), (
+        "the anomaly notice comes FIRST — a cap line is routine, this is not"
+    )
+    # …and the cap line must not contradict the notice directly above it. The
+    # coverage record counts verify_fn calls MADE, so on this run "verified
+    # all 3" would be a flat lie sitting one line under "not one survived".
+    assert "verified all" not in section.lower(), (
+        f"the coverage line must not claim an outcome the notice denies; got {section!r}"
+    )
+    assert "handed all 3 novel cluster(s) to the verifier" in section
+
+
+def test_render_report_flagless_golden_is_untouched_by_the_new_parameter():
+    """`mass_rejection=None` must leave the module's byte-identical-flagless
+    invariant exactly as it was — that property is deliberate and documented,
+    and must not be spent to buy an anomaly signal."""
+    report = mod.render_report(
+        date="2026-07-14",
+        project_id="dark_factory",
+        force=False,
+        matrix_md="matrix",
+        mining_result=_sample_mining_result(),
+        synthesis_md="prose",
+        filed_task_ids=["1"],
+        cost_note="cost",
+        mass_rejection=None,
+    )
+    assert report == _GOLDEN_FLAGLESS_REPORT
+
+
+# ---------------------------------------------------------------------------
+# task 4879 step-11: RED — W-C, the WIRING. Step-10 taught render_report to
+# say it; run_census never builds a MassRejection, so the committed markdown
+# of an uncapped all-rejected run is still indistinguishable from a clean
+# census.
+# ---------------------------------------------------------------------------
+
+def test_run_census_uncapped_mass_rejection_is_stated_in_the_committed_report(tmp_path):
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_three_novel_invoke),
+        batch_source=[_three_novel_batch()],
+        verify_fn=_make_fake_verify_fn(verified_titles=set()),   # all 3 reject
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        escalate_fn=_make_fake_escalate_fn(),
+        status_fetcher=_make_fake_status_fetcher(0),
+        commit=_make_fake_commit(),
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    # A suspicious run is still a COMPLETED run: mining is already paid for.
+    assert outcome.status == "done"
+    assert kwargs["census_state_path"].exists(), "state is still persisted"
+
+    # The COMMITTED MARKDOWN, not caplog — that is the whole point.
+    report_text = kwargs["report_path"].read_text(encoding="utf-8")
+    assert "## Verification" in report_text
+    section = report_text.split("## Verification", 1)[1].split("\n## ", 1)[0]
+    assert "3" in section, "the offered count"
+    lowered = section.lower()
+    assert "reject" in lowered and "systemic" in lowered
+    assert any(
+        phrase in lowered
+        for phrase in ("model unreachable", "tool access denied", "unparseable verdict")
+    ), f"the report names what to suspect; got {section!r}"
+
+
+def test_run_census_report_stays_silent_when_a_cluster_verifies(tmp_path):
+    """The negative control: the notice must fire only on the real signature,
+    not on any uncapped run. One cluster surviving is an ordinary census."""
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_three_novel_invoke),
+        batch_source=[_three_novel_batch()],
+        verify_fn=_make_fake_verify_fn(verified_titles={_THREE_NOVEL_TITLES[0]}),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        escalate_fn=_poison("escalate_fn"),
+        status_fetcher=_make_fake_status_fetcher(0),
+        commit=_make_fake_commit(),
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    report_text = kwargs["report_path"].read_text(encoding="utf-8")
+    assert "## Verification" not in report_text, (
+        "an ordinary uncapped run must still render no Verification section"
+    )
+
+
+# ---------------------------------------------------------------------------
+# task 4879 step-13: RED — W-D. `run_census`'s promote loop does
+# `cand_id = _find_pending_candidate_id(...)` / `if cand_id is None: continue`
+# — dropping a verify verdict the census PAID FOR with no log and no counter.
+# Post-4144 that None is a NORMAL outcome, not a defensive impossibility: for
+# a re-mined title whose only same-title candidate is already adjudicated,
+# `apply_coding_record` correctly declines to fabricate a pending twin (that
+# fabrication is how rejected cand-20260722-28 came back as pending
+# cand-20260724-2 in the live codebook). The standing prior verdict is the
+# right outcome; the SILENCE is the defect.
+# ---------------------------------------------------------------------------
+
+_STANDING_CANDIDATE_ID = "cand-20260701-9"
+_STANDING_FIRST_SEEN = "2026-07-01"
+
+
+def _codebook_with_a_rejected_candidate_for(title):
+    """A v2 codebook carrying one already-REJECTED candidate for *title*, so
+    re-mining that title routes the sighting to the standing record instead
+    of creating a pending twin."""
+    cb = _minimal_v2_codebook()
+    cb["candidates"] = [
+        {
+            "id": _STANDING_CANDIDATE_ID,
+            "title": title,
+            "first_seen": _STANDING_FIRST_SEEN,
+            "disposition": "rejected",
+            "sightings": [],
+        }
+    ]
+    return cb
+
+
+def _rejected_twin_kwargs(tmp_path, **overrides):
+    kwargs: dict[str, Any] = dict(
+        invoke=_make_fake_invoke(_three_novel_invoke),
+        batch_source=[_three_novel_batch()],
+        verify_fn=_make_fake_verify_fn(verified_titles=set(_THREE_NOVEL_TITLES)),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        escalate_fn=_make_fake_escalate_fn(),
+        status_fetcher=_make_fake_status_fetcher(0),
+        commit=_make_fake_commit(),
+        codebook_dict=_codebook_with_a_rejected_candidate_for(_THREE_NOVEL_TITLES[0]),
+    )
+    kwargs.update(overrides)
+    return _run_census_kwargs(tmp_path, **kwargs)
+
+
+def test_run_census_warns_when_a_verified_clusters_verdict_finds_no_pending_candidate(
+    tmp_path, caplog,
+):
+    kwargs = _rejected_twin_kwargs(tmp_path)
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done", "a dropped verdict must not fail the run"
+    assert kwargs["census_state_path"].exists(), "state is still persisted"
+    assert outcome.unresolved_verdicts == 1
+
+    per_cluster = [
+        r for r in _census_warnings(caplog)
+        if _THREE_NOVEL_TITLES[0] in r.getMessage()
+    ]
+    assert len(per_cluster) == 1, (
+        f"exactly one per-cluster warning naming the title; got "
+        f"{[r.getMessage() for r in _census_warnings(caplog)]}"
+    )
+    message = per_cluster[0].getMessage()
+    assert _STANDING_CANDIDATE_ID in message, "the standing candidate's id"
+    assert "rejected" in message, "its disposition"
+    assert _STANDING_FIRST_SEEN in message, "and when it was first seen"
+
+    # The other two titles were promoted normally — the drop is scoped to the
+    # one title with a standing verdict, not a whole-run failure.
+    written = codebook.load(kwargs["codebook_path"])
+    promoted = [
+        c for c in written["candidates"] if c.get("disposition") == "promoted"
+    ]
+    assert {c["title"] for c in promoted} == set(_THREE_NOVEL_TITLES[1:])
+    standing = next(
+        c for c in written["candidates"] if c["id"] == _STANDING_CANDIDATE_ID
+    )
+    assert standing["disposition"] == "rejected", "the prior verdict still stands"
+
+
+def test_run_census_clean_run_emits_no_unresolved_verdict_warning(tmp_path, caplog):
+    """Negative control: with no standing same-title verdict every cluster
+    resolves, so there is nothing to say and nothing is said."""
+    kwargs = _rejected_twin_kwargs(tmp_path, codebook_dict=_minimal_v2_codebook())
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    assert outcome.unresolved_verdicts == 0
+    assert not [
+        r for r in _census_warnings(caplog) if "unresolved" in r.getMessage().lower()
+    ]
+
+
+# ---------------------------------------------------------------------------
+# task 4879 step-15: RED — W-D, the RUN SUMMARY. Two silences remain. The
+# merge loop discards `apply_coding_record`'s stats entirely
+# (`updated_codebook, _stats = ...`), throwing away the
+# `candidate_disposition_conflicts` count task 4144 already computes; and
+# nothing states either tally once at the end of the run, where an operator
+# reading a journal sees the whole picture rather than one line per cluster.
+# The same already-rejected-same-title fixture drives BOTH signals: it is
+# exactly the case apply_coding_record counts as a disposition conflict.
+# ---------------------------------------------------------------------------
+
+def test_run_census_run_summary_names_unresolved_verdicts_and_disposition_conflicts(
+    tmp_path, caplog,
+):
+    kwargs = _rejected_twin_kwargs(tmp_path)
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    assert outcome.unresolved_verdicts == 1, "step-13's signal still holds"
+
+    summaries = [
+        r for r in _census_warnings(caplog)
+        if "unresolved" in r.getMessage().lower()
+        and _THREE_NOVEL_TITLES[0] not in r.getMessage()
+    ]
+    assert len(summaries) == 1, (
+        "exactly ONE run-summary line, distinct from the per-cluster line; got "
+        f"{[r.getMessage() for r in _census_warnings(caplog)]}"
+    )
+    message = summaries[0].getMessage()
+    assert "1" in message, "the unresolved-verdict count"
+    assert "conflict" in message.lower(), (
+        "and the candidate_disposition_conflicts count accumulated across the "
+        f"merge loop; got {message!r}"
+    )
+
+
+def test_run_census_clean_run_emits_no_run_summary_line(tmp_path, caplog):
+    kwargs = _rejected_twin_kwargs(tmp_path, codebook_dict=_minimal_v2_codebook())
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    assert outcome.unresolved_verdicts == 0
+    assert not [
+        r for r in _census_warnings(caplog)
+        if "unresolved" in r.getMessage().lower() or "conflict" in r.getMessage().lower()
+    ], "both tallies zero -> no summary line at all"
+
+
+def test_main_done_line_names_unresolved_verdicts_when_nonzero(
+    tmp_path, monkeypatch, capsys,
+):
+    _write_legibility_yaml(_default_config_path(tmp_path))
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+
+    def _run_main(unresolved):
+        monkeypatch.setattr(mod, "run_census", _make_fake_main_run_census(
+            outcome=mod.CensusOutcome(
+                status="done",
+                report_path="plans/confusion-census-2026-07-30.md",
+                filed_task_ids=["1234"],
+                stop_reason="exhausted",
+                unresolved_verdicts=unresolved,
+            )
+        ))
+        assert mod.main(["--project-root", str(tmp_path), "--force"]) == 0
+        return capsys.readouterr().out
+
+    nonzero_out = _run_main(2)
+    assert "unresolved_verdicts=2" in nonzero_out
+
+    zero_out = _run_main(0)
+    assert "unresolved_verdicts" not in zero_out, (
+        "the zero case must stay byte-identical — a clause trained to be "
+        "ignored is a clause that will be ignored"
+    )
+    assert zero_out == (
+        "census: done -- report=plans/confusion-census-2026-07-30.md "
+        "filed_tasks=1 stop_reason=exhausted\n"
+    )

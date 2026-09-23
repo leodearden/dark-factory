@@ -27,7 +27,11 @@ from fused_memory.config.reload import (
     apply_reload,
     diff_config,
 )
-from fused_memory.config.schema import EntityMintConfig, FusedMemoryConfig
+from fused_memory.config.schema import (
+    ConsolidationAutoConfig,
+    EntityMintConfig,
+    FusedMemoryConfig,
+)
 from fused_memory.server.entity_mint_authz import resolve_entity_mint_authorization
 from fused_memory.server.near_duplicate_guard import (
     resolve_near_dup_guard_enabled,
@@ -955,3 +959,225 @@ class TestTopicAnchoredRecallReloadTier:
         # Same service object, no reconstruction — the next search skips the I/O.
         await _search()
         assert service.mem0.scroll_by_metadata.await_count == 1
+
+
+class TestWriteJournalIsRestartOnly:
+    """Task 3212: `write_journal.*` is correctly restart-only.
+
+    The prune runs once at startup, so registering a leaf as reloadable would
+    hot-apply a value nothing re-reads — a leaf advertised green while silently
+    ignoring reloads, which is exactly the "restart-only in disguise" failure
+    reload.py's module docstring forbids. `RELOADABLE_FIELDS` is an opt-in
+    allowlist, so this holds by construction; it is asserted so an unexamined
+    future addition has to argue with a test.
+
+    The inverse direction — every allowlisted path resolving to a real leaf —
+    is already covered by test_every_reloadable_field_resolves_to_a_real_leaf.
+    """
+
+    def test_no_write_journal_leaf_is_allowlisted(self):
+        allowlisted = {p for p in RELOADABLE_FIELDS if p.startswith('write_journal.')}
+        assert not allowlisted, (
+            f'RED: write_journal leaves must not be hot-reloadable, found {allowlisted}'
+        )
+
+    def test_changed_write_journal_leaf_lands_in_restart_required(self):
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        old = live.write_journal.read_retention_days
+        object.__setattr__(fresh.write_journal, 'read_retention_days', old + 1)
+
+        d = diff_config(live, fresh)
+
+        assert d.restart_required['write_journal.read_retention_days'] == {
+            'old': old, 'new': old + 1,
+        }, 'RED: a startup-only knob must be reported restart_required, not applied'
+        assert 'write_journal.read_retention_days' not in d.applied_candidates
+
+
+class TestConsolidationAutoLeavesAreGreenTier:
+    """Every consolidation_auto.* leaf must hot-apply (task 5237, PRD §7/§11).
+
+    Modelled on ``TestMem0UpdateLeavesAreGreenTier`` above, in the stronger
+    ``TestWriteTriageJudgeLeavesAreGreenTier`` form: the expected leaf set is
+    DERIVED from ``ConsolidationAutoConfig.model_fields`` rather than restated,
+    so a FOURTEENTH leaf added later without a ``reload.py`` registration fails
+    HERE instead of silently degrading to restart-only.
+
+    Two leaves make the section's green tier load-bearing rather than
+    convenient. ``enabled`` is the kill switch — what an operator flips to stop
+    a mis-consolidating cycle, and a restart-only kill switch is no kill switch
+    (the ``mem0_update.enabled`` lesson). ``enabled_projects`` is PRD §11's
+    per-project staging lever, which is a rollout tool only if it moves on a
+    running server.
+
+    UNLIKE its sibling classes here, this one does NOT pair the classification
+    with a live-read resolver test, because on this branch there is no consumer
+    to read: the executor is task delta, the proposal tool task gamma, the
+    provenance bar task epsilon. The live-read half of reload.py's
+    reload-safety rule is discharged by those tasks and their own tests. What
+    IS assertable now — and asserted below — is the diff/apply behaviour and
+    that a held reference to the shared submodel observes the flip.
+    """
+
+    #: Discovered rather than restated — see the class docstring.
+    LEAVES = tuple(sorted(ConsolidationAutoConfig.model_fields))
+
+    #: One differing value per leaf. Every entry must differ from the shipped
+    #: default or the diff is vacuously empty and the assertion is void; the
+    #: parametrized test checks that explicitly rather than trusting the table.
+    CHANGED = {
+        'enabled': True,
+        'enabled_projects': ['dark_factory'],
+        'predicate_version': '2',
+        'member_min': 3,
+        'member_max': 12,
+        'claim_max_chars': 120,
+        'max_auto_per_cycle': 1,
+        'max_gate_filings_per_cycle': 0,
+        'backlog_multiplier': 2,
+        'refusal_streak_threshold': 3,
+        'slug_collision_jaccard': 0.8,
+        'proposal_ttl_hours': 24,
+        'category_weights': {
+            'procedural_knowledge': 1.0,
+            'preferences_and_norms': 1.0,
+            'observations_and_summaries': 0.4,
+        },
+    }
+
+    def test_the_schema_actually_declares_the_leaves(self):
+        """Guards the derivation itself: an empty set would pass vacuously."""
+        assert len(self.LEAVES) == 13, self.LEAVES
+
+    def test_every_leaf_is_allowlisted(self):
+        expected = {f'consolidation_auto.{name}' for name in self.LEAVES}
+        missing = expected - RELOADABLE_FIELDS
+        assert not missing, (
+            f'unregistered consolidation_auto leaves: {sorted(missing)} — an '
+            'absent leaf silently degrades to restart-only, and a restart-only '
+            'kill switch is no kill switch'
+        )
+
+    def test_the_changed_value_table_covers_every_leaf(self):
+        """The parametrisation below is only as complete as this table."""
+        assert set(self.CHANGED) == set(self.LEAVES), (
+            f'table/schema drift: {set(self.CHANGED) ^ set(self.LEAVES)}'
+        )
+
+    @pytest.mark.parametrize('field', LEAVES)
+    def test_changed_leaf_lands_in_applied_candidates(self, field):
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        path = f'consolidation_auto.{field}'
+        new_value = self.CHANGED[field]
+        old = getattr(live.consolidation_auto, field)
+        assert old != new_value, (
+            f'{path} must actually change for this to assert anything'
+        )
+        object.__setattr__(fresh.consolidation_auto, field, new_value)
+
+        d = diff_config(live, fresh)
+
+        assert path in d.applied_candidates, (
+            f'{path} must hot-apply so an operator can retune without a restart'
+        )
+        assert d.applied_candidates[path] == {'old': old, 'new': new_value}
+        assert path not in d.restart_required
+
+    @pytest.mark.parametrize('field', ['enabled_projects', 'category_weights'])
+    def test_list_and_dict_leaves_are_atomic(self, field):
+        """Each container reloads WHOLE — the
+        reconciliation.procedural_knowledge_topic_guard_clusters /
+        write_triage.t_high_by_category precedent. A per-key leaf would let one
+        weight land while another did not, and a half-applied ranking map would
+        gate a cycle on a state no operator ever wrote."""
+        path = f'consolidation_auto.{field}'
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        object.__setattr__(fresh.consolidation_auto, field, self.CHANGED[field])
+
+        paths = [p for p, _ in _iter_leaves(fresh)]
+        assert paths.count(path) == 1, (
+            f'expected exactly one leaf at {path}, got {paths.count(path)}'
+        )
+        assert not [p for p in paths if p.startswith(f'{path}.')], (
+            f'{path} must not be descended into'
+        )
+
+        d = diff_config(live, fresh)
+        assert d.applied_candidates[path]['new'] == self.CHANGED[field]
+        assert not [p for p in d.applied_candidates if p.startswith(f'{path}.')]
+        assert not [p for p in d.restart_required if p.startswith(f'{path}.')]
+
+    def test_enabled_flip_is_applied_and_observed_on_the_shared_object(self):
+        """The task's user-observable signal: reload_config reports
+        consolidation_auto.enabled under `applied`, and a reference held to the
+        submodel BEFORE the call reads the new value — _set_leaf mutates in
+        place rather than rebinding, which is what lets a future consumer
+        holding config.consolidation_auto observe the flip with no restart."""
+        live = FusedMemoryConfig()
+        held = live.consolidation_auto
+        assert held.enabled is False
+
+        fresh = FusedMemoryConfig()
+        object.__setattr__(fresh.consolidation_auto, 'enabled', True)
+
+        result = apply_reload(live, fresh)
+
+        assert result['reloaded'] is True, f'reload failed: {result.get("error")!r}'
+        assert 'consolidation_auto.enabled' in result['applied']
+        assert live.consolidation_auto is held, 'submodel identity must survive apply'
+        assert held.enabled is True
+
+    def test_project_staging_list_is_replaced_wholesale(self):
+        """Never merged: a merge would leave a project staged in after the
+        operator removed it, which is the opposite of a rollout lever."""
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        object.__setattr__(live.consolidation_auto, 'enabled_projects', ['a', 'b'])
+        object.__setattr__(fresh.consolidation_auto, 'enabled_projects', ['b'])
+
+        apply_reload(live, fresh)
+
+        assert live.consolidation_auto.enabled_projects == ['b']
+
+    def test_incoherent_member_range_is_rejected_and_rolled_back(self):
+        """The cross-field validator, exercised through the reload path.
+
+        Staging member_min above member_max is individually valid on each leaf
+        and invalid as a whole, so it only surfaces at apply_reload's hybrid
+        re-validation — which must fail closed and leave `live` untouched
+        rather than half-applying a range no proposal could satisfy.
+        """
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        object.__setattr__(fresh.consolidation_auto, 'member_min', 30)
+
+        report = apply_reload(live, fresh)
+
+        assert report['reloaded'] is False
+        assert report['applied'] == {}
+        assert report['error'].startswith('hybrid-invariant')
+        assert live.consolidation_auto.member_min == 2
+        assert live.consolidation_auto.member_max == 20
+
+    def test_reconciliation_provenance_prefix_leaf_is_green_tier(self):
+        """PRD C5's caller bar (task epsilon's B11 consumer). The empty-list
+        deny-all value is the one an operator reaches for during an incident,
+        so it must be reachable without a restart."""
+        path = 'reconciliation.deterministic_provenance_allowed_agent_prefixes'
+        assert path in RELOADABLE_FIELDS
+
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        object.__setattr__(
+            fresh.reconciliation,
+            'deterministic_provenance_allowed_agent_prefixes',
+            [],
+        )
+
+        d = diff_config(live, fresh)
+
+        assert d.applied_candidates[path] == {'old': ['orchestrator'], 'new': []}
+        assert path not in d.restart_required

@@ -29,13 +29,21 @@ from typing import cast
 
 
 class FailureCategory(StrEnum):
-    """The closed 15-value output domain of ``verify_classify.classify_failure``."""
+    """The closed output domain of ``verify_classify.classify_failure``.
+
+    The CARDINALITY is deliberately not written down here or in any other
+    prose: it was hand-patched across five sites the last two times a
+    category was added, and drifted (task 5580). ``CATEGORY_POLICY``'s
+    import-time exhaustiveness check and ``test_verify_categories`` are the
+    only places that count the members.
+    """
 
     INFRA_TIMEOUT = 'infra_timeout'
     INFRA_KILL = 'infra_kill'
     DISK_FULL = 'disk_full'
     SEMAPHORE_TIMEOUT = 'semaphore_timeout'
     CARGO_CLI_ERROR = 'cargo_cli_error'
+    PYTEST_USAGE_ERROR = 'pytest_usage_error'
     COMPILE_ERROR = 'compile_error'
     TREE_SITTER_GENERATE_ERROR = 'tree_sitter_generate_error'
     FLOCK_ERROR = 'flock_error'
@@ -51,7 +59,7 @@ class FailureCategory(StrEnum):
 class RetryKind(Enum):
     """How ``run_verification`` recovers from a given category, if at all.
 
-    Populated for all 15 ``CATEGORY_POLICY`` rows per the PRD contract
+    Populated for EVERY ``CATEGORY_POLICY`` row per the PRD contract
     (plans/verify-plan-prd.md task α item 4: ``CategoryPolicy(severity_rank,
     archive, preexisting_probe, is_infra_transient, retry_kind)``) but NOT
     yet dispatched on. ``run_verification`` still decides retries via two
@@ -238,23 +246,55 @@ CATEGORY_POLICY: dict[FailureCategory, CategoryPolicy] = {
         is_infra_transient=False, verdict_indeterminate=False,
         retry_kind=RetryKind.NONE,
     ),
+    # The pytest-side analogue of CARGO_CLI_ERROR, and sited beside it for
+    # that reason: both mean "the tool REJECTED the argv we built", which is
+    # a different fact from any verdict about the code. Four of the five
+    # fields are copied from that row rather than re-reasoned (task 5580).
+    #
+    # archive=True — same grounding as CARGO_CLI_ERROR: the rejected argv
+    # survives only in the per-attempt log, and that log IS the diagnosis.
+    # preexisting_probe=True — a config-caused usage error (a bad pyproject
+    # ``addopts``, an edited module test_command) genuinely IS pre-existing on
+    # main and should be found so; also matches today's behaviour via
+    # UNKNOWN_TEST_FAILURE, so no probe changes its mind.
+    # is_infra_transient=False — deliberately NOT widening
+    # INFRA_TRANSIENT_CATEGORIES, which drives the bounded RETRY windows in
+    # merge_queue.py/workflow.py/verify.py. Re-running a byte-identical
+    # rejected argv cannot help, so those windows would burn their attempts
+    # and file a blocking L1 anyway. Keeping it False also leaves this row
+    # outside ``_assert_infra_transient_rows_archive`` and every merge-path
+    # retry decision byte-identical to today.
+    # verdict_indeterminate=False — predicate (2) FAILS: a diff CAN cause
+    # this, so the leg keeps its veto over another host's PASS. Fail CLOSED,
+    # exactly as PYTEST_INTERNALERROR and ENV_TRANSIENT do.
+    #
+    # The narrower true statement — that a rejection of a command WE
+    # SYNTHESISED for an isolated re-run means "we could not re-run" — is a
+    # property of the re-run path, and lives there as its own named set
+    # (verify.py::_RERUN_NON_VERDICT_CATEGORIES) rather than being smuggled
+    # into a field whose consumers mean something else.
+    FailureCategory.PYTEST_USAGE_ERROR: CategoryPolicy(
+        severity_rank=5, archive=True, preexisting_probe=True,
+        is_infra_transient=False, verdict_indeterminate=False,
+        retry_kind=RetryKind.NONE,
+    ),
     FailureCategory.COMPILE_ERROR: CategoryPolicy(
-        severity_rank=5, archive=False, preexisting_probe=True,
+        severity_rank=6, archive=False, preexisting_probe=True,
         is_infra_transient=False, verdict_indeterminate=False,
         retry_kind=RetryKind.NONE,
     ),
     FailureCategory.TREE_SITTER_GENERATE_ERROR: CategoryPolicy(
-        severity_rank=6, archive=True, preexisting_probe=True,
+        severity_rank=7, archive=True, preexisting_probe=True,
         is_infra_transient=False, verdict_indeterminate=False,
         retry_kind=RetryKind.NONE,
     ),
     FailureCategory.FLOCK_ERROR: CategoryPolicy(
-        severity_rank=7, archive=True, preexisting_probe=False,
+        severity_rank=8, archive=True, preexisting_probe=False,
         is_infra_transient=False, verdict_indeterminate=False,
         retry_kind=RetryKind.NONE,
     ),
     FailureCategory.NPM_ERROR: CategoryPolicy(
-        severity_rank=8, archive=True, preexisting_probe=True,
+        severity_rank=9, archive=True, preexisting_probe=True,
         is_infra_transient=False, verdict_indeterminate=False,
         retry_kind=RetryKind.NONE,
     ),
@@ -284,7 +324,7 @@ CATEGORY_POLICY: dict[FailureCategory, CategoryPolicy] = {
     # branch-caused break: exactly the false-GREEN class tasks 2822/1700
     # hardened against.  Fail CLOSED; only the retry loop treats it as infra.
     FailureCategory.PYTEST_INTERNALERROR: CategoryPolicy(
-        severity_rank=9, archive=True, preexisting_probe=False,
+        severity_rank=10, archive=True, preexisting_probe=False,
         is_infra_transient=True, verdict_indeterminate=False,
         retry_kind=RetryKind.NONE,
     ),
@@ -317,27 +357,27 @@ CATEGORY_POLICY: dict[FailureCategory, CategoryPolicy] = {
     # carries a POSITIVE worktree-removal anchor rather than being matched by
     # the absence of a rustc span.
     FailureCategory.ENV_TRANSIENT: CategoryPolicy(
-        severity_rank=10, archive=True, preexisting_probe=False,
+        severity_rank=11, archive=True, preexisting_probe=False,
         is_infra_transient=True, verdict_indeterminate=False,
         retry_kind=RetryKind.ENV_SERIAL,
     ),
     FailureCategory.TEST_FAILURE: CategoryPolicy(
-        severity_rank=11, archive=False, preexisting_probe=True,
+        severity_rank=12, archive=False, preexisting_probe=True,
         is_infra_transient=False, verdict_indeterminate=False,
         retry_kind=RetryKind.NONE,
     ),
     FailureCategory.UNKNOWN_TEST_FAILURE: CategoryPolicy(
-        severity_rank=12, archive=True, preexisting_probe=True,
+        severity_rank=13, archive=True, preexisting_probe=True,
         is_infra_transient=False, verdict_indeterminate=False,
         retry_kind=RetryKind.NONE,
     ),
     FailureCategory.PASSED: CategoryPolicy(
-        severity_rank=13, archive=False, preexisting_probe=True,
+        severity_rank=14, archive=False, preexisting_probe=True,
         is_infra_transient=False, verdict_indeterminate=False,
         retry_kind=RetryKind.NONE,
     ),
     FailureCategory.NONE: CategoryPolicy(
-        severity_rank=14, archive=False, preexisting_probe=True,
+        severity_rank=15, archive=False, preexisting_probe=True,
         is_infra_transient=False, verdict_indeterminate=False,
         retry_kind=RetryKind.NONE,
     ),
@@ -491,7 +531,7 @@ def should_archive(category: str) -> bool:
     """Return True when *category* warrants durable human-triage archival.
 
     Pure CATEGORY_POLICY table lookup — no ``endswith('_error')`` heuristic.
-    A category outside the known 15 (e.g. a verify_runner UNSCOPED_TYPECHECK_*
+    A category outside the enum (e.g. a verify_runner UNSCOPED_TYPECHECK_*
     sentinel, or any other unrecognized string) defaults to False. See
     ``verify_classify.classify_failure``'s docstring for the closed-domain
     contract that keeps this default from silently misfiring on a future
@@ -511,7 +551,7 @@ def _assert_sentinels_disjoint(sentinels, enum_cls) -> None:
     an out-of-band sentinel namespace (e.g. verify_runner's
     UNSCOPED_TYPECHECK_* gate signals, injected into ``VerifyResult.category``
     but never produced by ``classify_failure``) is provably separate from
-    ``FailureCategory``'s closed 15-value output domain, so a future
+    ``FailureCategory``'s closed output domain, so a future
     accidental collision is caught fail-loud at import time instead of
     silently conflating a gate signal with a real classifier category.
     """

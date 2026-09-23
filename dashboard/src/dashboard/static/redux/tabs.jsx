@@ -1,6 +1,6 @@
 /* Remaining tabs: orchestrators, performance, memory, recon, merge, costs, burndown */
 const { Sparkline: SP, LineChart: LC, StackedAreaChart: SA, BarChart: BC, HBarChart: HBC, Donut: DN, StatTile: ST, PALETTE: CP, deriveVelocitySeries, defaultSmoothingForWindow, smoothingLabelToSeconds, SMOOTHING_OPTIONS, formatCountTick } = window.DF_CHARTS;
-const { Glyph: GL, ProjectGroup, Segmented, ChipGroup } = window.DF_SHELL;
+const { Glyph: GL, ProjectGroup, Pip, Segmented, ChipGroup } = window.DF_SHELL;
 const DF = window.DF_DATA;
 const { rtCell, rtAge } = window.DF_RUNTIME_FMT;
 // Unguarded, like the DF_* destructures above: index.html loads
@@ -19,9 +19,34 @@ const { orchEmptyLabel } = window.DF_ORCH_FILTER || { orchEmptyLabel: () => 'No 
 // a chart with no bands rather than fail. index.html's load order is the
 // enforced contract, pinned per-module by test_index_html.py: both scripts are
 // asserted served-200 and asserted to load before this file.
-const { strandBadgeState, agentCellState } = window.DF_TASK_ROW_CELLS;
+const { strandBadgeState, agentCellState, locksCellState } = window.DF_TASK_ROW_CELLS;
+// The Datum readers. Module scope, no fallback, bound under datum.js's own
+// names — see the CANONICAL note in datum.js's header.
+const { plainDatum, derivedDatum, unknownDatum } = window.DF_DATUM;
 const { burndownStacks, burndownLegend, parityBannerState } = window.DF_BURNDOWN_BANDS;
+const { reconRunCounts, reconSuccessPct, reconStatusTone } = window.DF_RECON_STATUS;
 const { useState: uS, useEffect: uE } = React;
+
+// Which endpoint each rendered number arrived on. plainDatum's provenance is
+// endpoint-granular until PRD leaf beta puts a served Datum on the wire, and the
+// path is the lookup key into DF_DATA.__receipt (data.js keys one receipt per
+// polled endpoint by its URL with the query stripped). Named once here because a
+// mistyped path is the one failure the wrapper cannot report: it finds no
+// receipt and the tile reads as never-fetched forever. Spelled in full, so the
+// paths data.js polls are greppable from the tiles that render them.
+const EP = Object.freeze({
+  orchestrators: '/api/v2/dashboard/orchestrators', performance:  '/api/v2/dashboard/performance',
+  memory:        '/api/v2/dashboard/memory',        memoryGraphs: '/api/v2/dashboard/memory-graphs',
+  recon:         '/api/v2/dashboard/recon',         mergeQueue:   '/api/v2/dashboard/merge-queue',
+  costs:         '/api/v2/dashboard/costs',         burndown:     '/api/v2/dashboard/burndown',
+  scheduler:     '/api/v2/dashboard/scheduler',
+});
+
+// Formatters the tiles hand to StatTile/Pip. Each is given a value that was
+// actually MEASURED — plainDatum answers the absent case itself — so none
+// repeats the `x == null ? '—' : …` sentinel that used to sit at every site.
+const fmtCount = n => n.toLocaleString();
+const fmtUsd = n => `$${n.toFixed(2)}`;
 
 // shared open-state helper for furl/unfurl, persisted to localStorage by key
 function useOpenSet(ids, defaultOpen = true, storageKey = null) {
@@ -177,11 +202,36 @@ function DepsCell({ task }) {
   return <ChipList items={sorted} renderChip={(d) => <DepChip key={d.id} dep={d} />} maxInline={2} persistKey={`df.deps.${task.id}`} />;
 }
 
-function LocksCell({ task }) {
+// Is anything KNOWN about this project's locks? DF.SCHEDULER is the only source
+// of lock state, so the question is "has the scheduler endpoint delivered a
+// snapshot that claims to cover this project?". One reporting the project
+// offline carries no lock rows for it, and drawing that empty set as chips is
+// the "nothing is held" lie locksCellState exists to refuse.
+const schedLocksDatum = project =>
+  DF.SCHEDULER.offline || (DF.SCHEDULER.offline_projects || []).includes(project)
+    ? unknownDatum('scheduler snapshot does not cover this project')
+    : plainDatum(DF.SCHEDULER, EP.scheduler);
+
+// ── The Locks column of a task row ──
+// `datum` says whether anything is KNOWN about this task's locks. The chips come
+// from DF.SCHEDULER, so a project whose scheduler is offline produced an empty
+// lockSet — and ChipList renders an empty list as a bare em-dash, which is
+// exactly what a task holding no locks renders too. Two opposite answers, one
+// pixel-identical cell, for an operator deciding whether a task is blocked.
+//
+// THE DECISION IS NOT MADE HERE. locksCellState answers it in
+// task_row_cells.js, where the node suite can actually execute it; a
+// `state === 'unknown'` test in this JSX would be a second authority that no
+// harness in this repo can run. This function only draws the answer: the
+// placeholder carrying its reason, or the existing ChipList untouched.
+function LocksCell({ task, datum }) {
   const { buildSchedLockInfo, disambiguateLabels } = window.DF_SCHED_UTILS || {};
-  const { rawTaskId, lockSet, moduleByPath } = buildSchedLockInfo
+  const lockInfo = buildSchedLockInfo
     ? buildSchedLockInfo(task, DF.SCHEDULER)
     : { rawTaskId: String(task.id).split('/T-').pop(), lockSet: [], moduleByPath: new Map() };
+  const cell = locksCellState(datum, lockInfo);
+  if (cell.placeholder) return <span className="chip-empty" title={cell.title || undefined}>{cell.placeholder}</span>;
+  const { rawTaskId, lockSet, moduleByPath } = lockInfo;
   const sorted = [...lockSet].sort((a, b) => {
     const ma = moduleByPath.get(a), mb = moduleByPath.get(b);
     const ha = ma && ma.holder, hb = mb && mb.holder;
@@ -219,10 +269,10 @@ function OrchTab({ projectFilter, search }) {
   return (
     <div className="grid cols-12" style={{ gap: 12 }}>
       <div className="col-span-12 grid cols-4">
-        <ST label="Orchestrators" value={matches.length} hint={`${matches.filter(o=>o.running).length} running`} spark={(DF.ORCHESTRATORS_SPARK?.values || []).slice(-30)} sparkColor={CP.accent} />
-        <ST label="Tasks in flight" value={matches.reduce((s,o)=>s+o.summary.in_progress,0)} spark={DF.BURNDOWN.in_progress} sparkColor={CP.accent} hint="30d" />
-        <ST label="Blocked" value={matches.reduce((s,o)=>s+o.summary.blocked,0)} spark={DF.BURNDOWN.blocked} sparkColor={CP.bad} hint="30d" />
-        <ST label="Pending" value={matches.reduce((s,o)=>s+o.summary.pending,0)} spark={DF.BURNDOWN.pending} sparkColor={CP.warn} hint="30d" />
+        <ST label="Orchestrators" datum={plainDatum(matches.length, EP.orchestrators)} hint={`${matches.filter(o=>o.running).length} running`} history={(DF.ORCHESTRATORS_SPARK?.values || []).slice(-30)} sparkColor={CP.accent} />
+        <ST label="Tasks in flight" datum={plainDatum(matches.reduce((s,o)=>s+o.summary.in_progress,0), EP.orchestrators)} history={DF.BURNDOWN.in_progress} sparkColor={CP.accent} hint="30d" />
+        <ST label="Blocked" datum={plainDatum(matches.reduce((s,o)=>s+o.summary.blocked,0), EP.orchestrators)} history={DF.BURNDOWN.blocked} sparkColor={CP.bad} hint="30d" />
+        <ST label="Pending" datum={plainDatum(matches.reduce((s,o)=>s+o.summary.pending,0), EP.orchestrators)} history={DF.BURNDOWN.pending} sparkColor={CP.warn} hint="30d" />
       </div>
 
       <div className="col-span-12"><GroupAllToggle allOpen={allOpen} onSetAll={setAll} /></div>
@@ -249,9 +299,16 @@ function OrchTab({ projectFilter, search }) {
         const summary = (
           <>
             <span className="pip"><span className={`status-dot ${o.running ? 'running' : 'completed'}`} style={{ marginRight: 0 }}></span>{o.running ? 'running' : 'completed'}</span>
-            <span className="pip"><span className="pip-dot" style={{ background: CP.ok }}></span>{o.summary.done}/{total}</span>
-            {o.summary.in_progress > 0 && <span className="pip"><span className="pip-dot" style={{ background: CP.accent }}></span>{o.summary.in_progress} active</span>}
-            {o.summary.blocked > 0 && <span className="pip"><span className="pip-dot" style={{ background: CP.bad }}></span>{o.summary.blocked} blocked</span>}
+            {/* Proven-down and not-measured are distinct facts and get distinct pips: collapsing
+                them sends an operator to restart a healthy service. Invariant:
+                dashboard/src/dashboard/data/active_tasks.py::collect_tasks_with_counts.
+                The !o.offline guard states the precedence here rather than trusting the
+                producer, so a malformed entry with both set reads as the stronger, proven one. */}
+            {o.offline && <span className="pip" title={o.error || undefined}><span className="pip-dot" style={{ background: CP.bad }}></span>offline</span>}
+            {!o.offline && o.degraded && <span className="pip" title={o.error || undefined}><span className="pip-dot" style={{ background: CP.warn }}></span>state unknown</span>}
+            <Pip datum={plainDatum(o.summary.done, EP.orchestrators)} color={CP.ok} format={done => `${done}/${total}`} />
+            {o.summary.in_progress > 0 && <Pip datum={plainDatum(o.summary.in_progress, EP.orchestrators)} color={CP.accent} label="active" />}
+            {o.summary.blocked > 0 && <Pip datum={plainDatum(o.summary.blocked, EP.orchestrators)} color={CP.bad} label="blocked" />}
             <span className="mono" style={{ color: 'var(--fg-3)', fontSize: 10 }}>PID {o.pid}</span>
           </>
         );
@@ -327,7 +384,7 @@ function OrchTab({ projectFilter, search }) {
                             <td style={{ color: 'var(--fg-2)', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{rtCell(t.phase)}</td>
                             <td style={{ color: 'var(--fg-2)', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{rtCell(t.lane_state)}</td>
                             <td><DepsCell task={t} /></td>
-                            <td><LocksCell task={t} /></td>
+                            <td><LocksCell task={t} datum={schedLocksDatum(o.project)} /></td>
                             <td>
                               <span className={`badge ${
                                 t.status === 'blocked' ? 'bad' :
@@ -397,7 +454,7 @@ function PerfTab({ projectFilter }) {
           const onePass = aggOnePassPct(subset);
           const escalation = aggEscalationRate(subset, 'interactive_rate');
           const totalTasks = Object.values(subset).reduce((s, p) => s + (p.ttc?.count || 0), 0);
-          const fmtPct = v => v == null ? '—' : `${v.toFixed(1)}`;
+          const fmtPct = v => `${v.toFixed(1)}`;
           // Aggregate historical sparks across the in-scope projects.
           // Per-project hour buckets must be aligned by label before summing.
           const histKeys = Object.keys(subset);
@@ -460,15 +517,15 @@ function PerfTab({ projectFilter }) {
           return (
             <>
               <ST label="p50 time-to-completion"
-                value={p50 == null ? '—' : fmtMs(p50)}
-                hint={`${totalTasks} tasks (window)`} spark={p50Spark} sparkColor={CP.accent} />
+                datum={derivedDatum(p50, EP.performance, 'no tasks in this window')} format={fmtMs}
+                hint={`${totalTasks} tasks (window)`} history={p50Spark} sparkColor={CP.accent} />
               <ST label="p95 time-to-completion"
-                value={p95 == null ? '—' : fmtMs(p95)}
-                hint={`${totalTasks} tasks (window)`} spark={p95Spark} sparkColor={CP.warn} />
-              <ST label="One-pass success" value={fmtPct(onePass)} unit={onePass == null ? '' : '%'}
-                hint={onePass == null ? 'no tasks' : 'across all paths'} spark={onePassSpark} sparkColor={CP.ok} />
-              <ST label="Human escalation rate" value={fmtPct(escalation)} unit={escalation == null ? '' : '%'}
-                hint="interactive" spark={escalationSpark} sparkColor={CP.warn} />
+                datum={derivedDatum(p95, EP.performance, 'no tasks in this window')} format={fmtMs}
+                hint={`${totalTasks} tasks (window)`} history={p95Spark} sparkColor={CP.warn} />
+              <ST label="One-pass success" datum={derivedDatum(onePass, EP.performance, 'no tasks in this window')} format={fmtPct} unit={onePass == null ? '' : '%'}
+                hint={onePass == null ? 'no tasks' : 'across all paths'} history={onePassSpark} sparkColor={CP.ok} />
+              <ST label="Human escalation rate" datum={derivedDatum(escalation, EP.performance, 'no tasks in this window')} format={fmtPct} unit={escalation == null ? '' : '%'}
+                hint="interactive" history={escalationSpark} sparkColor={CP.warn} />
             </>
           );
         })()}
@@ -483,9 +540,9 @@ function PerfTab({ projectFilter }) {
         const onePassPct = onePass ? onePass.pct : 0;
         const summary = (
           <>
-            <span className="pip"><span className="pip-dot" style={{ background: CP.accent }}></span>{fmtMs(p.ttc.p50)} p50</span>
-            <span className="pip"><span className="pip-dot" style={{ background: CP.warn }}></span>{fmtMs(p.ttc.p95)} p95</span>
-            <span className="pip"><span className="pip-dot" style={{ background: CP.ok }}></span>{onePassPct}% 1-pass</span>
+            <Pip datum={plainDatum(p.ttc.p50, EP.performance)} color={CP.accent} format={fmtMs} label="p50" />
+            <Pip datum={plainDatum(p.ttc.p95, EP.performance)} color={CP.warn} format={fmtMs} label="p95" />
+            <Pip datum={plainDatum(onePassPct, EP.performance)} color={CP.ok} format={pct => `${pct}%`} label="1-pass" />
             <span style={{ color: 'var(--fg-3)' }}>· {p.ttc.count} tasks</span>
           </>
         );
@@ -594,28 +651,28 @@ function MemoryTab({ projectFilter, onNavigate }) {
   return (
     <div className="grid cols-12" style={{ gap: 12 }}>
       <div className="col-span-12 grid cols-5">
-        <ST label="Graphiti nodes" value={DF.MEMORY_STATUS.graphiti.node_count.toLocaleString()}
+        <ST label="Graphiti nodes" datum={plainDatum(DF.MEMORY_STATUS.graphiti.node_count, EP.memory)} format={fmtCount}
             hint={`${DF.MEMORY_STATUS.graphiti.edge_count.toLocaleString()} edges`}
-            spark={(DF.MEMORY_STATUS.graphiti.spark?.values || []).slice(-30)} sparkColor={CP.accent} />
-        <ST label="Mem0 memories" value={DF.MEMORY_STATUS.mem0.memory_count.toLocaleString()}
+            history={(DF.MEMORY_STATUS.graphiti.spark?.values || []).slice(-30)} sparkColor={CP.accent} />
+        <ST label="Mem0 memories" datum={plainDatum(DF.MEMORY_STATUS.mem0.memory_count, EP.memory)} format={fmtCount}
             hint={`${DF.MEMORY_STATUS.graphiti.episode_count.toLocaleString()} episodes`}
-            spark={(DF.MEMORY_STATUS.mem0.spark?.values || []).slice(-30)} sparkColor={CP.info} />
-        <ST label="Write queue" value={DF.MEMORY_STATUS.queue.counts.pending}
+            history={(DF.MEMORY_STATUS.mem0.spark?.values || []).slice(-30)} sparkColor={CP.info} />
+        <ST label="Write queue" datum={plainDatum(DF.MEMORY_STATUS.queue.counts.pending, EP.memory)}
             hint={DF.MEMORY_STATUS.queue.oldest_pending_age_seconds != null
               ? `${DF.MEMORY_STATUS.queue.oldest_pending_age_seconds}s oldest`
               : 'idle'}
-            spark={(DF.MEMORY_STATUS.queue.spark?.values || []).slice(-30)} sparkColor={CP.warn} />
+            history={(DF.MEMORY_STATUS.queue.spark?.values || []).slice(-30)} sparkColor={CP.warn} />
         {(() => {
           // Combined ops (read+write) — last hour bucket, plus a per-hour spark.
           const combined = ts.reads.map((r, i) => r + (ts.writes[i] || 0));
-          const last = combined.length ? combined[combined.length - 1] : 0;
+          const last = combined.length ? combined[combined.length - 1] : null;
           return (
-            <ST label="Ops / hr" value={last.toLocaleString()}
-                spark={combined} sparkColor={CP.accent} hint="last 24h" />
+            <ST label="Ops / hr" datum={derivedDatum(last, EP.memoryGraphs, 'no hourly buckets in the last 24h')} format={fmtCount}
+                history={combined} sparkColor={CP.accent} hint="last 24h" />
           );
         })()}
         <ST label="fused-memory"
-            value={`up ${window.DF_SHELL.fmtUptime(DF.MEMORY_STATUS.uptime_seconds)}`}
+            datum={plainDatum(DF.MEMORY_STATUS.uptime_seconds, EP.memory)} format={secs => `up ${window.DF_SHELL.fmtUptime(secs)}`}
             hint={DF.MEMORY_STATUS.started_at || '—'} />
       </div>
 
@@ -723,34 +780,47 @@ function ReconTab({ projectFilter, search }) {
             lastFullIso = ts; lastFullProject = pid;
           }
         }
-        const totalRuns = r.runs.length;
-        const successCount = r.runs.filter(x => x.status === 'success').length;
-        const successPct = totalRuns ? Math.round(successCount / totalRuns * 100) : null;
-        // Sparkline of recent run durations (oldest first).
+        // ONE derivation for every run-derived tile below — recon_status.js
+        // owns the vocabulary, so no two tiles can disagree about the same
+        // window. That window is the UNFILTERED r.runs, like the three tiles
+        // beside them (Buffered events, Active agents, Last full run): the
+        // strip reports the store, the tables below report the operator's
+        // project/search filter. The Recent runs table headlines its own,
+        // narrower window as "N matching", so each run-derived tile names
+        // its scope in the hint — otherwise the two numbers read as a
+        // disagreement rather than as two different questions.
+        const counts = reconRunCounts(r.runs);
+        const successPct = reconSuccessPct(counts);
+        // Sparkline of recent run durations (oldest first), same window.
         const durSpark = r.runs
           .filter(x => x.duration_seconds != null)
           .slice(0, 40)
           .map(x => x.duration_seconds)
           .reverse();
         return (
-          <div className="col-span-12 grid cols-4">
-            <ST label="Buffered events" value={r.buffer.buffered_count}
+          <div className="col-span-12 grid cols-5">
+            <ST label="Buffered events" datum={plainDatum(r.buffer.buffered_count, EP.recon)}
                 hint={r.buffer.oldest_event_age_seconds != null
                   ? `oldest ${r.buffer.oldest_event_age_seconds}s`
                   : 'idle'}
-                spark={(r.buffer.spark?.values || []).slice(-30)} sparkColor={CP.warn} />
-            <ST label="Active agents" value={r.burst_state.length}
+                history={(r.buffer.spark?.values || []).slice(-30)} sparkColor={CP.warn} />
+            <ST label="Active agents" datum={plainDatum(r.burst_state.length, EP.recon)}
                 hint={`${r.burst_state.filter(b=>b.state!=='idle').length} non-idle`}
-                spark={(r.agents_spark?.values || []).slice(-30)} sparkColor={CP.accent} />
+                history={(r.agents_spark?.values || []).slice(-30)} sparkColor={CP.accent} />
+            <ST label="In progress" datum={plainDatum(counts.inFlight, EP.recon)}
+                hint={`of ${counts.total} recent runs (all projects)`}
+                history={[]} />
             <ST label="Last full run"
-                value={lastFullIso ? window.DF_SHELL.timeago(lastFullIso) : '—'}
+                datum={derivedDatum(lastFullIso, EP.recon, 'no completed run')} format={window.DF_SHELL.timeago}
                 hint={lastFullProject || 'no completed run'}
-                spark={[]} />
+                history={[]} />
             <ST label="Run success rate"
-                value={successPct != null ? successPct : '—'}
+                datum={derivedDatum(successPct, EP.recon, 'no finished runs')}
                 unit={successPct != null ? '%' : ''}
-                hint={`${totalRuns} runs · last ${durSpark.length} durations`}
-                spark={durSpark} sparkColor={CP.ok} />
+                hint={`${counts.terminal} finished · ${counts.inFlight} in flight`
+                  + (counts.unknown ? ` · ${counts.unknown} unknown status` : '')
+                  + ' (all projects)'}
+                history={durSpark} sparkColor={CP.ok} />
           </div>
         );
       })()}
@@ -808,7 +878,7 @@ function ReconTab({ projectFilter, search }) {
                   <td className="mono">{rn.project_id || rn.project}</td>
                   <td style={{ color: 'var(--fg-2)' }}>{rn.trigger_reason || rn.trigger}</td>
                   <td>{rn.run_type || rn.type}</td>
-                  <td><span className={`badge ${rn.status === 'success' || rn.status === 'completed' ? 'ok' : rn.status === 'failed' ? 'bad' : 'warn'}`}>{rn.status}</span></td>
+                  <td><span className={`badge ${reconStatusTone(rn.status)}`}>{rn.status}</span></td>
                   <td className="num">{rn.events_processed ?? rn.events ?? 0}</td>
                   <td className="num">{rn.duration_seconds != null ? `${rn.duration_seconds.toFixed(1)}s` : '—'}</td>
                   <td style={{ color: 'var(--fg-3)' }}>{window.DF_SHELL.timeago(rn.started_at)}</td>
@@ -875,8 +945,8 @@ function MergeTab({ projectFilter }) {
           : null;
         return (
           <div className="col-span-12 grid cols-4">
-            <ST label="Merges (window)" value={totals.count}
-                spark={aggDepth} sparkColor={CP.accent} />
+            <ST label="Merges (window)" datum={plainDatum(totals.count, EP.mergeQueue)}
+                history={aggDepth} sparkColor={CP.accent} />
             {(() => {
               // Aggregate the per-project active_spark series by label.
               const labelMap = {};
@@ -888,19 +958,19 @@ function MergeTab({ projectFilter }) {
               });
               const activeSpark = Object.keys(labelMap).sort().map(k => labelMap[k]).slice(-30);
               return (
-                <ST label="In queue now" value={totals.active}
+                <ST label="In queue now" datum={plainDatum(totals.active, EP.mergeQueue)}
                     hint={`${projects.filter(([_,d])=>d.active.length>0).length} projects`}
-                    spark={activeSpark} sparkColor={CP.warn} />
+                    history={activeSpark} sparkColor={CP.warn} />
               );
             })()}
             <ST label="Speculative hit rate"
-                value={hitPct != null ? hitPct : '—'} unit={hitPct != null ? '%' : ''}
+                datum={derivedDatum(hitPct, EP.mergeQueue, 'no speculative attempts')} unit={hitPct != null ? '%' : ''}
                 hint={`${totals.hits}/${totals.hits + totals.discards} attempts`}
-                spark={[]} sparkColor={CP.ok} />
+                history={[]} sparkColor={CP.ok} />
             <ST label="p95 latency · worst project"
-                value={p95 != null ? fmtMs(p95) : '—'}
+                datum={derivedDatum(p95, EP.mergeQueue, 'no merges in this window')} format={fmtMs}
                 hint={p95s.length ? `${p95s.length} projects` : 'no merges'}
-                spark={[]} sparkColor={CP.warn} />
+                history={[]} sparkColor={CP.warn} />
           </div>
         );
       })()}
@@ -912,8 +982,8 @@ function MergeTab({ projectFilter }) {
         const summary = (
           <>
             <HaltPill halt={d.halt} />
-            <span className="pip"><span className="pip-dot" style={{ background: CP.accent }}></span>{d.latency.count} attempts</span>
-            <span className="pip"><span className="pip-dot" style={{ background: CP.warn }}></span>{d.active.length} queued</span>
+            <Pip datum={plainDatum(d.latency.count, EP.mergeQueue)} color={CP.accent} label="attempts" />
+            <Pip datum={plainDatum(d.active.length, EP.mergeQueue)} color={CP.warn} label="queued" />
             {/* The approximate-data warning belongs on the SUMMARY STRIP, not
                 inside the "Currently queued" panel: the strip renders whether
                 or not the group is collapsed AND regardless of
@@ -922,7 +992,7 @@ function MergeTab({ projectFilter }) {
                 event-derived fallback empty, where "0 queued" previously read
                 as a confident zero. */}
             {d.active_approximate && <span className="badge warn">approx · event-derived</span>}
-            <span className="pip"><span className="pip-dot" style={{ background: CP.ok }}></span>{fmtMs(d.latency.p50)} p50</span>
+            <Pip datum={plainDatum(d.latency.p50, EP.mergeQueue)} color={CP.ok} format={fmtMs} label="p50" />
             <span style={{ color: 'var(--fg-3)' }}>· {hitPct}% spec hit</span>
           </>
         );
@@ -980,15 +1050,15 @@ function MergeTab({ projectFilter }) {
                       return (
                         <>
                           <ST label="Retries / landing"
-                              value={rpl != null ? Number(rpl).toFixed(2) : '—'}
+                              datum={plainDatum(rpl, EP.mergeQueue)} format={n => Number(n).toFixed(2)}
                               unit=""
                               hint={m.landings_total != null ? `${m.landings_total} landings` : 'offline'}
-                              spark={[]} sparkColor={CP.warn} />
+                              history={[]} sparkColor={CP.warn} />
                           <ST label="Drift @ detect"
-                              value={driftVal != null ? driftVal : '—'}
+                              datum={derivedDatum(driftVal, EP.mergeQueue, 'no drift detections')}
                               unit=""
                               hint={dd.count ? `${dd.count} detections` : 'no conflicts'}
-                              spark={[]} sparkColor={CP.bad} />
+                              history={[]} sparkColor={CP.bad} />
                         </>
                       );
                     })()}
@@ -1099,35 +1169,34 @@ function CostsTab({ projectFilter }) {
   return (
     <div className="grid cols-12" style={{ gap: 12 }}>
       <div className="col-span-12 grid cols-4">
-        <ST label="Total spend" value={`$${c.summary.total.toFixed(2)}`}
+        <ST label="Total spend" datum={plainDatum(c.summary.total, EP.costs)} format={fmtUsd}
             delta={c.summary.delta_pct != null ? `${c.summary.delta_pct}%` : null}
             deltaDir={c.summary.delta_pct == null ? null : (c.summary.delta_pct < 0 ? 'down' : 'up')}
-            spark={c.trend.values} sparkColor={CP.accent}
+            history={c.trend.values} sparkColor={CP.accent}
             hint={c.summary.delta_pct == null && c.summary.delta_hint
               ? c.summary.delta_hint
               : 'window total'} />
         <ST label="Runs"
-            value={c.summary.runs ? c.summary.runs.toLocaleString() : '—'}
+            datum={plainDatum(c.summary.runs, EP.costs)} format={fmtCount}
             hint={c.summary.runs
               ? `avg $${(c.summary.total / c.summary.runs).toFixed(3)}/run`
               : 'no runs in window'}
-            spark={[]} sparkColor={CP.info} />
+            history={[]} sparkColor={CP.info} />
         {(() => {
           const t = c.summary.tokens;
           const tot = t && typeof t === 'object' ? t.total : t;
-          const display = tot != null ? `${(tot/1e6).toFixed(2)}M` : '—';
           const breakdown = (t && typeof t === 'object' && tot != null)
             ? `in ${(t.input/1e6).toFixed(1)}M · out ${(t.output/1e6).toFixed(1)}M · cache ${((t.cache_read+t.cache_create)/1e6).toFixed(1)}M`
             : 'no token data';
           return (
-            <ST label="Tokens" value={display} hint={breakdown}
-                spark={[]} sparkColor={CP.ok} />
+            <ST label="Tokens" datum={plainDatum(tot, EP.costs)} format={n => `${(n/1e6).toFixed(2)}M`} hint={breakdown}
+                history={[]} sparkColor={CP.ok} />
           );
         })()}
         <ST label="p95 run cost"
-            value={c.summary.p95_run_cost != null ? `$${c.summary.p95_run_cost.toFixed(2)}` : '—'}
+            datum={plainDatum(c.summary.p95_run_cost, EP.costs)} format={fmtUsd}
             hint={c.summary.p95_run_cost != null ? 'across all runs' : 'no runs in window'}
-            spark={[]} sparkColor={CP.warn} />
+            history={[]} sparkColor={CP.warn} />
       </div>
 
       <div className="col-span-7 panel">
@@ -1240,22 +1309,21 @@ function BurnTab({ projectFilter, displayWindow }) {
   return (
     <div className="grid cols-12" style={{ gap: 12 }}>
       {(() => {
-        const completed = b.completed ?? 0;
         const velocity = b.velocity ?? 0;  // tasks/day — server-computed delta / distinct-day count
         const lastPending = b.pending.length ? b.pending[b.pending.length-1] : 0;
         const firstPending = b.pending.length ? b.pending[0] : 0;
         const forecastDays = velocity > 0 ? Math.round(lastPending / velocity) : null;
         return (
           <div className="col-span-12 grid cols-4">
-            <ST label="Net velocity" value={velocity.toFixed(1)} unit="/day"
+            <ST label="Net velocity" datum={plainDatum(velocity, EP.burndown)} format={v => v.toFixed(1)} unit="/day"
                 hint={b.window_days ? `window avg · ${b.window_days}d` : 'window avg'}
-                spark={deriveVelocitySeries(b.done, b.labels, smoothSecs)} sparkColor={CP.ok} />
-            <ST label="Completed (window)" value={completed}
-                spark={b.done} sparkColor={CP.ok} />
-            <ST label="Backlog" value={lastPending}
+                history={deriveVelocitySeries(b.done, b.labels, smoothSecs)} sparkColor={CP.ok} />
+            <ST label="Completed (window)" datum={plainDatum(b.completed, EP.burndown)}
+                history={b.done} sparkColor={CP.ok} />
+            <ST label="Backlog" datum={plainDatum(lastPending, EP.burndown)}
                 delta={`${lastPending - firstPending}`}
                 deltaDir={lastPending < firstPending ? 'down' : 'up'}
-                spark={b.pending} sparkColor={CP.warn} />
+                history={b.pending} sparkColor={CP.warn} />
             {(() => {
               // Server-computed forecast confidence (recent 7d vs lifetime
               // velocity) is null when <7 days of history. Fall back to the
@@ -1266,15 +1334,15 @@ function BurnTab({ projectFilter, displayWindow }) {
               const haveRange = lo != null && hi != null;
               const display = haveRange
                 ? (lo === hi ? `${lo}d` : `${lo}–${hi}d`)
-                : (forecastDays != null ? `${forecastDays}d` : '—');
+                : (forecastDays != null ? `${forecastDays}d` : null);
               const hint = haveRange
                 ? `${lastPending} pending · 7d vs lifetime velocity`
                 : (forecastDays != null
                     ? `${lastPending} / ${velocity.toFixed(1)} per day · need 7d for range`
                     : (velocity === 0 ? 'velocity is zero' : 'no data'));
               return (
-                <ST label="Forecast clear" value={display} hint={hint}
-                    spark={b.pending} sparkColor={CP.ok} />
+                <ST label="Forecast clear" datum={derivedDatum(display, EP.burndown, hint)} hint={hint}
+                    history={b.pending} sparkColor={CP.ok} />
               );
             })()}
           </div>
@@ -1347,15 +1415,14 @@ function BurnTab({ projectFilter, displayWindow }) {
       {view === 'per-project' && projects.map(p => {
         const pb = DF.BURNDOWN_BY_PROJECT[p.id];
         if (!pb) return null;
-        const completed = pb.completed ?? 0;
         const pbVelocity = pb.velocity ?? 0;
         const last = i => pb[i][pb[i].length-1];
         const summary = (
           <>
-            <span className="pip"><span className="pip-dot" style={{ background: CP.ok }}></span>{completed} done</span>
-            <span className="pip"><span className="pip-dot" style={{ background: CP.accent }}></span>{last('in_progress')} active</span>
-            {last('blocked') > 0 && <span className="pip"><span className="pip-dot" style={{ background: CP.bad }}></span>{last('blocked')} blocked</span>}
-            <span className="pip"><span className="pip-dot" style={{ background: CP.warn }}></span>{last('pending')} pending</span>
+            <Pip datum={plainDatum(pb.completed, EP.burndown)} color={CP.ok} label="done" />
+            <Pip datum={plainDatum(last('in_progress'), EP.burndown)} color={CP.accent} label="active" />
+            {last('blocked') > 0 && <Pip datum={plainDatum(last('blocked'), EP.burndown)} color={CP.bad} label="blocked" />}
+            <Pip datum={plainDatum(last('pending'), EP.burndown)} color={CP.warn} label="pending" />
             <span style={{ color: 'var(--fg-3)' }}>· {pbVelocity.toFixed(1)}/day</span>
           </>
         );
