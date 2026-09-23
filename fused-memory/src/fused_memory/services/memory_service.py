@@ -2423,19 +2423,7 @@ class MemoryService:
                     success=True,
                 )
             return result
-        except BaseException as e:
-            # BaseException, not Exception: observe-and-reraise, never swallow
-            # (the `raise` below is unconditional), so structured cancellation
-            # is unaffected and only the journal gains a row. Previously a
-            # cancelled backend call hit NEITHER branch and vanished from
-            # Layer 2 entirely. This is the shared helper for every
-            # `_execute_*` path, so one edit makes backend_ops truthful for
-            # all of them at once.
-            #
-            # f'{type(e).__name__}: {e}' rather than bare str(e): a bare
-            # CancelledError's str() is empty, which would record a failure
-            # with no identifiable cause. Matches durable_queue's
-            # _handle_failure and _execute_mem0_write.
+        except (Exception, asyncio.CancelledError) as e:
             if self._write_journal:
                 await self._write_journal.log_backend_op(
                     write_op_id=write_op_id,
@@ -5741,9 +5729,9 @@ class MemoryService:
 
         result = None
         error_msg = None
-        # POSITIVE EVIDENCE ONLY: set solely after the backend await returns.
-        # `success` used to be derived from the ABSENCE of an error, which made
-        # every path that skips the handler a silent false success.
+        # Set only once the backend await returns, never inferred from a None
+        # error_msg: a BaseException the handler below does not name must not
+        # journal as a success either.
         succeeded = False
         try:
             result = await self._journaled_backend_call(
@@ -5758,16 +5746,7 @@ class MemoryService:
             )
             succeeded = True
             return result
-        except BaseException as e:
-            # Deliberately BaseException, not Exception — this file's usual
-            # rule (stated in _apply_memory_metadata_validation and
-            # _is_rate_limit_or_quota_error) targets handlers that SWALLOW,
-            # where catching CancelledError would break structured cancellation.
-            # This one only OBSERVES and immediately re-raises: control flow
-            # for a cancellation is byte-for-byte unchanged, and only the
-            # journal row differs. A write the queue cancelled (its
-            # wait_for(write_timeout_seconds), or close()'s worker cancel)
-            # provably never executed, so it must not be journaled as landed.
+        except (Exception, asyncio.CancelledError) as e:
             error_msg = f'{type(e).__name__}: {e}'
             raise
         finally:
@@ -5778,17 +5757,6 @@ class MemoryService:
             # the failure invisible to the journal. The `finally` mirrors
             # add_episode's, and log_write_op is an upsert, so the retries of a
             # single item converge on one row whose last attempt wins.
-            #
-            # The row's `success` is now derived from POSITIVE EVIDENCE, so a
-            # write cancelled mid-flight reports success=False rather than
-            # inheriting a default. add_episode's mirror carries the same fix.
-            #
-            # `succeeded` is belt-and-braces over the widened `except`: should
-            # any future BaseException bypass the handler entirely, the row
-            # still cannot claim a success. log_write_op is documented
-            # fire-and-forget/never-raises (write_journal.py), so it is called
-            # undefended here — wrapping it would risk masking the very
-            # CancelledError being propagated.
             if self._write_journal:
                 await self._write_journal.log_write_op(
                     write_op_id=journal_write_op_id,
@@ -6109,12 +6077,8 @@ class MemoryService:
             known_project_ids=self._known_projects,
         )
 
-        # POSITIVE EVIDENCE ONLY, set after enqueue() commits. `success` on a
-        # write_ops row means "the enqueue was ACCEPTED", so an enqueue that
-        # was cancelled mid-commit is by definition not one. Mirrors
-        # _execute_mem0_write's matching fix — that method's comment already
-        # names this one as the shape it was copied from, so the two are a
-        # documented pair and are kept in step.
+        # Set only once enqueue() commits: `success` on a write_ops row means
+        # "the enqueue was ACCEPTED" (_execute_mem0_write has the same shape).
         success = False
         error_msg = None
         try:
@@ -6163,11 +6127,7 @@ class MemoryService:
                 callback_type='dual_write_episode',
             )
             success = True
-        except BaseException as e:
-            # Observe-and-reraise (see _execute_mem0_write for the full note):
-            # never swallows, so cancellation semantics are unchanged and only
-            # the journal row differs. type(e).__name__ is prefixed because a
-            # bare CancelledError's str() is empty.
+        except (Exception, asyncio.CancelledError) as e:
             error_msg = f'{type(e).__name__}: {e}'
             raise
         finally:
