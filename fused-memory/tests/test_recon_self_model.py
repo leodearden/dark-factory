@@ -581,6 +581,16 @@ class TestPremiseLint:
         violations = m.premise_lint('Reconcile task 7 status against the knowledge graph')
         assert violations == []
 
+    def test_violation_is_a_frozen_dataclass(self):
+        import dataclasses
+
+        v = m.Violation(premise='x', invariant='y', detail='z')
+        assert dataclasses.is_dataclass(v)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            # setattr, not a direct attribute assignment, so this stays pyright-clean
+            # (a direct assignment on a frozen dataclass is reportAttributeAccessIssue).
+            setattr(v, 'premise', 'mutated')  # noqa: B010
+
 
 class TestNegativeProbeSetPremise:
     """Task 4644: a negative mixed-store probe set licenses "0 of N
@@ -774,16 +784,6 @@ class TestNegativeProbeSetPremise:
             '0 of 3 probes reproduced the Graphiti degradation; continuing to '
             'watch it.'
         )
-
-    def test_violation_is_a_frozen_dataclass(self):
-        import dataclasses
-
-        v = m.Violation(premise='x', invariant='y', detail='z')
-        assert dataclasses.is_dataclass(v)
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            # setattr, not a direct attribute assignment, so this stays pyright-clean
-            # (a direct assignment on a frozen dataclass is reportAttributeAccessIssue).
-            setattr(v, 'premise', 'mutated')  # noqa: B010
 
 
 # --------------------------------------------------------------------------- #
