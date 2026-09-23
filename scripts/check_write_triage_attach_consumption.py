@@ -7,47 +7,35 @@ sibling of item 1's ``scripts/check_write_triage_attach_target.py``.
 THE INVARIANT
 -------------
 Item 1 asserts that the judge path can BIND a verdict to a determinate
-candidate. It stops there: it does not execute the attach, so nothing it
-measures shows that the binding is CONSUMED. A change that only widens the
-parse contract therefore opens item 1 while the attach still lands on the
-band's top-1 — the very harm item 1 describes, still live.
+candidate, and never executes the attach. So a change that only widens the
+parse contract opens item 1 while the attach still lands on the band's top-1.
+This probe EXECUTES ``triage_write`` with an injected fake judge and asks
+whether the attach id is the candidate the judge reasoned about.
 
-This probe closes that gap by EXECUTING ``triage_write`` with an injected fake
-judge and asking whether the attach id is determined by the candidate the judge
-reasoned about.
-
-TWO BRANCHES, AND WHAT EACH DOES AND DOES NOT MEASURE. What is asserted is
-the INVARIANT, not which remedy landed: requiring either branch alone would
-fail a correct fix that took the other route.
+TWO BRANCHES satisfy it. Requiring either alone would fail a correct fix that
+took the other route.
 
     judge-side designation swap (option a). The JUDGE names its candidate back
-    and the attach tracks it across two DIFFERENT designations. A measured
-    consumption result: the write runs twice and the attach id follows.
+    and the attach tracks it across two DIFFERENT designations: MEASURED, by
+    running the write twice.
 
-    judge-module attach target (option b, as it actually exists here). The
-    CALLER picks the target, so ``judge_write`` reads ``decision.canonical_id``
-    — which it already holds — and hands it to ``build_judge_prompt``, leaving
-    ``triage_write`` unchanged. The judge names nothing back, so no swap is
-    possible however correct the module is; consumption holds BY CONSTRUCTION,
-    because the announced target and the attach target are one expression. Read
-    from the ref's JUDGE module, which is the only place this remedy appears.
+    judge-module attach target (option b, as it exists here). ``judge_write``
+    hands ``build_judge_prompt`` the ``decision.canonical_id`` it already
+    holds, and ``triage_write`` is unchanged. The judge names nothing back, so
+    no swap is possible; consumption holds BY CONSTRUCTION, because announced
+    target and attach target are one expression.
 
-The PASS report names the branch that held. "A swap was measured" and "option
-(b) held by construction" authorise the production flag flip on different
-evidence, and an operator may not be left unable to tell which they have.
+The PASS report names the branch that held, since the two authorise the
+production flag flip on different evidence.
 
-WHY THE JUDGE SEAM. ``triage_write(..., judge=...)`` is a real injection point
-the module's own contract tests already use, and ``memory_service`` is
-duck-typed all the way down (every config read goes through a
-``getattr``-at-every-hop resolver). So no LLM call, no network and no real
-service are needed — which is what makes this fit a bounded before_done
-predicate at all.
+WHY THE JUDGE SEAM. ``triage_write(..., judge=...)`` is a real injection point,
+and ``memory_service`` is duck-typed all the way down, so no LLM call, network
+or real service is needed.
 
-WHY THE SLATE HOISTS A PARENT. The fixture's highest-scoring candidate is an
-evidence CHILD whose ``parent_id`` points at a record that never appears in the
-slate, so ``_canonical_id_of`` hoists it and the band's canonical is an id NO
-candidate carries as its own. That is what makes "the attach followed the
-judge's designation" separable from "the attach used the band's winner".
+WHY THE SLATE HOISTS A PARENT. The top-scoring candidate is an evidence CHILD
+whose ``parent_id`` names a record absent from the slate, so the band's
+canonical is an id NO candidate carries. That separates "the attach followed
+the judge" from "the attach used the band's winner".
 
 EXIT-CODE CONTRACT
     0  the invariant holds.
@@ -77,19 +65,13 @@ EXIT_FAIL = 1
 
 logger = logging.getLogger(__name__)
 
-#: Prefix for the probe's own degraded-measurement records. They are collected
-#: rather than logged straight out because logging's default destination is
-#: stderr, which the gate drops.
 _WARN_PREFIX = 'WARN  '
 
 
 class _WarnCollector(logging.Handler):
-    """Divert the probe's own warnings into the END of the report.
+    """Divert the probe's own warnings into the END of its stdout report.
 
-    A warning about HOW something was measured has to reach the operator
-    reading the verdict, and the two channels this probe's output survives are
-    narrow: the gate drops stderr, and a report read through a tail keeps only
-    its end. So the records go on stdout, and last.
+    The gate drops stderr, and a report read through a tail keeps only its end.
     """
 
     def __init__(self, sink: list[str]) -> None:
@@ -116,11 +98,9 @@ _TOP_SCORE = 0.60
 _SCORE_STEP = 0.05
 _CHILD_SCORE = 0.72
 
-#: Band edges chosen so the child's cosine lands STRICTLY between them and the
-#: write routes to the judge. Real floats, never defaults: ``t_low is None``
-#: means uncalibrated and short-circuits to ``stored``, and ``t_high is None``
-#: is a legitimate empty deterministic band — neither reaches the judge slot on
-#: the terms this probe needs.
+#: Band edges the child's cosine lands STRICTLY between, so the write routes to
+#: the judge. Real floats: a ``None`` edge means uncalibrated or an empty band,
+#: and neither reaches the judge slot.
 _T_HIGH = 0.85
 _T_LOW = 0.50
 
@@ -128,10 +108,8 @@ _CANDIDATE_K = 20
 _PROJECT_ID = 'write-triage-consumption-probe'
 _NEW_ENTRY = 'A new memory entry submitted for triage by this probe.'
 
-#: The outcome the fake judge returns. NOT ``stored``: main maps ``stored`` to
-#: ``canonical_id = None`` by design (nothing was attached), so a probe that
-#: designated a candidate and asked for ``stored`` would be asking the module
-#: to contradict itself.
+#: The outcome the fake judge returns. NOT ``stored``, which attaches nothing
+#: by design, so a designation paired with it would contradict itself.
 _ATTACH_OUTCOME = 'restated'
 
 _PASS_MARKER = 'PASS  the judge-bound candidate is CONSUMED by the attach'
@@ -162,14 +140,9 @@ _PROVIDER_NAME = '_call_llm'
 #: takes any time at all.
 _JUDGE_DRIVE_TIMEOUT = 5.0
 
-#: THE ONE MACHINE-READABLE LINE saying which branch satisfied item 5, and the
-#: two names it can carry. `PASS  item 5` alone cannot tell an operator
-#: whether a swap was MEASURED or whether option (b) held BY CONSTRUCTION, and
-#: those authorise the production flag flip on different evidence. The gate
-#: greps this prefix and quotes the rest into its own report.
-#:
-#: ASCII only, deliberately: the gate bounds the quoted text with a substring
-#: expansion, and a cut through a multi-byte character would emit a broken one.
+#: The one machine-readable line naming the branch that held. The gate greps
+#: this prefix and quotes a bounded prefix of the rest, so branch names stay
+#: ASCII: a cut through a multi-byte character would emit a broken one.
 _BRANCH_PREFIX = 'ITEM5-BRANCH  '
 
 
@@ -203,13 +176,10 @@ class _Unverifiable(Exception):
 
 
 class _Candidate:
-    """A duck-typed ``MemoryResult`` stand-in.
+    """A duck-typed ``MemoryResult`` stand-in: ``.id``/``.content``/``.metadata``.
 
-    ``_cosine_of`` reads the per-store cosine out of ``metadata['store_score']``
-    and ``_canonical_id_of`` reads ``metadata['kind']``/``metadata[PARENT_ID_KEY]``,
-    so ``.id``/``.content``/``.metadata`` is the whole contract. Constructing one
-    avoids importing ``MemoryResult``, whose module pulls in third-party deps a
-    bare extracted tree may not have.
+    That is all ``_cosine_of`` and ``_canonical_id_of`` read, and it avoids
+    importing ``MemoryResult``, whose deps a bare extracted tree may lack.
     """
 
     __slots__ = ('content', 'id', 'metadata')
@@ -226,9 +196,8 @@ class _Candidate:
 class _SearchResults(list):
     """``MemoryService.SearchResults`` stand-in: a list that carries degradation.
 
-    ``triage_write`` reads ``degraded`` before banding — a degraded retrieval is
-    a fail-open, not an empty corpus — so the attribute has to exist and be
-    False for the probe's run to reach the judge at all.
+    ``triage_write`` fails open on a degraded retrieval, so ``degraded`` must
+    exist and be False for the run to reach the judge.
     """
 
     degraded = False
@@ -292,11 +261,9 @@ def _is_inside(path: Path, root: Path) -> bool:
 def _import_triage(src_root: Path, extra_paths: list[Path]) -> Any:
     """Import the triage module out of *src_root*, shadowing any installed copy.
 
-    *extra_paths* carries first-party trees the module imports but that
-    ``--src-root`` does not contain — ``shared/src`` for ``shared.storm_counter``.
-    They go on ``sys.path`` BEFORE *src_root*, so *src_root* ends up first and
-    the assertion is made against the ref rather than against whatever happens
-    to be installed in the interpreter running this probe.
+    *extra_paths* are first-party trees the module imports that ``--src-root``
+    lacks (``shared/src``). They go on ``sys.path`` before *src_root*, so
+    *src_root* ends up first.
     """
     if not src_root.is_dir():
         raise _Unverifiable(f'--src-root is not a directory: {src_root}')
@@ -310,10 +277,8 @@ def _import_triage(src_root: Path, extra_paths: list[Path]) -> Any:
             f'cannot import {_MODULE_NAME} from {src_root}: {exc!r}',
         ) from exc
     origin = getattr(module, '__file__', None)
-    # PATH CONTAINMENT, not a string prefix: `str(a).startswith(str(b))` also
-    # accepts a SIBLING whose name extends the root -- `<root>-installed/...`
-    # for `--src-root <root>` -- so the probe would report on a module the ref
-    # never shipped, which is the substitution this guard exists to catch.
+    # Path containment, not a string prefix: a sibling `<root>-installed`
+    # extends the root's name without being inside it.
     if origin is None or not _is_inside(Path(origin), src_root):
         raise _Unverifiable(
             f'{_MODULE_NAME} resolved to {origin!r}, which is outside --src-root '
@@ -325,18 +290,11 @@ def _import_triage(src_root: Path, extra_paths: list[Path]) -> Any:
 def _import_judge_if_present(src_root: Path) -> Any | None:
     """The ref's judge module, or None. NON-FATAL, unlike :func:`_import_triage`.
 
-    A src-root with no judge module, or one whose import blows up, leaves the
-    judge-target branch unsatisfied rather than raising :class:`_Unverifiable`.
-    Every fixture repo written before option (b) carries no judge module at
-    all, and a branch that ERRORED on them would have invented a new way for
-    this gate to report UNVERIFIABLE against a tree it reads perfectly well.
-
-    ``BaseException``, for :func:`main`'s reason: a ``SystemExit`` out of the
-    ref's own module body is not an ``Exception``, and letting one through
-    here would end the probe mid-report with the REF's exit code.
-
-    *src_root* is already on ``sys.path`` — :func:`_import_triage` put it
-    there, and the two modules are siblings in the one tree the gate extracts.
+    A tree with no importable judge module leaves the judge-target branch
+    unsatisfied, so it keeps the verdict its triage module earns rather than
+    becoming UNVERIFIABLE. ``BaseException`` for :func:`main`'s reason: a
+    ``SystemExit`` out of the ref's module body would otherwise end the probe.
+    *src_root* is already on ``sys.path`` (:func:`_import_triage`).
     """
     try:
         module = importlib.import_module(_JUDGE_MODULE_NAME)
@@ -358,10 +316,8 @@ def _require(module: Any, name: str) -> Any:
 def _child_kind(module: Any) -> str:
     """A ``kind`` the ref's own ``_canonical_id_of`` treats as a child.
 
-    Read from the module rather than spelled here: the hoist only fires for a
-    kind in its ``CHILD_KINDS``, and a probe that hardcoded one would silently
-    stop hoisting — and therefore stop measuring the case that matters — if the
-    vocabulary moved.
+    Read from the ref, because a hardcoded kind would silently stop the hoist
+    — and with it the case that matters — if the vocabulary moved.
     """
     kinds = getattr(module, 'CHILD_KINDS', None)
     for kind in sorted(kinds) if isinstance(kinds, (frozenset, set)) else ():
@@ -376,22 +332,12 @@ def _parent_key(module: Any) -> str:
 
 
 def _attach_id_for(module: Any, candidate: Any) -> Any:
-    """The id an attach to *candidate* MUST land on, with the ref's hoist applied.
+    """The id an attach to *candidate* MUST land on: its own, or its PARENT's.
 
-    "The attach honoured this candidate" is NOT "the attach id equals this
-    candidate's id": for a child it is the PARENT's id. ``_canonical_id_of``
-    documents that hoist as mandatory — attaching to a child creates a
-    grandchild that can never fold under the true canonical, which reads as
-    content loss — so a correct remedy that threads a designation still hoists
-    it, and a probe measuring literal equality would report that remedy as
-    broken.
-
-    Read from the REF's own ``_canonical_id_of`` where it exposes one, for the
-    same reason :func:`_child_kind` is read from the ref: a rule spelled here
-    is a second copy of the write side's, and a copy that drifts produces
-    exactly the unfoldable children that function exists to prevent. The
-    metadata rule below is the fallback for a ref that renamed it, not a second
-    opinion.
+    ``_canonical_id_of`` makes hoisting a child to its parent mandatory, so a
+    correct remedy lands there. The ref's own function decides, so the probe
+    cannot drift from the write side. The metadata rule is only the fallback
+    for a ref that renamed it.
     """
     hoist = getattr(module, '_canonical_id_of', None)
     if callable(hoist):
@@ -429,17 +375,10 @@ class _Spelling(NamedTuple):
     payload: Callable[[str, str], Any]
 
 
-#: THE DESIGNATION-SHAPE SEARCH. Option (a) has not landed, so no single
-#: spelling may be pinned: requiring one would fail a correct fix that chose
-#: another, which is the false-FAIL class this gate family exists to remove.
-#: Every shape is tried and the FIRST whose consumption test holds wins. A
-#: spelling the implementation cannot consume simply is not the winner and
-#: costs nothing; only a module where NO spelling holds fails.
-#:
-#: The bare outcome str is included DELIBERATELY as a control that must never
-#: satisfy on its own — it designates no candidate, so a module that widened
-#: nothing must not open the gate on it. A control nobody exercises proves
-#: nothing, so it is tried and reported like any other.
+#: THE DESIGNATION-SHAPE SEARCH. Option (a)'s wire shape has not landed, so
+#: none is pinned: each is tried, and the first whose swap holds wins. The bare
+#: outcome str is a CONTROL: it designates nothing, so it must never satisfy on
+#: its own, and it is tried and reported like the rest.
 _SPELLINGS: tuple[_Spelling, ...] = (
     _Spelling('bare outcome str', lambda outcome, _ident: outcome),
     _Spelling(
@@ -490,16 +429,10 @@ async def _await(awaitable: Any) -> Any:
 def _decision_shape_error(decision: Any) -> str | None:
     """Why *decision* cannot be read as a ``BandDecision``, or None if it can.
 
-    Duck-typed on the two fields this probe reads rather than on the class.
-    An ``isinstance`` check against a class imported from the same bare tree
-    would add nothing and would fail any ref that renamed the dataclass, which
-    is a mechanism this gate may not pin.
-
-    Without this check a returned shape carrying no ``canonical_id`` reads as
-    an attach id of None on every run — neither the band's top-1 nor a
-    designation — so the probe would report NOT CONSUMED and send an operator
-    to fix a defect this run never measured. A wrong diagnosis, not merely a
-    wrong verdict.
+    Duck-typed on the two fields read, so a ref that renamed the dataclass is
+    still measured. Without it, a shape with no ``canonical_id`` would read as
+    an attach id of None and be reported NOT CONSUMED, a defect this run never
+    measured.
     """
     missing = [f for f in ('outcome', 'canonical_id') if not hasattr(decision, f)]
     if not missing:
@@ -565,12 +498,9 @@ class _CountingCounter:
 def _make_counter(module: Any) -> tuple[Any, Callable[[], int]]:
     """A FRESH fail-open counter for one run, and a reader for its count.
 
-    THE REF'S OWN CLASS FIRST, so what is measured is the ref's accounting
-    rather than a reimplementation of it: ``_record_fail_open`` increments it on
-    exactly the paths that swallowed the designation. The counting stand-in is
-    the fallback for a ref whose class is absent, whose constructor changed, or
-    whose ``live_count`` no longer reports an int — none of which is a reason to
-    stop measuring.
+    The ref's own ``TriageFailOpenCounter`` where usable, so the ref's
+    accounting is what is measured; a counting stand-in where the class is
+    absent or its shape changed.
     """
     cls = getattr(module, 'TriageFailOpenCounter', None)
     if cls is not None:
@@ -581,10 +511,8 @@ def _make_counter(module: Any) -> tuple[Any, Callable[[], int]]:
                 return counter, reader
         except Exception:  # noqa: BLE001 - a changed shape is not fatal
             pass
-    # Outside the branch above, so an ABSENT class warns too. Falling back is
-    # not a reason to stop measuring, but it does change what was measured —
-    # the stand-in's accounting rather than the ref's — and a gate that
-    # authorises a production flag flip may not degrade quietly.
+    # Outside the branch above, so an ABSENT class warns too: the fallback
+    # changes what was measured, and that has to be said.
     logger.warning(
         "the ref's TriageFailOpenCounter is absent or unusable, so fail-opens "
         "were counted with a stand-in rather than with the ref's own accounting",
@@ -598,21 +526,13 @@ def _designated_ids(
     slate: list[Any],
     band_canonical: Any,
 ) -> list[str]:
-    """Slate ids usable as a designation. Two filters, each load-bearing.
+    """Slate ids usable as a designation.
 
-    DISTINGUISHABLE FROM THE BAND'S OWN CANONICAL. A designation equal to it
-    proves nothing, because main already attaches there.
-
-    THEIR OWN CANONICAL ID. A child's attach target is its PARENT (see
-    :func:`_attach_id_for`), so designating one asks a correct remedy for two
-    contradictory things at once — honour the designation, and hoist it — and
-    the swap's FAIL would read "did not track the designated candidate", which
-    is an instruction to delete a mandatory hoist. The child stays on the
-    SLATE: it is the band's max-cosine winner, and hoisting it is what makes
-    the band canonical an id no candidate carries. It is barred only from being
-    designated.
-
-    Two are needed for the swap; see :func:`_swap_verdict`.
+    Each must differ from the band's own canonical, where main already
+    attaches. Each must also be its OWN canonical id. A child's attach target
+    is its parent (:func:`_attach_id_for`), so designating one would ask a
+    correct remedy both to honour the designation and to hoist it. The child
+    stays on the slate; it is only never designated.
     """
     seen: dict[str, None] = {}
     for candidate in slate:
@@ -628,12 +548,9 @@ def _designated_ids(
 def _measure(module: Any) -> tuple[_Run, list[Any], Any]:
     """A first run with a plain, valid verdict — what the module tells the judge.
 
-    Returns ``(run, slate, band_canonical)``, the slate as the candidate
-    OBJECTS the module handed the judge rather than as bare ids: deciding where
-    an attach to one of them must land needs its metadata, not just its name.
-    The verdict is a bare outcome str so the run cannot itself be rejected as an
-    unrecognised payload; what is being measured here is the module's inputs,
-    not its consumption.
+    Returns ``(run, slate, band_canonical)``, the slate as candidate OBJECTS,
+    because where an attach to one must land depends on its metadata. The
+    verdict is a bare outcome str, which no module can reject as unrecognised.
     """
     judge = _FakeJudge(_ATTACH_OUTCOME)
     run = _drive(module, judge)
@@ -667,36 +584,20 @@ def _swap_verdict(
 ) -> str | None:
     """None when the attach TRACKED both designations; a reason otherwise.
 
-    THE SWAP, and why one run is not enough. A single run whose attach id
-    merely differs from the band's canonical is satisfied by any hard-coded
-    position — an implementation that always attaches to the last slate entry
-    is not the band's top-1 either. Requiring the attach to follow TWO
-    different designations makes the assertion about the DEPENDENCY rather than
-    about a value, so it accepts any mechanism that genuinely threads the
-    designation and rejects every fixed choice.
-
-    Both halves are necessary: matching one designation alone could be
-    coincidence, and differing between runs without matching either means the
-    attach is tracking something else entirely.
-
-    EXACT equality is right precisely BECAUSE the pool is filtered. Every
-    designation :func:`_designated_ids` yields is already its own canonical id,
-    so a remedy that hoists — as ``_canonical_id_of`` obliges it to — lands on
-    the designation itself and passes here unaltered. Also accepting the
-    hoisted form would therefore be dead code, and it would blur what a FAIL
-    means by blessing a module that never hoists at all.
+    TWO different designations, because any fixed position differs from the
+    band's canonical too: only following both makes this a test of the
+    DEPENDENCY rather than of a value. Exact equality suffices because
+    :func:`_designated_ids` yields only self-canonical ids, so a remedy that
+    hoists lands on the designation itself.
     """
     for designated in designations:
         judge = _FakeJudge(spelling.payload(_ATTACH_OUTCOME, designated))
         run = _drive(module, judge)
         if run.error is not None:
             return run.error
-        # BEFORE the tracking test, and structurally rather than by inferring
-        # from the outcome. A fail-open run returns canonical_id=None, which is
-        # not the band's top-1 either — so a check that only asked "did the
-        # attach avoid the band canonical?" would read main's own
-        # `verdict not in TRIAGE_OUTCOMES` arm as CONSUMED. Inferring from the
-        # outcome is no better: `stored` is also a legitimate judge verdict.
+        # Before the tracking test, and read off the counter rather than the
+        # outcome (`stored` is a legitimate verdict too): a fail-open returns
+        # canonical_id=None, which also avoids the band's top-1.
         if run.fail_opens:
             return (
                 f'FAIL-OPEN ({run.fail_opens} recorded) — the module rejected '
@@ -776,13 +677,11 @@ def _usable_parameters(fn: Any) -> list[Any]:
 
 
 def _target_parameter_names(fn: Any) -> list[str]:
-    """Names beyond the first two that read as designating the attach target.
+    """Names beyond the first two (the entry and the slate) that read as a target.
 
-    The first two are the new entry and the slate. ALL of the rest are
-    returned rather than just the third, for item 1's measured reason: the
-    POSITION of a target parameter is a mechanism, and a fix spelled
-    ``build_judge_prompt(content, candidates, *, verdict_words=None,
-    attach_target_id=None)`` must not be read as having none.
+    All of them, not just the third: a target parameter's position is a
+    mechanism, so ``(content, candidates, *, verdict_words=None,
+    attach_target_id=None)`` still has one.
     """
     return [
         p.name for p in _usable_parameters(fn)[2:] if _TARGET_NAME_RE.search(p.name)
@@ -792,9 +691,8 @@ def _target_parameter_names(fn: Any) -> list[str]:
 def _judge_decision(module: Any, canonical_id: str) -> Any:
     """The ref's own ``BandDecision``, carrying a canonical id the probe chose.
 
-    The ref's class rather than a stand-in, so what ``judge_write`` reads is
-    the shape it reads in production. The namespace is the fallback for a ref
-    that renamed the dataclass — a mechanism this gate may not pin.
+    The ref's class, so ``judge_write`` reads the shape it reads in
+    production; a namespace only for a ref that renamed the dataclass.
     """
     cls = getattr(module, 'BandDecision', None)
     outcome = getattr(module, 'OUTCOME_JUDGE', 'judge')
@@ -846,9 +744,8 @@ def _fed_in_call(
 ) -> _Fed | None:
     """What one recorded render call handed a target parameter, if anything.
 
-    Bound against the REAL builder's signature, so a target supplied by
-    POSITION counts as much as one supplied by keyword — which of the two a
-    remedy picks is a spelling, and this gate may not pin one.
+    Bound against the REAL builder's signature, so a target passed by position
+    counts as much as one passed by keyword.
     """
     args, kwargs = call
     try:
@@ -1010,22 +907,14 @@ def _judge_target_branch(
 ) -> tuple[bool, str]:
     """Option (b) as it exists HERE: does the judge module name the attach target?
 
-    Returns ``(satisfied, report line)``. The line is emitted whether or not
-    the branch holds, so a reader can see it was EVALUATED rather than skipped.
-
-    Under option (b) the caller picks the attach target and tells the judge, so
-    the judge names nothing back and the judge-side swap cannot hold however
-    correct the module is. Requiring the swap would FAIL a correct fix and
-    re-block task 3169 — this gate family's false-FAIL disease. Measured before
-    this branch existed: with option (b) on main, item 1 PASSed and item 5
-    reported a consumption defect the run had never measured.
+    Returns ``(satisfied, report line)``; the line is emitted either way, so a
+    reader can see the branch was evaluated.
 
     THREE conditions, each rejecting a different near-miss: the renderer can be
     TOLD (a signature); ``judge_write`` actually TELLS it the id the write will
-    use (consumption, not a widened signature — this is also what keeps item
-    1's target-carrying judge fixtures, none of which defines ``judge_write``,
-    inert here); and the write LANDS there, without which a triage module that
-    ignores everything would ride the judge module's signature to a PASS.
+    use (a widened signature is not consumption); and the write LANDS there,
+    or a triage module that ignores everything would ride the judge module's
+    signature to a PASS.
     """
     if judge_module is None:
         return False, (
@@ -1094,10 +983,8 @@ def _search_spellings(
 ) -> tuple[_Spelling | None, list[str]]:
     """Try every designation spelling; return the first the attach CONSUMES.
 
-    Mirrors the discipline of item 1's ``_search_option_b``: a spelling the
-    implementation ignores simply is not the winner, and the whole search is
-    reported on failure so an operator sees what was tried rather than one
-    arbitrary verdict.
+    Every attempt's reason comes back too, so a FAIL reports the whole search
+    rather than one arbitrary verdict.
     """
     attempts: list[str] = []
     for spelling in _SPELLINGS:
@@ -1111,15 +998,9 @@ def _search_spellings(
 def _pass_scope_note(branch: _Branch) -> list[str]:
     """What a PASS on *branch* deliberately does NOT prove.
 
-    Item 5 asserts at ``BandDecision.canonical_id`` — the value
-    ``tools.py::add_memory`` consumes verbatim as ``attached_to``. It stops
-    there: the remaining hops live inline in that MCP tool body with no
-    callable seam, and standing up a real ``memory_service`` is not something a
-    bounded before_done predicate can do.
-
-    Emitted on the PASS path only. That is the run an operator acts on to flip
-    a production flag, and it is also the report whose window is uncontended: a
-    FAIL's window belongs to the remedy.
+    The probe stops at ``BandDecision.canonical_id``: the remaining hops live
+    inline in ``tools.py::add_memory`` with no callable seam. PASS path only —
+    the run an operator acts on, and one whose report window is uncontended.
     """
     return [
         '      NOTE this gate asserts at BandDecision.canonical_id — the value',
@@ -1228,17 +1109,14 @@ def main(argv: list[str] | None = None) -> int:
             'Repeatable.'
         ),
     )
-    # Argparse stays OUTSIDE the try below: `--help` and a missing --src-root
-    # are argparse's own exit codes to own, and reporting a usage error as an
-    # UNVERIFIABLE invariant would name a defect in the ref for a defect in the
-    # invocation.
+    # Outside the try below: a usage error is the invocation's defect, not the
+    # ref's, and keeps argparse's own exit code.
     args = parser.parse_args(argv)
 
     out: list[str] = []
     warnings: list[str] = []
-    # propagate=False so the collector is the ONLY destination: logging's
-    # lastResort handler would otherwise also write each record to stderr,
-    # which the gate drops, leaving a duplicate nobody reads.
+    # The collector is the ONLY destination: otherwise logging's lastResort
+    # handler duplicates each record to stderr, which the gate drops.
     logger.addHandler(_WarnCollector(warnings))
     logger.propagate = False
 
@@ -1255,14 +1133,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         rc = EXIT_FAIL
     except BaseException as exc:  # noqa: BLE001 - see below; nothing may escape
-        # BaseException, NOT Exception, and this is the whole point of the arm.
-        # A `SystemExit` out of the ref's own module body is not an Exception,
-        # so an `except Exception` lets it through: the interpreter then exits
-        # with the REF's code — 0 for `SystemExit(0)` — having printed nothing
-        # at all, and a gate that greps stdout for a marker reads silence plus
-        # rc=0 as a PASS. That is a measured escape on the item-1 probe, not a
-        # hypothetical one, and it is the worst failure this probe has: it
-        # authorises a production flag flip on a run that measured nothing.
+        # BaseException, not Exception: a SystemExit(0) out of the ref's own
+        # code would otherwise exit 0 having printed nothing, a PASS to any
+        # caller that trusts rc alone. Pinned by
+        # scripts/tests/test_check_write_triage_attach_consumption.py::TestFailsClosed.
         out.append(
             f'FAIL  UNVERIFIABLE: the probe raised {exc!r} while evaluating the '
             'invariant',
@@ -1273,8 +1147,7 @@ def main(argv: list[str] | None = None) -> int:
         rc = EXIT_FAIL
 
     # LAST, and deduplicated: every run builds its own counter, so one degraded
-    # measurement would otherwise repeat itself once per run and crowd the
-    # verdict out of a tail-truncated report.
+    # measurement would otherwise repeat once per run.
     out.extend(dict.fromkeys(warnings))
     sys.stdout.write('\n'.join(out) + '\n')
     return rc
