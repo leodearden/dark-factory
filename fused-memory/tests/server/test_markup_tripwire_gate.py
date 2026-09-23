@@ -42,7 +42,12 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastmcp.exceptions import ToolError
 from shared.mcp_markup_middleware import RepairPolicy
-from shared.toolcall_markup import CANONICAL_OPENER_PREFIX, ENVELOPE_LITERALS, closer_for
+from shared.toolcall_markup import (
+    CANONICAL_OPENER_PREFIX,
+    ENVELOPE_LITERALS,
+    INVOKE_CLOSER,
+    closer_for,
+)
 
 from fused_memory.server.markup_guard import install_markup_guard
 from fused_memory.server.markup_tripwire import (
@@ -53,14 +58,22 @@ from fused_memory.server.tools import create_mcp_server
 
 _PROJECT_ID = 'dark_factory'
 
-# One specimen per literal in the retired gate's pattern list. The
-# '</content>\n</invoke>' tail is the shape of the real corpus specimens (DF
-# 3083 vector 1); the '<parameter name=' fragment is vector 2, the one that
-# mis-parsed task 3210's priority silently. Held VERBATIM through the
-# retirement so the boundary is compared against the same corpus the gate was.
-_LEAKED_CONTENT = 'a real memory sentence\n</content>\n</invoke>'
-_LEAKED_INVOKE = 'a real memory sentence </invoke>'
-_LEAKED_PARAMETER = 'a real memory sentence <parameter name="priority">high</parameter>'
+# One specimen per literal in the retired gate's pattern list. _CORPUS_TAIL is
+# the shape of the real corpus specimens (DF 3083 vector 1); the
+# CANONICAL_OPENER_PREFIX fragment is vector 2, the one that mis-parsed task
+# 3210's priority silently. The VALUES are held byte-identical through the
+# retirement, so the boundary is compared against the same corpus the gate
+# was; they are assembled from shared.toolcall_markup's constants so that no
+# raw envelope sentinel is authored here.
+_CORPUS_TAIL = closer_for('content') + '\n' + INVOKE_CLOSER
+_LEAKED_CONTENT = 'a real memory sentence\n' + _CORPUS_TAIL
+_LEAKED_INVOKE = 'a real memory sentence ' + INVOKE_CLOSER
+_LEAKED_PARAMETER = (
+    'a real memory sentence '
+    + CANONICAL_OPENER_PREFIX
+    + '"priority">high'
+    + closer_for('parameter')
+)
 _CLEAN_CONTENT = 'a perfectly ordinary memory about the merge lane'
 
 #: The in-line gate's rejection vocabulary. Nothing may return it any more:
@@ -195,9 +208,9 @@ class TestAddMemoryOnlyTheBoundaryRejects:
     @pytest.mark.parametrize(
         ('content', 'pattern'),
         [
-            (_LEAKED_CONTENT, '</content>'),
-            (_LEAKED_INVOKE, '</invoke>'),
-            (_LEAKED_PARAMETER, '<parameter name='),
+            (_LEAKED_CONTENT, closer_for('content')),
+            (_LEAKED_INVOKE, INVOKE_CLOSER),
+            (_LEAKED_PARAMETER, CANONICAL_OPENER_PREFIX),
         ],
     )
     async def test_only_the_boundary_rejects_each_pattern(
@@ -252,7 +265,7 @@ class TestAddMemoryOnlyTheBoundaryRejects:
             )
 
         payload = _assert_boundary_refused(
-            exc_info, field='content', pattern='</content>'
+            exc_info, field='content', pattern=closer_for('content')
         )
         assert payload['tool'] == 'add_memory', f'got: {payload!r}'
         assert payload['repaired_call']['content'] == 'a real memory sentence\n'
@@ -366,7 +379,7 @@ class TestAddMemoryOnlyTheBoundaryRejects:
         with pytest.raises(ToolError) as exc_info:
             await server._tool_manager.call_tool('add_memory', arguments)
 
-        _assert_boundary_refused(exc_info, field='content', pattern='</invoke>')
+        _assert_boundary_refused(exc_info, field='content', pattern=INVOKE_CLOSER)
         mock_service.add_memory.assert_not_called()
 
 
@@ -377,9 +390,9 @@ class TestAddEpisodeOnlyTheBoundaryRejects:
     @pytest.mark.parametrize(
         ('content', 'pattern'),
         [
-            (_LEAKED_CONTENT, '</content>'),
-            (_LEAKED_INVOKE, '</invoke>'),
-            (_LEAKED_PARAMETER, '<parameter name='),
+            (_LEAKED_CONTENT, closer_for('content')),
+            (_LEAKED_INVOKE, INVOKE_CLOSER),
+            (_LEAKED_PARAMETER, CANONICAL_OPENER_PREFIX),
         ],
     )
     async def test_only_the_boundary_rejects_each_pattern(
@@ -460,7 +473,7 @@ class TestAddEpisodeOnlyTheBoundaryRejects:
         # Content that trips BOTH the markup boundary and mixed-temporal framing.
         content = (
             'As of now there are 5 pending tasks; historically there were 9.\n'
-            '</content>\n</invoke>'
+            + _CORPUS_TAIL
         )
         arguments = {
             'content': content,
@@ -478,7 +491,7 @@ class TestAddEpisodeOnlyTheBoundaryRejects:
         with pytest.raises(ToolError) as exc_info:
             await server._tool_manager.call_tool('add_episode', arguments)
 
-        _assert_boundary_refused(exc_info, field='content', pattern='</content>')
+        _assert_boundary_refused(exc_info, field='content', pattern=closer_for('content'))
 
 
 class TestSubmitTaskOnlyTheBoundaryRejects:
@@ -488,7 +501,7 @@ class TestSubmitTaskOnlyTheBoundaryRejects:
     async def test_only_the_boundary_rejects_the_vector_2_description(self, task_server):
         """The DF 3083 vector-2 case, previously a SILENT mis-parse.
 
-        A '<parameter name="priority">' fragment in a description reached the
+        A '\x3cparameter name="priority">' fragment in a description reached the
         interceptor's description parser, which derived the wrong value from it
         without complaint (reify task 3210 was filed priority=high and stored as
         medium). Loud refusal ahead of that parser is the whole point, and it is
@@ -515,7 +528,7 @@ class TestSubmitTaskOnlyTheBoundaryRejects:
             await server._tool_manager.call_tool('submit_task', arguments)
 
         _assert_boundary_refused(
-            exc_info, field='description', pattern='<parameter name='
+            exc_info, field='description', pattern=CANONICAL_OPENER_PREFIX
         )
         interceptor.submit_task.assert_not_called()
 
@@ -551,7 +564,7 @@ class TestSubmitTaskOnlyTheBoundaryRejects:
         with pytest.raises(ToolError) as exc_info:
             await server._tool_manager.call_tool('submit_task', arguments)
 
-        _assert_boundary_refused(exc_info, field=field, pattern='</invoke>')
+        _assert_boundary_refused(exc_info, field=field, pattern=INVOKE_CLOSER)
         interceptor.submit_task.assert_not_called()
 
     @pytest.mark.asyncio
@@ -659,7 +672,7 @@ class TestUpdateTaskOnlyTheBoundaryRejects:
         with pytest.raises(ToolError) as exc_info:
             await server._tool_manager.call_tool('update_task', arguments)
 
-        _assert_boundary_refused(exc_info, field='description', pattern='</content>')
+        _assert_boundary_refused(exc_info, field='description', pattern=closer_for('content'))
         interceptor.update_task.assert_not_called()
 
     @pytest.mark.asyncio
@@ -681,7 +694,7 @@ class TestUpdateTaskOnlyTheBoundaryRejects:
         with pytest.raises(ToolError) as exc_info:
             await server._tool_manager.call_tool('update_task', arguments)
 
-        _assert_boundary_refused(exc_info, field=field, pattern='</invoke>')
+        _assert_boundary_refused(exc_info, field=field, pattern=INVOKE_CLOSER)
         interceptor.update_task.assert_not_called()
 
     @pytest.mark.asyncio
@@ -792,13 +805,13 @@ _UNREPAIRABLE = 'mcp_markup_unrepairable'
 #: difference is a property of shared.toolcall_markup.repair's refusal to guess
 #: (its NO SILENT PARTIAL REPAIR contract), not a hole in the containment:
 #:
-#: * ``</content>`` mis-closes a parameter genuinely named ``content``, so on
+#: * ``closer_for('content')`` mis-closes a parameter genuinely named ``content``, so on
 #:   add_memory/add_episode it is a candidate mis-close position and the value
 #:   is repairable. On submit_task/update_task there IS no ``content``
 #:   parameter, so the same literal names nothing the repairer can anchor on.
-#: * ``</invoke>`` closes the ENVELOPE, not a parameter. Nothing downstream of
+#: * ``INVOKE_CLOSER`` closes the ENVELOPE, not a parameter. Nothing downstream of
 #:   it can be attributed to any argument.
-#: * ``<parameter name="priority">high</parameter>`` arrives with no preceding
+#: * ``CANONICAL_OPENER_PREFIX``, in ``_LEAKED_PARAMETER``, arrives with no preceding
 #:   mis-close, so the opener is embedded mid-text rather than following a
 #:   closed parameter — there is no anchor, and inventing one would be exactly
 #:   the guess the repairer refuses to make.
@@ -808,9 +821,9 @@ _UNREPAIRABLE = 'mcp_markup_unrepairable'
 #: separately by TestBoundaryRecoversAbsorbedParameters below, on corpus-shaped
 #: specimens.
 _BOUNDARY_SPECIMENS = [
-    (_LEAKED_CONTENT, '</content>', _DETECTED, _UNREPAIRABLE),
-    (_LEAKED_INVOKE, '</invoke>', _UNREPAIRABLE, _UNREPAIRABLE),
-    (_LEAKED_PARAMETER, '<parameter name=', _UNREPAIRABLE, _UNREPAIRABLE),
+    (_LEAKED_CONTENT, closer_for('content'), _DETECTED, _UNREPAIRABLE),
+    (_LEAKED_INVOKE, INVOKE_CLOSER, _UNREPAIRABLE, _UNREPAIRABLE),
+    (_LEAKED_PARAMETER, CANONICAL_OPENER_PREFIX, _UNREPAIRABLE, _UNREPAIRABLE),
 ]
 
 
@@ -1016,7 +1029,7 @@ class TestBoundaryRecoversAbsorbedParameters:
             )
 
         payload = _assert_boundary_rejection(
-            exc_info, field='content', pattern='</parameter>', error_type=_DETECTED
+            exc_info, field='content', pattern=closer_for('parameter'), error_type=_DETECTED
         )
         assert payload['recovered_params'] == ['agent_id']
         assert payload['repaired_call'] == {
@@ -1041,7 +1054,7 @@ class TestBoundaryRecoversAbsorbedParameters:
             )
 
         payload = _assert_boundary_rejection(
-            exc_info, field='content', pattern='</parameter>', error_type=_DETECTED
+            exc_info, field='content', pattern=closer_for('parameter'), error_type=_DETECTED
         )
         assert payload['repaired_call']['agent_id'] == 'claude-task-4458'
         assert payload['repaired_call']['content'] == _CLEAN_CONTENT
@@ -1070,7 +1083,7 @@ class TestBoundaryRecoversAbsorbedParameters:
             )
 
         payload = _assert_boundary_rejection(
-            exc_info, field='description', pattern='</parameter>', error_type=_DETECTED
+            exc_info, field='description', pattern=closer_for('parameter'), error_type=_DETECTED
         )
         assert payload['recovered_params'] == ['priority']
         assert payload['repaired_call'] == {
@@ -1098,7 +1111,7 @@ class TestBoundaryRecoversAbsorbedParameters:
             )
 
         payload = _assert_boundary_rejection(
-            exc_info, field='description', pattern='</parameter>', error_type=_DETECTED
+            exc_info, field='description', pattern=closer_for('parameter'), error_type=_DETECTED
         )
         assert payload['recovered_params'] == ['priority']
         assert payload['repaired_call']['priority'] == 'high'
@@ -1193,7 +1206,7 @@ class TestBoundaryPortsTheNonRejectionBehaviours:
             )
 
         _assert_boundary_rejection(
-            exc_info, field='content', pattern='</invoke>', error_type=_UNREPAIRABLE
+            exc_info, field='content', pattern=INVOKE_CLOSER, error_type=_UNREPAIRABLE
         )
         mock_service.add_memory.assert_not_called()
 
