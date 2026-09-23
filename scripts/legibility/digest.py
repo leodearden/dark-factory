@@ -594,6 +594,47 @@ def _signal_text_sources(
     return sources
 
 
+CODER_JUDGMENT_KEYS: frozenset[str] = frozenset({'matches', 'candidates'})
+"""The two top-level keys of a trickle-coder judgment, whose canonical source
+is the response schema in scripts/legibility/coder.py::build_prompt.
+Restated rather than imported: this module PRODUCES the digest coder.py
+consumes, and importing the consumer would invert that layering for two key
+names."""
+
+_JSON_FENCE_RE = re.compile(r'\A```(?:json)?\s*\n(.*)\n```\Z', re.DOTALL)
+"""One outer ```/```json fence enclosing an ENTIRE stripped carrier."""
+
+
+def is_coder_judgment_payload(text: str) -> bool:
+    """True when the WHOLE of *text* is a trickle-coder judgment: a JSON
+    object carrying every :data:`CODER_JUDGMENT_KEYS` key, bare or inside at
+    most ONE outer fence spanning the entire carrier -- the two spellings
+    coder.py::parse_coder_output already reads as one payload.
+
+    Deliberately narrower than that parser, which brace-slices an object out
+    of surrounding prose because its job is rescuing a reply. Here that
+    looseness would read an assistant turn that merely QUOTES the schema as
+    machine content and suppress a genuine self-correction in it, and
+    over-excluding genuine dialogue is the worse error -- the same trade-off
+    :func:`is_harness_injected_turn` makes.
+
+    Any carrier json.loads cannot handle answers False, RecursionError
+    included (it is not a ValueError): this runs on every carrier of
+    arbitrary transcripts and must answer, never abort a digest.
+    """
+    stripped = text.strip()
+    fence = _JSON_FENCE_RE.match(stripped)
+    if fence:
+        stripped = fence.group(1).strip()
+    if not stripped.startswith('{'):
+        return False
+    try:
+        parsed = json.loads(stripped)
+    except (ValueError, RecursionError):
+        return False
+    return isinstance(parsed, dict) and parsed.keys() >= CODER_JUDGMENT_KEYS
+
+
 def iter_self_corrections(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Detect curated self-correction markers in assistant TEXT blocks only.
 
