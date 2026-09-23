@@ -1,56 +1,30 @@
 """The probe protocol a recon stage follows before it says anything about
-Graphiti's health (task 4644).
-
-## The incident
-
-Run cd53b227-18ac-4432-b22f-2b5ac0913cf2 (2026-08-23) ran exactly ONE
-mixed-store probe — query "FalkorDB index provisioning and graph read
-latency", ``limit=3`` — reported it as a bare negative, and concluded both
-that the degradation "did not reproduce this cycle" and that no persistent
-Graphiti problem existed. Stage 3 of the SAME run then reproduced it on a
-``limit=8`` query ("recent completed work session summary and decisions"):
-``degraded: true``, ``failed_stores: ['graphiti']``. The run probed negative
-at Stage 2 and observed positive at Stage 3, inside one cycle.
-
-Raising N alone would not have saved it. Run
-45b9a919-ac25-431b-bb0f-39c28b1d1906 then ran three probes (``limit`` 15, 3
-and 8 — the last replaying the exact Stage-3 query and limit that HAD fired)
-and 0 of 3 reproduced. A ladder buys coverage, never clearance.
-
-## Why a negative set can never clear the fault
-
-``server/tools.py::search`` surfaces ``degraded`` / ``failed_stores`` under
-FAULT-ONLY LOUDNESS — the keys appear only when a store actually failed, so a
-healthy probe returns no health key at all. There is no positive "graphiti is
-fine" observation available to any stage. Every negative probe is an absence
-of evidence by construction, and no number of them becomes evidence of
-absence. That is the whole reason :data:`NEGATIVE_SET_VERDICT_TEMPLATE` is
-worded as a count rather than a verdict.
+Graphiti's health, held as data so the stage prompts render it rather than
+restate it (task 4644). It answers run cd53b227, whose Stage 2 turned one
+negative probe into "no persistent Graphiti problem" in a cycle where Stage 3
+then observed the fault; the full probe log is in Mem0 record
+da16ef9d-b9f1-4be4-af5e-0299ff9a65f2.
 
 ## Why these numbers
 
-:data:`PROBE_LIMIT_LADDER` is derived from the recorded probe log, not chosen
-to satisfy a requirement's wording. ``8`` is the fan-out BOTH positive
-sightings used, so it is the size with demonstrated power to fire. ``3`` is
-the limit whose lone probe produced the cd53b227 false negative — it stays in
-the ladder because the defect being fixed is that result size was a silently
-avoided variable rather than a controlled one, and controlling a variable
-means spanning it, including the value already known to miss. ``15`` extends
-past 8, matching the widest rung run 45b9a919 tried.
+:data:`PROBE_LIMIT_LADDER` comes from that probe log. ``8`` is the fan-out
+both positive sightings used, so it is the size with demonstrated power to
+fire and the floor the widest probe may not drop below
+(:data:`HIGH_FANOUT_LIMIT_FLOOR`). ``3`` is the limit whose lone probe
+produced the false negative; it stays because controlling a variable means
+spanning it, including the value already known to miss. ``15`` extends past
+8, matching the widest rung a later three-probe set tried.
 
-Reporting :data:`GRAPHITI_DEGRADATION_REPRODUCED_STAT_KEY` alongside
-:data:`GRAPHITI_MIXED_STORE_PROBES_RUN_STAT_KEY` follows the same convention as
-``graphiti_writes_queued`` beside ``writes_dead_lettered`` in
-``reconciliation/stage_stats.py``: a bare ``0`` reads as a no-op when it is
-actually an unresolved question, so the denominator is published with it and
-the pair is self-explaining.
+:data:`NEGATIVE_SET_VERDICT_TEMPLATE` is a count, not a verdict, because
+``server/tools.py::search`` reports ``degraded``/``failed_stores`` only when a
+store has already failed: a clean probe carries no health signal, so no number
+of negatives is evidence of absence. That later three-probe set was 0 of 3,
+one of them replaying the exact query and limit that had fired.
 
-## Scope
-
-This is a defect in reconciliation's own probe methodology. It is NOT part of
-task 3708 (FalkorDB index provisioning), which shares only the subject matter.
-The full corrected probe log — both positive sightings and all four negative
-probes — lives in Mem0 record da16ef9d-b9f1-4be4-af5e-0299ff9a65f2.
+The two stat keys are published together for the reason
+``reconciliation/stage_stats.py`` publishes ``graphiti_writes_queued`` beside
+``writes_dead_lettered``: a bare ``0`` reads as a no-op, and the denominator
+makes it read as "0 of N".
 """
 
 from __future__ import annotations
@@ -66,9 +40,7 @@ __all__ = [
     'render_graphiti_degradation_probe_section',
 ]
 
-# The denominator pair. Defined once here and reaching the stage prompts only
-# through the renderer, so the name an operator reads out of a cycle report's
-# `stats` is the same object the stage was told to emit.
+# The denominator pair, always published together.
 GRAPHITI_MIXED_STORE_PROBES_RUN_STAT_KEY = 'graphiti_mixed_store_probes_run'
 GRAPHITI_DEGRADATION_REPRODUCED_STAT_KEY = 'graphiti_degradation_reproduced'
 
@@ -90,33 +62,14 @@ NEGATIVE_SET_VERDICT = NEGATIVE_SET_VERDICT_TEMPLATE.format(n='N')
 
 
 def render_graphiti_degradation_probe_section(*, runs_probes: bool) -> str:
-    """Render the probe-protocol section for one stage.
-
-    Follows the :func:`prompts.render_finding_provenance_section` /
-    :func:`prompts.render_escalation_boundary_note` precedent: ONE shared body
-    plus a single clause selected by a keyword-only capability flag, so the
-    half both stages need exists exactly once (INV-5 ``no-lockstep-duplication``).
-
-    The split is a capability split, not a style choice. The verdict rule and
-    the cross-stage caveat govern any stage that says anything about Graphiti's
-    health; the ladder and the two counters belong only to the stage that
-    actually runs probes and reports ``stats``. Naming a counter to a stage is
-    a live instruction to emit it, so handing the read-only stage the probe
-    text would order it to report numbers it has no way to produce.
-
-    Every limit and both counter names are interpolated from this module's
-    constants. Nothing here may be hand-typed: the number an operator reads out
-    of a cycle report and the number the stage was told to emit have to be the
-    same object, or the protocol drifts silently.
+    """Render the probe-protocol section for one stage: a shared body (the
+    verdict rule and the cross-stage caveat) plus one capability clause, the
+    shape of :func:`prompts.render_finding_provenance_section`.
 
     Args:
-        runs_probes: True for the stage that runs the ladder and owns the
-            counters; False for a read-only stage, which inherits the verdict
-            rule and the caveat alone.
-
-    Returns:
-        The shared body plus the matching capability clause, interpolated into
-        a stage's system prompt at build time.
+        runs_probes: True for the stage that runs the ladder and reports its
+            counters; False for a read-only stage, whose clause tells it not
+            to.
     """
     ladder_phrase = ', '.join(str(limit) for limit in PROBE_LIMIT_LADDER)
 
