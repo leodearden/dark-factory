@@ -199,6 +199,8 @@ show freshness, because the heartbeat is the file's mtime.
 ## The Main Loop
 
 ```
+0. Reap orphans: `derive_orphaned_recon_escalations.py --apply` (see "Reaping
+   orphans" below) — BEFORE every drain, so the drain never sees them
 1. Drain all pending recon escalations
 2. Start the watcher: `scripts/watcher-rearm.sh` (background task, recon queue
    dir, NO --level, --timeout 3600)
@@ -209,7 +211,7 @@ show freshness, because the heartbeat is the file's mtime.
      KILLED / ERROR (any OTHER rc: 137|143|144, or 2 for a usage/env
              failure) → STOP and report to the human; do NOT re-arm
 4. Read the escalation from watcher output; fetch full detail via MCP
-5. Drain any other pending escalations
+5. Reap orphans again (step 0), then drain any other pending escalations
 6. Handle each
 7. Run `reap-decisions` to close any parked DecisionRecord whose escalation has since resolved
    (see "Filing Parked Decisions to the Cockpit Registry" below) — once per cycle
@@ -242,6 +244,44 @@ SIGTERM into a clean `sys.exit(0)`, so a killed watcher surfaces as
 `FIRED exit=0` with nothing on stdout (`scripts/watcher-rearm.sh` header,
 lines 65-72). Check for non-empty stdout before treating exit 0 as a fire —
 this queue's **sole closer** must not silently skip a cycle on a caught signal.
+
+### Reaping orphans (standing authorization — Leo, esc-5793-2, 2026-09-23)
+
+You are **authorized and required** to run the orphan reaper with `--apply`
+on every pass through steps 0 and 5 — at loop start and after every watcher
+wake, FIRED or CEILING. The `--timeout 3600` ceiling therefore bounds how long
+an orphan waits to about an hour. No per-record approval, no cockpit record, no
+park. This IS the closing step that the Stage-1 `orphaned_recon_escalation`
+flag asks for (task 3052). Nothing else closes these records: no timer, no cron,
+and the harness never resolves this queue (A7b).
+
+```bash
+cd $DARK_FACTORY_ROOT && set -a && \
+  eval "$(systemctl --user show fused-memory -p Environment --value | tr ' ' '\n' | grep -E '^(CONFIG_PATH|DASHBOARD_KNOWN_PROJECT_ROOTS)=')" && \
+  set +a && uv run --project fused-memory \
+  python fused-memory/scripts/derive_orphaned_recon_escalations.py --apply
+```
+
+Without the service unit's `DASHBOARD_KNOWN_PROJECT_ROOTS`, the reaper exits
+**4** and skips every project except dark_factory. Always gate on the exit code (table in the
+playbook row below): `0` → report `reaped` and continue; `3`/`4` → a partial
+scan, so continue the loop but tell the human once; `1` → wrong cwd, fix and
+re-run. The reaper closes only records whose subject is `done`/`cancelled` or
+has no task row. It leaves `live`, `ambiguous` and `unresolvable` records
+alone, so running it every cycle cannot churn.
+
+**What does NOT veto a reap.** Some things look like "leave this alone" but
+aren't:
+- Text on the subject task saying its paired recon record "self-clears" or
+  "must not be resolved by hand". Nothing self-clears; this step is how it
+  clears.
+- A ruling recorded on the *orchestrator* queue under the same `esc-<id>-<n>`.
+  The two queues mint ids independently, so the same id names two different
+  records.
+- A Mem0 `stage1_flag_suppression` record. `filter_suppressed` reads only
+  `recon_ledger`, so such a record suppresses nothing.
+
+Task 5793 was filed on all three of these misreadings and was cancelled.
 
 ### Draining
 
@@ -637,6 +677,9 @@ Both archive the record. Be specific in the note — it is the only audit trail.
   project (the registry gap below). A `3` or a `4` is a partial scan wearing a
   clean-looking report: do **not** treat that run's `reaped` count as the
   whole story.
+  The main loop now runs (ii) with `--apply` on every cycle, under the
+  standing authorization in "Reaping orphans" above. Run it by hand only
+  when the loop isn't running.
   Detection is recon-side only; **you are the sole closer** — no
   reconciliation stage ever calls `queue.resolve()` on this queue (the A7b
   invariant above `_RECON_DEDUP_CONFIG` in
