@@ -157,6 +157,7 @@ class _Repo:
         theirs: dict | _Baseline | None = None,
         ours_ledger: dict | None = None,
         theirs_ledger: dict | None = None,
+        before_merge: Callable[[_Repo], None] | None = None,
     ) -> _Repo:
         """The state a merge resolver finds: `git merge main` STOPPED on a conflict.
 
@@ -165,6 +166,10 @@ class _Repo:
         sentinel file both sides wrote is what stops the merge, and it is
         resolved and staged here. The ratchet artifacts are left exactly as git
         merged them, for each test to stage the resolution it is about.
+
+        *before_merge* runs on 'task' once both sides are committed. That is
+        where a hooked repo installs its hooks: neither side's commit runs them,
+        and nothing is committed on main once they exist.
         """
         repo = cls.seeded(tmp_path)
         repo.git('switch', '--quiet', '-c', 'task')
@@ -172,6 +177,8 @@ class _Repo:
         repo.git('switch', '--quiet', 'main')
         repo._commit_side('theirs', theirs, theirs_ledger)
         repo.git('switch', '--quiet', 'task')
+        if before_merge is not None:
+            before_merge(repo)
         repo.git('merge', 'main', check=False)
         merge_head = repo.git('rev-parse', '-q', '--verify', 'MERGE_HEAD', check=False)
         assert merge_head, '`git merge main` did not stop on the sentinel conflict'
@@ -1049,31 +1056,6 @@ def _install_real_hooks(repo: _Repo) -> None:
     repo.commit_all('install the real hooks and the instrument')
 
 
-def _hook_repo_mid_merge(tmp_path: Path, upstream: dict) -> _Repo:
-    """A hooked task branch stopped mid-merge with an upstream that moved the baseline.
-
-    The upstream branch moves the baseline BEFORE any hook exists, which is the
-    hook-less route main's moves arrive by. A sentinel both branches wrote stops
-    `git merge upstream`, and it is resolved and staged here; the baseline is
-    left as git merged it. Everything stays OFF main, for `_hook_repo`'s reason.
-    """
-    repo = _Repo.seeded(tmp_path)
-    repo.git('switch', '--quiet', '-c', 'upstream')
-    repo.write_baseline(upstream)
-    (repo.root / 'conflict.txt').write_text('upstream\n', encoding='utf-8')
-    repo.commit_all('upstream: move the baseline hook-lessly')
-    repo.git('switch', '--quiet', 'main')
-    repo.git('switch', '--quiet', '-c', 'task/5792-merge')
-    (repo.root / 'conflict.txt').write_text('task\n', encoding='utf-8')
-    _install_real_hooks(repo)
-    repo.git('merge', 'upstream', check=False)
-    merge_head = repo.git('rev-parse', '-q', '--verify', 'MERGE_HEAD', check=False)
-    assert merge_head, '`git merge upstream` did not stop on the sentinel conflict'
-    (repo.root / 'conflict.txt').write_text('resolved\n', encoding='utf-8')
-    repo.stage('conflict.txt')
-    return repo
-
-
 class TestTheHookActuallyRunsTheGate:
     """A gate wired into a path nothing runs is the failure this task is about.
 
@@ -1158,13 +1140,15 @@ class TestTheHookAuditsTheCommitThatFinishesAConflictedMerge:
     hooks, so no rewording of either hook can fool it.
     """
 
-    def test_taking_upstreams_unrecorded_move_commits_the_merge(
+    def test_taking_merge_heads_unrecorded_move_commits_the_merge(
         self, tmp_path: Path
     ) -> None:
-        repo = _hook_repo_mid_merge(tmp_path, _with_a_py_lines(1005))
+        repo = _Repo.mid_merge(
+            tmp_path, theirs=_with_a_py_lines(1005), before_merge=_install_real_hooks
+        )
         before = repo.git('rev-parse', 'HEAD')
 
-        result = repo.attempt_commit('merge upstream into the task branch')
+        result = repo.attempt_commit('merge main into the task branch')
 
         output = result.stdout + result.stderr
         assert result.returncode == 0, output
@@ -1173,16 +1157,18 @@ class TestTheHookAuditsTheCommitThatFinishesAConflictedMerge:
         assert repo.git('rev-parse', 'HEAD') != before
         assert len(repo.git('rev-list', '--parents', '-n', '1', 'HEAD').split()) == 3
 
-    def test_keeping_heads_stale_baseline_over_an_upstream_lowering_is_refused(
+    def test_keeping_heads_stale_baseline_over_a_merge_head_lowering_is_refused(
         self, tmp_path: Path
     ) -> None:
         # Byte-identical to HEAD, so a filter listing staged artifacts against
         # HEAD alone never spawns the auditor and the commit lands.
-        repo = _hook_repo_mid_merge(tmp_path, _with_a_py_lines(995))
+        repo = _Repo.mid_merge(
+            tmp_path, theirs=_with_a_py_lines(995), before_merge=_install_real_hooks
+        )
         repo.git('checkout', 'HEAD', '--', metrics.BASELINE_RELPATH)
         before = repo.git('rev-parse', 'HEAD')
 
-        result = repo.attempt_commit('merge upstream, keeping the stale baseline')
+        result = repo.attempt_commit('merge main, keeping the stale baseline')
 
         assert result.returncode != 0
         assert 'a.py' in result.stdout + result.stderr
