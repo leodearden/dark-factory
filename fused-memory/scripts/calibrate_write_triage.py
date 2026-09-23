@@ -1119,7 +1119,8 @@ def run_calibration(
     ``embed_fn(memory_id, content)`` is called exactly ONCE per distinct
     record — embedding per pair would multiply API cost by O(n).
     ``search_fn(record, k)`` returns ``{candidates, canonical_present}``,
-    plus optionally ``candidate_parents`` (see ``compute_recall_at_k``).
+    plus optionally ``candidate_parents`` (see ``compute_recall_at_k``) and
+    ``degraded`` (see ``fetch_recall_hit``).
 
     Neither callable's failure is caught. A swallowed embed error would
     silently shrink the measured population, producing a report whose
@@ -1180,7 +1181,14 @@ def run_calibration(
             'canonical_present': bool(hit.get('canonical_present')),
             'candidates': list(hit.get('candidates') or []),
             'candidate_parents': dict(hit.get('candidate_parents') or {}),
+            'degraded': bool(hit.get('degraded')),
         })
+    degraded = [r['memory_id'] for r in retrievals if r['degraded']]
+    if degraded:
+        logger.warning(
+            '%d retrieval(s) came back DEGRADED, so each scores as a recall miss that '
+            'measured nothing: %s', len(degraded), ', '.join(degraded),
+        )
     recall = compute_recall_at_k(
         retrievals, list(ks), aliases=aliases, count_absent_as_miss=aliases is not None,
     )
@@ -1198,6 +1206,7 @@ def run_calibration(
     run_provenance.setdefault('cluster_count', len({r['cluster_id'] for r in records}))
     run_provenance.setdefault('per_category_record_counts', per_category_record_counts)
     run_provenance.setdefault('cross_category_dropped', partition['cross_category_dropped'])
+    run_provenance.setdefault('degraded_retrievals', len(degraded))
     report = build_report(
         scores_by_class=scores_by_class, t_high=t_high, t_low=t_low,
         reason=reason, recall=recall, provenance=run_provenance,
@@ -1221,37 +1230,95 @@ def run_calibration(
 # Live edge / CLI
 # ---------------------------------------------------------------------------
 
-#: Valid ``--retrieval`` values (module constant so the CLI and the
-#: function below share one spelling of the vocabulary — INV-5/heuristic 12).
-RETRIEVAL_MODES = ('legacy', 'production')
+RETRIEVAL_LEGACY = 'legacy'
+RETRIEVAL_PRODUCTION = 'production'
+
+#: Each ``--retrieval`` mode, and the search call provenance names for it.
+RETRIEVAL_CALLS = {
+    RETRIEVAL_LEGACY: "fused_memory.services.memory_service::MemoryService.search(stores=['mem0'])",
+    RETRIEVAL_PRODUCTION: 'fused_memory.server.write_triage::retrieve_candidates',
+}
+RETRIEVAL_MODES = tuple(RETRIEVAL_CALLS)
 
 
-def search_kwargs_for_retrieval(retrieval_mode: str) -> dict[str, Any]:
-    """The extra ``MemoryService.search`` kwargs for *retrieval_mode*.
+def _require_retrieval_mode(retrieval_mode: str) -> None:
+    if retrieval_mode not in RETRIEVAL_CALLS:
+        raise ValueError(
+            f'unknown --retrieval mode {retrieval_mode!r}; expected one of {RETRIEVAL_MODES}',
+        )
 
-    ``'production'`` passes EXACTLY what
-    ``fused_memory.server.write_triage::retrieve_candidates`` passes on a
-    live triaged write — the three Mem0-primary categories (sorted, as
-    that call site sorts them) and ``anchor_topics=False`` — so the
-    measured recall matches what write_triage actually sees, not a
-    reconstruction of it. ``'legacy'`` (the default) passes neither,
-    preserving the committed report's search shape for reproducibility.
 
-    A bad *retrieval_mode* raises rather than silently falling back to
-    legacy — an unrecognized mode is a caller bug, not a preference.
+def recall_provenance(
+    *,
+    project_id: str,
+    retrieval_mode: str,
+    canonical_aliases_path: str | Path | None,
+    aliases: Mapping[str, str] | None,
+) -> dict[str, Any]:
+    """The recall side of a report's provenance.
+
+    It names the search call rather than restating its kwargs, so the record
+    cannot drift from what the call actually sends.
     """
-    if retrieval_mode == 'production':
-        from fused_memory.models.enums import MEM0_PRIMARY  # noqa: PLC0415
+    _require_retrieval_mode(retrieval_mode)
+    return {
+        'project_id': project_id,
+        'retrieval_mode': retrieval_mode,
+        'retrieval_call': RETRIEVAL_CALLS[retrieval_mode],
+        'canonical_aliases_path': (
+            package_relative(canonical_aliases_path) if canonical_aliases_path else None
+        ),
+        'canonical_aliases_count': len(aliases) if aliases else 0,
+    }
 
-        return {
-            'categories': sorted(category.value for category in MEM0_PRIMARY),
-            'anchor_topics': False,
-        }
-    if retrieval_mode == 'legacy':
-        return {}
-    raise ValueError(
-        f'unknown --retrieval mode {retrieval_mode!r}; expected one of {RETRIEVAL_MODES}',
+
+async def fetch_recall_hit(
+    memory_service: Any,
+    record: Mapping[str, Any],
+    *,
+    project_id: str,
+    k: int,
+    retrieval_mode: str,
+) -> dict[str, Any]:
+    """One record's search as *retrieval_mode* makes it, plus its canonical's liveness.
+
+    Returns the ranked candidate ids, the parent each sighting/amendment
+    candidate hoists to (the attach target production would use), whether the
+    canonical is live, and whether the search came back degraded.
+    """
+    _require_retrieval_mode(retrieval_mode)
+    from fused_memory.server.write_triage import (  # noqa: PLC0415
+        _canonical_id_of,
+        retrieve_candidates,
     )
+
+    if retrieval_mode == RETRIEVAL_PRODUCTION:
+        rows = await retrieve_candidates(memory_service, record['content'], project_id, k)
+    else:
+        # stores=['mem0'] is load-bearing: unscoped, the read router sends this
+        # corpus's queries to graphiti alone, whose edge UUIDs never equal a
+        # mem0 memory_id (measured: 0/6 canonicals in top-10 vs 4/6 scoped).
+        rows = await memory_service.search(
+            query=record['content'], project_id=project_id, limit=k, stores=['mem0'],
+        )
+    degraded = bool(getattr(rows, 'degraded', False))
+    return {
+        'candidates': [row.id for row in rows],
+        'candidate_parents': {
+            row.id: hoisted for row in rows if (hoisted := _canonical_id_of(row)) != row.id
+        },
+        'canonical_present': await _is_live(memory_service, project_id, record['cluster_id']),
+        'degraded': degraded,
+    }
+
+
+async def _is_live(memory_service: Any, project_id: str, memory_id: str) -> bool:
+    record = await memory_service.get_memory_by_id(project_id, memory_id)
+    if record is None:
+        return False
+    if isinstance(record, dict):
+        return bool(record.get('found', True))
+    return bool(getattr(record, 'found', True))
 
 
 def build_embed_fn(config: Any) -> Any:
@@ -1283,7 +1350,6 @@ async def _run(args: Any) -> int:
     import os  # noqa: PLC0415
 
     from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-    from fused_memory.server.grouped_read import CHILD_KINDS, PARENT_ID_KEY  # noqa: PLC0415
     from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
 
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -1291,7 +1357,10 @@ async def _run(args: Any) -> int:
         os.environ['CONFIG_PATH'] = str(args.config)
 
     aliases = load_canonical_aliases(args.canonical_aliases) if args.canonical_aliases else None
-    retrieval_kwargs = search_kwargs_for_retrieval(args.retrieval)
+    recall_side = recall_provenance(
+        project_id=args.project_id, retrieval_mode=args.retrieval,
+        canonical_aliases_path=args.canonical_aliases, aliases=aliases,
+    )
 
     config = FusedMemoryConfig()
     memory = MemoryService(config)
@@ -1302,59 +1371,6 @@ async def _run(args: Any) -> int:
 
         embed_fn = build_embed_fn(config)
 
-        async def _search_async(record: dict, k: int) -> dict:
-            # stores=['mem0'] is load-bearing, not a narrowing convenience.
-            # An unscoped MemoryService.search runs the read ROUTER first, and
-            # for this corpus the router sends every fixture query to graphiti
-            # alone — so the top-k comes back full of graphiti edge UUIDs,
-            # which can never equal a mem0 memory_id, and recall reads ~0 for
-            # reasons that have nothing to do with retrieval quality.
-            # Write triage's candidate set is the mem0/Qdrant neighbourhood
-            # (near_duplicate_guard searches mem0; the 21 canonicals live in
-            # the fused_reify Qdrant collection), so mem0 is the store whose
-            # recall the bands actually depend on. Measured on a 6-record
-            # probe: 0/6 canonicals in top-10 unscoped vs 4/6 scoped to mem0.
-            #
-            # `retrieval_kwargs` is EMPTY under --retrieval legacy (today's
-            # committed-report shape) and, under --retrieval production, is
-            # EXACTLY write_triage.py::retrieve_candidates's own kwargs
-            # (categories=the 3 Mem0-primary values, anchor_topics=False) —
-            # see search_kwargs_for_retrieval.
-            results = await memory.search(
-                query=record['content'], project_id=args.project_id, limit=k,
-                stores=['mem0'], **retrieval_kwargs,
-            )
-            rows = results.get('results', results) if isinstance(results, dict) else results
-            # MemoryService.search returns pydantic MemoryResult rows, not dicts.
-            candidates: list[str] = []
-            candidate_parents: dict[str, str] = {}
-            for r in rows or []:
-                rid = str(r['id'] if isinstance(r, dict) else r.id)
-                candidates.append(rid)
-                meta = r.get('metadata') if isinstance(r, dict) else getattr(r, 'metadata', None)
-                meta = meta or {}
-                # Mirrors write_triage.py::_canonical_id_of's child-hoist rule
-                # exactly (same imported constants) — a sighting/amendment
-                # candidate is credited to its parent, not scored as a miss
-                # under its own never-matching child id.
-                if meta.get('kind') in CHILD_KINDS:
-                    parent_id = meta.get(PARENT_ID_KEY)
-                    if isinstance(parent_id, str) and parent_id:
-                        candidate_parents[rid] = parent_id
-            canonical = await memory.get_memory_by_id(
-                args.project_id, record['cluster_id'],
-            )
-            if canonical is None:
-                present = False
-            elif isinstance(canonical, dict):
-                present = bool(canonical.get('found', True))
-            else:
-                present = bool(getattr(canonical, 'found', True))
-            return {
-                'candidates': candidates, 'candidate_parents': candidate_parents,
-                'canonical_present': present,
-            }
-
         # Pre-resolve retrievals on this loop, then hand run_calibration a
         # plain lookup — keeps the orchestrator fully synchronous and
         # testable while the I/O stays async here.
@@ -1362,7 +1378,10 @@ async def _run(args: Any) -> int:
         prefetched: dict[str, dict] = {}
         for record in records:
             if record['label'] != LABEL_CANONICAL:
-                prefetched[record['memory_id']] = await _search_async(record, max_k)
+                prefetched[record['memory_id']] = await fetch_recall_hit(
+                    memory, record, project_id=args.project_id, k=max_k,
+                    retrieval_mode=args.retrieval,
+                )
 
         result = run_calibration(
             records=records,
@@ -1372,17 +1391,9 @@ async def _run(args: Any) -> int:
             ks=args.k,
             provenance={
                 'fixture_path': package_relative(args.fixture),
-                'project_id': args.project_id,
                 'embedder_model': config.embedder.model,
                 'embedder_dimensions': getattr(config.embedder, 'dimensions', None),
-                'search_stores': 'mem0 (MemoryService.search, stores=[mem0])',
-                'search_categories': 'all',
-                'retrieval_mode': args.retrieval,
-                'retrieval_search_kwargs': retrieval_kwargs,
-                'canonical_aliases_path': (
-                    package_relative(args.canonical_aliases) if args.canonical_aliases else None
-                ),
-                'canonical_aliases_count': len(aliases) if aliases else 0,
+                **recall_side,
             },
             aliases=aliases,
         )
@@ -1468,12 +1479,11 @@ def main() -> int:
     parser.add_argument('--write-config', dest='write_config', action='store_true',
                         help='Write the derived thresholds into config.yaml '
                              '(default: report only)')
-    parser.add_argument('--retrieval', choices=RETRIEVAL_MODES, default='legacy',
-                        help="'legacy' (default) reproduces the committed report's search "
-                             "shape; 'production' passes exactly the kwargs "
-                             'write_triage.py::retrieve_candidates passes on a live '
-                             'triaged write (categories=the 3 Mem0-primary values, '
-                             'anchor_topics=False) — see search_kwargs_for_retrieval.')
+    parser.add_argument('--retrieval', choices=RETRIEVAL_MODES, default=RETRIEVAL_LEGACY,
+                        help="'production' calls write_triage.py::retrieve_candidates, the "
+                             "search a live triaged write makes; 'legacy' (default) is the "
+                             'older MemoryService.search(stores=[mem0]) shape, kept to '
+                             'reproduce historical reports.')
     parser.add_argument('--canonical-aliases', dest='canonical_aliases', default=None,
                         help='Path to a JSON {old_cluster_canonical_id: current_memory_id} '
                              'map resolving rotated canonicals. When given, recall is '
