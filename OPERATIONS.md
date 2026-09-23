@@ -811,6 +811,18 @@ takes no arguments: it always re-reads that process's own
 - `config_key_census.*` (the unknown-key census escape hatch — see
   [§6a](#6a-unknown-config-key-census); green-tier on purpose, so a
   false-positive L2 can be cleared on a live unit)
+- `merge_disjoint_skip_requires_verified_drift` (the soundness gate on the
+  merge queue's disjoint-delta fast path — see
+  [§"Merge-halt semantics"](#merge-halt-semantics-wip_conflict--unmerged_state)'s
+  neighbourhood and `merge_gates._disjoint_skip_blockers`). When `true`
+  (the default) a rebase whose footprint is disjoint from the intervening
+  main delta is re-verified anyway unless that delta is a main tip **this
+  queue landed green**; drift from any other writer — an unattended nightly
+  job, a direct commit, a push — has unknown health. Green-tier on purpose
+  and for the same reason as the two bullets above: it is a safety kill
+  switch, it only ever ADDS one verify before an advance, and it cannot
+  split an in-flight merge's breadth. Contrast its **restart-only**
+  neighbour `merge_verify_breadth`, which does change breadth mid-merge.
 - `merge_deep.chain_cap` (the deep merge-ahead chain cap — see
   [§"Deep merge-ahead chains"](#deep-merge-ahead-chains-merge_deepchain_cap);
   `0` is the shipped default and the feature's kill switch). Green-tier on

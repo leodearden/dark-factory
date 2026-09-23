@@ -148,13 +148,6 @@ ALLOWLIST_ENTRIES: list[tuple[str, str, str, str]] = [
         "sweep entirely (background probe, non-critical)",
     ),
     (
-        "orchestrator/src/orchestrator/verify.py",
-        "run_main_tip_sweep",
-        "e2a807e01521",
-        "debug-logged fail-safe: unexpected error during main-tip sweep "
-        "returns None; sweeps are background checks, not on critical path",
-    ),
-    (
         "scripts/orchestrator-watchdog.py",
         "_unit_start_elapsed_secs",
         "92b98f5b67f9",
