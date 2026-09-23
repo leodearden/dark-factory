@@ -635,7 +635,7 @@ def _refuse_real_post_under_test(url: str, tool_name: str) -> None:
     WHY RAISE. Loud over silent (no-silent-fail-soft): a sentinel return is
     indistinguishable from a real MCP response at every consumer. ``{}`` is
     what ``_escalate_fn`` already returns when a POST genuinely fails, and
-    what ``run_census`` reads as "submit_fn returned no usable id" -- so a
+    what ``run_census`` reads as "submit_fn returned no ticket id" -- so a
     suppressed POST would arrive looking like an ordinary weak response
     rather than like a suppression, and any future caller that checks only
     for an exception would read it as success. A typed exception says which
@@ -847,6 +847,25 @@ def build_task_payloads(clusters, *, project_root: str, project_id: str) -> list
             }
         )
     return payloads
+
+
+def _ticket_id_from_submit_result(result) -> str | None:
+    """The ticket id one curator-path ``submit_task`` call answered with, or
+    ``None`` if it filed nothing usable.
+
+    SPOT for that seam's contract (``fused_memory/server/tools.py::submit_task``,
+    ``fused_memory/middleware/task_interceptor.py::TaskInterceptor``): success
+    is ``{"ticket": "tkt_<id>"}`` -- a TICKET id, not a task id. The curator
+    decides create/combine/drop later, and ``resolve_ticket`` then yields the
+    task id. A rejection (``{"error": ..., "error_type": ...}``), a non-dict,
+    or a missing, empty or non-string ticket gives ``None``. The planning-mode
+    ``task_id`` shape is out of scope: ``build_task_payloads`` never sets
+    ``planning_mode``.
+    """
+    if not isinstance(result, dict):
+        return None
+    ticket_id = result.get("ticket")
+    return ticket_id if isinstance(ticket_id, str) and ticket_id else None
 
 
 # ---------------------------------------------------------------------------
@@ -1074,10 +1093,10 @@ class DryRunFiling:
     for human review, and NOTHING was filed into a live task tree.
 
     ``payload_count`` is how many payloads the file holds. Reused by both
-    ``render_report`` (which must not let an empty ``filed_task_ids`` read
+    ``render_report`` (which must not let an empty ``filed_ticket_ids`` read
     as a normal run that filed nothing) and ``CensusOutcome`` (so
     ``main``'s summary line can name the review file instead of printing a
-    misleading ``filed_tasks=0``). ``None`` in place of this record means
+    misleading ``filed_tickets=0``). ``None`` in place of this record means
     the run filed normally."""
 
     path: str
@@ -1141,7 +1160,7 @@ def census_report_sections(
     matrix_md: str,
     mining_result: MiningResult,
     synthesis_md: str,
-    filed_task_ids: list[str],
+    filed_ticket_ids: list[str],
     cost_note: str,
     verify_coverage: VerifyCoverage | None = None,
     dry_run: DryRunFiling | None = None,
@@ -1344,15 +1363,21 @@ def census_report_sections(
 
     filed_tasks = ["", "## Filed Tasks", ""]
     if dry_run is not None:
-        # Checked FIRST: under --dry-run-filing, filed_task_ids is empty by
+        # Checked FIRST: under --dry-run-filing, filed_ticket_ids is empty by
         # construction, and the plain "_none filed._" placeholder would read
         # as a normal run that simply had nothing to file.
         filed_tasks.append(
             f"_dry-run: {dry_run.payload_count} payload(s) written to {dry_run.path} "
             "-- NOTHING filed; review before filing._"
         )
-    elif filed_task_ids:
-        filed_tasks.extend(f"- {task_id}" for task_id in filed_task_ids)
+    elif filed_ticket_ids:
+        filed_tasks.append(
+            f"_{len(filed_ticket_ids)} ticket(s) filed -- the curator's "
+            "create/combine/drop decision is still pending, so no task id "
+            "exists yet; resolve_ticket returns the task id once it does._"
+        )
+        filed_tasks.append("")
+        filed_tasks.extend(f"- {ticket_id}" for ticket_id in filed_ticket_ids)
     else:
         filed_tasks.append("_none filed._")
     emit(SECTION_FILED_TASKS, filed_tasks)
@@ -1381,7 +1406,7 @@ def render_report(
     matrix_md: str,
     mining_result: MiningResult,
     synthesis_md: str,
-    filed_task_ids: list[str],
+    filed_ticket_ids: list[str],
     cost_note: str,
     verify_coverage: VerifyCoverage | None = None,
     dry_run: DryRunFiling | None = None,
@@ -1405,7 +1430,7 @@ def render_report(
         matrix_md=matrix_md,
         mining_result=mining_result,
         synthesis_md=synthesis_md,
-        filed_task_ids=filed_task_ids,
+        filed_ticket_ids=filed_ticket_ids,
         cost_note=cost_note,
         verify_coverage=verify_coverage,
         dry_run=dry_run,
@@ -1772,7 +1797,7 @@ class CensusOutcome:
     status: str
     reason: str | None = None
     report_path: str | None = None
-    filed_task_ids: list[str] = field(default_factory=list)
+    filed_ticket_ids: list[str] = field(default_factory=list)
     stop_reason: str | None = None
     dry_run: DryRunFiling | None = None
 
@@ -1985,8 +2010,8 @@ def run_census(
     reports fixed -> ``codebook.validate`` (raises and aborts BEFORE
     anything is written, on an invalid merge) -> ``build_task_payloads`` +
     *submit_fn* per payload, best-effort (a raised exception, or a result
-    with no usable id, is logged and excluded from ``filed_task_ids``
-    rather than aborting the run or inflating the filed-task count) ->
+    carrying no ticket id, is logged and excluded from ``filed_ticket_ids``
+    rather than aborting the run or inflating the filed count) ->
     ``render_report`` -> write the report to *report_path* ->
     ``codebook.dump`` -> ``advance_census_state`` (done-count from
     *status_fetcher*) -> best-effort *commit* of report + codebook + state.
@@ -2056,7 +2081,7 @@ def run_census(
     *dry_run_payloads_path* switches filing to review mode
     (``--dry-run-filing``): every would-be ``submit_task`` payload is
     written there as JSON for a human to read, *submit_fn* is never
-    called, and ``filed_task_ids`` stays empty. ONLY the external filing
+    called, and ``filed_ticket_ids`` stays empty. ONLY the external filing
     is stubbed -- mining, verification, synthesis, the matrix, the
     codebook merge and promotions, the report write, ``codebook.dump``
     and ``advance_census_state`` all proceed exactly as on a normal run,
@@ -2389,24 +2414,25 @@ def run_census(
             f"census: codebook merge produced an invalid codebook: {validation_errors}"
         )
 
-    # Best-effort per payload -- a raised exception, or a result with no
-    # usable id, is logged and EXCLUDED from filed_task_ids rather than
-    # aborting the run or silently inflating the filed-task count
-    # (reviewer_comprehensive finding #1: an id-less result must never
-    # render as a "- None" report bullet, nor count as a genuinely-filed
-    # task). Mirrors the best-effort handling used for commit() below.
+    # Best-effort per payload -- a raised exception, or a result in which
+    # _ticket_id_from_submit_result finds no ticket, is logged and EXCLUDED
+    # from filed_ticket_ids rather than aborting the run or silently
+    # inflating the filed count (reviewer_comprehensive finding #1: an
+    # unfilable result must never render as a "- None" report bullet, nor
+    # count as genuinely filed). Mirrors the best-effort handling used for
+    # commit() below.
     # Positioned BEFORE codebook.dump()/advance_census_state() below
     # (reviewer_comprehensive finding #4): a bug in payload construction can
     # then only abort the run before anything is persisted, never strand an
     # already-advanced codebook.
     task_payloads = build_task_payloads(verified, project_root=project_root, project_id=project_id)
-    filed_task_ids = []
+    filed_ticket_ids = []
     dry_run_filing = None
     if dry_run_payloads_path is not None:
         # --dry-run-filing: write the payloads for human review and file
         # NOTHING. submit_fn is deliberately left untouched (not swapped for
         # a collector) so a test can assert it was never reached, and so the
-        # id-less-result WARNING below can never fire for an intentional
+        # missing-ticket-id WARNING below can never fire for an intentional
         # operator mode.
         requested_path = Path(dry_run_payloads_path)
         resolved_path = _free_payloads_path(requested_path)
@@ -2453,14 +2479,14 @@ def run_census(
                     "census: submit_fn failed for payload %r: %s", payload.get("title"), exc,
                 )
                 continue
-            task_id = submit_result.get("id") if isinstance(submit_result, dict) else None
-            if task_id is None:
+            ticket_id = _ticket_id_from_submit_result(submit_result)
+            if ticket_id is None:
                 logger.warning(
-                    "census: submit_fn returned no usable id for payload %r (result=%r) "
+                    "census: submit_fn returned no ticket id for payload %r (result=%r) "
                     "-- not counted as filed", payload.get("title"), submit_result,
                 )
                 continue
-            filed_task_ids.append(task_id)
+            filed_ticket_ids.append(ticket_id)
 
     storm_batch_indices = [s.index for s in mining_result.batch_stats if s.status == "failure"]
     if storm_batch_indices:
@@ -2496,7 +2522,7 @@ def run_census(
         matrix_md=matrix_md,
         mining_result=mining_result,
         synthesis_md=synthesis_md,
-        filed_task_ids=filed_task_ids,
+        filed_ticket_ids=filed_ticket_ids,
         cost_note=cost_note,
         verify_coverage=verify_coverage,
         dry_run=dry_run_filing,
@@ -2559,7 +2585,7 @@ def run_census(
     return CensusOutcome(
         status="done",
         report_path=str(report_path),
-        filed_task_ids=filed_task_ids,
+        filed_ticket_ids=filed_ticket_ids,
         stop_reason=mining_result.stop_reason,
         dry_run=dry_run_filing,
         dropped_verdicts=tuple(dropped_verdicts),
@@ -3470,7 +3496,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if outcome.dry_run is not None:
-        # A bare filed_tasks=0 here would read as "a normal run that had
+        # A bare filed_tickets=0 here would read as "a normal run that had
         # nothing to file" -- name the review file and the count instead.
         print(
             f"census: done -- report={outcome.report_path} "
@@ -3490,7 +3516,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(
         f"census: done -- report={outcome.report_path} "
-        f"filed_tasks={len(outcome.filed_task_ids)} "
+        f"filed_tickets={len(outcome.filed_ticket_ids)} "
         f"stop_reason={outcome.stop_reason}{unresolved}"
     )
     return 0

@@ -17007,8 +17007,13 @@ class TestReverifyRebasedTree:
     """Unit tests for _reverify_rebased_tree shared gate.
 
     The gate:
-    (a) Disjoint overlap → returns None, run_scoped_verification NOT called,
-        merge_wt still exists.
+    (a) Disjoint overlap AND the drift is a tip this queue landed green →
+        returns None, run_scoped_verification NOT called, merge_wt still
+        exists.
+    (a2) Disjoint overlap but the drift is NOT queue-verified → re-verifies
+        anyway (the 2026-09-22 whole-tree-drift incident).
+    (a3) Disjoint overlap, drift queue-verified, but the project declares a
+        whole-tree merge gate → re-verifies anyway.
     (b) Overlapping, green verify → returns None, run_scoped_verification
         called exactly once, merge_wt still exists.
     (c) Overlapping, red verify → returns blocked MergeOutcome,
@@ -17029,18 +17034,29 @@ class TestReverifyRebasedTree:
     async def test_disjoint_no_reverify(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
-        """(a) Disjoint (overlap returns empty): gate returns None and does
-        NOT call run_scoped_verification.  merge_wt still exists.
+        """(a) Disjoint (overlap returns empty) AND the intervening main tip
+        is one this queue landed green: gate returns None and does NOT call
+        run_scoped_verification.  merge_wt still exists.
         """
+        from orchestrator.merge_gates import note_queue_verified_main_tip
         from orchestrator.merge_queue import _reverify_rebased_tree
 
-        merge_wt, req = await self._make_merge_wt(git_ops, 'rvrt-disjoint', config)
+        # This repo's own config declares merge_verify_breadth='full' (a
+        # whole-tree merge gate), which alone denies the fast path.  Exercise
+        # the TRUSTED path with a diff-scoped breadth.
+        scoped = config.model_copy(update={'merge_verify_breadth': 'scoped'})
+        merge_wt, req = await self._make_merge_wt(git_ops, 'rvrt-disjoint', scoped)
         fork_sha = await git_ops.get_main_sha()
         # Move main (so we have a rebased_onto)
         (git_ops.project_root / 'rvrt_main.py').write_text('m = 1\n')
         await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
         await _run(['git', 'commit', '-m', 'Move main'], cwd=git_ops.project_root)
         rebased_onto = await git_ops.get_main_sha()
+
+        # Premise P2: the drift is a tip THIS queue landed after a green gate
+        # run.  Without this the gate now fails safe and re-verifies — see
+        # test_disjoint_unverified_drift_reverifies below.
+        note_queue_verified_main_tip(rebased_onto)
 
         verify_mock = _mock_verify_pass()
         try:
@@ -17065,6 +17081,124 @@ class TestReverifyRebasedTree:
             )
             verify_mock.assert_not_called()
             assert merge_wt.exists(), 'merge_wt must still exist (not cleaned up)'
+        finally:
+            if merge_wt.exists():
+                await git_ops.cleanup_merge_worktree(merge_wt)
+
+    async def test_disjoint_unverified_drift_reverifies(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """(a2) THE 2026-09-22 WHOLE-TREE-DRIFT REGRESSION.
+
+        Main drifted under an in-flight verify because an unattended nightly
+        job committed straight to main — a writer the merge queue never gated.
+        The branch footprint and the drift footprint were disjoint, so the gate
+        skipped re-verification and the queue advanced a tree no verification
+        had ever seen green, reporting it as 'merged to main successfully'.
+
+        Disjointness alone must NOT clear the gate when the intervening tip is
+        not one this queue landed green.
+        """
+        from orchestrator.merge_queue import _reverify_rebased_tree
+
+        # Diff-scoped breadth, so the ONLY thing denying the fast path is the
+        # drift's unknown provenance.
+        scoped = config.model_copy(update={'merge_verify_breadth': 'scoped'})
+        merge_wt, req = await self._make_merge_wt(
+            git_ops, 'rvrt-unverified-drift', scoped,
+        )
+        fork_sha = await git_ops.get_main_sha()
+        # Drift authored by a writer that is NOT the merge queue.
+        (git_ops.project_root / 'rvrt_nightly.py').write_text('n = 1\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Unattended nightly trickle'],
+                   cwd=git_ops.project_root)
+        rebased_onto = await git_ops.get_main_sha()
+        # Deliberately NOT registered via note_queue_verified_main_tip.
+
+        verify_mock = _mock_verify_pass()
+        try:
+            with (
+                patch(
+                    'orchestrator.merge_queue._rebase_delta_touched_overlap',
+                    new=AsyncMock(return_value=[]),  # disjoint
+                ),
+                patch('orchestrator.merge_queue.run_scoped_verification', verify_mock),
+            ):
+                result = await _reverify_rebased_tree(
+                    git_ops, req, merge_wt,
+                    rebased_from=fork_sha,
+                    rebased_onto=rebased_onto,
+                    timeouts={},
+                    enospc_retries={},
+                    max_timeouts=3,
+                    max_enospc=1,
+                )
+            assert result is None, (
+                f'Re-verify ran and passed: expected None, got {result!r}'
+            )
+            assert verify_mock.call_count == 1, (
+                f'Disjoint-but-unverified drift must still re-verify; '
+                f'run_scoped_verification called {verify_mock.call_count} times'
+            )
+        finally:
+            if merge_wt.exists():
+                await git_ops.cleanup_merge_worktree(merge_wt)
+
+    async def test_disjoint_whole_tree_gate_reverifies(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """(a3) merge_verify_breadth='full' declares a whole-tree merge gate,
+        whose whole premise is that an unrelated file can fail you.  Footprint
+        disjointness cannot license a skip there even when the drift is itself
+        a tip this queue landed green — and the P2 kill switch does not cover
+        this arm.
+        """
+        from orchestrator.merge_gates import note_queue_verified_main_tip
+        from orchestrator.merge_queue import _reverify_rebased_tree
+
+        merge_wt, req = await self._make_merge_wt(
+            git_ops, 'rvrt-whole-tree', config,
+        )
+        fork_sha = await git_ops.get_main_sha()
+        (git_ops.project_root / 'rvrt_wt.py').write_text('w = 1\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Move main'], cwd=git_ops.project_root)
+        rebased_onto = await git_ops.get_main_sha()
+        note_queue_verified_main_tip(rebased_onto)
+
+        wide = config.model_copy(update={
+            'merge_verify_breadth': 'full',
+            # Kill switch OFF: proves the whole-tree arm is not gated by it.
+            'merge_disjoint_skip_requires_verified_drift': False,
+        })
+        req.config = wide
+
+        verify_mock = _mock_verify_pass()
+        try:
+            with (
+                patch(
+                    'orchestrator.merge_queue._rebase_delta_touched_overlap',
+                    new=AsyncMock(return_value=[]),  # disjoint
+                ),
+                patch('orchestrator.merge_queue.run_scoped_verification', verify_mock),
+            ):
+                result = await _reverify_rebased_tree(
+                    git_ops, req, merge_wt,
+                    rebased_from=fork_sha,
+                    rebased_onto=rebased_onto,
+                    timeouts={},
+                    enospc_retries={},
+                    max_timeouts=3,
+                    max_enospc=1,
+                )
+            assert result is None, (
+                f'Re-verify ran and passed: expected None, got {result!r}'
+            )
+            assert verify_mock.call_count == 1, (
+                f'A whole-tree merge gate must re-verify on ANY drift; '
+                f'run_scoped_verification called {verify_mock.call_count} times'
+            )
         finally:
             if merge_wt.exists():
                 await git_ops.cleanup_merge_worktree(merge_wt)
@@ -17466,6 +17600,8 @@ class TestSpeculativeMergeWorkerGate:
         Fast path: the gate detects no overlap and skips re-verify.
         run_scoped_verification called exactly once (initial verify only).
         """
+        from orchestrator.merge_gates import note_queue_verified_main_tip
+
         branch = 'smwg-disjoint'
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue)
@@ -17473,7 +17609,10 @@ class TestSpeculativeMergeWorkerGate:
         branch_wt = await _make_branch_with_file(
             git_ops, branch, 'branch_only.py', 'branch = 1\n',
         )
-        req = _make_request(branch, branch, branch_wt, config)
+        # This repo's own config declares merge_verify_breadth='full' (a
+        # whole-tree merge gate), which alone denies the fast path.
+        scoped = config.model_copy(update={'merge_verify_breadth': 'scoped'})
+        req = _make_request(branch, branch, branch_wt, scoped)
 
         item = await worker._remerge(req, None)
         assert isinstance(item, RealMergeItem)
@@ -17485,6 +17624,10 @@ class TestSpeculativeMergeWorkerGate:
             ['git', 'commit', '-m', 'Move main: add main_only.py (disjoint)'],
             cwd=git_ops.project_root,
         )
+        # The drift stands in for another QUEUE landing: a tip this queue
+        # already landed green.  Without this the gate fails safe and
+        # re-verifies (see test_disjoint_unverified_drift_extra_verify).
+        note_queue_verified_main_tip(await git_ops.get_main_sha())
 
         verify_calls: list[int] = []
 
@@ -17506,6 +17649,61 @@ class TestSpeculativeMergeWorkerGate:
         # Fast path: must NOT trigger a second verify call
         assert len(verify_calls) == 1, (
             f'(c) Disjoint fast path: expected 1 verify call, got {len(verify_calls)}'
+        )
+
+    async def test_disjoint_unverified_drift_extra_verify(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """(c2) THE 2026-09-22 WHOLE-TREE-DRIFT REGRESSION, end to end.
+
+        Same disjoint setup as (c), but the drift was authored by a writer the
+        merge queue never gated (on the day: an unattended nightly job
+        committing prose straight onto main at 03:20:36, which reddened a
+        whole-tree gate every merge runs).  The queue then found the two
+        footprints disjoint, skipped re-verification, and advanced — reporting
+        "merged to main successfully" for a tree no verification had ever seen
+        green.
+
+        The gate must re-verify instead: TWO verify calls, not one.
+        """
+        branch = 'smwg-disjoint-unverified'
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue)
+
+        branch_wt = await _make_branch_with_file(
+            git_ops, branch, 'branch_only_u.py', 'branch = 1\n',
+        )
+        scoped = config.model_copy(update={'merge_verify_breadth': 'scoped'})
+        req = _make_request(branch, branch, branch_wt, scoped)
+
+        item = await worker._remerge(req, None)
+        assert isinstance(item, RealMergeItem)
+
+        # Drift from a writer that is NOT the merge queue — never registered
+        # via note_queue_verified_main_tip.
+        (git_ops.project_root / 'nightly_only.py').write_text('n = 1\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(
+            ['git', 'commit', '-m', 'Unattended nightly trickle (disjoint)'],
+            cwd=git_ops.project_root,
+        )
+
+        verify_calls: list[int] = []
+
+        async def _verify_side_effect(*args: Any, **kwargs: Any) -> Any:
+            verify_calls.append(len(verify_calls) + 1)
+            return MagicMock(passed=True, summary='')
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification',
+            side_effect=_verify_side_effect,
+        ):
+            advanced = await drive_verify_and_advance(worker, item)
+
+        assert advanced, '(c2) expected True (done) once the re-verify passes'
+        assert len(verify_calls) == 2, (
+            f'(c2) disjoint-but-unverified drift must pay for a re-verify: '
+            f'expected 2 verify calls, got {len(verify_calls)}'
         )
 
     async def test_no_movement_regression(
