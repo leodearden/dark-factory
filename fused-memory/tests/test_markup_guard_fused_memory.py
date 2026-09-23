@@ -1423,3 +1423,31 @@ def test_the_guard_source_spells_no_raw_envelope_literal():
         f'{source_path.name} — escaping must not delete the specimen it '
         'explains.'
     )
+
+
+def test_this_module_spells_no_raw_envelope_literal():
+    """SELF-FILE (the idiom task 4696 promoted): this test module's own source
+    must never contain a raw envelope literal either.
+
+    Paired with an anti-vacuity check on TestUnrepairableResidueIsPreserved's
+    docstring, whose explanation of the envelope closer carries no behavioural
+    coverage: without the check, the scan could be satisfied by deleting that
+    sentence instead of escaping it.
+    """
+    source = Path(__file__).read_text(encoding='utf-8')
+
+    hits = _raw_sentinel_hits(source)
+    assert not hits, (
+        'A raw envelope literal was written into this test file. Build it from '
+        "shared.toolcall_markup's constants, as _leaked() does, or spell it "
+        "with the \\x3c escape in prose — see the AUTHORING RULE in this module's "
+        f'docstring. Offending needle(s): {hits!r}.'
+    )
+
+    doc = TestUnrepairableResidueIsPreserved.__doc__
+    assert doc is not None, 'TestUnrepairableResidueIsPreserved lost its docstring'
+    assert INVOKE_CLOSER in doc, (
+        'INVOKE_CLOSER is missing from the decoded docstring of '
+        'TestUnrepairableResidueIsPreserved — escaping must not delete the '
+        'specimen it explains.'
+    )
