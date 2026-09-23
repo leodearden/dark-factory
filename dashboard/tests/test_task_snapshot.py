@@ -446,7 +446,7 @@ class TestAcquireSnapshotHappyPath:
             validate_datum(half, late)
             assert half.state is DatumState.STALE
             assert half.as_of == NOW
-            assert f'{FRESHNESS_BOUND_SECONDS}s freshness bound' in half.reason
+            assert f'{FRESHNESS_BOUND_SECONDS}s freshness bound' in (half.reason or '')
         assert served.census.value == snapshot.census.value
         assert served.rows.value == snapshot.rows.value
         assert classify(served) is SnapshotHealth.COUNT_UNKNOWN
