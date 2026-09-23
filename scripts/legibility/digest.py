@@ -635,6 +635,25 @@ def is_coder_judgment_payload(text: str) -> bool:
     return isinstance(parsed, dict) and parsed.keys() >= CODER_JUDGMENT_KEYS
 
 
+def is_reingested_content(text: str) -> bool:
+    """True when *text* is machine content re-ingested as session material
+    rather than this session's own dialogue.
+
+    Two shapes are known: a prior trickle-coder answer
+    (:func:`is_coder_judgment_payload`) and an injected harness prompt or
+    briefing (:func:`is_harness_injected_turn`). Both quote signal literals
+    that belong to another session or to the harness. Session b203a05c
+    record 22, a coder answer, fired self_correct; session 6a527d51 record 3,
+    the trickle-coder prompt embedding the digest it codes, fired df_guard.
+
+    Consulted by EVERY signal bucket, never by one: task 5685's ruling is
+    that this contamination is fixed at the content-classification layer,
+    not per bucket. A newly-sighted machine-payload shape is a one-line
+    addition to this union.
+    """
+    return is_coder_judgment_payload(text) or is_harness_injected_turn(text)
+
+
 def iter_self_corrections(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Detect curated self-correction markers in assistant TEXT blocks only.
 
