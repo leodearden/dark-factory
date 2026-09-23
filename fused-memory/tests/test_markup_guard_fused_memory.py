@@ -21,7 +21,10 @@ sentinel literal into a source, test or doc file — a file that contains one
 becomes a specimen of the very corruption under test and trips the read-side
 prefilter. Specimens are BUILT from ``shared.toolcall_markup``'s own constants
 by :func:`_leaked`, exactly as ``shared/tests/test_toolcall_markup.py`` and the
-middleware itself already do.
+middleware itself already do. The rule is enforced mechanically, not by
+convention alone, by the two guards at the foot of this file:
+``test_this_module_spells_no_raw_envelope_literal`` for this file and
+``test_the_guard_source_spells_no_raw_envelope_literal`` for ``markup_guard.py``.
 """
 
 from __future__ import annotations
@@ -1216,7 +1219,7 @@ class TestTheFiledProjectRootIsRegistryVouched:
 class TestUnrepairableResidueIsPreserved:
     """A refusal must not destroy the payload it refuses.
 
-    ``</invoke>`` closes the ENVELOPE rather than a parameter, so
+    ``\x3c/invoke>`` closes the ENVELOPE rather than a parameter, so
     ``shared.toolcall_markup.repair`` can attribute the residue to nothing and
     refuses under its NO SILENT PARTIAL REPAIR contract. Per the boundary
     specimen table that is the COMMON outcome for the real corpus shapes, not an
