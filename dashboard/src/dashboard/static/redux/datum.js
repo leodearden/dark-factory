@@ -137,9 +137,9 @@ function describeNonDatum(x) {
 // A COPY, never a write-through: the poll loop holds the object the server
 // sent, and stamping into it would mutate state other readers are looking at.
 //
-// `_served_at` is the server's serving instant (null until PRD leaf beta puts
-// a top-level `served_at` on the wire); `_received_at` is this browser's clock
-// when the response resolved. Underscored as client-side annotations rather
+// `_served_at` is the server's serving instant, null for a payload with no
+// top-level `served_at` (since PRD leaf beta, /tasks and /orchestrators carry
+// one); `_received_at` is this browser's clock when the response resolved. Underscored as client-side annotations rather
 // than wire keys — isDatum ignores them, as it must, because a datum is equally
 // valid before and after it is stamped.
 function withReceipt(datum, receipt) {
@@ -164,11 +164,11 @@ function withReceipt(datum, receipt) {
 // during exactly the failure this signal exists to surface — and NaN would
 // reach the operator as 'an unknown time' via formatAgeMs.
 //
-// A MISSING `_served_at` DEGRADES RATHER THAN NULLS, because it is today's
-// normal case — no polled payload carries a top-level `served_at` yet, so the
-// server gap is unknown rather than wrong. Contributing zero makes the result a
-// LOWER bound: honest and still growing, where nulling would leave every tile
-// un-aged until beta lands.
+// A MISSING `_served_at` DEGRADES RATHER THAN NULLS, because it is still the
+// normal case: only /tasks and /orchestrators carry a top-level `served_at`
+// (since PRD leaf beta), so for every other endpoint the server gap is unknown
+// rather than wrong. Contributing zero makes the result a LOWER bound: honest
+// and still growing, where nulling would leave those tiles un-aged.
 function displayedAgeMs(datum, now) {
   const d = datum || {};
   const clientGap = Number(now) - Number(d._received_at);

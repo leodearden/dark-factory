@@ -27,6 +27,8 @@ const { burndownStacks, burndownLegend, parityBannerState } = window.DF_BURNDOWN
 const { reconRunCounts, reconSuccessPct, reconStatusTone } = window.DF_RECON_STATUS;
 // Interim, deleted by task 5589 (γ2) — orch_summary.js's header says why.
 const { hasOrchSummary, orchSummary } = window.DF_ORCH_SUMMARY;
+// Interim too, deleted by γ2 — task_done_count.js's header says why.
+const { doneCount } = window.DF_TASK_DONE_COUNT;
 const { useState: uS, useEffect: uE } = React;
 
 // Which endpoint each rendered number arrived on. plainDatum's provenance is
@@ -294,9 +296,7 @@ function OrchTab({ projectFilter, search }) {
         const counts = {
           active:   projTasks.filter(t => t.status === 'in-progress' || t.status === 'blocked').length,
           pending:  projTasks.filter(t => t.status === 'pending').length,
-          complete: (DF.DONE_COUNTS && DF.DONE_COUNTS[o.project] != null)
-                      ? DF.DONE_COUNTS[o.project]
-                      : projTasks.filter(t => t.status === 'done').length,
+          complete: doneCount(DF.TASKS_SNAPSHOT[o.project]),
         };
 
         const summary = (
