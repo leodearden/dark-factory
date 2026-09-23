@@ -2067,6 +2067,29 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         assert breach['current'] == metrics.FILE_LINE_CEILING + 1
 
 
+def _baseline_image(tmp_path: Path, name: str, report: dict) -> Path:
+    """*report* written as committed baseline bytes, for a path-taking face."""
+    target = tmp_path / name
+    target.write_text(metrics.render_baseline(report), encoding='utf-8')
+    return target
+
+
+def _violation_fields(violation: metrics.Violation) -> tuple[str, str, int, int]:
+    """The four fields a ledger record is projected from, message excluded.
+
+    Asserting on the tuple rather than on ``message`` is what keeps these
+    tests about the COMPARISON: the wording lives in ``Violation.rose`` and is
+    pinned by ``TestViolationShape``, so re-deriving it here would be a
+    second copy that drifts.
+    """
+    return (
+        violation.measure,
+        violation.key,
+        violation.baseline,
+        violation.current,
+    )
+
+
 class TestCompareBaselineFiles:
     """The comparison the WRITER cannot make: two committed IMAGES, not a tree.
 
@@ -2081,35 +2104,13 @@ class TestCompareBaselineFiles:
     """
 
     @staticmethod
-    def _image(tmp_path: Path, name: str, report: dict) -> Path:
-        target = tmp_path / name
-        target.write_text(metrics.render_baseline(report), encoding='utf-8')
-        return target
-
-    @staticmethod
-    def _fields(violation: metrics.Violation) -> tuple[str, str, int, int]:
-        """The four fields a ledger record is projected from, message excluded.
-
-        Asserting on the tuple rather than on ``message`` is what keeps these
-        tests about the COMPARISON: the wording lives in ``Violation.rose`` and is
-        pinned by ``TestViolationShape``, so re-deriving it here would be a
-        second copy that drifts.
-        """
-        return (
-            violation.measure,
-            violation.key,
-            violation.baseline,
-            violation.current,
-        )
-
-    @classmethod
-    def _pair(cls, tmp_path: Path, mutate) -> tuple[Path, Path]:
+    def _pair(tmp_path: Path, mutate) -> tuple[Path, Path]:
         """Two images: the seed, and the seed with one measure perturbed."""
         moved = copy.deepcopy(synthetic_report())
         mutate(moved)
         return (
-            cls._image(tmp_path, 'previous.json', synthetic_report()),
-            cls._image(tmp_path, 'current.json', moved),
+            _baseline_image(tmp_path, 'previous.json', synthetic_report()),
+            _baseline_image(tmp_path, 'current.json', moved),
         )
 
     def test_a_rise_is_reported_per_path_and_in_the_derived_total(
@@ -2125,8 +2126,8 @@ class TestCompareBaselineFiles:
         # would have produced, so a ledger record derived from either describes
         # the same raise. The total comes along because it is DERIVED -- moving
         # the mass to a new path is the shape that check exists for.
-        assert [self._fields(v) for v in raises] == [
-            self._fields(metrics.Violation.rose('lines', 'a.py', 1000, 1005)),
+        assert [_violation_fields(v) for v in raises] == [
+            _violation_fields(metrics.Violation.rose('lines', 'a.py', 1000, 1005)),
             ('total:lines', metrics.CLUSTER_TOTAL_KEY, 1200, 1205),
         ]
 
@@ -2177,12 +2178,12 @@ class TestCompareBaselineFiles:
             'new_big.py',
             metrics.FILE_LINE_CEILING,
             oversized,
-        ) in [self._fields(v) for v in raises]
+        ) in [_violation_fields(v) for v in raises]
 
     def test_a_missing_image_is_a_named_hard_failure(self, tmp_path: Path) -> None:
         # Inherited from load_baseline, never re-implemented: an unreadable
         # image must never read as an empty-baseline pass (INV-11).
-        previous = self._image(tmp_path, 'previous.json', synthetic_report())
+        previous = _baseline_image(tmp_path, 'previous.json', synthetic_report())
         absent = tmp_path / 'gone.json'
 
         with pytest.raises(metrics.MetricsError) as excinfo:
@@ -2191,7 +2192,7 @@ class TestCompareBaselineFiles:
         assert str(absent) in str(excinfo.value)
 
     def test_a_malformed_image_is_a_named_hard_failure(self, tmp_path: Path) -> None:
-        previous = self._image(tmp_path, 'previous.json', synthetic_report())
+        previous = _baseline_image(tmp_path, 'previous.json', synthetic_report())
         broken = tmp_path / 'broken.json'
         broken.write_text('{"files": {', encoding='utf-8')
 
@@ -2201,6 +2202,207 @@ class TestCompareBaselineFiles:
         message = str(excinfo.value)
         assert str(broken) in message
         assert 'not valid JSON' in message
+
+
+class TestCompareMergedBaselineFiles:
+    """The 3-WAY BOUND a merge commit's staged baseline is compared against.
+
+    A conflicted merge finished with `git commit` stages a baseline descended
+    from two parents (esc-3620-11). Read against HEAD alone, every measure
+    MERGE_HEAD moved is a raise; read against either parent, keeping one side's
+    stale value re-absorbs the other side's lowering. The bound is what git does
+    to the file text, applied per measure against the merge base: a measure one
+    side moved stands at that side's value, up or down, and where both moved,
+    the higher side bounds it.
+
+    The seed's numbers: a.py lines 1000, b.py lines 200, total:lines 1200.
+    """
+
+    @staticmethod
+    def _moved(*moves: tuple[str, str, int]) -> dict:
+        """The seed with each ``(path, measure, value)`` set in its ``files``."""
+        report = synthetic_report()
+        for path, measure, value in moves:
+            report['files'][path][measure] = value
+        return report
+
+    @staticmethod
+    def _bounded(
+        tmp_path: Path,
+        current: dict,
+        *,
+        base: dict | None,
+        ours: dict | None,
+        theirs: dict | None,
+    ) -> list[tuple[str, str, int, int]]:
+        """The raises *current* makes over the bound, as field tuples."""
+
+        def image(name: str, report: dict | None) -> Path | None:
+            return None if report is None else _baseline_image(tmp_path, name, report)
+
+        raises = metrics.compare_merged_baseline_files(
+            base=image('base.json', base),
+            ours=image('ours.json', ours),
+            theirs=image('theirs.json', theirs),
+            current=_baseline_image(tmp_path, 'current.json', current),
+        )
+        return [_violation_fields(violation) for violation in raises]
+
+    def test_a_measure_only_theirs_moved_stands_at_theirs_value(
+        self, tmp_path: Path
+    ) -> None:
+        # THE INCIDENT'S SHAPE: ours never touched the baseline, so the bound IS
+        # theirs' image -- and the reported baseline is the bound, not HEAD's.
+        seed, theirs = synthetic_report(), self._moved(('a.py', 'lines', 1005))
+
+        assert self._bounded(tmp_path, theirs, base=seed, ours=seed, theirs=theirs) == []
+        assert self._bounded(
+            tmp_path,
+            self._moved(('a.py', 'lines', 1006)),
+            base=seed,
+            ours=seed,
+            theirs=theirs,
+        ) == [
+            ('lines', 'a.py', 1005, 1006),
+            ('total:lines', metrics.CLUSTER_TOTAL_KEY, 1205, 1206),
+        ]
+
+    @pytest.mark.parametrize('lowered_by', ['ours', 'theirs'])
+    def test_a_lowering_one_side_made_is_not_reabsorbed_from_the_other(
+        self, tmp_path: Path, lowered_by: str
+    ) -> None:
+        # THE CASE EVERY EITHER-PARENT RULE ADMITS. Keeping the unmoved side's
+        # 1000 is clean against that side, and in a conflicted merge on main it
+        # would land an unrecorded widening.
+        seed, lowered = synthetic_report(), self._moved(('a.py', 'lines', 995))
+
+        assert self._bounded(
+            tmp_path,
+            seed,
+            base=seed,
+            ours=lowered if lowered_by == 'ours' else seed,
+            theirs=lowered if lowered_by == 'theirs' else seed,
+        ) == [
+            ('lines', 'a.py', 995, 1000),
+            ('total:lines', metrics.CLUSTER_TOTAL_KEY, 1195, 1200),
+        ]
+
+    def test_own_moves_stand_per_measure_not_per_path(self, tmp_path: Path) -> None:
+        # Both sides moved a.py, but different MEASURES of it: taking theirs'
+        # whole entry keeps theirs' cognitive lowering and undoes ours' lines one.
+        ours = self._moved(('a.py', 'lines', 995))
+        theirs = self._moved(('a.py', 'cognitive', 110))
+
+        assert self._bounded(
+            tmp_path, theirs, base=synthetic_report(), ours=ours, theirs=theirs
+        ) == [
+            ('lines', 'a.py', 995, 1000),
+            ('total:lines', metrics.CLUSTER_TOTAL_KEY, 1195, 1200),
+        ]
+
+    def test_where_both_sides_moved_a_measure_the_higher_bounds_it(
+        self, tmp_path: Path
+    ) -> None:
+        seed = synthetic_report()
+        ours = self._moved(('a.py', 'lines', 990))
+        theirs = self._moved(('a.py', 'lines', 1005))
+
+        assert self._bounded(tmp_path, theirs, base=seed, ours=ours, theirs=theirs) == []
+        assert self._bounded(
+            tmp_path,
+            self._moved(('a.py', 'lines', 1006)),
+            base=seed,
+            ours=ours,
+            theirs=theirs,
+        ) == [
+            ('lines', 'a.py', 1005, 1006),
+            ('total:lines', metrics.CLUSTER_TOTAL_KEY, 1205, 1206),
+        ]
+
+    def test_moves_on_different_paths_add_up_in_the_derived_total(
+        self, tmp_path: Path
+    ) -> None:
+        # The total is DERIVED from the bound, so it reads 1215. A per-measure
+        # max of the parents' own totals would read 1210 and refuse the merge.
+        ours = self._moved(('a.py', 'lines', 1005))
+        theirs = self._moved(('b.py', 'lines', 210))
+        merged = self._moved(('a.py', 'lines', 1005), ('b.py', 'lines', 210))
+
+        assert self._bounded(
+            tmp_path, merged, base=synthetic_report(), ours=ours, theirs=theirs
+        ) == []
+
+    def test_a_path_one_side_deleted_stays_deleted(self, tmp_path: Path) -> None:
+        seed, ours = synthetic_report(), synthetic_report()
+        del ours['files']['b.py']
+
+        assert ('total:lines', metrics.CLUSTER_TOTAL_KEY, 1000, 1200) in self._bounded(
+            tmp_path, seed, base=seed, ours=ours, theirs=seed
+        )
+
+    def test_a_deletion_does_not_undo_the_other_sides_move(
+        self, tmp_path: Path
+    ) -> None:
+        # git's modify/delete conflict: the modification stands.
+        ours = synthetic_report()
+        del ours['files']['b.py']
+        theirs = self._moved(('b.py', 'lines', 190))
+
+        assert self._bounded(
+            tmp_path, theirs, base=synthetic_report(), ours=ours, theirs=theirs
+        ) == []
+
+    def test_an_absent_base_bounds_each_measure_by_the_higher_parent(
+        self, tmp_path: Path
+    ) -> None:
+        # No common ancestor, or no baseline at it: git merges such histories
+        # against the empty tree, so each side moved every measure it holds.
+        ours = synthetic_report()
+        theirs = self._moved(('a.py', 'lines', 1005), ('b.py', 'lines', 190))
+
+        assert self._bounded(
+            tmp_path,
+            self._moved(('a.py', 'lines', 1005)),
+            base=None,
+            ours=ours,
+            theirs=theirs,
+        ) == []
+        assert ('lines', 'b.py', 200, 201) in self._bounded(
+            tmp_path,
+            self._moved(('a.py', 'lines', 1005), ('b.py', 'lines', 201)),
+            base=None,
+            ours=ours,
+            theirs=theirs,
+        )
+
+    def test_an_absent_parent_image_moved_nothing(self, tmp_path: Path) -> None:
+        # A parent without a baseline must not read as having lowered every
+        # measure to nothing, which would refuse a resolver who keeps theirs.
+        seed, theirs = synthetic_report(), self._moved(('a.py', 'lines', 1005))
+
+        assert self._bounded(tmp_path, theirs, base=seed, ours=None, theirs=theirs) == []
+        assert ('lines', 'a.py', 1005, 1006) in self._bounded(
+            tmp_path,
+            self._moved(('a.py', 'lines', 1006)),
+            base=seed,
+            ours=None,
+            theirs=theirs,
+        )
+
+    def test_a_name_set_both_sides_moved_is_bounded_by_the_side_naming_more(
+        self, tmp_path: Path
+    ) -> None:
+        # DISTINCT names, the unit the per-path comparison counts in.
+        seed, ours, theirs = synthetic_report(), synthetic_report(), synthetic_report()
+        ours['tests']['t1.py']['patch_targets'] = ['foo', 'bar', 'qux']
+        theirs['tests']['t1.py']['patch_targets'] = ['foo']
+        widened = copy.deepcopy(ours)
+        widened['tests']['t1.py']['patch_targets'].append('zap')
+
+        assert self._bounded(tmp_path, ours, base=seed, ours=ours, theirs=theirs) == []
+        assert ('patch_targets', 't1.py', 3, 4) in self._bounded(
+            tmp_path, widened, base=seed, ours=ours, theirs=theirs
+        )
 
 
 class TestAuthorizedRaise:
