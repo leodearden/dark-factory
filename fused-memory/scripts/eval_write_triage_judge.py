@@ -167,7 +167,10 @@ LABEL_DUPLICATE = _calibrate.LABEL_DUPLICATE
 LABEL_DISTINCT = _calibrate.LABEL_DISTINCT
 LABEL_PSEUDO_CONTRADICTION = _calibrate.LABEL_PSEUDO_CONTRADICTION
 load_fixture = _calibrate.load_fixture
+load_canonical_aliases = _calibrate.load_canonical_aliases
 package_relative = _calibrate.package_relative
+
+_NO_ALIASES: Mapping[str, str] = types.MappingProxyType({})
 
 #: The control class, which is this script's own construct rather than one of
 #: alpha's labels — hence a separate constant, so nothing reads it back as a
@@ -216,6 +219,9 @@ PROVENANCE_KEYS: tuple[str, ...] = (
     'judge_provider',
     'judge_model',
     'limit',
+    'canonical_aliases_path',
+    'canonical_aliases_count',
+    'cases_path',
     # How the slate reaching the judge was obtained, and how wide each field
     # of it was rendered. Both change what the model saw without changing any
     # other field in this block, so an artifact missing them is unreadable.
@@ -359,6 +365,7 @@ def _case(
     band: str,
     similarity: float | None,
     canonical_present: bool | None,
+    canonical_alias_id: str | None,
 ) -> dict[str, Any]:
     """One judge case: what is submitted, what it is shown, how it routed.
 
@@ -378,6 +385,7 @@ def _case(
         'band': band,
         'similarity': similarity,
         'canonical_present': canonical_present,
+        'canonical_alias_id': canonical_alias_id,
     }
 
 
@@ -386,6 +394,7 @@ def _seeded_case(
     slate: list[str],
     expected_class: str,
     acceptable: frozenset[str],
+    canonical_alias_id: str | None,
 ) -> dict[str, Any]:
     """A case whose slate is CONSTRUCTED rather than retrieved.
 
@@ -403,6 +412,7 @@ def _seeded_case(
         band=OUTCOME_JUDGE,
         similarity=None,
         canonical_present=None,
+        canonical_alias_id=canonical_alias_id,
     )
 
 
@@ -410,6 +420,7 @@ def build_judge_cases(
     records: Sequence[Mapping[str, Any]],
     *,
     distractors: int,
+    aliases: Mapping[str, str] = _NO_ALIASES,
 ) -> list[dict[str, Any]]:
     """One judge call per case, with the ground truth its label implies.
 
@@ -444,7 +455,9 @@ def build_judge_cases(
         canonical_id = str(record['cluster_id'])
         pool = _distractor_pool(ordered, record['cluster_id'])
         slate = [canonical_id, *_rotated(pool, index, distractors)]
-        cases.append(_seeded_case(record, slate, label, acceptable))
+        cases.append(_seeded_case(
+            record, slate, label, acceptable, aliases.get(canonical_id),
+        ))
 
     # The control set, appended after the labelled ones so a `--limit` smoke
     # run covers the classes the labels actually measure first.
@@ -459,6 +472,7 @@ def build_judge_cases(
         slate = _rotated(pool, index, distractors + 1)
         cases.append(_seeded_case(
             record, slate, CLASS_DISTRACTOR, _DISTRACTOR_ACCEPTABLE,
+            aliases.get(str(record['cluster_id'])),
         ))
 
     return cases
@@ -488,11 +502,14 @@ class EvalPlan:
 
 
 def seeded_plan(
-    records: Sequence[Mapping[str, Any]], *, distractors: int,
+    records: Sequence[Mapping[str, Any]],
+    *,
+    distractors: int,
+    aliases: Mapping[str, str] = _NO_ALIASES,
 ) -> EvalPlan:
     """Today's construction: the cluster canonical seeded at slate position 0."""
     return EvalPlan(
-        cases=tuple(build_judge_cases(records, distractors=distractors)),
+        cases=tuple(build_judge_cases(records, distractors=distractors, aliases=aliases)),
         records_by_id={str(r['memory_id']): r for r in records},
         record_count=len(records),
         provenance={
@@ -507,6 +524,7 @@ def plan_from_slates(
     slates: Sequence[Any],
     *,
     provenance: Mapping[str, Any],
+    aliases: Mapping[str, str] = _NO_ALIASES,
 ) -> EvalPlan:
     """Pair production-shaped slates with the curator labels they answer for.
 
@@ -540,6 +558,7 @@ def plan_from_slates(
             band=slate.band,
             similarity=slate.similarity,
             canonical_present=slate.canonical_present,
+            canonical_alias_id=aliases.get(str(record['cluster_id'])),
         ))
     return EvalPlan(
         cases=tuple(cases),
@@ -853,10 +872,13 @@ def case_row(
     target_id = case['attach_target_id']
     target = records_by_id.get(str(target_id)) if target_id else None
     cluster_id = case['cluster_id']
+    alias_id = case['canonical_alias_id']
+    canonical_ids = {str(cluster_id), *([str(alias_id)] if alias_id else [])}
     return {
         'index': index,
         'memory_id': case['memory_id'],
         'cluster_id': cluster_id,
+        'canonical_alias_id': alias_id,
         'category': case.get('category'),
         'expected_class': case['expected_class'],
         'acceptable_outcomes': sorted(case['acceptable_outcomes']),
@@ -865,9 +887,9 @@ def case_row(
         'attach_target_cluster_id': target.get('cluster_id') if target else None,
         'attach_target_category': target.get('category') if target else None,
         'attach_target_label': target.get('label') if target else None,
-        'attach_target_is_canonical': str(target_id) == str(cluster_id),
+        'attach_target_is_canonical': str(target_id) in canonical_ids,
         'canonical_in_slate': any(
-            _attachable_id(records_by_id[cid]) == str(cluster_id)
+            _attachable_id(records_by_id[cid]) in canonical_ids
             for cid in case['candidates']
         ),
         'canonical_present': case['canonical_present'],
@@ -1716,6 +1738,7 @@ def _retrieved_plan(
     records: Sequence[Mapping[str, Any]],
     *,
     judge_candidate_count: int,
+    aliases: Mapping[str, str],
 ) -> EvalPlan:
     """Retrieve, band and trim every labelled record exactly as production would.
 
@@ -1763,7 +1786,7 @@ def _retrieved_plan(
         'canonical_absent': sum(1 for s in slates if not s.canonical_present),
         'degraded_retrievals': sum(1 for s in slates if s.degraded),
         'self_retrieved': sum(1 for s in slates if s.self_retrieved),
-    })
+    }, aliases=aliases)
 
 
 def _run(args: Any) -> int:
@@ -1795,6 +1818,7 @@ def _run(args: Any) -> int:
     report_path = guard_committed_report(
         args.report_path, dry_run=args.dry_run, limit=args.limit,
     )
+    aliases = load_canonical_aliases(args.canonical_aliases) if args.canonical_aliases else {}
 
     config = FusedMemoryConfig()
     # Mutated on the in-memory config only — config.yaml is never touched. The
@@ -1829,10 +1853,10 @@ def _run(args: Any) -> int:
         if args.slate_mode == SLATE_RETRIEVED:
             plan = _retrieved_plan(
                 args, config, records,
-                judge_candidate_count=judge_candidate_count,
+                judge_candidate_count=judge_candidate_count, aliases=aliases,
             )
         else:
-            plan = seeded_plan(records, distractors=args.distractors)
+            plan = seeded_plan(records, distractors=args.distractors, aliases=aliases)
 
         if args.dry_run:
             judge_fn = _dry_run_judge_fn()
@@ -1863,6 +1887,11 @@ def _run(args: Any) -> int:
                 # report is a partial smoke rather than the corpus-wide
                 # measurement the task-3169 flip gate reads it as.
                 'limit': args.limit,
+                'canonical_aliases_path': (
+                    package_relative(args.canonical_aliases) if args.canonical_aliases else None
+                ),
+                'canonical_aliases_count': len(aliases),
+                'cases_path': package_relative(args.cases_path) if args.cases_path else None,
                 'field_chars': field_chars,
                 'judge_candidate_count': judge_candidate_count,
                 'judge_enabled': judge_enabled,
@@ -1913,6 +1942,10 @@ def main() -> int:
                         help='override write_triage.judge_candidate_count for '
                              'this run, in memory only — config.yaml is not '
                              'written')
+    parser.add_argument('--canonical-aliases', dest='canonical_aliases', default=None,
+                        help='the {old_cluster_canonical_id: current_memory_id} sidecar: '
+                             "an attach to a rotated canonical's successor counts as an "
+                             'attach to the canonical (default: none)')
     parser.add_argument('--cases-path', dest='cases_path', default=None,
                         help='append one JSON line per case as it completes: '
                              'slate, attach target, band, verdict, outcome and '

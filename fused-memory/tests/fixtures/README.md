@@ -213,11 +213,13 @@ and deliberately kept out of the `.jsonl` fixture's own row shape (the
 fixture's records must never change once labeled — see the schema note).
 Maps `{old_cluster_canonical_id: current_memory_id}` for a `cluster_id`
 that has since rotated out of the live `reify` store via a later
-re-consolidation the curation session predates. Consumed by
-`calibrate_write_triage.py --canonical-aliases` (`compute_recall_at_k`'s
-`aliases` kwarg) so a rotated cluster's recall can still be measured
-against its live successor instead of being silently excluded as a corpus
-gap forever.
+re-consolidation the curation session predates. Two consumers read it:
+
+- `calibrate_write_triage.py --canonical-aliases` (`compute_recall_at_k`'s
+  `aliases` kwarg), so a rotated cluster's recall is measured against its
+  live successor instead of being silently excluded as a corpus gap forever;
+- `eval_write_triage_judge.py --canonical-aliases`, where an attach to the
+  successor counts as an attach to the cluster's canonical.
 
 As of 2026-09-23, three of this fixture's 20 clusters have rotated:
 
@@ -225,7 +227,7 @@ As of 2026-09-23, three of this fixture's 20 clusters have rotated:
 |---|---|---|
 | `0e954870-bba1-44a7-81e9-5be94d5f6255` | `9b01e961-e086-428a-ad7e-68323b22f21a` | live `topic='docs-prd-landing'` closure record names `0e954870` explicitly as retired in favour of `9b01e961` (a same-cluster curator race, ~100min apart) |
 | `168c3a6b-55dd-4f53-88e4-3a829ea210fc` | `bbc063a7-ea8f-4262-b9dd-eef3002a99a8` | live successor's `metadata.supersedes` names `168c3a6b` directly |
-| `417d86d0-36fe-42c8-851a-9ed0a18c64bb` | `11ed0e22-b3ae-4635-909b-fa1eb4ae2f13` | live successor's `metadata.supersedes` names `417d86d0` directly; matches the pointer recorded at `plans/memory-subsystem-eval-design.md:275` |
+| `417d86d0-36fe-42c8-851a-9ed0a18c64bb` | `11ed0e22-b3ae-4635-909b-fa1eb4ae2f13` | live successor's `metadata.supersedes` names `417d86d0` directly; matches the pointer recorded in `plans/memory-subsystem-eval-design.md` §4 (the *Live-store probe facts* paragraph) |
 
 This file is a **point-in-time observation of the live store**, not derived
 data: as the `reify` corpus keeps consolidating, a successor id recorded
