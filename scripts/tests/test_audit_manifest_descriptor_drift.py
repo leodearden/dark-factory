@@ -51,11 +51,14 @@ from audit_manifest_descriptor_drift import (
     EXIT_OK,
     MECHANICAL_CHECK_KINDS,
     DescriptorDrift,
+    ManifestBinding,
     ProjectAudit,
+    TaskStoreScan,
     _is_dirty,
     audit_project,
     format_json,
     format_report,
+    load_task_store_scan,
 )
 from shared.capability_manifest import load_capability_manifest
 
@@ -657,6 +660,149 @@ def test_manifests_swept_and_compared_are_counted(tmp_path, make_tasks_db):
     # comparison volume, not eligibility.
     assert coverage.mechanical_capabilities_compared == 0
     assert coverage.capabilities_without_task_entry == 3
+
+
+# ---------------------------------------------------------------------------
+# load_task_store_scan — ONE read of tasks.db feeds BOTH directions.
+#
+# The drift direction needs every row id and each task's delivered_checks; the
+# label-binding direction needs each manifest-bearing task's status, label and
+# derived sidecar. All three come back from one scan in one TaskStoreScan
+# record, so the two halves of a report can never straddle a write the
+# orchestrator makes to the live store in between.
+# ---------------------------------------------------------------------------
+
+def _labelled(task_id, *, status="pending", prd_path="plans/x-prd.md", label="α", **extra):
+    """A task row whose metadata carries prd_path + prd_task_label (plus *extra*)."""
+    return {"id": task_id, "status": status,
+            "metadata": {"prd_path": prd_path, "prd_task_label": label, **extra}}
+
+
+def test_scan_binds_a_manifest_bearing_task_to_its_derived_sidecar(make_tasks_db):
+    """The binding carries what the label-binding direction reports: the task,
+    its status, its label verbatim, and the sidecar the stamper would open."""
+    db = make_tasks_db([_labelled(7, status="pending", label="γ1")])
+
+    scan = load_task_store_scan(str(db))
+
+    assert isinstance(scan, TaskStoreScan)
+    assert scan.manifest_bindings == (
+        ManifestBinding(task_id=7, status="pending", label="γ1",
+                        manifest="plans/x-prd.capability-manifest.yaml"),
+    )
+
+
+@pytest.mark.parametrize("prd_path,derived", [
+    ("plans/x-prd.md", "plans/x-prd.capability-manifest.yaml"),
+    # No `.md` suffix: the stamper's re.sub strips nothing and just appends.
+    ("plans/x-prd", "plans/x-prd.capability-manifest.yaml"),
+], ids=["md-suffix", "no-md-suffix"])
+def test_scan_derives_the_sidecar_by_the_stampers_rule(make_tasks_db, prd_path, derived):
+    """``re.sub(r'\\.md$', '', prd_path) + '.capability-manifest.yaml'`` —
+    manifest_stamping.py::_stamp_capability_manifests_impl step 1, exactly, so
+    the sweep opens the very sidecar a re-stamp would."""
+    db = make_tasks_db([_labelled(7, prd_path=prd_path)])
+
+    (binding,) = load_task_store_scan(str(db)).manifest_bindings
+
+    assert binding.manifest == derived
+
+
+@pytest.mark.parametrize("metadata", [
+    {"prd_task_label": "α"},
+    {"prd_path": "plans/x-prd.md"},
+    {"prd_path": "", "prd_task_label": "α"},
+    {"prd_path": "plans/x-prd.md", "prd_task_label": ""},
+    {"prd_path": None, "prd_task_label": "α"},
+    {"prd_path": "plans/x-prd.md", "prd_task_label": None},
+], ids=["no-path", "no-label", "empty-path", "empty-label", "null-path", "null-label"])
+def test_scan_mirrors_the_stampers_falsy_admission_gate(make_tasks_db, metadata):
+    """``if not prd_path or not prd_task_label: continue`` — the stamper's step 1.
+
+    A task the stamper never admits is promised nothing, so it can never be an
+    unbound label. Mirroring the gate exactly is what makes the sweep's
+    population the stamper's population.
+    """
+    db = make_tasks_db([{"id": 7, "status": "pending", "metadata": metadata}])
+
+    assert load_task_store_scan(str(db)).manifest_bindings == ()
+
+
+@pytest.mark.parametrize("metadata", [
+    {"prd_path": 5, "prd_task_label": "α"},
+    {"prd_path": ["plans/x-prd.md"], "prd_task_label": "α"},
+    {"prd_path": "plans/x-prd.md", "prd_task_label": 1},
+    {"prd_path": "plans/x-prd.md", "prd_task_label": ["α"]},
+    {"prd_path": "plans/x-prd.md", "prd_task_label": True},
+], ids=["int-path", "list-path", "int-label", "list-label", "bool-label"])
+def test_scan_admits_no_truthy_non_string_key(make_tasks_db, metadata):
+    """THE ONE DELIBERATE DIVERGENCE from the stamper, which would admit these.
+
+    It would then fail to derive a sidecar path from a non-string prd_path, or
+    never match a non-string label against the sidecar's string labels — so
+    such a row can neither be bound nor usefully reported. No live row has this
+    shape.
+    """
+    db = make_tasks_db([{"id": 7, "status": "pending", "metadata": metadata}])
+
+    assert load_task_store_scan(str(db)).manifest_bindings == ()
+
+
+@pytest.mark.parametrize("raw", [
+    "{not json",
+    None,
+    '["plans/x-prd.md", "α"]',
+    '"plans/x-prd.md"',
+], ids=["malformed-json", "null", "json-list", "json-string"])
+def test_undecodable_metadata_yields_no_binding_and_the_scan_continues(
+        make_tasks_db, raw):
+    """A corrupt metadata blob is a row to skip, never a reason to abort a
+    sweep over thousands of tasks — and the rows after it are still bound."""
+    db = make_tasks_db([
+        {"id": 1, "status": "pending", "metadata": raw},
+        _labelled(2),
+    ])
+
+    scan = load_task_store_scan(str(db))
+
+    assert [b.task_id for b in scan.manifest_bindings] == [2]
+    assert scan.row_ids == {1, 2}
+
+
+def test_bindings_come_back_in_numeric_task_id_order(make_tasks_db):
+    """Numeric, not insertion or lexicographic order ("200" < "30" < "4"): the
+    report built from these rows must diff cleanly between runs."""
+    db = make_tasks_db([_labelled(30), _labelled(200), _labelled(4)])
+
+    bindings = load_task_store_scan(str(db)).manifest_bindings
+
+    assert [b.task_id for b in bindings] == [4, 30, 200]
+
+
+def test_widening_the_loader_changed_neither_existing_output(make_tasks_db):
+    """The row-id set and the delivered_checks mapping the drift direction reads
+    are exactly what they were before the loader also collected bindings.
+
+    A task with no metadata at all is still a ROW (so a sidecar binding it is
+    not "without a db row"), and still has no delivered_checks. A task that
+    carries both a binding and delivered_checks feeds both outputs from its one
+    decoded metadata. A row under another tag reaches none of the three: the
+    ``tag = 'master'`` pin covers the bindings too.
+    """
+    gate = _entry("gate", _GREP_CHECK)
+    cap = _entry("cap", _SCRIPT_CHECK)
+    db = make_tasks_db([
+        {"id": 1, "status": "pending", "metadata": None},
+        {"id": 2, "status": "done", "metadata": {"delivered_checks": [gate]}},
+        _labelled(3, status="done", delivered_checks=[cap, "not-a-dict", {"name": 5}]),
+        {**_labelled(4, delivered_checks=[gate]), "tag": "other-tag"},
+    ])
+
+    scan = load_task_store_scan(str(db))
+
+    assert scan.row_ids == {1, 2, 3}
+    assert scan.delivered_checks == {2: {"gate": gate}, 3: {"cap": cap}}
+    assert [b.task_id for b in scan.manifest_bindings] == [3]
 
 
 # ---------------------------------------------------------------------------
