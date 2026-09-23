@@ -32,7 +32,9 @@ from orchestrator.flake_ledger import (
     FlakeVerdict,
     ledger_db_path,
     list_open_debt,
+    read_debt,
     read_occurrences,
+    resolve_debt,
 )
 from orchestrator.verify import VerifyResult
 
@@ -600,6 +602,66 @@ class TestRecordOpensDebt:
         assert {r.test_id for r in rows} == set(ids), rows
         assert all(r.owner_task_id for r in rows), rows
         assert len(client.submit_calls) == 5, client.submit_calls
+
+    async def test_a_resolved_debt_sorts_with_the_unowned_under_the_cap(
+        self, tmp_path: Path,
+    ) -> None:
+        """A test whose debt was RESOLVED (owner still recorded, per §5.2 retention)
+        recurs in a burst over the cap: it has no OPEN owner, so it must be filed in
+        the first observation alongside the never-filed tests, not deferred behind
+        the currently-owned ones — otherwise the recurrence η exists to catch waits
+        exactly as long as a starved tail would.
+        """
+        ids = tuple(f'orchestrator/tests/test_burst.py::test_{i}' for i in range(5))
+        client = _FakeLedgerTaskClient()
+        db = ledger_db_path(tmp_path)
+        await _record(_result(_suppression(test_ids=(ids[0],))), tmp_path, task_client=client)
+        await resolve_debt(db, _PROJECT_ID, ids[0], resolving_commit='f' * 40)
+        seeded = read_debt(db, ids[0])
+        assert seeded is not None and seeded.resolved_at and seeded.owner_task_id
+
+        await _record(
+            _result(_suppression(test_ids=ids)), tmp_path,
+            task_client=client, debt_filing_cap=3,
+        )
+
+        reopened = read_debt(db, ids[0])
+        assert reopened is not None and reopened.resolved_at is None, reopened
+        assert reopened.open_count == 2, reopened
+        assert {r.test_id for r in list_open_debt(db)} == set(ids[:3])
+
+    async def test_budget_expiry_names_only_the_unfiled_tests(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        """The client files the first test and hangs on the second: the expiry warning
+        must name the two left over and not the one that completed."""
+        ids = tuple(f'orchestrator/tests/test_burst.py::test_{i}' for i in range(3))
+        never = asyncio.Event()
+
+        class _HangsOnSecond(_FakeLedgerTaskClient):
+            async def submit_task(self, arguments: dict) -> str:
+                if self.submit_calls:
+                    self.submit_calls.append(arguments)
+                    await never.wait()
+                return await super().submit_task(arguments)
+
+        client = _HangsOnSecond()
+        with caplog.at_level(logging.WARNING):
+            await asyncio.wait_for(
+                _record(
+                    _result(_suppression(test_ids=ids)), tmp_path,
+                    task_client=client, debt_filing_budget_secs=0.2,
+                ),
+                timeout=5,
+            )
+
+        expired = [r for r in caplog.records if 'filing budget' in r.getMessage()]
+        assert len(expired) == 1, caplog.text
+        msg = expired[0].getMessage()
+        assert '2 of 3 test(s) unfiled' in msg, msg
+        assert ids[1] in msg and ids[2] in msg and ids[0] not in msg, msg
+        filed = read_debt(ledger_db_path(tmp_path), ids[0])
+        assert filed is not None and filed.owner_task_id == 'deflake-1', filed
 
     async def test_filing_phase_is_time_bounded(
         self, tmp_path: Path, caplog,
