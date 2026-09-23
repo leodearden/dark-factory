@@ -135,6 +135,21 @@ class TestDetectorFires:
         assert sites[0].callee == 'invoke_with_cap_retry', f'got {sites[0]!r}'
         assert is_violation(sites[0]), f'got {sites[0]!r}'
 
+    def test_a_tuple_display_wildcard_is_flagged(self) -> None:
+        """The builder tests ``'*' in disallowed_tools``, which holds for a
+        tuple exactly as for a list.
+        """
+        sites = _scan('''
+            def call_the_model(some_root):
+                return invoke_with_cap_retry(
+                    disallowed_tools=('*',),
+                    output_schema=SCHEMA,
+                    cwd=some_root,
+                )
+        ''')
+        assert len(sites) == 1, f'got {sites!r}'
+        assert is_violation(sites[0]), f'got {sites[0]!r}'
+
     def test_an_awaited_call_in_an_async_method_is_flagged(self) -> None:
         """The shape all five real sites use: awaited inside an async method."""
         sites = _scan('''
@@ -199,6 +214,24 @@ class TestStrictScopingIsCompliant:
                     disallowed_tools=['*'],
                     output_schema=SCHEMA,
                     mcp_config=no_mcp_servers_config(),
+                    cwd=some_root,
+                )
+        ''')
+        assert len(sites) == 1, f'got {sites!r}'
+        assert is_violation(sites[0]), f'got {sites[0]!r}'
+
+    def test_a_truthy_non_bool_strict_flag_is_still_a_violation(self) -> None:
+        """Deliberately conservative: ``build_claude_argv`` would emit the flag
+        for ``1``, but the parameter is a ``bool`` and every real caller spells
+        it ``True``, so no other spelling exempts.
+        """
+        sites = _scan('''
+            def call_the_model(some_root):
+                return invoke_with_cap_retry(
+                    disallowed_tools=['*'],
+                    output_schema=SCHEMA,
+                    mcp_config=no_mcp_servers_config(),
+                    strict_mcp_config=1,
                     cwd=some_root,
                 )
         ''')
@@ -390,6 +423,33 @@ class TestNeutralCwdExemption:
                         output_schema=SCHEMA,
                         cwd=cwd,
                     )
+        ''')
+        assert len(sites) == 1, f'got {sites!r}'
+        assert sites[0].exemption == EXEMPT_NEUTRAL_CWD, f'got {sites[0]!r}'
+
+    def test_an_annotated_assignment_from_the_call_is_compliant(self) -> None:
+        sites = _scan('''
+            def call_the_model():
+                cwd: Path = neutral_cli_cwd()
+                return invoke_with_cap_retry(
+                    disallowed_tools=['*'],
+                    output_schema=SCHEMA,
+                    cwd=cwd,
+                )
+        ''')
+        assert len(sites) == 1, f'got {sites!r}'
+        assert sites[0].exemption == EXEMPT_NEUTRAL_CWD, f'got {sites[0]!r}'
+
+    def test_every_target_of_a_chained_assignment_is_bound(self) -> None:
+        """``cwd`` is the SECOND target, so reading only the first misses it."""
+        sites = _scan('''
+            def call_the_model():
+                scratch = cwd = neutral_cli_cwd()
+                return invoke_with_cap_retry(
+                    disallowed_tools=['*'],
+                    output_schema=SCHEMA,
+                    cwd=cwd,
+                )
         ''')
         assert len(sites) == 1, f'got {sites!r}'
         assert sites[0].exemption == EXEMPT_NEUTRAL_CWD, f'got {sites[0]!r}'
