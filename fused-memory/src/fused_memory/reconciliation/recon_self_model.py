@@ -309,7 +309,14 @@ MCP_CALL_SIGNATURES: dict[str, str] = {
     ),
     'add_finding': (
         'add_finding(severity, category, flag_type, actionable, description, '
-        "suggested_action, task_id) -> {'finding_id': ...}  "
+        "suggested_action, task_id, supersedes) -> {'finding_id': ...}  "
+        '# supersedes (task-4653) = the finding_id of an earlier finding in '
+        'this run that this one makes historical — file it when your finding '
+        'RESOLVES an earlier claim rather than restating it. The dedup key '
+        'below cannot relate a claim to its resolution (the resolving '
+        'finding carries a different flag_type), so the relation must be '
+        'asserted explicitly or both stay live and a reader acts on the '
+        'first. The target is stamped and stays readable, not retracted. '
         '# actionable is a COMPUTED default (task-2432): when omitted, it '
         "resolves to False if task_id is None or category starts with "
         "'cross_project', else True; an explicit True/False from the caller "
@@ -658,12 +665,42 @@ def render_source_completion_section(*, can_file_tasks: bool) -> str:
     does NOT hold it, and must relay the residual to Stage 2 via
     flag_for_stage2 / flagged_items. Never instruct Stage 1 to call a tool it
     does not hold (loud-over-silent).
+
+    ## Why ``metadata.gate_subject`` is declared here (task 3588)
+
+    This section is the AUTHORITY on how a residual gate is filed, so it is
+    where the gate's dedupe key belongs. Before task 3588 there was no
+    canonical spelling and each filing invented its own: reify carriers used
+    ``stranded_task_id``, dark-factory task 3463 used ``related_task_id``.
+    With no agreed key, no deterministic consumer could join a carrier to its
+    subject — so nothing could tell that a gate had ALREADY been filed for
+    the same thing, and subject 5879 accumulated carriers 5902 -> 5916 ->
+    5929 (5929 even carried ``prior_escalation_tasks=[5916, 5902]`` and filed
+    anyway). ``middleware/recurring_gate_guard.py`` enforces the resulting
+    invariant at the ``submit_task`` boundary; this text is what tells the
+    filing agent the key exists and what happens if it is reused.
     """
     if can_file_tasks:
         residual_clause = (
             'You hold `submit_task` in this stage, so file it yourself: call '
             "`submit_task` declaring `metadata.operational_mode='gate'` "
             "alongside `metadata.execution_class='operational'`."
+        )
+        dedupe_clause = (
+            'A second gate for a `gate_subject` that already has a '
+            'NON-TERMINAL carrier is REJECTED at the `submit_task` boundary — '
+            'a hard rejection invariant, not a lint warning. The rejection '
+            'names the open carrier. When you hit it, AMEND that carrier with '
+            '`update_task` (refresh its evidence, bump '
+            '`metadata.recurrence_count`) instead of filing again; do not work '
+            'around it by rewording the title. Once the carrier is `done` or '
+            '`cancelled` it no longer blocks, so a condition that genuinely '
+            'recurs after closure can be filed afresh. `stranded_task_id` and '
+            '`related_task_id` are accepted as read-side ALIASES so carriers '
+            'already filed under those older, invented spellings are still '
+            'matched. They are read-side only: never use either for a NEW '
+            "filing, and never rewrite an existing carrier's metadata to "
+            'canonicalise it.'
         )
     else:
         residual_clause = (
@@ -672,6 +709,14 @@ def render_source_completion_section(*, can_file_tasks: bool) -> str:
             'residual in this stage. Relay it to Stage 2 via the '
             '`flag_for_stage2` / `flagged_items` channel, so Stage 2 files it '
             "as an `operational` task with `operational_mode='gate'`."
+        )
+        dedupe_clause = (
+            'A second gate for a `gate_subject` that already has a '
+            'NON-TERMINAL carrier is REJECTED when it is filed, so relay the '
+            'subject accurately — and say so in what you relay if you believe '
+            'an existing carrier already covers it. The amend-vs-refile '
+            'decision belongs to the stage that holds the task-write tools; '
+            'this stage does not hold them, so do not prescribe one here.'
         )
     return (
         '## Source-Completion\n'
@@ -691,6 +736,13 @@ def render_source_completion_section(*, can_file_tasks: bool) -> str:
         "`metadata.execution_class='operational'` and "
         "`metadata.operational_mode='gate'` (the human-gated routing mode, not "
         "the `'llm'` mode). " + residual_clause + '\n\n'
+        'EVERY gate filing MUST carry `metadata.gate_subject` — the ONE '
+        'canonical spelling for "the task or entity this gate is about". Use '
+        'the task id when the gate is about a task, or the stable '
+        'cluster/topic working key when it is a consolidation gate (the same '
+        'topic slug the "## Consolidation Gate" section already requires — '
+        'that is the natural cluster value, not a second key to invent).\n\n'
+        + dedupe_clause + '\n\n'
         'The "## Consolidation Gate" section is the AUTHORITY for what that '
         'gate must contain — its target end state, its topic working key, and '
         'the closure check that refuses to let it close over a malformed '
@@ -715,9 +767,16 @@ def render_task_creation_accounting_section() -> str:
     proactive/cross-project sample-review surface yet Stage 2 self-reported
     `tasks_created: 0` — exactly the gap this section closes, by stating the
     counter is path-agnostic and by giving the framework an action-record
-    ground truth (`task_created_records`) it can repair from, modeled
-    directly on `flag_deleted_records`' established convention (see
+    list (`task_created_records`) it can repair from, modeled directly on
+    `flag_deleted_records`' established convention (see
     `## Per-Cycle Counter Schema` in prompts/stage2.py).
+
+    That list is NOT taken as ground truth (task 3051): it is itself LLM
+    self-report, so the framework corroborates each record via `get_task`
+    against the record's own `project_id` before letting it raise the
+    counter. The closing paragraph says so, because a prompt that overstates
+    the framework's safety net lowers agent care on a counter nothing else
+    checks.
 
     Rendered once, as a shared renderer (INV-5) — not restated in
     `assemble_payload`'s "Your Task" block, where the Proactive Task Sample /
@@ -756,10 +815,15 @@ def render_task_creation_accounting_section() -> str:
         '"status": "created"|"combined", "project_id": <project the task '
         'was filed into>, "source_path": <short label of the surface that '
         'produced it>}`\n\n'
-        'The framework treats this list as ground truth and REPAIRS '
-        '`tasks_created` upward when the two disagree (recording the '
-        'pre-repair value under `tasks_created_reported`), so a missed '
-        'increment is recovered rather than lost.'
+        'The framework CORROBORATES every record before it counts for '
+        'anything: it looks each `task_id` up via `get_task` against the '
+        "root of that record's own `project_id`, and REPAIRS "
+        '`tasks_created` upward to the number of records whose task is '
+        'confirmed to EXIST (recording the pre-repair value under '
+        '`tasks_created_reported`), so a missed increment is recovered '
+        'rather than lost. A record naming a task that cannot be confirmed '
+        'to exist will NOT raise the counter — record only creations you '
+        'actually made, with the `project_id` you actually filed into.'
     )
 
 

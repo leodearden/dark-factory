@@ -39,7 +39,10 @@
 # holds an flock over ~/.config/systemd/user/.lms-dropin-selftest.lock for the
 # whole cycle, so at most one process on the host drives this file at a time.
 # Running it BY HAND does not take that lock; expect to slow (not break) a
-# concurrent verify if you do.
+# concurrent verify if you do.  A by-hand run SIGKILLed before its
+# `trap cleanup EXIT` fires strands the default template's unit and drop-in
+# in ~/.config/systemd/user; the wrapper's prune now reaps that residue after
+# _STALE_AFTER_S instead of leaving it there permanently.
 #
 # Usage: scripts/tests/test_remove_lms_dropin.sh
 #        LMS_SELFTEST_TEMPLATE='lms-dropin-selftest-<unique>@' scripts/tests/test_remove_lms_dropin.sh
@@ -50,6 +53,13 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPT="$REPO_ROOT/scripts/remove-lms-arm-worktree-dropin.sh"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 
+# This default is now LOAD-BEARING for the Python wrapper, not just a
+# fallback: scripts/tests/test_remove_lms_dropin_wrapper.py::_DEFAULT_TEMPLATE
+# must equal it exactly (pinned by
+# test_default_template_constant_matches_the_shell_default), because that
+# equality is what lets the wrapper's prune reap residue a killed HAND-RUN
+# strands under this literal.  Editing this line without editing the wrapper
+# turns that pin red -- by design.
 TEMPLATE="${LMS_SELFTEST_TEMPLATE:-lms-dropin-selftest@}"
 UNIT="$UNIT_DIR/${TEMPLATE}.service"
 DROPIN_DIR="$UNIT_DIR/${TEMPLATE}.service.d"

@@ -5,41 +5,24 @@ sys.path pollution — mirrors the pattern in test_audit_duplicate_tasks.py.
 """
 from __future__ import annotations
 
-import importlib.util
 import json
 import types
 from datetime import datetime
 from pathlib import Path
 
 import pytest
+from _fm_helpers import load_script_module
+from _store_mutation_preflight_contract import (
+    SENTINEL,
+    deny,
+    fail_closed_records,
+    neutralise_fixture,
+)
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'audit_duplicate_memories.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load audit_duplicate_memories.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    @dataclass and other reflection-based decorators work correctly
-    (they call sys.modules.get(cls.__module__)).
-    """
-    import sys  # noqa: PLC0415
-
-    mod_name = 'audit_duplicate_memories'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='audit_duplicate_memories')
 cluster_memories_by_pairs = _mod.cluster_memories_by_pairs
 ann_pairs_from_neighbors = _mod.ann_pairs_from_neighbors
 ann_scores_for_pairs = _mod.ann_scores_for_pairs
@@ -84,27 +67,15 @@ _build_parser = _mod._build_parser
 _run = _mod._run
 
 
-@pytest.fixture(autouse=True)
-def _neutralise_store_mutation_preflight(monkeypatch):
-    """Keep this MOCK-unit suite independent of the REAL ``~/.mem0``.
-
-    ``_run(args)`` with ``--apply`` runs a fail-closed capability preflight
-    before it constructs a MemoryService (task 4127). That probe touches the
-    real filesystem, so without this fixture every ``--apply`` test would pass
-    or fail according to whether the machine running pytest happens to be able
-    to write mem0's history directory -- and it genuinely cannot inside an
-    agent sandbox, which is the whole reason the guard exists. This suite is
-    deliberately MOCK-unit (``_FakeMemoryService``, no live Qdrant), so the
-    environment must not be an input to it.
-
+_neutralise = neutralise_fixture(
+    _mod,
+    note="""``_run(args)`` with ``--apply`` runs the preflight before it constructs
+    a MemoryService (task 4127). This suite is deliberately MOCK-unit
+    (``_FakeMemoryService``, no live Qdrant).
     ``TestApplyStoreMutationPreflight`` re-rigs this per test -- to refuse, to
     record, or to pass -- so the guard's own behaviour is still pinned
-    explicitly rather than assumed away.
-
-    Deliberately NOT ``raising=False``: if the guard is ever removed from the
-    script this fixture must break loudly rather than silently no-op.
-    """
-    monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+    explicitly rather than assumed away.""",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -5278,15 +5249,11 @@ class TestLivenessSubjectFactsFallback:
     carrying no readable assignment, and a clause boundary landing inside a
     quoted value.
 
-    An earlier reading of this class claimed the rescope "can only ADD recall
-    if a subject the clauses say nothing about keeps exactly the key it had
-    BEFORE the rescope". That condition is real but NOT sufficient, and
-    believing it shipped a regression: a subject whose clause named only SOME
-    of the record's fields keyed on a partial fact instead, silently vacating
-    the whole-record bucket it used to share -- an empty-set-only fallback
-    never fires for it. The invariant that actually holds is the unconditional
-    one above; `TestLivenessSubjectFactsIsAdditive` pins the
-    non-empty-but-incomplete half this class does not reach.
+    An empty-set-only fallback is NOT sufficient on its own: a subject whose
+    clause names only SOME of the record's fields keys on a partial fact
+    instead, silently vacating the whole-record bucket it shared -- a shape
+    an empty-set test never reaches. `TestLivenessSubjectFactsIsAdditive` pins
+    that non-empty-but-incomplete half.
 
     Because every pre-rescope bucket membership therefore survives, nothing is
     lost and no new `_LIVENESS_DISCLOSURE_KEYS` counter is warranted -- pinned
@@ -5412,14 +5379,14 @@ class TestLivenessSubjectFactsIsAdditive:
     covers the strictly harder one they do not reach -- clause evidence that
     is non-empty but INCOMPLETE.
 
-    Measured against the shipped module before this class landed: record B
-    below names task 94 in its first clause and puts the other two fields in a
-    second clause naming no task, so the subject keyed on the partial
-    `status=in-progress`, matched nothing, and the whole-record bucket it had
-    shared with A was silently vacated -- `find_liveness_snapshot_recurrences`
-    returned `[]` with an ALL-ZERO disclosure. A fallback that fires only on
-    the empty set cannot catch that; a non-empty-but-incomplete set wins
-    outright.
+    This is the failure mode the unconditional seed closes: record B below
+    names task 94 in its first clause and puts the other two fields in a
+    second clause naming no task, so keying the subject on the partial
+    `status=in-progress` ALONE would match nothing, vacating the whole-record
+    bucket it shares with A and making `find_liveness_snapshot_recurrences`
+    return `[]` with an ALL-ZERO disclosure -- the outcome the unconditional
+    seed prevents, pinned below. A fallback that fires only on the empty set
+    cannot catch that; a non-empty-but-incomplete set wins outright.
 
     The invariant that closes it: every subject buckets under *core_fact*
     unconditionally, with the clause-scoped fact ADDED beside it. Every bucket
@@ -6712,14 +6679,6 @@ class TestApplyStoreMutationPreflight:
     what makes that warning enforceable rather than advisory.
     """
 
-    @staticmethod
-    def _deny(monkeypatch):
-        """Rig the preflight to refuse, as it would inside an agent sandbox."""
-        def _raise(*_args, **_kwargs):
-            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
-
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
-
     def _raw(self) -> dict:
         """A real two-member cluster, so ``--apply`` has work to refuse."""
         return {_PK: [
@@ -6738,7 +6697,7 @@ class TestApplyStoreMutationPreflight:
         ``finally: await memory.close()`` teardown of a service that was never
         initialized.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         _install_run_doubles(monkeypatch, self._raw())
         args = _build_parser().parse_args([
             '--project-id', 'p', '--apply', '--threshold', '0.75',
@@ -6746,7 +6705,7 @@ class TestApplyStoreMutationPreflight:
         ])
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+            _mod.StoreMutationUnavailable, match=SENTINEL
         ):
             await _run(args)
 
@@ -6760,7 +6719,7 @@ class TestApplyStoreMutationPreflight:
         """It aborts without a single Qdrant read: neither ``fetch_memories``'
         per-category scroll (with_vectors=True) nor ``fetch_ann_neighbors``'
         per-record query fan-out is paid for."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         _install_run_doubles(monkeypatch, self._raw())
         called: list[str] = []
         monkeypatch.setattr(
@@ -6786,7 +6745,7 @@ class TestApplyStoreMutationPreflight:
     ):
         """A read-only run mutates nothing, so it must not require the ability
         to mutate -- the audit report stays obtainable from anywhere."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         _install_run_doubles(monkeypatch, self._raw())
         args = _build_parser().parse_args([
             '--project-id', 'p', '--threshold', '0.75',
@@ -6855,7 +6814,7 @@ class TestApplyStoreMutationPreflight:
         ``main`` is a separate claim, tested in
         ``TestApplyStoreMutationPreflightThroughMain``.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         _install_run_doubles(monkeypatch, {})
         args = _build_parser().parse_args([
             '--project-id', 'p', '--apply',
@@ -6877,40 +6836,6 @@ class TestApplyStoreMutationPreflightThroughMain:
     same way.
     """
 
-    @staticmethod
-    def _deny(monkeypatch):
-        """Rig the preflight to refuse, as it would inside an agent sandbox."""
-        def _raise(*_args, **_kwargs):
-            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
-
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
-
-    @staticmethod
-    def _fail_closed_records(caplog) -> list:
-        """The guard site's OWN diagnosis.
-
-        ``main`` is three lines with no handler -- the refusal exits the
-        interpreter as an uncaught traceback -- so this ERROR record is the
-        ONLY place the operator is told what was refused and what to do
-        instead. Pinned on the fail-closed marker and the remedy noun ONLY, so
-        every other word of the message stays free to reword.
-
-        Asserting on message CONTENT is deliberate, and is the narrow exception
-        to the repo's don't-pin-guard-message-prose norm (task 3799): the record
-        this test is about is defined BY its content -- mere record-existence
-        would still pass if the whole diagnosis were replaced by "boom",
-        precisely the regression this exists to catch. Verified non-vacuous:
-        mutating the marker in the script turns this assertion red (task 4127
-        amendment).
-        """
-        return [
-            rec for rec in caplog.records
-            if rec.name == 'audit_duplicate_memories'
-            and rec.levelname == 'ERROR'
-            and 'NOT started (fail-closed)' in rec.getMessage()
-            and 'MCP server' in rec.getMessage()
-        ]
-
     def test_the_refusal_escapes_main_and_is_never_a_report_shaped_return(
         self, monkeypatch, tmp_path, caplog,
     ):
@@ -6930,7 +6855,7 @@ class TestApplyStoreMutationPreflightThroughMain:
         import asyncio  # noqa: PLC0415
         import sys  # noqa: PLC0415
 
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         _install_run_doubles(monkeypatch, {})
         monkeypatch.setattr(sys, 'argv', [
             'audit_duplicate_memories.py', '--project-id', 'p', '--apply',
@@ -6942,11 +6867,11 @@ class TestApplyStoreMutationPreflightThroughMain:
         )
 
         with caplog.at_level('ERROR'), pytest.raises(
-            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+            _mod.StoreMutationUnavailable, match=SENTINEL
         ):
             _mod.main()
 
-        assert self._fail_closed_records(caplog), (
+        assert fail_closed_records(caplog, 'audit_duplicate_memories'), (
             'nothing else explains this traceback -- the guard site must log '
             'the fail-closed diagnosis before raising; got: '
             f'{[rec.getMessage() for rec in caplog.records]}'

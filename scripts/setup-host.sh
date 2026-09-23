@@ -372,12 +372,32 @@ fi
 # NOT to reconcile RestartSteps=4 back out, since a rebuilt host or a stale
 # re-install would reopen exactly the gap it warns about.
 #
-# The orchestrator units run `uv run --frozen ...`, so process start never
-# implicitly re-syncs the shared dark-factory/.venv. After any dependency change
-# (or a fresh checkout) run scripts/sync-orchestrator-env.sh once to materialize
-# the runtime venv on the .python-version pin — the watchdog only port-probes and
-# will NOT repair a missing/stale venv (a frozen-start failure that exhausts
-# StartLimitBurst is left stopped for operator attention).
+# The orchestrator units run `uv run --no-sync ...`, so process start never
+# installs into the shared dark-factory/.venv. CORRECTION (task 5553): this note
+# said `--frozen` and said it was what stopped the re-sync. It is not — `--frozen`
+# is a LOCKFILE option and a start synced anyway; `--no-sync` is the flag that
+# actually stops it. The measurement behind that is in
+# scripts/orchestrator-autopilot-video.service, above its ExecStart.
+#
+# PROPAGATING THAT FLAG CHANGE TO THIS HOST IS A DELIBERATE, ONE-TIME STEP.
+# check_orchestrator_unit_parity.py below compares parsed directives for FULL
+# symmetric equality, so every unit installed before task 5553 differs from its
+# committed copy on ExecStart, reports verdict `drift`, and is SKIPPED by the
+# per-unit install decision. Until an operator runs
+#   DF_INSTALL_ORCH_UNITS=1 bash scripts/setup-host.sh
+#   systemctl --user daemon-reload && scripts/sync-orchestrator-env.sh
+# the running units keep `--frozen` and keep syncing into the shared venv, and
+# every setup-host run keeps reporting drift on all seven. The dashboard and
+# fused-memory units have their own gates and need the same treatment.
+#
+# After any dependency change (or a fresh checkout) run
+# scripts/sync-orchestrator-env.sh once to materialize the runtime venv on the
+# .python-version pin — it now runs `uv sync --all-packages`, the only form that
+# repairs the whole workspace without pruning siblings. A start against a
+# missing/stale venv now fails with ModuleNotFoundError rather than bootstrapping
+# one (uv still creates an empty .venv first). The watchdog only port-probes and
+# will NOT repair a missing/stale venv, so such a start failure, once it exhausts
+# StartLimitBurst, is left stopped for operator attention.
 #
 # The unit files reference /home/leo/bin/wait-for-port.py from ExecStartPre,
 # so the helper lives under ~/bin (stable absolute path across repo moves).
@@ -396,9 +416,10 @@ install -m 0755 "$REPO_ROOT/scripts/wait-for-port.py" "$HOME/bin/wait-for-port.p
 # a second run would only restate what the copy just did.)
 #
 # NON-FATAL, but not merely advisory: a finding never aborts this script (the
-# sections below still run, and five of the seven registered units are KNOWN
-# RED on this host until the follow-up task lands) — it makes the install of
-# THAT UNIT opt-in instead. A bare warning would not be an intervention point
+# sections below still run, and two of the nine registered units carry a
+# standing, deliberate finding on this host — re-measured 2026-09-05, see the
+# checker's KNOWN RED section) — it makes the install of THAT UNIT opt-in
+# instead. A bare warning would not be an intervention point
 # in a non-interactive `set -e` script: it scrolls past and the next line
 # overwrites the units anyway, so the operator is told to check the direction
 # at the one moment they can no longer act on it.
@@ -407,12 +428,18 @@ install -m 0755 "$REPO_ROOT/scripts/wait-for-port.py" "$HOME/bin/wait-for-port.p
 # per-unit install decision is taken from those verdicts further down. See the
 # section header for the policy that shape implements.
 #
-# NOTE the report does not mean "the installed copy is stale". Measured
-# 2026-08-02, the direction varies per unit: the repo copy is correct for
-# RestartSteps=4, but the INSTALLED copy is correct for the ExecStart --config
-# path (two committed units name config files that do not exist). That is why
-# the skip is the default and DF_INSTALL_ORCH_UNITS=1 is the override, rather
-# than the reverse.
+# NOTE the report does not mean "the installed copy is stale". The direction
+# varies per unit, which is why the skip is the default and
+# DF_INSTALL_ORCH_UNITS=1 is the override, rather than the reverse.
+# The instance that established this, measured 2026-08-02: the repo copy was
+# correct for RestartSteps=4, but the INSTALLED copy was correct for the
+# ExecStart --config path (two committed units named config files that did not
+# exist). Resolved by commit 4fcd43eec0 (task 3512) — but the argument is not
+# historical, only that instance is. Re-measured 2026-09-05, the direction
+# still varies and now runs the other way: orchestrator-watchdog.service
+# carries an installed-only Environment=ORCH_RESTART_MIN_INTERVAL_SECS the
+# committed copy lacks (a deliberate, self-expiring deploy pause owned by task
+# 5020), so installing the committed copy would silently delete it.
 # The exit code alone is NOT trusted, because 2 is overloaded three ways:
 # the checker's "not installed on this host" (benign), `python3` refusing to
 # open a missing script file, and argparse rejecting an unknown flag. Renaming
@@ -535,9 +562,14 @@ fi
 # A unit that did not clear is SKIPPED rather than warned about, because a
 # warning scrolling past in a non-interactive `set -e` script is not an
 # intervention point: the very next line would overwrite the installed unit.
-# A finding does not mean the installed copy is the stale one — measured
-# 2026-08-02, two COMMITTED units name --config paths that do not exist on this
-# host, so copying them would break those orchestrators on their next restart.
+# A finding does not mean the installed copy is the stale one. The instance
+# that established that, measured 2026-08-02: two COMMITTED units named
+# --config paths that did not exist on this host, so copying them would have
+# broken those orchestrators on their next restart (resolved by commit
+# 4fcd43eec0, task 3512). Re-measured 2026-09-05 the hazard is still live in a
+# different directive — the sole drift is an installed-only
+# Environment=ORCH_RESTART_MIN_INTERVAL_SECS on orchestrator-watchdog.service
+# that a copy would silently delete.
 # The gate stays non-fatal (it never aborts the run; sections below still
 # execute), it just declines to act on an unverified diff without being told.
 #
@@ -1279,7 +1311,36 @@ else
     ;;
   finding | *)
     # `*` folded in for the reason given at the orchestrator gate.
-    warn "Fused-memory unit: DRIFT detected — run: python3 $_fm_parity_script --fix"
+    #
+    # A finding is "drift OR unverifiable": it also covers a drop-in override,
+    # which the checker words apart so the operator is not sent hunting for a
+    # directive diff that does not exist. The two remedies differ, so naming
+    # only --fix here would collapse that distinction back and point at a
+    # command that CANNOT help — --fix appends to the unit FILE and can
+    # neither synthesize nor resolve an override living in a different one.
+    #
+    # The HEADLINE therefore has to be true for BOTH inputs, which is why the
+    # dashboard and orchestrator gates lead with "drift or unverifiable state"
+    # rather than with drift alone. This one follows them: leading with "DRIFT
+    # detected — run --fix" and only then conceding it might be an override
+    # states something false in the override case (every required directive
+    # matched; nothing drifted) and points first at the command that cannot
+    # help. A follow-up line cannot retract a headline the operator has
+    # already acted on. The remedies are each named UNDER their own condition
+    # instead.
+    #
+    # "DRIFT" stays capitalised where the siblings lowercase it: it is the
+    # checker's own report vocabulary, and two tests in
+    # tests/scripts/test_check_fused_memory_unit_parity.py pin the literal
+    # token (::test_gate_reports_drift_when_a_required_directive_is_missing
+    # and ::test_gate_still_names_fix_for_plain_directive_drift, whose
+    # docstring states the pin is a CONSTRAINT on exactly this rewording).
+    warn "Fused-memory unit: DRIFT detected or unverifiable state — see the"
+    warn "  [fused_memory_unit_parity] report above for which it was."
+    warn "  Missing directives: run python3 $_fm_parity_script --fix."
+    warn "  A drop-in override: --fix CANNOT resolve it — it appends to the"
+    warn "  unit FILE and the override lives in a different one, so it needs"
+    warn "  manual removal (or move the setting into the committed template)."
     ;;
   esac
 fi

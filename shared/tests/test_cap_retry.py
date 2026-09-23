@@ -414,7 +414,8 @@ class TestCapRetryFailover:
         assert got.success is True
 
     async def test_detect_cap_hit_called_with_correct_args(self):
-        """detect_cap_hit receives stderr, output, 'claude', and oauth_token from each invocation."""
+        """detect_cap_hit receives stderr, output, 'claude', oauth_token and scope
+        from each invocation."""
         gate = _mock_gate(
             account_count=2,
             before_invoke=AsyncMock(side_effect=['tok-a', 'tok-b']),
@@ -429,8 +430,8 @@ class TestCapRetryFailover:
         ):
             await invoke_with_cap_retry(gate, 'lbl', prompt='hi')
         calls = gate.detect_cap_hit.call_args_list
-        assert calls[0] == call('err1', 'out1', 'claude', oauth_token='tok-a')
-        assert calls[1] == call('err2', 'out2', 'claude', oauth_token='tok-b')
+        assert calls[0] == call('err1', 'out1', 'claude', oauth_token='tok-a', scope=None)
+        assert calls[1] == call('err2', 'out2', 'claude', oauth_token='tok-b', scope=None)
 
 
 # ===================================================================

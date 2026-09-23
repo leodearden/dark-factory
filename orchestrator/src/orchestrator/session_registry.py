@@ -1541,18 +1541,31 @@ def normalize_project_token(value: object) -> str:
     let one project's reaper close the other's decisions -- strictly worse
     than the bug being fixed. A named collapse-guard test pins that.
 
-    SCOPE: this canonicalizes ``DecisionRecord.project`` ONLY.
-    ``SessionRecord.project`` is the other half of the same fleet-global
-    project axis and is deliberately NOT normalized here -- the cockpit
-    unions the two (``known_projects`` over records + decisions, and one
-    ``project_weights`` lookup keyed on ``item.project`` for both row kinds),
-    so until the session side folds too, the picker can list one project
-    under two names and an operator-set weight keyed on the session spelling
-    will not apply to decision rows. That is a KNOWN, filed gap (task 3812),
-    not an oversight: the session population is ~39k records written on the
-    spawn path, and folding it is a strictly larger change than task 3807's
-    decision-registry fix. Do not read "canonical" here as "canonical
-    fleet-wide".
+    SCOPE: at the WRITE path, this canonicalizes ``DecisionRecord.project``
+    ONLY. ``SessionRecord.project`` is deliberately still written raw --
+    ``identity.project`` feeds ``build_session_slug`` (the record's on-disk
+    directory identity) and the stored value is parsed from
+    ``record.title``, the literal terminal title, so folding it at the spawn
+    path would churn the slug namespace and desynchronize a documented
+    mirror.
+
+    The cockpit folds BOTH record kinds at its READ boundary instead (task
+    3812), so its picker and its scorer key can no longer disagree, and the
+    fix is retroactive over every already-written record with no migration
+    run. ``cockpit/src/cockpit/registry_reader.py`` IS that boundary and its
+    module docstring is where the reasoning lives; its entry points are
+    ``::_read_record_soft`` for sessions and ``::scan_decisions`` for
+    decisions, joined by the ``priorities.yaml`` ``project_weights`` KEYS at
+    load (``cockpit/src/cockpit/priority.py::_canonical_project_weights``)
+    and the picker candidates
+    (``cockpit/src/cockpit/panes/weight_editor.py::known_projects``).
+
+    Do not read "canonical" here as "canonical fleet-wide": the on-disk
+    session records themselves are still unnormalized (they are TTL-reaped
+    by ``reap_stale_records`` rather than migrated, which is why they need
+    no ``migrate_session_project_tokens`` twin), so any OTHER consumer
+    comparing a raw ``SessionRecord.project`` must run it through this
+    function itself.
 
     Stdlib-only and fail-soft: never raises, and coerces a non-str *value*
     via ``str()`` rather than rejecting it -- ``42`` becomes ``'42'``, which
@@ -1886,12 +1899,25 @@ def _pid_alive(pid: int) -> bool:
 
     Copied (not imported) from harness.py:295-317 to keep this module
     stdlib-only and self-contained (invocable as a standalone script from
-    bash with no orchestrator package import).
+    bash with no orchestrator package import). That copy's contract is
+    preserved verbatim EXCEPT in the OverflowError branch, where this one
+    deliberately diverges (task 4755): harness.py::_pid_alive and the
+    fused_memory orchestrator_detector copy it mirrors still raise there, and
+    widening them is filed as follow-up work rather than done here, because
+    neither sits on the fleet-redeploy lease's read path.
 
     - Returns False for pid <= 0 (invalid).
     - Uses os.kill(pid, 0): success -> alive; ProcessLookupError -> dead;
-      PermissionError -> alive (visible but unsignalable); other OSError ->
+      PermissionError -> alive (visible but unsignalable); other OSError, or
+      an OverflowError from a pid too large for the platform's C pid_t ->
       treated as dead.
+
+    The OverflowError case is ordinary untrusted input, not a hypothetical:
+    service_restart.lease_is_live imports this predicate to evaluate a pid
+    parsed out of JSON another process wrote, so a value no pid_t can hold
+    arrives the same way a negative one does. "Cannot name a live process" is
+    exactly the judgment the OSError branch already makes for every other
+    value the syscall refuses.
     """
     if pid <= 0:
         return False
@@ -1902,7 +1928,7 @@ def _pid_alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True
-    except OSError:
+    except (OSError, OverflowError):
         return False
 
 

@@ -1706,13 +1706,14 @@ class TestStage1CycleSummaryHarnessBackstop:
         """Complements the False-return case above: if the re-attempt
         itself raises (rather than returning False), the optimistic True
         stamped before the call (needed so a genuinely successful
-        re-attempt's OWN ledger row — serialized synchronously at call
-        time — carries the marker; see the method's docstring) is caught
-        and corrected back to False by an inner except before re-raising
-        to this method's own outer ``except BaseException`` (which must
-        never let this raise out of the finally block, per its docstring).
-        The cycle itself must still complete successfully; only the
-        best-effort backstop write failed."""
+        re-attempt's OWN ledger row — serialized into payload_json only
+        once the shielded task takes its first step, never synchronously
+        at call time — carries the marker; see the method's docstring) is
+        caught and corrected back to False by an inner except before
+        re-raising to this method's own outer ``except BaseException``
+        (which must never let this raise out of the finally block, per
+        its docstring). The cycle itself must still complete
+        successfully; only the best-effort backstop write failed."""
         from fused_memory.models.reconciliation import StageId
 
         mock_memory_service.recon_ledger = ledger_store
@@ -2329,7 +2330,7 @@ class TestStage2CycleSummaryHarnessBackstop:
 
     @staticmethod
     async def _count_cycle_summary_rows(ledger_store, run_id: str) -> int:
-        cursor = await ledger_store._require_db().execute(
+        cursor = await ledger_store._require_access().connection.execute(
             """
             SELECT COUNT(*) FROM recon_ledger
             WHERE project_id = ? AND record_kind = 'cycle_summary'
@@ -8077,7 +8078,7 @@ async def test_recover_stale_runs_reaps_dead_owner_with_stale_heartbeat(
     dead_heartbeat = (
         datetime.now(UTC) - timedelta(seconds=cutoff + 100)
     ).isoformat()
-    async with event_buffer._txn() as db:
+    async with event_buffer._require_access().write() as db:
         await db.execute(
             'UPDATE reconciliation_locks SET heartbeat_at = ? WHERE project_id = ?',
             (dead_heartbeat, project_id),
@@ -8141,7 +8142,7 @@ async def test_recover_stale_runs_suppresses_escalation_for_dead_owner_shielded(
     dead_heartbeat_a = (
         datetime.now(UTC) - timedelta(seconds=cutoff_a + 100)
     ).isoformat()
-    async with event_buffer._txn() as db:
+    async with event_buffer._require_access().write() as db:
         await db.execute(
             'UPDATE reconciliation_locks SET heartbeat_at = ? WHERE project_id = ?',
             (dead_heartbeat_a, project_a),
@@ -8251,7 +8252,7 @@ async def test_recover_stale_runs_emits_storm_escalation_for_dead_owner_shielded
     dead_heartbeat = (
         datetime.now(UTC) - timedelta(seconds=cutoff + 100)
     ).isoformat()
-    async with event_buffer._txn() as db:
+    async with event_buffer._require_access().write() as db:
         await db.execute(
             'UPDATE reconciliation_locks SET heartbeat_at = ? WHERE project_id = ?',
             (dead_heartbeat, project_id),
@@ -8354,7 +8355,7 @@ async def test_recover_stale_runs_no_storm_for_single_restart_multi_project_burs
         # Fabricate the dead owner's lock row directly (bypassing mark_run_active,
         # which always stamps THIS process's own instance_id) so the lock's
         # instance_id matches the run's dead-owner instance_id exactly.
-        async with event_buffer._txn() as db:
+        async with event_buffer._require_access().write() as db:
             await db.execute(
                 'INSERT INTO reconciliation_locks '
                 '(project_id, instance_id, acquired_at, heartbeat_at) VALUES (?, ?, ?, ?)',
@@ -8414,7 +8415,7 @@ async def test_recover_stale_runs_storm_for_distinct_dead_owner_instances(
             instance_id=dead_instance_id,
         )
         await journal.start_run(run)
-        async with event_buffer._txn() as db:
+        async with event_buffer._require_access().write() as db:
             await db.execute(
                 'INSERT INTO reconciliation_locks '
                 '(project_id, instance_id, acquired_at, heartbeat_at) VALUES (?, ?, ?, ?)',
@@ -8875,7 +8876,7 @@ async def test_recover_stale_runs_restore_is_run_scoped_not_project_wide(
     assert err.get('error_type') == 'StaleRunRecovery'
 
     # X's drained events were restored to 'buffered'.
-    db = event_buffer._require_db()
+    db = event_buffer._require_access().connection
     x_ids = [e.id for e in x_events]
     async with db.execute(
         "SELECT status FROM event_buffer WHERE id IN ({})".format(
@@ -8967,7 +8968,7 @@ async def test_recover_stale_runs_restores_pre_upgrade_unattributed_drained_even
 
     await harness._recover_stale_runs()
 
-    db = event_buffer._require_db()
+    db = event_buffer._require_access().connection
 
     async def _statuses(events) -> list[str]:
         ids = [e.id for e in events]
@@ -9032,7 +9033,7 @@ async def test_recover_predecessor_runs_recovers_dead_predecessor_orphan(
     acquired = await event_buffer.mark_run_active(project_id)
     assert acquired is True
     fresh_heartbeat = datetime.now(UTC).isoformat()
-    async with event_buffer._txn() as db:
+    async with event_buffer._require_access().write() as db:
         await db.execute(
             'UPDATE reconciliation_locks SET instance_id = ?, heartbeat_at = ? '
             'WHERE project_id = ?',
@@ -9251,7 +9252,7 @@ async def _setup_interrupted_dead_predecessor_run(
     # Stamp completed_at = the interrupt instant (the freshness clock).
     await journal.complete_run(run_id, 'interrupted')
     if completed_at is not None:
-        async with journal._txn() as db:
+        async with journal._require_access().write() as db:
             await db.execute(
                 'UPDATE runs SET completed_at = ? WHERE id = ?',
                 (completed_at.isoformat(), run_id),
@@ -9268,7 +9269,7 @@ async def _setup_interrupted_dead_predecessor_run(
     acquired = await event_buffer.mark_run_active(project_id)
     assert acquired is True
     fresh_heartbeat = datetime.now(UTC).isoformat()
-    async with event_buffer._txn() as db:
+    async with event_buffer._require_access().write() as db:
         await db.execute(
             'UPDATE reconciliation_locks SET instance_id = ?, heartbeat_at = ? '
             'WHERE project_id = ?',
@@ -13417,6 +13418,310 @@ class TestFindingHasCitationFailures:
             ],
         }
         assert _finding_has_citation_failures(finding) is True
+
+# ---------------------------------------------------------------------------
+# task-4653: a superseded finding must never reach remediation or escalation,
+# and must not be mis-attributed to either task-4781 drop cause.
+# ---------------------------------------------------------------------------
+
+
+_SUPERSEDER_FID = 'f1111111-2222-3333-4444-555555555555'
+
+
+def _make_superseded_finding() -> dict:
+    """An actionable finding a LATER finding of the same run has retired.
+
+    Carries a real reference so it clears _finding_has_reference: the drop
+    must be attributable to supersession alone, never to a missing citation.
+    """
+    return {
+        'description': 'Superseded claim: mechanism X contradicts Y',
+        'severity': 'moderate',
+        'actionable': True,
+        'category': 'memory_contradiction',
+        'affected_ids': ['edge-superseded-1'],
+        'suggested_action': 'Delete the contradictory edge',
+        'superseded_by': _SUPERSEDER_FID,
+    }
+
+
+class TestFindingIsLiveActionable:
+    """_finding_is_live_actionable joins the _finding_has_reference /
+    _finding_has_citation_failures predicate family: True only for a finding
+    that is actionable AND not superseded.
+    """
+
+    def test_actionable_and_unsuperseded_is_live(self):
+        from fused_memory.reconciliation.harness import _finding_is_live_actionable
+
+        assert _finding_is_live_actionable({'actionable': True}) is True
+
+    def test_explicitly_non_actionable_is_not_live(self):
+        from fused_memory.reconciliation.harness import _finding_is_live_actionable
+
+        assert _finding_is_live_actionable({'actionable': False}) is False
+
+    def test_missing_actionable_key_is_not_live(self):
+        from fused_memory.reconciliation.harness import _finding_is_live_actionable
+
+        assert _finding_is_live_actionable({}) is False
+
+    def test_superseded_actionable_finding_is_not_live(self):
+        from fused_memory.reconciliation.harness import _finding_is_live_actionable
+
+        assert _finding_is_live_actionable(_make_superseded_finding()) is False
+
+    def test_a_none_superseded_by_does_not_neuter(self):
+        """get_assembled_report always projects the key; None means unset."""
+        from fused_memory.reconciliation.harness import _finding_is_live_actionable
+
+        assert _finding_is_live_actionable(
+            {'actionable': True, 'superseded_by': None}
+        ) is True
+
+
+def _drop_records(caplog, message):
+    return [r for r in caplog.records if r.getMessage() == message]
+
+
+@pytest.mark.asyncio
+async def test_maybe_remediate_drops_a_superseded_actionable_finding(
+    journal,
+    event_buffer,
+    mock_memory_service,
+    caplog,
+):
+    """ALL-DROPPED: the only actionable finding is superseded, so nothing is
+    left to remediate — and the drop is attributed to supersession, not to
+    either task-4781 cause.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    await event_buffer.push(_make_event('test-project'))
+
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2], items_flagged=[_make_superseded_finding()])
+
+    # MagicMock rather than a lambda so the spy is assignable over the bound
+    # method and reads with the same assert_not_called idiom as the rest of the
+    # file's harness-method spies.
+    record_phantom = MagicMock(return_value=None)
+    record_placeholder = MagicMock(return_value=None)
+    harness._record_phantom_citation_finding_drop = record_phantom
+    harness._record_placeholder_finding_drop = record_placeholder
+
+    with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+        run = await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+    assert run.status == 'completed'
+
+    recent_runs = await journal.get_recent_runs('test-project', limit=5)
+    assert [r for r in recent_runs if r.run_type == 'remediation'] == [], (
+        'A superseded finding must not trigger a remediation run'
+    )
+
+    # Routed to the existing non-actionable log branch, carrying the pointer so
+    # the log distinguishes superseded from never-actionable.
+    records = _drop_records(caplog, 'reconciliation.non_actionable_integrity_finding')
+    assert len(records) == 1, (
+        f'Expected one non-actionable log record; got '
+        f'{[r.getMessage() for r in caplog.records]}'
+    )
+    assert getattr(records[0], 'superseded_by', None) == _SUPERSEDER_FID
+
+    # task-4781 non-contamination: neither drop cause, neither storm counter.
+    assert _drop_records(caplog, 'reconciliation.remediation_dropped_phantom_cited_finding') == []
+    assert _drop_records(caplog, 'reconciliation.remediation_dropped_placeholder_finding') == []
+    record_phantom.assert_not_called()  # not a phantom-cited drop
+    record_placeholder.assert_not_called()  # not a never-cited placeholder drop
+
+
+@pytest.mark.asyncio
+async def test_maybe_remediate_mixed_batch_keeps_the_live_finding(
+    journal,
+    event_buffer,
+    mock_memory_service,
+):
+    """MIXED: a superseded finding alongside a live one.  Remediation still
+    runs, and only the live finding reaches Stage 1."""
+    from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    stages = harness._make_stages(_scope('test-project', '/tmp/test-project'))
+    harness._make_stages = lambda scope, **k: _rescope(stages, scope)
+
+    stage1 = stages[0]
+    assert isinstance(stage1, MemoryConsolidator)
+
+    captured: dict = {}
+
+    async def capture_attrs(stage):
+        captured['remediation_findings'] = stage.remediation_findings
+
+    superseded = _make_superseded_finding()
+    live = _make_s3_findings()[0]
+
+    _mock_stage_run(stage1, before_return=capture_attrs)
+    _mock_stage_run(stages[1])
+    _mock_stage_run(stages[2], items_flagged=[superseded, live])
+
+    await event_buffer.push(_make_event('test-project'))
+    run = await harness.run_full_cycle('test-project', 'buffer_size:1')
+    assert run.status == 'completed'
+
+    recent_runs = await journal.get_recent_runs('test-project', limit=5)
+    assert len([r for r in recent_runs if r.run_type == 'remediation']) == 1
+
+    forwarded = captured.get('remediation_findings') or []
+    descriptions = [f.get('description') for f in forwarded]
+    assert live['description'] in descriptions
+    assert superseded['description'] not in descriptions, (
+        f'the superseded finding reached remediation: {descriptions}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_maybe_remediate_filters_a_dict_shaped_s3_report(
+    journal, event_buffer, mock_memory_service,
+):
+    """The partition enforces the rule on a DICT-shaped s3_report too, not just
+    on a StageReport.
+
+    Both shapes are read duck-typed from a producer the partition cannot
+    identify, so the predicate is applied locally rather than trusting that
+    ``actionable`` came from get_assembled_report's neuter.  The pairing of
+    ``actionable: True`` with ``superseded_by`` is deliberately one no
+    production path emits today — that IS the invariant under test: whatever
+    produced the dict, a superseded finding does not reach remediation.
+    """
+    harness, remediation = _remediation_harness(
+        journal, event_buffer, mock_memory_service, buffer_size=4,
+    )
+    parent_run = await _persist_parent_run(journal, 'test-project', [])
+    parent_run.stage_reports = {
+        'integrity_check': {'items_flagged': [_make_superseded_finding()]}
+    }
+
+    await _call_maybe_remediate(harness, parent_run)
+
+    remediation.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_maybe_remediate_dict_shaped_report_still_forwards_a_live_finding(
+    journal, event_buffer, mock_memory_service,
+):
+    """Complement of the test above: the dict-shaped branch is filtered, not
+    disabled."""
+    harness, remediation = _remediation_harness(
+        journal, event_buffer, mock_memory_service, buffer_size=4,
+    )
+    superseded = _make_superseded_finding()
+    live = _make_s3_findings()[0]
+    parent_run = await _persist_parent_run(journal, 'test-project', [])
+    parent_run.stage_reports = {'integrity_check': {'items_flagged': [superseded, live]}}
+
+    await _call_maybe_remediate(harness, parent_run)
+
+    assert remediation.await_count == 1
+    assert remediation.await_args is not None
+    forwarded = remediation.await_args.args[2]
+    assert [f['description'] for f in forwarded] == [live['description']]
+
+
+@pytest.mark.asyncio
+async def test_run_remediation_pass_never_gates_a_superseded_finding(
+    journal, event_buffer, mock_memory_service, caplog,
+):
+    """The second-pass partition must route a superseded finding to the
+    non-actionable log branch, so it can never reach the persistence-gated
+    recon_integrity_issue escalation regardless of recurrence count.
+
+    Asserted by proving _finding_persistence_count — the first thing the
+    escalation loop does per finding — is consulted for a LIVE finding of the
+    same batch and NOT for the superseded one.  A live finding is in the batch
+    deliberately: `gated == []` alone would also pass if the escalation loop
+    simply stopped being reached in this fixture, proving nothing about the
+    filter.
+    """
+    from fused_memory.reconciliation.harness import TierConfig
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    superseded = _make_superseded_finding()
+    live = _make_s3_findings()[0]
+
+    persistence_spy = AsyncMock(return_value=0)
+    harness._finding_persistence_count = persistence_spy
+
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2], items_flagged=[superseded, live])
+
+    with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+        await harness._run_remediation_pass(
+            'test-project',
+            'parent-run-id',
+            [_make_s3_findings()[0]],
+            TierConfig(model='sonnet', episode_limit=100, memory_limit=200),
+            scope=_scope('test-project', '/tmp/test-project'),
+        )
+
+    gated = [c.args[1].get('description') for c in persistence_spy.await_args_list]
+    assert gated == [live['description']], (
+        f'expected exactly the live finding to be gated, got: {gated}'
+    )
+    records = _drop_records(caplog, 'reconciliation.non_actionable_integrity_finding')
+    assert [getattr(r, 'superseded_by', None) for r in records] == [_SUPERSEDER_FID]
+
+
+@pytest.mark.asyncio
+async def test_get_prior_s3_findings_drops_a_superseded_finding(
+    journal, event_buffer, mock_memory_service,
+):
+    """The CROSS-CYCLE forward feed must not re-present a claim the run refuted.
+
+    _get_prior_s3_findings' return value becomes the next cycle's Stage-1
+    ``prior_s3_findings``, which assemble_payload renders under "These issues
+    were found in the last integrity check and should be addressed during this
+    consolidation pass if possible"
+    (stages/memory_consolidator.py::MemoryConsolidator.assemble_payload) — a
+    stricter instruction than the Stage-2 channel's, and one that reads as a
+    live to-do.
+    """
+    from fused_memory.reconciliation.stages.memory_consolidator import _format_findings
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    superseded = _make_superseded_finding()
+    live = _make_s3_findings()[0]
+    await _persist_parent_run(journal, 'test-project', [superseded, live])
+
+    forward_fed = await harness._get_prior_s3_findings('test-project')
+
+    assert forward_fed == [live], (
+        f'a superseded finding was forward-fed into the next cycle: {forward_fed}'
+    )
+    # WHY the filter must live at this source and cannot be left to the reader:
+    # the renderer emits description/severity/category/suggested_action plus the
+    # typed citation lists, and nothing else — so a retirement that survives
+    # this far is invisible by the time an agent reads it.
+    assert _SUPERSEDER_FID not in _format_findings([superseded])
+    assert 'superseded_by' not in _format_findings([superseded])
+
+
+@pytest.mark.asyncio
+async def test_get_prior_s3_findings_looks_past_an_all_superseded_run(
+    journal, event_buffer, mock_memory_service,
+):
+    """A run whose every finding was retired forward-feeds nothing, exactly as
+    a run that flagged nothing does — the ``if items:`` fall-through is
+    evaluated AFTER the filter, so an older completed run still gets its turn
+    and no empty "Prior Stage 3 Findings" section is rendered."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    older_live = _make_s3_findings()[1]
+    await _persist_parent_run(journal, 'test-project', [older_live])
+    await _persist_parent_run(journal, 'test-project', [_make_superseded_finding()])
+
+    assert await harness._get_prior_s3_findings('test-project') == [older_live]
 
 
 @pytest.mark.asyncio
@@ -19817,4 +20122,898 @@ def test_record_resume_failure_reads_its_threshold_live_off_config(
     assert after is None, (
         'the narrowed 1s window must have pruned every earlier failure on this '
         'very call, leaving a count of 1'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Task 4821 (task 4764 arm 3) — route a Stage-3 finding that names a task id
+# onto that task's ORCHESTRATOR escalation queue
+# ---------------------------------------------------------------------------
+
+
+def _orch_finding(**over) -> dict:
+    """An actionable Stage-3 finding naming a real task id."""
+    finding = {
+        'finding_id': 'f-4458',
+        'severity': 'serious',
+        'category': 'memory_contradiction',
+        'description': 'Operator ruled Option A on esc-4458-87; the commit did the opposite',
+        'suggested_action': 'Re-read the operator ruling before closing',
+        'actionable': True,
+        'task_id': '4458',
+        'affected_ids': ['4458'],
+    }
+    finding.update(over)
+    return finding
+
+
+def _orch_queue_dir(root):
+    """The per-project ORCHESTRATOR escalation queue dir under *root*.
+
+    Distinct from the RECON queue (`config.escalation_queue_dir`, drained by the
+    port-8103 watcher) that `_escalate` writes to — see the A7b scope note.
+    """
+    return root / 'data' / 'escalations'
+
+
+def _wire_orchestrator_queue(harness, tmp_path, monkeypatch, *, live=True):
+    """Point 'test-project' at *tmp_path* and force the orchestrator-liveness gate."""
+    import fused_memory.reconciliation.harness as _h
+
+    harness._known_projects = dict(harness._known_projects)
+    harness._known_projects['test-project'] = str(tmp_path)
+    monkeypatch.setattr(_h, 'is_orchestrator_live_for', lambda _root: live)
+    return _orch_queue_dir(tmp_path)
+
+
+def _wire_remediation_tree(harness, task_ids):
+    """Make `_run_remediation_pass` see a task tree containing *task_ids*.
+
+    The remediation pass builds `task_by_id` from the FilteredTaskTree, and the
+    routed-filing existence gate reads it. Under the plain `mock_memory_service`
+    fixture `_fetch_filtered_task_tree` degrades to an EMPTY tree (the taskmaster
+    call is an unawaited AsyncMock), which puts the gate on its fail-OPEN branch
+    — correct behaviour, but not the branch a test about task existence wants to
+    exercise. Wiring a real tree here is what lets a test distinguish "the tree
+    says no such task" from "there is no tree".
+    """
+    from fused_memory.reconciliation.task_filter import FilteredTaskTree
+
+    tree = FilteredTaskTree(
+        active_tasks=[
+            {'id': tid, 'status': 'pending', 'title': f'task {tid}', 'metadata': {}}
+            for tid in task_ids
+        ],
+    )
+
+    async def _fetch(_project_root, _tree=tree):
+        return _tree
+
+    harness._fetch_filtered_task_tree = _fetch
+    return tree
+
+
+def test_file_finding_task_escalation_lands_a_record_on_the_real_task(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """A finding naming task 4458 files a record whose STORED task_id is 4458.
+
+    This is the acceptance SHAPE. `_escalate` files the same finding to the
+    recon queue under a synthetic `recon-<run8>` id, so the real task id
+    survives only inside the JSON detail — and `get_by_task`, which filters on
+    the stored `task_id` field, never surfaces it on task 4458's own ladder.
+    """
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    from fused_memory.reconciliation.finding_task_escalation import (
+        FINDING_TASK_ESCALATION_CATEGORY,
+    )
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    esc_id = harness._file_finding_task_escalation(
+        'test-project', 'abcdef0123456789', _orch_finding(), 4,
+    )
+
+    assert esc_id, f'expected the filer to return an escalation id, got {esc_id!r}'
+    assert queue_dir.is_dir(), f'expected a queue at {queue_dir}'
+
+    pending = EscalationQueue(queue_dir).get_pending()
+    assert len(pending) == 1, f'expected exactly one record, got {[e.id for e in pending]}'
+    esc = pending[0]
+
+    assert esc.task_id == '4458', (
+        f'the STORED task_id must be the real one (get_by_task filters on this '
+        f'field, not on the filename), got {esc.task_id!r}'
+    )
+    assert not esc.task_id.startswith('recon-'), (
+        'the synthetic recon-<run8> id is what this arm exists to stop using'
+    )
+    assert esc.id.startswith('esc-4458-'), f'unexpected id stem: {esc.id!r}'
+    assert esc.id == esc_id
+    assert esc.level == 0, (
+        'level 0 keeps the record invisible to the orchestrator\'s level-1-only '
+        'has_open_l1 guards — see the dedicated test below'
+    )
+    assert esc.category == FINDING_TASK_ESCALATION_CATEGORY
+    assert esc.severity == 'info'
+    assert esc.agent_role == 'reconciliation-harness'
+    assert '4458' in esc.summary and 'memory_contradiction' in esc.summary
+
+    detail = json.loads(esc.detail)
+    assert detail['finding_id'] == 'f-4458'
+    assert detail['run_id'] == 'abcdef0123456789'
+    assert detail['project_id'] == 'test-project'
+    assert detail['persistence'] == 4
+
+
+def test_routed_record_is_invisible_to_the_orchestrator_l1_guards(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """THE LOAD-BEARING ASSERTION — the record reaches the ladder without
+    answering YES to any level-1 guard.
+
+    `EscalationQueue.has_open_l1` is LEVEL-1-ONLY
+    (`escalation/queue.py::EscalationQueue.has_open_l1`, which delegates to
+    `get_by_task(task_id, status='pending', level=1)`), and the orchestrator
+    reads it UNCATEGORIZED — i.e. "is a human already on this task?" — at a
+    spread of guards that divert or suppress real work: the external-dep,
+    cross-repo and substrate-flip block-and-escalate paths and the orphan-L0
+    reaper's DISMISS branch in `orchestrator/harness.py`, plus TWO sites in
+    `orchestrator/workflow.py`. That population is enumerated authoritatively,
+    in `path::symbol` form, in the `FINDING_TASK_ESCALATION_LEVEL` comment block
+    of `fused_memory/reconciliation/finding_task_escalation.py` — read it there
+    rather than restating it here, and do not reintroduce bare line pins
+    (CLAUDE.md: cite as `path/to/module.py::symbol`, never `module.py:1234`).
+    Deliberately a POINTER and not a summary-with-names: an earlier revision
+    named one of the two workflow.py sites and read as if that were the whole
+    set, which is how the block's own list came to be missing one (see the
+    correction note in it).
+
+    A recon-authored L1 would answer YES to every one of them, turning a
+    PASSIVE observation into a gate on dispatch. The two assertions below are
+    together the executable proof that the collision class is closed WITHOUT
+    sacrificing the acceptance criterion — the record is still on the task's
+    own ladder, it simply is not an L1.
+
+    Do not weaken either half: raising the level to satisfy some future dedupe
+    convenience silently re-opens every one of those sites at once.
+    """
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    esc_id = harness._file_finding_task_escalation('test-project', 'run-1', _orch_finding(), 4)
+    assert esc_id
+
+    queue = EscalationQueue(queue_dir)
+
+    # (1) Invisible to every uncategorized L1 guard above.
+    assert queue.has_open_l1('4458') is False, (
+        'a routed recon finding must NOT register as an open L1 — that is the '
+        'signal every uncategorized orchestrator guard reads as "a human is '
+        'handling this task"'
+    )
+
+    # (2) ...while still landing on task 4458's own ladder. This is the
+    # acceptance criterion and it is NOT sacrificed by (1).
+    on_task = queue.get_by_task('4458')
+    assert len(on_task) == 1, f'expected one record on the task, got {on_task!r}'
+    assert on_task[0].task_id == '4458'
+    assert on_task[0].id.startswith('esc-4458-')
+    assert on_task[0].id == esc_id
+
+
+def test_file_finding_task_escalation_resolves_via_same_project_citation(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """With no bare task_id, the same-project citation supplies the target."""
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    finding = _orch_finding(
+        task_id=None,
+        cited_tasks=[{'project_id': 'test-project', 'task_id': '4458', 'title': 'x'}],
+    )
+    esc_id = harness._file_finding_task_escalation('test-project', 'run-1', finding, 4)
+
+    assert esc_id
+    pending = EscalationQueue(queue_dir).get_pending()
+    assert [e.task_id for e in pending] == ['4458']
+
+
+def test_file_finding_task_escalation_folds_across_cycles(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """Dedupe matrix (a): two cycles leave exactly ONE open record.
+
+    The `_sweep_escalate_l1` template this filer is transcribed from does NOT
+    dedupe and refiles on every sweep — acceptable for a one-shot cancellation
+    event, but not for a filer that re-evaluates on every reconciliation cycle.
+    Because the record is level 0, `has_open_l1` cannot supply this: the dedupe
+    is a pending-scan filtered on (level, category), the same idiom
+    `orchestrator/harness.py::_file_warm_base_hard_down_notice` uses.
+    """
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    first = harness._file_finding_task_escalation('test-project', 'run-1', _orch_finding(), 4)
+    second = harness._file_finding_task_escalation('test-project', 'run-2', _orch_finding(), 5)
+
+    assert first, 'the first filing must land'
+    assert second is None, f'the second filing must fold, got {second!r}'
+    assert [e.id for e in EscalationQueue(queue_dir).get_pending()] == [first]
+
+
+def test_unrelated_pending_record_on_the_same_task_does_not_suppress_the_filing(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """Dedupe matrix (b) and (c): only a SAME-CATEGORY record folds.
+
+    (b) A pending LEVEL-0 record of a different category must not swallow a
+        recon finding — the `category` filter, which is the ONLY filter the
+        scan applies. Without it, a lingering `risk_identified` INFO on the
+        task would silently suppress every recon finding for that task forever,
+        the failure mode `has_open_l1`'s own category filter (task 2757) exists
+        to prevent.
+
+    (c) A pending LEVEL-1 record OF A DIFFERENT CATEGORY must not suppress
+        either. The scan is level-BLIND (see
+        `test_promoted_record_folds_the_next_cycle` for why), so the category
+        filter is doing all the work on this axis too: a refactor to an
+        UNCATEGORIZED `has_open_l1(task_id)` read — "is any human on this
+        task?" — would start swallowing recon findings behind an unrelated open
+        L1, and this case is what makes that fail loudly.
+
+    NOTE the deliberate change of shape from an earlier revision, which used a
+    SAME-category L1 here to pin that no L1 ever suppresses. That is no longer
+    the contract: a same-category L1 is this filer's OWN record after the
+    orphan reaper promoted it, and folding onto it is required — see
+    `test_promoted_record_folds_the_next_cycle`. The refactor-to-`has_open_l1`
+    guard this case used to provide is not lost: `has_open_l1` is level-1-only,
+    so it cannot see the pending L0 that
+    `test_file_finding_task_escalation_folds_across_cycles` pins, and that test
+    fails under either the categorized or the uncategorized spelling.
+    """
+    from escalation.models import Escalation  # type: ignore[import-untyped]
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    from fused_memory.reconciliation.finding_task_escalation import (
+        FINDING_TASK_ESCALATION_CATEGORY,
+    )
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    queue = EscalationQueue(queue_dir)
+    # (b) Same task, same level, DIFFERENT category.
+    queue.submit(Escalation(
+        id=queue.make_id('4458'),
+        task_id='4458',
+        agent_role='orchestrator-starvation-watchdog',
+        severity='info',
+        category='risk_identified',
+        summary='Task 4458 starved for 6h',
+        level=0,
+    ))
+    # (c) Same task, DIFFERENT category, LEVEL 1 — an unrelated human-facing
+    # record, the thing an uncategorized has_open_l1 read would fold onto.
+    queue.submit(Escalation(
+        id=queue.make_id('4458'),
+        task_id='4458',
+        agent_role='steward',
+        severity='blocking',
+        category='scope_violation',
+        summary='Escalated by a human to L1',
+        level=1,
+    ))
+
+    esc_id = harness._file_finding_task_escalation('test-project', 'run-1', _orch_finding(), 4)
+
+    assert esc_id, (
+        'neither an unrelated level-0 record nor an unrelated level-1 record '
+        'may suppress a recon finding'
+    )
+    filed = [
+        e for e in EscalationQueue(queue_dir).get_pending()
+        if e.category == FINDING_TASK_ESCALATION_CATEGORY and e.level == 0
+    ]
+    assert [e.id for e in filed] == [esc_id]
+
+
+def test_promoted_record_folds_the_next_cycle(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """file -> promote-to-L1 -> refile must NOT produce a second record.
+
+    This is the unbounded-churn regression (esc-4821 amendment pass). The
+    filer writes at level 0, and
+    `orchestrator/harness.py::Harness._reap_orphan_l0_escalations` promotes an
+    aged pending L0 to L1 — with no category filter, and gated on the task
+    having NO live workflow, which is the very condition under which this filer
+    fires at all. So every record it writes is born eligible for promotion.
+
+    Under the earlier `level == 0 and category == ...` dedupe scan, promotion
+    broke the fold: the next reconciliation cycle saw no matching L0 and filed
+    a fresh one, which the reaper then DISMISSED as a duplicate of the open L1
+    (its `has_open_l1` branch). One born-and-dismissed record per cycle,
+    forever, on a task already represented by an open L1.
+
+    Making the scan level-BLIND folds onto the promoted record instead — the
+    L1 *is* this finding, escalated. The promotion is simulated here by
+    rewriting the record's level in place, exactly as the reaper does.
+    """
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    from fused_memory.reconciliation.finding_task_escalation import (
+        FINDING_TASK_ESCALATION_CATEGORY,
+    )
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    first = harness._file_finding_task_escalation('test-project', 'run-1', _orch_finding(), 4)
+    assert first, 'the first filing must land'
+
+    # Simulate the orphan reaper promoting it: same record, level 1, still
+    # pending. (The reaper mutates level via its own escalate path; what the
+    # dedupe scan sees is only the stored level, so rewriting it is faithful.)
+    queue = EscalationQueue(queue_dir)
+    promoted = queue.get_by_task('4458', status='pending')
+    assert len(promoted) == 1
+    promoted[0].level = 1
+    (queue_dir / f'{first}.json').write_text(promoted[0].to_json())
+    assert queue.has_open_l1('4458') is True, 'promotion must be visible as an open L1'
+
+    second = harness._file_finding_task_escalation('test-project', 'run-2', _orch_finding(), 5)
+
+    assert second is None, (
+        f'the promoted L1 already represents this finding; refiling an L0 here '
+        f'is the unbounded churn loop (the reaper dismisses it, next cycle '
+        f'files another). Got {second!r}'
+    )
+    routed = [
+        e for e in EscalationQueue(queue_dir).get_pending()
+        if e.category == FINDING_TASK_ESCALATION_CATEGORY
+    ]
+    assert [e.id for e in routed] == [first], (
+        f'exactly one routed record must survive promotion, got '
+        f'{[(e.id, e.level) for e in routed]}'
+    )
+
+
+def test_resolved_prior_record_does_not_suppress_a_refile(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """Dedupe matrix (d): the scan is PENDING-only, so a settled finding refiles.
+
+    If the finding recurs after a human adjudicated the previous record, that is
+    new information and must reach the ladder again. `get_by_task` with
+    `status='pending'` skips the archive by construction, so this holds without
+    a second filter.
+    """
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    first = harness._file_finding_task_escalation('test-project', 'run-1', _orch_finding(), 4)
+    assert first
+    EscalationQueue(queue_dir).resolve(first, 'adjudicated by operator')
+
+    second = harness._file_finding_task_escalation('test-project', 'run-2', _orch_finding(), 5)
+
+    assert second and second != first, (
+        f'a resolved prior record must not suppress a refile, got {second!r}'
+    )
+    assert [e.id for e in EscalationQueue(queue_dir).get_pending()] == [second]
+
+
+def test_dead_orchestrator_files_nothing_and_creates_no_queue_directory(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """No live orchestrator -> no filing, and NO `data/escalations` directory.
+
+    The directory assertion is what pins LAZY queue construction:
+    `EscalationQueue.__init__` does `mkdir(parents=True, exist_ok=True)`, so a
+    queue built before the gates would leave a spurious directory under every
+    project that never files.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch, live=False)
+
+    assert harness._file_finding_task_escalation(
+        'test-project', 'run-1', _orch_finding(), 4,
+    ) is None
+    assert not queue_dir.exists(), (
+        f'the queue must be constructed lazily, but {queue_dir} was created'
+    )
+
+
+def test_finding_with_no_same_project_target_files_nothing(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """No bare task_id and only a FOREIGN-project citation -> no filing."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    finding = _orch_finding(
+        task_id=None,
+        cited_tasks=[{'project_id': 'some-other-project', 'task_id': '4458', 'title': 'x'}],
+    )
+
+    assert harness._file_finding_task_escalation('test-project', 'run-1', finding, 4) is None
+    assert not queue_dir.exists()
+
+
+def test_unregistered_project_files_nothing(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """A project absent from `_known_projects` fails safe to no-file.
+
+    `_resolve_known_root` returns None on a miss (rather than raising, as
+    `_known_project_scope_for` does), so an unregistered project cannot cause a
+    filing to land under a guessed root.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    assert harness._resolve_known_root('never-registered') is None
+    assert harness._file_finding_task_escalation(
+        'never-registered', 'run-1', _orch_finding(), 4,
+    ) is None
+    assert not _orch_queue_dir(tmp_path).exists()
+
+
+def test_queue_submit_failure_is_swallowed_and_warned(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch, caplog,
+):
+    """A queue hiccup must never abort a reconciliation cycle."""
+    import escalation.queue as _eq  # type: ignore[import-untyped]
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    def _boom(self, escalation):
+        raise OSError('disk on fire')
+
+    monkeypatch.setattr(_eq.EscalationQueue, 'submit', _boom)
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.harness'):
+        result = harness._file_finding_task_escalation(
+            'test-project', 'run-1', _orch_finding(), 4,
+        )
+
+    assert result is None
+    assert not list(queue_dir.glob('esc-*.json')), 'no record should have landed'
+    assert any('disk on fire' in r.getMessage() for r in caplog.records), (
+        f'expected a warning naming the failure, got: {[r.getMessage() for r in caplog.records]}'
+    )
+
+
+async def _drive_cycle(harness, journal, event_buffer, finding, *, n_seed):
+    """Seed *n_seed* prior completed runs flagging *finding*, then run a cycle."""
+    import uuid as _uuid
+
+    base_time = datetime.now(UTC) - timedelta(minutes=n_seed + 1)
+    for i in range(n_seed):
+        run_id = str(_uuid.uuid4())
+        await journal.start_run(ReconciliationRun(
+            id=run_id,
+            project_id='test-project',
+            run_type=RunType.full,
+            trigger_reason='buffer_size:1',
+            started_at=base_time + timedelta(minutes=i),
+            events_processed=1,
+            status=RunStatus.running,
+        ))
+        await journal.update_run_stage_reports(run_id, {
+            'integrity_check': {'items_flagged': [finding]},
+        })
+        await journal.complete_run(run_id, 'completed')
+
+    await event_buffer.push(_make_event())
+
+    async def s3(events, watermark, prior_reports, run_id, model=None, _s=harness.stages[2]):
+        return StageReport(
+            stage=_s.stage_id,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[finding],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+
+    _mock_stage_run(harness.stages[0])
+    _mock_stage_run(harness.stages[1])
+    harness.stages[2].run = s3
+    await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+
+def _routed_records(orch_queue_dir):
+    """Every `recon_task_finding` record on the orchestrator queue, or []."""
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    from fused_memory.reconciliation.finding_task_escalation import (
+        FINDING_TASK_ESCALATION_CATEGORY,
+    )
+
+    if not orch_queue_dir.exists():
+        return []
+    return [
+        e for e in EscalationQueue(orch_queue_dir).get_pending()
+        if e.category == FINDING_TASK_ESCALATION_CATEGORY
+    ]
+
+
+@pytest.mark.asyncio
+async def test_persistent_finding_naming_a_task_lands_on_both_queues(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """THE ACCEPTANCE TEST — item (c) of task 4764's acceptance sketch.
+
+    A recon finding tagged with a task id must land as a QUEUED ESCALATION ON
+    THAT TASK, not merely as a note in memory. Driven through a real full cycle
+    plus remediation pass, so it exercises the production call site rather than
+    the filer in isolation.
+
+    Two assertions, and the second matters as much as the first:
+
+    (1) the NEW orchestrator-queue record lands under the finding's REAL task id;
+    (2) NO REGRESSION — the existing `recon_integrity_issue` still lands on the
+        RECON queue with its synthetic `recon-<run8>` task id, unchanged. The
+        recon-queue filing is not replaced or displaced by the new one; the two
+        queues have different readers and both must keep working.
+    """
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    from fused_memory.reconciliation.finding_task_escalation import (
+        FINDING_TASK_ESCALATION_CATEGORY,
+    )
+    from fused_memory.reconciliation.harness import (
+        _INTEGRITY_FINDING_RECURRENCE_THRESHOLD,
+    )
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    # The RECON queue (config.escalation_queue_dir, port-8103 watcher) — a
+    # DIFFERENT directory from the per-project orchestrator queue below.
+    recon_queue = EscalationQueue(tmp_path / 'recon-esc')
+    harness._escalation_queue = recon_queue
+    orch_queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+    # A real remediation tree containing task 4458, so this test crosses the
+    # existence gate the way production does rather than on its fail-open
+    # branch (see `test_routed_target_absent_from_the_remediation_tree_...`).
+    _wire_remediation_tree(harness, ['4458'])
+
+    # No cited_tasks: the live-workflow gate iterates cited task ids only, so an
+    # empty list leaves `any_live` False and the escalation branch is reached.
+    finding = _orch_finding()
+    assert finding['actionable'] is True
+
+    # Seed N-2 prior completed runs; the parent full run and the remediation run
+    # supply the remaining two, so persistence reaches the threshold exactly.
+    await _drive_cycle(
+        harness, journal, event_buffer, finding,
+        n_seed=max(1, _INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 2),
+    )
+
+    # (1) THE NEW BEHAVIOUR — a record on task 4458's own ladder.
+    orch_pending = EscalationQueue(orch_queue_dir).get_pending()
+    routed = [e for e in orch_pending if e.category == FINDING_TASK_ESCALATION_CATEGORY]
+    assert len(routed) == 1, (
+        f'expected exactly one routed record on the orchestrator queue, got '
+        f'{[(e.id, e.category) for e in orch_pending]}'
+    )
+    esc = routed[0]
+    assert esc.task_id == '4458', (
+        f'the finding named task 4458; get_by_task filters on the STORED task_id '
+        f'field, so this is what decides whether it surfaces there. Got {esc.task_id!r}'
+    )
+    assert esc.id.startswith('esc-4458-'), f'unexpected id stem: {esc.id!r}'
+    assert esc.level == 0, 'routed records stay off the level-1 guard surface'
+    assert json.loads(esc.detail)['persistence'] >= _INTEGRITY_FINDING_RECURRENCE_THRESHOLD
+
+    # (2) NO REGRESSION — the recon-queue filing is untouched.
+    recon_pending = recon_queue.get_pending()
+    integrity = [
+        e for e in recon_pending
+        if e.category == 'recon_integrity_issue'
+        and e.summary.startswith('Persistently unresolved after remediation')
+    ]
+    assert len(integrity) == 1, (
+        f'the pre-existing recon_integrity_issue filing must be unchanged, got '
+        f'{[(e.id, e.category, e.summary) for e in recon_pending]}'
+    )
+    assert integrity[0].task_id.startswith('recon-'), (
+        f'the recon queue keeps its synthetic recon-<run8> task id, got '
+        f'{integrity[0].task_id!r}'
+    )
+
+    # The two records are on genuinely different queues, under different ids.
+    assert integrity[0].task_id != esc.task_id
+    assert orch_queue_dir != recon_queue.queue_dir
+
+
+# The four tests below are the VOLUME-PARITY guarantee made executable. Each
+# drives a real cycle with a finding that DOES name a task id — so target
+# resolution always succeeds and the only thing that can stop a filing is the
+# suppression layer under test. A regression that moved the call site earlier
+# (or re-implemented a check instead of inheriting it) fails here.
+
+
+@pytest.mark.asyncio
+async def test_non_actionable_finding_naming_a_task_is_not_routed(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """Inherited layer 1: the non-actionable partition.
+
+    MUTATION-CHECKING THIS TEST (esc-4821-2): the partition is implemented at
+    TWO sites, and either one alone suffices to block the routing. Disabling
+    just one leaves this test passing, which reads as a false negative --
+    "the pin is not load-bearing" -- when in fact the other site caught it:
+
+      harness.py, _maybe_remediate:      actionable = [... if f.get('actionable', False)]
+      harness.py, _run_remediation_pass: actionable_remaining = [... if f.get('actionable', False)]
+
+    The routing call site sits inside `for finding in actionable_remaining`,
+    so the second is the proximate gate; the first decides whether the
+    remediation pass is dispatched with this finding at all. Mutate BOTH to
+    `list(...)` and this test fails as intended (verified 2026-09-07).
+    """
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalation_queue = EscalationQueue(tmp_path / 'recon-esc')
+    orch_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    finding = _orch_finding(actionable=False, category='systemic_pattern')
+    await _drive_cycle(harness, journal, event_buffer, finding, n_seed=4)
+
+    assert _routed_records(orch_dir) == [], (
+        'a non-actionable finding is partitioned off to _log_non_actionable_finding '
+        'and must never reach the routing call site'
+    )
+
+
+@pytest.mark.asyncio
+async def test_referenceless_placeholder_finding_naming_a_task_is_not_routed(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """Inherited layer 2: the `_finding_has_reference` placeholder drop.
+
+    Worth pinning precisely: `_derive_affected_ids` does NOT read the bare
+    `finding['task_id']` field, so a placeholder finding can name a task while
+    referencing nothing concrete. `resolve_finding_task_target` WOULD resolve a
+    target for it — only the inherited drop stops the filing.
+    """
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    from fused_memory.reconciliation.finding_task_escalation import (
+        resolve_finding_task_target,
+    )
+    from fused_memory.reconciliation.harness import _finding_has_reference
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalation_queue = EscalationQueue(tmp_path / 'recon-esc')
+    orch_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    finding = _orch_finding(affected_ids=[])
+    assert not _finding_has_reference(finding), 'fixture must be referenceless'
+    assert resolve_finding_task_target(finding, 'test-project') == '4458', (
+        'the bypass risk this test exists for: the filer WOULD resolve a target'
+    )
+
+    await _drive_cycle(harness, journal, event_buffer, finding, n_seed=4)
+
+    assert _routed_records(orch_dir) == []
+
+
+@pytest.mark.asyncio
+async def test_finding_below_the_persistence_threshold_is_not_routed(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """Inherited layer 3: `_INTEGRITY_FINDING_RECURRENCE_THRESHOLD`."""
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    from fused_memory.reconciliation.harness import (
+        _INTEGRITY_FINDING_RECURRENCE_THRESHOLD,
+    )
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalation_queue = EscalationQueue(tmp_path / 'recon-esc')
+    orch_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    # No seeded runs: the parent and remediation runs supply 2, below the bar of 4.
+    assert _INTEGRITY_FINDING_RECURRENCE_THRESHOLD > 2
+    await _drive_cycle(harness, journal, event_buffer, _orch_finding(), n_seed=0)
+
+    assert _routed_records(orch_dir) == [], (
+        'a finding must persist across two full reconciliation cycles before it '
+        'reaches any ladder'
+    )
+
+
+@pytest.mark.asyncio
+async def test_finding_suppressed_by_the_live_workflow_gate_is_not_routed(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """Inherited layer 4: the live-workflow gate.
+
+    A task with live work in flight must not be escalated about — the workflow
+    is expected to resolve the divergence itself.
+    """
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    import fused_memory.reconciliation.harness as _h
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalation_queue = EscalationQueue(tmp_path / 'recon-esc')
+    orch_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    # The gate iterates CITED task ids, so the finding must carry one.
+    finding = _orch_finding(
+        cited_tasks=[{'project_id': 'test-project', 'task_id': '4458', 'title': 'x'}],
+    )
+    monkeypatch.setattr(_h, 'is_workflow_live_for_task', lambda *a, **k: True)
+
+    await _drive_cycle(harness, journal, event_buffer, finding, n_seed=4)
+
+    assert _routed_records(orch_dir) == []
+    # Parity check: the recon queue is silenced by the same gate, so the two
+    # paths stay in lockstep rather than one leaking past the other.
+    assert [
+        e for e in harness._escalation_queue.get_pending()
+        if e.summary.startswith('Persistently unresolved after remediation')
+    ] == []
+
+
+@pytest.mark.asyncio
+async def test_routed_target_absent_from_the_remediation_tree_is_not_filed(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """A finding naming a task that does not exist files NOTHING on the ladder.
+
+    Stage-3 findings are LLM-authored free text, and the bare-`task_id` branch
+    of `resolve_finding_task_target` INTERPRETS whatever string it finds as a
+    task in this project — it does not confirm one exists. Without an existence
+    gate a hallucinated or stale id ('9999' here; a subtask spelling like
+    '4458.2' is the other shape) files `esc-9999-N` onto the orchestrator queue,
+    and `orchestrator/harness.py::Harness._reap_orphan_l0_escalations` scans
+    `get_pending()` with NO task-existence check — so after
+    `orphan_l0_timeout_secs` the phantom L0 is promoted into a phantom L1 in
+    front of a human.
+
+    The same hazard is already reasoned about, for the comma-joined case, in
+    `finding_task_escalation.py::_sole_task_id_part`'s docstring; this closes it
+    for the hallucinated-id case.
+
+    (b) is the narrowness check, as everywhere else in this group: the
+    recon-queue `_escalate` filing is UNAFFECTED, so the finding is not lost —
+    it simply does not manufacture a ladder record against a task that is not
+    there.
+    """
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalation_queue = EscalationQueue(tmp_path / 'recon-esc')
+    orch_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+    # A populated tree that does NOT contain 9999 — the gate needs a tree to
+    # read, or it (deliberately) fails open. See the next test.
+    _wire_remediation_tree(harness, ['4458', '4764'])
+
+    finding = _orch_finding(task_id='9999', affected_ids=['9999'])
+
+    await _drive_cycle(harness, journal, event_buffer, finding, n_seed=4)
+
+    assert _routed_records(orch_dir) == [], (
+        'task 9999 is not in the remediation tree; routing it would file '
+        'esc-9999-N, which the orphan reaper eventually promotes to a phantom L1'
+    )
+    assert [
+        e for e in harness._escalation_queue.get_pending()
+        if e.summary.startswith('Persistently unresolved after remediation')
+    ] != [], (
+        'the existence gate must narrow only the NEW routed filing — the '
+        'recon-queue escalation for this finding still files today and must'
+    )
+
+
+@pytest.mark.asyncio
+async def test_unavailable_task_tree_does_not_disable_routing(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """The existence gate fails OPEN when there is no tree to read.
+
+    `_fetch_filtered_task_tree` degrades to an EMPTY FilteredTaskTree whenever
+    taskmaster is disabled or the fetch fails — so an empty `task_by_id` is
+    evidence that we do not KNOW which tasks exist, never evidence that a task
+    is absent. Reading it as absence would switch this whole arm off for the
+    duration of any taskmaster hiccup: a total, silent loss of the feature,
+    which is exactly the degradation the surrounding gate already refuses (its
+    coverage caveat degrades a missing entry to the fail-safe value for that ONE
+    id, not for every id).
+
+    This test is the pin on that direction. It is deliberately the ONLY thing
+    separating the gate from a one-character change (`task_by_id and ...` ->
+    `...`) that would look like a simplification.
+    """
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalation_queue = EscalationQueue(tmp_path / 'recon-esc')
+    orch_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+    # No tree at all — the shape a failed/disabled taskmaster fetch produces.
+    _wire_remediation_tree(harness, [])
+
+    await _drive_cycle(harness, journal, event_buffer, _orch_finding(), n_seed=4)
+
+    routed = _routed_records(orch_dir)
+    assert [e.task_id for e in routed] == ['4458'], (
+        f'with no task tree the gate has no evidence of absence and must not '
+        f'suppress; got {[(e.id, e.task_id) for e in routed]}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_bare_task_id_finding_is_gated_by_the_live_workflow_check(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """Inherited layer 4, on the BARE-`task_id` branch — the bypass this closes.
+
+    Contrast with `test_finding_suppressed_by_the_live_workflow_gate_is_not_routed`
+    directly above, which supplies `cited_tasks` and therefore never exercised
+    this path. The remediation pass's live-workflow gate iterates CITED task ids
+    only, so a finding whose target comes from the bare `finding['task_id']`
+    field — the fixture shape, and the commoner one — leaves `cited_task_ids`
+    EMPTY. `any_live` is then vacuously False and the routed filing lands even
+    though the task has live work in flight, which is exactly the case the gate
+    exists to suppress.
+
+    So the routed filing cannot simply INHERIT the gate on this branch: the
+    resolved target has to be gated explicitly. Two assertions, and the second
+    is what keeps the fix narrow:
+
+    (a) ZERO routed records — the resolved target is gated;
+    (b) the pre-existing `recon_integrity_issue` record STILL lands on the recon
+        queue, because the `_escalate` gate is keyed on cited task ids and must
+        NOT be widened by this fix. Widening it would silently suppress recon
+        escalations that file today, a behaviour change well outside this arm.
+    """
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    import fused_memory.reconciliation.harness as _h
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalation_queue = EscalationQueue(tmp_path / 'recon-esc')
+    orch_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    # The fixture as-is: a bare task_id, NO cited_tasks.
+    finding = _orch_finding()
+    assert 'cited_tasks' not in finding, (
+        'this test is only meaningful while the fixture leaves cited_task_ids empty'
+    )
+    monkeypatch.setattr(_h, 'is_workflow_live_for_task', lambda *a, **k: True)
+
+    await _drive_cycle(harness, journal, event_buffer, finding, n_seed=4)
+
+    assert _routed_records(orch_dir) == [], (
+        'task 4458 has a live workflow; the routed filing must be suppressed on '
+        'the bare-task_id branch too, not only when the finding cites the task'
+    )
+    # (b) The existing recon-queue gate is UNCHANGED: with no cited tasks it was
+    # vacuously not-live before this fix and must stay that way after it.
+    assert [
+        e for e in harness._escalation_queue.get_pending()
+        if e.summary.startswith('Persistently unresolved after remediation')
+    ] != [], (
+        'the fix must gate only the NEW routed filing — widening the _escalate '
+        'gate to the resolved target would silence recon escalations that file today'
     )

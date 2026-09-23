@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -83,6 +84,7 @@ since this fake is already per-unit-state-based.
 import json
 import os
 import sys
+import time
 
 STATE_PATH = os.environ["FAKE_SYSTEMCTL_STATE"]
 
@@ -97,6 +99,36 @@ def _save(state):
         json.dump(state, f)
 
 
+def _observe_lease(args):
+    """Snapshot the in-flight fleet-redeploy lease as of THIS call (task 4755).
+
+    This fake is the only vantage point a test has on the lease while it is
+    actually held: it runs as a descendant of restart-all-orchestrators.sh,
+    mid-sweep, whereas the test process only ever sees the before and after.
+
+    `pid_cmdline` is what turns "pid is a plausible integer" into "pid is the
+    sweep's own": the lease names a pid, and the process wearing that pid
+    right now is read straight out of /proc. Resolved HERE rather than in the
+    test because the pid is only guaranteed to still be running while the
+    sweep that recorded it is mid-flight.
+    """
+    obs = {"args": args, "observed_at": time.time(), "lease": None, "pid_cmdline": None}
+    try:
+        with open(os.environ.get("ORCH_FLEET_LEASE", "")) as f:
+            obs["lease"] = json.load(f)
+    except (OSError, ValueError):
+        return obs
+    pid = obs["lease"].get("pid") if isinstance(obs["lease"], dict) else None
+    if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                raw = f.read()
+        except OSError:
+            return obs
+        obs["pid_cmdline"] = raw.replace(b"\\x00", b" ").decode(errors="replace").strip()
+    return obs
+
+
 def main(argv):
     args = [a for a in argv[1:] if a != "--user"]
     if not args:
@@ -105,6 +137,7 @@ def main(argv):
 
     state = _load()
     state.setdefault("calls", []).append(argv[1:])
+    state.setdefault("lease_observations", []).append(_observe_lease(args))
 
     if verb == "list-units":
         for unit in state.get("running_units", []):
@@ -1389,4 +1422,346 @@ def test_busy_stale_busy_oscillation_does_not_reset_the_force_fire_anchor(tmp_pa
     )
     assert ["--user", "restart", UNIT_R] in state["calls"], (
         f"expected a restart call for {UNIT_R}; got calls={state['calls']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The in-flight fleet-redeploy lease (task 4755), producer side.
+#
+# INVARIANT: for as long as a sweep is running, `$ORCH_FLEET_LEASE` names a
+# live lease recording the sweep's own pid, the epoch it started, and the unit
+# it is currently restarting -- and it is gone again on every exit path the
+# shell can catch. The three readers (the watchdog's staleness backstop, the
+# merge-landed coordinator, and the watchdog's liveness probe) all stand down
+# while that file is live, which is how the fleet stops redeploying on top of
+# its own in-flight sweep.
+#
+# This half of the suite owns MID-SWEEP observation and SIGNAL handling,
+# matching how the two suites already divide; the exit-path lifecycle
+# assertions that pair with the clock stamp live in
+# tests/scripts/test_restart_all_orchestrators.py.
+# ---------------------------------------------------------------------------
+
+UNIT_S = synthetic_unit("solar")
+
+
+def _lease_observations(state_path):
+    """Every mid-sweep lease snapshot the fake systemctl recorded, in order."""
+    return _load_state(state_path).get("lease_observations", [])
+
+
+@contextlib.contextmanager
+def _sweep_in_background(bin_dir, state_path, fleet_dir, lease_path, *extra_args, env=None):
+    """Spawn the sweep, yield (popen, pgid) once its lease is on disk, always reap.
+
+    A foreground `run_in_new_session` cannot serve the signal tests: they need
+    to signal a sweep that is still running, and the only way to know one has
+    got as far as acquiring its lease is to watch for the file. Session
+    isolation and the group kill are kept -- `start_new_session=True` plus a
+    pgid frozen at spawn is exactly `run_in_new_session`'s own defence, and for
+    the same task-845 reason (`os.getpgid` on a reaped-and-recycled pid resolves
+    the NEW owner's group). The `finally` is what honours the task-3798 leaked
+    drain-process guard: whatever the test did or failed to do, the whole group
+    is SIGKILLed before the test returns.
+    """
+    full_env = dict(os.environ)
+    full_env["PATH"] = f"{bin_dir}{os.pathsep}{full_env['PATH']}"
+    full_env["FAKE_SYSTEMCTL_STATE"] = str(state_path)
+    full_env["ORCH_FLEET_DIR"] = str(fleet_dir)
+    full_env["ORCH_FLEET_LEASE"] = str(lease_path)
+    if env:
+        full_env.update(env)
+    proc = subprocess.Popen(
+        ["bash", str(SCRIPT), *extra_args],
+        env=full_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    pgid = proc.pid
+    try:
+        deadline = time.monotonic() + load_scaled_grace(
+            10, cap_secs=WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS,
+        )
+        while not lease_path.exists():
+            assert proc.poll() is None, (
+                f"the sweep exited (rc={proc.returncode}) before writing a lease at "
+                f"{lease_path}"
+            )
+            assert time.monotonic() < deadline, (
+                f"no lease appeared at {lease_path} while the sweep ran"
+            )
+            time.sleep(0.05)
+        yield proc, pgid
+    finally:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(pgid, signal.SIGKILL)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.communicate(timeout=10)
+
+
+def test_lease_is_held_mid_sweep_and_names_the_sweeps_own_pid(tmp_path):
+    """(a) While the sweep runs, the lease records {pid, started_ts, current_unit}.
+
+    `pid` is asserted to be the SWEEP's pid, not merely a positive integer:
+    the fake reads /proc/<pid>/cmdline at observation time, and a lease whose
+    pid names some other process would silently defeat every reader -- all
+    three of them stand down only while that pid is alive, so a wrong pid is
+    either a lease that never expires or one that never holds.
+    """
+    fleet_dir = tmp_path / "fleet"
+    lease_path = tmp_path / "lease.json"
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
+    )
+
+    result = _run_script(
+        bin_dir, state_path, fleet_dir,
+        env={"RESTART_VERIFY_TIMEOUT": "5", "ORCH_FLEET_LEASE": str(lease_path)},
+    )
+
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    observations = [o for o in _lease_observations(state_path) if o["lease"] is not None]
+    assert observations, (
+        f"no systemctl call observed a lease on disk; the sweep must hold one "
+        f"for its whole run. observations={_lease_observations(state_path)!r} "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    for obs in observations:
+        lease = obs["lease"]
+        assert set(lease) == {"pid", "started_ts", "current_unit"}, (
+            f"lease body must carry exactly pid/started_ts/current_unit; got {lease!r}"
+        )
+        assert isinstance(lease["pid"], int) and lease["pid"] > 0, (
+            f"pid must be a positive int; got {lease['pid']!r}"
+        )
+        assert obs["pid_cmdline"] is not None and "restart-all-orchestrators.sh" in obs["pid_cmdline"], (
+            f"the lease pid {lease['pid']} must be the sweep's own process; "
+            f"/proc said {obs['pid_cmdline']!r}"
+        )
+        assert isinstance(lease["started_ts"], (int, float)), (
+            f"started_ts must be numeric; got {lease['started_ts']!r}"
+        )
+        assert 0 <= obs["observed_at"] - lease["started_ts"] < 300, (
+            f"started_ts {lease['started_ts']!r} is not a plausible epoch for a "
+            f"sweep observed at {obs['observed_at']!r}"
+        )
+
+
+def test_lease_current_unit_advances_in_ordered_units_order(tmp_path):
+    """(b) `current_unit` names the unit being restarted RIGHT NOW.
+
+    This is the field the liveness probe scopes its suppression on, so a lease
+    that named only "some sweep is running" would force a blanket liveness
+    disable -- which I5 forbids. Two units, with SELF_UNIT among them, also
+    pins the deferred-self ordering: ordered_units puts everything except
+    SELF_UNIT first in enumeration order and appends SELF_UNIT last, so
+    current_unit must walk [UNIT_S, UNIT_R] even though list-units reported
+    [UNIT_R, UNIT_S].
+    """
+    fleet_dir = tmp_path / "fleet"
+    lease_path = tmp_path / "lease.json"
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path,
+        running_units=[UNIT_R, UNIT_S],
+        units={UNIT_R: {"scenario": "fresh"}, UNIT_S: {"scenario": "fresh"}},
+    )
+
+    result = _run_script(
+        bin_dir, state_path, fleet_dir,
+        env={
+            "RESTART_VERIFY_TIMEOUT": "5",
+            "ORCH_FLEET_LEASE": str(lease_path),
+            "SELF_UNIT": UNIT_R,
+        },
+    )
+
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    observations = [o for o in _lease_observations(state_path) if o["lease"] is not None]
+    # Dedup CONSECUTIVE repeats only: each unit is the subject of several
+    # systemctl calls, and what is under test is the order of the transitions,
+    # not how many calls each unit happened to make.
+    walk = []
+    for obs in observations:
+        value = obs["lease"]["current_unit"]
+        if not walk or walk[-1] != value:
+            walk.append(value)
+    assert walk == ["", UNIT_S, UNIT_R], (
+        f"current_unit must start empty (the lease is acquired before any unit "
+        f"is enumerated), then follow ordered_units with SELF_UNIT={UNIT_R} "
+        f"last; got {walk!r} from observations={observations!r}"
+    )
+    # The gate runs BEFORE the restart, so a unit deferred for its whole busy
+    # grace is still correctly named as current -- pinned by the fact that the
+    # unit's very first observed call already sees its own name.
+    first_for_self = next(
+        o for o in observations if o["args"][:2] == ["restart", UNIT_R]
+    )
+    assert first_for_self["lease"]["current_unit"] == UNIT_R, (
+        f"the lease must already name {UNIT_R} by the time it is restarted; "
+        f"got {first_for_self!r}"
+    )
+
+
+def test_sigterm_mid_sweep_releases_the_lease(tmp_path):
+    """(g) A SIGTERMed sweep releases its lease.
+
+    The script had NO trap before this task, and an untrapped SIGTERM kills
+    the shell WITHOUT running an EXIT trap -- so this fails against a naive
+    `trap lease_release EXIT` alone. Operators stop a sweep this way
+    (`systemctl --user stop`, a killed transient unit), and a lease left
+    behind by one suppresses every redeploy tier until the max-age bound
+    expires.
+    """
+    fleet_dir = tmp_path / "fleet"
+    lease_path = tmp_path / "lease.json"
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
+    )
+    # Busy heartbeat + a grace far longer than this test: the sweep parks in
+    # drain_gate's defer loop, which is what gives us a sweep to signal.
+    _write_heartbeat(fleet_dir, UNIT_R, merge_idle=False, ts_epoch=time.time())
+
+    with _sweep_in_background(
+        bin_dir, state_path, fleet_dir, lease_path, "--drain",
+        env={
+            "RESTART_VERIFY_TIMEOUT": "5",
+            "ORCH_RESTART_FORCE_FIRE_AFTER_SECS": str(
+                wait_proof_grace_secs(load_scaled_grace(
+                    10, cap_secs=WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS,
+                ))
+            ),
+            "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
+        },
+    ) as (proc, pgid):
+        assert lease_path.exists()
+        # The GROUP, so the foreground `sleep` dies too: bash defers a trap
+        # until the running foreground command returns, so signalling the
+        # shell alone would stall the release for a whole poll interval.
+        os.killpg(pgid, signal.SIGTERM)
+        stdout, stderr = proc.communicate(timeout=30)
+
+    assert not lease_path.exists(), (
+        f"a SIGTERMed sweep must release its lease; {lease_path} still holds "
+        f"{lease_path.read_text()!r}. stdout={stdout!r} stderr={stderr!r}"
+    )
+
+
+def test_sigkill_mid_sweep_leaves_the_lease_behind_by_design(tmp_path):
+    """(h) SIGKILL strands the lease -- BY DESIGN, and the reason for the bound.
+
+    Not a defect and not a gap to be closed: SIGKILL is uncatchable, so no
+    amount of trapping can make the producer clean up after one. This test
+    exists so that a future reader finding a stranded lease reads it as the
+    ANTICIPATED case rather than a bug, and so the reader-side max-age bound
+    (ORCH_FLEET_LEASE_MAX_AGE_SECS) can never be deleted as redundant: it is
+    the ONLY thing standing between a SIGKILLed sweep and a wedged fleet.
+    """
+    fleet_dir = tmp_path / "fleet"
+    lease_path = tmp_path / "lease.json"
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
+    )
+    _write_heartbeat(fleet_dir, UNIT_R, merge_idle=False, ts_epoch=time.time())
+
+    with _sweep_in_background(
+        bin_dir, state_path, fleet_dir, lease_path, "--drain",
+        env={
+            "RESTART_VERIFY_TIMEOUT": "5",
+            "ORCH_RESTART_FORCE_FIRE_AFTER_SECS": str(
+                wait_proof_grace_secs(load_scaled_grace(
+                    10, cap_secs=WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS,
+                ))
+            ),
+            "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
+        },
+    ) as (proc, pgid):
+        held = json.loads(lease_path.read_text())
+        os.killpg(pgid, signal.SIGKILL)
+        proc.communicate(timeout=30)
+        assert wait_pid_gone(proc.pid), "the SIGKILLed sweep must actually be gone"
+
+    assert lease_path.exists(), (
+        "SIGKILL is uncatchable, so the lease MUST still be here -- if this "
+        "ever starts passing by removal, something other than the script is "
+        "deleting leases, and the reader-side max-age bound is being asked to "
+        "cover a case it was never given"
+    )
+    assert json.loads(lease_path.read_text()) == held, (
+        "the stranded lease must be byte-equal to what the sweep held"
+    )
+
+
+def test_every_exit_after_acquisition_is_covered_by_the_release_trap():
+    """(f)+(j) Trap COVERAGE, asserted structurally -- the only way it can be.
+
+    MEASURED, not assumed (2026-09-21): drain_gate's `_drain_validate_verdict`
+    defensive `exit 1` is unreachable from outside the script, so it cannot be
+    driven by a behavioural test at all. drain_check_verdict whitelists its own
+    subprocess's output through a `case idle|busy|stale|absent` and coerces
+    anything else to "absent", and drain_await_fresh sets _DRAIN_VERDICT only
+    from that function -- so no heartbeat, no drain_check.py behaviour and no
+    PATH shim can produce an unrecognised verdict. Driving the script with a
+    `python3` on PATH that printed `bogus-verdict` and exited 0 produced
+    `heartbeat absent after 0s grace` and exit 0, never the `BUG(task 3852)`
+    abort. The branch is a backstop against a future IN-script refactor, which
+    is precisely the change this test protects the lease against.
+
+    So the checkable invariant is coverage rather than any one path: the EXIT
+    trap is installed before execution can reach ANY function body, hence
+    before every `exit` inside one. Two structural facts carry that:
+
+    * the trap is installed before `mapfile -t running_units`, the first
+      top-level statement after the definitions -- so no function has yet been
+      CALLED, however early its `exit` sits in the file; and
+    * the only `exit` textually before the trap is the argument-parse one,
+      which is also (j): a rejected argument must leave NO lease, because
+      acquisition happens after parsing.
+    """
+    lines = SCRIPT.read_text().splitlines()
+
+    def _sole_index(pattern, what):
+        hits = [i for i, line in enumerate(lines) if re.search(pattern, line)]
+        assert len(hits) == 1, (
+            f"expected exactly one {what} line matching {pattern!r}; got "
+            f"{[(i + 1, lines[i]) for i in hits]!r}"
+        )
+        return hits[0]
+
+    trap_at = _sole_index(r"^trap lease_release EXIT$", "EXIT-trap install")
+    acquire_at = _sole_index(r"^lease_acquire$", "top-level lease_acquire call")
+    enumerate_at = _sole_index(r"^mapfile -t running_units", "unit-enumeration")
+
+    assert trap_at < acquire_at, (
+        "the trap must be installed BEFORE the lease is acquired: an exit "
+        "between the two is then harmless (rm -f is idempotent), whereas the "
+        "reverse order strands a lease on any failure inside lease_acquire"
+    )
+    assert acquire_at < enumerate_at, (
+        "the lease must be held for the whole sweep, so it is acquired before "
+        "any unit is enumerated"
+    )
+    assert trap_at < enumerate_at, (
+        "the trap must be installed before the first top-level statement that "
+        "calls a function -- otherwise an `exit` inside a function body (e.g. "
+        "_drain_validate_verdict's defensive abort) escapes the release"
+    )
+
+    pre_trap_exits = [
+        (i + 1, lines[i]) for i, line in enumerate(lines[:trap_at])
+        if re.match(r"^\s*exit \d+\s*$", line)
+    ]
+    assert len(pre_trap_exits) == 1, (
+        f"exactly one exit may precede the trap -- the argument-parse "
+        f"rejection, which must write no lease; got {pre_trap_exits!r}"
+    )
+    reject_at = _sole_index(r"unexpected argument", "argument-rejection")
+    assert reject_at < trap_at < acquire_at, (
+        f"the argument rejection (line {reject_at + 1}) must stay ahead of the "
+        f"trap and the acquisition, so an unknown argument never writes a lease"
     )

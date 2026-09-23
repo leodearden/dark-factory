@@ -80,6 +80,96 @@ exit 0
 """
 
 
+# ── task 4211 stubs: reify 5568's --distinct-lock-refusal-rc ──────────────
+#
+# A post-5568 script that ADVERTISES the flag (the probe is a text search over
+# the script body, exactly as for --assume-lane-lock-held) and records the argv
+# it was actually handed, so the plumbing can be asserted at the wire.
+_ARGV_RECORDING_SEED_SCRIPT = """#!/usr/bin/env bash
+# Supported flags include --distinct-lock-refusal-rc (reify task 5568).
+set -u
+lane_dir="$2"
+printf '%s\n' "$@" > "${lane_dir}.argv"
+mkdir -p "$lane_dir/target"
+echo seeded > "$lane_dir/target/seeded.bin"
+exit 0
+"""
+
+# A pre-5568 script: records argv, then rejects ANY unrecognised flag with
+# exit 2, like the real generic `-*) err "Unknown flag: $1"; exit 2` arm.  As
+# with _LEGACY_SEED_SCRIPT above it must NOT spell the flag out anywhere — the
+# probe is a text search, so a script naming the flag in order to reject it
+# would be indistinguishable from one that supports it.
+_LEGACY_ARGV_RECORDING_SEED_SCRIPT = """#!/usr/bin/env bash
+set -u
+lane_dir="$2"
+printf '%s\n' "$@" > "${lane_dir}.argv"
+shift 3
+for a in "$@"; do
+    case "$a" in
+        -*)
+            echo "Unknown flag: $a" >&2
+            exit 2
+            ;;
+    esac
+done
+mkdir -p "$lane_dir/target"
+echo seeded > "$lane_dir/target/seeded.bin"
+exit 0
+"""
+
+
+# Mimics the REAL post-5568 script's refusal contract: it takes
+# ${LANE_DIR}.lock itself, and when that lock is already held by a live
+# consumer it emits the LANE_LOCK_CONTENDED: marker and exits 77 under
+# --distinct-lock-refusal-rc (75 without it, which is all a pre-5568 script
+# could ever say).
+#
+# Like _LOCKING_SEED_SCRIPT above it does NOT advertise --assume-lane-lock-held,
+# so DF's own outer flock is the live consumer holding the lock when the script
+# runs.  That is the esc-5556-1 self-refusal shape verbatim — the one that
+# actually ran in production for ~46h — now carrying the 5568 return code.
+_POST_5568_LOCKING_SEED_SCRIPT = """#!/usr/bin/env bash
+# Supported flags include --distinct-lock-refusal-rc (reify task 5568).
+set -u
+lane_dir="$2"
+refusal_rc=75
+for a in "$@"; do
+    [ "$a" = "--distinct-lock-refusal-rc" ] && refusal_rc=77
+done
+exec 9>"${lane_dir}.lock"
+if ! flock -n 9; then
+    echo "LANE_LOCK_CONTENDED: ${lane_dir}.lock held by a live consumer" >&2
+    exit "$refusal_rc"
+fi
+mkdir -p "$lane_dir/target"
+echo seeded > "$lane_dir/target/seeded.bin"
+exit 0
+"""
+
+# The paired legacy fence: byte-identical refusal contract, but a pre-5568
+# vintage — it never names the flag (the probe is a text search) and can only
+# ever say 75.  Pins that lanes on an older seed script are UNCHANGED by task
+# 4211.
+_PRE_5568_LOCKING_SEED_SCRIPT = """#!/usr/bin/env bash
+set -u
+lane_dir="$2"
+exec 9>"${lane_dir}.lock"
+if ! flock -n 9; then
+    echo "LANE_LOCK_CONTENDED: ${lane_dir}.lock held by a live consumer" >&2
+    exit 75
+fi
+mkdir -p "$lane_dir/target"
+echo seeded > "$lane_dir/target/seeded.bin"
+exit 0
+"""
+
+
+def _recorded_argv(lane: Path) -> list[str]:
+    """The argv the stub seed script was actually handed."""
+    return Path(f'{lane}.argv').read_text().split()
+
+
 async def _init_repo(repo: Path) -> None:
     await _run(['git', 'init', '-b', 'main'], cwd=repo)
     await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
@@ -128,6 +218,18 @@ async def _make_lane(repo: Path, git_ops: GitOps, script_body: str) -> Path:
     return lane
 
 
+async def _seed(git_ops: GitOps, lane: Path, *args: str, **kwargs: object) -> int:
+    """Drive one seed run.
+
+    The single place in this module that names ``GitOps._seed_warm_lane``.
+    That method is the unit under test and has no public alias, so the
+    coupling is unavoidable -- but it is confined to one line here rather
+    than repeated at every call site.
+    """
+    return await git_ops._seed_warm_lane(lane, *args, **kwargs)  # type: ignore[arg-type]
+
+
+
 @pytest.mark.asyncio
 class TestSeedLaneLockReentrancy:
     async def test_fresh_checkout_seed_does_not_self_refuse_on_own_lane_lock(
@@ -140,7 +242,7 @@ class TestSeedLaneLockReentrancy:
         git_ops = GitOps(_config(), seed_repo)
         lane = await _make_lane(seed_repo, git_ops, _LOCKING_SEED_SCRIPT)
 
-        rc = await git_ops._seed_warm_lane(lane, '--fresh-checkout')
+        rc = await _seed(git_ops, lane, '--fresh-checkout')
 
         assert rc == 0, (
             f'seed must succeed while DF holds the outer lane lock, got rc={rc}. '
@@ -161,7 +263,7 @@ class TestSeedLaneLockReentrancy:
         git_ops = GitOps(_config(), seed_repo)
         lane = await _make_lane(seed_repo, git_ops, _LEGACY_SEED_SCRIPT)
 
-        rc = await git_ops._seed_warm_lane(lane, '--fresh-checkout')
+        rc = await _seed(git_ops, lane, '--fresh-checkout')
 
         assert rc == 0, (
             f'a pre-5354 seed script must still seed cleanly, got rc={rc} '
@@ -182,7 +284,7 @@ class TestSeedLaneLockReentrancy:
         lane = await _make_lane(seed_repo, git_ops, _LOCKING_SEED_SCRIPT)
 
         # Nobody holds the lock -> the script's own flock -n succeeds.
-        rc = await git_ops._seed_warm_lane(
+        rc = await _seed(git_ops, 
             lane, '--fresh-checkout', take_lane_lock=False,
         )
         assert rc == 0, f'unlocked seed should succeed, got rc={rc}'
@@ -196,7 +298,7 @@ class TestSeedLaneLockReentrancy:
         )
         try:
             await asyncio.sleep(0.5)
-            rc_locked = await git_ops._seed_warm_lane(
+            rc_locked = await _seed(git_ops, 
                 lane, '--fresh-checkout', take_lane_lock=False,
             )
         finally:
@@ -207,4 +309,340 @@ class TestSeedLaneLockReentrancy:
             'with take_lane_lock=False and a foreign holder, the seed script must '
             f'still self-refuse (75) — got rc={rc_locked}, meaning inv.2 '
             'single-consumer exclusivity was silently dropped'
+        )
+
+
+# ===========================================================================
+# Task 4211: --distinct-lock-refusal-rc capability probe + flag plumbing
+# ===========================================================================
+#
+# reify's seed-warm-lane.sh exits 75 from BOTH its lane-lock refusal arms
+# (flock -n immediate refusal; flock -w queue timeout) and has no
+# disk-pressure exit-75 path at all, so DF rendered every lock refusal as
+# WarmLaneDiskPressure.  reify task 5568 added the OPT-IN
+# --distinct-lock-refusal-rc flag, under which those arms exit 77 instead.
+# DF must pass it — capability-probed, for the same per-lane-vintage reason
+# --assume-lane-lock-held is probed.
+
+
+class TestDistinctLockRefusalRcProbe:
+    """_seed_script_supports_distinct_lock_refusal_rc — text-grep, fail CLOSED."""
+
+    def _probe(self):
+        from orchestrator.git_ops import (
+            _seed_script_supports_distinct_lock_refusal_rc,
+            _seed_script_text,
+        )
+        # The probe itself is a thin named wrapper; the lru_cache lives on the
+        # shared _seed_script_text read (both probes go through it, so one seed
+        # is one read).  Clear THAT so a prior test's answer for a same-named
+        # path can never leak in.
+        _seed_script_text.cache_clear()
+        return _seed_script_supports_distinct_lock_refusal_rc
+
+    def test_true_when_the_script_advertises_the_flag(self, tmp_path: Path):
+        script = tmp_path / 'seed-warm-lane.sh'
+        script.write_text(_ARGV_RECORDING_SEED_SCRIPT)
+        assert self._probe()(script) is True
+
+    def test_false_for_a_pre_5568_script(self, tmp_path: Path):
+        script = tmp_path / 'seed-warm-lane.sh'
+        script.write_text(_LEGACY_ARGV_RECORDING_SEED_SCRIPT)
+        assert self._probe()(script) is False
+
+    def test_false_when_the_script_is_absent(self, tmp_path: Path):
+        """Fails CLOSED on a read error, mirroring the sibling probe's OSError arm.
+
+        A false negative simply omits the flag, so the script exits 75 and the
+        condition surfaces as DISK_PRESSURE — byte-identical to the behaviour
+        before this fix existed, which is the safe degradation.
+        """
+        assert self._probe()(tmp_path / 'does-not-exist.sh') is False
+
+    def test_false_when_the_path_is_a_directory(self, tmp_path: Path):
+        """IsADirectoryError is an OSError — the same fail-closed arm."""
+        d = tmp_path / 'seed-warm-lane.sh'
+        d.mkdir()
+        assert self._probe()(d) is False
+
+    def test_a_same_path_script_swap_is_not_served_from_cache(
+        self, tmp_path: Path,
+    ):
+        """A stale TRUE is NOT a safe degradation — the cache must invalidate.
+
+        The create-once acquire route removes and re-adds ``_lane-N`` at a
+        FIXED path, and a reseed rewrites the checkout in place, so within one
+        orchestrator lifetime the same path can hold seed scripts of different
+        vintages.  Keyed on the path alone, a lane re-checked-out on an OLDER
+        base would keep the cached True, the flag would go to a parser that
+        rejects it, the script would exit 2, and _seed_rc_to_unavailable maps
+        that to FAULT -> blocked + L1 — strictly worse than the rc-75 fallback
+        a stale False gives.  So this direction is the one that must be pinned.
+        """
+        from orchestrator.git_ops import (
+            _seed_script_supports_distinct_lock_refusal_rc as probe,
+        )
+
+        script = tmp_path / 'seed-warm-lane.sh'
+        script.write_text(_ARGV_RECORDING_SEED_SCRIPT)
+        assert probe(script) is True
+
+        # Same path, older vintage — mtime and size both move, so the shared
+        # text cache key changes and the entry cannot be reused.
+        script.write_text(_LEGACY_ARGV_RECORDING_SEED_SCRIPT)
+        assert probe(script) is False, (
+            'the capability answer was served from a cache keyed on the path '
+            'alone — a lane re-checked-out on a pre-5568 base would be handed '
+            'a flag its parser rejects (exit 2 -> FAULT -> blocked + L1)'
+        )
+
+
+@pytest.mark.asyncio
+class TestDistinctLockRefusalRcPlumbing:
+    async def test_flag_is_passed_when_the_script_advertises_it(
+        self, seed_repo: Path,
+    ):
+        git_ops = GitOps(_config(), seed_repo)
+        lane = await _make_lane(seed_repo, git_ops, _ARGV_RECORDING_SEED_SCRIPT)
+
+        rc = await _seed(git_ops, lane, '--fresh-checkout')
+
+        assert rc == 0, f'seed must succeed, got rc={rc}'
+        assert '--distinct-lock-refusal-rc' in _recorded_argv(lane), (
+            'DF must opt in to reify 5568 rc-77 disambiguation, otherwise a '
+            'lane-lock refusal keeps arriving as 75 and rendering as disk '
+            'pressure'
+        )
+
+    async def test_flag_is_not_passed_to_a_pre_5568_script(
+        self, seed_repo: Path,
+    ):
+        """A legacy lane must keep seeding cleanly — the flag is a usage error there."""
+        git_ops = GitOps(_config(), seed_repo)
+        lane = await _make_lane(
+            seed_repo, git_ops, _LEGACY_ARGV_RECORDING_SEED_SCRIPT,
+        )
+
+        rc = await _seed(git_ops, lane, '--fresh-checkout')
+
+        assert rc == 0, (
+            f'a pre-5568 seed script must still seed cleanly, got rc={rc} '
+            '(rc=2 means the unknown flag was passed without a capability probe)'
+        )
+        assert '--distinct-lock-refusal-rc' not in _recorded_argv(lane)
+
+    async def test_flag_is_passed_regardless_of_take_lane_lock(
+        self, seed_repo: Path,
+    ):
+        """The gating fence — deliberately UNLIKE --assume-lane-lock-held.
+
+        That flag is gated on ``take_lane_lock`` (it only matters when DF holds
+        the outer lock), which
+        test_flag_omitted_when_caller_does_not_take_the_lane_lock pins.  This
+        one must NOT be, because seed's refusal arms are reachable precisely
+        when the SCRIPT self-locks: take_lane_lock=False (the ephemeral-worktree
+        CM caller, which holds the lock itself), and take_lane_lock=True against
+        a pre-5354 script that ignores --assume-lane-lock-held — the original
+        esc-5556-1 self-refusal shape.  Gating it would make it inert in exactly
+        the cases it exists for.
+        """
+        git_ops = GitOps(_config(), seed_repo)
+        lane = await _make_lane(seed_repo, git_ops, _ARGV_RECORDING_SEED_SCRIPT)
+
+        rc_held = await _seed(git_ops, 
+            lane, '--fresh-checkout', take_lane_lock=True,
+        )
+        assert rc_held == 0, f'take_lane_lock=True seed failed: rc={rc_held}'
+        assert '--distinct-lock-refusal-rc' in _recorded_argv(lane)
+
+        rc_free = await _seed(git_ops, 
+            lane, '--fresh-checkout', take_lane_lock=False,
+        )
+        assert rc_free == 0, f'take_lane_lock=False seed failed: rc={rc_free}'
+        assert '--distinct-lock-refusal-rc' in _recorded_argv(lane), (
+            'the flag must survive take_lane_lock=False — that is the caller '
+            'shape where the script self-locks and can therefore refuse'
+        )
+
+
+async def _commit_seed_script(repo: Path, script_body: str) -> None:
+    """Commit ``script_body`` as the repo's seed script so POOL lanes carry it.
+
+    Unlike ``_make_lane`` (which writes into one manually-registered lane),
+    ``acquire_warm_lane`` creates its own ``_lane-N`` worktrees, so the script
+    has to be in the committed tree for the lane checkout to pick it up.
+    """
+    scripts_dir = repo / 'scripts'
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    seed = scripts_dir / 'seed-warm-lane.sh'
+    seed.write_text(script_body)
+    seed.chmod(0o755)
+    debug = scripts_dir / 'setup-worktree-debug-port.sh'
+    debug.write_text('#!/usr/bin/env bash\necho 39411\n')
+    debug.chmod(0o755)
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'add seed + debug-port scripts'], cwd=repo)
+
+
+@pytest.mark.asyncio
+class TestLaneLockRefusalEndToEnd:
+    """The whole task-4211 seam, driven by a stub that mimics the real
+    script's REFUSAL contract rather than by pinning any intermediate value.
+
+    Every hop is real: seed subprocess exit code → _seed_rc_to_unavailable →
+    the acquire_warm_lane discriminant → the create_worktree raise arm →
+    classify_failure's disposition row.  A stub that merely asserted on argv
+    could not fail for the reason production failed; this one can.
+    """
+
+    async def test_post_5568_lane_surfaces_lock_contention_not_disk_pressure(
+        self, seed_repo: Path,
+    ):
+        from orchestrator.git_ops import WarmLaneUnavailable
+
+        await _commit_seed_script(seed_repo, _POST_5568_LOCKING_SEED_SCRIPT)
+        git_ops = GitOps(_config(), seed_repo, warm_lane_pool_size=1)
+
+        result = await git_ops.acquire_warm_lane('task/lock', 'HEAD')
+
+        assert result is WarmLaneUnavailable.LANE_LOCK_CONTENDED, (
+            f'expected LANE_LOCK_CONTENDED, got {result!r} — DISK_PRESSURE here '
+            'means DF never opted in to the rc-77 disambiguation and is still '
+            'rendering a lane-lock refusal as disk pressure (esc-5556-1)'
+        )
+
+    async def test_lane_is_released_back_to_free_after_a_refusal(
+        self, seed_repo: Path,
+    ):
+        """No ASSIGNED leak — same invariant the DISK_PRESSURE path already holds."""
+        from orchestrator.warm_lane_pool import LaneState
+
+        await _commit_seed_script(seed_repo, _POST_5568_LOCKING_SEED_SCRIPT)
+        git_ops = GitOps(_config(), seed_repo, warm_lane_pool_size=1)
+
+        await git_ops.acquire_warm_lane('task/lock', 'HEAD')
+
+        assert git_ops.warm_lane_pool is not None
+        lane = git_ops.worktree_base / '_lane-0'
+        assert git_ops.warm_lane_pool.state(lane) == LaneState.FREE, (
+            'lane must be FREE after a lock-contention failure'
+        )
+
+    async def test_the_lane_worktree_is_retained_not_torn_down(
+        self, seed_repo: Path,
+    ):
+        """Contention must NOT trigger `git worktree remove --force`.
+
+        A lane-lock refusal is the one seed failure whose entire meaning is
+        that ANOTHER LIVE CONSUMER holds <lane_dir>.lock right now, so the
+        generic seed-failure teardown would be a destructive rm racing that
+        holder (a reify GC reclaim, a thin rm -rf, another seed).  It is also
+        unnecessary — seed refused before touching the lane.  Pins the retain
+        policy explicitly, since the pool slot being FREE (asserted by
+        test_lane_is_released_back_to_free_after_a_refusal) holds under EITHER
+        policy and so cannot distinguish them.
+        """
+        await _commit_seed_script(seed_repo, _POST_5568_LOCKING_SEED_SCRIPT)
+        git_ops = GitOps(_config(), seed_repo, warm_lane_pool_size=1)
+
+        await git_ops.acquire_warm_lane('task/lock', 'HEAD')
+
+        lane = git_ops.worktree_base / '_lane-0'
+        assert lane.is_dir(), (
+            f'{lane} was torn down on a lane-lock refusal — that is a '
+            'destructive teardown racing the live lock holder'
+        )
+        rc, out, _ = await _run(
+            ['git', 'worktree', 'list', '--porcelain'], cwd=seed_repo,
+        )
+        assert rc == 0
+        assert str(lane) in out, (
+            f'the lane worktree was unregistered on a lane-lock refusal; '
+            f'`git worktree list` was:\n{out}'
+        )
+
+    async def test_create_worktree_disposition_names_lock_contention(
+        self, seed_repo: Path,
+    ):
+        """The operator-facing end of the seam: the block reason must be truthful."""
+        from orchestrator.git_ops import WarmLaneLockContention
+        from orchestrator.workflow_types import RequeueKind, classify_failure
+
+        await _commit_seed_script(seed_repo, _POST_5568_LOCKING_SEED_SCRIPT)
+        git_ops = GitOps(_config(), seed_repo, warm_lane_pool_size=1)
+
+        with pytest.raises(WarmLaneLockContention) as excinfo:
+            await git_ops.create_worktree('lock')
+
+        disp = classify_failure(excinfo.value)
+        assert 'lock_contention' in disp.reason_prefix, disp.reason_prefix
+        assert 'disk_pressure' not in disp.reason_prefix, (
+            f'the block reason still says disk pressure: {disp.reason_prefix!r}'
+        )
+        assert disp.requeue_kind is RequeueKind.REQUEUE
+        assert disp.counts_against_requeue_cap is False
+
+    async def test_journal_line_names_lock_contention_and_the_lane_lock(
+        self, seed_repo: Path, caplog,
+    ):
+        """The journal an operator actually greps must name the real condition.
+
+        esc-5556-1 was diagnosable only in hindsight because the line read as a
+        generic non-zero seed fault and the block reason said disk pressure.
+        """
+        import logging
+
+        await _commit_seed_script(seed_repo, _POST_5568_LOCKING_SEED_SCRIPT)
+        git_ops = GitOps(_config(), seed_repo, warm_lane_pool_size=1)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            await git_ops.acquire_warm_lane('task/lock', 'HEAD')
+
+        # Scoped to the _seed_warm_lane line specifically: the acquire_warm_lane
+        # abort path emits its OWN refusal WARNING (naming the retain-the-
+        # worktree decision), and both are wanted.  This test pins the one that
+        # carries the contended lock path.
+        refusals = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING
+            and '_seed_warm_lane: seed refused' in r.getMessage()
+        ]
+        assert len(refusals) == 1, (
+            f'expected exactly one _seed_warm_lane refusal WARNING, '
+            f'got {caplog.messages}'
+        )
+        msg = refusals[0]
+        assert 'lane-lock contention' in msg, msg
+        assert 'rc=77' in msg, msg
+        # The structural point, not an editorial phrase: an operator triaging
+        # the esc-5556-1 shape greps the journal for 'disk pressure', so this
+        # line must not come back from that sweep AT ALL — not even carrying
+        # the phrase in order to negate it.
+        assert 'disk pressure' not in msg.lower(), (
+            f'the contention WARNING still matches a disk-pressure grep: {msg!r}'
+        )
+        lane_lock = f'{git_ops.worktree_base / "_lane-0"}.lock'
+        assert lane_lock in msg, (
+            f'the contended lock path must be named so an operator can find '
+            f'the holder: expected {lane_lock!r} in {msg!r}'
+        )
+
+    async def test_pre_5568_lane_is_unchanged_and_still_yields_disk_pressure(
+        self, seed_repo: Path,
+    ):
+        """The legacy fence: a lane on an older seed script must not regress.
+
+        The probe fails CLOSED for it, so no flag is passed, the script exits
+        75, and the condition surfaces exactly as it did before task 4211.
+        Byte-identical behaviour is the point — the fix is purely additive.
+        """
+        from orchestrator.git_ops import WarmLaneUnavailable
+
+        await _commit_seed_script(seed_repo, _PRE_5568_LOCKING_SEED_SCRIPT)
+        git_ops = GitOps(_config(), seed_repo, warm_lane_pool_size=1)
+
+        result = await git_ops.acquire_warm_lane('task/legacy', 'HEAD')
+
+        assert result is WarmLaneUnavailable.DISK_PRESSURE, (
+            f'a pre-5568 lane must be unchanged by task 4211, got {result!r}'
         )

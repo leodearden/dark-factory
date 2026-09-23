@@ -455,12 +455,40 @@ class EventType(StrEnum):
     # and an ambiguity L1 appearing alone is not evidence of a resume storm.
     session_config_dir_ambiguous = 'session_config_dir_ambiguous'
 
-    # session_resume_failed (task 3578) — a resume that was ADOPTED by the
-    # _run_slot guard above and then still failed to happen. It closes the
-    # population that was previously journal-only and runs.db-INVISIBLE: an
-    # armed --resume whose transcript the CLI could not resolve exits before it
-    # ever contacts the API, so none of the three events above, and no cost or
-    # cap row, ever recorded that the session was lost.
+    # session_resume_failed (task 3578) — an ARMED resume that then failed to
+    # happen. It closes the population that was previously journal-only and
+    # runs.db-INVISIBLE: an armed --resume whose transcript the CLI could not
+    # resolve exits before it ever contacts the API, so none of the three
+    # events above, and no cost or cap row, ever recorded that the session was
+    # lost.
+    #
+    # WHICH PRODUCER ARMED IT is not what this used to say. The original text
+    # read "a resume that was ADOPTED by the _run_slot guard above", and the
+    # data says otherwise: measured 2026-09-16 against runs.db, all 10 rows are
+    # stage='cli', spanning 2026-08-24..2026-09-15, and NOT ONE of their
+    # session ids (or task ids) appears among the 8 session_resume rows the
+    # guard has ever emitted — whose nearest neighbours in time, 2026-08-20 and
+    # 2026-09-16, fall outside the failure span entirely. The only other writer
+    # of TaskWorkflow._pending_resume_session_id is the IN-WORKFLOW
+    # progress-timeout re-arm (workflow.py::TaskWorkflow, the re-arm beside the
+    # progress-timeout handler), so that is what armed all ten.
+    #
+    # That is also why this population, and not the guard's, is dense enough to
+    # carry an alarm — see the streak note below.
+    #
+    # THE INV-4 STORM STREAK'S SOLE GENUINE FEEDER since task ε/3733. Every row
+    # here is also reported to Harness.note_resume_failed, which subtracts the
+    # by-design carve-out and counts what is left as a chained run. FEEDS the
+    # streak: stage='cli' always (the restore ran a phase earlier and is not
+    # what failed), and stage='pre_flight' with restore 'fault' or 'published'.
+    # Does NOT feed it: restore 'disabled' (the kill switch) and 'miss' (the
+    # archive-COVERAGE signal, which belongs on a RATE watch rather than a
+    # consecutive-run detector) — harness.py::_BY_DESIGN_RESTORE_OUTCOMES. A
+    # restore outcome added later is GENUINE by default and must be added to
+    # that constant to be exempted. No new EventType was introduced for the
+    # feeder and no fourth term was added to the ratio denominator below: these
+    # rows already ARE the population, and a second event would be a second
+    # source of truth for one fact.
     #
     # NOT part of the ratio recipe's denominator above, and this is the one
     # thing to get right when querying it. The three events above are emitted by

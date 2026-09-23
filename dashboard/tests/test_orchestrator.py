@@ -562,12 +562,26 @@ class TestDiscoverOrchestratorsBudget:
     ``asyncio.wait_for(..., timeout=2.0)``. The inner budget is monkeypatched
     down to 0.05 s, so the guard is 40x the budget: it can only trip on a real
     regression, never on scheduling jitter.
+
+    NO ASSERTION IN THIS CLASS MAY MEASURE WALL CLOCK. Every bound here is
+    proven by call counts and by the operator-facing budget messages — which
+    are what the code actually promises an operator — and the 2.0 s test-side
+    ``wait_for`` above is the only clock permitted, because its job is to stop
+    an unbounded walk hanging pytest rather than to measure anything. Two
+    elapsed-time assertions used to live here and both recurred as flakes on a
+    loaded host: task 5201's 0.534 s against a 0.5 s ceiling, and task 5032's
+    merge-verify 0.793 s against 1.5x a 0.5 s budget. Each time the behaviour
+    under test passed and only the clock missed. They were removed after
+    measuring that they discriminated nothing the mechanism assertions did not
+    already catch (see the mutation recorded in
+    ``test_the_loop_deadline_truncates_a_root_share_not_the_per_root_budget``).
+    Do not restore one.
     """
 
     async def test_a_hanging_fetch_tasks_does_not_hang_discover_orchestrators(
         self, tmp_path, monkeypatch, dummy_client,
     ):
-        """One root whose fetch never returns degrades to the offline marker."""
+        """One root whose fetch never returns is reported DEGRADED, not offline."""
         import asyncio
         from unittest.mock import patch
 
@@ -604,17 +618,24 @@ class TestDiscoverOrchestratorsBudget:
         assert len(calls) == 1, 'the hang stub must actually have been reached'
         assert len(result) == 1
         entry = result[0]
-        # Exactly the shape the module's EXISTING offline path already writes,
-        # so no shaper, wire contract or React change is needed.
         assert entry['tasks'] == []
-        assert entry['offline'] is True
+        assert entry['offline'] is False, (
+            'the budget cancelled this fetch; nothing about it demonstrably '
+            'FAILED. Reporting it offline tells an operator fused-memory is '
+            f'down when the handler merely ran out of time: {entry}'
+        )
+        assert entry['degraded'] is True, (
+            "a cancelled fetch leaves this root's task tree UNKNOWN, and the "
+            'entry must say so in a field a consumer can branch on, not only '
+            f'inside the free-text error: {entry}'
+        )
         assert entry['summary']['total'] == 0
         assert 'error' in entry
         # A starved root must not read as a healthy project with zero tasks:
         # the real cause has to reach the operator on the wire.
         assert 'budget' in entry['error']
 
-    async def test_a_root_that_never_got_its_turn_is_marked_offline_not_silently_empty(
+    async def test_a_root_that_never_got_its_turn_is_marked_degraded_not_silently_empty(
         self, tmp_path, monkeypatch, dummy_client,
     ):
         """The whole-loop deadline degrades the unreached root, not the loop."""
@@ -661,10 +682,16 @@ class TestDiscoverOrchestratorsBudget:
         # The loop is not abandoned: BOTH roots still come back.
         assert len(result) == 2
         for entry in result:
-            assert entry['offline'] is True, (
+            assert entry['degraded'] is True, (
                 'a root the budget never let us measure must not render as a '
                 'healthy project with zero tasks — that is the invisible '
-                'failure this whole task exists to close'
+                f'failure this whole task exists to close: {entry}'
+            )
+            assert entry['offline'] is False, (
+                'neither root was proven unreachable — one was cancelled '
+                'mid-fetch and the other never attempted at all. Reporting '
+                'them offline sends an operator to restart a healthy service: '
+                f'{entry}'
             )
             assert entry['error']
         # The second root was skipped outright, not attempted and abandoned.
@@ -682,6 +709,21 @@ class TestDiscoverOrchestratorsBudget:
         exists to prevent. Here the per-root budget is 10x the loop budget, so
         only the ``min`` can keep the walk bounded, and only the ``min`` can
         report the share the root ACTUALLY got.
+
+        The discriminator for that mutation is the REPORTED SHARE, not a clock.
+        Measured 2026-09-15: mutating ``share = min(remaining,
+        _ORCHESTRATORS_PER_ROOT_BUDGET)`` to the bare per-root constant, with
+        both of this class's wall-clock assertions simultaneously neutralised,
+        still reddened this test — on ``'1.0s share' not in error``. The
+        elapsed-time assertion that used to sit below was therefore pure flake
+        surface, and is gone.
+
+        One residual is knowingly left uncovered: the reported share and the
+        applied ``timeout=`` read the same ``share`` local, so a mutation
+        touching ONLY the ``timeout=`` argument would slip past. Catching it
+        would mean monkeypatching ``asyncio.wait_for`` to observe a call this
+        module makes internally — reaching past the module's interface for a
+        mutation nobody has seen. Deliberately not chased.
         """
         import asyncio
         import re
@@ -715,26 +757,17 @@ class TestDiscoverOrchestratorsBudget:
              'running': True, 'started': 'Mar18'},
         ]
 
-        loop = asyncio.get_running_loop()
         with patch(
             'dashboard.data.orchestrator.find_running_orchestrators',
             return_value=mock_procs,
         ):
-            started = loop.time()
             result = await asyncio.wait_for(
                 discover_orchestrators(client=dummy_client, config=config),
                 timeout=2.0,
             )
-            elapsed = loop.time() - started
 
         assert len(result) == 2
         assert len(calls) == 1
-        # The whole walk costs the LOOP budget, not roots x per-root budget.
-        assert elapsed < 0.5, (
-            f'the walk took {elapsed:.3f}s against a 0.1s loop budget with a '
-            '1.0s per-root budget — the per-root bound alone is being applied, '
-            'so N roots cost N x 1.0s and the deadline buys nothing'
-        )
 
         # The operator message must name the share this root actually got, not
         # the per-root constant it never received.
@@ -751,7 +784,7 @@ class TestDiscoverOrchestratorsBudget:
         )
 
     async def test_two_pids_sharing_one_root_pay_the_budget_once(
-        self, tmp_path, monkeypatch, dummy_client,
+        self, tmp_path, monkeypatch, dummy_client, caplog,
     ):
         """Two processes on one root cost ONE budget, not one each.
 
@@ -763,9 +796,13 @@ class TestDiscoverOrchestratorsBudget:
         that is what must not regress.
 
         The deterministic ``len(calls) == 1`` assertion is what actually pins
-        that property; the timing assertion below is a secondary backstop.
+        that property. Its backstop is the WARNING COUNT below — exactly one
+        'exceeded its ... share' record means exactly one budget was actually
+        SPENT — and no longer a wall-clock ceiling; see this class's docstring
+        for why nothing here measures elapsed time.
         """
         import asyncio
+        import logging
         from unittest.mock import patch
 
         from dashboard.config import DashboardConfig
@@ -779,7 +816,9 @@ class TestDiscoverOrchestratorsBudget:
             await asyncio.Event().wait()
 
         monkeypatch.setattr('dashboard.data.orchestrator.fetch_tasks', _hang)
-        budget = 0.5
+        # The hang stub means this test literally sleeps for one budget, and
+        # nothing asserts on its magnitude now that the clock is gone.
+        budget = 0.05
         monkeypatch.setattr(orchestrator, '_ORCHESTRATORS_PER_ROOT_BUDGET', budget)
 
         proj = tmp_path / 'proj_shared'
@@ -793,28 +832,14 @@ class TestDiscoverOrchestratorsBudget:
              'running': True, 'started': 'Mar18'},
         ]
 
-        loop = asyncio.get_running_loop()
         with patch(
             'dashboard.data.orchestrator.find_running_orchestrators',
             return_value=mock_procs,
-        ):
-            # Pre-warm the default executor so its FIRST-USE thread spin-up (a
-            # one-off cost of tens of ms) is not charged to the budget: the
-            # first act of dashboard/src/dashboard/data/orchestrator.py::
-            # discover_orchestrators is
-            # `await asyncio.to_thread(find_running_orchestrators)`, and that
-            # spin-up is not the budget under test. `_resolve_project_root`'s
-            # filesystem walks run inside the timed region too and CANNOT be
-            # pre-warmed away from the test side — they are absorbed by the
-            # widened 1.5x margin instead. Both remedies are needed here;
-            # neither alone suffices.
-            await asyncio.to_thread(lambda: None)
-            started = loop.time()
+        ), caplog.at_level(logging.WARNING, logger='dashboard.data.orchestrator'):
             result = await asyncio.wait_for(
                 discover_orchestrators(client=dummy_client, config=config),
                 timeout=2.0,
             )
-            elapsed = loop.time() - started
 
         assert len(calls) == 1, (
             f'the shared root was fetched {len(calls)} times — one PID per '
@@ -823,24 +848,30 @@ class TestDiscoverOrchestratorsBudget:
         )
         assert len(result) == 1
         assert sorted(result[0]['pids']) == [1234, 5678]
-        assert result[0]['offline'] is True
+        assert result[0]['offline'] is False, (
+            'the single fetch was cancelled by the budget, not proven to fail'
+        )
+        assert result[0]['degraded'] is True, (
+            "the shared root's task tree is UNKNOWN for this render, and both "
+            'PIDs must carry that fact rather than a confident zero'
+        )
         assert result[0]['error']
-        # Secondary backstop to `len(calls) == 1` above. The budget is
-        # deliberately large for a test whose subject is a timeout: it is
-        # scaled so the ABSOLUTE jitter margin exceeds host scheduling noise,
-        # not because the operation needs 0.5 s. One root fetched once costs
-        # ~1x budget; the per-process regression costs 2 PIDs x budget = ~2x;
-        # 1.5x sits midway, giving 0.25 s of slack on both sides instead of
-        # the 50 ms that flaked at ~4% per run. Do NOT shrink it back.
-        assert elapsed < 1.5 * budget, (
-            f'one root took {elapsed:.3f}s against a {1.5 * budget}s '
-            f'threshold (1.5 x the {budget}s per-root budget). The '
-            'len(calls) == 1 assertion above already passed, so the root was '
-            'fetched EXACTLY ONCE and this is not per-process payment: a '
-            'single fetch overran one budget of wall time. Look at the '
-            'per-root wait_for wiring and the min(remaining, '
-            '_ORCHESTRATORS_PER_ROOT_BUDGET) deadline arithmetic in '
-            'discover_orchestrators — or, failing that, at host jitter.'
+        # Backstop to `len(calls) == 1`: one budget SPENT, not merely one
+        # fetch issued. Each root that overruns logs exactly one 'exceeded
+        # its ... share' WARNING, so a walk that charged per PROCESS would
+        # log two for this single shared root.
+        overruns = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and 'exceeded its' in r.getMessage()
+        ]
+        assert len(overruns) == 1, (
+            f'{len(overruns)} budget-overrun warnings were logged for ONE '
+            'shared root, which overruns once and so must log once. More than '
+            'one means an N-orchestrator host pays N x the budget for a single '
+            'project on every poll: look at the `groups` merge and the '
+            '`if project_root not in project_cache` guard in '
+            f'discover_orchestrators. Messages: '
+            f'{[r.getMessage() for r in overruns]}'
         )
 
 
@@ -1089,7 +1120,19 @@ class TestDiscoverOrchestratorsPerProject:
 
 
 class TestDiscoverOrchestratorsOfflineMarker:
-    """Tests for discover_orchestrators propagating the MCP offline marker."""
+    """discover_orchestrators carries *offline* and *degraded* SEPARATELY.
+
+    This class owns the SPLIT, not merely the marker's survival. The invariant
+    itself — *offline* means the fetch demonstrably failed and the project is
+    proven unreachable, *degraded* means a budget expired first and the
+    project's state is simply UNKNOWN — is stated once, at
+    ``dashboard/src/dashboard/data/active_tasks.py::collect_tasks_with_counts``,
+    together with the operator consequence of collapsing them.
+
+    ``TestDiscoverOrchestratorsBudget`` pins the degraded corner. What is
+    pinned here is the other two: a fetch that demonstrably failed, and a
+    healthy one.
+    """
 
     async def test_offline_marker_preserved_not_discarded(self, tmp_path, monkeypatch, dummy_client):
         """When fetch_tasks returns the offline marker, the project entry must still appear
@@ -1117,9 +1160,45 @@ class TestDiscoverOrchestratorsOfflineMarker:
         entry = result[0]
         assert entry.get('offline') is True, f'expected offline=True, got: {entry}'
         assert entry.get('error') == 'boom', f'expected error=boom, got: {entry}'
+        assert entry.get('degraded') is False, (
+            'this fetch was attempted and demonstrably failed, so the project '
+            'is proven unreachable — reporting it merely degraded understates '
+            f'a real outage as an unmeasured one: {entry}'
+        )
         # Summary should be all-zero (no tasks)
         s = entry.get('summary', {})
         assert s.get('total', -1) == 0
+
+    async def test_a_healthy_root_is_neither_offline_nor_degraded(
+        self, tmp_path, monkeypatch, dummy_client,
+    ):
+        """The common case sets BOTH flags False — neither may be absent.
+
+        Every consumer downstream reads the pair unconditionally (the shaper
+        ``bool()``-coerces both; the orchestrators tab branches on both), so
+        "no key at all" is not an acceptable spelling of "healthy".
+        """
+        from unittest.mock import patch
+
+        from dashboard.config import DashboardConfig
+        from dashboard.data.orchestrator import discover_orchestrators
+
+        config = DashboardConfig(project_root=tmp_path)
+        prd_path = str(tmp_path / 'prd.md')
+        mock_procs = [{'pid': 4242, 'prd': prd_path, 'config_path': None, 'running': True, 'started': 'Mar18'}]
+
+        async def healthy_fetch(client, cfg, project_root):
+            return [{'id': 1, 'title': 'a real task', 'status': 'done'}]
+
+        monkeypatch.setattr('dashboard.data.orchestrator.fetch_tasks', healthy_fetch)
+        with patch('dashboard.data.orchestrator.find_running_orchestrators', return_value=mock_procs):
+            result = await discover_orchestrators(client=dummy_client, config=config)
+
+        assert len(result) == 1
+        entry = result[0]
+        assert entry['summary']['total'] == 1, f'the success arm was not taken: {entry}'
+        assert entry['offline'] is False, f'a fetch that returned tasks is not offline: {entry}'
+        assert entry['degraded'] is False, f'a fetch that returned tasks is not degraded: {entry}'
 
 
 class TestReadMaxConcurrentTasks:

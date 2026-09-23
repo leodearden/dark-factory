@@ -577,6 +577,30 @@ async def run_server():
             f'idempotent_ops retention prune at startup: {_idempotent_pruned} rows'
         )
 
+    # Bounded retention: age out old write_ops so the journal does not grow
+    # without bound. UNLIKE its two siblings above this prune is BATCHED,
+    # ROW-BUDGETED and DEADLINE-BOUNDED: write_ops was measured at 35.4M rows /
+    # 16 GB, and an unbounded DELETE here would hold the write lock past the
+    # watchdog's 120 s startup grace (STARTUP_GRACE_SECS in
+    # scripts/orchestrator-watchdog.py) while silently dropping journal rows —
+    # log_write_op swallows its own errors and busy_timeout is only 5000 ms — so
+    # it would corrupt the very telemetry it is pruning. A first run against the
+    # current backlog will legitimately need many restarts to drain, which the
+    # prune discloses at WARNING rather than hiding. Fire-and-forget.
+    _wj = config.write_journal
+    _write_ops_pruned = await write_journal.prune_write_ops(
+        read_older_than_days=_wj.read_retention_days,
+        search_older_than_days=_wj.search_retention_days,
+        write_older_than_days=_wj.write_retention_days,
+        batch_size=_wj.prune_batch_size,
+        max_rows=_wj.prune_max_rows_per_run,
+        max_seconds=_wj.prune_max_seconds,
+    )
+    if _write_ops_pruned:
+        logger.info(
+            f'write_ops retention prune at startup: {_write_ops_pruned} rows'
+        )
+
     # Initialize task backend (SqliteTaskBackend).
     taskmaster = None
     task_interceptor = None

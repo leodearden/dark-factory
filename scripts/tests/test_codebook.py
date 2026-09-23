@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 import pytest
 from legibility import codebook as mod
+from legibility import coder
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -763,6 +765,321 @@ def test_apply_coding_record_still_creates_pending_for_a_genuinely_new_title():
 
 
 # ---------------------------------------------------------------------------
+# task 5198: RED — apply_coding_record() `corrections`, the third op.
+#
+# A sighting is an immutable dated observation, so both existing ops are pure
+# appends. An entry's title/cause is instead the CURRENT best explanation of a
+# cause, and it is the only part of an entry that
+# `scripts/legibility/coder.py::build_codebook_index` renders to the coder —
+# so a refuted framing can only be withdrawn by rewriting it there.
+# ---------------------------------------------------------------------------
+
+# apply_coding_record()'s full stats contract with every counter at rest: what
+# the sole writer reports when it changed nothing. Shared with the live-corpus
+# re-apply no-op pins below so the contract is declared once.
+_NO_CHANGES = {
+    "matched": 0,
+    "skipped_unknown_entry": 0,
+    "candidates_applied": 0,
+    "candidate_disposition_conflicts": 0,
+    "corrections_applied": 0,
+    "correction_skipped": 0,
+    "record_invalid": False,
+}
+
+
+def _correction_record(entry_id="entry-a", session="sess-correction", date="2026-07-14"):
+    """A §7.3 record carrying one `corrections` op that names all three
+    writable fields. Callers mutate the returned record to build variants."""
+    return {
+        "session": session,
+        "date": date,
+        "project": "dark_factory",
+        "agent_class": "orchestrated-task",
+        "corrections": [
+            {
+                "entry_id": entry_id,
+                "origin_phase": "unknown",
+                "manifested_phase": "verify",
+                "title": "Retracted: the recorded cause was refuted",
+                "cause": "The premise did not hold; superseded by entry-b.",
+                "status": "retired",
+                "note": "CORRECTION: the transcript refutes the recorded cause.",
+            }
+        ],
+    }
+
+
+def test_apply_coding_record_correction_rewrites_only_the_named_fields():
+    """Writes title/cause/status, leaves every other entry field alone, and
+    appends exactly one sighting built from the record header + the
+    correction's own phase stamps and note."""
+    codebook = _codebook_with_entry_a()
+    before = copy.deepcopy(codebook["entries"][0])
+    record = _correction_record()
+    correction = record["corrections"][0]
+
+    result, stats = mod.apply_coding_record(codebook, record)
+
+    entry = next(e for e in result["entries"] if e["id"] == "entry-a")
+    assert entry["title"] == correction["title"]
+    assert entry["cause"] == correction["cause"]
+    assert entry["status"] == correction["status"]
+
+    untouched = {
+        field: value
+        for field, value in before.items()
+        if field not in {"title", "cause", "status", "sightings"}
+    }
+    assert {field: entry[field] for field in untouched} == untouched
+
+    assert entry["sightings"] == [
+        {
+            "date": "2026-07-14",
+            "project": "dark_factory",
+            "session": "sess-correction",
+            "origin_phase": "unknown",
+            "manifested_phase": "verify",
+            "note": correction["note"],
+        }
+    ]
+    assert stats == {**_NO_CHANGES, "corrections_applied": 1}
+    assert mod.validate(result) == []
+
+
+def test_apply_coding_record_correction_never_deletes_and_does_not_mutate_input():
+    """Prior sightings survive a field rewrite, the new one lands after them,
+    and the input codebook is not touched (deep-copy semantics, as both
+    existing ops guarantee)."""
+    codebook = _codebook_with_entry_a()
+    codebook["entries"][0]["sightings"] = [
+        {
+            "date": "2026-07-01",
+            "project": "dark_factory",
+            "session": "sess-original",
+            "origin_phase": "unknown",
+            "manifested_phase": "verify",
+        }
+    ]
+    original = copy.deepcopy(codebook)
+
+    result, _ = mod.apply_coding_record(codebook, _correction_record())
+
+    entry = next(e for e in result["entries"] if e["id"] == "entry-a")
+    assert [s["session"] for s in entry["sightings"]] == [
+        "sess-original",
+        "sess-correction",
+    ]
+    mod.assert_no_deletion(original, result)
+    assert codebook == original
+
+
+def test_apply_coding_record_correction_re_apply_is_a_no_op(caplog):
+    """The whole correction — field writes AND provenance sighting — is gated
+    by the one `session` dedup the match path already uses, so `apply` re-run
+    over the same file (nightly, or to resolve a rebase) changes nothing."""
+    codebook = _codebook_with_entry_a()
+    record = _correction_record()
+
+    with caplog.at_level(logging.WARNING, logger="legibility.codebook"):
+        once, _ = mod.apply_coding_record(codebook, record)
+        twice, stats = mod.apply_coding_record(once, record)
+
+    assert stats == _NO_CHANGES
+    assert twice == once
+    # SILENT by design, and that is the whole point of the distinction: an
+    # already-merged record is the dedup doing its job. `correction_skipped`
+    # and its WARNING are reserved for the sibling-op collision below, where
+    # a correction genuinely failed to land.
+    assert caplog.records == []
+
+
+def _match_and_correction_record(entry_id="entry-a"):
+    """One record that both matches and corrects the same entry — the shape in
+    which the per-(session, entry) sighting dedup forces a choice between the
+    two ops."""
+    record = _correction_record(entry_id=entry_id)
+    record["matches"] = [
+        {
+            "entry_id": entry_id,
+            "origin_phase": "implement",
+            "manifested_phase": "merge",
+            "note": "the match's own note",
+        }
+    ]
+    return record
+
+
+def test_apply_coding_record_correction_outranks_a_sibling_match_on_one_entry():
+    """Both ops write at most one sighting per (session, entry), so a record
+    carrying both for one entry can land only one — and it must be the
+    correction: a match's sighting is one interchangeable observation, while
+    the correction is the only op that can withdraw a refuted framing."""
+    codebook = _codebook_with_entry_a()
+    record = _match_and_correction_record()
+    correction = record["corrections"][0]
+
+    result, stats = mod.apply_coding_record(codebook, record)
+
+    entry = next(e for e in result["entries"] if e["id"] == "entry-a")
+    assert entry["title"] == correction["title"]
+    assert [s["note"] for s in entry["sightings"]] == [correction["note"]]
+    assert stats == {**_NO_CHANGES, "corrections_applied": 1}
+    assert mod.validate(result) == []
+
+
+def test_apply_coding_record_colliding_correction_is_counted_and_logged(caplog):
+    """Two corrections for one entry in one record collide on that same single
+    slot. The loser cannot land — but it must not be dropped SILENTLY, since a
+    vanished framing withdrawal is indistinguishable from a successful one in
+    the returned codebook."""
+    codebook = _codebook_with_entry_a()
+    record = _correction_record()
+    loser = copy.deepcopy(record["corrections"][0])
+    loser["title"] = "A second, conflicting retitle"
+    record["corrections"].append(loser)
+
+    with caplog.at_level(logging.WARNING, logger="legibility.codebook"):
+        result, stats = mod.apply_coding_record(codebook, record)
+
+    entry = next(e for e in result["entries"] if e["id"] == "entry-a")
+    assert entry["title"] == record["corrections"][0]["title"]
+    assert stats == {**_NO_CHANGES, "corrections_applied": 1, "correction_skipped": 1}
+
+    assert len(caplog.records) == 1
+    message = caplog.records[0].getMessage()
+    assert "entry-a" in message and record["session"] in message
+    assert mod.validate(result) == []
+
+
+# The never-clear guard's input grid. ("status", "empty") is absent by
+# construction: "" is not in STATUSES, so an emptied status never reaches the
+# truthiness guard — `validate_coding_record` rejects the whole record first,
+# which `_correction_with_an_empty_status` pins below.
+_UNSUPPLIED_FIELD_SPELLINGS = [
+    ("title", "empty"),
+    ("title", "omitted"),
+    ("cause", "empty"),
+    ("cause", "omitted"),
+    ("status", "omitted"),
+]
+
+
+@pytest.mark.parametrize(("field", "spelling"), _UNSUPPLIED_FIELD_SPELLINGS)
+def test_apply_coding_record_correction_never_clears_a_field(field, spelling):
+    """The never-delete boundary of the one op allowed to overwrite instead of
+    append: a field the correction does not actually supply — spelled `""` or
+    left out — keeps its pre-correction value, while the fields it does supply
+    are still written and the provenance sighting is still appended."""
+    codebook = _codebook_with_entry_a()
+    # entry-a carries no `cause` by default; a correction that omits one can
+    # only be shown to preserve it if there was something to preserve.
+    codebook["entries"][0]["cause"] = "The original, not-yet-refuted explanation."
+    before = copy.deepcopy(codebook["entries"][0])
+
+    record = _correction_record()
+    correction = record["corrections"][0]
+    if spelling == "empty":
+        correction[field] = ""
+    else:
+        del correction[field]
+
+    result, stats = mod.apply_coding_record(codebook, record)
+
+    entry = next(e for e in result["entries"] if e["id"] == "entry-a")
+    assert entry[field] == before[field]
+    for still_supplied in {"title", "cause", "status"} - {field}:
+        assert entry[still_supplied] == correction[still_supplied]
+    assert [s["note"] for s in entry["sightings"]] == [correction["note"]]
+    assert stats == {**_NO_CHANGES, "corrections_applied": 1}
+    assert mod.validate(result) == []
+
+
+def test_apply_coding_record_correction_unknown_entry_id_is_skipped_and_counted():
+    """Mirrors the match path: only the census creates entries, so an
+    unresolvable entry_id is counted, never fabricated."""
+    codebook = _codebook_with_entry_a()
+    record = _correction_record(entry_id="entry-zzz")
+
+    result, stats = mod.apply_coding_record(codebook, record)
+
+    assert result["entries"] == _codebook_with_entry_a()["entries"]
+    assert stats == {**_NO_CHANGES, "skipped_unknown_entry": 1}
+    assert mod.validate(result) == []
+
+
+@pytest.mark.parametrize("action", ["delete", "remove"])
+def test_apply_coding_record_raises_on_correction_removal_action(action):
+    """A removal-shaped correction is rejected before the codebook is copied,
+    exactly as `_reject_deletion_directive` already treats `matches`."""
+    codebook = _codebook_with_entry_a()
+    original = copy.deepcopy(codebook)
+    record = _correction_record()
+    record["corrections"][0]["action"] = action
+
+    with pytest.raises(mod.NeverDeleteError):
+        mod.apply_coding_record(codebook, record)
+
+    assert codebook == original
+
+
+def _correction_with_out_of_enum_status():
+    record = _correction_record()
+    record["corrections"][0]["status"] = "not-a-status"
+    return record
+
+
+def _correction_without_its_required_note():
+    record = _correction_record()
+    del record["corrections"][0]["note"]
+    return record
+
+
+def _correction_with_an_empty_note():
+    """`""` is a missing audit trail spelled differently: `_build_sighting`
+    emits `note` only when truthy, so an empty one would rewrite the entry's
+    framing and leave a bare sighting that says nothing about why."""
+    record = _correction_record()
+    record["corrections"][0]["note"] = ""
+    return record
+
+
+def _correction_with_an_empty_status():
+    """Unlike title/cause, an emptied `status` is not a silently-ignored
+    "field not supplied": "" is outside STATUSES, so the record is rejected
+    before the never-clear guard ever sees it."""
+    record = _correction_record()
+    record["corrections"][0]["status"] = ""
+    return record
+
+
+@pytest.mark.parametrize(
+    "build_record",
+    [
+        _correction_with_out_of_enum_status,
+        _correction_without_its_required_note,
+        _correction_with_an_empty_note,
+        _correction_with_an_empty_status,
+    ],
+)
+def test_apply_coding_record_invalid_correction_is_skipped_whole(build_record):
+    """An entry's framing may never change without an audit trail, and never
+    into a status outside STATUSES. Every such failure is caught by
+    `validate_coding_record`, which skips the record WHOLE — no partial field
+    write survives."""
+    codebook = _codebook_with_entry_a()
+    original = copy.deepcopy(codebook)
+    record = build_record()
+
+    assert mod.validate_coding_record(record) != []
+
+    result, stats = mod.apply_coding_record(codebook, record)
+
+    assert stats == {**_NO_CHANGES, "record_invalid": True}
+    assert result == original
+
+
+# ---------------------------------------------------------------------------
 # step-13: RED (§8.3 never-delete) — NeverDeleteError + assert_no_deletion
 # ---------------------------------------------------------------------------
 
@@ -1170,6 +1487,29 @@ class TestMainCLI:
         assert candidate["sightings"][1]["session"] == "sess-new"
         assert mod.validate(reloaded) == []
 
+    def test_apply_summary_reports_corrections_applied(self, tmp_path, capsys):
+        """The third op reports itself in the same stdout summary as the other
+        two, so an operator (and the nightly log) can see a correction landed
+        rather than inferring it from a silent file rewrite."""
+        codebook_path = tmp_path / "codebook.yaml"
+        mod.dump(_codebook_with_entry_a(), codebook_path)
+        records_path = tmp_path / "records.jsonl"
+        records_path.write_text(
+            json.dumps(_correction_record()) + "\n", encoding="utf-8"
+        )
+
+        ret = mod.main(["apply", str(codebook_path), str(records_path)])
+        captured = capsys.readouterr()
+
+        assert ret == 0
+        assert "corrections_applied=1" in captured.out
+
+        reloaded = mod.load(codebook_path)
+        entry = next(e for e in reloaded["entries"] if e["id"] == "entry-a")
+        assert entry["status"] == "retired"
+        assert entry["sightings"][0]["session"] == "sess-correction"
+        assert mod.validate(reloaded) == []
+
     def test_migrate_empty_file_fails_loudly_instead_of_crashing(self, tmp_path, capsys):
         """An empty codebook file loads via yaml.safe_load() as None.
         _cmd_migrate must report a clear error and return 1, not raise an
@@ -1298,6 +1638,185 @@ def test_live_codebook_has_no_pending_twin_of_an_adjudicated_candidate():
 
 
 # ---------------------------------------------------------------------------
+# Shared machinery for the live-file guards below (tasks 4892, 5198, 5687).
+# Each asserts that a committed §7.3 coding record and the merger-owned
+# registry still agree; the comparison itself is single-sourced here, so each
+# guard states only what is distinctive about its own correction and a fix to
+# the comparison lands once rather than once per guard.
+# ---------------------------------------------------------------------------
+
+# What apply_coding_record copies verbatim from a match/candidate/correction
+# payload into the sighting it appends. The optional three are emitted only
+# when truthy, so a payload that omits one is compared as omitting it.
+_SIGHTING_PAYLOAD_FIELDS = (
+    "origin_phase",
+    "manifested_phase",
+    "invariant_violated",
+    "note",
+    "evidence_quote",
+)
+
+
+def _sightings_for(holder: dict, session: str) -> list[dict]:
+    return [s for s in holder.get("sightings") or [] if s.get("session") == session]
+
+
+def _assert_correction_absorbed(
+    record_path: Path,
+    session: str,
+    entry_id: str,
+    *,
+    refuted_tokens: tuple[str, ...],
+    expected_status: str,
+    original_sightings: dict[str, str],
+) -> tuple[dict, dict, dict]:
+    """Assert the *session* correction committed in *record_path* is fully
+    absorbed by the committed registry, and hand back its
+    ``(record, correction, entry)`` triple for whatever else a caller pins.
+
+    A correction REWRITES merger-owned fields in place — the one op in the
+    §7.3 vocabulary that is not a pure append — so every guard over one needs
+    the same six properties, each invariant under every transition the system
+    is designed to make to these two files:
+
+    (0) WELL-FORMED — *record_path* is JSONL, exactly one of its records
+        carries *session*, it validates, and it holds exactly one
+        `corrections` op naming *entry_id*. Both counts are scoped BY
+        SESSION, not file-wide: the sanctioned way to re-correct an entry
+        later is a NEW session in the same file (task 4892's record holds
+        several ops across two), and a file-wide count would break the moment
+        anyone appends. Exactly-one matters because the merger admits one
+        sighting per (session, entry), so a second op for this entry in this
+        session would be counted in `correction_skipped` with its field
+        writes lost.
+    (1) AGREEMENT — the entry's title/cause/status equal the record's, and one
+        sighting carries the record's payload field for field. This is the
+        in-place-rewrite detector for the merger-owned YAML, and it is what
+        proves the correction's full text is carried verbatim — which is why
+        no caller needs to pin cause or note prose.
+    (2) WITHDRAWN — no *refuted_tokens* member survives in the title, the one
+        field `scripts/legibility/coder.py::build_codebook_index` renders to
+        the nightly coder unconditionally.
+    (3) STATUS — the entry is *expected_status*, pinned so a later sweep can
+        neither retire a live defect nor reopen a settled one while leaving
+        the guard green.
+    (4) NEVER-DELETE and ORDER — every session in *original_sightings*
+        survives, still carrying its mapped date, and the correction's own
+        sighting follows all of them.
+    (5) NO-OP — re-applying the record changes nothing, which makes a rebase
+        onto a nightly-rewritten main resolvable by re-running one CLI command
+        instead of hand-editing 22k lines of generated YAML.
+
+    An entry's TOTAL sighting count is deliberately never pinned: the nightly
+    census may legitimately append more, to retired entries too (they stay in
+    the coder's index). Presence-of-each-original plus ORDER carries
+    never-delete without that coupling. Nor is any substring of a note's prose
+    pinned — (1) already proves it is carried verbatim — and schema shape
+    stays owned by `test_live_codebook_is_v2_and_validates_green`.
+    """
+    # (0) WELL-FORMED.
+    records = [
+        json.loads(line)
+        for line in record_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    mine = [r for r in records if r.get("session") == session]
+    assert len(mine) == 1, (
+        f"expected exactly one {session!r} record in {record_path}, found "
+        f"{len(mine)}; sessions present: "
+        f"{sorted({r.get('session') for r in records})}"
+    )
+    record = mine[0]
+    assert mod.validate_coding_record(record) == [], (
+        f"invalid §7.3 coding record for session {session!r}"
+    )
+    corrections = record.get("corrections") or []
+    assert len(corrections) == 1, (
+        f"expected exactly one correction in the {session!r} record, got "
+        f"{len(corrections)} — the merger admits one sighting per (session, "
+        "entry), so a second op for this entry in this session would be "
+        "dropped into `correction_skipped` with its field writes lost"
+    )
+    correction = corrections[0]
+    assert correction.get("entry_id") == entry_id
+
+    codebook = mod.load(_LIVE_CODEBOOK_PATH)
+    entries = [e for e in codebook.get("entries") or [] if e.get("id") == entry_id]
+    assert len(entries) == 1, f"expected exactly one {entry_id!r} entry"
+    entry = entries[0]
+
+    # (1) AGREEMENT — entry fields, then the provenance sighting.
+    field_drift = {
+        field: (correction[field], entry.get(field))
+        for field in ("title", "cause", "status")
+        if correction.get(field) and correction[field] != entry.get(field)
+    }
+    assert field_drift == {}, (
+        f"{entry_id!r} no longer carries the committed correction — a "
+        f"merger-owned field was rewritten by hand {{field: (record, codebook)}}: "
+        f"{field_drift}"
+    )
+
+    carried = _sightings_for(entry, session)
+    assert len(carried) == 1, (
+        f"expected exactly one {session!r} sighting on {entry_id!r}, found "
+        f"{len(carried)}"
+    )
+    sighting_drift = {
+        field: (correction[field], carried[0].get(field))
+        for field in _SIGHTING_PAYLOAD_FIELDS
+        if correction.get(field) and correction[field] != carried[0].get(field)
+    }
+    assert sighting_drift == {}, (
+        f"the {session!r} sighting no longer matches the committed record "
+        f"{{field: (record, codebook)}}: {sighting_drift}"
+    )
+
+    # (2) WITHDRAWN — the refuted framing is gone from the one field
+    #     build_codebook_index renders unconditionally.
+    title_lower = entry["title"].lower()
+    still_asserted = [t for t in refuted_tokens if t.lower() in title_lower]
+    assert still_asserted == [], (
+        f"{entry_id!r} still asserts the refuted framing via {still_asserted} "
+        f"— build_codebook_index renders this title to the coder every night: "
+        f"{entry['title']!r}"
+    )
+
+    # (3) STATUS.
+    assert entry.get("status") == expected_status, (
+        f"{entry_id!r} is {entry.get('status')!r}, not {expected_status!r}"
+    )
+
+    # (4) NEVER-DELETE and ORDER.
+    sightings = entry.get("sightings") or []
+    order = {s.get("session"): i for i, s in enumerate(sightings)}
+    for original_session, date in original_sightings.items():
+        assert original_session in order, (
+            f"the {original_session!r} sighting was deleted from {entry_id!r} "
+            "— sightings are immutable dated observations, and a correction "
+            "annotates them rather than retracting them"
+        )
+        original = sightings[order[original_session]]
+        assert original.get("date") == date, (
+            f"the {original_session!r} sighting was re-dated to "
+            f"{original.get('date')!r} (was {date!r}) — a dated observation is "
+            "not editable"
+        )
+    assert order[session] > max(order[s] for s in original_sightings), (
+        f"the {session!r} sighting does not follow the sightings it annotates"
+    )
+
+    # (5) NO-OP — the committed YAML is exactly what the sole writer produces.
+    _, stats = mod.apply_coding_record(codebook, record)
+    assert stats == _NO_CHANGES, (
+        f"re-applying session {session!r} changed something — the committed "
+        f"codebook has not fully absorbed the record: {stats}"
+    )
+
+    return record, correction, entry
+
+
+# ---------------------------------------------------------------------------
 # task 4892 (live-file guard) — both corrections landed through the sole
 # writer, and the committed registry still carries the committed record.
 # ---------------------------------------------------------------------------
@@ -1309,21 +1828,6 @@ _T4892_CANDIDATE_SESSION = "task-4892-lettered-option-collision"
 _T4892_RECORD_PATH = (
     _REPO_ROOT / "docs" / "legibility" / "coding-records" / "task-4892-corrections.jsonl"
 )
-
-# What apply_coding_record copies verbatim from a match/candidate payload into
-# the sighting it appends. The optional three are emitted only when truthy, so
-# a payload that omits one is compared as omitting it.
-_SIGHTING_PAYLOAD_FIELDS = (
-    "origin_phase",
-    "manifested_phase",
-    "invariant_violated",
-    "note",
-    "evidence_quote",
-)
-
-
-def _t4892_sightings_for(holder: dict, session: str) -> list[dict]:
-    return [s for s in holder.get("sightings") or [] if s.get("session") == session]
 
 
 def _t4892_carriers(codebook: dict, record: dict):
@@ -1391,12 +1895,12 @@ def test_live_codebook_carries_the_task_4892_corrections():
             f"invalid §7.3 coding record for session {session!r}"
         )
         for key, payload, holders in _t4892_carriers(codebook, record):
-            carrying = [h for h in holders if _t4892_sightings_for(h, session)]
+            carrying = [h for h in holders if _sightings_for(h, session)]
             assert len(carrying) == 1, (
                 f"expected exactly one live record under {key!r} to carry a "
                 f"{session!r} sighting, found {[h.get('id') for h in carrying]}"
             )
-            carried = _t4892_sightings_for(carrying[0], session)
+            carried = _sightings_for(carrying[0], session)
             assert len(carried) == 1, (
                 "the sole writer must not duplicate a sighting on a re-run — "
                 f"{session!r} appears {len(carried)}x on {carrying[0].get('id')!r}"
@@ -1437,13 +1941,187 @@ def test_live_codebook_carries_the_task_4892_corrections():
     #     writer over it appends nothing.
     for record in records:
         codebook, stats = mod.apply_coding_record(codebook, record)
-        assert stats == {
-            "matched": 0,
-            "skipped_unknown_entry": 0,
-            "candidates_applied": 0,
-            "candidate_disposition_conflicts": 0,
-            "record_invalid": False,
-        }, (
+        assert stats == _NO_CHANGES, (
             f"re-applying session {record.get('session')!r} appended something — "
             f"its sightings are not already absorbed by the live codebook: {stats}"
         )
+
+
+# ---------------------------------------------------------------------------
+# task 5198 (live-file guard, esc-5120-2) — the refuted task-5120 framing is
+# withdrawn from the committed registry, through the sole writer.
+# ---------------------------------------------------------------------------
+
+_T5198_ENTRY_ID = "entry-cand-20260831-16"
+_T5198_CORRECTION_SESSION = "task-5198-verify-summary-glob-refutation"
+_T5198_RECORD_PATH = (
+    _REPO_ROOT / "docs" / "legibility" / "coding-records" / "task-5198-corrections.jsonl"
+)
+
+# The three sightings the correction ANNOTATES. They observed a real symptom —
+# agents genuinely did hit an opaque JSONDecodeError — and only the cause they
+# were filed under was refuted, so each must survive, still carrying its date.
+_T5198_ORIGINAL_SIGHTINGS = {
+    "273579c5-e299-40c6-ab02-e4c0ab24213b": "2026-08-31",
+    "8a483603-92b1-460b-8af1-65c02d70a598": "2026-09-05",
+    "d83f509f-a7e5-4eeb-9e2b-74e80289204b": "2026-09-05",
+}
+
+# The token pair that made the entry self-ingesting: the census kept matching
+# its own quoted error string back to this title.
+_T5198_REFUTED_TOKENS = ("glob miss", "JSONDecodeError")
+
+
+def test_live_codebook_withdraws_the_refuted_task_5120_framing():
+    """The committed §7.3 record and the committed registry still agree, and
+    the refuted framing is no longer asserted to the coder.
+
+    `scripts/legibility/coder.py::build_codebook_index` renders one line per
+    entry — `- {id}: {title} — {cause}` — and deliberately keeps retired
+    entries in that index, so retirement alone would leave the refuted title
+    in front of the very loop esc-5120-2 diagnoses as self-ingesting. The
+    withdrawal therefore had to be a rewritten title AND a 'retired' status,
+    which is exactly the pair `_assert_correction_absorbed` pins; nothing
+    about this correction is distinctive enough to assert beyond it.
+    """
+    _assert_correction_absorbed(
+        _T5198_RECORD_PATH,
+        _T5198_CORRECTION_SESSION,
+        _T5198_ENTRY_ID,
+        refuted_tokens=_T5198_REFUTED_TOKENS,
+        expected_status="retired",
+        original_sightings=_T5198_ORIGINAL_SIGHTINGS,
+    )
+
+
+# ---------------------------------------------------------------------------
+# task 5687 (live-file guard, confusion census 2026-09-20 §1.2/§5) — the
+# refuted em-dash framing is withdrawn from the committed registry, through
+# the sole writer.
+# ---------------------------------------------------------------------------
+
+_T5687_ENTRY_ID = "entry-cand-20260919-2"
+_T5687_CORRECTION_SESSION = "task-5687-embedded-triple-quote-reproduction"
+_T5687_RECORD_PATH = (
+    _REPO_ROOT / "docs" / "legibility" / "coding-records" / "task-5687-corrections.jsonl"
+)
+
+# The founding observation the correction ANNOTATES, and the quote it was
+# filed with. The symptom was real — python3 genuinely did report an invalid
+# U+2014 — and only the cause it was filed under was refuted, so the sighting
+# survives unedited rather than being retracted.
+_T5687_ORIGINAL_SIGHTING = {"fbd7b22b-949a-4047-8087-6a719edb1dc2": "2026-09-19"}
+_T5687_ORIGINAL_EVIDENCE_QUOTE = "SyntaxError: invalid character '—' (U+2014)"
+
+# The withdrawn framing, as WORD tokens only, all lowercase, compared against
+# lowercased text.
+#
+# `unicode` is deliberately BROADER than the two em-dash spellings and the
+# codepoint beside it. python3 reported the symptom as an `invalid character`,
+# so the refuted claim respells itself just as naturally as "a unicode
+# character in the pasted source breaks the script" — which the three narrow
+# tokens would let through unchallenged. The cost is bounded and visible: the
+# tuple is scanned against two short surfaces this correction owns (the title,
+# and the index line the coder reads), so a future re-framing that genuinely
+# needs the word can drop the token in the same commit that needs it.
+#
+# The bare U+2014 CHARACTER is deliberately NOT in this tuple; it is asserted
+# against the TITLE alone, by (b) below. `build_codebook_index` renders each
+# entry as `- {id}: {title} — {cause}`, and that separator IS U+2014, emitted
+# exactly when the cause is non-empty. Banning the bare character from the
+# rendered line would therefore contradict (c)'s demand for a rendered cause —
+# no implementation could satisfy both. A title is a leaf value the separator
+# cannot contaminate, so the character check belongs there. Do not "helpfully"
+# add it back here.
+_T5687_REFUTED_TOKENS = ("em-dash", "em dash", "u+2014", "unicode")
+
+# How much of the entry's own collapsed cause must reach the rendered index
+# line. Short enough to survive `build_codebook_index`'s truncation under any
+# cap it may adopt, so this pins that the cause is carried, never how far.
+_T5687_RENDERED_CAUSE_PREFIX_LEN = 80
+
+
+def test_live_codebook_withdraws_the_refuted_em_dash_framing():
+    """`_assert_correction_absorbed` pins the mechanics; this adds the three
+    things distinctive to withdrawing a refuted SYMPTOM from a still-open
+    entry.
+
+    The entry named a symptom, not a mechanism. Measured against the archived
+    transcript, replacing every U+2014 in the failing script with an ASCII
+    hyphen leaves it failing — with a different error — while escaping or
+    deleting the one embedded `\"\"\"` fixes it with every U+2014 left in
+    place. So the reported error string is unstable across recurrences of the
+    same defect, and a title keyed to it gives the nightly coder nothing to
+    match on.
+
+    (a) STILL OPEN, not retired — passed to the helper as the expected status.
+        This correction replaces an explanation; it does not retire a live,
+        unfixed defect, and pinning that stops a later sweep quietly retiring
+        the entry. (Diverges deliberately from the task-5198 guard above.)
+    (b) THE FOUNDING SIGHTING IS ANNOTATED, NOT RETRACTED. The helper pins
+        that it survives and keeps its date; its `evidence_quote` is the part
+        a later editor is most likely to mistake for the refuted claim and
+        "clean up", so the exact quote is pinned here. The symptom it records
+        was real — only the cause it was filed under was wrong.
+    (c) THE CODER'S VIEW carries the mechanism and none of the symptom. The
+        cause is non-empty and reaches the rendered index line, and no refuted
+        token survives anywhere in that line. Asserted through the PUBLIC
+        renderer over a one-entry codebook, whose output IS the single line
+        the coder reads: one scan then covers the title and the truncated
+        cause window together, a renderer change surfaces here instead of
+        being mirrored in a copy of its format string, and a regression to the
+        cause-less `- {id}: {title}` fallback — the very state this task
+        exists to end — cannot pass. The cause BODY stays free to name the
+        em-dash in order to REFUTE it; only what the coder actually reads is
+        policed.
+    """
+    _, _, entry = _assert_correction_absorbed(
+        _T5687_RECORD_PATH,
+        _T5687_CORRECTION_SESSION,
+        _T5687_ENTRY_ID,
+        refuted_tokens=_T5687_REFUTED_TOKENS,
+        expected_status="open",  # (a)
+        original_sightings=_T5687_ORIGINAL_SIGHTING,
+    )
+    title = entry["title"]
+    assert "—" not in title, (
+        f"{_T5687_ENTRY_ID!r} still spells the refuted character in its "
+        f"title: {title!r}"
+    )
+
+    # (b) THE FOUNDING SIGHTING IS ANNOTATED, NOT RETRACTED.
+    for session in _T5687_ORIGINAL_SIGHTING:
+        quotes = [s.get("evidence_quote") for s in _sightings_for(entry, session)]
+        assert quotes == [_T5687_ORIGINAL_EVIDENCE_QUOTE], (
+            f"the {session!r} sighting of {_T5687_ENTRY_ID!r} now carries "
+            f"{quotes!r} — the symptom it recorded was real, and is not what "
+            "the correction withdraws"
+        )
+
+    # (c) THE CODER'S VIEW.
+    cause = entry.get("cause")
+    assert cause, (
+        f"{_T5687_ENTRY_ID!r} has no cause — with none, build_codebook_index "
+        "shows the coder the title alone, which is the state this task exists "
+        "to end"
+    )
+    opening = " ".join(str(cause).split())[:_T5687_RENDERED_CAUSE_PREFIX_LEN]
+    rendered = coder.build_codebook_index({"entries": [entry]})
+    missing = [
+        part
+        for part, needle in (
+            ("id", _T5687_ENTRY_ID),
+            ("title", title),
+            ("cause", opening),
+        )
+        if needle not in rendered
+    ]
+    assert missing == [], (
+        f"build_codebook_index left the {missing} of {_T5687_ENTRY_ID!r} out "
+        f"of the index line the nightly coder reads: {rendered!r}"
+    )
+    still_rendered = [t for t in _T5687_REFUTED_TOKENS if t in rendered.lower()]
+    assert still_rendered == [], (
+        f"the index line the coder actually reads still asserts the refuted "
+        f"framing via {still_rendered}: {rendered!r}"
+    )

@@ -55,32 +55,48 @@ def _register_fetch_tasks(monkeypatch, tasks: list[dict]) -> None:
     """Monkeypatch fetch_tasks (and its compact map) to a fixed shaped task list.
 
     ``_shape_one_project`` narrows its fetch server-side and reads its counts
-    from ``fetch_statuses`` (task 3857), so the fake honours ``statuses`` /
-    ``page_size`` / ``offset`` — emulating the substrate's row filter and
-    ascending-id slice — and derives the compact map from the same list.
-    Ignoring the narrowing would hand the whole list to both fetch calls and
-    duplicate every row; leaving ``fetch_statuses`` unpatched would reach for
-    the network.
+    from ``fetch_statuses`` (task 3857), so the fakes honour ``statuses`` —
+    emulating the substrate's row filter and ascending-id order — and derive
+    the compact map from the same list.  Ignoring the narrowing would hand the
+    whole list to both fetch calls and duplicate every row; leaving
+    ``fetch_statuses`` unpatched would reach for the network.
+
+    TWO fakes: ``fetch_tasks`` returns the COMPLETE set and has no window,
+    ``fetch_task_page`` returns ONE page and REQUIRES ``page_size``/``offset``.
+    Each matches its real signature exactly — a laxer fake would let a
+    call-site regression pass.
     """
 
-    async def _fake_fetch_tasks(
-        client, config, project_root, *,
-        statuses=None, page_size=None, offset=0, timeout=None,
-    ):
+    def _filtered(statuses):
         rows = list(tasks)
         if statuses is not None:
             rows = [r for r in rows if r.get('status') in statuses]
         rows.sort(key=lambda r: r.get('id') or 0)  # ORDER BY id ASC
-        if page_size is not None:
-            rows = rows[offset:offset + page_size]
         return rows
 
-    async def _fake_fetch_statuses(client, config, project_root):
+    # ``timeout`` accepted-and-ignored by all three fakes: _shape_one_project
+    # threads active_tasks._TASKS_PER_CALL_TIMEOUT into every call it makes.
+    async def _fake_fetch_tasks(
+        client, config, project_root, *,
+        statuses=None, chunk_size=None, timeout=None,
+    ):
+        return _filtered(statuses)
+
+    async def _fake_fetch_task_page(
+        client, config, project_root, *,
+        page_size, offset, statuses=None, timeout=None,
+    ):
+        return _filtered(statuses)[offset:offset + page_size]
+
+    async def _fake_fetch_statuses(client, config, project_root, *, timeout=None):
         return {
             r['id']: r.get('status') for r in tasks if isinstance(r.get('id'), int)
         }
 
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_tasks', _fake_fetch_tasks)
+    monkeypatch.setattr(
+        'dashboard.data.active_tasks.fetch_task_page', _fake_fetch_task_page,
+    )
     monkeypatch.setattr('dashboard.data.active_tasks.fetch_statuses', _fake_fetch_statuses)
 
 

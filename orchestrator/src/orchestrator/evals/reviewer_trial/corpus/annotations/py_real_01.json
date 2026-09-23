@@ -25,5 +25,37 @@
       "description": "The heuristic safety net (zero-cost, instant, <=1-turn failed result = probable cap hit) is a reasonable belt-and-suspenders approach, but it could false-positive on legitimately fast failures like syntax errors in the prompt. The conditions are conservative (success=False AND cost==0 AND turns<=1 AND duration<5s), making false positives unlikely in practice.",
       "mutation_type": "real_world"
     }
-  ]
+  ],
+  "context": {
+    "task": {
+      "title": "Fail over on usage-cap hits the CLI reports as successful runs",
+      "description": "When an account exhausts its extra usage, the Claude CLI exits 0 with a `subtype='success'` payload whose body is the cap message. `shared/src/shared/cli_invoke.py::_parse_claude_output` therefore builds a successful `AgentResult` carrying useless output, and `shared/src/shared/usage_gate.py::UsageGate.detect_cap_hit` does not match that wording, so `invoke_with_cap_retry` hands the empty result back to its caller instead of cooling down and rotating to another account \u2014 the task then fails on a blank agent answer. Teach cap detection the cap-message wording it is still missing, derive invocation success from the CLI's structured output rather than exit code and subtype alone, and add a conservative last-resort signal in the retry loop so a cap hit whose wording nobody recognises still takes the cooldown-and-failover path. A cap hit must never reach the caller as a completed invocation.",
+      "test_strategy": "Cover the classification change in `shared/tests/test_cli_invoke.py` (a payload the CLI marks as failed must not classify as success even at exit code 0, and an ordinary successful payload must be untouched), the wording in `shared/tests/test_usage_gate.py` (every known cap message is detected, non-cap text is not), and the loop behaviour in `shared/tests/test_cap_retry.py` (a capped invocation drives the cooldown/account-rotation branch rather than returning to the caller).",
+      "details": "",
+      "authored": true,
+      "id": null,
+      "record_source": {
+        "kind": "authored",
+        "authored_at": "2026-09-11",
+        "method": "reconstructed from the diff and the annotation description by an opus agent; states intent without naming the planted defect"
+      }
+    },
+    "changed_files": [
+      "shared/src/shared/cli_invoke.py",
+      "shared/src/shared/usage_gate.py"
+    ],
+    "base_sha": "160cd855635dcb31cf716ad4d1c01035133eed59",
+    "branch_sha": null,
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "hand-authored fixture: no orchestrator run produced it, so no plan ever existed",
+    "verification": {
+      "method": "git apply --cached --check against a temporary index (fails on format for every candidate); base commit identified via git log --all -S content search and confirmed with git show byte-for-byte comparison",
+      "applies_cleanly": false,
+      "tolerance_flags": [],
+      "candidates_tested": 2,
+      "reason": "The fixture is not a git-apply-parseable patch at all: it uses custom '\u2500\u2500 path (modified) \u2500\u2500' section headers with no `diff --git`, no `index` line, and no `@@` hunk headers. `git apply --cached --check` rejects it unconditionally with 'No valid patches in input (allow with --allow-empty)' against every tree tested (edf348e39127^ and the base_sha candidate below) -- a format failure independent of base commit, so applies_cleanly is false by construction and no tolerance flag can fix it. Base commit was instead established by content: searched (`git log --all -S`) for the fixture's most distinctive added lines (`\"You're out of extra usage\"` in usage_gate.py; `is_error = data.get('is_error', False)`, and the 'Heuristic safety net' comment block in cli_invoke.py). All three first appear together in exactly one commit, 1e8a9b2dd02692dee18a30f6358c490991b7d4fd ('fix(usage-gate): detect \"extra usage\" cap message + respect is_error field', 2026-04-07 15:29:12+0100) -- `git show` on that commit reproduces the fixture's added/removed lines byte-for-byte across both files (same comments, same code, same 'three layered fixes' shape described in the fixture). That commit is reachable from current main (`git merge-base --is-ancestor` confirms) but is NOT an ancestor of edf348e39127bed3759a82d72e5414d263a6a95d -- its merge-base with edf348e is 1383c28352794ef4acbcb5feecffea63623dd462 (edf348e's own first parent), so it is a sibling lineage merged into main separately, matching the task's own hint that the hand-picked real-bug fixture may come from an older/different commit than the synthetic ones. base_sha is therefore this commit's sole parent, 160cd855635dcb31cf716ad4d1c01035133eed59 ('fix(eval): bind SSH tunnel to 127.0.0.1 explicitly + bump default port', 2026-04-07 15:07:48+0100), which is the pre-image tree the fixture's removed/context lines were cut from, and which is itself confirmed an ancestor of main.",
+      "verified_at": "2026-09-11"
+    }
+  }
 }
