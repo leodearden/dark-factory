@@ -5760,8 +5760,9 @@ class MemoryService:
             return result
         except BaseException as e:
             # Deliberately BaseException, not Exception — this file's usual
-            # rule (see :562, :1002) targets handlers that SWALLOW, where
-            # catching CancelledError would break structured cancellation.
+            # rule (stated in _apply_memory_metadata_validation and
+            # _is_rate_limit_or_quota_error) targets handlers that SWALLOW,
+            # where catching CancelledError would break structured cancellation.
             # This one only OBSERVES and immediately re-raises: control flow
             # for a cancellation is byte-for-byte unchanged, and only the
             # journal row differs. A write the queue cancelled (its
