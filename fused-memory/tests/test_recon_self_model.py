@@ -728,8 +728,8 @@ class TestNegativeProbeSetPremise:
     @pytest.mark.parametrize(
         'claim',
         [
-            'The degradation did not reproduce at limit=3 and did not '
-            'reproduce at limit=8 this cycle.',
+            'The degradation did not reproduce this cycle and did not '
+            'reproduce last cycle either.',
             'The Graphiti degradation did not reproduce this cycle and is no '
             'longer reproducing.',
             'The Graphiti degradation no longer reproduces at limit=3 and no '
@@ -767,6 +767,69 @@ class TestNegativeProbeSetPremise:
         "0 of N probes reproduced" wording, which makes appending it to the
         barred claim the likeliest relapse."""
         assert self.INVARIANT in self._invariants(claim)
+
+    @pytest.mark.parametrize(
+        'report',
+        [
+            'The degradation did not reproduce this cycle at limit=3.',
+            'The Graphiti degradation did not reproduce at limit=3 this cycle.',
+            'At limit=8 the probe did not reproduce the degradation this run.',
+            'The degradation did not reproduce at limit=3 and did not '
+            'reproduce at limit=8 this cycle.',
+        ],
+    )
+    def test_limit_scoped_report_is_not_flagged(self, report):
+        """A clause that names a probe's `limit` reports that probe, even when
+        it also says "this cycle": the window then scopes the probe, not the
+        fault. That is the per-probe reporting the protocol asks for."""
+        assert self.INVARIANT not in self._invariants(report)
+
+    @pytest.mark.parametrize(
+        'claim',
+        [
+            'The Graphiti degradation did not reproduce at limit=8 and is gone.',
+            'The degradation did not reproduce at limit=3 and has cleared.',
+            'The Graphiti degradation no longer reproduces at limit=3.',
+        ],
+    )
+    def test_state_claim_is_flagged_even_beside_a_limit(self, claim):
+        """A limit scopes a window, not a state: "gone", "cleared" and "no
+        longer" say the fault itself is over, whichever probe came first."""
+        assert self.INVARIANT in self._invariants(claim)
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            'known miss: the rules reach only a negated `reproduce` and '
+            '"no <scope> <fault>". A rule for a bare state verb or "no <fault> '
+            'observed" would also reject what recon files as a goal or a '
+            'check ("close once the degradation is resolved"), and this lint '
+            'prefers a miss to a rejected legitimate call.'
+        ),
+    )
+    @pytest.mark.parametrize(
+        'claim',
+        [
+            'The Graphiti degradation has cleared.',
+            'Graphiti degradation is resolved.',
+            'No Graphiti degradation observed this cycle.',
+        ],
+    )
+    def test_flags_clearance_claim_without_a_negated_reproduction(self, claim):
+        assert self.INVARIANT in self._invariants(claim)
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            'known miss, the price of the limit exemption: a cycle-wide claim '
+            'that also cites a limit reads as a per-probe report.'
+        ),
+    )
+    def test_flags_cycle_claim_that_also_cites_a_limit(self):
+        assert self.INVARIANT in self._invariants(
+            'The Graphiti degradation did not reproduce this cycle, not even '
+            'at limit=15.'
+        )
 
     def test_zero_count_does_not_hide_a_positive_sighting(self):
         assert self.INVARIANT not in self._invariants(

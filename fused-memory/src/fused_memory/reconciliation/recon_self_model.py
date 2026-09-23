@@ -942,15 +942,19 @@ _NEGATED_REPRODUCTION = re.compile(
 )
 
 # What turns that report into a CLEARANCE CLAIM when it follows the report in
-# the same clause: it scopes the negative to the fault's current existence
-# rather than to the one probe that was run. Without one, "did not reproduce"
-# is precisely the fine-grained reporting the Stage 2 probe protocol asks for,
-# and rejecting it would make the rule reject the protocol's own output.
-_CLEARANCE_QUALIFIER = re.compile(
-    r'\b(?:this\s+(?:cycle|run)|no\s+longer|any\s?more|cleared|clear|'
-    r'resolved|gone|absent|healthy)\b',
+# the same clause. A state word says the fault itself is over. A window word
+# widens the negative from one probe to the whole cycle — unless the clause
+# also names a probe's `limit`, which scopes it back to that probe: "did not
+# reproduce this cycle at limit=3" is a per-probe report. Without either,
+# "did not reproduce" is precisely the fine-grained reporting the Stage 2
+# probe protocol asks for, and rejecting it would make the rule reject the
+# protocol's own output.
+_STATE_QUALIFIER = re.compile(
+    r'\b(?:no\s+longer|any\s?more|cleared|clear|resolved|gone|absent|healthy)\b',
     re.IGNORECASE,
 )
+_WINDOW_QUALIFIER = re.compile(r'\bthis\s+(?:cycle|run)\b', re.IGNORECASE)
+_PROBE_LIMIT = re.compile(r'\blimits?\s*[=:-]?\s*\d', re.IGNORECASE)
 
 # "<fault> no longer reproduces" qualifies itself, and carries no negated
 # auxiliary for _NEGATED_REPRODUCTION to hang on.
@@ -961,8 +965,8 @@ _NO_LONGER_REPRODUCES = re.compile(
 # A clause that also names a POSITIVE sighting is a mixed-outcome report —
 # "did not reproduce at limit=3, but fired at limit=8 this cycle" — and the
 # qualifier there scopes the sighting, not a clearance. Only an un-negated
-# verb counts: "did not reproduce at limit=3 and did not reproduce at limit=8
-# this cycle" is still a clearance claim.
+# verb counts: "did not reproduce this cycle and did not reproduce last cycle
+# either" is still a clearance claim.
 _SIGHTING_VERB = r'\b(?:reproduc(?:e|es|ed|ing)|fired|fires|recurred|recurs)\b'
 # A zero count negates its verb through its subject instead ("0 of 3 probes
 # reproduced", "none of them fired", "no probe reproduced"). It is the
@@ -1019,9 +1023,13 @@ def _clause_reports_non_reproduction_as_clearance(clause: str) -> bool:
     # Only the first report needs testing: a qualifier that follows any later
     # report follows this one too.
     report = _NEGATED_REPRODUCTION.search(clause)
+    if report is None:
+        return False
+    if _STATE_QUALIFIER.search(clause, report.end()):
+        return True
     return (
-        report is not None
-        and _CLEARANCE_QUALIFIER.search(clause, report.end()) is not None
+        _WINDOW_QUALIFIER.search(clause, report.end()) is not None
+        and _PROBE_LIMIT.search(clause) is None
     )
 
 
