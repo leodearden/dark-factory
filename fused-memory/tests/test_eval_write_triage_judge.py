@@ -1604,21 +1604,27 @@ class TestGuardCommittedReport:
     that measures nothing at all — defaulted to the committed path and
     rewrote both artifacts with fixed-answer numbers under a `dry-run`
     provider nobody was obliged to notice.
+
+    The committed report is also the RETRIEVED-slate arbiter (PRD C2'), so a
+    seeded measurement aimed at it is refused outright. A seeded run anywhere
+    else is untouched: that is how historical artifacts are reproduced.
     """
 
     def test_an_unrelated_path_is_returned_untouched(self, tmp_path: Path) -> None:
         target = str(tmp_path / 'somewhere-else.json')
         assert _mod().guard_committed_report(
-            target, dry_run=True, limit=None) == target
+            target, dry_run=True, limit=None, slate_mode=_mod().SLATE_SEEDED) == target
 
     def test_a_dry_run_is_redirected_off_the_committed_artifact(self) -> None:
         committed = _mod()._DEFAULT_REPORT_PATH
-        got = _mod().guard_committed_report(committed, dry_run=True, limit=None)
-        assert Path(got).resolve() != Path(committed).resolve(), (
-            'a --dry-run scores a fixed-answer stub; publishing it puts '
-            'fabricated numbers in front of the flip-gate operator'
-        )
-        assert Path(got).name == _mod()._DRY_RUN_REPORT_NAME
+        for slate_mode in _mod().SLATE_MODES:
+            got = _mod().guard_committed_report(
+                committed, dry_run=True, limit=None, slate_mode=slate_mode)
+            assert Path(got).resolve() != Path(committed).resolve(), (
+                f'a {slate_mode} --dry-run scores a fixed-answer stub; publishing '
+                f'it puts fabricated numbers in front of the flip-gate operator'
+            )
+            assert Path(got).name == _mod()._DRY_RUN_REPORT_NAME
 
     def test_a_relative_spelling_of_the_committed_path_is_also_caught(
         self, tmp_path: Path, monkeypatch,
@@ -1627,14 +1633,46 @@ class TestGuardCommittedReport:
         committed = Path(_mod()._DEFAULT_REPORT_PATH)
         monkeypatch.chdir(committed.parent.parent)
         relative = str(Path('calibration') / committed.name)
-        got = _mod().guard_committed_report(relative, dry_run=True, limit=None)
+        got = _mod().guard_committed_report(
+            relative, dry_run=True, limit=None, slate_mode=_mod().SLATE_SEEDED)
         assert Path(got).resolve() != committed.resolve()
 
     def test_the_dry_run_redirect_is_logged_loudly(self, caplog) -> None:
         with caplog.at_level(logging.WARNING):
             _mod().guard_committed_report(
-                _mod()._DEFAULT_REPORT_PATH, dry_run=True, limit=None)
+                _mod()._DEFAULT_REPORT_PATH, dry_run=True, limit=None,
+                slate_mode=_mod().SLATE_SEEDED)
         assert any(r.levelno >= logging.WARNING for r in caplog.records)
+
+    @pytest.mark.parametrize('limit', [None, 5])
+    def test_a_seeded_measurement_cannot_overwrite_the_retrieved_arbiter(
+        self, limit: int | None,
+    ) -> None:
+        with pytest.raises(ValueError, match='--report-path'):
+            _mod().guard_committed_report(
+                _mod()._DEFAULT_REPORT_PATH, dry_run=False, limit=limit,
+                slate_mode=_mod().SLATE_SEEDED)
+
+    def test_nor_can_it_through_a_relative_spelling(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        committed = Path(_mod()._DEFAULT_REPORT_PATH)
+        monkeypatch.chdir(committed.parent.parent)
+        with pytest.raises(ValueError, match='--report-path'):
+            _mod().guard_committed_report(
+                str(Path('calibration') / committed.name), dry_run=False, limit=None,
+                slate_mode=_mod().SLATE_SEEDED)
+
+    def test_a_seeded_measurement_elsewhere_is_untouched(self, tmp_path: Path) -> None:
+        target = str(tmp_path / 'historical.json')
+        assert _mod().guard_committed_report(
+            target, dry_run=False, limit=None, slate_mode=_mod().SLATE_SEEDED) == target
+
+    def test_the_slate_mode_must_be_named(self) -> None:
+        """No default: a caller that forgot it must not be waved through as retrieved."""
+        with pytest.raises(TypeError, match='slate_mode'):
+            _mod().guard_committed_report(
+                _mod()._DEFAULT_REPORT_PATH, dry_run=False, limit=None)
 
     def test_a_limit_run_still_writes_the_committed_path_but_warns(
         self, caplog,
@@ -1649,16 +1687,18 @@ class TestGuardCommittedReport:
         """
         committed = _mod()._DEFAULT_REPORT_PATH
         with caplog.at_level(logging.WARNING):
-            got = _mod().guard_committed_report(committed, dry_run=False, limit=5)
+            got = _mod().guard_committed_report(
+                committed, dry_run=False, limit=5, slate_mode=_mod().SLATE_RETRIEVED)
         assert got == committed
         assert any(r.levelno >= logging.WARNING for r in caplog.records)
 
-    def test_a_full_live_run_is_neither_redirected_nor_warned(
+    def test_a_full_retrieved_run_is_neither_redirected_nor_warned(
         self, caplog,
     ) -> None:
         committed = _mod()._DEFAULT_REPORT_PATH
         with caplog.at_level(logging.WARNING):
-            got = _mod().guard_committed_report(committed, dry_run=False, limit=None)
+            got = _mod().guard_committed_report(
+                committed, dry_run=False, limit=None, slate_mode=_mod().SLATE_RETRIEVED)
         assert got == committed
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
@@ -1730,30 +1770,21 @@ class TestABareDryRunCannotReachTheCommittedArtifact:
             'judge_provider'
         ] == 'dry-run'
 
+    def test_a_bare_live_run_is_refused_before_it_reads_the_fixture(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """The old "full measured pass" command: seeded, aimed at the arbiter.
 
-#: Provenance the committed artifact PREDATES, added 2026-09-23 with the
-#: retrieved slate mode, the per-field prompt budget override and the alias
-#: sidecar. The
-#: committed report is regenerated only by a paid live run, which this change
-#: deliberately does not perform against `calibration/`; until the operator
-#: re-runs it, these keys are absent from the file and that is staleness
-#: rather than a lie. Every OTHER key stays asserted, and
-#: `test_no_provenance_key_outside_the_vocabulary` keeps this set from
-#: hiding a rename.
-_ADDED_AFTER_THE_COMMITTED_RUN = frozenset({
-    'slate_mode',
-    'field_chars',
-    'project_id',
-    't_high',
-    't_low',
-    'candidate_k',
-    'canonical_absent',
-    'degraded_retrievals',
-    'self_retrieved',
-    'canonical_aliases_path',
-    'canonical_aliases_count',
-    'cases_path',
-})
+        Given a fixture that does not exist, so a refusal ordered after the
+        fixture load would surface as `FileNotFoundError` instead.
+        """
+        import sys  # noqa: PLC0415
+
+        monkeypatch.setattr(sys, 'argv', [
+            'eval_write_triage_judge.py', '--fixture', str(tmp_path / 'absent.jsonl'),
+        ])
+        with pytest.raises(ValueError, match='--report-path'):
+            _mod().main()
 
 
 class TestCommittedJudgeAccuracyReportIsTraceable:
@@ -1953,12 +1984,11 @@ class TestCommittedJudgeAccuracyReportIsTraceable:
         )
 
     def test_no_provenance_key_outside_the_vocabulary(self) -> None:
-        """The other half of the ledger below: nothing stale may be UNKNOWN.
+        """Nothing the artifact carries may be UNKNOWN.
 
-        `_ADDED_AFTER_THE_COMMITTED_RUN` excuses keys the artifact predates. It
-        must not become a way for a RENAMED key to sit unnoticed in the
-        artifact under its old spelling, so every key the file does carry has
-        to still be vocabulary.
+        A RENAMED key would otherwise sit in the artifact under its old
+        spelling and read as disclosed, so every key the file carries has to
+        still be vocabulary.
         """
         _block, report, _resolved = self._committed()
         assert report is not None
@@ -1981,21 +2011,15 @@ class TestCommittedJudgeAccuracyReportIsTraceable:
         were added and the committed report still carried the ten keys that
         predated them.
 
-        A superset, not equality: an artifact from a run that recorded MORE
-        than the current vocabulary is stale provenance, not a lie, and must
-        not be a red test.
+        A superset check: keys beyond the vocabulary are
+        `test_no_provenance_key_outside_the_vocabulary`'s concern.
         """
         _block, report, _resolved = self._committed()
         assert report is not None
-        missing = (
-            set(_mod().PROVENANCE_KEYS)
-            - set(report['provenance'])
-            - _ADDED_AFTER_THE_COMMITTED_RUN
-        )
-        assert not missing, (
-            f'the committed report does not disclose {sorted(missing)} — either '
-            f're-run the eval, or record the values the original run used and '
-            f'say so in the caveats'
+        assert set(_mod().PROVENANCE_KEYS) <= set(report['provenance']), (
+            f'the committed report does not disclose '
+            f'{sorted(set(_mod().PROVENANCE_KEYS) - set(report["provenance"]))} — '
+            f're-run the eval'
         )
 
     def test_the_committed_report_says_the_judge_arm_was_live(self) -> None:
@@ -2079,6 +2103,46 @@ class TestCommittedJudgeAccuracyReportIsTraceable:
             f'the report measured {provenance["fixture_path"]!r}, not the '
             f'committed fixture'
         )
+
+    def test_the_committed_report_is_the_retrieved_slate_arbiter(self) -> None:
+        """PRD C2': `retrieved` is the arbiter; `seeded` reproduces history."""
+        _block, report, _resolved = self._committed()
+        assert report is not None
+        assert report['provenance']['slate_mode'] == _mod().SLATE_RETRIEVED
+
+    def test_every_duplicate_is_in_the_attach_population(self, records) -> None:
+        """Recounted from the fixture rather than hardcoded (75 today; gate Γ1 reads it)."""
+        _block, report, _resolved = self._committed()
+        assert report is not None
+        expected = sum(1 for r in records if r['label'] == _mod().LABEL_DUPLICATE)
+        assert report['production_shape']['duplicate_attach']['n'] == expected
+
+    def test_the_alias_sidecar_is_named_and_committed(self) -> None:
+        _block, report, _resolved = self._committed()
+        assert report is not None
+        named = report['provenance']['canonical_aliases_path']
+        assert named == 'tests/fixtures/write_triage_calibration.canonical_aliases.json'
+        assert (Path(__file__).parent.parent / named).resolve() == ALIASES_PATH.resolve()
+        assert ALIASES_PATH.exists()
+
+    def test_the_production_shape_is_the_score_of_the_committed_cases(self) -> None:
+        """C2' computes `production_shape` ONCE, by `score_attachments`, and the
+        per-case evidence it was computed from is committed beside it."""
+        _block, report, _resolved = self._committed()
+        assert report is not None
+        provenance = report['provenance']
+        assert isinstance(provenance['cases_path'], str), 'no per-case evidence is named'
+        cases = Path(__file__).parent.parent / provenance['cases_path']
+        assert cases.exists(), f'{provenance["cases_path"]} is not committed'
+        rows = [json.loads(line) for line in cases.read_text().splitlines()]
+        assert len(rows) == provenance['case_count']
+        assert _mod().score_attachments(rows) == report['production_shape']
+
+    def test_no_retrieval_came_back_degraded(self) -> None:
+        """Each degraded retrieval is a fail-open that measured nothing."""
+        _block, report, _resolved = self._committed()
+        assert report is not None
+        assert report['provenance']['degraded_retrievals'] == 0
 
 
 # ---------------------------------------------------------------------------

@@ -439,3 +439,67 @@ class TestBandsFromCli:
             _calib().main()
         assert excinfo.value.code == 2
         assert 'not allowed with argument' in capsys.readouterr().err
+
+
+class TestCommittedRecallIsProductionShaped:
+    """The committed report's recall is production's, over the full population.
+
+    Committed artifacts only: no network, no Qdrant. The band section is the
+    calibration of record, carried verbatim by a `--bands-from` regeneration
+    and pinned against config.yaml by
+    `test_calibrate_write_triage.py::TestCommittedCalibrationIsTraceable`.
+    This class pins the recall section beside it.
+    """
+
+    CONFIG_PATH = Path(__file__).parent.parent / 'config' / 'config.yaml'
+    FIXTURE_PATH = Path(__file__).parent / 'fixtures' / 'write_triage_calibration.jsonl'
+
+    @staticmethod
+    @functools.cache
+    def _committed() -> tuple[str, Path, dict]:
+        """config.yaml's `calibration_report_path`, where it resolves, and the report."""
+        import yaml  # noqa: PLC0415
+
+        cls = TestCommittedRecallIsProductionShaped
+        named = yaml.safe_load(cls.CONFIG_PATH.read_text())['write_triage'][
+            'calibration_report_path'
+        ]
+        path = Path(__file__).parent.parent / named
+        return named, path, json.loads(path.read_text())
+
+    def test_recall_is_measured_through_the_shipped_seam(self) -> None:
+        provenance = self._committed()[2]['provenance']
+        assert provenance['retrieval_mode'] == 'production'
+        assert provenance['retrieval_call'] == (
+            f'{retrieve_candidates.__module__}::{retrieve_candidates.__qualname__}'
+        )
+
+    def test_the_alias_sidecar_is_named_and_committed(self) -> None:
+        named = self._committed()[2]['provenance']['canonical_aliases_path']
+        assert named == 'tests/fixtures/write_triage_calibration.canonical_aliases.json'
+        assert (Path(__file__).parent.parent / named).resolve() == ALIASES_PATH.resolve()
+        assert ALIASES_PATH.exists()
+
+    def test_recall_is_reported_at_k_20_and_50(self) -> None:
+        per_k = {row['k']: row for row in self._committed()[2]['recall_at_k']['per_k']}
+        for k in (20, 50):
+            assert isinstance(per_k[k]['recall'], float), per_k.get(k)
+
+    def test_every_non_canonical_record_is_in_the_denominator(self) -> None:
+        recall = self._committed()[2]['recall_at_k']
+        assert recall['absent_in_denominator'] is True
+        records = [json.loads(line) for line in self.FIXTURE_PATH.read_text().splitlines()
+                   if line.strip()]
+        labelled = sum(1 for r in records if r['label'] != _calib().LABEL_CANONICAL)
+        assert [row['total'] for row in recall['per_k']] == [labelled] * len(recall['per_k'])
+
+    def test_the_bands_are_carried_from_the_calibration_of_record(self) -> None:
+        named, _path, report = self._committed()
+        assert report['provenance']['bands_from'] == named
+
+    def test_no_retrieval_came_back_degraded(self) -> None:
+        assert self._committed()[2]['provenance']['degraded_retrievals'] == 0
+
+    def test_the_committed_markdown_is_the_render_of_the_committed_json(self) -> None:
+        _named, path, report = self._committed()
+        assert path.with_suffix('.md').read_text() == _calib().render_markdown(report)
