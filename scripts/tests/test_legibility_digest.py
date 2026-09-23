@@ -389,8 +389,8 @@ class TestIterUserTurns:
 
     def test_excludes_reingested_content_through_the_shared_predicate(self):
         """A user turn whose whole text is a coder judgment was NOT observed:
-        0 of the 35,887 dark-factory transcripts on disk on 2026-09-23 carry
-        one. It is pinned so the gold bucket and every scalar detector answer
+        no dark-factory transcript on disk on 2026-09-23 carries one. It is
+        pinned so the gold bucket and every scalar detector answer
         "is this re-ingested?" with ONE predicate. The genuine and briefing
         turns pin that sharing it neither widens nor narrows the filter."""
         records = [

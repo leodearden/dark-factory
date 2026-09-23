@@ -1304,8 +1304,7 @@ def classify_agent_class(
     Unlike every signal detector, it reads the RAW carriers
     (:func:`_signal_text_sources`), not :func:`_dialogue_text_sources`: it
     classifies BY injected markers, so filtering them out would delete its
-    own evidence (pinned by
-    ``TestReingestedContentIsBucketAgnostic.test_classify_agent_class_still_reads_the_raw_carriers``).
+    own evidence.
     """
     if override is not None:
         return override
