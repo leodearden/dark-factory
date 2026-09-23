@@ -19,7 +19,7 @@ import sys
 import time
 import types
 
-import pytest  # pyright: ignore[reportMissingImports]
+import pytest
 
 # Importable by name only because tests/scripts/conftest.py puts this
 # directory on sys.path, which pytest's --import-mode=importlib deliberately
