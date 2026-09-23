@@ -2414,9 +2414,9 @@ def _gate_repo(
     #   ordering them first makes it structural that a stub checker body can
     #   never shadow the renderer's dependencies.
     #
-    # This is also why render_dashboard_unit.py must not import the checker: see
+    # This is also why render_systemd_unit.py must not import the checker: see
     # its module docstring, which names this harness as the concrete obstacle.
-    for _name in ("render_dashboard_unit.py", "systemd_unit_parity.py"):
+    for _name in ("render_systemd_unit.py", "systemd_unit_parity.py"):
         (repo / "scripts" / _name).write_text(
             (REPO_ROOT / "scripts" / _name).read_text(encoding="utf-8"),
             encoding="utf-8",
@@ -2872,7 +2872,7 @@ def test_section_8_render_failure_leaves_the_installed_unit_intact(
     """
     mod = _load_checker()
     repo = _gate_repo(tmp_path, mod)
-    (repo / "scripts" / "render_dashboard_unit.py").write_text(
+    (repo / "scripts" / "render_systemd_unit.py").write_text(
         _FAILING_RENDERER, encoding="utf-8"
     )
     unit_dir = _seeded_with_nine_roots(tmp_path, mod, repo)
@@ -2896,7 +2896,7 @@ def test_section_8_missing_renderer_does_not_clobber_host_local_values(
     """
     mod = _load_checker()
     repo = _gate_repo(tmp_path, mod)
-    (repo / "scripts" / "render_dashboard_unit.py").unlink()
+    (repo / "scripts" / "render_systemd_unit.py").unlink()
     unit_dir = _seeded_with_nine_roots(tmp_path, mod, repo)
     before = (unit_dir / _DASHBOARD_SERVICE).read_bytes()
 
@@ -2926,7 +2926,7 @@ def test_section_8_bare_host_with_a_failed_render_still_installs_the_watchdog(
     """
     mod = _load_checker()
     repo = _gate_repo(tmp_path, mod)
-    (repo / "scripts" / "render_dashboard_unit.py").write_text(
+    (repo / "scripts" / "render_systemd_unit.py").write_text(
         _FAILING_RENDERER, encoding="utf-8"
     )
     unit_dir = tmp_path / "bare-unit-dir"
