@@ -147,8 +147,10 @@ _WRITER_NAME = 'judge_write'
 #: word for word until the two probes share a helper module.
 _TARGET_NAME_RE = re.compile(r'attach|target|candidate_id', re.IGNORECASE)
 
-#: The attribute a judge-side attach target is read off the decision through.
+#: The attribute a judge-side attach target is read off the decision through,
+#: and the kwarg the triage module hands its judge that decision under.
 _CANONICAL_ATTR = 'canonical_id'
+_DECISION_KWARG = 'decision'
 
 #: Backstop bound on the one ``judge_write`` call this probe makes. The
 #: recorder below is the primary guarantee that no model request goes out --
@@ -830,49 +832,71 @@ def _called_name(func: ast.AST) -> str | None:
     return None
 
 
-def _reads_canonical_id(expr: ast.AST, aliases: frozenset[str]) -> bool:
-    """Does *expr* read the decision's canonical id, directly or via a local?
+def _is_name(node: ast.AST, name: str) -> bool:
+    return isinstance(node, ast.Name) and node.id == name
 
-    Both spellings of the direct read count: the attribute (``decision.canonical_id``)
-    and the string a defensive ``getattr(decision, 'canonical_id', None)``
-    names it by.
+
+def _is_decision_canonical_id(expr: ast.AST) -> bool:
+    """Is *expr* exactly the decision's canonical id, read off ``decision`` itself?
+
+    ``decision.canonical_id``, or ``getattr(decision, 'canonical_id'[, default])``.
+    ``decision`` is the kwarg the triage module hands its judge the band's
+    decision under. A canonical id read off anything else — a slate candidate
+    — is not the id the write attaches to.
     """
-    for node in ast.walk(expr):
-        if isinstance(node, ast.Attribute) and node.attr == _CANONICAL_ATTR:
-            return True
-        if isinstance(node, ast.Constant) and node.value == _CANONICAL_ATTR:
-            return True
-        if isinstance(node, ast.Name) and node.id in aliases:
-            return True
-    return False
+    if isinstance(expr, ast.Attribute):
+        return expr.attr == _CANONICAL_ATTR and _is_name(expr.value, _DECISION_KWARG)
+    if not (
+        isinstance(expr, ast.Call)
+        and _is_name(expr.func, 'getattr')
+        and len(expr.args) in (2, 3)
+        and not expr.keywords
+    ):
+        return False
+    owner, attr = expr.args[:2]
+    return (
+        _is_name(owner, _DECISION_KWARG)
+        and isinstance(attr, ast.Constant)
+        and attr.value == _CANONICAL_ATTR
+    )
 
 
 def _canonical_id_aliases(tree: ast.AST) -> frozenset[str]:
-    """Locals assigned from an expression that reads the canonical id.
+    """Locals EVERY binding of which is the decision's canonical id.
 
-    ONE level, deliberately. main spells it ``attach_target_id =
-    getattr(decision, 'canonical_id', None)`` and passes that local one call
-    later, which is the shape this has to see. Chasing a chain of rebindings
-    would be a dataflow analysis, and the DYNAMIC route above is what covers a
-    module too clever for this one.
+    main spells it ``attach_target_id = getattr(decision, 'canonical_id',
+    None)`` and passes that local one call later. A local bound to anything
+    else anywhere in the function may not hold the canonical id where it is
+    passed, and working out which binding reaches the call would be a
+    dataflow analysis.
     """
-    aliases: set[str] = set()
+    direct: set[int] = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.Assign) and _reads_canonical_id(
-            node.value, frozenset(),
+        if isinstance(node, ast.Assign) and _is_decision_canonical_id(node.value):
+            direct.update(id(target) for target in node.targets)
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and node.value is not None
+            and _is_decision_canonical_id(node.value)
         ):
-            aliases.update(t.id for t in node.targets if isinstance(t, ast.Name))
-    return frozenset(aliases)
+            direct.add(id(node.target))
+    bound_only_directly: dict[str, bool] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            bound_only_directly[node.id] = (
+                bound_only_directly.get(node.id, True) and id(node) in direct
+            )
+    return frozenset(name for name, only in bound_only_directly.items() if only)
 
 
 def _statically_fed_target(writer: Any, targets: list[str]) -> str | None:
     """The target parameter *writer*'s SOURCE feeds the decision's canonical id.
 
-    The fallback for a ``judge_write`` that raises before it renders — main's
-    own does exactly that on a deployment with no provider configured, which
-    is the state this probe's fake service is in. Reading the call rather than
-    executing it is what stops a mechanism the dynamic route cannot reach from
-    being reported as an absent remedy.
+    The fallback for a ``judge_write`` that raises before it renders, leaving
+    the recorder nothing to see. main's does not: under the probe's fake
+    service it renders first, and the dynamic route decides it. Only a keyword
+    whose value IS the decision's canonical id, or a local aliased directly
+    from it, counts — an expression that merely mentions one is not a feed.
     """
     try:
         tree = ast.parse(textwrap.dedent(inspect.getsource(writer)))
@@ -883,7 +907,11 @@ def _statically_fed_target(writer: Any, targets: list[str]) -> str | None:
         if not isinstance(node, ast.Call) or _called_name(node.func) != _BUILDER_NAME:
             continue
         for keyword in node.keywords:
-            if keyword.arg in targets and _reads_canonical_id(keyword.value, aliases):
+            value = keyword.value
+            fed = _is_decision_canonical_id(value) or (
+                isinstance(value, ast.Name) and value.id in aliases
+            )
+            if keyword.arg in targets and fed:
                 return keyword.arg
     return None
 

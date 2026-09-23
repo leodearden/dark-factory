@@ -42,6 +42,7 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 from write_triage_attach_fixtures import (  # noqa: E402
+    JUDGE_STATIC_NEAR_MISS_VARIANTS,
     write_fake_judge,
     write_fake_triage,
 )
@@ -443,13 +444,12 @@ class TestJudgeModuleAttachTarget:
     def test_a_judge_that_raises_before_rendering_is_read_statically(
         self, tmp_path,
     ):
-        """A correct option (b) whose judge_write never reaches the renderer.
+        """A correct option (b) whose judge_write raises before it renders.
 
-        main's judge raises on an unresolvable provider, which on a deployment
-        with no key happens before the prompt is built — so the recorder never
-        fires. Reading the call instead of executing it is what keeps a
-        mechanism the dynamic route cannot reach from being reported as an
-        absent remedy.
+        The recorder never fires, so only reading the call can see the
+        remedy. main's own judge_write does not take this route — it renders
+        before anything raises under the probe's fake service — so this pins
+        the fallback for a ref that does.
         """
         src_root = _src_with(
             tmp_path,
@@ -460,6 +460,24 @@ class TestJudgeModuleAttachTarget:
         assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
         assert _PASS in proc.stdout, proc.stdout
         assert _JUDGE_BRANCH_SATISFIED in proc.stdout, proc.stdout
+
+    @pytest.mark.parametrize('judge', JUDGE_STATIC_NEAR_MISS_VARIANTS)
+    def test_the_static_route_counts_only_the_decisions_own_canonical_id(
+        self, tmp_path, judge,
+    ):
+        """Mentioning a canonical id is not feeding the decision's.
+
+        Each judge raises before rendering, so the static route decides, and
+        each hands the target something that merely MENTIONS a canonical id —
+        another candidate's, or an alias of the decision's that is only a
+        condition or is rebound before the call. None is the id the write
+        attaches to, so reading any of them as fed would be a false PASS.
+        """
+        src_root = _src_with(tmp_path, triage='band_top1', judge=judge)
+        proc = _run_probe(src_root)
+        assert proc.returncode != 0, f'{proc.stdout}\n{proc.stderr}'
+        assert _PASS not in proc.stdout, proc.stdout
+        assert _NEVER_FED in proc.stdout, proc.stdout
 
     def test_a_judge_with_no_target_parameter_does_not_satisfy_item_5(
         self, tmp_path,

@@ -637,7 +637,7 @@ def _render(content, candidates, marked=None):
 
 
 def _require_provider(memory_service):
-    """main's unresolvable-provider raise, which fires before any model call."""
+    """Raises under the probe's fake service, which configures no provider."""
     config = getattr(memory_service, 'config', None)
     provider = getattr(getattr(config, 'llm', None), 'provider', None)
     if not isinstance(provider, str) or not provider:
@@ -665,10 +665,9 @@ async def judge_write(*, memory_service, content, project_id, decision,
 '''
 
 
-#: The same remedy, reached only by READING the call. Its judge_write raises
-#: before it renders — an unresolvable provider, which is what main's own judge
-#: does on a deployment with no key — so the recorder never fires and a probe
-#: with no static route would report a correct option (b) as absent.
+#: The same remedy, reached only by READING the call: its judge_write raises
+#: before it renders, so the recorder never fires. main's own judge_write
+#: renders first; this stands in for a ref that does not.
 _JUDGE_FEEDS_TARGET_AFTER_RAISING = r'''
 
 def build_judge_prompt(content, candidates, *, attach_target_id=None):
@@ -736,6 +735,52 @@ async def judge_write(*, memory_service, content, project_id, decision,
 '''
 
 
+#: STATIC-ROUTE NEAR MISSES. Each judge_write raises before it renders, so
+#: only reading its source can decide it, and each hands the target a value
+#: that MENTIONS a canonical id without being the decision's own: another
+#: candidate's attribute, a lookup of the same name on a non-decision, an
+#: alias used only as a condition, and an alias rebound after the read.
+_RAISES_THEN_FEEDS = r'''
+
+def build_judge_prompt(content, candidates, *, attach_target_id=None):
+    return _render(content, candidates, marked=attach_target_id)
+
+
+async def judge_write(*, memory_service, content, project_id, decision,
+                      candidates=()):
+    first = next(iter(candidates or ()), None)
+    attach_target_id = getattr(decision, 'canonical_id', None)
+    _require_provider(memory_service)
+    build_judge_prompt(content, candidates, attach_target_id={fed})
+    return OUTCOME_RESTATED
+'''
+
+_JUDGE_STATIC_NEAR_MISSES = {
+    'feeds_a_slate_canonical_after_raising': 'first.canonical_id',
+    'feeds_a_canonical_named_lookup_after_raising': (
+        "getattr(first, 'canonical_id', None)"
+    ),
+    'feeds_a_guarded_alias_after_raising': (
+        'first.id if attach_target_id else None'
+    ),
+}
+
+_JUDGE_FEEDS_A_REBOUND_ALIAS_AFTER_RAISING = r'''
+
+def build_judge_prompt(content, candidates, *, attach_target_id=None):
+    return _render(content, candidates, marked=attach_target_id)
+
+
+async def judge_write(*, memory_service, content, project_id, decision,
+                      candidates=()):
+    attach_target_id = getattr(decision, 'canonical_id', None)
+    attach_target_id = getattr(next(iter(candidates or ()), None), 'id', None)
+    _require_provider(memory_service)
+    build_judge_prompt(content, candidates, attach_target_id=attach_target_id)
+    return OUTCOME_RESTATED
+'''
+
+
 #: judge variant name -> the tail appended to :data:`JUDGE_PREAMBLE`.
 JUDGE_VARIANT_TAILS: dict[str, str] = {
     'feeds_attach_target': _JUDGE_FEEDS_TARGET,
@@ -743,7 +788,21 @@ JUDGE_VARIANT_TAILS: dict[str, str] = {
     'no_target_parameter': _JUDGE_NO_TARGET_PARAMETER,
     'target_never_fed': _JUDGE_TARGET_NEVER_FED,
     'feeds_a_different_id': _JUDGE_FEEDS_A_DIFFERENT_ID,
+    **{
+        name: _RAISES_THEN_FEEDS.replace('{fed}', fed)
+        for name, fed in _JUDGE_STATIC_NEAR_MISSES.items()
+    },
+    'feeds_a_rebound_alias_after_raising': (
+        _JUDGE_FEEDS_A_REBOUND_ALIAS_AFTER_RAISING
+    ),
 }
+
+#: The judge variants only the static route can decide, and that it must NOT
+#: read as feeding the decision's canonical id.
+JUDGE_STATIC_NEAR_MISS_VARIANTS = (
+    *_JUDGE_STATIC_NEAR_MISSES,
+    'feeds_a_rebound_alias_after_raising',
+)
 
 
 def write_fake_judge(src_root: Path, *, variant: str) -> Path:
