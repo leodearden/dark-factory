@@ -2369,6 +2369,7 @@ class TestExecutedColumnSchema:
                 {'group_id': 'grp', 'operation': 'add_episode',
                  'payload': {'content': 'via enqueue_batch'}},
             ])
+            assert q._db is not None
             cursor = await q._db.execute(
                 'SELECT id, executed FROM write_queue ORDER BY id'
             )
