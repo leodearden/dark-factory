@@ -30,21 +30,18 @@ wording, headings or ordering. Fully rewording ``### Anchoring ad-hoc paths``
 while keeping the marked commands intact must leave this green; breaking either
 command must turn it red.
 
-THE EXTRACTOR IS RE-IMPLEMENTED RATHER THAN IMPORTED from its two siblings in
-this directory, per the no-cross-import-between-guards convention recorded in
-``tests/scripts/conftest.py`` — task 3959 copied it from task 3558, and task
-5330 from 3959, for the same reason.
-
 PLACEMENT IS LOAD-BEARING. ``tests/scripts/`` carries its own module config, so
 this guard runs under FULL_SUITE and merge-role ``merge_verify_breadth: full``.
 """
 from __future__ import annotations
 
 import pathlib
+import re
 import shlex
 import subprocess
 
 import pytest
+import verify_command_invariants as vci
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -77,57 +74,23 @@ _GIT_IDENTITY = (
 
 
 def _marked_command(markdown_text, marker, bullet_label):
-    """The inline-code command on the *bullet_label* bullet delimited by *marker*.
+    """The command on the *bullet_label* bullet between *marker*'s begin/end comments.
 
-    Every failure is a loud ``AssertionError`` naming the marker literal and
-    CLAUDE.md, never a ``''``/``None`` return: an extractor that silently
-    yields nothing turns every execution assertion below vacuously green while
-    running nothing at all, which is strictly worse than no guard because the
-    check still reports success. The span is anchored on the LABEL prefix
-    rather than on backticks, because keying on backticks alone would extract
-    the begin comment's own explanatory inline code — a plausible-looking
-    string, so the mistake would not announce itself.
+    ``verify_command_invariants.marked_span`` owns the loud marker checks. This
+    guard supplies only the pattern, keyed on the bullet's label rather than on
+    backticks so that inline code in the begin comment is never extracted.
     """
-    begin = f"{marker}:begin"
-    end = f"{marker}:end"
-
-    begin_count = markdown_text.count(begin)
-    assert begin_count == 1, (
-        f"expected exactly one {begin!r} marker, found {begin_count} (task 5690). "
-        f"It delimits a copy-pasteable command in CLAUDE.md's `### Anchoring "
-        f"ad-hoc paths` section. If it was deleted, restore it around that "
-        f"bullet; if it was duplicated, one of the two copies is unpinned and "
-        f"free to rot into a command that no longer runs."
-    )
-    end_count = markdown_text.count(end)
-    assert end_count == 1, (
-        f"expected exactly one {end!r} marker to close {begin!r} in CLAUDE.md, "
-        f"found {end_count} (task 5690) — restore the closing marker below the "
-        f"bullet it wraps"
-    )
-
-    # Inverted markers yield an empty slice, so the next assertion catches that
-    # too, loudly and with the same remedy.
-    marked = markdown_text[markdown_text.index(begin):markdown_text.index(end)]
-    prefix = f"- **{bullet_label}**: `"
-    spans = [
-        segment.split("`", 1)[0]
-        for segment in marked.split(prefix)[1:]
-        if "`" in segment
-    ]
-    assert len(spans) == 1, (
-        f"expected exactly one ``{prefix}<command>``` bullet between {begin!r} "
-        f"and {end!r} in CLAUDE.md, found {len(spans)}: {spans!r} (task 5690). "
-        f"The marker must wrap that bullet and nothing else; if the bullet was "
-        f"relabelled or the markers were inverted, move the marker back around "
-        f"the copy-pasteable command."
-    )
-
-    command = spans[0].strip()
-    assert command, (
-        f"the command between {begin!r} and {end!r} in CLAUDE.md is empty (task 5690)"
-    )
-    return command
+    bullet = re.compile(r"- \*\*" + re.escape(bullet_label) + r"\*\*: `([^`]+)`")
+    return vci.marked_span(
+        markdown_text,
+        begin=f"{marker}:begin",
+        end=f"{marker}:end",
+        pattern=bullet,
+        what=f"`- **{bullet_label}**: <command>` bullet",
+        source="CLAUDE.md",
+        label=f"the {bullet_label!r} command",
+        task="5690",
+    ).strip()
 
 
 _HAPPY_DOC = """\
