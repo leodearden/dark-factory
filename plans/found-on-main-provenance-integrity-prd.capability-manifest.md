@@ -43,3 +43,29 @@ Per-leaf capability→evidence bindings (G3+G6 mechanized). Substrate verified o
 - DAG-direction: ε, ι, κ upstream. PASS
 
 No FAIL bindings. Batch clear to queue.
+
+## Unbound task labels (task 4907 adjudication)
+
+**Class A2 — the PRD's intermediates, left out of a leaf-only sidecar.** Four
+tasks, all `done` when measured on 2026-09-23, carry this PRD's
+`metadata.prd_path` and a `prd_task_label` the YAML sidecar does not declare:
+**2674** α, **2677** β, **2675** δ and **2676** ι. `commit_planning`'s
+label→task-id stamper binds nothing for these labels.
+
+Evidence. The PRD's "Decomposition plan" marks α, β, δ and ι "(Intermediate →
+unlocks …)" and the other six, γ, ε, ζ, η, κ and θ, as leaves. The sidecar
+declares exactly those six leaves (2678–2683). Stamp commit `b461b2a915` records the choice in
+so many words: "intermediates α/δ/ι/β carry no sidecar entries by design".
+This manifest is headed "Per-leaf capability→evidence bindings", and its leaf
+blocks cite the four intermediates as "producer: task-α (upstream)" and
+similar.
+
+**This leaf-only sidecar was this PRD's deliberate choice, and it is NOT the
+house norm.** The exemplar,
+`plans/capability-delivered-checks-prd.capability-manifest.yaml`, gives its
+intermediates entries, and so does every other PRD checked that marks its
+intermediates. This is the only sidecar in the corpus that leaves a labelled
+plan task without an entry.
+
+**Verdict: not a defect, no repair.** Nothing was lost: an intermediate with no
+entry has nothing to stamp and no checks to copy, and all four tasks are done.
