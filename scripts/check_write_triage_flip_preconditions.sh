@@ -55,7 +55,7 @@
 #
 #           Checked by EXECUTING the ref's triage_write with an injected fake
 #           judge AND by reading the ref's judge module, via
-#           scripts/check_write_triage_attach_consumption.py. THREE branches
+#           scripts/check_write_triage_attach_consumption.py. TWO branches
 #           satisfy it, and the verdict below names the one that did -- they
 #           rest on different evidence:
 #             - judge-side designation swap (option a): the judge names its
@@ -66,10 +66,6 @@
 #               holds, and triage_write is unchanged. Consumption holds BY
 #               CONSTRUCTION -- announced target and attach target are the same
 #               expression -- not by a measured swap.
-#             - triage-side announced target: a HYPOTHETICAL channel. No remedy
-#               in this codebase announces a target to the judge through a
-#               kwarg of its own. Kept because the invariant it asserts is
-#               sound and it costs nothing, not because it models a remedy.
 #
 #           WHAT IT DOES NOT ASSERT. The probe stops at
 #           BandDecision.canonical_id -- the value tools.py::add_memory consumes
@@ -156,14 +152,14 @@ fi
 # containing a space must not tear the resolved interpreter path apart.
 PROBE5="$REPO/scripts/check_write_triage_attach_consumption.py"
 
-# Item 5's PASS line, matched literally (grep -F). ALL THREE of its PASS
-# branches emit this prefix (see the item 5 block above), and no FAIL or
+# Item 5's PASS line, matched literally (grep -F). BOTH of its PASS branches
+# emit this prefix (see the item 5 block above), and no FAIL or
 # UNVERIFIABLE path does. Pinned by the hermetic tests in
 # scripts/tests/test_check_write_triage_flip_preconditions.py so the two cannot
 # drift apart silently.
 PROBE5_PASS_MARKER='PASS  the judge-bound candidate is CONSUMED by the attach'
 
-# The probe's one machine-readable line naming WHICH of those three branches
+# The probe's one machine-readable line naming WHICH of those two branches
 # held, quoted into the verdict below. `PASS item 5` alone cannot tell an
 # operator whether a swap was MEASURED or whether option (b) held BY
 # CONSTRUCTION, and those authorise the production flag flip on different
@@ -612,8 +608,8 @@ else
   if item_failed 5; then
     note "        Item 5 is item 1's CONSUMPTION half: a verdict can be bound to a"
     note "        determinate candidate and still not be the id the write attaches to,"
-    note "        so closing item 1 does not close this. Any of the three branches"
-    note "        listed in this script's item 5 block satisfies it."
+    note "        so closing item 1 does not close this. Either branch listed in"
+    note "        this script's item 5 block satisfies it."
     clause_printed=1
   fi
   # Fallback so this block can never go guidance-free: unreachable today

@@ -16,10 +16,9 @@ This probe closes that gap by EXECUTING ``triage_write`` with an injected fake
 judge and asking whether the attach id is determined by the candidate the judge
 reasoned about.
 
-THREE BRANCHES, AND WHAT EACH DOES AND DOES NOT MEASURE. What is asserted is
-the INVARIANT, not which remedy landed: requiring any single branch would fail
-a correct fix that took another route and re-block task 3169, which is the
-false-FAIL class this gate family was rewritten to remove.
+TWO BRANCHES, AND WHAT EACH DOES AND DOES NOT MEASURE. What is asserted is
+the INVARIANT, not which remedy landed: requiring either branch alone would
+fail a correct fix that took the other route.
 
     judge-side designation swap (option a). The JUDGE names its candidate back
     and the attach tracks it across two DIFFERENT designations. A measured
@@ -32,11 +31,6 @@ false-FAIL class this gate family was rewritten to remove.
     possible however correct the module is; consumption holds BY CONSTRUCTION,
     because the announced target and the attach target are one expression. Read
     from the ref's JUDGE module, which is the only place this remedy appears.
-
-    triage-side announced target. A HYPOTHETICAL channel: nothing in this
-    codebase announces a target to the judge through a kwarg of its own. It is
-    kept because the invariant it asserts is sound and it costs nothing, not
-    because it models a remedy.
 
 The PASS report names the branch that held. "A swap was measured" and "option
 (b) held by construction" authorise the production flag flip on different
@@ -143,9 +137,6 @@ _ATTACH_OUTCOME = 'restated'
 _PASS_MARKER = 'PASS  the judge-bound candidate is CONSUMED by the attach'
 _FAIL_MARKER = 'FAIL  the judge-bound candidate is NOT CONSUMED by the attach'
 
-_ANNOUNCED_BRANCH = 'announced-target branch'
-_ANNOUNCEMENT_IGNORED = 'the attach did not land on the announced target'
-
 _JUDGE_MODULE_NAME = 'fused_memory.server.write_triage_judge'
 _JUDGE_TARGET_BRANCH = 'judge-target branch'
 _BUILDER_NAME = 'build_judge_prompt'
@@ -169,7 +160,7 @@ _CANONICAL_ATTR = 'canonical_id'
 _JUDGE_DRIVE_TIMEOUT = 5.0
 
 #: THE ONE MACHINE-READABLE LINE saying which branch satisfied item 5, and the
-#: three names it can carry. `PASS  item 5` alone cannot tell an operator
+#: two names it can carry. `PASS  item 5` alone cannot tell an operator
 #: whether a swap was MEASURED or whether option (b) held BY CONSTRUCTION, and
 #: those authorise the production flag flip on different evidence. The gate
 #: greps this prefix and quotes the rest into its own report.
@@ -182,23 +173,6 @@ _BRANCH_JUDGE_TARGET = (
     'judge-module attach target (option (b)) - holds BY CONSTRUCTION, '
     'not by a measured swap'
 )
-_BRANCH_ANNOUNCED = (
-    'triage-side announced target (hypothetical channel) - a MEASURED '
-    'consumption result'
-)
-
-#: The kwargs main ALREADY hands the judge. An announcement read out of any of
-#: these is one main already makes -- `decision.canonical_id` is precisely the
-#: id main already attaches to -- so admitting them would let the branch hold
-#: on a codebase where nothing changed at all. Excluding them is what makes the
-#: branch evidence rather than decoration.
-_JUDGE_KWARGS = frozenset({
-    'memory_service',
-    'content',
-    'project_id',
-    'decision',
-    'candidates',
-})
 
 
 class _Unverifiable(Exception):
@@ -463,8 +437,8 @@ _SPELLINGS: tuple[_Spelling, ...] = (
 class _FakeJudge:
     """An async judge that records its call and returns a designating verdict.
 
-    Records every keyword argument it is handed, so the probe can measure what
-    the module told the judge as well as what it did with the answer.
+    The recorded kwargs are where :func:`_measure` reads the slate and the
+    band's decision the module handed its judge.
     """
 
     def __init__(self, payload: Any) -> None:
@@ -722,76 +696,6 @@ def _swap_verdict(
                 f'designated candidate {designated!r}'
             )
     return None
-
-
-def _announced_candidates(
-    call: dict[str, Any],
-    eligible: list[str],
-) -> list[tuple[str, Any]]:
-    """Slate candidates the module NAMED to the judge, as ``(kwarg, candidate)``.
-
-    An announcement counts only when it is BOTH beyond :data:`_JUDGE_KWARGS`
-    and drawn from *eligible* — the ids that are distinguishable from the
-    band's own canonical, the same set the swap draws its designations from and
-    for the same reason. Announcing the id main already attaches to says
-    nothing about whether the announcement was honoured.
-
-    A candidate may be named as its id or as the object itself; both are read,
-    because which one a remedy would pass is a mechanism this probe may not pin.
-    The OBJECT is what comes back either way: honouring an announcement means
-    landing on :func:`_attach_id_for` of it, which reads its metadata.
-    """
-    by_id = {getattr(c, 'id', None): c for c in call.get('candidates') or ()}
-    found = []
-    for name, value in call.items():
-        if name in _JUDGE_KWARGS:
-            continue
-        ident = value if isinstance(value, str) else getattr(value, 'id', None)
-        if isinstance(ident, str) and ident in eligible:
-            found.append((name, by_id[ident]))
-    return found
-
-
-def _announced_target_branch(
-    module: Any,
-    run: _Run,
-    eligible: list[str],
-) -> tuple[bool, str]:
-    """Did the attach land on a candidate the module itself announced?
-
-    Returns ``(satisfied, report line)``. The line is emitted whether or not
-    the branch holds, so a reader can see the branch was EVALUATED rather than
-    skipped — the non-vacuity of "main does not satisfy it" is only legible if
-    main's run says so out loud.
-    """
-    announced = _announced_candidates(run.calls[0], eligible)
-    observed = getattr(run.decision, 'canonical_id', None)
-    if not announced:
-        return False, (
-            f'{_ANNOUNCED_BRANCH}: the judge was told no slate candidate beyond '
-            f'{sorted(_JUDGE_KWARGS)}, so nothing was announced for the attach '
-            'to honour'
-        )
-    # Against _attach_id_for rather than the announced id verbatim, for the
-    # reason _designated_ids filters its pool: an announcing remedy that also
-    # hoists a child is honouring its announcement, and must not be read here
-    # as ignoring it.
-    honoured = [
-        (name, candidate) for name, candidate in announced
-        if _attach_id_for(module, candidate) == observed
-    ]
-    if honoured:
-        name, candidate = honoured[0]
-        return True, (
-            f'{_ANNOUNCED_BRANCH}: satisfied — triage_write announced '
-            f'{getattr(candidate, "id", None)!r} to the judge via {name!r}, and '
-            f'the attach landed on {observed!r}'
-        )
-    ignored = [f'{name}={getattr(c, "id", None)!r}' for name, c in announced]
-    return False, (
-        f'{_ANNOUNCED_BRANCH}: triage_write announced {_first_few(ignored)}, '
-        f'but the attach landed on {observed!r} — {_ANNOUNCEMENT_IGNORED}'
-    )
 
 
 class _JudgeAborted(Exception):
@@ -1170,9 +1074,9 @@ def _pass_scope_note() -> list[str]:
 def _pass(out: list[str], branch: str) -> int:
     """Report a satisfied invariant, NAMING the branch that satisfied it.
 
-    One exit for all three branches, so the marker the gate greps, the branch
-    line it quotes and the scope note an operator reads can never be emitted
-    by one branch and forgotten by another.
+    One exit for both branches, so the marker the gate greps, the branch line
+    it quotes and the scope note an operator reads can never be emitted by one
+    branch and forgotten by the other.
     """
     out.append(_BRANCH_PREFIX + branch)
     out.append(_PASS_MARKER)
@@ -1193,28 +1097,20 @@ def _probe(src_root: Path, extra_paths: list[Path], out: list[str]) -> int:
     out.append(
         f'slate: {slate_ids!r} — band canonical {band_canonical!r}',
     )
-    usable = _designated_ids(module, slate, band_canonical)
     observed = getattr(measured.decision, 'canonical_id', None)
 
-    # BOTH by-construction branches are evaluated and REPORTED before either
-    # can return, and both before the swap. Each is decided from the run
-    # already measured plus at most one judge call, so neither costs anything
-    # a reader would notice -- while a branch that returned before the other
-    # printed would leave an operator unable to see that it had been
-    # considered at all. The swap comes last because it is the only branch
-    # that drives the write eight more times, and because a module satisfying
-    # either branch above has no judge-side designation for it to find.
+    # The judge-target branch first: it is decided from the run already
+    # measured plus one judge call, while the swap drives the write eight more
+    # times -- and a module satisfying it has no judge-side designation for
+    # the swap to find.
     judged, judge_line = _judge_target_branch(
         module, judge_module, band_canonical, observed, slate,
     )
     out.append(judge_line)
-    announced, announced_line = _announced_target_branch(module, measured, usable)
-    out.append(announced_line)
     if judged:
         return _pass(out, _BRANCH_JUDGE_TARGET)
-    if announced:
-        return _pass(out, _BRANCH_ANNOUNCED)
 
+    usable = _designated_ids(module, slate, band_canonical)
     if len(usable) < 2:
         # UNVERIFIABLE, never PASS. With fewer than two candidates that are
         # distinguishable from the band's own canonical there is nothing here

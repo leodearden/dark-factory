@@ -184,14 +184,8 @@ def _record_fail_open(counter, project_id, exc, *, stage):
 
 
 async def _stub_judge(*, memory_service, content, project_id, decision,
-                      candidates=(), **_announced):
-    """main's default judge. Tolerates an announced attach target.
-
-    Swallowing an unknown kwarg is what a real judge under option (b) would
-    have to do anyway, and without it an announcing variant that fell back to
-    this stub would raise -- turning a fixture the probe never exercises that
-    way into a fail-open, and measuring the stub instead of the variant.
-    """
+                      candidates=()):
+    """main's default judge."""
     return OUTCOME_STORED
 
 
@@ -286,91 +280,6 @@ def _make_designating_triage_write(decode, attach=_attach_designated):
             canonical_id = attach(candidate_id, candidates, decision)
         return BandDecision(
             outcome, canonical_id, decision.similarity,
-            decision.t_high, decision.t_low,
-        )
-
-    return triage_write
-
-
-#: The kwarg an announcing variant tells the judge its attach target through.
-#: A NEW name, beyond main's five: an announcement the probe could read out of
-#: `decision` would be one main already makes, so the branch would hold on a
-#: codebase where nothing changed.
-ANNOUNCE_KWARG = 'attach_target'
-
-
-def _announced_target(candidates, decision):
-    """The CALLER's own pick of attach target, under an option-(b) remedy.
-
-    The first slate id that is not the band's canonical: announcing the band's
-    own canonical would be announcing what main already attaches to, so it
-    would carry no information about whether the announcement was honoured.
-    """
-    for ident in _slate_ids(candidates):
-        if isinstance(ident, str) and ident and ident != decision.canonical_id:
-            return ident
-    return decision.canonical_id
-
-
-def _honour_announcement(announced, candidates, decision):
-    return announced
-
-
-def _make_announcing_triage_write(attach=_honour_announcement):
-    """Build a triage_write shaped like an option-(b) remedy.
-
-    Under option (b) the CALLER picks the attach target and tells the judge
-    which candidate it is reasoning about, rather than letting the judge name
-    one back. The judge's verdict stays a bare outcome word, so no designation
-    is decoded here at all.
-
-    *attach* maps ``(announced, candidates, decision)`` to the id the write
-    attaches to. Announcing a target and HONOURING it are separate things, and
-    a module that names one candidate in the prompt and files the verdict
-    against another is the option-(b)-shaped form of the very defect this item
-    exists to detect -- so, as with the designating builder, they are separate
-    parameters rather than one entangled body.
-    """
-    async def triage_write(memory_service, *, content, project_id, counter,
-                           judge=None, allow_near_duplicate=False,
-                           caller_owns_attach_keys=False):
-        if _forced(allow_near_duplicate, caller_owns_attach_keys):
-            return BandDecision(OUTCOME_STORED, None, None, None, None)
-        decision, candidates = await _band_and_candidates(
-            memory_service, content, project_id, counter,
-        )
-        if decision.outcome != OUTCOME_JUDGE:
-            return decision
-        announced = _announced_target(candidates, decision)
-        try:
-            verdict = await (judge or _stub_judge)(**{
-                'memory_service': memory_service,
-                'content': content,
-                'project_id': project_id,
-                'decision': decision,
-                'candidates': candidates,
-                ANNOUNCE_KWARG: announced,
-            })
-        except Exception as exc:
-            _record_fail_open(counter, project_id, exc, stage='judge')
-            return BandDecision(
-                OUTCOME_STORED, None, None, decision.t_high, decision.t_low,
-            )
-        if not isinstance(verdict, str) or verdict not in TRIAGE_OUTCOMES:
-            _record_fail_open(
-                counter, project_id,
-                ValueError('judge returned %r' % (verdict,)),
-                stage='judge',
-            )
-            return BandDecision(
-                OUTCOME_STORED, None, None, decision.t_high, decision.t_low,
-            )
-        if verdict == OUTCOME_STORED:
-            canonical_id = None
-        else:
-            canonical_id = attach(announced, candidates, decision)
-        return BandDecision(
-            verdict, canonical_id, decision.similarity,
             decision.t_high, decision.t_low,
         )
 
@@ -572,35 +481,6 @@ async def triage_write(memory_service, *, content, project_id, counter,
 '''
 
 
-#: The triage-side announcement channel, which nothing in this codebase uses:
-#: here the CALLER picks the attach target and announces it to the judge
-#: through a kwarg beyond main's five. Real option (b) announces it in the
-#: JUDGE module instead (see the judge stand-ins below), so this models a
-#: HYPOTHETICAL remedy rather than the one that landed. It is kept because the
-#: invariant it asserts -- an announced target the write must honour -- is
-#: sound and costs nothing, and because a branch with no fixture is a branch
-#: nobody has run.
-_ANNOUNCES_TARGET = r"""
-
-triage_write = _make_announcing_triage_write()
-"""
-
-
-#: The option-(b)-shaped form of the defect: the prompt names one candidate and
-#: the write files the verdict against the band's top-1 anyway. It announces,
-#: so the branch is reachable; it does not honour the announcement, so the
-#: branch must not hold. Without this variant, "an announcement exists" would
-#: be indistinguishable from "the announcement was consumed".
-_ANNOUNCES_BUT_ATTACHES_ELSEWHERE = r"""
-
-def _attach_band_canonical(announced, candidates, decision):
-    return decision.canonical_id
-
-
-triage_write = _make_announcing_triage_write(_attach_band_canonical)
-"""
-
-
 #: THE UNUSABLE REFS. Each is a way the probe can be pointed at a tree it
 #: cannot decide the invariant on, and every one of them must land on
 #: UNVERIFIABLE rather than on a verdict — an unverifiable invariant is not a
@@ -688,8 +568,6 @@ VARIANT_TAILS: dict[str, str] = {
     'consumes_designated_and_hoists': _CONSUMES_AND_HOISTS,
     'hardcodes_last_candidate': _HARDCODES_LAST,
     'fail_opens_on_designation': _FAIL_OPENS_ON_DESIGNATION,
-    'announces_attach_target': _ANNOUNCES_TARGET,
-    'announces_but_attaches_elsewhere': _ANNOUNCES_BUT_ATTACHES_ELSEWHERE,
     'raises_on_triage_write': _RAISES_ON_CALL,
     'exits_during_import': _EXITS_DURING_IMPORT,
     'not_awaitable': _NOT_AWAITABLE,

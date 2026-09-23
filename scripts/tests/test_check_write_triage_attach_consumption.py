@@ -69,16 +69,6 @@ _DID_NOT_TRACK = 'did not track the designated candidate'
 #: structurally, from the counter, and reported with its count.
 _FAIL_OPEN = 'FAIL-OPEN'
 _ONE_FAIL_OPEN = 'FAIL-OPEN (1 recorded)'
-#: The SECOND way item 5's invariant can hold: under an option-(b)-shaped
-#: remedy the CALLER picks the attach target and tells the judge, so the judge
-#: names no candidate back and the judge-side swap cannot hold. Reported by
-#: name on every run, satisfied or not, so a reader can see the branch was
-#: evaluated rather than skipped.
-_ANNOUNCED_BRANCH = 'announced-target branch'
-#: The finding an announcement the write ignores earns. Distinguishable from
-#: "the judge was told nothing": one remedy is to honour the announcement, the
-#: other is to make one.
-_ANNOUNCEMENT_IGNORED = 'the attach did not land on the announced target'
 
 #: The option-(a) wire shapes a fix might land. None may be pinned by the
 #: probe: option (a) has not landed, so a probe that required one spelling
@@ -129,14 +119,13 @@ _NOT_THE_CANONICAL = "is not the decision's canonical id"
 _TOLD_NOT_USED = 'did not use the target the judge was told about'
 
 #: The probe's one machine-readable "which branch satisfied item 5" line, and
-#: the three names it can carry. The gate quotes this line into its own item-5
+#: the two names it can carry. The gate quotes this line into its own item-5
 #: PASS note, because `PASS  item 5` alone cannot tell an operator whether a
 #: swap was MEASURED or whether option (b) held BY CONSTRUCTION — and those two
 #: authorise the production flag flip on different evidence.
 _BRANCH_MARKER = 'ITEM5-BRANCH'
 _BRANCH_SWAP = 'judge-side designation swap'
 _BRANCH_JUDGE_TARGET = 'judge-module attach target'
-_BRANCH_ANNOUNCED = 'triage-side announced target'
 
 _BAND_CANONICAL = 'parent-1'
 #: The slate's evidence child: the top-scoring candidate, and the one
@@ -342,58 +331,6 @@ class TestConsumptionProbe:
         for line in named:
             assert _EVIDENCE_CHILD not in line, proc.stdout
 
-    def test_an_honoured_announcement_satisfies_item_5(self, tmp_path):
-        """The option-(b)-shaped remedy, and why item 5 may not require the swap.
-
-        Under option (b) the CALLER picks the attach target and announces it to
-        the judge; the judge names no candidate back, so the judge-side swap
-        cannot hold however correct the module is. Requiring the swap would
-        therefore fail a correct fix and re-block task 3169 — the false-FAIL
-        class this gate family was rewritten to remove. What item 5 asserts is
-        the INVARIANT, not which remedy landed, so either branch satisfies it
-        and the report says which one did.
-        """
-        src_root = write_fake_triage(
-            tmp_path / 'src', variant='announces_attach_target',
-        )
-        proc = _run_probe(src_root)
-        assert proc.returncode == 0, f'{proc.stdout}\n{proc.stderr}'
-        assert _PASS in proc.stdout, proc.stdout
-        assert _ANNOUNCED_BRANCH in proc.stdout, proc.stdout
-
-    def test_the_announced_target_branch_is_not_vacuous(self, tmp_path):
-        """main announces nothing, so the branch must not hold for main.
-
-        main already hands the judge `decision`, whose `canonical_id` is the
-        very id it already attaches to. A branch that read the announcement out
-        of any of today's five kwargs would hold on a codebase where nothing
-        changed at all — the same catastrophic false pass the fail-open control
-        guards, reached by a different route. So the branch is asserted to be
-        EVALUATED here (it is named) and to be UNSATISFIED.
-        """
-        src_root = write_fake_triage(tmp_path / 'src', variant='band_top1')
-        proc = _run_probe(src_root)
-        assert proc.returncode != 0, f'{proc.stdout}\n{proc.stderr}'
-        assert _PASS not in proc.stdout, proc.stdout
-        assert _ANNOUNCED_BRANCH in proc.stdout, proc.stdout
-
-    def test_an_announcement_the_attach_ignores_is_not_consumption(self, tmp_path):
-        """Announcing a target is not the same as attaching to it.
-
-        This variant names one candidate in the prompt and files the verdict
-        against the band's top-1 anyway — the option-(b)-shaped form of the
-        defect item 5 exists to detect. Without it, "an announcement exists"
-        would be indistinguishable from "the announcement was consumed", and
-        the branch would bless the defect it was added to catch.
-        """
-        src_root = write_fake_triage(
-            tmp_path / 'src', variant='announces_but_attaches_elsewhere',
-        )
-        proc = _run_probe(src_root)
-        assert proc.returncode != 0, f'{proc.stdout}\n{proc.stderr}'
-        assert _PASS not in proc.stdout, proc.stdout
-        assert _ANNOUNCEMENT_IGNORED in proc.stdout, proc.stdout
-
 
 class TestFailsClosed:
     """An unverifiable invariant is not a satisfied one.
@@ -596,7 +533,6 @@ class TestJudgeModuleAttachTarget:
         [
             ('band_top1', 1),
             ('consumes_designated_id', 0),
-            ('announces_attach_target', 0),
         ],
     )
     def test_a_src_root_with_no_judge_module_keeps_its_verdict(
@@ -619,7 +555,7 @@ class TestJudgeModuleAttachTarget:
 class TestThePassNamesItsBranch:
     """`PASS  item 5` alone does not say what was measured.
 
-    Three branches can satisfy item 5 and they rest on different evidence: a
+    Two branches can satisfy item 5 and they rest on different evidence: a
     swap the probe MEASURED, and an option (b) that holds BY CONSTRUCTION
     because the announced target and the attach target are one expression. An
     operator flipping a production flag is entitled to know which ran, so the
@@ -631,7 +567,6 @@ class TestThePassNamesItsBranch:
         ('triage', 'judge', 'branch'),
         [
             ('consumes_designated_id', 'missing', _BRANCH_SWAP),
-            ('announces_attach_target', 'missing', _BRANCH_ANNOUNCED),
             ('band_top1', 'feeds_attach_target', _BRANCH_JUDGE_TARGET),
         ],
     )
