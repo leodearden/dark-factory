@@ -205,6 +205,13 @@ filterwarnings = [
 # this value with tomllib at runtime — edit the two together.
 timeout = 540
 timeout_method = "thread"
+# A test still running after this many seconds dumps every thread's stack to
+# the worker's stderr, which the verify log carries, so a hang whose kill comes
+# LATER than this is legible before the os._exit() below erases the worker.
+# Kept under verify's CLI --timeout=300 so an unmarked test dumps before it is
+# killed. Why stderr, and why not pytest-timeout's own banner:
+# test_whole_tree_scan_timeout_guard.py::TestTimeoutConstants, which pins it.
+faulthandler_timeout = 240
 # Parallelise the 2183-test orchestrator suite. ``-n auto`` picks worker
 # count from CPUs; ``--dist loadgroup`` keeps tests tagged with the same
 # xdist_group on a single worker (see test_cargo_scope.py /

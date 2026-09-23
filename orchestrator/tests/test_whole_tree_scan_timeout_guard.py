@@ -67,6 +67,7 @@ import pytest
 from _orch_helpers import (
     ORCH_PYPROJECT,
     PYPROJECT_DEFAULT_TIMEOUT,
+    VERIFY_CLI_PER_TEST_TIMEOUT,
     WHOLE_TREE_SCAN_TEST_TIMEOUT,
 )
 
@@ -149,6 +150,28 @@ def _pytest_ini_options() -> dict[str, object]:
 
 class TestTimeoutConstants:
     """The two constants this guard's remediation advice depends on."""
+
+    def test_a_hung_test_dumps_its_stacks_before_any_kill_can_reach_it(self) -> None:
+        """``faulthandler_timeout`` must fire below the tightest kill a test meets.
+
+        Under ``timeout_method = "thread"`` the kill is an ``os._exit()`` that
+        leaves no traceback.  pytest-timeout's own banner goes through the
+        terminal writer to the worker's STDOUT, which execnet's
+        ``init_popen_io`` dup2s to /dev/null, so under xdist it never reaches
+        the controller; the faulthandler dump goes to STDERR, which the worker
+        inherits from the controller, and verify merges stderr into its log.
+        The dump is evidence only if it lands first, and the tightest kill an
+        UNMARKED test can meet is verify's CLI ``--timeout=300``, not this
+        file's ini default.  Marked tests below this value still die silently.
+        """
+        ini_options = _pytest_ini_options()
+
+        dump_after = float(ini_options['faulthandler_timeout'])
+        assert 0 < dump_after < VERIFY_CLI_PER_TEST_TIMEOUT, (
+            f'faulthandler_timeout ({dump_after}) must be positive and below '
+            f'VERIFY_CLI_PER_TEST_TIMEOUT ({VERIFY_CLI_PER_TEST_TIMEOUT}), or a '
+            'hung test is killed before its stacks reach the verify log'
+        )
 
     def test_pyproject_default_timeout_mirrors_pyproject(self) -> None:
         """``PYPROJECT_DEFAULT_TIMEOUT`` must equal the REAL configured default.
