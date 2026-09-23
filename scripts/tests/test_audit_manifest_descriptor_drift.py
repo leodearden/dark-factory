@@ -982,6 +982,129 @@ def test_unbound_rows_leave_the_drift_findings_and_coverage_untouched(
         assert getattr(with_unbound.coverage, field) == getattr(baseline.coverage, field), field
 
 
+# The label-binding direction's coverage counters. With len(unbound_labels) they
+# partition every task the stamper would admit.
+_LABEL_BINDING_COUNTERS = (
+    "manifest_bearing_tasks",
+    "tasks_bound_to_a_declared_label",
+    "tasks_without_a_tracked_sidecar",
+    "tasks_on_an_unparseable_sidecar",
+)
+
+
+def _label_binding_counters(coverage) -> dict[str, int]:
+    return {name: getattr(coverage, name) for name in _LABEL_BINDING_COUNTERS}
+
+
+def test_manifest_bearing_tasks_equal_bound_plus_unbound_plus_every_skip_class(
+        tmp_path, make_tasks_db):
+    """THE ARITHMETIC CLOSES, as it does for the drift direction (see
+    test_seen_equals_compared_plus_every_skip_class), so the unbound list can
+    never be mistaken for the whole population it came from.
+
+    One project exercising every outcome. The absent and the untracked sidecar
+    share one term, because neither is part of the tracked corpus. The
+    unparseable sidecar gets its own term: it IS tracked, so calling it
+    "without a tracked sidecar" would be false.
+    """
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[
+            _labelled(1, label="α"),
+            _labelled(2, label="ω"),
+            _labelled(3, prd_path="plans/absent-prd.md"),
+            _labelled(4, prd_path="plans/untracked-prd.md"),
+            _labelled(5, prd_path="plans/broken-prd.md"),
+            _labelled(6, prd_path="plans/broken-prd.md", label="β"),
+            # Excluded by the stamper's falsy gate, so in NO term at all.
+            {"id": 7, "status": "pending", "metadata": {"prd_path": "plans/x-prd.md"}},
+        ],
+        manifests=[
+            ("plans/x-prd.capability-manifest.yaml", _declaring("α")),
+            ("plans/broken-prd.capability-manifest.yaml", "prd: [unclosed\n  nope: {"),
+        ],
+    )
+    _write_manifest(root, "plans/untracked-prd.capability-manifest.yaml",
+                    _declaring("α", prd="plans/untracked-prd.md"))
+
+    audit = audit_project(str(root))
+    c = audit.coverage
+
+    assert _label_binding_counters(c) == {
+        "manifest_bearing_tasks": 6,
+        "tasks_bound_to_a_declared_label": 1,
+        "tasks_without_a_tracked_sidecar": 2,
+        "tasks_on_an_unparseable_sidecar": 2,
+    }
+    assert _unbound_pairs(audit) == [(2, "ω")]
+    assert c.manifest_bearing_tasks == (
+        c.tasks_bound_to_a_declared_label
+        + len(audit.unbound_labels)
+        + c.tasks_without_a_tracked_sidecar
+        + c.tasks_on_an_unparseable_sidecar
+    )
+    # Two failure modes, never conflated: the existing count stays one per
+    # SIDECAR, and still names it, however many tasks point at it.
+    assert c.manifest_parse_failures == 1
+    assert c.manifest_parse_failure_details[0].startswith(
+        "plans/broken-prd.capability-manifest.yaml: ")
+
+
+def test_label_binding_counters_are_zero_without_manifest_bearing_tasks(
+        tmp_path, make_tasks_db):
+    root = _one_project(tmp_path, make_tasks_db,
+                        sidecar_check=_GREP_CHECK,
+                        task_entry=_entry("gate", _GREP_CHECK))
+
+    counters = _label_binding_counters(audit_project(str(root)).coverage)
+
+    assert counters == dict.fromkeys(_LABEL_BINDING_COUNTERS, 0)
+
+
+def test_label_binding_counters_are_zero_when_git_discovery_failed(
+        tmp_path, make_tasks_db):
+    """Nothing was enumerated, so nothing was classified. That matches the
+    drift counters, which are zero there too; the discovery failure itself is
+    what the report's notice and exit 1 carry."""
+    root = _make_project(tmp_path, make_tasks_db, tasks=[_labelled(7)])
+    not_a_checkout = tmp_path / "bare"
+    not_a_checkout.mkdir()
+
+    audit = audit_project(str(root), str(not_a_checkout))
+
+    assert audit.coverage.git_discovery_failed is True
+    assert audit.unbound_labels == []
+    assert _label_binding_counters(audit.coverage) == dict.fromkeys(
+        _LABEL_BINDING_COUNTERS, 0)
+
+
+def test_coverage_block_counts_the_label_binding_classes_as_aligned_rows(
+        tmp_path, make_tasks_db):
+    """Four labelled rows, asserted as WHOLE LINES with their alignment (see
+    test_report_coverage_rows_render_with_their_column_alignment).
+
+    The no-tracked-sidecar class is COUNTED and never LISTED. Live, it is 407
+    tasks for which the stamper does nothing at all, and listing them would bury
+    the few rows the report exists to show. capabilities_without_task_entry is
+    treated the same way.
+    """
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_labelled(1, label="α"), _labelled(2, label="ω"),
+               _labelled(918273, prd_path="plans/absent-prd.md")],
+        manifests=[("plans/x-prd.capability-manifest.yaml", _declaring("α"))],
+    )
+
+    report = format_report([audit_project(str(root))])
+    lines = report.splitlines()
+
+    assert "    manifest-bearing tasks:             3" in lines
+    assert "    tasks bound to a declared label:    1" in lines
+    assert "    tasks with no tracked sidecar:      1" in lines
+    assert "    tasks on an unparseable sidecar:    0" in lines
+    assert "918273" not in report
+
+
 # ---------------------------------------------------------------------------
 # Non-vacuity / loudness. A silently-empty corpus must NEVER render as a clean
 # zero: an empty corpus and a clean corpus are indistinguishable in the finding
