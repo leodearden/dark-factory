@@ -52,7 +52,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from fused_memory.reconciliation.graphiti_degradation_probe import (
-    NEGATIVE_SET_VERDICT_TEMPLATE,
+    NEGATIVE_SET_VERDICT,
 )
 from fused_memory.reconciliation.recon_pool_map import (
     CYCLE_SUMMARY_STAGE_TO_RECON_POOL,
@@ -1051,14 +1051,14 @@ def _asserts_fault_absence(text: str) -> bool:
     return any(map(_clause_asserts_fault_absence, _CLAUSE_BREAK.split(text)))
 
 
-# Sourced from the template the stage prompts render, so a rejected caller is
-# told the exact permitted wording and the two can never disagree.
+# Quotes the verdict the stage prompts show, so a rejected caller is told the
+# exact permitted wording and the two can never disagree.
 _NEGATIVE_PROBE_SET_DETAIL = (
     'The Graphiti mixed-store degradation is intermittent and load-dependent, '
     'and `search` reports store failure only WHEN a store has already failed — '
     'so a clean probe is no evidence of health, and a negative probe set is an '
     'absence of evidence rather than evidence of absence. Report the count, not '
-    'a verdict: "' + NEGATIVE_SET_VERDICT_TEMPLATE.format(n='N') + '"'
+    'a verdict: "' + NEGATIVE_SET_VERDICT + '"'
 )
 
 # Module-level rule table for premise_lint: (matcher, invariant_name,

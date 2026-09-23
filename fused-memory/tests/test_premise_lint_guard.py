@@ -14,6 +14,9 @@ mis-modeled recon's run_id and marker-deletion mechanics.
 from __future__ import annotations
 
 from fused_memory.middleware.premise_lint_guard import premise_lint_error
+from fused_memory.reconciliation.graphiti_degradation_probe import (
+    NEGATIVE_SET_VERDICT,
+)
 
 # ---------------------------------------------------------------------------
 # Step-1: invariant matrix tests
@@ -281,6 +284,8 @@ class TestPremiseLintErrorInvariantMatrix:
         assert result is not None
         assert result.get('error_type') == 'ValidationError'
         assert 'negative_probe_set_does_not_clear_intermittent_fault' in result['error']
+        # The caller is told the same wording the stage prompts show.
+        assert NEGATIVE_SET_VERDICT in result['error']
 
     def test_non_recon_caller_negative_probe_claim_passes(self):
         """The guard's recon-only scoping is unchanged by the new rule: a

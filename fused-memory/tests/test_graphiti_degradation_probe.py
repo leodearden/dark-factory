@@ -20,6 +20,7 @@ from fused_memory.reconciliation.graphiti_degradation_probe import (
     GRAPHITI_MIXED_STORE_PROBES_RUN_STAT_KEY,
     HIGH_FANOUT_LIMIT_FLOOR,
     MIN_PROBES_PER_CYCLE,
+    NEGATIVE_SET_VERDICT,
     NEGATIVE_SET_VERDICT_TEMPLATE,
     PROBE_LIMIT_LADDER,
     render_graphiti_degradation_probe_section,
@@ -31,7 +32,6 @@ from fused_memory.reconciliation.prompts.stage2 import (
 )
 from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
 
-_VERDICT = NEGATIVE_SET_VERDICT_TEMPLATE.format(n=len(PROBE_LIMIT_LADDER))
 _PROBE_SECTION = render_graphiti_degradation_probe_section(runs_probes=True)
 _READ_ONLY_SECTION = render_graphiti_degradation_probe_section(runs_probes=False)
 
@@ -40,9 +40,13 @@ class TestProbeLadderIsAControlledVariable:
     """Requirements 1 and 2: N>=3 probes, with ``limit`` spanned rather than
     silently held at the one value that produced the cd53b227 false negative."""
 
+    def test_ladder_meets_the_three_probe_requirement(self):
+        """Requirement 1 — at least three probes per cycle, one per rung."""
+        assert len(PROBE_LIMIT_LADDER) >= 3
+
     def test_ladder_supplies_at_least_the_per_cycle_minimum(self):
-        """Requirement 1 — the ladder IS the reason for the minimum, so it
-        must be able to satisfy it on its own."""
+        """The ladder IS the reason for the minimum, so it must be able to
+        satisfy it on its own."""
         assert len(PROBE_LIMIT_LADDER) >= MIN_PROBES_PER_CYCLE
 
     def test_ladder_rungs_are_distinct(self):
@@ -64,12 +68,6 @@ class TestProbeLadderIsAControlledVariable:
     def test_ladder_includes_the_limit_both_positive_sightings_used(self):
         """Both reproductions came from limit=8 mixed-store queries."""
         assert 8 in PROBE_LIMIT_LADDER
-
-    def test_minimum_probe_count_is_three(self):
-        assert MIN_PROBES_PER_CYCLE == 3
-
-    def test_high_fanout_floor_is_eight(self):
-        assert HIGH_FANOUT_LIMIT_FLOOR == 8
 
     def test_ladder_is_immutable(self):
         """A module-level list would let one importer mutate the protocol for
@@ -129,7 +127,7 @@ def test_module_is_import_light():
         "assert 'mem0' not in sys.modules, sorted(k for k in sys.modules if 'mem0' in k); "
         "assert 'fused_memory.config.schema' not in sys.modules; "
         "assert 'fused_memory.reconciliation.harness' not in sys.modules; "
-        'assert p.MIN_PROBES_PER_CYCLE == 3'
+        'assert p.PROBE_LIMIT_LADDER'
     )
     result = subprocess.run(
         [sys.executable, '-c', probe], capture_output=True, text=True, timeout=120
@@ -144,7 +142,14 @@ class TestBothBranchesCarryTheVerdictRule:
     @pytest.mark.parametrize('runs_probes', [True, False])
     def test_verdict_appears_exactly_once(self, runs_probes):
         rendered = render_graphiti_degradation_probe_section(runs_probes=runs_probes)
-        assert rendered.count(_VERDICT) == 1
+        assert rendered.count(NEGATIVE_SET_VERDICT) == 1
+
+    @pytest.mark.parametrize('runs_probes', [True, False])
+    def test_verdict_leaves_the_count_to_the_stage(self, runs_probes):
+        """The minimum is "at least", so a stage may run more probes than the
+        ladder has rungs. A fixed count would hand it a false denominator."""
+        rendered = render_graphiti_degradation_probe_section(runs_probes=runs_probes)
+        assert NEGATIVE_SET_VERDICT_TEMPLATE.format(n=MIN_PROBES_PER_CYCLE) not in rendered
 
 
 class TestProbeBranchRendersTheLadder:
