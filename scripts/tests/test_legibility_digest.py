@@ -1101,6 +1101,20 @@ class TestTrickleCoderSessionDigest:
         assert meta['signal_counts'] == dict.fromkeys(mod.SIGNAL_COUNT_KEYS, 0)
         assert meta['n_user_turns'] == 0
 
+    def test_frontmatter_names_a_generation_that_excludes_reingested_content(self):
+        """Generation 3 is the first whose signal_counts exclude re-ingested
+        content, so a census can tell a pre-fix coder-JSON self-correction
+        trace (generation 2) from a live regression -- the discriminator
+        plans/confusion-reduction-prd.md §7.2.2 exists for. A floor, not a
+        freeze: a later legitimate bump must never have to edit a test named
+        for this decision (see §7.2.2's task-4751 note that no test freezes
+        the constant)."""
+        digest = mod.render_digest(_trickle_coder_session_records(), agent_class='interactive')
+
+        frontmatter_yaml, _ = _split_frontmatter(digest)
+
+        assert yaml.safe_load(frontmatter_yaml)['instrument_version'] >= 3
+
 
 # ---------------------------------------------------------------------------
 # find_retry_loops — same tool name + canonical (sort_keys) input signature
