@@ -153,7 +153,9 @@ class TestDetectorFires:
 
 
 class TestStrictScopingIsCompliant:
-    """Only a TRUTHY mcp_config paired with strict_mcp_config=True closes MCP."""
+    """Only an mcp_config KNOWN to be truthy, with a literal
+    strict_mcp_config=True, closes MCP.
+    """
 
     def test_zero_server_config_plus_strict_flag_is_compliant(self) -> None:
         sites = _scan('''
@@ -216,6 +218,57 @@ class TestStrictScopingIsCompliant:
                     disallowed_tools=['*'],
                     output_schema=SCHEMA,
                     mcp_config={},
+                    strict_mcp_config=True,
+                    cwd=some_root,
+                )
+        ''')
+        assert len(sites) == 1, f'got {sites!r}'
+        assert is_violation(sites[0]), f'got {sites[0]!r}'
+
+    def test_a_config_passed_by_name_is_still_a_violation(self) -> None:
+        """The same footgun arriving by another route: a name may hold ``{}``
+        at runtime, and a static scan cannot see what it holds. A config the
+        scanner cannot read exempts nothing; only the factory call spelled AT
+        the call site does.
+        """
+        sites = _scan('''
+            def call_the_model(some_root, cfg):
+                return invoke_with_cap_retry(
+                    disallowed_tools=['*'],
+                    output_schema=SCHEMA,
+                    mcp_config=cfg,
+                    strict_mcp_config=True,
+                    cwd=some_root,
+                )
+        ''')
+        assert len(sites) == 1, f'got {sites!r}'
+        assert is_violation(sites[0]), f'got {sites[0]!r}'
+
+    def test_a_dict_display_with_a_key_is_compliant(self) -> None:
+        """The factory's return value written inline is known truthy on sight."""
+        sites = _scan('''
+            def call_the_model(some_root):
+                return invoke_with_cap_retry(
+                    disallowed_tools=['*'],
+                    output_schema=SCHEMA,
+                    mcp_config={'mcpServers': {}},
+                    strict_mcp_config=True,
+                    cwd=some_root,
+                )
+        ''')
+        assert len(sites) == 1, f'got {sites!r}'
+        assert sites[0].exemption == EXEMPT_STRICT_MCP, f'got {sites[0]!r}'
+
+    def test_a_dict_display_of_only_a_splat_is_still_a_violation(self) -> None:
+        """``{**base}`` is only as truthy as ``base``: a display counts only
+        when it spells a key of its own.
+        """
+        sites = _scan('''
+            def call_the_model(some_root, base):
+                return invoke_with_cap_retry(
+                    disallowed_tools=['*'],
+                    output_schema=SCHEMA,
+                    mcp_config={**base},
                     strict_mcp_config=True,
                     cwd=some_root,
                 )
@@ -524,9 +577,11 @@ class TestWholeTreeGate:
             f'TO FIX, either close MCP explicitly at the call:\n'
             f'    mcp_config=no_mcp_servers_config(),\n'
             f'    strict_mcp_config=True,\n'
-            f'  — the config must stay TRUTHY. --strict-mcp-config is emitted '
-            f'inside build_claude_argv\'s `if mcp_config:` block, so a bare {{}} '
-            f'emits NEITHER flag and silently reinstates the hole while looking '
+            f'  — both spelled literally AT the call; the gate does not look '
+            f'through a name, which could hold {{}} at runtime. The config must '
+            f'stay TRUTHY: --strict-mcp-config is emitted inside '
+            f'build_claude_argv\'s `if mcp_config:` block, so a bare {{}} emits '
+            f'NEITHER flag and silently reinstates the hole while looking '
             f'correct. See cli_invoke.py::no_mcp_servers_config.\n'
             f'OR run somewhere with no ambient .mcp.json to merge:\n'
             f'    cwd=neutral_cli_cwd(),   # shared/src/shared/neutral_cwd.py\n'

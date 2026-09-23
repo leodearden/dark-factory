@@ -49,11 +49,17 @@ Design
   anti-vacuity test nothing to measure: this tree is already green, so the
   ratchet passes trivially and a detector that silently stopped detecting would
   look identical.
-* **An unresolvable argument is silence, never a finding.**  A ``**kwargs``
-  splat, a ``Name``-valued ``disallowed_tools``, a computed schema — none is a
-  site.  A false RED in a whole-tree gate blocks every merge until someone
-  blesses a non-defect, which trains reviewers to bless rows unread and
-  destroys the gate's value.
+* **What must be literal, and why.**  A call is a site only when its
+  ``disallowed_tools`` is a display holding a literal ``'*'``: a ``**kwargs``
+  splat or a ``Name``-valued deny-list is silence, never a finding, because a
+  false RED in a whole-tree gate blocks every merge until someone blesses a
+  non-defect, which trains reviewers to bless rows unread and destroys the
+  gate's value.  An ``output_schema`` need only be passed and not literally
+  falsy — real callers pass it by name, so demanding a literal would blind the
+  scanner.  A PROTECTION, by contrast, counts only when spelled literally at
+  the call: an unresolvable argument must never be a blessing, and a name the
+  scanner cannot see through may hold ``{}`` at runtime — the very footgun
+  being guarded.
 """
 
 from __future__ import annotations
@@ -85,6 +91,10 @@ TARGET_CALLEES: frozenset[str] = frozenset({
 #: ``shared/src/shared/neutral_cwd.py::neutral_cli_cwd`` — matched on the bare
 #: name, so the ``neutral_cwd.neutral_cli_cwd()`` attribute spelling counts too.
 NEUTRAL_CWD_CALLEE = 'neutral_cli_cwd'
+
+#: ``shared/src/shared/cli_invoke.py::no_mcp_servers_config`` — matched the same
+#: way, so ``cli_invoke.no_mcp_servers_config()`` counts too.
+NO_MCP_SERVERS_CALLEE = 'no_mcp_servers_config'
 
 #: How a site is protected.  Named constants rather than bare literals at the
 #: comparison sites, so a typo is an ImportError instead of a silent miss.
@@ -158,13 +168,13 @@ def _denies_everything(node: ast.expr | None) -> bool:
 
 
 def _is_falsy_literal(node: ast.expr | None) -> bool:
-    """True when *node* is a literal that ``build_claude_argv`` would skip.
+    """True when *node* is absent, or a literal ``build_claude_argv`` would skip.
 
-    That is: ``None``/``False``/``0``/``''`` as constants, or an empty ``{}`` /
-    ``[]`` display.  Anything else — a ``Name``, a call such as
-    ``no_mcp_servers_config()``, a non-empty display — counts as truthy,
-    because the builder's own test is a plain ``if <value>:`` and only these
-    spellings are statically known to fail it.
+    That is: no node at all, ``None``/``False``/``0``/``''`` as constants, or
+    an empty ``{}`` / ``[]`` display.  Anything else — a ``Name`` such as a
+    module-level schema constant, a call, a non-empty display — is not known
+    to be falsy, because the builder's own test is a plain ``if <value>:`` and
+    only these spellings are statically known to fail it.
     """
     if node is None:
         return True
@@ -175,6 +185,19 @@ def _is_falsy_literal(node: ast.expr | None) -> bool:
     if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
         return not node.elts
     return False
+
+
+def _is_known_truthy_config(node: ast.expr | None) -> bool:
+    """True only for an ``mcp_config`` spelling statically known to be truthy.
+
+    Two spellings qualify: a ``no_mcp_servers_config()`` call, and a dict
+    display that spells at least one key of its own.  Nothing else is read
+    through — a ``Name`` or an attribute may hold ``{}`` at runtime, and
+    ``{**base}`` is only as truthy as ``base`` — so nothing else exempts.
+    """
+    if isinstance(node, ast.Dict):
+        return any(key is not None for key in node.keys)
+    return node is not None and _callee_name(node) == NO_MCP_SERVERS_CALLEE
 
 
 def _is_true_literal(node: ast.expr | None) -> bool:
@@ -268,8 +291,7 @@ def find_wildcard_mcp_scoping_sites(
             continue
         if not _denies_everything(_keyword(node, 'disallowed_tools')):
             continue
-        schema = _keyword(node, 'output_schema')
-        if schema is None or _is_falsy_literal(schema):
+        if _is_falsy_literal(_keyword(node, 'output_schema')):
             continue
 
         pmap = parent_map()
@@ -381,7 +403,7 @@ def _classify(call: ast.Call, parent_map: dict[int, ast.AST]) -> tuple[str, str]
     inherits from where it happens to run.
     """
     strict = _is_true_literal(_keyword(call, 'strict_mcp_config'))
-    if strict and not _is_falsy_literal(_keyword(call, 'mcp_config')):
+    if strict and _is_known_truthy_config(_keyword(call, 'mcp_config')):
         return EXEMPT_STRICT_MCP, _STRICT_MCP_MESSAGE
     if _resolves_to_neutral_cwd(call, parent_map):
         return EXEMPT_NEUTRAL_CWD, _NEUTRAL_CWD_MESSAGE
