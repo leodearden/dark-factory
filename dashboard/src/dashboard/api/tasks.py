@@ -119,6 +119,19 @@ async def _terminal_window(
     )
 
 
+def _terminal_key(project: str) -> str:
+    """The payload key the ``?terminal=<project>`` window answers under.
+
+    The other half of this contract is ``data.js::ON_DEMAND_KEYS.terminal.key``:
+    the client reads the body under the key it built itself and stores the
+    value under that same name. A body that lacks the key is still reported
+    ``applied``, so a mismatch is silent. The two halves are guarded together by
+    ``test_app.py::TestTerminalWindow::test_the_real_client_applies_the_window_this_endpoint_serves``,
+    which runs the real client over this endpoint's real body.
+    """
+    return f'TASKS_TERMINAL:{project}'
+
+
 @router.get('/api/v2/dashboard/tasks')
 async def api_tasks(request: Request) -> JSONResponse:
     """ACTIVE_TASKS (lock state surfaced via the scheduler endpoint — see /api/v2/dashboard/scheduler).
@@ -192,9 +205,13 @@ async def api_tasks(request: Request) -> JSONResponse:
 
     **``?terminal=<project>`` — terminal rows, on request only.** The default
     render stopped fetching them, so its cost no longer grows with the terminal
-    tree at all; a client that wants them asks, and gets ``TASKS_TERMINAL``
-    carrying ONE ``Datum`` in the ``lower_bound`` state. Absent the parameter
-    the key is absent too, for the same reason ``DONE_COUNTS`` is.
+    tree at all; a client that wants them asks, and gets ONE ``Datum`` in the
+    ``lower_bound`` state under the flat top-level key
+    ``TASKS_TERMINAL:<project>`` (``_terminal_key``). The key is flat because
+    the client registry applies body keys VERBATIM: the name it reads from the
+    body is the name it stores under, so a per-project key cannot be nested
+    inside a ``TASKS_TERMINAL`` map. Absent the parameter no terminal key is
+    present at all, for the same reason ``DONE_COUNTS`` is absent.
 
     That ``lower_bound`` state IS the disclosure PRD decision 5 substitutes for
     the retired live-PRD terminal-member exemption. Task 4416 asked how a tab
@@ -287,7 +304,7 @@ async def api_tasks(request: Request) -> JSONResponse:
                 f'invariant: {broken}',
                 FRESHNESS_BOUND_SECONDS,
             )
-        payload['TASKS_TERMINAL'] = {terminal: window.to_wire()}
+        payload[_terminal_key(terminal)] = window.to_wire()
     # ...and the same N goes on the wire as TASKS_PROJECT_COUNT, so the banner
     # denominates over the population its numerator is drawn from.
     return JSONResponse(

@@ -336,6 +336,16 @@ def _measured_census(snapshot: TaskSnapshot) -> TaskCensus:
     return census
 
 
+def _measured_rows(snapshot: TaskSnapshot) -> list[dict]:
+    """The rows of a snapshot asserted to have measured them; see ``_measured_census``."""
+    rows = snapshot.rows.value
+    assert rows is not None, (
+        f'expected measured rows, got state {snapshot.rows.state} '
+        f'({snapshot.rows.reason})'
+    )
+    return rows
+
+
 def _done_counts(snapshots) -> dict[str, int]:
     """``{label: done count}`` for every root whose census was MEASURED.
 
@@ -2133,7 +2143,7 @@ class TestTheReturnedUnitsCarryTheShapedRows:
 
         active, snapshots = await collect_tasks_with_counts(dummy_client, config)
 
-        joined = [row for label in ('df', 'reify') for row in snapshots[label].rows.value]
+        joined = [row for label in ('df', 'reify') for row in _measured_rows(snapshots[label])]
         assert active == joined
         assert [row['project'] for row in active] == ['df'] * 3 + ['reify'] * 3
 
@@ -2162,7 +2172,7 @@ class TestTheReturnedUnitsCarryTheShapedRows:
             dummy_client, DashboardConfig(project_root=root), resolve_external=True,
         )
 
-        (wire_row,) = snapshots['xdeps'].rows.value
+        (wire_row,) = _measured_rows(snapshots['xdeps'])
         assert wire_row is active[0]
         assert wire_row['external_deps'] == [{'id': 'dark_factory:13', 'status': 'done'}]
 

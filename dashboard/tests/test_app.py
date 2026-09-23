@@ -720,12 +720,21 @@ def _terminal_render(
         monkeypatch.setattr(snapshot_mod, '_TERMINAL_FETCH_WINDOW', window)
     tasks_mod._fetch_tasks_cache_clear()
 
+    roots = [Path('/proj') / label for label in labels]
+    rendered = {str(root) for root in roots}
     calls: list[dict] = []
 
     async def _mcp(http_client, url, tool, args, **kwargs):
-        # kwargs is kept: the per-request budget rides as ``timeout=`` and is
-        # assertable at the wire nowhere else.
-        calls.append({'tool': tool, 'args': dict(args), 'kwargs': dict(kwargs)})
+        # Only THIS render's roots are logged. The lifespan's burndown loop
+        # snapshots the real configured roots through this same patched seam
+        # as the app starts, and its reads landed here whenever the two
+        # overlapped (measured: 5 of 10 runs of this class failed on them).
+        # Nothing but the handler can reach a /proj root: only the patched
+        # enumerator below hands one out.
+        if args.get('project_root') in rendered:
+            # kwargs is kept: the per-request budget rides as ``timeout=`` and
+            # is assertable at the wire nowhere else.
+            calls.append({'tool': tool, 'args': dict(args), 'kwargs': dict(kwargs)})
         if tool == 'get_statuses':
             return {'statuses': {}}
         rows = sorted(terminal_rows, key=lambda row: int(row['id']))  # ORDER BY id ASC
@@ -745,7 +754,7 @@ def _terminal_render(
             new=AsyncMock(return_value=([], snapshots)),
         ), patch(
             'dashboard.api.tasks._all_project_roots',
-            new=lambda config: [Path('/proj') / label for label in labels],
+            new=lambda config: list(roots),
         ), patch('dashboard.data.tasks.mcp_tool_call', new=_mcp):
             resp = client.get(f'/api/v2/dashboard/tasks?terminal={terminal}')
     finally:
