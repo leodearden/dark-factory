@@ -806,6 +806,165 @@ class TestAConflictedMergeLedgerIsAuditedAgainstBothParents:
         assert 'delete' in result.stderr.lower()
 
 
+class TestAConflictedMergeBaselineIsBoundedByBothParents:
+    """A merge's staged BASELINE is compared against a 3-way bound of its parents.
+
+    esc-3620-11's 18 refused "raises" were main's own moves, carried in by git's
+    clean file-level merge while the resolver made no choice about the ratchet
+    files at all. Against HEAD alone each read as new; against either parent,
+    keeping one side's stale value would re-absorb the other side's lowering.
+    The bound is git's own rule per measure: a measure one side moved stands at
+    that side's value, and where both moved, the higher side bounds it. Only
+    entries the merge ITSELF appends cover anything above it.
+    """
+
+    @staticmethod
+    def _unrelated_mid_merge(tmp_path: Path, *, ours: dict, theirs: dict) -> _Repo:
+        """Two histories with NO common ancestor, stopped on a baseline add/add."""
+        repo = _Repo.seeded(tmp_path, report=theirs)
+        repo.git('switch', '--quiet', '--orphan', 'task')
+        repo.write_baseline(ours)
+        repo.write_ledger(metrics.empty_ledger())
+        repo.commit_all('ours: an unrelated history')
+        repo.git('merge', '--allow-unrelated-histories', 'main', check=False)
+        merge_head = repo.git('rev-parse', '-q', '--verify', 'MERGE_HEAD', check=False)
+        assert merge_head, 'the unrelated merge did not stop on the baseline add/add'
+        return repo
+
+    def test_the_incident_takes_merge_heads_unrecorded_move_cleanly(
+        self, tmp_path: Path
+    ) -> None:
+        # Main moved a.py 1000 -> 1005 hook-lessly, with no ledger entry, and
+        # git's merge carried that move in untouched.
+        repo = _Repo.mid_merge(tmp_path, theirs=_with_a_py_lines(1005))
+        baseline = metrics.BASELINE_RELPATH
+        assert repo.git('rev-parse', f':{baseline}') == repo.git(
+            'rev-parse', f'MERGE_HEAD:{baseline}'
+        )
+
+        result = repo.gate()
+
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    def test_exceeding_both_parents_unrecorded_is_refused(self, tmp_path: Path) -> None:
+        repo = _Repo.mid_merge(tmp_path, theirs=_with_a_py_lines(1005))
+        repo.write_baseline(_with_a_py_lines(1009))
+        repo.stage(metrics.BASELINE_RELPATH)
+
+        result = repo.gate()
+
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert 'a.py' in result.stderr and '1009' in result.stderr
+        assert metrics.RAISE_REMEDY in result.stderr
+
+    def test_a_covering_entry_the_merge_itself_appends_allows_it(
+        self, tmp_path: Path
+    ) -> None:
+        repo = _Repo.mid_merge(tmp_path, theirs=_with_a_py_lines(1005))
+        repo.write_baseline(_with_a_py_lines(1009))
+        repo.write_ledger(
+            _ledger_with(
+                _record(
+                    [
+                        metrics.Violation.rose('lines', 'a.py', 1005, 1009),
+                        metrics.Violation.rose(
+                            'total:lines', metrics.CLUSTER_TOTAL_KEY, 1205, 1209
+                        ),
+                    ],
+                    '5792',
+                )
+            )
+        )
+        repo.stage(metrics.BASELINE_RELPATH, metrics.LEDGER_RELPATH)
+
+        result = repo.gate()
+
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    def test_keeping_heads_stale_value_over_a_merge_head_lowering_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        # Clean against HEAD, which is why a HEAD-only audit let it through.
+        repo = _Repo.mid_merge(tmp_path, theirs=_with_a_py_lines(995))
+        repo.git('checkout', 'HEAD', '--', metrics.BASELINE_RELPATH)
+
+        result = repo.gate()
+
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert 'a.py' in result.stderr
+
+    def test_taking_merge_heads_stale_value_over_a_head_lowering_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        # The single-parent restore carve-out reads this as "undoing the last
+        # change": the seed blob IS the path's previous value in HEAD's history.
+        # In a merge it discards HEAD's own lowering, so it must not be asked.
+        repo = _Repo.mid_merge(tmp_path, ours=_with_a_py_lines(995))
+        repo.write_baseline(synthetic_report())
+        repo.stage(metrics.BASELINE_RELPATH)
+        baseline = metrics.BASELINE_RELPATH
+        assert repo.git('rev-parse', f':{baseline}') == repo.git(
+            'rev-parse', f'HEAD~1:{baseline}'
+        )
+
+        result = repo.gate()
+
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert 'restores the value this path held' not in result.stdout
+
+    def test_where_both_parents_moved_a_measure_the_higher_bounds_it(
+        self, tmp_path: Path
+    ) -> None:
+        repo = _Repo.mid_merge(
+            tmp_path, ours=_with_a_py_lines(990), theirs=_with_a_py_lines(1005)
+        )
+        repo.write_baseline(_with_a_py_lines(1005))
+        repo.stage(metrics.BASELINE_RELPATH)
+
+        result = repo.gate()
+
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    def test_unrelated_histories_are_bounded_by_the_higher_parent(
+        self, tmp_path: Path
+    ) -> None:
+        # No common ancestor: git merges such histories against the empty tree.
+        repo = self._unrelated_mid_merge(
+            tmp_path, ours=synthetic_report(), theirs=_with_a_py_lines(1005)
+        )
+        repo.write_baseline(_with_a_py_lines(1005))
+        repo.stage(metrics.BASELINE_RELPATH)
+
+        result = repo.gate()
+
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    def test_a_head_without_a_baseline_does_not_make_the_merge_a_first_write(
+        self, tmp_path: Path
+    ) -> None:
+        # The incident's LEDGER shape, applied to the baseline: HEAD lacks the
+        # file, so the single-parent arm has nothing to compare and would pass
+        # ANY staged baseline as a first write.
+        repo = _Repo.mid_merge(tmp_path, ours=_Baseline.REMOVED)
+        repo.write_baseline(_with_a_py_lines(1009))
+        repo.stage(metrics.BASELINE_RELPATH)
+
+        result = repo.gate()
+
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert '1009' in result.stderr
+
+    def test_a_head_without_a_baseline_may_take_merge_heads(
+        self, tmp_path: Path
+    ) -> None:
+        repo = _Repo.mid_merge(tmp_path, ours=_Baseline.REMOVED)
+        repo.git('checkout', 'MERGE_HEAD', '--', metrics.BASELINE_RELPATH)
+
+        result = repo.gate()
+
+        assert result.returncode == 0, result.stdout + result.stderr
+
+
 #: The four real files a miniature repo needs before its hooks mean anything.
 #: Copied VERBATIM rather than restated: if someone renames the auditor or drops
 #: the project-checks section, the copied hook stops refusing and these go red.
