@@ -14,8 +14,19 @@ THE QUESTION THIS ASKS IS DIFFERENT, and that is the whole point. Not "does the
 tree match the baseline" -- which is trivially true in every committed state,
 because the pytest gate forces it -- but "does this COMMIT raise anything".
 Regenerate, delete-then-write, write-elsewhere-and-copy, hand-edit: every route
-to a widened baseline lands as the same staged diff against HEAD's blob, so one
+to a widened baseline lands as the same staged diff against the commit's
+parent's blob -- HEAD's, or both parents' when finishing a merge -- so one
 comparison covers all of them.
+
+A CONFLICTED MERGE has two parents, and pre-commit runs when one is finished
+with `git commit`, with MERGE_HEAD set; only a clean merge skips it. Read
+against HEAD alone, every measure MERGE_HEAD moved is a "raise" -- 18 of them
+refused esc-3620-11's resolver, all main's own. So a merge's artifacts are
+audited against BOTH parents: each measure is bounded by the 3-way rule git
+applies to the text (a side's own move stands, up or down; where both sides
+moved, the higher one bounds it), and only the ledger entries the merge itself
+appends cover anything above that bound. The restore carve-out is a
+single-parent rule and is not consulted.
 
 WHY THIS IS A SEPARATE FILE from the instrument it calls. ``merge_lane_metrics``
 deliberately has no git dependency -- ``repo_root()`` derives from ``__file__``,
@@ -65,11 +76,12 @@ def _git(root: Path, *args: str, stdin: str | None = None) -> str:
     """Every git invocation this gate makes.
 
     ``check=True``: a plumbing call that fails is an instrument failure, and
-    ``main`` reports it as one. The single exception -- a revision that names
-    nothing, which is legitimate data rather than a fault -- goes through
-    :func:`_object_id`, whose ``--quiet`` makes absence an exit code instead of
-    a message. ``encoding`` is pinned so a blob round trip does not depend on
-    the committing shell's locale.
+    ``main`` reports it as one. The two exceptions are answers rather than
+    faults, and each is read in exactly one place: a revision that names
+    nothing (:func:`_object_id`, whose ``--quiet`` makes absence an exit code
+    instead of a message), and two histories with no common ancestor
+    (:func:`_merge_base`). ``encoding`` is pinned so a blob round trip does not
+    depend on the committing shell's locale.
     """
     return subprocess.run(
         ['git', '-C', str(root), *args],
@@ -93,6 +105,22 @@ def _object_id(root: Path, revision: str) -> str | None:
         return _git(root, 'rev-parse', '--verify', '--quiet', revision).strip()
     except subprocess.CalledProcessError:
         return None
+
+
+def _merge_base(root: Path, merge_head: str) -> str | None:
+    """The commit HEAD and *merge_head* are merged over, or None when none exists.
+
+    None is DATA: unrelated histories have no common ancestor, and git merges
+    them against the empty tree. ``git merge-base`` says so with rc 1 and no
+    output, so exactly that is read as absence; any other failure is the
+    instrument failure ``main`` reports.
+    """
+    try:
+        return _git(root, 'merge-base', 'HEAD', merge_head).strip()
+    except subprocess.CalledProcessError as exc:
+        if exc.returncode == 1 and not (exc.stdout or exc.stderr):
+            return None
+        raise
 
 
 def _staged(root: Path, diff_filter: str, merge_head: str | None) -> set[str]:
@@ -262,13 +290,7 @@ def _audit_baseline(
     baseline = metrics.BASELINE_RELPATH
     head_oid = _object_id(root, f'HEAD:{baseline}')
     if head_oid is None:
-        # A first write has nothing to compare against -- write_baseline's
-        # already-documented limit, and said out loud rather than passed over.
-        print(
-            f'ratchet commit gate: {baseline} is absent from HEAD, so this is a '
-            'first write with nothing to compare against.'
-        )
-        return []
+        return _first_write('HEAD')
 
     staged_oid = _object_id(root, f':{baseline}')
     if staged_oid is None:
@@ -300,6 +322,58 @@ def _audit_baseline(
     return _refuse_unrecorded(raises, appended)
 
 
+def _audit_merged_baseline(
+    root: Path, scratch: Path, merge_head: str, own_entries: list[dict]
+) -> list[str]:
+    """Audit a MERGE's staged baseline against its parents' 3-way bound.
+
+    The restore carve-out is NOT consulted. "Undoing the last change" names ONE
+    parent's history, and in a merge HEAD's previous value is exactly the stale
+    image that discards HEAD's own last move.
+    """
+    baseline = metrics.BASELINE_RELPATH
+    ours_oid = _object_id(root, f'HEAD:{baseline}')
+    theirs_oid = _object_id(root, f'{merge_head}:{baseline}')
+    if ours_oid is None and theirs_oid is None:
+        return _first_write('both parents')
+
+    staged_oid = _object_id(root, f':{baseline}')
+    if staged_oid is None:
+        return []
+
+    base = _merge_base(root, merge_head)
+    base_oid = None if base is None else _object_id(root, f'{base}:{baseline}')
+    over = f'merge base {base}' if base is not None else 'no common ancestor'
+    print(
+        f'ratchet commit gate: finishing a merge, so {baseline} is held to the '
+        f'3-way bound of HEAD and MERGE_HEAD over {over}.'
+    )
+
+    def image(oid: str | None, name: str) -> Path | None:
+        return None if oid is None else _image(root, oid, scratch / name)
+
+    raises = metrics.compare_merged_baseline_files(
+        base=image(base_oid, 'base.json'),
+        ours=image(ours_oid, 'ours.json'),
+        theirs=image(theirs_oid, 'theirs.json'),
+        current=_image(root, staged_oid, scratch / 'current.json'),
+    )
+    return _refuse_unrecorded(raises, own_entries)
+
+
+def _first_write(absent_from: str) -> list[str]:
+    """Pass a baseline no parent carried -- and say so out loud.
+
+    A first write has nothing to compare against: ``write_baseline``'s
+    already-documented limit, announced rather than passed over.
+    """
+    print(
+        f'ratchet commit gate: {metrics.BASELINE_RELPATH} is absent from '
+        f'{absent_from}, so this is a first write with nothing to compare against.'
+    )
+    return []
+
+
 def _refuse(lines: list[str]) -> int:
     if not lines:
         return 0
@@ -327,16 +401,17 @@ def _audit(root: Path) -> int:
             'unrecorded.'
         ])
 
-    with tempfile.TemporaryDirectory() as scratch:
+    with tempfile.TemporaryDirectory() as scratch_dir:
+        scratch = Path(scratch_dir)
         # The ledger audit runs on BOTH paths; the baseline audit only when the
         # baseline is staged. Neither can excuse the other: a covering append
         # does not launder a rewritten history, and an untouched history does
         # not excuse an unrecorded raise.
         try:
-            appended = (
-                _appended_ledger_entries(root, Path(scratch))
+            own_entries = (
+                _appended_ledger_entries(root, scratch)
                 if merge_head is None
-                else _merged_ledger_entries(root, Path(scratch), merge_head)
+                else _merged_ledger_entries(root, scratch, merge_head)
             )
         except metrics.AppendOnlyViolation as exc:
             # A VERDICT, so the POLICY rung -- never the instrument-failure one
@@ -344,10 +419,12 @@ def _audit(root: Path) -> int:
             # rather than joining the baseline arm's lines because nothing else
             # in the commit can excuse it.
             return _refuse([f'ratchet commit gate: {exc}'])
+        if metrics.BASELINE_RELPATH not in staged:
+            return 0
         refusals = (
-            _audit_baseline(root, Path(scratch), appended)
-            if metrics.BASELINE_RELPATH in staged
-            else []
+            _audit_baseline(root, scratch, own_entries)
+            if merge_head is None
+            else _audit_merged_baseline(root, scratch, merge_head, own_entries)
         )
     return _refuse(refusals)
 
