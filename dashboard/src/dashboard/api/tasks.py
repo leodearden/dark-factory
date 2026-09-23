@@ -1,7 +1,7 @@
 """`/api/v2/dashboard/tasks` — the active-task table and its done counts.
 
 Fans out over every known project root, reporting four distinct failure
-facts separately (offline / degraded / count-unknown / no rows anywhere)
+facts separately (offline / degraded / count-unknown / no root measured)
 rather than collapsing them into one "empty" — see the handler docstring
 for why each is its own signal.
 """
@@ -167,15 +167,18 @@ async def api_tasks(request: Request) -> JSONResponse:
     **Four distinct failure facts (plus a denominator), deliberately not
     collapsed:**
 
-    - ``TASKS_OFFLINE`` — NO root produced rows and at least one root
-      DEMONSTRABLY failed. One fused-memory URL serves every root, so that is
-      the observable proxy for "fused-memory itself is unreachable", and it is
-      the only state the global banner's copy ("fused-memory offline — task
-      data unavailable") actually describes.
+    - ``TASKS_OFFLINE`` — NO root was measured this render and at least one
+      root DEMONSTRABLY failed. One fused-memory URL serves every root, so that
+      is the observable proxy for "fused-memory itself is unreachable", and it
+      is the only state the global banner's copy ("fused-memory offline — task
+      data unavailable") actually describes. Rows served from a root's LAST
+      GOOD do not count as measured. They are an earlier render's evidence,
+      and each carries a stale ``rows`` Datum, so an outage banner over a
+      table of them is the honest picture.
 
       The demonstrably-failed conjunct is what keeps a pure budget expiry
       (every root merely degraded, nothing proven down) from claiming an
-      outage. The no-root-succeeded conjunct is why the test is *not* the
+      outage. The no-root-measured conjunct is why the test is *not* the
       tighter ``len(offline) == total_roots``: the handler's own budget caps
       how many roots can even reach the offline state. In the hang case each
       root burns up to ``_TASKS_PER_PROJECT_BUDGET`` before ``wait_for`` cuts
@@ -297,12 +300,13 @@ async def api_tasks(request: Request) -> JSONResponse:
     # out over. ``bool(total_roots)`` guards the degenerate no-roots config:
     # 0 == 0 would otherwise declare an outage with nothing configured to fail.
     total_roots = len(_all_project_roots(config))
-    # "No root succeeded" — the three lists are disjoint by construction (each
-    # root appends to exactly one of them, then ``continue``s), so a root that
-    # is in neither of these two either produced rows or produced rows with an
-    # unknown count; both veto the flag. A set, not a sum, so a duplicate
-    # label can only ever UNDERcount and fail safe (flag stays False).
-    no_rows_anywhere = (
+    # The loop above routes each root to at most one banner, so a root in
+    # neither of these two lists had its rows read this render, with or
+    # without a count, and either case vetoes the flag. An offline root's
+    # last-good rows do not veto it, although they are in ACTIVE_TASKS. A set,
+    # not a sum, so a duplicate label can only ever UNDERcount and fail safe
+    # (flag stays False).
+    no_root_measured = (
         len(set(offline_projects) | set(degraded_projects)) == total_roots
     )
     payload: dict[str, object] = {}
@@ -327,7 +331,7 @@ async def api_tasks(request: Request) -> JSONResponse:
             'ACTIVE_TASKS': active,
             'TASKS_SNAPSHOT': wire_snapshots,
             'TASKS_OFFLINE': (
-                bool(total_roots) and bool(offline_projects) and no_rows_anywhere
+                bool(total_roots) and bool(offline_projects) and no_root_measured
             ),
             'TASKS_OFFLINE_PROJECTS': offline_projects,
             'TASKS_DEGRADED_PROJECTS': degraded_projects,

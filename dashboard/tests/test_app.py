@@ -2234,9 +2234,9 @@ def test_tasks_offline_flag_survives_a_hang_that_degrades_most_roots(client):
 def test_tasks_one_healthy_root_vetoes_the_outage_flag(client):
     """A single root that produced rows blocks the global claim, however bad the rest.
 
-    The flag's conjunct is "NO root produced rows" — a root missing from both
-    failure lists produced rows (the three lists are disjoint by
-    construction), so "task data unavailable" would be false.
+    The flag's conjunct is "no root was measured this render". A root missing
+    from both failure lists had its rows read (classify routes each root to at
+    most one list), so "task data unavailable" would be false.
     """
     body = _tasks_body(
         client,
@@ -2265,3 +2265,39 @@ def test_tasks_count_unknown_root_vetoes_the_outage_flag(client):
         'different (and separately reported) fact from an outage'
     )
     assert body['TASKS_COUNT_UNKNOWN_PROJECTS'] == ['p1']
+
+
+def test_last_good_rows_do_not_veto_the_outage_flag(client):
+    """Rows served from a root's last good were not measured this render.
+
+    An offline root still puts its last good rows, aged, into ACTIVE_TASKS.
+    The flag asks whether THIS render measured any root. So when every root
+    is offline, the banner stands over those rows, and each root's ``rows``
+    Datum says how old they are.
+    """
+    from dataclasses import replace
+    from datetime import UTC, datetime, timedelta
+
+    from dashboard.data.datum import Datum, DatumState
+    from dashboard.data.task_snapshot import FRESHNESS_BOUND_SECONDS
+
+    row = {'id': 'p0/T-1', 'project': 'p0', 'status': 'in-progress'}
+    last_good = Datum(
+        [row], datetime.now(UTC) - timedelta(minutes=5), DatumState.STALE,
+        'canned offline root', FRESHNESS_BOUND_SECONDS,
+    )
+    offline = replace(_snapshot(health='offline'), rows=last_good)
+    with patch(
+        'dashboard.api.tasks.collect_tasks_with_counts',
+        new=AsyncMock(return_value=([row], {'p0': offline})),
+    ), patch(
+        'dashboard.api.tasks._all_project_roots', new=lambda config: _fake_roots(1),
+    ):
+        resp = client.get('/api/v2/dashboard/tasks')
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body['ACTIVE_TASKS'] == [row]
+    assert body['TASKS_SNAPSHOT']['p0']['rows']['state'] == 'stale'
+    assert body['TASKS_OFFLINE_PROJECTS'] == ['p0']
+    assert body['TASKS_OFFLINE'] is True
