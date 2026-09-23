@@ -151,11 +151,17 @@ fused_memory:
     - "--transport"
     - "http"
 
-# Sandbox — disabled due to Bun segfault inside bwrap on this kernel (6.17).
-# A landlock backend now exists (SandboxConfig.backend: landlock) that sidesteps
-# the bwrap/userns issue — flip to `enabled: true, backend: landlock` when ready.
+# OS filesystem sandbox (Landlock) — dashboard config flip, γ7.
+# Per plans/os-sandbox-worktree-containment-prd.md task γ7 (D6, D10, D13).
+# The backend is pinned to landlock, not left at `auto`: auto takes the first
+# available of landlock, bwrap and none
+# (orchestrator/src/orchestrator/agents/sandbox_dispatch.py::resolve_active_backend),
+# so it could land on bwrap, under which Bun segfaulted on kernel 6.17, whereas
+# a pinned landlock either confines the dispatch or refuses it (D4).
+# Fleet-wide status: docs/sandbox-fleet-status.md.
 sandbox:
-  enabled: false
+  enabled: true
+  backend: landlock
 
 # Escalation — port 8102
 escalation:
