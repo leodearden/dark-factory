@@ -137,9 +137,11 @@ __all__ = [
     'DEFAULT_MD_OUT',
     'DEFAULT_PROJECTS',
     'GATE_METADATA_KEY',
+    'GateCensus',
     'GateGroup',
     'WriteRejectedError',
     'assert_write_accepted',
+    'census_consolidation_gates',
     'load_mcp_client_class',
     'pair_gate_blocks',
     'rename_group',
@@ -916,12 +918,144 @@ class GateGroup:
     gate_block: dict[str, Any] | None = None
 
 
+@dataclass(frozen=True)
+class GateCensus:
+    """Every consolidation gate the task stores hold, and what could not be read.
+
+    A value rather than a bare list because "no gate was found" and "no store
+    was read" must never share a representation: an empty list said both, and
+    that ambiguity is how the live path came to treat every slug as ungated.
+
+    Attributes:
+        roots: The project roots attempted, deduplicated, in the order given.
+        tasks: The gate tasks of the covered projects, in the shape
+            :func:`pair_gate_blocks` consumes, sorted by ``(project_id, id)``.
+        covered_projects: The project ids whose one task store answered.
+        failures: One ``gate_census_incomplete`` entry per root that could not
+            be read, or whose store contradicted another root's.
+    """
+
+    roots: tuple[str, ...]
+    tasks: tuple[dict, ...]
+    covered_projects: frozenset[str]
+    failures: tuple[dict, ...]
+
+
+def _census_failure(root: str, error: str, **extra) -> dict:
+    return {'reason': 'gate_census_incomplete', 'project_root': root, **extra, 'error': error}
+
+
+def _unreadable_listing(response: object) -> str | None:
+    """Why a ``get_tasks`` answer is not a task listing, or ``None`` if it is."""
+    if not isinstance(response, dict):
+        return f'get_tasks answered a {type(response).__name__}, not a task listing'
+    if (
+        isinstance(response.get('tasks'), list)
+        and isinstance(response.get('project_id'), str) and response['project_id']
+        and isinstance(response.get('project_root'), str) and response['project_root']
+    ):
+        return None
+    if response.get('error') or response.get('error_type'):
+        return f'{response.get("error_type") or "error"}: {response.get("error")}'
+    return 'get_tasks answered without a task list, project_id and project_root'
+
+
+def _gate_tasks_in(listing: dict) -> list[dict]:
+    gates: list[dict] = []
+    for task in listing['tasks']:
+        metadata = task.get('metadata') if isinstance(task, dict) else None
+        block = metadata.get(GATE_METADATA_KEY) if isinstance(metadata, dict) else None
+        if not isinstance(block, dict):
+            continue
+        gates.append({
+            'id': str(task.get('id')),
+            'project_id': listing['project_id'],
+            'project_root': listing['project_root'],
+            'metadata': {GATE_METADATA_KEY: block},
+        })
+    return gates
+
+
+async def census_consolidation_gates(client, roots) -> GateCensus:
+    """Read every consolidation gate out of each root's task store.
+
+    One ``get_tasks`` per DISTINCT root, through the same client that later
+    patches the gates, so a run cannot pair against one task store and patch
+    another.  Each root's call is individually guarded: a timed-out or refused
+    root becomes one failure entry instead of unwinding the census, because
+    the census's whole contract is to state what it could NOT see.
+
+    A refusal is detected STRUCTURALLY — a missing or non-list ``tasks``, or
+    a missing ``project_id``/``project_root`` — because
+    ``FusedMemoryClient.call_tool`` raises only on a JSON-RPC-level error; a
+    tool-level refusal arrives as an ordinary dict.
+
+    ``project_id`` and ``project_root`` are taken from the RESPONSE as-is.
+    The server derives the id with ``resolve_project_id`` over the
+    main-checkout-normalized root, which is the derivation
+    ``TaskInterceptor._consolidation_closure_error`` scrolls under, so the
+    pairing key and the closure key cannot diverge.  Two roots the server
+    normalizes to one store are one store read twice; two DIFFERENT stores
+    answering for one project id are a contradiction this census cannot
+    settle, so that project is left uncovered.
+
+    Why no paging: ``page_size`` slices a FULL server-side re-read on every
+    page, and an offset shifts when a task is removed between pages, so a gate
+    could be skipped with no error.  One call is one SQL SELECT, an atomic
+    snapshot.  Measured 2026-09-23 through ``FusedMemoryClient``: dark-factory
+    5,747 tasks, 32.3 MB, 11.4 s, 17 gates; reify 7,760 tasks, 33.1 MB, 5.8 s,
+    40 gates — both inside the client's 30 s timeout, and a timeout degrades
+    into a failure entry, never into a silent gap.
+    """
+    attempted = tuple(dict.fromkeys(roots))
+    gates: list[dict] = []
+    failures: list[dict] = []
+    # project_id -> (the store that answered for it, the root it was asked as)
+    stores: dict[str, tuple[str, str]] = {}
+    contradicted: set[str] = set()
+    for root in attempted:
+        try:
+            listing = await client.call_tool('get_tasks', {'project_root': root})
+        except Exception as exc:
+            failures.append(_census_failure(root, f'{type(exc).__name__}: {exc}'))
+            continue
+        problem = _unreadable_listing(listing)
+        if problem is not None:
+            failures.append(_census_failure(root, problem))
+            continue
+        project_id, store = listing['project_id'], listing['project_root']
+        first_store, first_root = stores.setdefault(project_id, (store, root))
+        if first_store != store:
+            contradicted.add(project_id)
+            failures.append(_census_failure(
+                root,
+                f'ambiguous task store: {root!r} answered as project '
+                f'{project_id!r} from {store!r}, but {first_root!r} answered '
+                f'as {project_id!r} from {first_store!r}',
+                project_id=project_id,
+            ))
+        elif first_root == root:
+            gates.extend(_gate_tasks_in(listing))
+
+    covered = frozenset(stores) - contradicted
+    return GateCensus(
+        roots=attempted,
+        tasks=tuple(sorted(
+            (gate for gate in gates if gate['project_id'] in covered),
+            key=lambda gate: (gate['project_id'], gate['id']),
+        )),
+        covered_projects=covered,
+        failures=tuple(failures),
+    )
+
+
 def pair_gate_blocks(renames, gate_tasks) -> tuple[list[GateGroup], list[dict]]:
     """Pair each slug's renames with the consolidation gate filed against it.
 
     Pure.  Takes the plan rows and the gate tasks as plain dicts (``{'id',
-    'project_id', 'project_root', 'metadata'}`` — the shape MCP ``get_task``
-    hands over) and returns ``(groups, skips)``.
+    'project_id', 'project_root', 'metadata'}`` — the shape
+    :func:`census_consolidation_gates` produces) and returns
+    ``(groups, skips)``.
 
     ``metadata.x_recon_consolidation_gate`` is a Tier-C block on TASK
     metadata, read by ``reconciliation/consolidation_gate.py`` and enforced on
