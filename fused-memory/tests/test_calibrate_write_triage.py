@@ -1244,7 +1244,9 @@ def _report(scores: dict, t_high, t_low, reason=None, recall=None, **kwargs) -> 
         t_high=t_high,
         t_low=t_low,
         reason=reason,
-        recall=recall if recall is not None else {'per_k': [], 'canonical_absent': []},
+        recall=recall if recall is not None else {
+            'per_k': [], 'canonical_absent': [], 'absent_in_denominator': False,
+        },
         provenance=dict(_PROVENANCE),
         **kwargs,
     )
@@ -1294,7 +1296,7 @@ class TestBuildReport:
 
     def test_carries_the_recall_block(self) -> None:
         recall = {'per_k': [{'k': 1, 'hits': 2, 'total': 3, 'recall': 2 / 3}],
-                  'canonical_absent': []}
+                  'canonical_absent': [], 'absent_in_denominator': False}
         got = _report(CLEAN_SCORES, 0.70, 0.60, recall=recall)
         assert got['recall_at_k'] == recall
 
