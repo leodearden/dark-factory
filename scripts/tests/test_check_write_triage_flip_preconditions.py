@@ -31,12 +31,14 @@ prompt prose is the meta-test class this repo deletes (task 3128 steps 23-25).
 """
 from __future__ import annotations
 
+import importlib.util
 import os
 import shlex
 import subprocess
 import sys
 import time
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -903,6 +905,17 @@ def _write_fake_judge(src_root: Path, *, variant: str) -> Path:
     return src_root
 
 
+def _load_judge_fixture(tmp_path: Path, variant: str) -> ModuleType:
+    """The judge stand-in *variant*, laid down and IMPORTED as a module."""
+    src_root = _write_fake_judge(tmp_path / variant, variant=variant)
+    path = src_root / 'fused_memory' / 'server' / 'write_triage_judge.py'
+    spec = importlib.util.spec_from_file_location(f'judge_fixture_{variant}', path)
+    assert spec is not None and spec.loader is not None, path
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _run_probe(src_root: Path, *, env: dict[str, str] | None = None):
     """Drive the probe directly under this interpreter."""
     full_env = dict(os.environ)
@@ -1605,11 +1618,27 @@ _DELIVERED_CHECK_TIMEOUT_SECS = 120
 #: script: a gate that merely equalled it would ERROR on a busy host.
 _GATE_WORST_CASE_CEILING_SECS = 110
 
-#: The ONE knob both probes' `timeout` is built from, spelled as the gate
-#: spells it. Pinned rather than merely exercised: two probes bounded
-#: independently is exactly how a 120s budget silently becomes a 180s worst
-#: case, and nothing in a passing run would show it.
-_PROBE_TIMEOUT_KNOB = 'PROBE_TIMEOUT_SECS=45'
+#: The ONE knob both probes' `timeout` is built from: its value, and the line
+#: the gate spells it on. Pinned rather than merely exercised: two probes
+#: bounded independently is exactly how a 120s budget silently becomes a 180s
+#: worst case, and nothing in a passing run would show it.
+_PROBE_TIMEOUT_SECS = 45
+_PROBE_TIMEOUT_KNOB = f'PROBE_TIMEOUT_SECS={_PROBE_TIMEOUT_SECS}'
+
+
+def _shrink_probe_timeout(gate: Path, secs: int) -> None:
+    """Rewrite the gate's one probe-timeout knob, so a test need not wait it out.
+
+    ASSERTED, not assumed: were the knob retuned, the replacement would be a
+    silent no-op, and the test would wait out the REAL bound instead.
+    """
+    gate_src = gate.read_text()
+    assert _PROBE_TIMEOUT_KNOB in gate_src, (
+        f'the gate no longer spells `{_PROBE_TIMEOUT_KNOB}`'
+    )
+    gate.write_text(
+        gate_src.replace(_PROBE_TIMEOUT_KNOB, f'PROBE_TIMEOUT_SECS={secs}'),
+    )
 
 
 def _hang_module(repo: Path, name: str) -> None:
@@ -1905,17 +1934,8 @@ class TestFlipPreconditionsScript:
         ran-but-never-finished, which reaches a different record_fail site.
         """
         repo = _make_gate_repo(tmp_path, judge='by_id', eval_src='fixed')
-        # Shrink the gate's own bound so the test does not wait it out.
         gate = repo / 'scripts' / _GATE_SCRIPT.name
-        gate_src = gate.read_text()
-        # ASSERTED, not assumed: the bound is a tuning knob (its comment ties it
-        # to the predicate's 120s budget). Retuned, this replacement becomes a
-        # silent no-op — the test still passes, but only after the REAL timeout
-        # elapses, which fits inside _run_gate's 240s and so degrades invisibly.
-        assert _PROBE_TIMEOUT_KNOB in gate_src, (
-            f'the gate no longer spells `{_PROBE_TIMEOUT_KNOB}`'
-        )
-        gate.write_text(gate_src.replace(_PROBE_TIMEOUT_KNOB, 'PROBE_TIMEOUT_SECS=2'))
+        _shrink_probe_timeout(gate, 2)
         _hang_module(repo, 'write_triage_judge.py')
         _commit_all(repo, 'hang')
         proc = _run_gate(gate, ref=_FIXTURE_REF)
@@ -2254,36 +2274,51 @@ class TestBothProbesShareOneBudget:
     and forever, which is strictly worse than the clean FAIL the gate spent
     all this machinery earning.
 
-    So the bound is measured behaviourally here rather than read off the
-    script: a shared knob that both probes are DERIVED from is the only thing
-    that makes the worst case addable, and only running it proves they are.
+    So the bound is measured behaviourally, at a SHRUNK knob so the suite does
+    not sleep out 90s. Everything the gate spends beyond the two bounds is
+    overhead, and that overhead plus two REAL bounds must fit the budget. A
+    probe whose bound did not shrink with the knob adds its whole bound to the
+    measured overhead, so the same assertion catches a bound that is not
+    derived from the one knob.
     """
+
+    #: Small enough to keep the test quick, and large enough to exceed a
+    #: probe's own startup, so each probe is killed by its bound mid-hang.
+    _SHRUNK_SECS = 3
 
     def test_both_probes_hanging_stays_inside_the_delivered_check_budget(
         self, tmp_path,
     ):
         repo = _make_gate_repo(tmp_path, judge='by_id', eval_src='fixed')
+        gate = repo / 'scripts' / _GATE_SCRIPT.name
+        _shrink_probe_timeout(gate, self._SHRUNK_SECS)
         _hang_module(repo, 'write_triage_judge.py')
         _hang_module(repo, 'write_triage.py')
         _commit_all(repo, 'both probe subjects hang')
 
         started = time.monotonic()
-        proc = _run_gate(repo / 'scripts' / _GATE_SCRIPT.name, ref=_FIXTURE_REF)
+        proc = _run_gate(gate, ref=_FIXTURE_REF)
         elapsed = time.monotonic() - started
 
         # Fail CLOSED, both items, each with its own verdict: a hang is an
         # unverifiable invariant, and an unverifiable invariant is not a
-        # satisfied one.
+        # satisfied one. Both via `timeout`'s own exit 124, so both bounds
+        # really elapsed and `elapsed` below measures them.
         assert proc.returncode == 1, f'{proc.stdout}\n{proc.stderr}'
         assert f'FAIL  item 1  {_UNVERIFIABLE}' in proc.stdout, proc.stdout
         assert f'{_ITEM5_FAIL}  {_UNVERIFIABLE}' in proc.stdout, proc.stdout
-        # ... and in time for anyone to read it.
-        assert elapsed < _GATE_WORST_CASE_CEILING_SECS, (
-            f'both probes hanging took {elapsed:.0f}s, against a '
-            f'{_DELIVERED_CHECK_TIMEOUT_SECS}s delivered-check budget. An '
-            f'overrunning check is ERRORED, not failed: the dependent waits '
-            f'silently and indefinitely instead of being told which item is '
-            f'unmet. Bound both probes from one knob sized so their sum fits.'
+        assert proc.stdout.count('(exit 124)') == 2, proc.stdout
+        # ... and in time for anyone to read it, at the knob's REAL value.
+        overhead = elapsed - 2 * self._SHRUNK_SECS
+        worst_case = 2 * _PROBE_TIMEOUT_SECS + overhead
+        assert worst_case < _GATE_WORST_CASE_CEILING_SECS, (
+            f'both probes hanging at PROBE_TIMEOUT_SECS={self._SHRUNK_SECS} '
+            f'took {elapsed:.1f}s, {overhead:.1f}s beyond the two bounds; at '
+            f'the real {_PROBE_TIMEOUT_SECS}s that projects to {worst_case:.0f}s '
+            f'against a {_DELIVERED_CHECK_TIMEOUT_SECS}s delivered-check budget. '
+            'An overrunning check is ERRORED, not failed: the dependent waits '
+            'silently and indefinitely instead of being told which item is '
+            'unmet. Bound both probes from one knob sized so their sum fits.'
         )
 
 
@@ -2785,21 +2820,27 @@ class TestItemFiveNamesTheBranchThatSatisfiedIt:
         assert _ITEM5_FAIL in proc.stdout, proc.stdout
         assert _ITEM5_PASS not in proc.stdout, proc.stdout
 
-    def test_no_pre_existing_judge_variant_defines_judge_write(self):
+    def test_no_pre_existing_judge_variant_defines_judge_write(self, tmp_path):
         """Every pairing written before this branch keeps its item-5 verdict.
 
-        Asserted once, here, rather than by re-running all 23 variants through
+        Asserted once, here, rather than by re-running every variant through
         the gate: `judge_write` is the ONLY way a judge fixture can satisfy the
         judge-target branch, so its absence is what makes every other pairing
         inert. It also keeps the tests above honest — `test_main_shape_fails_item_5`
         and `test_item_5_blocks_the_flip_on_its_own` both use `by_id`, and if a
         later edit taught it to feed its own target they would silently stop
         testing what they were written to test.
+
+        Read off each fixture as LOADED, not off its source text, so prose that
+        merely mentions the name cannot trip it. `option_b_end_to_end` is the
+        control showing that a loaded fixture exposes the name at all.
         """
+        assert hasattr(_load_judge_fixture(tmp_path, _JUDGE_OPTION_B), 'judge_write')
         carriers = [
             name
-            for name, tail in _VARIANT_TAILS.items()
-            if 'judge_write' in tail and name != _JUDGE_OPTION_B
+            for name in _VARIANT_TAILS
+            if name != _JUDGE_OPTION_B
+            and hasattr(_load_judge_fixture(tmp_path, name), 'judge_write')
         ]
         assert not carriers, carriers
 
