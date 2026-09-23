@@ -386,6 +386,22 @@ class TestIterUserTurns:
         assert [t['text'] for t in turns] == ['first', 'second']
         assert [t['index'] for t in turns] == [0, 3]
 
+    def test_excludes_reingested_content_through_the_shared_predicate(self):
+        """A user turn whose whole text is a coder judgment was NOT observed:
+        0 of the 35,887 dark-factory transcripts on disk on 2026-09-23 carry
+        one. It is pinned so the gold bucket and every scalar detector answer
+        "is this re-ingested?" with ONE predicate. The genuine and briefing
+        turns pin that sharing it neither widens nor narrows the filter."""
+        records = [
+            _user_text(_coder_judgment()),
+            _user_text('please redo the merge'),
+            _user_text(_briefing_text()),
+        ]
+
+        turns = mod.iter_user_turns(records)
+
+        assert [(t['index'], t['text']) for t in turns] == [(1, 'please redo the merge')]
+
 
 # ---------------------------------------------------------------------------
 # iter_error_neighborhoods — is_error tool_result blocks ONLY (never a
@@ -1067,6 +1083,23 @@ class TestReingestedContentIsBucketAgnostic:
 
         assert mod.is_reingested_content(text) is True
         assert mod.classify_agent_class(records) == 'orchestrated-task'
+
+
+class TestTrickleCoderSessionDigest:
+    """The rendered ARTIFACT a census reads, not just the counters: a
+    trickle-coder session renders no trace of the signals it re-ingested."""
+
+    def test_renders_none_of_the_sections_the_contamination_fed(self):
+        digest = mod.render_digest(_trickle_coder_session_records(), agent_class='interactive')
+
+        frontmatter_yaml, _ = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+        lines = digest.splitlines()
+
+        for key in ('self_corrections', 'user_corrections', 'df_guard'):
+            assert f'## {mod.SECTION_HEADINGS[key]}' not in lines
+        assert meta['signal_counts'] == dict.fromkeys(mod.SIGNAL_COUNT_KEYS, 0)
+        assert meta['n_user_turns'] == 0
 
 
 # ---------------------------------------------------------------------------
