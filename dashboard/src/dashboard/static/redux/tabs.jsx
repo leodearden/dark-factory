@@ -303,8 +303,8 @@ function OrchTab({ projectFilter, search }) {
           <>
             <span className="pip"><span className={`status-dot ${o.running ? 'running' : 'completed'}`} style={{ marginRight: 0 }}></span>{o.running ? 'running' : 'completed'}</span>
             {/* Proven-down and not-measured are distinct facts and get distinct pips: collapsing
-                them sends an operator to restart a healthy service. Invariant:
-                dashboard/src/dashboard/data/active_tasks.py::collect_tasks_with_counts.
+                them sends an operator to restart a healthy service. Neither fires since task 5587:
+                discovery attempts no read, so nothing sets either flag (handed to γ2, task 5589).
                 The !o.offline guard states the precedence here rather than trusting the
                 producer, so a malformed entry with both set reads as the stronger, proven one. */}
             {o.offline && <span className="pip" title={o.error || undefined}><span className="pip-dot" style={{ background: CP.bad }}></span>offline</span>}

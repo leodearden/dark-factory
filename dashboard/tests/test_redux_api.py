@@ -122,9 +122,9 @@ def test_shape_orchestrators_projects_degraded():
 
     The pair matters, not either field alone: a degraded root's state is
     UNKNOWN, while an offline root is proven down.  Collapsing them here would
-    re-merge on the wire exactly what
-    ``dashboard/src/dashboard/data/orchestrator.py::discover_orchestrators``
-    keeps apart on the entry.
+    re-merge on the wire what the raw entry keeps apart.  Discovery has set
+    neither flag since task 5587; the pair is the shaper's contract for any
+    caller that supplies it.
     """
     raw = [{
         'pids': [7777],
