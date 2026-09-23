@@ -41,6 +41,9 @@ from fused_memory.server.write_triage import (
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'eval_write_triage_judge.py'
 CALIBRATE_PATH = Path(__file__).parent.parent / 'scripts' / 'calibrate_write_triage.py'
 FIXTURE_PATH = Path(__file__).parent / 'fixtures' / 'write_triage_calibration.jsonl'
+ALIASES_PATH = (
+    Path(__file__).parent / 'fixtures' / 'write_triage_calibration.canonical_aliases.json'
+)
 
 
 def _load_module(path: Path, mod_name: str) -> types.ModuleType:
@@ -1402,32 +1405,38 @@ class TestRunResolvesTheJudgeConfigIntoProvenance:
     resolution wiring rather than the runner it hands off to.
     """
 
-    def _captured(self, tmp_path: Path, monkeypatch) -> dict:
-        captured: dict = {}
+    def _handed(self, tmp_path: Path, monkeypatch, **overrides) -> dict:
+        """The kwargs `_run` hands `run_judge_eval`, with *overrides* on the args."""
+        handed: dict = {}
 
         def fake_run_judge_eval(**kwargs):
-            captured.update(kwargs['provenance'])
+            handed.update(kwargs)
             return _mod().build_report(
                 scored=_mod().score_cases([], []),
                 provenance=dict(kwargs['provenance']),
             )
 
         monkeypatch.setattr(_mod(), 'run_judge_eval', fake_run_judge_eval)
-        args = types.SimpleNamespace(
-            config=None,
-            report_path=str(tmp_path / 'report.json'),
-            fixture=str(FIXTURE_PATH),
-            distractors=2,
-            limit=None,
-            dry_run=True,
-            slate_mode=_mod().SLATE_SEEDED,
-            project_id='reify',
-            field_chars=None,
-            judge_candidate_count=None,
-            cases_path=None,
-        )
+        args = types.SimpleNamespace(**{
+            'config': None,
+            'report_path': str(tmp_path / 'report.json'),
+            'fixture': str(FIXTURE_PATH),
+            'distractors': 2,
+            'limit': None,
+            'dry_run': True,
+            'slate_mode': _mod().SLATE_SEEDED,
+            'project_id': 'reify',
+            'field_chars': None,
+            'judge_candidate_count': None,
+            'cases_path': None,
+            'canonical_aliases': None,
+            **overrides,
+        })
         assert _mod()._run(args) == 0
-        return captured
+        return handed
+
+    def _captured(self, tmp_path: Path, monkeypatch, **overrides) -> dict:
+        return dict(self._handed(tmp_path, monkeypatch, **overrides)['provenance'])
 
     @staticmethod
     def _service():
@@ -1472,6 +1481,60 @@ class TestRunResolvesTheJudgeConfigIntoProvenance:
         captured = self._captured(tmp_path, monkeypatch)
         assert captured['judge_enabled'] is False
 
+    def test_provenance_names_the_alias_sidecar_and_its_size(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        captured = self._captured(tmp_path, monkeypatch, canonical_aliases=str(ALIASES_PATH))
+        assert captured['canonical_aliases_path'] == (
+            'tests/fixtures/write_triage_calibration.canonical_aliases.json'
+        )
+        assert captured['canonical_aliases_count'] == 3
+
+    def test_no_sidecar_is_recorded_as_none_and_zero(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        captured = self._captured(tmp_path, monkeypatch)
+        assert (captured['canonical_aliases_path'], captured['canonical_aliases_count']) == (
+            None, 0,
+        )
+
+    def test_every_case_is_built_with_the_sidecars_aliases(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        aliases = json.loads(ALIASES_PATH.read_text())
+        plan = self._handed(tmp_path, monkeypatch, canonical_aliases=str(ALIASES_PATH))['plan']
+        for case in plan.cases:
+            assert case['canonical_alias_id'] == aliases.get(case['cluster_id']), (
+                case['memory_id']
+            )
+        assert {c['canonical_alias_id'] for c in plan.cases} - {None} == set(aliases.values())
+
+    def test_provenance_names_the_cases_file_package_relative(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        never_written = SCRIPT_PATH.parent.parent / 'calibration' / 'never-written.cases.jsonl'
+        captured = self._captured(tmp_path, monkeypatch, cases_path=str(never_written))
+        assert captured['cases_path'] == 'calibration/never-written.cases.jsonl'
+        assert not never_written.exists()
+
+    def test_no_dump_is_recorded_as_no_cases_path(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        assert self._captured(tmp_path, monkeypatch)['cases_path'] is None
+
+    def test_a_malformed_sidecar_is_refused_by_the_calibrators_parser(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        sidecar = tmp_path / 'aliases.json'
+        sidecar.write_text(json.dumps({'old-canonical': 123}))
+        with pytest.raises(ValueError, match='str -> str'):
+            self._captured(tmp_path, monkeypatch, canonical_aliases=str(sidecar))
+
+    def test_the_three_keys_are_provenance_vocabulary(self) -> None:
+        assert {'canonical_aliases_path', 'canonical_aliases_count', 'cases_path'} <= set(
+            _mod().PROVENANCE_KEYS,
+        )
+
 
 class TestADotMdReportPathIsRejectedAtArgumentTime:
     """`--report-path foo.md` is a bad ARGUMENT, so `_run` refuses it up front.
@@ -1498,6 +1561,7 @@ class TestADotMdReportPathIsRejectedAtArgumentTime:
             field_chars=None,
             judge_candidate_count=None,
             cases_path=None,
+            canonical_aliases=None,
         )
 
     def test_run_refuses_it_before_it_even_reads_the_fixture(
@@ -1658,7 +1722,8 @@ class TestABareDryRunCannotReachTheCommittedArtifact:
 
 
 #: Provenance the committed artifact PREDATES, added 2026-09-23 with the
-#: retrieved slate mode and the per-field prompt budget override. The
+#: retrieved slate mode, the per-field prompt budget override and the alias
+#: sidecar. The
 #: committed report is regenerated only by a paid live run, which this change
 #: deliberately does not perform against `calibration/`; until the operator
 #: re-runs it, these keys are absent from the file and that is staleness
@@ -1675,6 +1740,9 @@ _ADDED_AFTER_THE_COMMITTED_RUN = frozenset({
     'canonical_absent',
     'degraded_retrievals',
     'self_retrieved',
+    'canonical_aliases_path',
+    'canonical_aliases_count',
+    'cases_path',
 })
 
 
@@ -2040,6 +2108,25 @@ def _live(memory_id: str, *, canonical_id: str | None = None, category='procedur
     }
 
 
+_ALIASES = {'old-canon': 'new-canon'}
+
+
+def _aliased_row(candidates, attach_target_id) -> dict:
+    """The dump row of a duplicate whose cluster canonical was rotated."""
+    records = [
+        _rec('old-canon', 'old-canon', 'canonical'),
+        _rec('dup', 'old-canon', 'duplicate'),
+    ]
+    slate = _slate('dup', candidates=candidates, attach_target_id=attach_target_id,
+                   band=OUTCOME_JUDGE, canonical_present=False)
+    plan = _mod().plan_from_slates(records, [slate], provenance={}, aliases=_ALIASES)
+    return _mod().case_row(
+        0, plan.cases[0],
+        _mod().JudgeAnswer(outcome=OUTCOME_AMENDED, verdict=OUTCOME_AMENDED),
+        plan.records_by_id,
+    )
+
+
 class TestTheCasesDump:
     """Per-case evidence, written as it is bought."""
 
@@ -2112,6 +2199,60 @@ class TestTheCasesDump:
     def test_no_dump_is_written_without_a_cases_path(self, tmp_path: Path) -> None:
         _run(tmp_path)
         assert list(tmp_path.glob('*.jsonl')) == []
+
+    def test_an_attach_to_the_alias_is_an_attach_to_the_canonical(self) -> None:
+        row = _aliased_row([_live('new-canon')], 'new-canon')
+        assert row['canonical_alias_id'] == 'new-canon'
+        assert row['attach_target_is_canonical'] is True
+        assert row['canonical_in_slate'] is True
+
+    def test_a_sighting_child_of_the_alias_puts_the_canonical_on_the_slate(self) -> None:
+        row = _aliased_row([_live('child', canonical_id='new-canon')], 'new-canon')
+        assert row['canonical_in_slate'] is True
+
+    def test_an_alias_does_not_make_an_unrelated_attach_canonical(self) -> None:
+        row = _aliased_row([_live('zz')], 'zz')
+        assert row['attach_target_is_canonical'] is False
+        assert row['canonical_in_slate'] is False
+
+    def test_a_case_with_no_alias_yields_todays_row(self) -> None:
+        records = [
+            _rec('c1-canon', 'c1-canon', 'canonical'),
+            _rec('c1-dup-1', 'c1-canon', 'duplicate'),
+        ]
+        slate = _slate('c1-dup-1', candidates=[_live('c1-canon'), _live('zz')],
+                       attach_target_id='c1-canon', band=OUTCOME_JUDGE)
+        plan = _mod().plan_from_slates(records, [slate], provenance={}, aliases=_ALIASES)
+        row = _mod().case_row(
+            3, plan.cases[0],
+            _mod().JudgeAnswer(outcome=OUTCOME_AMENDED, verdict=OUTCOME_AMENDED),
+            plan.records_by_id,
+        )
+        assert row == {
+            'index': 3,
+            'memory_id': 'c1-dup-1',
+            'cluster_id': 'c1-canon',
+            'category': 'procedural_knowledge',
+            'expected_class': 'duplicate',
+            'acceptable_outcomes': sorted([OUTCOME_AMENDED, OUTCOME_RESTATED]),
+            'candidates': ['c1-canon', 'zz'],
+            'attach_target_id': 'c1-canon',
+            'attach_target_cluster_id': None,
+            'attach_target_category': 'procedural_knowledge',
+            'attach_target_label': None,
+            'attach_target_is_canonical': True,
+            'canonical_in_slate': True,
+            'canonical_present': True,
+            'band': OUTCOME_JUDGE,
+            'similarity': 0.7,
+            'verdict': OUTCOME_AMENDED,
+            'outcome': OUTCOME_AMENDED,
+            'correct': True,
+            'entry_elided': None,
+            'candidates_elided': None,
+            'usage': None,
+            'canonical_alias_id': None,
+        }
 
 
 class TestScoreAttachments:
@@ -2192,6 +2333,11 @@ class TestScoreAttachments:
         scored = _mod().score_attachments([self._row()])
         assert json.loads(json.dumps(scored)) == scored
 
+    def test_an_attach_to_the_alias_is_strict_and_not_a_wrong_record(self) -> None:
+        scored = _mod().score_attachments([_aliased_row([_live('new-canon')], 'new-canon')])
+        assert scored['duplicate_attach']['strict'] == 1
+        assert scored['wrong_record_attach']['n'] == 0
+
 
 class TestPlanFromSlates:
     """The retrieved mode's case construction, with the live edge stubbed."""
@@ -2204,16 +2350,19 @@ class TestPlanFromSlates:
             _rec('c2-distinct', 'c2-canon', 'distinct'),
         ]
 
-    def _plan(self, **overrides):
-        slates = [
+    @staticmethod
+    def _slates() -> list:
+        return [
             _slate('c1-dup-1', candidates=[_live('c1-canon'), _live('zz')],
                    attach_target_id='c1-canon', band=OUTCOME_JUDGE),
             _slate('c2-distinct', candidates=[_live('zz')],
                    attach_target_id='zz', band=OUTCOME_RESTATED,
                    canonical_present=False),
         ]
+
+    def _plan(self, **overrides):
         return _mod().plan_from_slates(
-            self._records(), slates, provenance=overrides or {'t_low': 0.5},
+            self._records(), self._slates(), provenance=overrides or {'t_low': 0.5},
         )
 
     def test_one_case_per_non_canonical_record_and_no_control(self) -> None:
@@ -2273,6 +2422,25 @@ class TestPlanFromSlates:
             plan.records_by_id,
         )
         assert row['canonical_in_slate'] is True
+
+    def test_every_case_carries_its_clusters_alias(self) -> None:
+        plan = _mod().plan_from_slates(
+            self._records(), self._slates(), provenance={},
+            aliases={'c1-canon': 'c1-new'},
+        )
+        assert [c['canonical_alias_id'] for c in plan.cases] == ['c1-new', None]
+
+    def test_without_aliases_no_case_carries_one(self) -> None:
+        assert [c['canonical_alias_id'] for c in self._plan().cases] == [None, None]
+
+    def test_a_seeded_case_carries_its_clusters_alias_too(self) -> None:
+        plan = _mod().seeded_plan(_corpus(), distractors=2, aliases={'c1-canon': 'c1-new'})
+        for case in plan.cases:
+            expected = 'c1-new' if case['cluster_id'] == 'c1-canon' else None
+            assert case['canonical_alias_id'] == expected, case['memory_id']
+        assert _mod().CLASS_DISTRACTOR in {
+            c['expected_class'] for c in plan.cases if c['canonical_alias_id']
+        }, 'the control case of an aliased cluster carries the alias too'
 
 
 class TestFieldCharsOverride:
