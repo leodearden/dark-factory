@@ -69,16 +69,16 @@ Usage
   # redirected away from the committed artifact — see `guard_committed_report`.
   python scripts/eval_write_triage_judge.py --dry-run
 
-  # A cheap live smoke over the first few cases.
-  python scripts/eval_write_triage_judge.py --limit 5
+  # A cheap live smoke over a few cases, kept off the committed artifact.
+  python scripts/eval_write_triage_judge.py --limit 5 --report-path /tmp/smoke.json
 
-  # The full measured pass, written to calibration/.
-  python scripts/eval_write_triage_judge.py
-
-  # What production would actually do: real retrieval, real bands, real
-  # attach targets, with every case dumped as it completes.
-  python scripts/eval_write_triage_judge.py --slate-mode retrieved \
-      --report-path /tmp/retrieved.json --cases-path /tmp/retrieved-cases.jsonl
+  # The committed arbiter (plans/write-triage-flip-readiness-prd.md C2'):
+  # production's retrieval, bands and attach targets, every case dumped as it
+  # completes.
+  python scripts/eval_write_triage_judge.py --slate-mode retrieved --project-id reify \\
+      --canonical-aliases tests/fixtures/write_triage_calibration.canonical_aliases.json \\
+      --report-path calibration/write_triage_judge_accuracy_report.json \\
+      --cases-path calibration/write_triage_judge_accuracy_report.cases.jsonl
 """
 from __future__ import annotations
 
@@ -1109,15 +1109,11 @@ def build_report(
 
 
 def _render_production_shape(report: Mapping[str, Any]) -> list[str]:
-    """The attach/band half of the report, or nothing on an artifact predating it.
+    """The attach/band half of the report.
 
-    An ABSENT key means the report was assembled before this section existed,
-    so the render stays silent and remains the provable render of that JSON. A
-    key PRESENT and empty means a run that assembled no attach accounting, and
-    says so rather than reading as a section nobody wrote.
+    An EMPTY section means a run that assembled no attach accounting, and says
+    so rather than reading as a section nobody wrote.
     """
-    if 'production_shape' not in report:
-        return []
     shape = report['production_shape']
     if not shape:
         return ['', '## Where the writes attached', '',
@@ -1415,14 +1411,16 @@ def _is_committed_report(report_path: str) -> bool:
 
 
 def guard_committed_report(
-    report_path: str, *, dry_run: bool, limit: int | None,
+    report_path: str, *, dry_run: bool, limit: int | None, slate_mode: str,
 ) -> str:
     """Keep a non-measurement run from publishing itself as the measurement.
 
     The committed report is what ``write_triage.judge_accuracy_report_path``
     points at and, per D10, what the operator reads at the task-3169 flip
-    gate. Two kinds of run can reach it without having measured what it
-    claims, and they are NOT the same hazard, so they get different answers:
+    gate. It is the RETRIEVED-slate arbiter (flip-readiness PRD C2'), so a
+    measurement in any other slate mode aimed at it is refused outright. Two
+    more kinds of run can reach it without having measured what it claims,
+    and they are NOT the same hazard, so they get different answers:
 
     - ``--dry-run`` measures NOTHING. Every number in its report comes from a
       fixed-answer stub, so publishing it would put fabricated figures under
@@ -1454,6 +1452,12 @@ def guard_committed_report(
             report_path, redirected,
         )
         return redirected
+
+    if slate_mode != SLATE_RETRIEVED:
+        raise ValueError(
+            f"the committed artifact is the retrieved-slate arbiter (PRD C2'); pass "
+            f'--report-path for a {slate_mode} run',
+        )
 
     if limit is not None:
         logger.warning(
@@ -1835,6 +1839,7 @@ def _run(args: Any) -> int:
     # artifacts with fixed-answer numbers.
     report_path = guard_committed_report(
         args.report_path, dry_run=args.dry_run, limit=args.limit,
+        slate_mode=args.slate_mode,
     )
     aliases = load_canonical_aliases(args.canonical_aliases) if args.canonical_aliases else {}
 
