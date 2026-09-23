@@ -48,6 +48,7 @@ transcription, not yet a verified single source of truth.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from fused_memory.reconciliation.graphiti_degradation_probe import (
@@ -926,17 +927,36 @@ _NOT_REPRODUCED = (
     r"(?:\s+not|n['\u2019]t)\s+(?:be\s+)?reproduc\w*"
 )
 
-# What turns a negative probe report into a CLEARANCE CLAIM: it scopes the
-# negative to the fault's current existence rather than to the one probe that
-# was run. Without one of these in the same clause, "did not reproduce" is a
-# truthful per-probe observation — which is precisely the fine-grained
-# reporting the Stage 2 probe protocol asks for, and rejecting it would make
-# the rule reject the protocol's own output.
-_CLEARANCE_QUALIFIER = (
-    r'(?:this\s+(?:cycle|run)|no\s+longer|any\s?more|cleared|clear|'
-    r'resolved|gone|absent|healthy)'
+# At most a couple of determiners may sit between a negated `reproduce` and
+# the fault it is about. Anything wordier is a DIFFERENT subject wearing the
+# same words — "the stage1 stall bug did not reproduce after the Graphiti
+# degradation was fixed" asserts nothing this invariant forbids.
+_DETERMINER_GAP = r'(?:\s+(?:the|this|that|a|an|any|its|such)){0,2}\s+'
+
+# "<fault> did not reproduce" or "did not reproduce the <fault>": on its own,
+# a truthful report of what a probe saw.
+_NEGATED_REPRODUCTION = re.compile(
+    rf'{_PROBE_SUBJECT}\s+{_NOT_REPRODUCED}'
+    rf'|{_NOT_REPRODUCED}{_DETERMINER_GAP}{_PROBE_SUBJECT}',
+    re.IGNORECASE,
 )
-_CLEARANCE_IN_CLAUSE = rf'(?=[^.;]*\b{_CLEARANCE_QUALIFIER}\b)'
+
+# What turns that report into a CLEARANCE CLAIM when it follows the report in
+# the same clause: it scopes the negative to the fault's current existence
+# rather than to the one probe that was run. Without one, "did not reproduce"
+# is precisely the fine-grained reporting the Stage 2 probe protocol asks for,
+# and rejecting it would make the rule reject the protocol's own output.
+_CLEARANCE_QUALIFIER = re.compile(
+    r'\b(?:this\s+(?:cycle|run)|no\s+longer|any\s?more|cleared|clear|'
+    r'resolved|gone|absent|healthy)\b',
+    re.IGNORECASE,
+)
+
+# "<fault> no longer reproduces" qualifies itself, and carries no negated
+# auxiliary for _NEGATED_REPRODUCTION to hang on.
+_NO_LONGER_REPRODUCES = re.compile(
+    rf'{_PROBE_SUBJECT}\s+no\s+longer\s+(?:be\s+)?reproduc\w*', re.IGNORECASE
+)
 
 # A clause that also names a POSITIVE sighting is a mixed-outcome report —
 # "did not reproduce at limit=3, but fired at limit=8 this cycle" — and the
@@ -944,47 +964,84 @@ _CLEARANCE_IN_CLAUSE = rf'(?=[^.;]*\b{_CLEARANCE_QUALIFIER}\b)'
 # verb counts: "did not reproduce at limit=3 and did not reproduce at limit=8
 # this cycle" is still a clearance claim.
 _SIGHTING_VERB = r'\b(?:reproduc(?:e|es|ed|ing)|fired|fires|recurred|recurs)\b'
-_POSITIVE_SIGHTING = (
-    rf'(?={_SIGHTING_VERB})'
-    r"(?<!\bnot\s)(?<!n't\s)(?<!n\u2019t\s)(?<!\bbe\s)(?<!\bnever\s)"
-    r'(?<!\blonger\s)'
-)
 # A zero count negates its verb through its subject instead ("0 of 3 probes
-# reproduced", "none of them fired", "no probe reproduced"), so both scans
-# step over it whole. It is the protocol's own permitted wording: read as a
-# sighting, it would wave through any claim it is appended to.
+# reproduced", "none of them fired", "no probe reproduced"). It is the
+# protocol's own permitted wording: read as a sighting, it would wave through
+# any claim it is appended to.
 _ZERO_COUNT_REPORT = (
     r'\b(?:0|zero|none|no|neither|not\s+(?:a\s+single|one))\b(?:/\d+)?(?:\s+of)?'
     r'(?:\s+(?:the|these|those|them))?(?:\s+\d+)?'
     r'(?:\s+(?:[\w-]+\s+)?probes?)?(?:\s+(?:has|have|had))?\s+'
     + _SIGHTING_VERB
 )
-# Steps one character at a time, so a claim may start anywhere in the clause.
-_NO_POSITIVE_BEFORE_IN_CLAUSE = (
-    rf'(?:^|(?<=[.;]))(?:{_ZERO_COUNT_REPORT}|(?!{_POSITIVE_SIGHTING})[^.;])*?'
+# Scanned left to right, so a zero count or a negation consumes the verb it
+# governs before the last alternative can read that verb as a sighting.
+_SIGHTING_SCAN = re.compile(
+    rf'{_ZERO_COUNT_REPORT}'
+    rf"|(?:\bnot|n['\u2019]t|\bnever|\bbe|\blonger)\s+{_SIGHTING_VERB}"
+    rf'|(?P<sighting>{_SIGHTING_VERB})',
+    re.IGNORECASE,
 )
-# Runs once per candidate claim, so it steps over whole words, the widest step
-# that cannot skip a sighting or a zero count (both start at a word boundary),
-# and never backtracks.
-_NO_POSITIVE_AFTER_IN_CLAUSE = (
-    rf'(?=(?:[^\w.;]|{_ZERO_COUNT_REPORT}|(?!{_POSITIVE_SIGHTING})\w++)*+'
-    r'(?![^.;]))'
-)
-
-# At most a couple of determiners may sit between a negated `reproduce` and
-# the fault it is about. Anything wordier is a DIFFERENT subject wearing the
-# same words — "the stage1 stall bug did not reproduce after the Graphiti
-# degradation was fixed" asserts nothing this invariant forbids.
-_DETERMINER_GAP = r'(?:\s+(?:the|this|that|a|an|any|its|such)){0,2}\s+'
 
 # The other shape a clearance claim takes: asserting the fault's absence
-# outright. Both halves must be present and the scope word must GOVERN the
-# fault noun — "no current Graphiti failure" is a clearance claim, "no current
-# owner for the ... degradation problem" is a statement about ownership.
+# outright. The scope word must GOVERN the fault noun — "no current Graphiti
+# failure" is a clearance claim, "no current owner for the ... degradation
+# problem" is a statement about ownership — so at most the probe subject may
+# sit between them. The fault must also be named somewhere after the `no`, so
+# the rule fires only on sentences about THIS fault.
 _FAULT_SCOPE = (
     r'(?:persistent|persisting|ongoing|active|current|systemic|underlying)'
 )
 _FAULT_NOUN = r'\b(?:problem|issue|degradation|fault|defect|failure)s?\b'
+_SCOPED_ABSENCE = re.compile(
+    rf'\bno\s+{_FAULT_SCOPE}\b(?:\s+{_PROBE_SUBJECT})?\s+{_FAULT_NOUN}',
+    re.IGNORECASE,
+)
+_NAMES_THE_FAULT = re.compile(_PROBE_SUBJECT, re.IGNORECASE)
+
+# Both probe rules judge one clause at a time with a fixed number of single
+# passes over it, so a lint stays linear in the length of the text — it runs
+# synchronously on the submit_task path. One pattern that found each candidate
+# claim and then re-scanned the rest of its clause cost time quadratic in the
+# length of a clause with no terminator.
+_CLAUSE_BREAK = re.compile(r'[.;]')
+
+
+def _names_positive_sighting(clause: str) -> bool:
+    return any(match['sighting'] for match in _SIGHTING_SCAN.finditer(clause))
+
+
+def _clause_reports_non_reproduction_as_clearance(clause: str) -> bool:
+    if _names_positive_sighting(clause):
+        return False
+    if _NO_LONGER_REPRODUCES.search(clause):
+        return True
+    # Only the first report needs testing: a qualifier that follows any later
+    # report follows this one too.
+    report = _NEGATED_REPRODUCTION.search(clause)
+    return (
+        report is not None
+        and _CLEARANCE_QUALIFIER.search(clause, report.end()) is not None
+    )
+
+
+def _clause_asserts_fault_absence(clause: str) -> bool:
+    absence = _SCOPED_ABSENCE.search(clause)
+    return (
+        absence is not None
+        and _NAMES_THE_FAULT.search(clause, absence.start()) is not None
+    )
+
+
+def _reports_non_reproduction_as_clearance(text: str) -> bool:
+    return any(
+        map(_clause_reports_non_reproduction_as_clearance, _CLAUSE_BREAK.split(text))
+    )
+
+
+def _asserts_fault_absence(text: str) -> bool:
+    return any(map(_clause_asserts_fault_absence, _CLAUSE_BREAK.split(text)))
+
 
 # Sourced from the template the stage prompts render, so a rejected caller is
 # told the exact permitted wording and the two can never disagree.
@@ -996,14 +1053,17 @@ _NEGATIVE_PROBE_SET_DETAIL = (
     'a verdict: "' + NEGATIVE_SET_VERDICT_TEMPLATE.format(n='N') + '"'
 )
 
-# Module-level rule table for premise_lint: (compiled case-insensitive
-# regex, invariant_name, detail). Each rule encodes one known-false premise
-# recon has written into a task: the run_id and marker rules come from the
-# 2083/2092/2093 batch, which mis-modeled run_id and the stage1_flag_marker
-# lifecycle; the two probe rules from run cd53b227, which promoted a negative
-# probe set to a clearance claim (task 4644). Extend this table as new false
-# premises (or new paraphrasings of an existing one) are discovered;
-# premise_lint returns one Violation per matching rule.
+# Module-level rule table for premise_lint: (matcher, invariant_name,
+# detail). A matcher is truthy when its text asserts the premise: a compiled
+# pattern's `search` where a fixed phrasing is enough, or a clause-level
+# predicate where the rest of the clause decides whether a phrase is the
+# claim. Each rule encodes one known-false premise recon has written into a
+# task: the run_id and marker rules come from the 2083/2092/2093 batch, which
+# mis-modeled run_id and the stage1_flag_marker lifecycle; the two probe rules
+# from run cd53b227, which promoted a negative probe set to a clearance claim
+# (task 4644). Extend this table as new false premises (or new paraphrasings
+# of an existing one) are discovered; premise_lint returns one Violation per
+# matching rule.
 #
 # BEST-EFFORT DENYLIST, NOT EXHAUSTIVE VALIDATION: premise_lint is a regex
 # lint over a fixed, small set of known-false phrasings — it does not
@@ -1013,13 +1073,13 @@ _NEGATIVE_PROBE_SET_DETAIL = (
 # matched, not that the description is otherwise correct. Treat a clean
 # lint result accordingly and keep extending this table as new paraphrases
 # surface, rather than over-trusting its coverage.
-_PREMISE_RULES: tuple[tuple[re.Pattern[str], str, str], ...] = (
+_PREMISE_RULES: tuple[tuple[Callable[[str], object], str, str], ...] = (
     (
         re.compile(
             r'run_id\s+(?:persists?|is\s+persist(?:ed|ent)|stable|the\s+same|'
             r'carr(?:y|ies)\s+over)\s+(?:across|between)\s+(?:cycles|runs)',
             re.IGNORECASE,
-        ),
+        ).search,
         'run_id_is_fresh_per_run',
         (
             'run_id is minted fresh per run and is never persisted across '
@@ -1032,7 +1092,7 @@ _PREMISE_RULES: tuple[tuple[re.Pattern[str], str, str], ...] = (
             r'reuse\s+(?:the\s+)?run_id\s+from\s+(?:the\s+)?'
             r'(?:previous|prior|last)\s+(?:cycle|run)',
             re.IGNORECASE,
-        ),
+        ).search,
         'run_id_is_fresh_per_run',
         (
             'run_id is minted fresh per run and must never be reused from a '
@@ -1047,7 +1107,7 @@ _PREMISE_RULES: tuple[tuple[re.Pattern[str], str, str], ...] = (
             + _GAP_NO_NEGATION + r'\b(?:flag_for_stage2|flag\s+marker|'
             r'stage1_flag_marker|marker)\b',
             re.IGNORECASE,
-        ),
+        ).search,
         'markers_deleted_only_by_gc',
         (
             'Per-task markers (stage1_flag_marker, flag_for_stage2, '
@@ -1056,39 +1116,12 @@ _PREMISE_RULES: tuple[tuple[re.Pattern[str], str, str], ...] = (
         ),
     ),
     (
-        re.compile(
-            _NO_POSITIVE_BEFORE_IN_CLAUSE
-            + '(?:'
-            # <fault> did not reproduce ... this cycle
-            + _PROBE_SUBJECT + r'\s+' + _NOT_REPRODUCED + _CLEARANCE_IN_CLAUSE
-            + '|'
-            # did not reproduce the <fault> ... this cycle
-            + _NOT_REPRODUCED + _DETERMINER_GAP + _PROBE_SUBJECT
-            + _CLEARANCE_IN_CLAUSE
-            + '|'
-            # <fault> no longer reproduces — self-qualifying, and carries no
-            # negated auxiliary for the two arms above to hang on.
-            + _PROBE_SUBJECT + r'\s+no\s+longer\s+(?:be\s+)?reproduc\w*'
-            + ')'
-            + _NO_POSITIVE_AFTER_IN_CLAUSE,
-            re.IGNORECASE,
-        ),
+        _reports_non_reproduction_as_clearance,
         'negative_probe_set_does_not_clear_intermittent_fault',
         _NEGATIVE_PROBE_SET_DETAIL,
     ),
     (
-        re.compile(
-            r'\bno\s+' + _FAULT_SCOPE + r'\b'
-            # Still only fires on sentences about THIS fault.
-            + f'(?=[^.;]*{_PROBE_SUBJECT})'
-            # At most the probe subject may sit between the scope word and the
-            # noun it governs, so `no ongoing mixed-store degradation` matches
-            # while `no ongoing WORK on the ... degradation issue` does not:
-            # there the scope word governs the work, not the fault.
-            + f'(?:\\s+{_PROBE_SUBJECT})?'
-            + r'\s+' + _FAULT_NOUN,
-            re.IGNORECASE,
-        ),
+        _asserts_fault_absence,
         'negative_probe_set_does_not_clear_intermittent_fault',
         _NEGATIVE_PROBE_SET_DETAIL,
     ),
@@ -1104,8 +1137,8 @@ def premise_lint(task_description: str) -> list[Violation]:
     description is otherwise correct.
     """
     violations: list[Violation] = []
-    for pattern, invariant, detail in _PREMISE_RULES:
-        if pattern.search(task_description):
+    for matches, invariant, detail in _PREMISE_RULES:
+        if matches(task_description):
             violations.append(
                 Violation(premise=task_description, invariant=invariant, detail=detail)
             )

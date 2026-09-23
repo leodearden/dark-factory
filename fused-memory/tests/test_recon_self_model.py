@@ -14,6 +14,8 @@ drift invariant to own.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from fused_memory.reconciliation import recon_self_model as m
@@ -732,11 +734,14 @@ class TestNegativeProbeSetPremise:
             'longer reproducing.',
             'The Graphiti degradation no longer reproduces at limit=3 and no '
             'longer fires at limit=8.',
+            'The Graphiti degradation did not reproduce this cycle and did '
+            'not  reproduce last cycle either.',
         ],
     )
     def test_negated_sighting_later_in_the_clause_is_still_flagged(self, claim):
         """Only an UN-negated verb makes the clause mixed-outcome, and "no
-        longer" negates it as surely as "not" does."""
+        longer" negates it as surely as "not" does, however the words are
+        spaced."""
         assert self.INVARIANT in self._invariants(claim)
 
     @pytest.mark.parametrize(
@@ -783,6 +788,43 @@ class TestNegativeProbeSetPremise:
         assert self.INVARIANT not in self._invariants(
             '0 of 3 probes reproduced the Graphiti degradation; continuing to '
             'watch it.'
+        )
+
+    #: Wall-clock budget for linting one ~40K-character field. Measured
+    #: post-fix at ~30ms, far from the CI-flake boundary.
+    BUDGET_SECONDS = 1.0
+
+    @pytest.mark.parametrize(
+        ('near_miss', 'claim'),
+        [
+            # measured pre-fix: ~5.9s
+            (
+                'graphiti did not reproduce ',
+                'The degradation did not reproduce this cycle.',
+            ),
+            # measured pre-fix: ~8.1s
+            ('no ongoing ', 'There is no ongoing mixed-store degradation.'),
+        ],
+        ids=['negated-reproduction', 'scoped-absence'],
+    )
+    def test_lint_time_is_linear_in_clause_length(self, near_miss, claim):
+        """`premise_lint` runs synchronously on the `submit_task` path, so a
+        long clause must not cost time quadratic in its length. Each near-miss
+        repeats a claim's opening with nothing that completes it, which is
+        the input that used to make a probe rule re-scan the rest of the
+        clause at every candidate position.
+
+        The real claim in the clause after it pins correctness alongside
+        cost: a rule that met the budget by no longer matching would fail
+        here too."""
+        text = near_miss * (40_000 // len(near_miss)) + '. ' + claim
+        started = time.perf_counter()
+        invariants = self._invariants(text)
+        elapsed = time.perf_counter() - started
+        assert self.INVARIANT in invariants
+        assert elapsed < self.BUDGET_SECONDS, (
+            f'premise_lint took {elapsed:.3f}s on {len(text)} characters '
+            f'(budget {self.BUDGET_SECONDS}s)'
         )
 
 
