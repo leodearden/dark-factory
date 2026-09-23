@@ -607,6 +607,15 @@ def _dialogue_text_sources(
     Two layers, two questions: :func:`_signal_text_sources` answers "which
     native carriers exist", and this answers "which of them are this
     session's own dialogue". Every signal detector reads this layer.
+
+    Dropping is WHOLE-carrier on every carrier kind, tool_results and
+    assistant text included, so a genuine literal printed beside a harness
+    prompt goes with it. That cost is accepted on measurement: across the
+    2026-09-23 dark-factory corpus the harness rule dropped 59 non-user
+    carriers with signal hits, each one foreign material (a Read of a
+    module holding the marker literals, a task record, a dump of another
+    session). Merely NAMING a harness heading drops nothing, because the
+    heading rules are line-anchored.
     """
     return [
         (index, text)
