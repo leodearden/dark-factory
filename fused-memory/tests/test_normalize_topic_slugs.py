@@ -2027,6 +2027,18 @@ def resolve_exit(report: dict) -> int:
     return _mod.resolve_exit_code(report)
 
 
+def _census(*, covered=('dark_factory',), tasks=(), failures=(), roots=('/repo',)) -> object:
+    """A ``GateCensus`` built by hand, as ``census_consolidation_gates`` returns one."""
+    return _mod.GateCensus(
+        roots=tuple(roots), tasks=tuple(tasks),
+        covered_projects=frozenset(covered), failures=tuple(failures))
+
+
+def _census_failure(root: str) -> dict:
+    return {'reason': 'gate_census_incomplete', 'project_root': root,
+            'error': 'RuntimeError: get_tasks failed: timed out'}
+
+
 class _FakeCorpus:
     """A STATEFUL Mem0 double: scroll, count, read and write over one dict.
 
@@ -2293,6 +2305,173 @@ class TestRunApplyStoreMutationPreflight:
         assert 'fail-closed' in message.lower()
         # The remedy must name the hazard, not merely the denial.
         assert 'two topic values' in message or 'half' in message.lower()
+
+
+def _error_log(caplog) -> str:
+    return '\n'.join(
+        r.getMessage() for r in caplog.records
+        if r.name == 'normalize_topic_slugs' and r.levelname == 'ERROR'
+    )
+
+
+def _gates_section(report: dict) -> str:
+    return _mod.render_markdown(report).split('## Consolidation gates')[1].split('\n## ')[0]
+
+
+class TestRunRequiresACompleteGateCensus:
+    """``run(..., gates=GateCensus)`` — the gate census is a REQUIRED input.
+
+    An optional gate list whose absence meant "no gates" is how the live path
+    came to rename gated slugs without their gates.  A required census makes
+    "not enumerated" impossible to spell as "none found", and ``run`` — the
+    choke point every write passes through — refuses ``--apply`` over one that
+    cannot vouch for every swept project.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_run_without_a_census_fails_at_the_call(self):
+        service, corpus = _run_service({'dark_factory': [_crec('m1', 'legacy_topic')]})
+
+        with pytest.raises(TypeError):
+            await _mod.run(service, projects=('dark_factory',))
+
+        assert corpus.scrolls == []
+
+    @pytest.mark.asyncio
+    async def test_apply_over_an_uncovered_project_refuses_before_any_scroll(
+        self, caplog, capsys,
+    ):
+        service, corpus = _run_service({'dark_factory': [_crec('m1', 'legacy_topic')]})
+        client = _client()
+
+        with (
+            caplog.at_level('ERROR', logger='normalize_topic_slugs'),
+            pytest.raises(_mod.GateCensusIncomplete) as refused,
+        ):
+            await run_sweep(service, projects=('dark_factory',), apply=True,
+                            client=client, gates=_census(covered=('reify',)))
+
+        assert corpus.scrolls == []
+        assert corpus.writes == []
+        client.call_tool.assert_not_awaited()
+        assert [gap.get('project_id') for gap in refused.value.gaps] == ['dark_factory']
+        assert capsys.readouterr().out == ''
+        message = _error_log(caplog)
+        assert 'dark_factory' in message
+        assert '--project-root' in message
+
+    @pytest.mark.asyncio
+    async def test_apply_with_any_census_failure_refuses_the_same_way(self, caplog):
+        service, corpus = _run_service({'dark_factory': [_crec('m1', 'legacy_topic')]})
+        client = _client()
+        census = _census(covered=('dark_factory',), failures=[_census_failure('/rf')])
+
+        with (
+            caplog.at_level('ERROR', logger='normalize_topic_slugs'),
+            pytest.raises(_mod.GateCensusIncomplete),
+        ):
+            await run_sweep(service, projects=('dark_factory',), apply=True,
+                            client=client, gates=census)
+
+        assert corpus.scrolls == []
+        assert corpus.writes == []
+        client.call_tool.assert_not_awaited()
+        assert '/rf' in _error_log(caplog)
+
+    @pytest.mark.asyncio
+    async def test_a_dry_run_over_a_gap_completes_and_reports_it(self):
+        """The dry run shows what --apply would do, and "refuse" is part of that."""
+        service, corpus = _run_service({
+            'dark_factory': [_crec('m1', 'legacy_topic'), _crec('m2', '!!!')],
+            'reify': [],
+        })
+        failure = _census_failure('/df')
+        census = _census(covered=('reify',), failures=[failure])
+
+        report = await run_sweep(service, projects=('dark_factory', 'reify'),
+                                 apply=False, gates=census)
+
+        bucket = report['skips']['gate_census_incomplete']
+        assert len(bucket) == 2
+        assert failure in bucket
+        assert [gap.get('project_id') for gap in bucket if gap != failure] == ['dark_factory']
+        assert all(gap['reason'] == 'gate_census_incomplete' for gap in bucket)
+        assert resolve_exit(report) == 1
+        assert report['outcomes'].get('would_rename') == 1
+        assert len(report['skips']['topic_unfoldable']) == 1
+        assert corpus.writes == []
+
+    @pytest.mark.asyncio
+    async def test_the_gap_alone_is_what_fails_that_dry_run(self):
+        records = {'dark_factory': [_crec('m1', 'legacy_topic')]}
+        complete = await run_sweep(_run_service(records)[0], projects=('dark_factory',),
+                                   gates=_census(covered=('dark_factory',)))
+        gapped = await run_sweep(_run_service(records)[0], projects=('dark_factory',),
+                                 gates=_census(covered=()))
+
+        assert complete['skips']['gate_census_incomplete'] == []
+        assert resolve_exit(complete) == 0
+        assert resolve_exit(gapped) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_gate_of_an_unswept_project_is_neither_paired_nor_an_orphan(self):
+        service, _corpus = _run_service({'dark_factory': [_crec('m1', 'legacy_topic')]})
+        census = _census(
+            covered=('dark_factory', 'reify'),
+            tasks=[_gate_task('6852', 'legacy_topic', project_id='reify'),
+                   _gate_task('6853', 'ghost_topic', project_id='reify')])
+
+        report = await run_sweep(service, projects=('dark_factory',), gates=census)
+
+        assert report['gate_results'] == []
+        assert report['skips']['orphan_gate_topic'] == []
+
+    @pytest.mark.asyncio
+    async def test_the_report_carries_the_census_as_sorted_lists(self):
+        """A frozenset through ``default=str`` renders in hash order, not a diffable one."""
+        service, _corpus = _run_service({'dark_factory': [], 'reify': []})
+        census = _census(roots=('/rf', '/df'), covered=('reify', 'dark_factory'),
+                         tasks=[_gate_task('4220', 'good-topic')])
+
+        report = await run_sweep(service, projects=('dark_factory', 'reify'), gates=census)
+
+        assert report['gate_census'] == {
+            'roots': ['/df', '/rf'],
+            'covered_projects': ['dark_factory', 'reify'],
+            'gate_count': 1,
+            'complete': True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_an_incomplete_census_is_complete_false_in_the_report(self):
+        service, _corpus = _run_service({'dark_factory': []})
+
+        report = await run_sweep(service, projects=('dark_factory',), gates=_census(covered=()))
+
+        assert report['gate_census']['complete'] is False
+
+    @pytest.mark.asyncio
+    async def test_the_markdown_says_an_incomplete_census_is_incomplete(self):
+        service, _corpus = _run_service({'dark_factory': [_crec('m1', 'legacy_topic')]})
+
+        report = await run_sweep(service, projects=('dark_factory',), gates=_census(covered=()))
+        section = _gates_section(report)
+
+        assert '_no gate-backed topic in this sweep_' not in section
+        assert 'INCOMPLETE' in section
+
+    @pytest.mark.asyncio
+    async def test_the_markdown_still_says_no_gate_over_a_complete_census(self):
+        service, _corpus = _run_service({'dark_factory': [_crec('m1', 'legacy_topic')]})
+
+        report = await run_sweep(service, projects=('dark_factory',),
+                                 gates=_census(covered=('dark_factory',)))
+
+        assert '_no gate-backed topic in this sweep_' in _gates_section(report)
+
+    def test_gate_census_incomplete_is_a_pre_seeded_error_bucket(self):
+        assert 'gate_census_incomplete' in _mod.ERROR_OUTCOMES
+        assert 'gate_census_incomplete' in _mod.SKIP_BUCKETS
 
 
 class TestReportRenderAndCli:
