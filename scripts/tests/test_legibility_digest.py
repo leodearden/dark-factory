@@ -860,6 +860,46 @@ class TestIterSelfCorrections:
 
         assert mod.iter_self_corrections(records) == []
 
+    def test_ignores_a_whole_block_coder_judgment(self):
+        # The b203a05c record-22 sighting: a prior trickle-coder answer whose
+        # note quotes "that's wrong" from the digest it coded.
+        records = [_assistant(_text(_coder_judgment()))]
+
+        assert mod.iter_self_corrections(records) == []
+
+    def test_ignores_a_json_fenced_coder_judgment(self):
+        records = [_assistant(_text(_json_fenced(_coder_judgment())))]
+
+        assert mod.iter_self_corrections(records) == []
+
+    def test_ignores_a_coder_judgment_quoting_i_was_wrong(self):
+        # The 6a527d51 record-10 marker.
+        records = [_assistant(_text(
+            _coder_judgment(note='I was wrong to keep reporting it as stuck'),
+        ))]
+
+        assert mod.iter_self_corrections(records) == []
+
+    def test_coder_judgment_does_not_mask_a_prose_self_correction(self):
+        records = [
+            _assistant(_text(_coder_judgment())),
+            _assistant(_text('My mistake, the lease check belongs in the watcher.')),
+        ]
+
+        hits = mod.iter_self_corrections(records)
+
+        assert [(h['index'], h['pattern']) for h in hits] == [(1, 'my mistake')]
+
+    def test_prose_quoting_the_schema_inline_still_self_corrects(self):
+        records = [_assistant(_text(
+            'Earlier I said the coder answers {"matches": [], "candidates": []} '
+            "on every run. That's wrong: it answers that only when nothing matches."
+        ))]
+
+        hits = mod.iter_self_corrections(records)
+
+        assert [h['pattern'] for h in hits] == ["that's wrong"]
+
 
 # ---------------------------------------------------------------------------
 # iter_not_found / iter_df_guards / iter_interrupts — secondary scalar
