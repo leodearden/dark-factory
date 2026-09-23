@@ -1653,8 +1653,9 @@ def _common_prefix_length(previous: list, current: list) -> int:
     return next(
         (
             index
-            # strict=False deliberately: the two lists have DIFFERENT
-            # lengths in every case this is asked about.
+            # strict=False deliberately: the two lists may differ in length --
+            # a recorded history against the staged list that extends it, or
+            # a merge's two parent histories against each other.
             for index, (was, now) in enumerate(
                 zip(previous, current, strict=False)
             )
@@ -1695,6 +1696,38 @@ def ledger_appended_entries(previous: dict, current: dict) -> list[dict]:
             'instead of touching a recorded one.'
         )
     return current_raises[len(previous_raises) :]
+
+
+def ledger_merged_entries(ours: dict, theirs: dict, current: dict) -> list[dict]:
+    """The entries a MERGE commit adds beyond BOTH parents' histories.
+
+    The reader half of ``append_authorization``'s promise for a merge commit,
+    as ``ledger_appended_entries`` is for an ordinary one. *current* must start
+    with one parent's entries followed by the other parent's own additions, in
+    EITHER order -- a resolver keeps both appended blocks in whichever order
+    the conflict presents them. Dropping or rewriting either side's entries is
+    the same ``AppendOnlyViolation``.
+
+    A parent's entries are HISTORY, never this merge's own: LEDGER_README
+    promises that nothing in the file grants a future raise, so only what
+    follows both histories may cover a raise the merge makes.
+    """
+    ours_raises = list(ours.get('raises', ()))
+    theirs_raises = list(theirs.get('raises', ()))
+    current_raises = list(current.get('raises', ()))
+    for first, second in ((ours_raises, theirs_raises), (theirs_raises, ours_raises)):
+        history = [*first, *second[_common_prefix_length(first, second) :]]
+        if current_raises[: len(history)] == history:
+            return current_raises[len(history) :]
+    raise AppendOnlyViolation(
+        'the authorized-raise ledger is append-only, and this merge rewrites '
+        "its history: the staged file must hold one parent's recorded entries, "
+        "then the other parent's own additions, then the merge's own. Ours "
+        f'records {len(ours_raises)} entr(ies), theirs {len(theirs_raises)}, '
+        f'and the staged file holds {len(current_raises)}. Keep both blocks '
+        'whole, in either order, and append a new entry with --authorize-raise '
+        'instead of touching a recorded one.'
+    )
 
 
 # ---------------------------------------------------------------------------
