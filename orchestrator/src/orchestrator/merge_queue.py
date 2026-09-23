@@ -15,6 +15,7 @@ import asyncio
 import collections
 import contextlib
 import dataclasses
+import functools
 import json
 import logging
 import math
@@ -2524,15 +2525,6 @@ async def _record_flake_observation(
     enforcing the invariant for whichever observations flow through it, with no
     failure anywhere.  One seam, one answer to who owns the debt row.
 
-    Which of the three ``_run_post_merge_verify`` callers can supply it is a fact
-    about scope, and it is worth stating precisely because an earlier version of
-    this docstring got it wrong.  ``SpeculativeMergeWorker`` (:18190) and the train
-    pipeline ``_do_train_merge`` (:7300) BOTH hold a worker and both pass it.
-    ``reverify_member_solo`` (:5956) is the only one that genuinely cannot: it takes
-    ``git_ops``/``config`` and no worker at all, so there is nothing there to read.
-    A suppression observed on that path therefore records its occurrence row and
-    opens no debt — a configuration, not a breach.
-
     Never raises (the recorder owns that guarantee), so a lost measurement can
     never fail a verify or stall the merge queue.
     """
@@ -2594,19 +2586,11 @@ async def _run_post_merge_verify(
     ``'Verification error: ...'`` outcome.
 
     Args:
-        task_client: Optional duck-typed task client (``submit_task`` /
-            ``get_statuses`` / ``commit_planning``, all async) threaded to the
-            flake recorder so a suppressed merge red acquires a de-flake task at
-            write time (PRD task ζ, §5.9).  Threaded exactly as
-            ``escalation_queue`` is, and defaulting to ``None`` for the same
-            reason: the one caller that omits it — ``reverify_member_solo``,
-            which holds no worker to read it from — stays byte-identical, and
-            with nothing wired the recorder opens no debt row rather than an
-            unowned one.  ``SpeculativeMergeWorker`` passes its
-            ``_flake_task_client``; ``_do_train_merge`` passes the same handle
-            off the worker it is given (``getattr``, since the frozen
-            test-local ``_TrainMergeHost`` reference defines neither flake
-            handle and simply gets ``None``).
+        task_client: Optional task client (``submit_task`` / ``get_statuses`` /
+            ``commit_planning``) threaded to the flake recorder so a suppressed
+            merge red acquires a de-flake task at write time (PRD task ζ, §5.9).
+            Threaded like ``escalation_queue``; with ``None`` the recorder opens
+            no debt row.
         max_narrowed: Budget for the classified-infra-transient retry loop
             (task 2835) when this call's failed-only retry was actually
             NARROWED — i.e. the D2 producer inside that branch built a
@@ -3139,21 +3123,14 @@ async def _run_post_merge_verify(
     # masked red that the inline pre-ε emit would have reported at the moment it
     # happened.  `superseded_observations` is empty on every path where no retry
     # carried an observation, which is the overwhelmingly common case.
-    for superseded in superseded_observations:
-        await _record_flake_observation(
-            superseded, req,
-            merge_sha=merge_sha,
-            event_store=event_store,
-            escalation_queue=escalation_queue,
-            task_client=task_client,
-        )
-    await _record_flake_observation(
-        verify, req,
-        merge_sha=merge_sha,
-        event_store=event_store,
-        escalation_queue=escalation_queue,
+    record_observation = functools.partial(
+        _record_flake_observation, req=req, merge_sha=merge_sha,
+        event_store=event_store, escalation_queue=escalation_queue,
         task_client=task_client,
     )
+    for superseded in superseded_observations:
+        await record_observation(superseded)
+    await record_observation(verify)
 
     # Invoke the optional result-capture callback (PRD §10 invariant 6(b)):
     # called with the FINAL VerifyResult (after any ENOSPC retry) so the
@@ -3246,13 +3223,7 @@ async def _run_post_merge_verify(
             # recording it here is what keeps this detective-control path from
             # regressing.  Inside the `try`, after the await, so a raised verify
             # (handled below) records nothing — there is no verdict to record.
-            await _record_flake_observation(
-                local_verify, req,
-                merge_sha=merge_sha,
-                event_store=event_store,
-                escalation_queue=escalation_queue,
-                task_client=task_client,
-            )
+            await record_observation(local_verify)
         except RunnerUnavailable as exc:
             # Fail-safe: a closed/flaky laptop trust-anchor must never block a
             # remote green (symmetric with DriftDetector's Invariant 5).
@@ -7332,25 +7303,6 @@ async def _do_train_merge(
     # builds for role='merge': merge_verify_breadth=='full' fans out to
     # every REGISTERED module's full suite per-module; =='scoped' (the
     # shipped default) stays the pre-λ opaque global workspace command.
-    # Flake handles (task ζ amend): a train merge suppresses reds exactly like a
-    # single-branch one, so §5.9 must be enforced for it too — a train's masked red
-    # is no less debt.  Both handles ride on `worker`, which is already read for five
-    # other fields two lines up, so the earlier claim that this site structurally
-    # could not own a debt row was simply wrong.
-    #
-    # `getattr` rather than a `_TrainMergeHost` field because the Protocol's other
-    # implementer is the FROZEN test-local serial-worker reference (see that class's
-    # docstring), which defines neither attribute; widening the Protocol would break a
-    # file this task does not own.  The default is None, which is precisely the
-    # "nothing wired" configuration both consumers already handle.
-    #
-    # `escalation_queue` is threaded WITH it, not as a drive-by: ζ's write-time filing
-    # is a fail-soft path whose only bound on a many-distinct-tests storm is INV-4's
-    # fixed-sentinel escape, and that escape lives behind this handle.  Arming the
-    # filing at a site where the alarm is unwired is the one combination the recorder's
-    # ordering contract exists to prevent.  (It also restores the task-2307 β
-    # flock-contention escalation on this path, which was dropped here for the same
-    # unthreaded-handle reason.)
     verify_outcome = await _run_post_merge_verify(
         git_ops, req, merge_wt,
         timeouts=worker._post_merge_verify_timeouts,

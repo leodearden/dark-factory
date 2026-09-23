@@ -54,6 +54,7 @@ from orchestrator.flake_ledger import (
     FlakeVerdict,
     ledger_db_path,
     open_debt,
+    read_debt_many,
     record_flake_occurrence,
 )
 
@@ -110,22 +111,17 @@ _MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD = 5
 _MERGE_FLAKE_SUPPRESSION_STORM_SENTINEL = 'merge-flake-suppression-storm'
 
 #: Upper bound on de-flake filings ONE observation may attempt (task 4974).  A filing
-#: is up to three MCP round trips (``get_statuses`` / ``submit_task`` /
-#: ``commit_planning``) awaited SERIALLY on the merge post-verify path, and
-#: ``FlakeSuppression.test_ids`` is uncapped, so without a bound a broad flake burst
-#: against a degraded fused-memory could hold the merge queue for as long as it liked.
-#: Tests past the cap still get their occurrence row (recorded above, unconditionally);
-#: they get a debt row on their NEXT suppression instead.  Not a timeout, so §5.5's
-#: never-widen rule does not apply — but do not raise it as a "fix" for a burst either:
-#: a burst that large is INV-4's storm, and the escape for it is the streak, not more
-#: filings.
+#: is up to three MCP round trips awaited serially on the merge post-verify path over
+#: an uncapped ``FlakeSuppression.test_ids``, so a bound is what keeps a broad burst
+#: against a degraded fused-memory from holding the merge queue.  Tests past the cap
+#: keep their occurrence row; tests with no owned debt row are filed FIRST, so a
+#: recurring burst reaches every member across observations instead of re-selecting
+#: the same prefix.  A count, not a timeout, so §5.5's never-widen rule does not apply.
 _DEBT_FILINGS_PER_OBSERVATION_CAP = 8
 
-#: Wall-clock budget, in seconds, for the WHOLE filing phase of one observation
-#: (task 4974).  Bounds the per-filing worst case (~75 s of MCP timeouts) times the cap
-#: above to something the merge queue can absorb; on expiry the remaining filings are
-#: a lost signal (logged loudly, like every other lost signal here), never a stalled
-#: merge.  This is an added bound, not a widened one.
+#: Wall-clock budget, in seconds, for the filing phase of ONE observation (task 4974).
+#: On expiry the unfinished filings are a lost signal, logged with the ids left over,
+#: never a stalled merge.  An added bound, not a widened one.
 _DEBT_FILING_BUDGET_SECS = 120.0
 
 
@@ -228,6 +224,17 @@ def _bump_suppression_streak_and_maybe_escalate(
     escalation_queue.submit(esc)
 
 
+def _unowned_first(db_path: Path, test_ids: list[str]) -> list[str]:
+    """*test_ids* with those lacking an OPEN, OWNED debt row moved to the front, each
+    half in its original order.  A ledger read failure degrades to the input order."""
+    rows = read_debt_many(db_path, test_ids)
+    owned = {
+        tid for tid, row in rows.items()
+        if row.owner_task_id and row.resolved_at is None
+    }
+    return [t for t in test_ids if t not in owned] + [t for t in test_ids if t in owned]
+
+
 async def record_merge_flake_suppression(
     result: VerifyResult,
     *,
@@ -238,6 +245,8 @@ async def record_merge_flake_suppression(
     event_store: EventStore | None = None,
     escalation_queue: Any = None,
     task_client: Any = None,
+    debt_filing_cap: int = _DEBT_FILINGS_PER_OBSERVATION_CAP,
+    debt_filing_budget_secs: float = _DEBT_FILING_BUDGET_SECS,
 ) -> None:
     """Record the flake observation *result* carries — ε's job, plus ζ's fourth effect.
 
@@ -431,20 +440,21 @@ async def record_merge_flake_suppression(
             return
         carried: list[str] = []
         _guarded('debt-test-ids', lambda: carried.extend(s.test_ids))
-        cap = _DEBT_FILINGS_PER_OBSERVATION_CAP
-        if len(carried) > cap:
+        if len(carried) > debt_filing_cap:
+            carried = _unowned_first(ledger_db_path(project_root), carried)
             logger.warning(
                 'flake_recorder: %d test(s) carried on one observation exceed the '
-                'per-observation de-flake filing cap of %d; the last %d get an '
-                'occurrence row but no debt row this time (merge_sha=%s, task_id=%s): %s',
+                'per-observation de-flake filing cap of %d; deferred to a later '
+                'observation (merge_sha=%s, task_id=%s): %s',
                 len(carried),
-                cap,
-                len(carried) - cap,
+                debt_filing_cap,
                 merge_sha,
                 task_id,
-                carried[cap:],
+                carried[debt_filing_cap:],
             )
-            carried = carried[:cap]
+            carried = carried[:debt_filing_cap]
+
+        remaining = list(carried)
 
         async def _file_all() -> None:
             for carried_test_id in carried:
@@ -457,12 +467,22 @@ async def record_merge_flake_suppression(
                         task_client=task_client,
                     ),
                 )
+                remaining.remove(carried_test_id)
 
-        # BOUNDED (task 4974): the filing phase as a whole gets one wall-clock budget.
-        # Expiry cancels whichever filing is in flight and skips the rest — a lost
-        # signal, reported through the same `_lost` as every other one — so a degraded
-        # fused-memory can delay a merge by at most the budget, never stall it.
+        # BOUNDED (task 4974): one wall-clock budget per observation's filing phase.
+        # Expiry cancels the filing in flight and skips the rest — a lost signal,
+        # reported like every other one here, naming what was left unfiled.
         try:
-            await asyncio.wait_for(_file_all(), timeout=_DEBT_FILING_BUDGET_SECS)
+            await asyncio.wait_for(_file_all(), timeout=debt_filing_budget_secs)
         except TimeoutError:
+            logger.warning(
+                'flake_recorder: de-flake filing budget of %.0fs expired with %d of %d '
+                'test(s) unfiled (merge_sha=%s, task_id=%s): %s',
+                debt_filing_budget_secs,
+                len(remaining),
+                len(carried),
+                merge_sha,
+                task_id,
+                remaining,
+            )
             _lost('debt-filing-budget')
