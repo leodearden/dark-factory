@@ -997,11 +997,11 @@ class TestSecondarySignals:
 
 # ---------------------------------------------------------------------------
 # Re-ingested content is excluded from EVERY signal bucket (task 5685), not
-# only the one it was first sighted in. Fixture shapes mirror the 2026-09-23
-# measurement over 35,882 dark-factory transcripts: the harness-injected
-# trickle-coder prompt embeds the digest it codes (908 sessions carried
+# only the one it was first sighted in. Fixture shapes mirror a 2026-09-23
+# read-only scan of all 35,888 dark-factory transcripts: the harness-injected
+# trickle-coder prompt embeds the digest it codes (901 sessions carried
 # phantom df_guard or interrupt hits from it), and a coder answer quotes that
-# digest back (273 of the 301 sessions it contaminated had df_guard hits).
+# digest back (246 of the 301 sessions it contaminated had df_guard hits).
 # ---------------------------------------------------------------------------
 
 def _trickle_coder_session_records():
