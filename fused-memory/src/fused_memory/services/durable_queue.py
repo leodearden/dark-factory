@@ -636,13 +636,8 @@ class DurableWriteQueue:
                 # The backend write LANDED. Anything that fails below is a
                 # post-execute failure, which is a materially different fact
                 # for anyone deciding whether a dead item is safe to replay.
-                #
-                # ORDER IS LOAD-BEARING, both halves:
-                #  - the local is set BEFORE the await, so even if the flag
-                #    write itself fails, THIS attempt still reports correctly;
-                #  - the flag is made DURABLE before the callback runs, because
-                #    the callback is precisely what can fail and schedule the
-                #    retry that would otherwise lose the fact.
+                # Made durable BEFORE the callback, because the callback is
+                # what can fail and schedule a retry.
                 executed = True
                 await self._mark_executed(item)
                 # Fire callback before marking completed — failure retries item.
@@ -655,7 +650,7 @@ class DurableWriteQueue:
                 await self._mark_completed(item)
                 terminal = ('completed', None)
             except Exception as exc:
-                terminal = await self._handle_failure(item, exc)
+                terminal = await self._handle_failure(item, exc, executed=executed)
 
         if terminal is not None:
             status, error = terminal
@@ -702,22 +697,32 @@ class DurableWriteQueue:
             )
 
     async def _mark_executed(self, item: QueueItem) -> None:
-        """Durably record that a backend write for this item LANDED.
+        """Durably record that this item's backend write LANDED — best-effort.
 
-        One extra commit per item, weighed against a backend round trip
-        measured in seconds — not worth conditionalising on ``callback_type``,
-        since an item with no callback can still dead-letter on the completion
-        commit. Skipped when the row already carries the flag, so a retry of an
-        already-flagged item costs nothing.
+        A failure is logged and swallowed, never raised. Raising would
+        reschedule the item, and the retry would re-execute a write that has
+        already landed: the duplicate this flag exists to prevent. The fact is
+        not lost with it: ``_handle_failure`` records it again in the commit
+        that settles a failed attempt, and only a failed attempt's row is ever
+        read for it. It goes unrecorded only if the process dies before that
+        commit.
         """
         if item.executed:
             return
         assert self._db is not None
-        await self._db.execute(
-            'UPDATE write_queue SET executed = 1 WHERE id = ?',
-            (item.id,),
-        )
-        await self._db.commit()
+        try:
+            await self._db.execute(
+                'UPDATE write_queue SET executed = 1 WHERE id = ?',
+                (item.id,),
+            )
+            await self._db.commit()
+        except Exception:
+            logger.warning(
+                'Item %d (%s, group_id=%s): backend write landed but the '
+                'executed flag could not be persisted; continuing without a '
+                'retry — if this attempt fails, its failure commit records it',
+                item.id, item.operation, item.group_id, exc_info=True,
+            )
 
     async def _notify_dead_letter(
         self,
@@ -856,13 +861,18 @@ class DurableWriteQueue:
         return ('normal', item.max_attempts)
 
     async def _handle_failure(
-        self, item: QueueItem, exc: Exception
+        self, item: QueueItem, exc: Exception, *, executed: bool
     ) -> tuple[str, str | None] | None:
         """Dead-letter or schedule a retry.
 
         Returns ``('dead', error_msg)`` when the item reached its terminal
         dead state, or ``None`` when it was merely rescheduled — the caller
         uses that to decide whether to fire the terminal hook.
+
+        *executed* (a backend write for this item has landed) is recorded in
+        the same commit, because ``_mark_executed`` is best-effort. The CASE
+        only ever sets the flag: an attempt that did not land leaves the
+        column as it was, so a legacy NULL stays unknown.
         """
         assert self._db is not None
         new_attempts = item.attempts + 1
@@ -871,9 +881,9 @@ class DurableWriteQueue:
         died = new_attempts >= limit
         if died:
             await self._db.execute(
-                "UPDATE write_queue SET status = 'dead', attempts = ?, error = ? "
-                "WHERE id = ?",
-                (new_attempts, error_msg, item.id),
+                "UPDATE write_queue SET status = 'dead', attempts = ?, error = ?, "
+                "executed = CASE WHEN ? THEN 1 ELSE executed END WHERE id = ?",
+                (new_attempts, error_msg, executed, item.id),
             )
             # operation / group_id / classification are what a triager needs
             # first, and the log line is all that survives once the queue row is
@@ -895,8 +905,9 @@ class DurableWriteQueue:
             next_retry = time.time() + delay
             await self._db.execute(
                 "UPDATE write_queue SET status = 'retry', attempts = ?, "
-                "next_retry_at = ?, error = ? WHERE id = ?",
-                (new_attempts, next_retry, error_msg, item.id),
+                "next_retry_at = ?, error = ?, "
+                "executed = CASE WHEN ? THEN 1 ELSE executed END WHERE id = ?",
+                (new_attempts, next_retry, error_msg, executed, item.id),
             )
             # Kept symmetrical with the dead-letter line above so a retry storm
             # is attributable to an operation and a project without a second

@@ -1944,6 +1944,134 @@ class TestTerminalHook:
         finally:
             await q.close()
 
+    @staticmethod
+    async def _fail_flag_writes_while_in_flight(data_dir) -> None:
+        """Make the pre-callback `executed` flag write fail, on the real DB file.
+
+        A trigger installed through a second connection, so the fault lands
+        where a SQLITE_BUSY or disk error would. It is scoped to writes made
+        while the item is still in flight, which models a transient fault that
+        has cleared by the time the attempt is settled as a retry or a
+        dead-letter.
+        """
+        async with aiosqlite.connect(str(data_dir / 'write_queue.db')) as db:
+            await db.execute(
+                'CREATE TRIGGER fail_in_flight_executed_flag '
+                'BEFORE UPDATE OF executed ON write_queue '
+                "WHEN NEW.status = 'in_flight' "
+                "BEGIN SELECT RAISE(ABORT, 'injected: executed flag write failed'); END"
+            )
+            await db.commit()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_flag_write_does_not_re_execute_the_landed_write(
+        self, tmp_path, caplog
+    ):
+        """Losing the `executed` flag must never cost a retry of a landed write.
+
+        The flag write is a commit between "the backend write landed" and the
+        callback. Routed like any other failure, it would reschedule the item
+        and the retry would call execute_write AGAIN. That duplicates a landed
+        backend write, which is exactly what the flag exists to prevent, and
+        no callback failure is needed to cause it.
+        """
+        calls, hook = self._recorder()
+        execute = AsyncMock(return_value={'episode_uuid': 'ep-1'})
+        callback = AsyncMock()
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=execute,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=3,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            on_terminal=hook,
+        )
+        q.register_callback('dual_write_episode', callback)
+        await q.initialize()
+        try:
+            await self._fail_flag_writes_while_in_flight(tmp_path / 'queue')
+            with caplog.at_level(logging.WARNING, logger=dq_module.__name__):
+                item_id = await q.enqueue(
+                    group_id='proj1', operation='add_episode',
+                    payload={'content': 'x', '_write_op_id': 'W13'},
+                    callback_type='dual_write_episode',
+                )
+                await poll_until(lambda: len(calls) >= 1, timeout=20.0, interval=0.05)
+
+            assert calls == [('W13', 'completed', None)]
+            assert execute.await_count == 1, (
+                'the backend write landed once; a failed flag write must not '
+                'send it round again'
+            )
+            callback.assert_awaited_once()
+            warnings = [
+                r.getMessage() for r in caplog.records
+                if r.levelno >= logging.WARNING and r.name == dq_module.__name__
+            ]
+            assert any(
+                f'Item {item_id} ' in m and 'executed' in m for m in warnings
+            ), f'the lost flag write must still be audible; got {warnings}'
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_flag_write_is_re_recorded_when_the_attempt_fails(
+        self, tmp_path
+    ):
+        """A lost flag write must not surface later as "never landed".
+
+        Once the early flag write is best-effort, its failure leaves the row
+        saying no backend write landed. Attempt 1 lands and its callback
+        raises; attempt 2 never reaches the backend and dead-letters. If
+        nothing recorded the fact again, the dead-letter would report
+        `executed: False` with no POST_EXECUTE_DEAD_PREFIX. That tells the
+        operator a landed write is safe to replay. The commit that schedules
+        the retry has to carry the fact instead.
+        """
+        calls, hook = self._recorder()
+
+        async def exploding_callback(_ctype, _result, _payload):
+            raise RuntimeError('callback keeps failing')
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(side_effect=[
+                {'episode_uuid': 'ep-1'},
+                RuntimeError('attempt 2 never reached the backend'),
+            ]),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=2,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            on_terminal=hook,
+        )
+        q.register_callback('dual_write_episode', exploding_callback)
+        await q.initialize()
+        try:
+            await self._fail_flag_writes_while_in_flight(tmp_path / 'queue')
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'x', '_write_op_id': 'W14'},
+                callback_type='dual_write_episode',
+            )
+            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until(lambda: len(calls) >= 1, timeout=20.0, interval=0.05)
+
+            dead = await q.get_dead_items(group_id='proj1')
+            assert dead[0]['executed'] is True, (
+                'attempt 1 landed a write; a failed flag write must not turn '
+                'that into a licence to replay it'
+            )
+            write_op_id, status, error = calls[0]
+            assert (write_op_id, status) == ('W14', 'dead')
+            assert error is not None
+            assert error.startswith(dq_module.POST_EXECUTE_DEAD_PREFIX)
+        finally:
+            await q.close()
+
     @pytest.mark.asyncio
     async def test_callback_still_sees_journal_metadata_popped_by_execute(
         self, tmp_path
