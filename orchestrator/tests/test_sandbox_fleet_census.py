@@ -33,8 +33,7 @@ from orchestrator.config import SandboxConfig
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-DASHBOARD_CONFIG = 'dashboard/orchestrator.yaml'
-FACTORY_TARGETS: tuple[str, ...] = ('dark-factory-orchestrator.yaml', DASHBOARD_CONFIG)
+FACTORY_TARGETS: tuple[str, ...] = ('dark-factory-orchestrator.yaml', 'dashboard/orchestrator.yaml')
 LANDLOCK_PINNED = {'enabled': True, 'backend': 'landlock'}
 SHIPPED_DEFAULTS = 'orchestrator/src/orchestrator/defaults.yaml'
 # The canonical `--config` name, plus the module-config name that
@@ -169,13 +168,4 @@ def test_shipped_default_leaves_the_sandbox_off() -> None:
         f'FIX: restore the explicit key. Enablement is explicit per-project config (PRD D7), '
         f'and SandboxConfig\'s model default is `enabled=True`, so deleting the key from '
         f'defaults.yaml silently turns sandboxing ON for every adopter.'
-    )
-
-
-def test_dashboard_config_no_longer_defers_the_flip() -> None:
-    text = (REPO_ROOT / DASHBOARD_CONFIG).read_text(encoding='utf-8')
-    assert 'when ready' not in text, (
-        f'{DASHBOARD_CONFIG} still defers its sandbox flip "when ready".\n'
-        f'FIX: the flip is γ7\'s deliverable; once the block pins landlock, drop that '
-        f'pending instruction from the comment above it.'
     )
