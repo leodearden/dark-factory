@@ -87,10 +87,10 @@ GUARDED, as of task 4848 -- ``amend_stale_resume_cwd_records``,
 ``cleanup_count_snapshots``, ``cleanup_pin_queue_edges``,
 ``clear_false_dependency_invalidations``, ``clear_malformed_empty_memory``,
 ``consolidate_namespace_families``, ``invalidate_fabricated_shipping_edges``,
-``migrate_cross_graph_leak``, ``prune_recon_cycle_summaries``,
-``purge_knowlive_namespace``, ``retro_stamp_topics``,
-``sweep_orphan_flag_markers``, ``sweep_toolcall_xml_leak``,
-``tag_cgl_eta_rehome_scope`` (16 call sites).
+``migrate_cross_graph_leak``, ``normalize_topic_slugs``,
+``prune_recon_cycle_summaries``, ``purge_knowlive_namespace``,
+``retro_stamp_topics``, ``sweep_orphan_flag_markers``,
+``sweep_toolcall_xml_leak``, ``tag_cgl_eta_rehome_scope`` (17 call sites).
 This column IS exhaustive, because CALLING this function is what "guarded"
 MEANS: ``grep -rln 'assert_store_mutation_allowed(' fused-memory/scripts/
 --include='*.py'`` re-derives it, and re-dates it, in one line.
