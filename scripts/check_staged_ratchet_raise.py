@@ -67,9 +67,9 @@ def _git(root: Path, *args: str, stdin: str | None = None) -> str:
     ``check=True``: a plumbing call that fails is an instrument failure, and
     ``main`` reports it as one. The single exception -- a revision that names
     nothing, which is legitimate data rather than a fault -- goes through
-    :func:`_blob_oid`, whose ``--quiet`` makes absence an exit code instead of a
-    message. ``encoding`` is pinned so a blob round trip does not depend on the
-    committing shell's locale.
+    :func:`_object_id`, whose ``--quiet`` makes absence an exit code instead of
+    a message. ``encoding`` is pinned so a blob round trip does not depend on
+    the committing shell's locale.
     """
     return subprocess.run(
         ['git', '-C', str(root), *args],
@@ -81,12 +81,13 @@ def _git(root: Path, *args: str, stdin: str | None = None) -> str:
     ).stdout
 
 
-def _blob_oid(root: Path, revision: str) -> str | None:
-    """The blob *revision* names, or None when it names nothing.
+def _object_id(root: Path, revision: str) -> str | None:
+    """The object *revision* names, or None when it names nothing.
 
     Absence is an ANSWER here, not a fault: an unborn HEAD, the commit that
-    introduces the baseline, a ledger not yet committed. This is the one place a
-    non-zero git exit is read as data.
+    introduces the baseline, a ledger not yet committed, a commit that is not
+    finishing a merge and so has no MERGE_HEAD. This is the one rev-parse site
+    where a non-zero git exit is read as data.
     """
     try:
         return _git(root, 'rev-parse', '--verify', '--quiet', revision).strip()
@@ -94,12 +95,31 @@ def _blob_oid(root: Path, revision: str) -> str | None:
         return None
 
 
-def _staged(root: Path, diff_filter: str) -> set[str]:
-    """Which ratchet artifacts this commit stages, under *diff_filter*."""
+def _staged(root: Path, diff_filter: str, merge_head: str | None) -> set[str]:
+    """Which ratchet artifacts this commit stages, under *diff_filter*.
+
+    Against HEAD and, finishing a merge, against MERGE_HEAD too. A resolution
+    that keeps HEAD's artifacts byte-for-byte while dropping MERGE_HEAD's moves
+    or entries differs from MERGE_HEAD alone, and it is exactly the resolution
+    that breaks a merge's invariant (heuristic 10, uniformly).
+    """
+    staged = _index_changes(root, diff_filter)
+    if merge_head is not None:
+        staged |= _index_changes(root, diff_filter, merge_head)
+    return staged
+
+
+def _index_changes(root: Path, diff_filter: str, *commit: str) -> set[str]:
+    """The ratchet artifacts the index changes against *commit*, or else HEAD.
+
+    HEAD stays IMPLICIT rather than named: ``git diff --cached HEAD`` fails on
+    an unborn HEAD, where the implicit form compares against the empty tree.
+    """
     listing = _git(
         root,
         'diff',
         '--cached',
+        *commit,
         '--name-only',
         f'--diff-filter={diff_filter}',
         '--',
@@ -120,7 +140,7 @@ def _ledger_image(root: Path, revision: str, scratch: Path, name: str) -> dict:
     ``load_ledger`` owns both polarities -- absent is empty, malformed is fatal
     -- so neither is re-implemented here.
     """
-    oid = _blob_oid(root, revision)
+    oid = _object_id(root, revision)
     if oid is None:
         return metrics.empty_ledger()
     return metrics.load_ledger(_image(root, oid, scratch / name))
@@ -182,7 +202,7 @@ def _restores_previous_image(root: Path, staged_oid: str) -> str | None:
         '--batch-check',
         stdin='\n'.join(f'{commit}:{baseline}' for commit in commits),
     ).splitlines()
-    head_oid = _blob_oid(root, f'HEAD:{baseline}')
+    head_oid = _object_id(root, f'HEAD:{baseline}')
 
     # Newest first. Skip the run of entries still holding HEAD's blob -- those
     # are commits that touched the path without changing its value -- and let
@@ -219,12 +239,28 @@ def _appended_ledger_entries(root: Path, scratch: Path) -> list[dict]:
     )
 
 
+def _merged_ledger_entries(root: Path, scratch: Path, merge_head: str) -> list[dict]:
+    """A merge's OWN new ledger entries, refusing any rewrite of either parent's.
+
+    Both parents' recorded entries are HISTORY: a record MERGE_HEAD committed is
+    not "appended" by this commit merely because HEAD lacks it, so it can never
+    cover a raise the merge makes (LEDGER_README: nothing in the file grants a
+    future raise).
+    """
+    ledger = metrics.LEDGER_RELPATH
+    return metrics.ledger_merged_entries(
+        _ledger_image(root, f'HEAD:{ledger}', scratch, 'head.json'),
+        _ledger_image(root, f'{merge_head}:{ledger}', scratch, 'merge_head.json'),
+        _ledger_image(root, f':{ledger}', scratch, 'staged.json'),
+    )
+
+
 def _audit_baseline(
     root: Path, scratch: Path, appended: list[dict]
 ) -> list[str]:
     """Audit the staged baseline against HEAD's. Empty list means clean."""
     baseline = metrics.BASELINE_RELPATH
-    head_oid = _blob_oid(root, f'HEAD:{baseline}')
+    head_oid = _object_id(root, f'HEAD:{baseline}')
     if head_oid is None:
         # A first write has nothing to compare against -- write_baseline's
         # already-documented limit, and said out loud rather than passed over.
@@ -234,7 +270,7 @@ def _audit_baseline(
         )
         return []
 
-    staged_oid = _blob_oid(root, f':{baseline}')
+    staged_oid = _object_id(root, f':{baseline}')
     if staged_oid is None:
         return []
 
@@ -272,13 +308,15 @@ def _refuse(lines: list[str]) -> int:
 
 
 def _audit(root: Path) -> int:
-    staged = _staged(root, 'ACMRD')
+    # One quiet rev-parse that reads no history, so it may precede the filter.
+    merge_head = _object_id(root, 'MERGE_HEAD')
+    staged = _staged(root, 'ACMRD', merge_head)
     if not staged:
         # The cheap filter, and it decides before anything consults HEAD: an
         # ordinary commit is never ambushed, and never pays for archaeology.
         return 0
 
-    if metrics.BASELINE_RELPATH in _staged(root, 'D'):
+    if metrics.BASELINE_RELPATH in _staged(root, 'D', merge_head):
         # The first half of "delete the destination first", closed before any
         # comparison is attempted. Deleting the baseline is never legitimate:
         # the freshness gate fails hard without it.
@@ -295,7 +333,11 @@ def _audit(root: Path) -> int:
         # does not launder a rewritten history, and an untouched history does
         # not excuse an unrecorded raise.
         try:
-            appended = _appended_ledger_entries(root, Path(scratch))
+            appended = (
+                _appended_ledger_entries(root, Path(scratch))
+                if merge_head is None
+                else _merged_ledger_entries(root, Path(scratch), merge_head)
+            )
         except metrics.AppendOnlyViolation as exc:
             # A VERDICT, so the POLICY rung -- never the instrument-failure one
             # its ``MetricsError`` siblings take at ``main``. It returns here
