@@ -687,12 +687,13 @@ class TestWholeTreeGate:
 class TestPrefilterParity:
     """The source-substring prefilter drops files, and drops nothing that matters.
 
-    Walking all 524 parsed ASTs for Call nodes costs ~10x what walking only the
-    files whose source spells a target name costs, and ``shared/tests`` is the
-    FIRST segment of the repo test_command — so its runtime is charged to every
-    subsequent task. The filter is sound by construction (a call cannot appear
-    in a file whose source never spells the name), and these two tests are what
-    keep that claim honest rather than merely asserted.
+    Walking every parsed AST for Call nodes costs several times what walking
+    only the files whose source spells a target name costs, and
+    ``shared/tests`` is the FIRST segment of the repo test_command — so its
+    runtime is charged to every subsequent task. The filter is sound by
+    construction (a call cannot appear in a file whose source never spells the
+    name), and these two tests are what keep that claim honest rather than
+    merely asserted.
     """
 
     def test_prefiltered_scan_equals_unfiltered_scan(
@@ -706,7 +707,7 @@ class TestPrefilterParity:
         self, first_party_tree: Sequence[ParsedFile]
     ) -> None:
         """A parity test alone passes vacuously if the filter keeps everything,
-        silently costing the ~10x it exists to buy. The other direction —
+        silently costing the speedup it exists to buy. The other direction —
         dropping a file that holds a site — is the parity test's to catch.
         """
         survivors = records_worth_scanning(first_party_tree)

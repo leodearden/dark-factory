@@ -223,20 +223,8 @@ def records_worth_scanning(records: Iterable[ParsedFile]) -> list[ParsedFile]:
     the real tree, and that the filter drops something rather than passing
     everything through.
 
-    Why it is worth having: ``shared/tests`` is the FIRST segment of the repo
-    ``test_command``, so this gate's runtime is charged to every subsequent
-    task. Measured on this worktree at HEAD 97e3a4d097 (2026-09-22), over 524
-    parsed records of which 28 survive, taking the best of three runs::
-
-        unfiltered walk   1.21s
-        prefiltered walk  0.21s   (the filter itself costs 0.019s of that)
-
-    The parse is NOT part of either number — it is already paid once by the
-    session-scoped ``first_party_tree`` fixture. Task 4891's plan recorded
-    2.92s / 0.29s for the same two walks over the same 524/28 records, so the
-    RATIO a reader should expect ranges from ~6x to ~10x depending on machine
-    and cache state. Re-measure rather than re-judge: the record counts have
-    reproduced exactly, the wall-clock has not.
+    Skipping those files makes the walk several times faster; re-measure
+    rather than trust any figure for that.
     """
     return [
         record for record in records
