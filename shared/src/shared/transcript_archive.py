@@ -52,6 +52,7 @@ growing a second glob.
 from __future__ import annotations
 
 import errno
+import gzip
 import logging
 import os
 import shutil
@@ -737,4 +738,190 @@ def durable_archive_path(
                 'errno': getattr(exc, 'errno', None),
             },
         )
+        return None
+
+
+def restore_archived_transcript(
+    archive_root: Path,
+    task_id: str,
+    session_id: str,
+    config_dir: Path,
+    strict: bool = False,
+) -> Path | None:
+    """Rehydrate *session_id*'s archived transcript into *config_dir*.
+
+    The write-back sibling of :func:`durable_archive_path`, and the inverse of
+    :func:`_archive_one`: the read side gains the one consumer that puts a
+    transcript BACK, so producer and restorer stay on one layout (INV-5).
+    Returns the destination path, or ``None`` when there is nothing to restore.
+
+    Why this exists: the orchestrator recovers a session id from a sidecar and
+    arms ``--resume``, but under pooled warm lanes the lane it re-dispatches
+    into has never seen that session's JSONL — the config dir that held it was
+    destroyed at teardown. Restoring the archived copy makes the resume real
+    instead of a silent fresh start.
+
+    **The destination mirrors the archive's own relative path VERBATIM** —
+    ``<config_dir>/projects/<encoded-cwd>/<session_id>.jsonl``, with the
+    encoded-cwd component carried across untouched rather than re-derived from
+    the new lane's cwd. That is measured, not assumed: on Claude Code CLI
+    2.1.236 a session resumed successfully with its transcript sitting under
+    an entirely unrelated ``projects/<enc>/`` directory while running from a
+    different cwd, so the CLI scans every ``projects/*/`` subdir by session id
+    and ignores both the directory name and the ``cwd`` recorded inside the
+    records. Mirroring is therefore already lane-portable; a cwd re-encoder
+    would be a second implementation obliged to agree with the CLI's private
+    encoding forever, for no behavioural gain.
+
+    The source is located by CALLING :func:`durable_archive_path` — never a
+    second glob. Its I-E contract makes it the sole session-id-keyed lookup
+    into the archive precisely so a restore cannot grow a rival derivation
+    that must agree with it byte-for-byte forever.
+
+    The archived mtime is mirrored onto the restored copy with :func:`os.utime`
+    for the same reason :func:`_archive_one` mirrors it outbound: a copy
+    stamped ``now`` reads to the next archival pass as newer than its own
+    archive and is pointlessly re-archived over it.
+
+    ``strict`` selects who classifies a genuine FAULT. It defaults to
+    ``False``, preserving the published totality contract (the sibling of
+    :func:`durable_archive_path`'s I-A, pinned by
+    ``test_a_genuine_fault_returns_none_loudly_and_never_raises``) for every
+    caller that wants a helper which cannot fail. ``strict=True`` re-raises
+    after the WARNING is emitted, and exists for the ONE caller that already
+    brackets this call in its own blanket ``except``: without it, a broken
+    restore and an empty archive are the same ``None`` there, so the whole
+    fault population is mis-bucketed as an archive MISS and an operator is
+    sent to chase coverage instead of the breakage. Totality is then held at
+    the composite level rather than surrendered. Only genuine faults are
+    affected, by construction: the miss and no-clobber early-returns sit ABOVE
+    the handler and never enter it, so ``strict`` can never turn a miss into a
+    raise. The orchestrator's arm site is currently the sole production
+    caller, making this an additive seam rather than a migration.
+    """
+    # Imported lazily, NOT at module scope: transcript_archive is a leaf on the
+    # PURE_STDLIB_LEAVES contract and cli_invoke is a heavy sibling, so a
+    # module-level edge here would drag it into every archival import.
+    #
+    # _resolve_transcript_path, not its transcript_exists wrapper, and that is
+    # deliberate rather than a reach past the underscore: transcript_exists IS
+    # `_resolve_transcript_path(...) is not None` (cli_invoke.py:403), so this
+    # is the SAME single-homed locator the CLI guard, the harness eligibility
+    # guard and the cap-hit precedent all key on — it simply also yields the
+    # path the no-clobber branch has to return, without globbing twice for one
+    # answer.
+    from shared.cli_invoke import _resolve_transcript_path
+
+    try:
+        archived = durable_archive_path(archive_root, task_id, session_id)
+        if archived is None:
+            # MISS — the common case (~36% of sessions per the PRD §2 reference
+            # measurement). Return before any mkdir so a miss leaves NO trace,
+            # and stay silent so the common case can never become log noise.
+            return None
+
+        config_dir = Path(config_dir)
+        # NO-CLOBBER. A resumed session's transcript only ever grows (the same
+        # premise durable_archive_path's I-F newest-mtime rule rests on), so a
+        # copy already live in this config dir is by construction at least as
+        # complete as any archive — overwriting it would destroy context on the
+        # very path meant to preserve it. Keyed on the SESSION ID via the same
+        # predicate the CLI and the resume guards use, not on the destination
+        # path: the live copy may sit under a different encoded-cwd dir than
+        # the archive's, and it is still the one to keep.
+        live = _resolve_transcript_path(config_dir, session_id)
+        if live is not None:
+            return live
+
+        rel = archived.relative_to(Path(archive_root) / str(task_id))
+        dest = config_dir / 'projects' / rel
+        # Pre-task-3618 archives are still `.jsonl.gz` on disk and
+        # durable_archive_path locates them (I-C, format-agnostic), so the restore
+        # must span both shapes or it silently no-ops on the OLDEST corpus — the
+        # one most likely to need a rehydrate. The destination drops the `.gz`:
+        # the CLI parses plain JSONL and rejects a gzip blob named `.jsonl`
+        # exactly as it rejects a zero-byte one, and transcript_exists globs
+        # `*.jsonl`, so a `.gz`-suffixed destination would not even be seen.
+        gzipped = dest.name.endswith('.jsonl.gz')
+        if gzipped:
+            dest = dest.with_name(dest.name[: -len('.gz')])
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        st = archived.stat()
+        # ATOMIC PUBLISH, the mirror image of _archive_one's protocol and
+        # reusing its two helpers rather than growing a second spelling: write
+        # to a staging sibling, stamp it, then os.replace onto the canonical
+        # name — a same-directory rename, hence atomic on one filesystem.
+        #
+        # Writing `dest` directly would publish a TRUNCATED transcript whenever
+        # a copy is interrupted (a hard kill, ENOSPC part-way, a corrupt gzip
+        # member). That is not a degraded resume but a silent NON-resume that
+        # still costs an invocation: the CLI parses the transcript rather than
+        # stat-ing it, so a torn file yields `No conversation found with
+        # session ID` exactly as a zero-byte one does (measured, CLI 2.1.236).
+        # The mtime mirror goes onto the STAGING file so the published copy is
+        # correctly stamped from the instant it appears.
+        staging = dest.with_name(dest.name + _STAGING_SUFFIX)
+        try:
+            if gzipped:
+                # STREAMED, not read()-then-write: agent-session JSONL runs to
+                # many MB and only grows on resume, so peak RSS stays flat
+                # regardless of transcript size — the same bound _archive_one's
+                # comment records for shutil.copyfile's platform fast-copy path.
+                with gzip.open(archived, 'rb') as src_fh, staging.open('wb') as dest_fh:
+                    shutil.copyfileobj(src_fh, dest_fh)
+            else:
+                shutil.copyfile(archived, staging)
+            os.utime(staging, (st.st_atime, st.st_mtime))
+            os.replace(staging, dest)
+        except Exception:
+            # Only the staging file is ever touched before the replace, so a
+            # transcript already at `dest` (there is none — the no-clobber
+            # guard above returned early — but the invariant is the same one
+            # _archive_one relies on) is untouched. Drop the partial and
+            # re-raise into the blanket handler below, which logs it.
+            _discard_staging(staging)
+            raise
+        return dest
+    except Exception as exc:
+        # One blanket swallow, copying durable_archive_path's I-A rationale
+        # verbatim rather than enumerating OSError subclasses: the whole point
+        # of the contract is that NOTHING escapes onto the dispatch path, which
+        # is what lets the orchestrator's arm-site rehydration stay total.
+        #
+        # Level WARNING, and note what does NOT reach here: the plain MISS
+        # returns None from the branch above and logs nothing at all, so the
+        # ~36%-of-sessions common case can never become log noise. Only a
+        # genuine fault lands in this handler — an unreadable archive root, a
+        # full disk, a config dir whose parent is a regular file — and each of
+        # those is a real breakage an operator should see, so silence or DEBUG
+        # here would be exactly the silent degradation design-invariants
+        # INV-2/INV-4 forbid. Structured extra=, matching the shape
+        # _record_failure and durable_archive_path already emit, so all three
+        # archive-side failure signals stay greppable the same way.
+        logger.warning(
+            'restore_archived_transcript: restore failed for session %s '
+            '(task %s) into %s: %s',
+            session_id,
+            task_id,
+            config_dir,
+            exc,
+            extra={
+                # The HELPER-layer half of the fault pair, deliberately named
+                # apart from the dispatch layer's session_resume_restore_fault
+                # (workflow.py): both now fire for one underlying fault, and a
+                # shared name would double-count it under one greppable key.
+                # This record is the one carrying errno/path; that one carries
+                # task/role/session.
+                'event': 'transcript_restore_fault',
+                'path': str(config_dir),
+                'task_id': str(task_id),
+                'errno': getattr(exc, 'errno', None),
+            },
+        )
+        # LOG, then propagate — never one or the other. The WARNING keeps the
+        # fault greppable at this layer; the raise is what lets the caller one
+        # frame up tell it apart from a plain miss. See the docstring for why
+        # the default stays total.
+        if strict:
+            raise
         return None

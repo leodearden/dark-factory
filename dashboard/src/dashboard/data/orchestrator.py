@@ -51,13 +51,39 @@ import logging
 import re
 import subprocess
 from pathlib import Path
+from typing import NamedTuple
 
 import httpx
 
 from dashboard.config import DashboardConfig
-from dashboard.data.tasks import fetch_tasks
+from dashboard.data.tasks import DEFAULT_WHOLE_OPERATION_BUDGET, fetch_tasks
 
 logger = logging.getLogger(__name__)
+
+# --- Budget constants -------------------------------------------------------
+#
+# ``discover_orchestrators`` walks its project roots SEQUENTIALLY, so it needs
+# the same two-layer bound ``active_tasks.collect_tasks_with_counts`` uses: a
+# per-root budget AND a whole-loop deadline. A per-root bound alone leaves a
+# worst case of ``roots * budget``, which on a machine with several roots
+# overruns the browser's fetch abort and throws away the very degraded payload
+# the bound exists to deliver.
+
+# Whole-operation bound for ONE root's ``fetch_tasks`` call. Bound to the
+# shared default rather than restating the literal, so the arithmetic lives in
+# exactly one place; a site may later TIGHTEN its own constant (the structural
+# test enforces that it can never widen it).
+_ORCHESTRATORS_PER_ROOT_BUDGET = DEFAULT_WHOLE_OPERATION_BUDGET
+
+# Whole-loop deadline for the entire per-root walk.
+#
+# Strictly below ``data.js``'s 30 000 ms fetch abort with 10 s of headroom for
+# HTTP and JSON serialisation, so the PARTIAL payload the deadline produces is
+# actually deliverable to the browser that asked for it. The reasoning is
+# ``active_tasks._TASKS_TOTAL_BUDGET``'s, restated here rather than imported
+# because this bounds a DIFFERENT handler: coupling the two would make a
+# future adjustment to one silently move the other.
+_ORCHESTRATORS_TOTAL_BUDGET = 20.0
 
 
 def _resolve_project_root(prd: str, default_root: Path) -> Path:
@@ -355,6 +381,20 @@ def find_running_orchestrators() -> list[dict]:
     return orchestrators
 
 
+class _RootFetch(NamedTuple):
+    """What one project root's task fetch yielded, and how it ended.
+
+    *offline* and *degraded* are named rather than positional because they are
+    adjacent booleans written at four sites, where a transposition between them
+    is the very defect this record exists to make unrepresentable.
+    """
+
+    tasks: list[dict]
+    offline: bool
+    degraded: bool
+    error: str | None
+
+
 async def discover_orchestrators(
     client: httpx.AsyncClient,
     config: DashboardConfig,
@@ -367,6 +407,39 @@ async def discover_orchestrators(
 
     Returns [] if no orchestrator processes are running.
     Per-project task fetches that hit MCP errors degrade to an empty list.
+
+    **Bounded as a whole, not merely per root.** The per-root walk below is
+    SEQUENTIAL, so without a deadline the worst case is the SUM of every
+    root's worst case — on a machine with several roots that overruns
+    ``data.js``'s 30 000 ms fetch abort and throws away the very degraded
+    payload the bound exists to deliver. Hence both layers, matching
+    ``active_tasks.collect_tasks_with_counts``: a per-root
+    ``_ORCHESTRATORS_PER_ROOT_BUDGET`` and a whole-loop
+    ``_ORCHESTRATORS_TOTAL_BUDGET`` deadline.
+
+    Both budget outcomes — a root that TIMED OUT and a root that never got its
+    TURN — are reported as *degraded*, and never as *offline*. This entry
+    carries the two as SEPARATE fields because they are distinct facts:
+    *offline* means the fetch demonstrably failed, *degraded* means "the budget
+    expired first and this project's state is simply UNKNOWN"
+    (``dashboard/src/dashboard/data/active_tasks.py::collect_tasks_with_counts``
+    states the invariant and what collapsing it costs — an operator sent to
+    restart a healthy service). On this entry, concretely:
+
+    - both budget paths set ``degraded=True`` with ``offline=False``, carrying
+      the cause verbatim in ``error`` and in a WARNING;
+    - a fetch that returned the offline marker sets ``offline=True`` with
+      ``degraded=False`` — it was attempted, and it failed;
+    - every other path leaves both ``False``.
+
+    The alternative — leaving both False with empty tasks — would render a
+    starved root as a healthy project with zero tasks, which is exactly the
+    invisible-failure class this bound exists to close.
+
+    The two-layer bound is complementary, not redundant: ``fetch_tasks``'
+    ``DEFAULT_PER_CALL_TIMEOUT`` is a PER-HTTP-REQUEST budget bounding
+    connect/read/write and pool acquisition, and never bounds the operation as
+    a whole; only this ``wait_for`` does.
     """
     processes = await asyncio.to_thread(find_running_orchestrators)
     if not processes:
@@ -396,25 +469,77 @@ async def discover_orchestrators(
 
     # Cache per-project data so we don't re-fetch the same task list
     # when multiple processes share a project root.
-    # Cache tuple: (tasks, offline, error)
-    project_cache: dict[Path, tuple[list[dict], bool, str | None]] = {}
+    project_cache: dict[Path, _RootFetch] = {}
 
     result: list[dict] = []
+    # Taken BEFORE the loop so every root's cost is inside the budget rather
+    # than being free time the later roots then pay for.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _ORCHESTRATORS_TOTAL_BUDGET
     for project_root, group in groups.items():
         if project_root not in project_cache:
-            fetched = await fetch_tasks(client, config, project_root)
-            if isinstance(fetched, list):
-                tasks = fetched
-                offline = False
-                fetch_error: str | None = None
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                # Never got its turn: DEGRADED (state unknown), not offline —
+                # nothing about this root was measured.
+                message = (
+                    f'skipped — the {_ORCHESTRATORS_TOTAL_BUDGET:.1f}s '
+                    'orchestrators budget was already spent before this root '
+                    'was reached; its task tree is UNKNOWN for this render '
+                    '(not zero)'
+                )
+                logger.warning('project %s: %s', project_root, message)
+                project_cache[project_root] = _RootFetch(
+                    tasks=[], offline=False, degraded=True, error=message,
+                )
             else:
-                # Offline marker: {'offline': True, 'error': ...}
-                tasks = []
-                offline = bool(fetched.get('offline')) if isinstance(fetched, dict) else False
-                fetch_error = str(fetched.get('error', '')) if isinstance(fetched, dict) else None
-            project_cache[project_root] = (tasks, offline, fetch_error)
+                # The EFFECTIVE share, hoisted so the operator message can
+                # report the bound this root actually got. Late in the walk
+                # the whole-loop deadline, not the per-root constant, is the
+                # binding constraint — reporting the constant there would tell
+                # an operator a root blew a 7.0s share when it was in fact
+                # given 1.2s, which is the same illegibility this change set
+                # exists to close.
+                share = min(remaining, _ORCHESTRATORS_PER_ROOT_BUDGET)
+                try:
+                    fetched = await asyncio.wait_for(
+                        fetch_tasks(client, config, project_root),
+                        timeout=share,
+                    )
+                except TimeoutError:
+                    # On 3.11+ ``asyncio.TimeoutError`` IS the builtin, and so
+                    # is ``socket.timeout``, so a ``TimeoutError`` raised
+                    # INSIDE the fetch is deliberately folded into this same
+                    # budget path rather than propagating. The message is
+                    # therefore authoritative about the OUTCOME — this root's
+                    # task tree is unknown — and not about the cause.
+                    message = (
+                        f'exceeded its {share:.1f}s share of the '
+                        f'{_ORCHESTRATORS_TOTAL_BUDGET:.1f}s orchestrators '
+                        'budget; its task tree is UNKNOWN for this render '
+                        '(not zero)'
+                    )
+                    logger.warning('project %s: %s', project_root, message)
+                    project_cache[project_root] = _RootFetch(
+                        tasks=[], offline=False, degraded=True, error=message,
+                    )
+                else:
+                    if isinstance(fetched, list):
+                        tasks = fetched
+                        offline = False
+                        fetch_error: str | None = None
+                    else:
+                        # Offline marker: {'offline': True, 'error': ...}
+                        tasks = []
+                        offline = bool(fetched.get('offline')) if isinstance(fetched, dict) else False
+                        fetch_error = str(fetched.get('error', '')) if isinstance(fetched, dict) else None
+                    # The fetch ran to completion on both arms, so whatever
+                    # it reports was measured — nothing here is merely unknown.
+                    project_cache[project_root] = _RootFetch(
+                        tasks=tasks, offline=offline, degraded=False, error=fetch_error,
+                    )
 
-        tasks, offline, fetch_error = project_cache[project_root]
+        tasks, offline, degraded, fetch_error = project_cache[project_root]
         summary = {
             'total': len(tasks),
             'done': sum(1 for t in tasks if t.get('status') == 'done'),
@@ -448,6 +573,7 @@ async def discover_orchestrators(
             'tasks': tasks,
             'summary': summary,
             'offline': offline,
+            'degraded': degraded,
         }
         if fetch_error:
             entry['error'] = fetch_error

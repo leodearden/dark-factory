@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _merge_lane_fakes import DrivenMerge, drive_merge
 from _orch_helpers import pydantic_spec
 
 from orchestrator.artifacts import TaskArtifacts
@@ -22,16 +24,20 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.merge_queue import (
     WORKTREE_MISSING_REASON_PREFIX,
     MergeOutcome,
-    MergeRequest,
 )
-from orchestrator.workflow import TaskWorkflow, WorkflowCancelled, WorkflowOutcome
+from orchestrator.workflow import (
+    TaskWorkflow,
+    WorkflowCancelled,
+    WorkflowOutcome,
+    WorkflowState,
+)
 
 
 def _make_workflow(
     *,
     tmp_path: Path,
     task_id: str = '999',
-) -> TaskWorkflow:
+) -> tuple[TaskWorkflow, asyncio.Event]:
     assignment = MagicMock()
     assignment.task_id = task_id
     assignment.task = {'id': task_id, 'title': 'Tx', 'description': 'd'}
@@ -49,10 +55,12 @@ def _make_workflow(
     config.git.branch_prefix = 'task/'  # task ν: real str prefix for QueuedBranch.parse
 
     scheduler = MagicMock()
+    scheduler.set_task_status = AsyncMock()
     git_ops = MagicMock()
     # task-1923: _submit_to_merge_queue awaits rebind_branch_to_head before enqueue.
     git_ops.rebind_branch_to_head = AsyncMock(return_value=True)
 
+    cancel_event = asyncio.Event()
     wf = TaskWorkflow(
         assignment=assignment,
         config=config,
@@ -60,116 +68,134 @@ def _make_workflow(
         scheduler=scheduler,
         briefing=MagicMock(),
         mcp=MagicMock(),
+        cancel_event=cancel_event,
     )
     worktree = tmp_path / 'wt'
     worktree.mkdir(parents=True, exist_ok=True)
     wf.artifacts = TaskArtifacts(worktree)
+    # init() so write_review has a root: the merge-failure review it writes is
+    # what stands in for a stub on _write_merge_failure_review.
+    wf.artifacts.init(task_id, 'Tx', 'd')
     wf.worktree = worktree
-    wf.merge_queue = MagicMock()
+    # A REAL queue, so the REAL enqueue path runs (_submit_to_merge_queue ->
+    # register_and_enqueue_merge_request -> the module-global
+    # enqueue_merge_request -> queue.put) and the request a test resolves is
+    # the one production actually parked there.
+    wf.merge_queue = asyncio.Queue()
+    wf.merge_inflight_registry = None  # skip the registry attach branch
     # _task_files is a property reading from self.plan; supply an empty plan
     # so the property returns None rather than raising.
     wf.plan = {'files': []}
     wf._module_configs = []
-    return wf
+    return wf, cancel_event
 
 
-def _patch_enqueue_with_outcome(monkeypatch, outcome: MergeOutcome) -> None:
-    """Replace ``enqueue_merge_request`` so the request's future resolves
-    immediately with ``outcome``.  Skips the real merge worker.
-    """
-    async def fake_enqueue(queue, req: MergeRequest, event_store, **_kwargs):
-        req.result.set_result(outcome)
-
-    monkeypatch.setattr(
-        'orchestrator.merge_queue.enqueue_merge_request', fake_enqueue,
-    )
-
-
-@pytest.mark.asyncio
-async def test_worktree_missing_with_terminal_status_returns_done(
-    tmp_path: Path, monkeypatch,
-):
-    """Human marked task done → merge worker surfaces worktree-missing →
-    workflow short-circuits to DONE without writing a merge-failure review.
-    """
-    wf = _make_workflow(tmp_path=tmp_path)
-    wf.scheduler.get_status = AsyncMock(return_value='done')
-    write_review = MagicMock()
-    wf._write_merge_failure_review = write_review  # type: ignore[method-assign]
-    mark_blocked = AsyncMock()
-    wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
-
-    _patch_enqueue_with_outcome(
-        monkeypatch,
+async def _drive_worktree_missing(wf: TaskWorkflow) -> DrivenMerge:
+    """Run the submit to completion, playing the merger for a worktree-missing block."""
+    assert wf.merge_queue is not None
+    return await drive_merge(
+        wf._submit_to_merge_queue('task/999', pre_rebased=False),
+        wf.merge_queue,
         MergeOutcome(
             'blocked',
             reason=f'{WORKTREE_MISSING_REASON_PREFIX}: /tmp/gone',
         ),
     )
 
-    outcome = await wf._submit_to_merge_queue('task/999', pre_rebased=False)
 
-    assert outcome == WorkflowOutcome.DONE
-    write_review.assert_not_called()
-    mark_blocked.assert_not_awaited()
+def _merge_review(wf: TaskWorkflow) -> dict | None:
+    """The merge-failure review this run wrote, or None.
+
+    ``_write_merge_failure_review`` ends at ``artifacts.write_review('merge', ...)``,
+    and these workflows hold a REAL TaskArtifacts — so the file it leaves in
+    ``.task/reviews/`` is the observable the stub used to stand in for.
+    """
+    assert wf.artifacts is not None
+    return wf.artifacts.read_reviews().get('merge')
+
+
+@pytest.mark.asyncio
+async def test_worktree_missing_with_terminal_status_returns_done(
+    tmp_path: Path,
+):
+    """Human marked task done → merge worker surfaces worktree-missing →
+    workflow short-circuits to DONE without writing a merge-failure review.
+    """
+    wf, _cancel_event = _make_workflow(tmp_path=tmp_path)
+    wf.scheduler.get_status = AsyncMock(return_value='done')
+
+    driven = await _drive_worktree_missing(wf)
+
+    assert driven.result == WorkflowOutcome.DONE
+    assert _merge_review(wf) is None, 'the short-circuit writes no merge review'
+    # …and never marks the row blocked, which is where _mark_blocked lands.
+    cast(AsyncMock, wf.scheduler.set_task_status).assert_not_awaited()
+    wf.scheduler.get_status.assert_awaited_once_with('999')
+
+
+@pytest.mark.asyncio
+async def test_worktree_missing_with_cancelled_status_returns_cancelled(
+    tmp_path: Path,
+):
+    """Human CANCELLED the task → worktree-missing → short-circuit to CANCELLED.
+
+    Task 3538 / boundary #14b: this fallback used to collapse every
+    ``TERMINAL_STATUSES`` member onto DONE, so a cancellation was reported as
+    a completion.  That is a live crash as well as a lie —
+    ``_OUTCOME_ALLOWED['done'] == {DONE}``, so the DONE exit fails ``run()``'s
+    SM-2 consistency check against the ``cancelled`` row — and it inflated the
+    completed tally, which counts ``outcome == DONE``.  The CANCELLED branch
+    also enters ``WorkflowState.CANCELLED`` from MERGE (SM-1 terminal
+    absorption).  Sits beside the ``done`` case above so the two terminal rows
+    read as one decision table.
+    """
+    wf, _cancel_event = _make_workflow(tmp_path=tmp_path)
+    wf.state = WorkflowState.MERGE  # where this fallback is reached from
+    wf.scheduler.get_status = AsyncMock(return_value='cancelled')
+
+    driven = await _drive_worktree_missing(wf)
+
+    assert driven.result == WorkflowOutcome.CANCELLED
+    assert wf.machine.state is WorkflowState.CANCELLED
+    assert _merge_review(wf) is None, 'the short-circuit writes no merge review'
+    cast(AsyncMock, wf.scheduler.set_task_status).assert_not_awaited()
     wf.scheduler.get_status.assert_awaited_once_with('999')
 
 
 @pytest.mark.asyncio
 async def test_worktree_missing_with_nonterminal_status_falls_through(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path,
 ):
     """Worktree gone but task still in-progress → fall through to
     blocked + escalation (the existing path).  No silent DONE.
     """
-    wf = _make_workflow(tmp_path=tmp_path)
+    wf, _cancel_event = _make_workflow(tmp_path=tmp_path)
     wf.scheduler.get_status = AsyncMock(return_value='in-progress')
-    write_review = MagicMock()
-    wf._write_merge_failure_review = write_review  # type: ignore[method-assign]
-    mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
-    wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
 
-    _patch_enqueue_with_outcome(
-        monkeypatch,
-        MergeOutcome(
-            'blocked',
-            reason=f'{WORKTREE_MISSING_REASON_PREFIX}: /tmp/gone',
-        ),
+    driven = await _drive_worktree_missing(wf)
+
+    assert driven.result == WorkflowOutcome.BLOCKED
+    review = _merge_review(wf)
+    assert review is not None and review['verdict'] == 'ISSUES_FOUND', (
+        f'the fall-through must leave a merge-failure review, got: {review}'
     )
-
-    outcome = await wf._submit_to_merge_queue('task/999', pre_rebased=False)
-
-    assert outcome == WorkflowOutcome.BLOCKED
-    write_review.assert_called_once()
-    mark_blocked.assert_awaited_once()
+    cast(AsyncMock, wf.scheduler.set_task_status).assert_awaited_once_with('999', 'blocked')
 
 
 @pytest.mark.asyncio
 async def test_worktree_missing_with_get_status_error_falls_through(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path,
 ):
     """If ``scheduler.get_status`` itself fails (None), don't silently
     consume the failure as DONE — fall through so a human is notified.
     """
-    wf = _make_workflow(tmp_path=tmp_path)
+    wf, _cancel_event = _make_workflow(tmp_path=tmp_path)
     wf.scheduler.get_status = AsyncMock(return_value=None)
-    write_review = MagicMock()
-    wf._write_merge_failure_review = write_review  # type: ignore[method-assign]
-    mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
-    wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
 
-    _patch_enqueue_with_outcome(
-        monkeypatch,
-        MergeOutcome(
-            'blocked',
-            reason=f'{WORKTREE_MISSING_REASON_PREFIX}: /tmp/gone',
-        ),
-    )
+    driven = await _drive_worktree_missing(wf)
 
-    outcome = await wf._submit_to_merge_queue('task/999', pre_rebased=False)
-
-    assert outcome == WorkflowOutcome.BLOCKED
-    mark_blocked.assert_awaited_once()
+    assert driven.result == WorkflowOutcome.BLOCKED
+    cast(AsyncMock, wf.scheduler.set_task_status).assert_awaited_once_with('999', 'blocked')
 
 
 # ---------------------------------------------------------------------------
@@ -177,12 +203,35 @@ async def test_worktree_missing_with_get_status_error_falls_through(
 # ---------------------------------------------------------------------------
 
 
+async def _submit_then_cancel(
+    wf: TaskWorkflow, cancel_event: asyncio.Event,
+) -> WorkflowCancelled:
+    """Park a real submit on its merge future, then win the race with a cancel.
+
+    Taking the request off the REAL queue (rather than resolving it) is what
+    makes the race genuine: it proves the enqueue happened and leaves the
+    future unresolved, which is the state ``_await_cancellable`` arbitrates.
+    """
+    assert wf.merge_queue is not None
+    submit = asyncio.ensure_future(
+        wf._submit_to_merge_queue('task/x', pre_rebased=False)
+    )
+    try:
+        await asyncio.wait_for(wf.merge_queue.get(), timeout=2)
+        cancel_event.set()
+        with pytest.raises(WorkflowCancelled) as excinfo:
+            await asyncio.wait_for(submit, timeout=2)
+        return excinfo.value
+    finally:
+        submit.cancel()
+
+
 @pytest.mark.asyncio
 async def test_cancel_event_during_merge_returns_done_when_terminal(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path,
 ):
-    """Set ``_cancel_event`` while merge future is unresolved → ``_await_cancellable``
-    raises ``WorkflowCancelled('soft')`` (W9-θ).
+    """Set the cancel event while the merge future is unresolved →
+    ``_await_cancellable`` raises ``WorkflowCancelled('soft')`` (W9-θ).
 
     The terminal-status → DONE decision this test's name refers to no longer
     happens at this layer: ``_await_cancellable`` raises unconditionally on a
@@ -193,55 +242,26 @@ async def test_cancel_event_during_merge_returns_done_when_terminal(
     ``TestHandleSoftCancelOutcome`` in test_workflow.py, which pins the
     terminal→DONE branch directly.
     """
-    wf = _make_workflow(tmp_path=tmp_path)
+    wf, cancel_event = _make_workflow(tmp_path=tmp_path)
     wf.scheduler.get_status = AsyncMock(return_value='done')
 
-    # enqueue without resolving the future, then set cancel_event so the
-    # _await_cancellable race picks the cancel.
-    async def fake_enqueue(queue, req: MergeRequest, event_store, **_kwargs):
-        # Schedule the cancel after a moment so the race is real
-        async def _do_cancel():
-            await asyncio.sleep(0.01)
-            wf._cancel_event.set()
-        asyncio.create_task(_do_cancel())
+    cancelled = await _submit_then_cancel(wf, cancel_event)
 
-    monkeypatch.setattr(
-        'orchestrator.merge_queue.enqueue_merge_request', fake_enqueue,
-    )
-
-    with pytest.raises(WorkflowCancelled) as excinfo:
-        await asyncio.wait_for(
-            wf._submit_to_merge_queue('task/x', pre_rebased=False),
-            timeout=2,
-        )
-    assert excinfo.value.kind == 'soft'
+    assert cancelled.kind == 'soft'
 
 
 @pytest.mark.asyncio
 async def test_cancel_event_during_merge_soft_cancels_when_nonterminal(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path,
 ):
     """Cancel-event set + status non-terminal → ``_await_cancellable`` raises
     ``WorkflowCancelled('soft')`` (W9-θ) — same raise as the terminal case
     above; see that test's docstring for where the status-aware decision
     (SOFT_CANCELLED vs DONE) now lives.
     """
-    wf = _make_workflow(tmp_path=tmp_path)
+    wf, cancel_event = _make_workflow(tmp_path=tmp_path)
     wf.scheduler.get_status = AsyncMock(return_value='in-progress')
 
-    async def fake_enqueue(queue, req: MergeRequest, event_store, **_kwargs):
-        async def _do_cancel():
-            await asyncio.sleep(0.01)
-            wf._cancel_event.set()
-        asyncio.create_task(_do_cancel())
+    cancelled = await _submit_then_cancel(wf, cancel_event)
 
-    monkeypatch.setattr(
-        'orchestrator.merge_queue.enqueue_merge_request', fake_enqueue,
-    )
-
-    with pytest.raises(WorkflowCancelled) as excinfo:
-        await asyncio.wait_for(
-            wf._submit_to_merge_queue('task/x', pre_rebased=False),
-            timeout=2,
-        )
-    assert excinfo.value.kind == 'soft'
+    assert cancelled.kind == 'soft'

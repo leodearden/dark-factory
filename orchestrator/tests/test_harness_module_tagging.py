@@ -1066,3 +1066,149 @@ async def test_tag_force_omitted_task_preserves_existing_files(harness):
         f'preserves pre-existing files; got metadata={metadata!r}'
     )
     mock_seed_modules.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# files_tagged_empty: the empty prediction is a SIGNAL, not an absence
+# (task 3122)
+# ---------------------------------------------------------------------------
+
+
+def _agent_result(predictions: list[dict]) -> AgentResult:
+    payload = {'predictions': predictions}
+    return AgentResult(
+        success=True,
+        output=json.dumps(payload),
+        structured_output=payload,
+        cost_usd=0.01, duration_ms=6000, turns=2,
+    )
+
+
+def _one_task(metadata: dict | None = None) -> list[dict]:
+    return [
+        {
+            'id': '1', 'title': 'Task', 'description': 'desc',
+            'status': 'pending',
+            'metadata': metadata if metadata is not None else {},
+            'dependencies': [],
+        },
+    ]
+
+
+async def _run_tagger(harness, tasks, predictions, *, force: bool = False) -> dict:
+    """Drive _tag_task_modules once and return the persisted metadata dict."""
+    harness.scheduler.get_tasks = AsyncMock(return_value=tasks)
+    harness.scheduler.update_task = AsyncMock()
+    harness.scheduler.seed_modules = Mock(return_value=[])
+
+    with patch(
+        'orchestrator.harness.invoke_agent',
+        AsyncMock(return_value=_agent_result(predictions)),
+    ):
+        await harness._tag_task_modules(force=force)
+
+    harness.scheduler.update_task.assert_awaited_once()
+    return json.loads(harness.scheduler.update_task.call_args.args[1])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('case', 'predictions'),
+    [
+        ('agent omits the task entirely', []),
+        ('agent predicts an explicit empty list', [{'id': '1', 'files': []}]),
+        (
+            'agent predicts only directory-shaped paths',
+            [{'id': '1', 'files': ['crates/reify-eval/src']}],
+        ),
+    ],
+)
+async def test_empty_prediction_persists_files_tagged_empty(
+    harness, case, predictions,
+):
+    """The discarded structured verdict from reify 5575.
+
+    An LLM prompted with the project's own top-level directory listing, and
+    explicitly instructed to include a task with an empty files list rather
+    than omit it, answered "no local file for this task" — and that answer
+    was thrown away as noise. Today only files_tagged_at survives, which
+    records THAT the tagger ran, never WHAT it concluded.
+
+    All three shapes the current code collapses into the same silence must
+    now persist the verdict, while still writing no `files` key (the
+    no-clobber guarantee is unchanged).
+    """
+    metadata = await _run_tagger(harness, _one_task(), predictions)
+
+    assert metadata.get('files_tagged_empty') is True, (
+        f'[{case}] expected files_tagged_empty=True; got metadata={metadata!r}'
+    )
+    assert metadata.get('files_tagged_at'), (
+        f'[{case}] the sibling sentinel must still be stamped; '
+        f'got metadata={metadata!r}'
+    )
+    assert 'files' not in metadata, (
+        f'[{case}] no-clobber: an empty prediction must never write a files '
+        f'key; got metadata={metadata!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_real_prediction_persists_files_tagged_empty_false(harness):
+    """Written on EVERY tagged task, not only the empty ones."""
+    metadata = await _run_tagger(
+        harness, _one_task(), [{'id': '1', 'files': ['src/app.py']}],
+    )
+
+    assert metadata.get('files_tagged_empty') is False, (
+        f'Expected files_tagged_empty=False beside a real prediction; '
+        f'got metadata={metadata!r}'
+    )
+    assert metadata.get('files') == ['src/app.py']
+
+
+@pytest.mark.asyncio
+async def test_force_retag_overwrites_a_stale_true(harness):
+    """Staleness pin — why the key is unconditional rather than set-when-empty.
+
+    Scheduler.update_task defaults to shallow last-write-wins `merge`, so a
+    conditional write would leave a previously-recorded True sitting beside
+    the real `files` this run predicts — a self-contradicting record for
+    whatever eventually reads the pair. (Nothing does yet; task 3121 landed
+    with no leg for these signals — see
+    `orchestrator/src/orchestrator/cross_repo_gate.py::classify_cross_repo`.)
+    """
+    metadata = await _run_tagger(
+        harness,
+        _one_task({'files_tagged_empty': True,
+                   'files_tagged_at': '2026-07-16T00:00:00+00:00'}),
+        [{'id': '1', 'files': ['src/app.py']}],
+        force=True,
+    )
+
+    assert metadata.get('files_tagged_empty') is False, (
+        f'A force re-tag predicting real files must overwrite the stale True; '
+        f'got metadata={metadata!r}'
+    )
+    assert metadata.get('files') == ['src/app.py']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'predictions',
+    [[], [{'id': '1', 'files': []}], [{'id': '1', 'files': ['src/pkg']}]],
+)
+async def test_empty_prediction_does_not_seed_or_count(harness, predictions):
+    """Seeding / tagged_count behaviour is untouched on every empty path."""
+    harness.scheduler.get_tasks = AsyncMock(return_value=_one_task())
+    harness.scheduler.update_task = AsyncMock()
+    mock_seed_modules = Mock(return_value=[])
+    harness.scheduler.seed_modules = mock_seed_modules
+
+    with patch(
+        'orchestrator.harness.invoke_agent',
+        AsyncMock(return_value=_agent_result(predictions)),
+    ):
+        await harness._tag_task_modules()
+
+    mock_seed_modules.assert_not_called()

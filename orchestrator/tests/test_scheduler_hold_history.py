@@ -27,10 +27,22 @@ from pathlib import Path
 
 import _hold_history_fixtures as F
 import pytest
+from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.hold_history import HoldHistory
 from orchestrator.scheduler import Scheduler
+
+# test_lock_events_are_emitted_from_exactly_one_site AST-parses every *.py
+# under orchestrator/src via rglob. MEASURED at 2.90s and 3.07s per call
+# unloaded and serial (-n0) here: it is parametrized over two event names, so
+# the whole sweep runs twice. Not individually reproduced under load; marked
+# because it is structurally identical to the three members that crashed.
+# WHY 300s, the thread-mode os._exit() cost model it clears, and the guard that
+# ENFORCES this mark rather than trusting it to be sprinkled: see
+# WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py, and
+# test_whole_tree_scan_timeout_guard.py (task 4215).
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 FIXED_DT = datetime(2026, 8, 1, 0, 0, 0, tzinfo=UTC)
 

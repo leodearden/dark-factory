@@ -78,8 +78,16 @@ def is_infra_held(task: Mapping[str, Any] | None) -> bool:
     row (see
     ``test_legacy_metadata_flag_without_infra_hold_status_still_reverts``),
     so any row still in that legacy shape at deploy time loses its hold on
-    the next reconcile pass or escalation resolution and re-competes for its
-    implement footprint instead of resuming at verify. This is accepted as a
+    the next reconcile pass or escalation resolution and is re-pended like
+    any other row. What that costs is the HOLD, not the resume: the row can
+    be dispatched again before its infra fault is fixed, and (on the
+    reconcile path) before its escalation resolves. It does NOT cost
+    resume-at-verify — skipping re-implementation is branch-keyed, delivered
+    by ``TaskWorkflow._has_prior_implementation`` reading the worktree's
+    base_commit and durable iteration log, and is unaffected by the task
+    row's status (task 3538; see
+    ``test_harness_infra_resume_truthful.py``, which pins that answer across
+    infra-hold / in-progress / pending alike). This is accepted as a
     one-time deploy-boundary cost, not a steady-state bug: there is no
     startup sweep that relabels legacy ``metadata.infra_hold`` rows to
     ``status='infra-hold'``. Confirm no live task carries

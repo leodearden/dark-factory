@@ -90,15 +90,30 @@ import asyncio
 import functools
 import importlib.util
 import json
-import re
+import logging
 import sys
 import types
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from fused_memory.memory_metadata import normalize_supersedes
-from fused_memory.topic_slug import TOPIC_SLUG_MAX_LEN, is_valid_topic_slug
+from fused_memory.topic_slug import (
+    TOPIC_SLUG_MAX_LEN,
+    derive_topic_slug,
+    is_valid_topic_slug,
+)
+from fused_memory.utils.store_mutation_preflight import (
+    StoreMutationUnavailable,
+    assert_store_mutation_allowed,
+)
 from fused_memory.utils.validation import is_full_uuid
+
+# This script reports through ``print``; stdout carries its machine-read
+# markdown/JSON artifact, so the ONE diagnosis that must not land there -- the
+# fail-closed store-mutation refusal in ``run`` -- goes through this logger
+# instead. Named for the script basename, matching every other guarded script
+# (and what the tests filter ``caplog`` on).
+logger = logging.getLogger('retro_stamp_topics')
 
 # Convention: this list carries every imported helper the tests reach through the
 # module object, not only the names defined locally — ``TOPIC_SLUG_MAX_LEN``,
@@ -222,48 +237,12 @@ Phrasing = _probe.Phrasing
 # Pure core — derivation
 # ---------------------------------------------------------------------------
 
-#: Any run of characters that cannot appear inside a slug segment.  Note the
-#: complement class is ``[a-z0-9]`` only: ``_`` is NOT preserved, which is the
-#: whole point of the fold (98 of 352 live topic values are snake_case).
-#:
-#: This is deliberately NOT the anchored slug validator — that lives once, in
-#: :mod:`fused_memory.topic_slug`, and is called below.  Two different
-#: patterns doing two different jobs; the *verdict* has one home.
-_NON_SLUG_RUN_RE = re.compile(r'[^a-z0-9]+')
-
-
-def derive_topic_slug(value: object) -> str | None:
-    """Fold *value* into ε's topic-slug shape, or ``None`` if it cannot be.
-
-    The fold: lowercase, strip, collapse every run of non-``[a-z0-9]``
-    characters (which includes ``_``, so snake_case becomes hyphen-case) to a
-    single ``-``, then strip leading/trailing hyphens.  The result is returned
-    **only** if :func:`fused_memory.topic_slug.is_valid_topic_slug` accepts
-    it — which is also where the ``TOPIC_SLUG_MAX_LEN`` cap is enforced.
-
-    Returning ``None`` rather than a repaired value is load-bearing.  An
-    over-long topic truncated to 100 chars, or ``'!!!'`` turned into
-    ``'unnamed-topic'``, would file a record under a topic no human chose;
-    the caller instead reports it and moves on (loud over silent).
-
-    NOT a copy of ``memory_eval_retrieval_probe._slugify``, and the two must
-    not be "unified": that one preserves ``_`` and falls back to
-    ``'unnamed-topic'``, so it emits slugs ε *rejects*.  It is right for its
-    own job (naming derivation candidates for human review) and wrong for
-    this one (writing a validated vocabulary key to the corpus).
-
-    Args:
-        value: Any object.  A non-``str`` is a ``None`` verdict, matching
-            ``is_valid_topic_slug``'s "non-str is False" convention — both
-            are handed untrusted values off live records and fixtures.
-
-    Returns:
-        The conforming slug, or ``None`` when no honest fold exists.
-    """
-    if not isinstance(value, str):
-        return None
-    folded = _NON_SLUG_RUN_RE.sub('-', value.strip().lower()).strip('-')
-    return folded if is_valid_topic_slug(folded) else None
+# ``derive_topic_slug`` — the snake_case -> hyphen-case fold — is IMPORTED
+# above, not defined here.  It lived in this script until task 4878 gave
+# ``scripts/normalize_topic_slugs.py`` a second need for the same fold;
+# INV-5 then moved it next to the predicate whose verdict it defers to.
+# ``tests/test_retro_stamp_topics.py::TestTopicSlugNamespaceIsShared`` pins
+# the identity by ``is``, so re-inlining it here fails by design.
 
 
 @dataclass(frozen=True)
@@ -1133,10 +1112,18 @@ def merge_plans(*plan_lists: list[ClusterPlan]) -> tuple[list[StampTarget], list
 # The single I/O boundary
 # ---------------------------------------------------------------------------
 
-#: Written to every ``update_memory`` so the write journal attributes each
-#: stamp to this sweep rather than to a generic ``mcp_tool``.  The amendment
-#: storm alarm reads this field; a bulk run under the default source would
-#: look exactly like the runaway rewrite that alarm exists to catch.
+#: Passed as BOTH ``_source`` and ``agent_id`` to every ``update_memory``
+#: call below, because the two kwargs feed different consumers and neither
+#: substitutes for the other. ``_source`` becomes the write journal's
+#: ``source`` column, attributing each stamp to this sweep rather than to a
+#: generic ``mcp_tool``. ``agent_id`` is what
+#: ``_apply_memory_metadata_validation`` forwards to ``emit_schema_warnings``,
+#: ``UnknownKeyStormDetector.record``, and ``file_unknown_key_storm_escalation``
+#: — and it is also what the write journal records in its own ``agent_id``
+#: column alongside ``source``. Leaving ``agent_id`` unset would attribute
+#: every census line and unknown-key storm bucket from this sweep to a null
+#: agent even though the journal correctly names it, so both kwargs are set
+#: to the same value to keep every view in agreement.
 WRITE_SOURCE = 'retro_stamp_topics'
 
 #: Recorded on the write journal row beside the patch.
@@ -1325,6 +1312,7 @@ async def stamp_one(memory_service, target: StampTarget, *, apply: bool) -> dict
             metadata_patch=dict(decision.patch),
             metadata_mode='merge',
             reason=WRITE_REASON,
+            agent_id=WRITE_SOURCE,
             _source=WRITE_SOURCE,
         )
     except Exception as exc:
@@ -1520,6 +1508,36 @@ async def run(
         The report dict — rendered by :func:`render_markdown` /
         :func:`render_json` and graded by :func:`resolve_exit_code`.
     """
+    # Fail-CLOSED capability preflight, one probe per run, BEFORE the scan.
+    #
+    # ``run`` is the choke point precisely because ``stamp_one``'s own
+    # ``--apply`` gate is PER TARGET: probing there would run once per target
+    # rather than once per run, and -- since ``StoreMutationUnavailable``
+    # subclasses ``RuntimeError`` -- would be swallowed by the per-target
+    # ``except Exception`` around the write, downgrading a run-wide
+    # environment denial into N ``outcome: 'error'`` rows inside a report that
+    # otherwise looks like a completed sweep. Emitted through the logger, not
+    # ``print``, to keep it off the stdout this script reserves for its
+    # machine-read artifact.
+    if apply:
+        try:
+            assert_store_mutation_allowed(operation='retro_stamp_topics --apply')
+        except StoreMutationUnavailable:
+            logger.error(
+                'retro_stamp_topics: --apply NOT started (fail-closed) -- this '
+                "process cannot write mem0's history directory, so each stamp "
+                'would patch a record and then fail to record the change, '
+                'leaving the corpus half-stamped: some claims filed under the '
+                'new topic slug and some under the legacy one, which is worse '
+                'for an exact-match topic query than either uniform state. '
+                'Nothing was scrolled and no record was stamped. Route the '
+                'stamping through the fused-memory MCP server (the unsandboxed '
+                'owner of the store), or re-run from an unsandboxed operator '
+                'shell. To obtain the sweep report safely from anywhere, '
+                're-run without --apply.'
+            )
+            raise
+
     if calibration_rows is None:
         calibration_rows = load_calibration_rows(CALIBRATION_FIXTURE_PATH)
     if registry is None:
@@ -1895,6 +1913,19 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     """Build a live service, run the sweep, write both artifacts, exit graded."""
+    # This script is otherwise print-based, so without this the module logger
+    # added for the fail-closed store preflight would have no handler at all
+    # and its refusal would reach the operator only through
+    # ``logging.lastResort`` -- a bare line on stderr with no timestamp, level
+    # or logger name, unlike every sibling guarded script. ``stream`` is named
+    # explicitly because stdout here is reserved for the machine-read report
+    # rendered below; diagnostics must not land in it.
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(levelname)s %(message)s',
+        stream=sys.stderr,
+    )
+
     args = _build_parser().parse_args(argv)
 
     if args.config:

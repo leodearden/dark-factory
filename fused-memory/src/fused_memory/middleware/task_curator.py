@@ -32,7 +32,7 @@ import json
 import logging
 import time
 import uuid as uuid_mod
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -347,17 +347,98 @@ class CuratorDecision:
 class PreparedCandidate:
     """Per-candidate batch input prepared by :meth:`TaskCurator.prepare_candidate`.
 
-    Carries the candidate, its assembled corpus pool, pool sizes, and the
-    estimated user-prompt token count for this candidate's section of the
+    Carries the candidate, its assembled corpus pool, pool sizes, the
+    :class:`PoolWithheld` census of what the caps kept out of that pool, and
+    the estimated user-prompt token count for this candidate's section of the
     batched prompt.  The token estimate is what the worker uses to decide
     whether adding this candidate to the in-flight batch would exceed the
     soft ``batch_token_threshold``.
+
+    ``corpus_error`` is set when assembly FAILED and the pool above is the
+    empty degradation rather than a real (possibly empty) corpus.  The two
+    are indistinguishable from the fields alone, and they call for opposite
+    handling: a real corpus is worth reusing, a failed one is worth
+    rebuilding (see :meth:`TaskCurator.curate`'s ``prepared`` parameter).
     """
 
     candidate: CandidateTask
     pool: list[_PoolEntry]
     pool_sizes: dict[str, int]
     prompt_tokens: int
+    withheld: PoolWithheld | None = None
+    corpus_error: str | None = None
+
+
+@dataclass(frozen=True)
+class PoolWithheld:
+    """Per-cap census of the pool entries a cap kept out of the prompt.
+
+    The consumer is the CURATOR LLM, and the prompt is the only surface it
+    reads — so the pool's incompleteness travels in :meth:`render`, not in a
+    log line nobody at the decision point sees (INV-11
+    ``no-silent-fail-soft``). Without it the LLM cannot distinguish "no
+    duplicate exists" from "the duplicate was cut at a cap", and answers
+    ``create`` or ``combine`` as if the pool were complete.
+
+    ``by_source`` counts the eligible entries each cap excluded, keyed by the
+    stream that lost them (``module`` / ``embedding`` / ``dependency``) plus
+    ``total_cap`` for the final :func:`_trim_pool` pass. ``caps`` carries the
+    configured limits that produced those counts, so a reader can tell a pool
+    one entry over its cap from one that lost forty.
+
+    The ``module`` and ``dependency`` counts are corpus-exhaustive — both
+    streams scan every task. The ``embedding`` count is NOT: it is taken over
+    a fixed qdrant retrieval window (``pool_embedding_cap + 20`` points), so
+    at most 20 neighbours can ever be reported however many near-duplicates
+    the corpus holds. A stream whose count is ceilinged that way is named in
+    ``lower_bounds`` and :meth:`render` says so, because the alternative is
+    the LLM reading a ceiling as an exact count on the one stream ordered by
+    actual similarity — the stream whose withheld entries are the likeliest
+    duplicates of all.
+
+    Every count is deliberately per-STREAM and not only at ``total_cap``:
+    under stock config the stream caps are the binding constraints and
+    ``total_cap`` never fires at all (see the pool-cap block in
+    ``config/schema.py::CuratorConfig``), so a census keyed on the final trim
+    alone would be permanently silent.
+
+    An empty census renders nothing: a pool that fit says nothing about
+    fitting, exactly as a complete result surface carries no delta.
+    """
+
+    by_source: Mapping[str, int] = field(default_factory=dict)
+    caps: Mapping[str, int] = field(default_factory=dict)
+    lower_bounds: tuple[str, ...] = ()
+
+    @property
+    def total(self) -> int:
+        """How many eligible entries the caps kept out of the pool, in total."""
+        return sum(self.by_source.values())
+
+    def render(self) -> str | None:
+        """Render the prompt block, or ``None`` when nothing was withheld."""
+        if self.total == 0:
+            return None
+        payload: dict[str, object] = {
+            'withheld': dict(self.by_source), 'caps': dict(self.caps),
+        }
+        if self.lower_bounds:
+            payload['lower_bounds'] = list(self.lower_bounds)
+        block = (
+            f'pool_truncated: {json.dumps(payload, sort_keys=True)}\n'
+            '  The pool above is INCOMPLETE — the counts above are tasks that '
+            'matched this candidate but did not fit. Absence of a duplicate in '
+            'a truncated pool is not proof that no duplicate exists, so prefer '
+            '"create" over a speculative "combine" or "drop" when the pool '
+            'offers no clearly-overlapping task.'
+        )
+        if self.lower_bounds:
+            block += (
+                '\n  The streams named in "lower_bounds" withheld AT LEAST '
+                'that many: the retrieval window they were counted over was '
+                'itself full, so the true number is that count or higher.'
+            )
+        return block
 
 
 @dataclass
@@ -376,13 +457,13 @@ class _PoolEntry:
     combine_eligible: bool
 
     def render(self, desc_cap: int, details_cap: int) -> str:
-        """Render this entry as a human-readable block for the LLM prompt."""
-        desc = self.description[:desc_cap]
-        if len(self.description) > desc_cap:
-            desc += '…'
-        det = self.details[:details_cap]
-        if len(self.details) > details_cap:
-            det += '…'
+        """Render this entry as a human-readable block for the LLM prompt.
+
+        Truncation goes through :func:`clip_for_prompt`, the same helper the
+        CANDIDATE block uses, so the two sides of the prompt cannot drift.
+        """
+        desc = clip_for_prompt(self.description, desc_cap)
+        det = clip_for_prompt(self.details, details_cap)
         files = ', '.join(self.files_to_modify) if self.files_to_modify else '(none)'
         return (
             f'[Task {self.task_id}] status={self.status} priority={self.priority} '
@@ -606,6 +687,15 @@ class TaskCurator:
         # only the YAML load itself is cached for the instance lifetime.
         self._premise_registry: list | None = None
         self._premise_registry_load_attempted: bool = False
+        # Guards the one-shot lazy load above. Needed because the load is
+        # offloaded via asyncio.to_thread: the await point means a concurrent
+        # caller could otherwise observe load_attempted=True with
+        # _premise_registry still None and silently fail the guard open. One
+        # TaskCurator instance is shared across projects while the
+        # interceptor's curator lock is per-project, so concurrent entry is
+        # reachable. asyncio.Lock() is loop-agnostic at construction on
+        # Python 3.13, so building it here in __init__ is safe.
+        self._premise_registry_load_lock = asyncio.Lock()
         # Operational-ask registry (filing-policy gate) — lazy-loaded on first
         # curate() call, same shape as _blocklist above. A match routes the
         # candidate straight to a deterministic PURE-GATE instead of the LLM;
@@ -977,21 +1067,62 @@ class TaskCurator:
         genuinely-fixed bug-fix task. ``payload_hash`` is accepted only for
         signature symmetry with ``_maybe_blocklist_drop`` and is unused here.
 
+        Both blocking halves of this method run off the event-loop thread
+        (task 4201, 2026-08-29): the one-shot registry load and the
+        per-match live-source re-verification are each dispatched via
+        ``asyncio.to_thread``. The textual match (``match_candidate``) is
+        deliberately kept ON the loop — it is pure string work with no I/O,
+        so the common case of a non-matching candidate pays no thread-pool
+        dispatch. Measured on the shipped registry: registry load ~9.9ms
+        (8.15ms of it ``yaml.safe_load``, only 21us the ``read_text``);
+        worst per-match verification 1.2ms warm / 6.2ms cold on a 664 KB
+        cited file; thread-dispatch overhead ~67us. This resolves an
+        instance of INV-8 ``loop-thread-occupancy-bounded``
+        (docs/legibility/design-invariants.md), mirroring the offload
+        pattern already used by :meth:`_maybe_flag_unverified_claims` and
+        the claim-verification block in :meth:`curate_batch_prepared`.
+
+        This bounds the loop stall for THIS guard only. The two sibling
+        one-shot lazy loads invoked earlier in the same :meth:`curate` /
+        :meth:`curate_batch_prepared` sequence — :meth:`_maybe_blocklist_drop`
+        loading ``cancelled_premise_blocklist_path`` (2.2 KB) and
+        :meth:`_maybe_route_deterministic` loading
+        ``operational_ask_registry_path`` (6.7 KB, ~60% the size of this
+        guard's own 11 KB registry) — still run synchronously on the loop, so
+        the first-submission loop stall under the per-project curator write
+        lock is reduced by this change, not bounded by it. Left as-is here
+        (task 4201 scope); tracked as a follow-up to either extend the
+        offload to those two sites or fold all three into one shared
+        lazy-load helper so the idiom exists once.
+
         Returns ``None`` (fail-open) when:
         - The registry path is not configured (``None``).
-        - The registry file is missing, unreadable, or unparseable (one WARNING logged).
+        - The registry file is missing, unreadable, or unparseable, or the
+          offloaded load raised — for example a registry file that is not
+          valid UTF-8 (one WARNING logged; the guard then stays disabled for
+          this TaskCurator instance rather than retrying per call). This is
+          deliberate even for a cause that is transient in principle (a
+          partially-written file observed mid-deploy, a momentary worker
+          thread I/O error): the load's ``except Exception`` below does not
+          distinguish exception type, so any raise latches the same as a
+          permanently-malformed file, and a process restart is the recovery
+          path. Only ``asyncio.CancelledError`` is excluded from the latch
+          (see the comment on that except block) — every other exception is
+          treated as permanent by design, not oversight.
         - The registry is empty.
         - No entry textually matches the candidate.
         - ``self._cwd`` is ``None`` — the source root cannot be resolved, so the
           premise cannot be verified.
         - The candidate matches an entry, but the live source no longer refutes
           its premise.
+        - The offloaded live-source verification raised (one WARNING logged).
 
         Never raises.
         """
         from fused_memory.middleware.recon_code_fix_premise_guard import (
             load_premise_registry,
-            premise_refuted_entry,
+            match_candidate,
+            verify_premise_refuted,
         )
 
         cfg_path = self._config.curator.recon_code_fix_premise_registry_path
@@ -1007,20 +1138,94 @@ class TaskCurator:
             )
             return None
 
-        # Lazy load — run at most once per TaskCurator instance.
+        # Lazy load — run at most once per TaskCurator instance. Offloaded:
+        # measured 9.9ms for the shipped 11 KB registry, of which 8.15ms is
+        # pure-Python yaml.safe_load (not the 21us read_text) — the largest
+        # single event-loop stall in this method, paid on the first task
+        # submission per process while the per-project curator write lock is
+        # held.
+        #
+        # Double-checked lock: the await point inside the offloaded load
+        # means a concurrent second caller could otherwise observe
+        # load_attempted=True while self._premise_registry is still None and
+        # silently fail the guard open. The outer unlocked check keeps the
+        # steady-state path (every call after the first) lock-free; the
+        # inner re-check under the lock is what makes concurrent first calls
+        # correct. The flag is set only AFTER the assignment so nobody can
+        # observe the attempted-but-unassigned window.
         if not self._premise_registry_load_attempted:
-            self._premise_registry_load_attempted = True
-            raw_path = Path(cfg_path)
-            if not raw_path.is_absolute():
-                raw_path = self._cwd / raw_path
-            self._premise_registry = load_premise_registry(raw_path)
+            async with self._premise_registry_load_lock:
+                if not self._premise_registry_load_attempted:
+                    raw_path = Path(cfg_path)
+                    if not raw_path.is_absolute():
+                        raw_path = self._cwd / raw_path
+                    try:
+                        self._premise_registry = await asyncio.to_thread(
+                            load_premise_registry, raw_path,
+                        )
+                    except Exception as exc:
+                        # load_premise_registry documents "never raises" and,
+                        # since task 4483, actually honours it for the whole
+                        # read/parse path (FileNotFoundError, OSError,
+                        # UnicodeDecodeError, yaml.YAMLError all degrade to []).
+                        # This wrapper is still required: asyncio.to_thread is a
+                        # raise path of its own (thread-pool failure/shutdown)
+                        # that the guard module's internal excepts cannot cover.
+                        # Fail OPEN (guard disabled) rather than escaping into
+                        # curate()/curate_batch_prepared, which call this
+                        # unguarded — an escape fails the whole task submission.
+                        logger.warning(
+                            'task_curator: recon-premise registry load errored for %s, '
+                            'failing open (guard disabled): %s',
+                            raw_path, exc,
+                        )
+                        self._premise_registry = None
+                    # Settled outcome (loaded, or failed open) — latch the
+                    # one-shot contract. Deliberately NOT a `finally`:
+                    # asyncio.CancelledError is a BaseException, so it bypasses
+                    # the except above, and latching in a `finally` would
+                    # permanently disable the guard because an unrelated caller
+                    # was cancelled mid-load. Leaving the flag clear on
+                    # cancellation lets the next call retry.
+                    self._premise_registry_load_attempted = True
 
         entries = self._premise_registry
         if not entries:
             return None
 
-        entry = premise_refuted_entry(candidate, entries, self._cwd)
+        # Pure string ops over the registry, no I/O — deliberately kept ON the
+        # loop so the overwhelmingly common non-matching candidate never pays a
+        # thread-pool dispatch (measured 67us) nor extra curator-lock hold.
+        # premise_refuted_entry composes exactly these two halves and already
+        # short-circuits here; we split it so only the blocking half is offloaded.
+        entry = match_candidate(candidate, entries)
         if entry is None:
+            return None
+
+        # Off the event loop: verify_premise_refuted re-reads EVERY cited file
+        # fresh on every call (that is what makes the guard self-correcting).
+        # Measured on the shipped registry: the stage2_flag_query entry cites
+        # tests/test_stages.py at 664 KB => 1.2 ms warm, 6.2 ms cold, 29 ms worst;
+        # the 3-assertion entry is 170 us warm. curate() reaches this on EVERY
+        # task submission while holding the per-project curator write lock
+        # (task_interceptor.py _curator_lock, held around curate() and
+        # curate_batch_prepared). Mirrors this file's claim-verification offloads.
+        try:
+            refuted = await asyncio.to_thread(verify_premise_refuted, entry, self._cwd)
+        except Exception as exc:
+            # Honour this method's documented "Never raises" contract. The guard
+            # module fails open internally on OSError, but asyncio.to_thread adds
+            # a raise path it cannot cover, and curate()/curate_batch_prepared
+            # call this unguarded — an escape would fail the whole submission.
+            # Fail OPEN: let the candidate reach the architect rather than
+            # silently refusing it on an unverified premise.
+            logger.warning(
+                'task_curator: recon-premise verification errored for entry=%s, '
+                'failing open (candidate not dropped): %s',
+                entry.name, exc,
+            )
+            return None
+        if not refuted:
             return None
 
         decision = CuratorDecision(
@@ -1275,11 +1480,24 @@ class TaskCurator:
         candidate: CandidateTask,
         project_id: str,
         project_root: str,
+        *,
+        prepared: PreparedCandidate | None = None,
     ) -> CuratorDecision:
         """Render a drop/combine/create decision for a candidate task.
 
         Best-effort: any internal failure returns a ``create`` decision with the
         failure reason in ``justification``. Never raises.
+
+        *prepared* hands over a corpus the caller already assembled, so it is
+        not assembled twice.  :meth:`curate_batch_prepared`'s size-1
+        short-circuit is the caller this exists for: a rebuild there costs a
+        full ``get_tasks`` over the task tree plus an embedder call and a
+        qdrant query for work already done, and size-1 batches get MORE likely
+        as per-candidate sections grow, so the cost would otherwise move with
+        exactly the setting that shrinks the batch.  A bundle whose own
+        assembly failed is deliberately NOT reused — see ``corpus_error``.
+        Everything ahead of corpus assembly (blocklist, premise, exact-match,
+        idempotency cache, deterministic routing, ZOT breaker) still runs.
         """
         start = time.monotonic()
         payload_hash = candidate.payload_hash()
@@ -1354,24 +1572,31 @@ class TaskCurator:
                 latency_ms=int((time.monotonic() - start) * 1000),
             )
 
-        try:
-            pool, pool_sizes = await self._build_corpus(
-                candidate, project_id, project_root,
-            )
-        except Exception as exc:
-            logger.warning(
-                'task_curator: corpus assembly failed, falling through to create: %s',
-                exc,
-                exc_info=True,
-            )
-            decision = CuratorDecision(
-                action='create',
-                justification=f'corpus-failed: {exc}',
-                pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
-                latency_ms=int((time.monotonic() - start) * 1000),
-            )
-            self._store_cache(payload_hash, decision)
-            return decision
+        if prepared is not None and prepared.corpus_error is None:
+            pool = prepared.pool
+            pool_sizes = prepared.pool_sizes
+            withheld = prepared.withheld or PoolWithheld()
+        else:
+            try:
+                pool, pool_sizes, withheld = await self._build_corpus(
+                    candidate, project_id, project_root,
+                )
+            except Exception as exc:
+                logger.warning(
+                    'task_curator: corpus assembly failed, falling through to create: %s',
+                    exc,
+                    exc_info=True,
+                )
+                decision = CuratorDecision(
+                    action='create',
+                    justification=f'corpus-failed: {exc}',
+                    pool_sizes={
+                        'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0,
+                    },
+                    latency_ms=int((time.monotonic() - start) * 1000),
+                )
+                self._store_cache(payload_hash, decision)
+                return decision
 
         # Render the LLM call. A genuine LLM failure raises
         # CuratorFailureError; route it through the escalator if one was
@@ -1381,6 +1606,7 @@ class TaskCurator:
         try:
             decision = await self._call_llm(
                 candidate, pool, pool_sizes, start, project_id, project_root,
+                withheld=withheld,
             )
             # Success: reset the consecutive-ZOT counter so a single hung call
             # that was followed by a healthy one doesn't accumulate toward open.
@@ -1476,8 +1702,9 @@ class TaskCurator:
         already exceeded the soft ``batch_token_threshold``.  Corpus failures
         degrade to an empty pool — same behaviour as inside ``curate_batch``.
         """
+        corpus_error: str | None = None
         try:
-            pool, pool_sizes = await self._build_corpus(
+            pool, pool_sizes, withheld = await self._build_corpus(
                 candidate, project_id, project_root,
             )
         except Exception as exc:
@@ -1490,14 +1717,21 @@ class TaskCurator:
             )
             pool = []
             pool_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+            withheld = PoolWithheld()
+            corpus_error = str(exc)
         # batch_index=0 is fine for the estimate — only a couple of digits of
         # rendered length difference at most across realistic batch sizes.
-        section = self._build_batch_section(candidate, pool, 0)
+        # The census IS included: the estimate has to be taken over the section
+        # actually emitted, or the accumulator under-counts every truncated
+        # candidate.
+        section = self._build_batch_section(candidate, pool, 0, withheld=withheld)
         return PreparedCandidate(
             candidate=candidate,
             pool=pool,
             pool_sizes=pool_sizes,
             prompt_tokens=estimate_tokens(section),
+            withheld=withheld,
+            corpus_error=corpus_error,
         )
 
     async def curate_batch(
@@ -1548,7 +1782,10 @@ class TaskCurator:
             return []
         if len(prepared) == 1:
             return [
-                await self.curate(prepared[0].candidate, project_id, project_root),
+                await self.curate(
+                    prepared[0].candidate, project_id, project_root,
+                    prepared=prepared[0],
+                ),
             ]
 
         candidates = [p.candidate for p in prepared]
@@ -1750,6 +1987,11 @@ class TaskCurator:
         # intentional — opening sooner is harmless and simpler than trying to
         # normalise concurrent increments.  curate_batch_prepared need not
         # record separately; it relies on the per-size-1 accumulation.
+        # Conversely, a successful _call_llm_batch call resets the counter
+        # itself (see the success branch near its `return`, task 4143), so
+        # "consecutive" is measured across every real LLM success — batch
+        # and size-1 alike — not just the size-1 successes handled by
+        # curate().
         if llm_k_list and self._zero_output_breaker_open(time.monotonic()):
             batch_breaker_now = time.monotonic()
             logger.warning(
@@ -1780,10 +2022,13 @@ class TaskCurator:
             pool_sizes_list = [
                 prepared[unique_indices[k]].pool_sizes for k in llm_k_list
             ]
+            withheld_list = [
+                prepared[unique_indices[k]].withheld for k in llm_k_list
+            ]
             try:
                 llm_raw_decisions = await self._call_llm_batch_with_fallback(
                     to_llm_candidates, pools, pool_sizes_list, start,
-                    project_id, project_root,
+                    project_id, project_root, withheld_list=withheld_list,
                 )
             except AllAccountsCappedException:
                 # Cap exhaustion bubbles up so the caller (worker) can defer
@@ -2232,8 +2477,16 @@ class TaskCurator:
         candidate: CandidateTask,
         project_id: str,
         project_root: str,
-    ) -> tuple[list[_PoolEntry], dict[str, int]]:
-        """Assemble the four-stream pool for the LLM prompt."""
+    ) -> tuple[list[_PoolEntry], dict[str, int], PoolWithheld]:
+        """Assemble the four-stream pool for the LLM prompt.
+
+        Returns ``(pool, pool_sizes, withheld)``. ``withheld`` is the
+        :class:`PoolWithheld` census of everything the caps kept out, counted
+        at EVERY cap rather than only at the final :func:`_trim_pool` — under
+        stock config that final trim never fires (see the pool-cap block in
+        ``config/schema.py::CuratorConfig``), so the stream caps are where the
+        genuinely-overlapping task is actually lost.
+        """
         # Resolve lock_depth PER PROJECT, not from a single global scalar:
         # fused-memory serves many projects and each orchestrator resolves its
         # own depth (3..12 across the fleet). The scheduler snapshot already
@@ -2304,12 +2557,21 @@ class TaskCurator:
                 module_matches.append(entry)
 
         module_matches.sort(key=_module_sort_key)
-        for entry in module_matches[: self._config.curator.pool_module_cap]:
+        module_cap = self._config.curator.pool_module_cap
+        # The sort key is status+priority, NOT relevance, so the entries this
+        # cap discards are not the least-similar ones — a genuinely
+        # overlapping task can sit just past it. Which of them the POOL
+        # actually loses is not known yet: streams 3 and 4 can still admit
+        # one. Hold the ids and count the absent ones once, below.
+        module_overflow_ids = [e.task_id for e in module_matches[module_cap:]]
+        for entry in module_matches[:module_cap]:
             pool.append(entry)
             seen_ids.add(entry.task_id)
 
         # Stream 3: embedding neighbors
         embedding_matches: list[_PoolEntry] = []
+        embedding_unvisited_ids: list[str] = []
+        embedding_window_full = False
         try:
             collection = await self._ensure_collection(project_id)
             embedder = await self._get_embedder()
@@ -2326,7 +2588,8 @@ class TaskCurator:
                 limit=overfetch,
                 with_payload=True,
             )
-            for point in results.points:
+            points = list(results.points)
+            for i, point in enumerate(points):
                 payload = point.payload or {}
                 tid = str(payload.get('task_id', ''))
                 if not tid or tid in seen_ids:
@@ -2341,6 +2604,26 @@ class TaskCurator:
                     continue
                 embedding_matches.append(entry)
                 if len(embedding_matches) >= self._config.curator.pool_embedding_cap:
+                    # The neighbours the cap left unvisited, by id — the count
+                    # is taken below against what the pool finally holds, so a
+                    # neighbour another stream already pooled is not reported
+                    # as lost. It stays an upper bound in one narrower
+                    # respect: an unvisited point might have been unresolvable
+                    # via _fetch_entry_for_neighbor and so never eligible.
+                    # These are ordered by embedding distance, so the closest
+                    # of them are the most likely duplicates in the corpus.
+                    embedding_unvisited_ids = [
+                        str((p.payload or {}).get('task_id', ''))
+                        for p in points[i + 1:]
+                    ]
+                    # And a hard ceiling in the other direction, unlike the
+                    # corpus-exhaustive module/dependency streams: this tail
+                    # can hold at most `overfetch - cap` ids because that is
+                    # all qdrant was asked for. A full window means neighbours
+                    # past it were never fetched, so the count is a FLOOR and
+                    # is reported as one rather than as a count of everything
+                    # excluded.
+                    embedding_window_full = len(points) >= overfetch
                     break
         except Exception as exc:
             logger.debug('task_curator: embedding neighbors failed: %s', exc)
@@ -2373,12 +2656,26 @@ class TaskCurator:
                 if entry is not None:
                     dep_matches.append(entry)
 
-        for entry in dep_matches[: self._config.curator.pool_dependency_cap]:
+        dependency_cap = self._config.curator.pool_dependency_cap
+        dep_overflow_ids = [e.task_id for e in dep_matches[dependency_cap:]]
+        for entry in dep_matches[:dependency_cap]:
             pool.append(entry)
             seen_ids.add(entry.task_id)
 
+        # Every stream has run, so seen_ids is now the complete admitted set
+        # and a stream's overflow can be resolved into what the pool actually
+        # lacks. Counting against seen_ids rather than the post-trim pool
+        # keeps the stream counts and total_cap DISJOINT by construction: a
+        # stream can only count ids that were never admitted, the trim only
+        # ids that were, so `total` stays a count of distinct absent entries.
+        module_withheld = _count_absent(module_overflow_ids, seen_ids)
+        embedding_withheld = _count_absent(embedding_unvisited_ids, seen_ids)
+        dependency_withheld = _count_absent(dep_overflow_ids, seen_ids)
+
         # Final cap — trim weakest entries first (embedding, then module, then dep).
-        pool = _trim_pool(pool, self._config.curator.pool_total_cap)
+        pool, total_cap_dropped = _trim_pool(
+            pool, self._config.curator.pool_total_cap,
+        )
 
         pool_sizes = {
             'anchor': sum(1 for e in pool if e.source == 'anchor'),
@@ -2386,7 +2683,22 @@ class TaskCurator:
             'embedding': sum(1 for e in pool if e.source == 'embedding'),
             'dependency': sum(1 for e in pool if e.source == 'dependency'),
         }
-        return pool, pool_sizes
+        withheld = PoolWithheld(
+            by_source={
+                'module': module_withheld,
+                'embedding': embedding_withheld,
+                'dependency': dependency_withheld,
+                'total_cap': total_cap_dropped,
+            },
+            caps={
+                'module': module_cap,
+                'embedding': self._config.curator.pool_embedding_cap,
+                'dependency': dependency_cap,
+                'total_cap': self._config.curator.pool_total_cap,
+            },
+            lower_bounds=('embedding',) if embedding_window_full else (),
+        )
+        return pool, pool_sizes, withheld
 
     async def _fetch_entry_for_neighbor(
         self,
@@ -2466,12 +2778,14 @@ class TaskCurator:
         start: float,
         project_id: str,
         project_root: str,
+        *,
+        withheld: PoolWithheld | None = None,
     ) -> CuratorDecision:
         # Task 1989: neutral CLI cwd decouples per-call cost from the filing
         # project's CLAUDE.md/MEMORY.md; self._cwd stays project-root for
         # Python-side premise/blocklist resolution (L774/863/870).
         cwd = neutral_cli_cwd()
-        user_prompt = self._build_user_prompt(candidate, pool)
+        user_prompt = self._build_user_prompt(candidate, pool, withheld=withheld)
 
         # max_budget_usd is now a durable flat $2.00 (task 1980 /
         # esc-task-curator-194): max_budget_usd and single_call_budget_cap_usd
@@ -2547,6 +2861,8 @@ class TaskCurator:
         start: float,
         project_id: str,
         project_root: str,
+        *,
+        withheld_list: list[PoolWithheld | None] | None = None,
     ) -> list[CuratorDecision]:
         """Invoke one batched LLM call for N candidates and parse the result.
 
@@ -2560,7 +2876,9 @@ class TaskCurator:
         # Python-side premise/blocklist resolution (L774/863/870).
         cwd = neutral_cli_cwd()
         n = len(candidates)
-        user_prompt = self._build_batch_user_prompt(candidates, pools)
+        user_prompt = self._build_batch_user_prompt(
+            candidates, pools, withheld_list=withheld_list,
+        )
 
         # Scale by (n-1): the single-call budget (timeout_seconds /
         # max_turns / max_budget_usd) already covers the first item's
@@ -2627,6 +2945,29 @@ class TaskCurator:
                 cost_usd=agent_result.cost_usd,
             )
 
+        # Success: a real LLM round-trip completed, so the service is not
+        # wedged — reset the consecutive-ZOT counter exactly as the
+        # single-item path does in task_curator.py::TaskCurator.curate.
+        # Without this, size-1 bisect ZOTs accumulate across arbitrarily
+        # many healthy BATCH calls in a batch-dominant deployment until
+        # threshold (default 2) trips the breaker and disables dedupe for
+        # the cooldown (default 600s) on a healthy service (task 4143).
+        # Keyed on agent_result.success, not on decision quality:
+        # _parse_batch_decisions degrades unparseable items to
+        # action='create' without raising, and a degraded decision is
+        # still evidence the CLI round-trip completed.
+        #
+        # This also closes an ALREADY-OPEN breaker/cooldown, not just the
+        # counter: _call_llm_batch_with_fallback's two bisect halves run
+        # concurrently under asyncio.gather, so a sibling half's size-1
+        # curate() ZOTs can open the breaker while this call is still in
+        # flight. A completed round-trip is still proof the backend isn't
+        # wedged, so letting it close an already-open cooldown early is a
+        # deliberate choice, not an oversight (see this task's plan design
+        # decision 3; pinned by
+        # TestZeroOutputBreakerBatchReset.test_successful_batch_closes_already_open_breaker).
+        self._reset_zero_output_breaker()
+
         return _parse_batch_decisions(
             agent_result,
             pools=pools,
@@ -2642,6 +2983,8 @@ class TaskCurator:
         start: float,
         project_id: str,
         project_root: str,
+        *,
+        withheld_list: list[PoolWithheld | None] | None = None,
     ) -> list[CuratorDecision]:
         """Try one batched LLM call; on :exc:`CuratorFailureError` bisect and retry each half.
 
@@ -2673,10 +3016,11 @@ class TaskCurator:
                 await self.curate(candidates[0], project_id, project_root),
             ]
 
+        censuses: list[PoolWithheld | None] = list(withheld_list or [None] * n)
         try:
             return await self._call_llm_batch(
                 candidates, pools, pool_sizes_list, start,
-                project_id, project_root,
+                project_id, project_root, withheld_list=censuses,
             )
         except AllAccountsCappedException:
             raise
@@ -2696,10 +3040,12 @@ class TaskCurator:
                 self._call_llm_batch_with_fallback(
                     candidates[:mid], pools[:mid], pool_sizes_list[:mid],
                     start, project_id, project_root,
+                    withheld_list=censuses[:mid],
                 ),
                 self._call_llm_batch_with_fallback(
                     candidates[mid:], pools[mid:], pool_sizes_list[mid:],
                     start, project_id, project_root,
+                    withheld_list=censuses[mid:],
                 ),
             )
             # Right-half decisions came back in [0, n-mid)-local space; shift
@@ -2712,7 +3058,11 @@ class TaskCurator:
             return left + shifted_right
 
     def _build_user_prompt(
-        self, candidate: CandidateTask, pool: list[_PoolEntry],
+        self,
+        candidate: CandidateTask,
+        pool: list[_PoolEntry],
+        *,
+        withheld: PoolWithheld | None = None,
     ) -> str:
         desc_cap = self._config.curator.entry_description_chars
         details_cap = self._config.curator.entry_details_chars
@@ -2725,9 +3075,13 @@ class TaskCurator:
         if candidate.spawned_from:
             lines.append(f'  spawned_from: {candidate.spawned_from}')
         if candidate.description:
-            lines.append(f'  description: {candidate.description[:desc_cap]}')
+            lines.append(
+                f'  description: {clip_for_prompt(candidate.description, desc_cap)}',
+            )
         if candidate.details:
-            lines.append(f'  details: {candidate.details[:details_cap]}')
+            lines.append(
+                f'  details: {clip_for_prompt(candidate.details, details_cap)}',
+            )
         if candidate.files_to_modify:
             lines.append(
                 '  files_to_modify: '
@@ -2742,6 +3096,7 @@ class TaskCurator:
             for entry in pool:
                 lines.append(entry.render(desc_cap, details_cap))
                 lines.append('')
+        _append_pool_truncation(lines, withheld)
 
         lines.append(
             'Decide drop / combine / create per the system-prompt rules. '
@@ -2754,6 +3109,8 @@ class TaskCurator:
         candidate: CandidateTask,
         pool: list[_PoolEntry],
         batch_index: int,
+        *,
+        withheld: PoolWithheld | None = None,
     ) -> str:
         """Build one candidate's section of the batched user prompt.
 
@@ -2774,9 +3131,13 @@ class TaskCurator:
         if candidate.spawned_from:
             lines.append(f'  spawned_from: {candidate.spawned_from}')
         if candidate.description:
-            lines.append(f'  description: {candidate.description[:desc_cap]}')
+            lines.append(
+                f'  description: {clip_for_prompt(candidate.description, desc_cap)}',
+            )
         if candidate.details:
-            lines.append(f'  details: {candidate.details[:details_cap]}')
+            lines.append(
+                f'  details: {clip_for_prompt(candidate.details, details_cap)}',
+            )
         if candidate.files_to_modify:
             lines.append(
                 '  files_to_modify: '
@@ -2791,6 +3152,7 @@ class TaskCurator:
             for entry in pool:
                 lines.append(entry.render(desc_cap, details_cap))
                 lines.append('')
+        _append_pool_truncation(lines, withheld)
         lines.append('')
         return '\n'.join(lines)
 
@@ -2798,15 +3160,27 @@ class TaskCurator:
         self,
         candidates: list[CandidateTask],
         pools: list[list[_PoolEntry]],
+        *,
+        withheld_list: list[PoolWithheld | None] | None = None,
     ) -> str:
         """Build a batched user prompt containing one labelled section per candidate.
 
         Each section mirrors the single-item :meth:`_build_user_prompt` layout but
         is prefixed ``# Candidate batch_index={i}`` so the model can address
-        decisions by index.  Pools are kept per-candidate (not unioned).
+        decisions by index.  Pools are kept per-candidate (not unioned) — and so
+        is each pool's :class:`PoolWithheld` census, which renders inside its own
+        candidate's section so a truncated pool for one candidate is never read
+        as a qualifier on another's.
+
+        A short or absent *withheld_list* is tolerated: the missing entries
+        simply render nothing, which is what an untruncated pool renders anyway.
         """
+        censuses = withheld_list or []
         sections = [
-            self._build_batch_section(candidate, pool, i)
+            self._build_batch_section(
+                candidate, pool, i,
+                withheld=censuses[i] if i < len(censuses) else None,
+            )
             for i, (candidate, pool) in enumerate(
                 zip(candidates, pools, strict=True),
             )
@@ -2821,6 +3195,53 @@ class TaskCurator:
 # ----------------------------------------------------------------------
 # Pure helpers (module-level — easier to unit-test)
 # ----------------------------------------------------------------------
+
+
+def _count_absent(task_ids: Iterable[str], admitted: set[str]) -> int:
+    """How many DISTINCT ids in *task_ids* the pool never admitted.
+
+    The census counts what the prompt is MISSING, so an id a later stream
+    picked up is not withheld however early a cap skipped it. Counting has to
+    run against the finished admitted set for that reason; counting at the
+    moment each cap fires reports entries that end up present.
+    """
+    return len({tid for tid in task_ids if tid and tid not in admitted})
+
+
+def _append_pool_truncation(
+    lines: list[str], withheld: PoolWithheld | None,
+) -> None:
+    """Append the pool-truncation block to *lines*, if there is one.
+
+    The one place both prompt builders emit the census, so the fact and its
+    guidance cannot end up worded differently on the single and batch paths.
+    Appends nothing when the pool was complete.
+    """
+    rendered = withheld.render() if withheld is not None else None
+    if rendered is not None:
+        lines.append(rendered)
+        lines.append('')
+
+
+def clip_for_prompt(text: str, cap: int) -> str:
+    """Clip *text* to *cap* characters, marking how much was elided.
+
+    The single owner of truncate-and-mark for the curator prompt. Both sides
+    of that prompt route through it — the POOL side (:meth:`_PoolEntry.render`)
+    and the CANDIDATE side (:meth:`TaskCurator._build_user_prompt` and
+    :meth:`TaskCurator._build_batch_section`) — so the two cannot drift apart
+    (INV-5 ``no-lockstep-duplication``). They previously did: the pool side
+    appended a bare ``…`` while the candidate side clipped silently, so the
+    reading LLM could not tell a short description from a truncated one.
+
+    The elided COUNT is part of the marker because the size of the loss is
+    what decides whether it mattered: "2 characters trimmed" and "1827
+    characters of concrete file references gone" are not the same event, and
+    1827 was the measured mean elision at the pre-2026-09-18 cap.
+    """
+    if len(text) <= cap:
+        return text
+    return f'{text[:cap]}…[+{len(text) - cap} chars elided]'
 
 
 def _task_files(task: dict) -> list[str]:
@@ -2917,13 +3338,22 @@ def _module_sort_key(entry: _PoolEntry) -> tuple[int, int, str]:
     return (status_rank, priority_rank, entry.task_id)
 
 
-def _trim_pool(pool: list[_PoolEntry], total_cap: int) -> list[_PoolEntry]:
+def _trim_pool(
+    pool: list[_PoolEntry], total_cap: int,
+) -> tuple[list[_PoolEntry], int]:
     """Trim a pool that exceeds the total cap, dropping the weakest first.
 
     Weak = dependency > embedding > module > anchor, preserving anchor always.
+
+    Returns ``(kept, dropped_n)``. ``dropped_n`` is how many entries the cap
+    removed, and it feeds the :class:`PoolWithheld` census so the prompt can
+    say that the pool the LLM is reading is incomplete. Reporting the
+    shortfall alongside the result, rather than logging it, is INV-11
+    ``no-silent-fail-soft``: the consumer that makes the combine-vs-create
+    call is the LLM, and the prompt is the only surface it reads.
     """
     if len(pool) <= total_cap:
-        return pool
+        return pool, 0
     weakest_order = ['dependency', 'embedding', 'module', 'anchor']
     result = list(pool)
     for source in weakest_order:
@@ -2939,7 +3369,8 @@ def _trim_pool(pool: list[_PoolEntry], total_cap: int) -> list[_PoolEntry]:
             if len(result) <= total_cap:
                 break
             result.pop(i)
-    return result[:total_cap]
+    kept = result[:total_cap]
+    return kept, len(pool) - len(kept)
 
 
 def _parse_decision_dict(

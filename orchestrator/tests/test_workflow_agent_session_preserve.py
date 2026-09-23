@@ -173,6 +173,19 @@ class TestSidecarV2Wiring:
         workflow, cwd = await _make_workflow(
             config, git_ops, task_assignment, resume_session_id=resume
         )
+        # Make this row's previously-IMPLICIT premise explicit (task 3578): the
+        # arm site now corroborates the recovered session against the config dir
+        # it is about to export as CLAUDE_CONFIG_DIR, so an adopted resume only
+        # happens when the transcript is genuinely reachable there.  Without the
+        # seed, _invoke correctly vetoes and this row would be asserting the
+        # resume-count bump on a path that no longer resumes.
+        assert workflow._config_dir is not None
+        transcript = (
+            workflow._config_dir.path / 'projects' / '-enc-cwd'
+            / 'prior-sess-xyz.jsonl'
+        )
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text('{"type": "user"}\n')
 
         seen: dict[str, Any] = {}
 

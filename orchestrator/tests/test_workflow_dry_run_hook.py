@@ -125,11 +125,30 @@ def _make_workflow(*, tmp_path: Path, task_id: str = '42',
     wf.artifacts = TaskArtifacts(worktree)
     wf.worktree = worktree
     wf.plan = {'files': []}
-    wf._module_configs = []
     # No escalation queue so _mark_blocked doesn't try to submit escalations
     wf.escalation_queue = None
     wf.event_store = None
     return wf, scheduler
+
+
+async def _drain_unblock_tasks(wf: TaskWorkflow) -> None:
+    """Await the dry-run investigation task(s) this workflow spawned.
+
+    The hook names its background task ``unblock-auto-<task_id>``, and
+    production's own duplicate-spawn guard keys on exactly that name
+    (``orchestrator/workflow.py::TaskWorkflow._spawn_dry_run_unblock``), so the
+    name is a load-bearing public identity rather than an incidental label.
+    Reading the spawn back off ``asyncio.all_tasks()`` is therefore an honest
+    public observation of it, and it is what keeps pytest-asyncio from warning
+    "Task destroyed but it is pending".
+    """
+    me = asyncio.current_task()
+    spawned = [
+        t for t in asyncio.all_tasks()
+        if t is not me and t.get_name() == f'unblock-auto-{wf.task_id}'
+    ]
+    if spawned:
+        await asyncio.gather(*spawned, return_exceptions=True)
 
 
 # ---------------------------------------------------------------------------
@@ -162,12 +181,10 @@ class TestMarkBlockedSpawnsFireAndForget:
         # Give the background task a tick to register its call
         await asyncio.sleep(0)
 
-        # Capture any still-pending background tasks before releasing hang,
-        # then await them so pytest-asyncio doesn't warn "Task destroyed while pending".
-        pending = list(wf._background_tasks)
+        # Release the hanging investigation, then drain it so pytest-asyncio
+        # doesn't warn "Task destroyed but it is pending".
         hang_event.set()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+        await _drain_unblock_tasks(wf)
 
         # run_dry_run_unblock was called with the right kwargs
         assert len(calls) == 1
@@ -204,8 +221,14 @@ class TestMarkBlockedSkipsDryRunWhenMergePhase:
         # hook was NOT called
         assert len(dry_run_calls) == 0
 
-        # blocked status was NOT written (merge_phase suppresses it)
-        assert 'blocked' not in scheduler.statuses.get('43', [])
+        # The 'blocked' status IS written.  Task 3537 (spec §8-E2, INV-6)
+        # narrowed merge_phase's suppression to the ENTRY transition only:
+        # this call takes _mark_blocked's final fall-through BLOCKED return,
+        # which is a SLOT EXIT, so the row must be parked truthfully rather
+        # than left 'in-progress' with no live claimant.  merge_phase still
+        # suppresses the write on the REQUEUED retry-in-place arm, which is
+        # the carve-out's only real dependent (commit 22918d5c24).
+        assert 'blocked' in scheduler.statuses.get('43', [])
 
 
 # ---------------------------------------------------------------------------
@@ -300,11 +323,10 @@ class TestMarkBlockedDeduplicatesDryRun:
             f'Expected 1 dry-run invocation, got {len(calls)}'
         )
 
-        # Clean up: release the hanging task
-        pending = list(wf._background_tasks)
+        # Release the hanging investigation, then drain it so pytest-asyncio
+        # doesn't warn "Task destroyed but it is pending".
         hang_event.set()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+        await _drain_unblock_tasks(wf)
 
 
 # ---------------------------------------------------------------------------
@@ -322,8 +344,9 @@ class TestMarkBlockedSpawnsDryRunWhenMergePhaseAndOptIn:
 
         This is the post-merge red-main class: main is already advanced when
         _mark_blocked runs, so the SHA capture inside run_dry_run_unblock
-        naturally reflects post-merge reality.  The status write is still
-        suppressed (merge_phase=True contract intact).
+        naturally reflects post-merge reality.  The status write now HAPPENS
+        here (task 3537): merge_phase suppresses only the entry transition,
+        and this escalate_to_human short-circuit is a slot exit.
         """
         wf, scheduler = _make_workflow(tmp_path=tmp_path, task_id='47', enabled=True)
 
@@ -353,11 +376,10 @@ class TestMarkBlockedSpawnsDryRunWhenMergePhaseAndOptIn:
         # Give the background task a tick to register its call
         await asyncio.sleep(0)
 
-        # Capture pending tasks and drain them cleanly
-        pending = list(wf._background_tasks)
+        # Release the hanging investigation, then drain it so pytest-asyncio
+        # doesn't warn "Task destroyed but it is pending".
         hang_event.set()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+        await _drain_unblock_tasks(wf)
 
         # run_dry_run_unblock was called once with the correct task worktree
         assert len(calls) == 1, f'Expected 1 dry-run invocation, got {len(calls)}'
@@ -367,8 +389,12 @@ class TestMarkBlockedSpawnsDryRunWhenMergePhaseAndOptIn:
         assert 'worktree' in kwargs
         assert kwargs['worktree'] == str(wf.worktree)
 
-        # merge_phase=True suppresses the 'blocked' status write — still
-        assert 'blocked' not in scheduler.statuses.get('47', [])
+        # The 'blocked' status IS written.  This is the escalate_to_human
+        # short-circuit, a SLOT EXIT: the merge landed, main advanced, and an
+        # L1 goes to a human, so the workflow returns BLOCKED and frees the
+        # slot.  Task 3537 (spec §8-E2, INV-6) made merge-phase BLOCKED exits
+        # park the row instead of leaving it 'in-progress' unclaimed.
+        assert 'blocked' in scheduler.statuses.get('47', [])
 
 
 # ---------------------------------------------------------------------------
@@ -435,9 +461,7 @@ class TestMarkBlockedSpawnDryRunOrderingInvariant:
             await wf._mark_blocked(_reason, merge_phase=True, spawn_dry_run=True)
 
         await asyncio.sleep(0)
-        pending = list(wf._background_tasks)
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+        await _drain_unblock_tasks(wf)
 
         assert len(dry_run_calls) == 1, (
             f'Correct prefix should spawn once, got {len(dry_run_calls)}'
@@ -473,9 +497,7 @@ class TestMarkBlockedForwardsResilienceContext:
             await wf._mark_blocked('verify exhausted')
 
         await asyncio.sleep(0)  # let the background task register its call
-        pending = list(wf._background_tasks)
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+        await _drain_unblock_tasks(wf)
 
         assert len(calls) == 1, f'Expected 1 dry-run invocation, got {len(calls)}'
         kwargs = calls[0]
@@ -509,9 +531,7 @@ class TestMarkBlockedStampsLastBlockedAt:
             await wf._mark_blocked('verify exhausted', detail='All attempts failed')
 
         await asyncio.sleep(0)  # let any background tasks register
-        pending = list(wf._background_tasks)
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+        await _drain_unblock_tasks(wf)
 
         # Confirmed block transition: the status write succeeded first.
         assert 'blocked' in scheduler.statuses.get('46', [])
@@ -584,9 +604,7 @@ class TestMarkBlockedStampPrecedesDryRunSpawn:
             await wf._mark_blocked('verify exhausted', detail='All attempts failed')
 
         await asyncio.sleep(0)  # let any background tasks register/finish
-        pending = list(wf._background_tasks)
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+        await _drain_unblock_tasks(wf)
 
         assert call_order == ['stamp', 'spawn'], (
             'Expected the last_blocked_at stamp to be awaited BEFORE '

@@ -12,9 +12,15 @@ Steps covered:
   13 (test) real-process capstone: setsid + start_new_session escape tree reaped
 """
 
+import errno
+import os
+import threading
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
+
+from orchestrator.verify_runner import HEARTBEAT_STOP_JOIN_SECS
 
 # ---------------------------------------------------------------------------
 # Step-1: pgid-file path & lifecycle
@@ -278,6 +284,164 @@ class TestCancelRequest:
 
 
 # ---------------------------------------------------------------------------
+# Task 3186 (PRD δ) step-21: `killed_pgid_out` — what cancel_request ACTUALLY
+# killed, as distinct from what it returned.
+#
+# THE STAKE.  `cancel_request` returns 0 for FOUR distinct cases and only ONE
+# of them killed anything: a successful kill, `FileNotFoundError`,
+# corrupt/unparseable content, and `pgid <= 0`.  Its sole production caller
+# (`cli.py:cancel_verify`) must clear the SHARED fixed-key holder rendezvous
+# ONLY when the key names the process it actually SIGKILLed — and rc alone
+# cannot tell it that.  cli.py:607-622 shows the key's owner writes it only
+# when it won the build-lane flock and clears it only in its own `finally`, so
+# the key routinely names a DIFFERENT, live verify; clearing it then makes
+# `GitOps._merge_verify_lease_active` fail-OPEN (`read_lock_holder_pgid` ->
+# None -> "not held"), losing `reset_persistent_merge_worktree`'s typed
+# `MergeVerifyLeaseHeld` diagnosis and making DF-3071's admission guard read
+# `_merge-verify` as IDLE while a verify is live — so the fleet redeploys over
+# it instead of deferring.
+#
+# The reporting channel follows the established `failed_pids_out` out-param
+# idiom, and is additive + keyword-only so every existing caller stays
+# source-compatible (test_cli.py's `fake_cancel_request(path, **kwargs)`
+# absorbs it; its rc=42 never reaches the clear).
+# ---------------------------------------------------------------------------
+
+
+class TestCancelRequestReportsWhatItKilled:
+    """`killed_pgid_out` reports on the kill path only — rc == 0 does not."""
+
+    def _run(self, path, ppid_map, *, kill_side_effects=None, out=None, failed_out=None):
+        """Run cancel_request with declawed kill/killpg and the new out-param."""
+        from orchestrator.verify_cancel import cancel_request
+
+        def _kill(pid, sig):
+            if kill_side_effects and kill_side_effects.get(pid) is not None:
+                raise kill_side_effects[pid]
+
+        rc = cancel_request(
+            path,
+            ppid_map_provider=lambda: ppid_map,
+            kill=_kill,
+            killpg=lambda pgid, sig: None,
+            failed_pids_out=failed_out,
+            killed_pgid_out=out,
+        )
+        return rc
+
+    def test_success_path_reports_the_killed_pgid(self, tmp_path):
+        """(a) The one return-0 path that killed something reports it."""
+        from orchestrator.verify_cancel import pgid_file, write_pgid_file
+
+        path = pgid_file(tmp_path / 'wt', 'req-killed')
+        write_pgid_file(path, 4242)
+        out: list[int] = []
+        failed: list[int] = []
+
+        rc = self._run(path, {900: 4242}, out=out, failed_out=failed)
+
+        assert rc == 0
+        assert out == [4242], (
+            'the caller can only gate its shared-key clear on identity if the '
+            'pgid that was swept is reported back'
+        )
+        assert failed == []
+        assert not path.exists()
+
+    def test_absent_file_reports_nothing(self, tmp_path):
+        """(b) `FileNotFoundError` -> rc 0, nothing killed, nothing reported.
+
+        The COMMON case: a verify-merge that completes normally removes its own
+        per-request pgid file in its finally, so a cancel racing normal
+        completion lands here.
+        """
+        from orchestrator.verify_cancel import pgid_file
+
+        path = pgid_file(tmp_path / 'wt', 'req-absent')
+        out: list[int] = []
+
+        assert self._run(path, {}, out=out) == 0
+        assert out == []
+
+    def test_corrupt_content_reports_nothing(self, tmp_path):
+        """(c) Unparseable content -> rc 0, file removed, nothing reported."""
+        from orchestrator.verify_cancel import pgid_file
+
+        path = pgid_file(tmp_path / 'wt', 'req-corrupt')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('not-an-int')
+        out: list[int] = []
+
+        assert self._run(path, {}, out=out) == 0
+        assert out == []
+        assert not path.exists()
+
+    def test_nonsensical_pgid_reports_nothing(self, tmp_path):
+        """(d) `pgid <= 0` -> rc 0, treated as corrupt, nothing reported."""
+        from orchestrator.verify_cancel import pgid_file
+
+        for i, raw in enumerate(('0', '-1')):
+            path = pgid_file(tmp_path / 'wt', f'req-nonsense-{i}')
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(raw)
+            out: list[int] = []
+
+            assert self._run(path, {}, out=out) == 0, raw
+            assert out == [], f'{raw!r} kills nothing, so it reports nothing'
+            assert not path.exists()
+
+    def test_permission_error_path_reports_nothing(self, tmp_path):
+        """(e) rc == 1 -> a LIVE process refused SIGKILL; report nothing.
+
+        The victim plausibly still holds both lease axes, so the caller must
+        stay fail-closed and leave the rendezvous alone.  `failed_pids_out`
+        keeps its existing behaviour on this same path.
+        """
+        from orchestrator.verify_cancel import pgid_file, write_pgid_file
+
+        path = pgid_file(tmp_path / 'wt', 'req-refused')
+        write_pgid_file(path, 4242)
+        out: list[int] = []
+        failed: list[int] = []
+
+        rc = self._run(
+            path, {}, kill_side_effects={4242: PermissionError()},
+            out=out, failed_out=failed,
+        )
+
+        assert rc == 1
+        assert out == [], 'a refused SIGKILL killed nothing — report nothing'
+        assert failed == [4242], 'the existing out-param is unchanged'
+        assert path.exists()
+
+    def test_out_param_is_optional_and_keyword_only(self, tmp_path):
+        """(f) Every existing call site stays source-compatible.
+
+        `cancel_request(path)` with no out-params must still work, and the new
+        parameter must be keyword-only so no positional caller can bind it by
+        accident.
+        """
+        import inspect
+
+        from orchestrator.verify_cancel import cancel_request, pgid_file, write_pgid_file
+
+        params = inspect.signature(cancel_request).parameters
+        assert params['killed_pgid_out'].kind is inspect.Parameter.KEYWORD_ONLY
+        assert params['killed_pgid_out'].default is None
+
+        path = pgid_file(tmp_path / 'wt', 'req-nokwargs')
+        write_pgid_file(path, 4242)
+        rc = cancel_request(
+            path,
+            ppid_map_provider=dict,
+            kill=lambda pid, sig: None,
+            killpg=lambda pgid, sig: None,
+        )
+        assert rc == 0
+        assert not path.exists()
+
+
+# ---------------------------------------------------------------------------
 # Step-7: start_own_process_group — setsid + fallback
 # ---------------------------------------------------------------------------
 
@@ -437,6 +601,59 @@ def _locks_row(
     triple = f'{_os.major(st.st_dev):02x}:{_os.minor(st.st_dev):02x}:{st.st_ino}'
     arrow = '-> ' if waiter else ''
     return f'{row_id}: {arrow}{kind}  ADVISORY  WRITE {pid} {triple} 0 EOF'
+
+
+class _ChunkedLocksPath(Path):
+    """A ``locks_path`` serving SCRIPTED snapshots, one per ``read_text()`` call.
+
+    Makes the measured ``/proc/locks`` CHUNKED-READ SKIP deterministic.  The
+    kernel serves that seq_file one PAGE per ``read(2)`` regardless of the
+    caller's buffer (measured on this host: 4 ``read(2)`` calls returning
+    4049/4087/4083/3536 bytes for a 15755-byte table against a 1 MiB request),
+    and each read restarts the per-CPU lock-list walk from a POSITIONAL index —
+    so a lock released at an earlier position between chunks shifts every later
+    record down and ours is skipped outright.  The result is a read that
+    SUCCEEDS and returns a table missing a record: no ``OSError``, nothing for
+    an errno-keyed retry to notice, and a confident wrong answer at the caller.
+    Reproduced at 1.54% of reads (144/9337) against a real held flock with 24
+    concurrent churners — which is why it is invisible in isolation and red
+    only under a full parallel suite.
+
+    A ``pathlib.Path`` SUBCLASS rather than a duck-typed fake: it is
+    ``isinstance(..., Path)``, so it satisfies the reader's ``locks_path: Path``
+    annotation pyright-clean, and it drives the parser through the EXISTING
+    ``locks_path=`` keyword that :data:`PROC_LOCKS_PATH`'s own comment already
+    blesses — no new production seam.  Monkeypatching ``PROC_LOCKS_PATH``
+    instead would be INERT: both reader variants consume it as a DEF-TIME
+    default (esc-3604-1, recorded at
+    ``orchestrator/tests/test_lane_lock_leak_guard.py::test_an_unreadable_lock_table_is_not_silently_no_holders``).
+
+    Snapshots are served in order and STICK on the last one, so a scripted list
+    bounds only the LOSSY PREFIX and never the read count — a reader free to
+    take one more read than the script anticipated still gets a well-defined
+    table.  An entry may be an ``OSError`` INSTANCE to raise instead of text,
+    which is how the first-read-vs-later-read failure asymmetry is driven.
+    ``reads`` records how many reads the caller actually took.
+    """
+
+    def __init__(
+        self, *args, snapshots: Sequence[str | OSError] = (), **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._snapshots: list[str | OSError] = list(snapshots)
+        self.reads: int = 0
+
+    def read_text(self, *args, **kwargs) -> str:  # noqa: ARG002 -- signature parity
+        self.reads += 1
+        if not self._snapshots:
+            raise AssertionError(
+                '_ChunkedLocksPath was constructed with no snapshots — the '
+                'fixture would be staging nothing at all'
+            )
+        entry = self._snapshots[min(self.reads - 1, len(self._snapshots) - 1)]
+        if isinstance(entry, OSError):
+            raise entry
+        return entry
 
 
 class TestLaneLockHolderPids:
@@ -813,6 +1030,518 @@ class TestLaneLockHolderPidsStrict:
 
 
 # ---------------------------------------------------------------------------
+# Task 4227: the CHUNKED-READ skip — a read that SUCCEEDS and is still wrong.
+#
+# Task 3604 drew the line between "this ROW is odd" (skip) and "the whole
+# ANSWER is unknown" (raise).  There is a THIRD case neither variant handled:
+# "this READ was SHORT".  `/proc/locks` is a seq_file served one page per
+# `read(2)`, and each read restarts the per-CPU walk from a positional index,
+# so a lock released at an earlier position between chunks shifts every later
+# record down and ours is dropped.  Nothing raises, so `require_lane_lock_
+# holders`' OSError-keyed retry never fires; both variants render it as a
+# confident, WRONG answer.
+#
+# Every case is an explicit A/B: the SAME staging read with the confirm loop
+# and with `confirm_reads=1`, which reproduces the pre-fix one-shot behaviour
+# exactly.  The divergence is the thing under test, and the control arm is
+# what stops these cases from passing vacuously if the staging stops biting.
+# ---------------------------------------------------------------------------
+
+
+#: One row for an inode that is never any lock file (inode 1 is not a regular
+#: file), present in EVERY scripted snapshot of the chunk-skip staging below.
+UNRELATED_LOCKS_ROW = '309: FLOCK  ADVISORY  WRITE 6001 103:08:1 0 EOF\n'
+
+
+def chunk_skipped_locks(lock_path: Path, pid: int) -> _ChunkedLocksPath:
+    """A table whose FIRST read drops *lock_path*'s row, then settles.
+
+    THE shared staging for the measured defect, module-level and public-ish so
+    ``test_lane_lock_leak_guard`` builds its end-to-end arms from this ONE
+    definition rather than a second copy.  Two copies could drift, and a later
+    "fix" to one (say, to an empty first snapshot) would leave the other
+    silently modelling a different defect while still passing.
+
+    The unrelated row is present throughout: a chunk-skip drops OUR record
+    while the rest of a system-wide table reads normally, so a fixture that
+    served an empty first snapshot would be modelling a different (and easier)
+    defect than the measured one.
+    """
+    ours = _locks_row(lock_path, pid) + '\n'
+    return _ChunkedLocksPath(
+        lock_path.parent / 'locks',
+        snapshots=[UNRELATED_LOCKS_ROW, UNRELATED_LOCKS_ROW + ours],
+    )
+
+
+class TestChunkedLocksReadIsToleratedByTheReader:
+    """A record dropped by one chunked read must not read as "no holder"."""
+
+    def test_a_record_dropped_by_the_first_read_is_recovered(self, tmp_path: Path):
+        """THE root-cause case: the holder is reported despite a lossy read.
+
+        A confirm read costs microseconds (procfs, no sleep) and can only ADD
+        an attribution that was true of the kernel at some instant — the defect
+        is FALSE-NEGATIVE-ONLY, since a chunked read can DROP a record but
+        never INVENT one.  Both variants must recover it: the read policy lives
+        in the strict core precisely so the wrapper cannot grow its own.
+        """
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids,
+            lane_lock_holder_pids_strict,
+        )
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+
+        strict_locks = chunk_skipped_locks(lock_path, 4242)
+        strict = lane_lock_holder_pids_strict(lock_path, locks_path=strict_locks)
+        assert strict == [4242], (
+            f'a holder dropped by ONE chunked read must still be reported — '
+            f'rendering it as "nobody holds it" is what misclassifies a '
+            f'self-owned B13 leak as foreign contention; got {strict!r} after '
+            f'{strict_locks.reads} read(s)'
+        )
+        assert strict_locks.reads > 1, (
+            f'the answer must have come from a CONFIRM read, not from the '
+            f'staging failing to bite; the reader took {strict_locks.reads} '
+            f'read(s)'
+        )
+
+        wrapper_locks = chunk_skipped_locks(lock_path, 4242)
+        assert lane_lock_holder_pids(lock_path, locks_path=wrapper_locks) == [4242], (
+            'ANTI-FORK: the fail-safe wrapper must inherit the read policy '
+            'from the strict core, never carry a second copy of it'
+        )
+
+    def test_confirm_reads_one_reproduces_the_pre_fix_miss(self, tmp_path: Path):
+        """THE defect, pinned beside the fix on IDENTICAL staging.
+
+        ``confirm_reads=1`` is the pre-fix one-shot read exactly.  Pinning it
+        is what makes the case above legible (it shows what the confirm loop
+        buys) and what keeps it honest (if the chunked staging ever stops
+        biting, this arm fails rather than the other passing vacuously).
+        """
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids,
+            lane_lock_holder_pids_strict,
+        )
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+
+        strict_locks = chunk_skipped_locks(lock_path, 4242)
+        strict = lane_lock_holder_pids_strict(
+            lock_path, locks_path=strict_locks, confirm_reads=1,
+        )
+        assert strict == [], (
+            f'a single read of this staging MUST miss the holder, or the '
+            f'fixture is not reproducing the defect; got {strict!r}'
+        )
+        assert strict_locks.reads == 1, (
+            f'confirm_reads=1 must take exactly one read — otherwise it is '
+            f'not the pre-fix behaviour it claims to reproduce; took '
+            f'{strict_locks.reads}'
+        )
+
+        wrapper_locks = chunk_skipped_locks(lock_path, 4242)
+        assert lane_lock_holder_pids(
+            lock_path, locks_path=wrapper_locks, confirm_reads=1,
+        ) == [], (
+            'the wrapper must diverge from the strict core ONLY on OSError '
+            'policy — the read count is core behaviour and must track it'
+        )
+
+
+class TestChunkedConfirmLoopContract:
+    """What the confirm loop must NOT change, on either side of the fix.
+
+    A fix for a 1.54% loss is only worth having if it leaves task 3604's raise
+    contract bit-for-bit intact and returns the SAME answer on the
+    overwhelmingly common non-lossy path.  Both are easy to break silently
+    here: K reads give a previously-single-read function K chances to raise,
+    and a union across snapshots could quietly reorder or invent a holder.
+    """
+
+    @staticmethod
+    def _mixed_table(lock_path: Path, other: Path) -> str:
+        """The full parse-exercising table: holder, waiter, POSIX, foreign, junk."""
+        return (
+            'garbage\n'
+            '311: FLOCK  ADVISORY  WRITE notapid 103:08:zzz 0 EOF\n'
+            + _locks_row(lock_path, 4242)
+            + '\n'
+            + _locks_row(lock_path, 4243, row_id=309, waiter=True)
+            + '\n'
+            + _locks_row(lock_path, 5150, row_id=310, kind='POSIX')
+            + '\n'
+            + _locks_row(other, 6001, row_id=311)
+            + '\n'
+            + _locks_row(lock_path, 4242, row_id=312)
+            + '\n'
+        )
+
+    def test_a_first_read_failure_still_propagates_unchanged(self, tmp_path: Path):
+        """(a) Task 3604's contract, bit-for-bit: read #1 failing means UNKNOWN.
+
+        A first read that fails means NO rows were examined at all, so the
+        answer carries no information about the target inode and the strict
+        variant must still raise — with errno AND filename intact, which
+        ``require_lane_lock_holders``' deliberate ``!s``-not-``!r`` message
+        depends on to name the path that could not be read.
+        """
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids,
+            lane_lock_holder_pids_strict,
+        )
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        denied = PermissionError(
+            errno.EACCES, 'Permission denied', str(tmp_path / 'locks'),
+        )
+        good = _locks_row(lock_path, 4242) + '\n'
+
+        strict_locks = _ChunkedLocksPath(
+            tmp_path / 'locks', snapshots=[denied, good],
+        )
+        with pytest.raises(PermissionError) as excinfo:
+            lane_lock_holder_pids_strict(lock_path, locks_path=strict_locks)
+
+        assert excinfo.value.errno == errno.EACCES
+        assert str(tmp_path / 'locks') in str(excinfo.value), (
+            f'the filename must survive to the message — a confirm loop that '
+            f're-raised a bare OSError would leave the operator without the '
+            f'path that could not be read; got {str(excinfo.value)!r}'
+        )
+        assert strict_locks.reads == 1, (
+            f'a failed FIRST read must not be retried past: the confirm reads '
+            f'exist to enrich an answer, and there is no answer yet; took '
+            f'{strict_locks.reads} read(s)'
+        )
+
+        wrapper_locks = _ChunkedLocksPath(
+            tmp_path / 'locks', snapshots=[denied, good],
+        )
+        assert lane_lock_holder_pids(lock_path, locks_path=wrapper_locks) == [], (
+            'the fail-safe wrapper must keep its production contract unchanged'
+        )
+
+    def test_a_missing_lock_file_raises_before_any_read_is_taken(
+        self, tmp_path: Path,
+    ):
+        """(a) The stat stays ONCE, outside the loop — no stat-per-read.
+
+        Task 3604's headline case is a held lane whose lock file was unlinked:
+        ``os.stat`` fails and the answer is unknown having examined no rows.
+        Asserting ZERO reads is what pins the stat OUTSIDE the confirm loop —
+        a stat moved inside would still raise, so the raise alone cannot tell
+        the two structures apart.
+        """
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids,
+            lane_lock_holder_pids_strict,
+        )
+
+        absent = tmp_path / 'absent.lock'
+        locks = _ChunkedLocksPath(
+            tmp_path / 'locks', snapshots=['313: FLOCK  ADVISORY  WRITE 4242 103:08:1 0 EOF\n'],
+        )
+
+        with pytest.raises(FileNotFoundError):
+            lane_lock_holder_pids_strict(absent, locks_path=locks)
+        assert locks.reads == 0, (
+            f'a structurally-unknown answer must cost no procfs I/O at all; '
+            f'the lock table was read {locks.reads} time(s)'
+        )
+        assert lane_lock_holder_pids(absent, locks_path=locks) == []
+
+    def test_a_missing_locks_table_still_raises_on_the_first_read(
+        self, tmp_path: Path,
+    ):
+        """(a) The plain existing seam: an absent ``/proc/locks`` is still UNKNOWN."""
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids,
+            lane_lock_holder_pids_strict,
+        )
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        missing = tmp_path / 'nope'
+
+        with pytest.raises(OSError):
+            lane_lock_holder_pids_strict(lock_path, locks_path=missing)
+        assert lane_lock_holder_pids(lock_path, locks_path=missing) == []
+
+    def test_a_later_confirm_read_failure_is_best_effort(self, tmp_path: Path):
+        """(b) A LATER read failing must not subtract information.
+
+        The confirm reads exist only to RECOVER a possibly-dropped record, so
+        failing to obtain an EXTRA one cannot make the answer less known than
+        the first read already made it.  Letting it raise would take a reader
+        that previously raised on 1-in-N reads and hand it K chances to raise —
+        manufacturing a NEW failure class out of a fix, on precisely the
+        acquire-timeout paths whose documented reason for using the fail-safe
+        wrapper is that an exception there converts a diagnosable stall into a
+        broken merge.  The wrapper's degradation is the sharper half: a
+        perfectly good answer would become ``[]``, which is the very
+        "nobody holds it" this task exists to stop rendering.
+        """
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids,
+            lane_lock_holder_pids_strict,
+        )
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        good = _locks_row(lock_path, 4242) + '\n'
+        denied = PermissionError(
+            errno.EACCES, 'Permission denied', str(tmp_path / 'locks'),
+        )
+
+        strict_locks = _ChunkedLocksPath(
+            tmp_path / 'locks', snapshots=[good, denied],
+        )
+        assert lane_lock_holder_pids_strict(
+            lock_path, locks_path=strict_locks,
+        ) == [4242], (
+            'read #1 already answered the question — a failed CONFIRM read '
+            'must end the loop, not propagate'
+        )
+
+        wrapper_locks = _ChunkedLocksPath(
+            tmp_path / 'locks', snapshots=[good, denied],
+        )
+        assert lane_lock_holder_pids(
+            lock_path, locks_path=wrapper_locks,
+        ) == [4242], (
+            'the fail-safe wrapper must not degrade a known holder set to [] '
+            'because an EXTRA read it did not need happened to fail'
+        )
+
+    def test_the_union_never_fabricates_a_holder(self, tmp_path: Path):
+        """(c) The union may only ADD what the kernel actually reported.
+
+        The defect being fixed is false-negative-only, and the fix must stay
+        that way: a pid in no snapshot must never appear, and a target row
+        absent from EVERY snapshot must still read as ``[]`` — otherwise a
+        genuine RELEASE would stop reading as released, which is the opposite
+        (and louder) error.
+        """
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids,
+            lane_lock_holder_pids_strict,
+        )
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        other = tmp_path / 'other.lock'
+        other.write_text('x')  # distinct inode on the same device
+
+        foreign = _locks_row(other, 6001) + '\n'
+        released = _ChunkedLocksPath(
+            tmp_path / 'locks', snapshots=[foreign, foreign, foreign],
+        )
+        assert lane_lock_holder_pids_strict(lock_path, locks_path=released) == [], (
+            'a lock genuinely released must still read as released — the union '
+            'is a recovery mechanism, not a source of holders'
+        )
+        assert released.reads > 1, (
+            'staging error: the empty answer must have survived the WHOLE '
+            'confirm loop, not been returned before it ran'
+        )
+
+        mixed = _ChunkedLocksPath(
+            tmp_path / 'locks',
+            snapshots=[foreign, foreign + _locks_row(lock_path, 4242) + '\n'],
+        )
+        assert lane_lock_holder_pids(lock_path, locks_path=mixed) == [4242], (
+            'only the target inode\'s holders may appear: a foreign row read '
+            'K times must not leak into the answer'
+        )
+
+    def test_reading_a_static_table_k_times_yields_the_pre_fix_answer(
+        self, tmp_path: Path,
+    ):
+        """(d) STATIC EQUIVALENCE: the non-lossy path answers exactly as before.
+
+        The overwhelmingly common case is a table that reads correctly every
+        time.  Reading it K times must be bit-for-bit the one-read answer —
+        de-duplicated, first-seen order preserved, ``-> FLOCK`` waiters and
+        ``POSIX`` rows still excluded, malformed rows still tolerated — for
+        BOTH variants.  Without this pin the union could quietly change the
+        answer everywhere in exchange for fixing 1.54% of reads.
+
+        Also pins the READ COUNT on that path, so the loop's cost is a STATED
+        one rather than an accident: all K reads are taken even once read #1
+        has named a holder.  The reader deliberately does NOT break out early
+        there — see its "WHY ALL K READS ALWAYS" note — because the shortcut
+        is sound only under the callers' ``LOCK_EX`` invariant, which this
+        reader neither states nor enforces, and would truncate a shared-lock
+        answer.  If that decision is ever revisited, this assertion is what
+        makes the change visible instead of silent.
+        """
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids,
+            lane_lock_holder_pids_strict,
+        )
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        other = tmp_path / 'other.lock'
+        other.write_text('x')
+        locks = tmp_path / 'locks'
+        locks.write_text(self._mixed_table(lock_path, other))
+
+        one_shot = lane_lock_holder_pids_strict(
+            lock_path, locks_path=locks, confirm_reads=1,
+        )
+        assert one_shot == [4242], (
+            f'staging error: the fixture must exercise waiter/POSIX/foreign/'
+            f'malformed exclusion in ONE read; got {one_shot!r}'
+        )
+        assert lane_lock_holder_pids_strict(lock_path, locks_path=locks) == one_shot
+        assert lane_lock_holder_pids(lock_path, locks_path=locks) == one_shot
+        assert lane_lock_holder_pids(
+            lock_path, locks_path=locks, confirm_reads=1,
+        ) == one_shot
+
+        # The stated cost: K reads, even though read #1 already named a holder.
+        import orchestrator.verify_cancel as vc_mod
+
+        static = _ChunkedLocksPath(
+            tmp_path / 'locks', snapshots=[self._mixed_table(lock_path, other)],
+        )
+        assert lane_lock_holder_pids_strict(lock_path, locks_path=static) == one_shot
+        assert static.reads == vc_mod._LOCKS_CONFIRM_READS, (
+            f'the confirm loop must take all {vc_mod._LOCKS_CONFIRM_READS} '
+            f'reads on the non-lossy path — an early break on a non-empty read '
+            f'#1 is correct only under the callers\' LOCK_EX invariant, which '
+            f'this reader does not enforce, and would truncate a shared-lock '
+            f'answer; took {static.reads}'
+        )
+        control = _ChunkedLocksPath(
+            tmp_path / 'locks', snapshots=[self._mixed_table(lock_path, other)],
+        )
+        assert lane_lock_holder_pids_strict(
+            lock_path, locks_path=control, confirm_reads=1,
+        ) == one_shot
+        assert control.reads == 1, (
+            f'confirm_reads=1 must be exactly the pre-fix one-shot read, or '
+            f'every control arm in this module is measuring something else; '
+            f'took {control.reads}'
+        )
+
+    def test_a_sub_one_read_count_is_floored_at_one_read(self, tmp_path: Path):
+        """Zero reads is not reachable — the STRICT contract survives any count.
+
+        ``confirm_reads=0`` (or a ``_LOCKS_CONFIRM_READS`` monkeypatched to 0)
+        would make ``range(reads)`` empty and return ``[]`` having examined NO
+        rows: a silent fail-soft that converts the STRICT variant into the
+        fail-safe one, and hands back the one answer that VACUOUSLY satisfies
+        the negative-asserting callers this variant exists for
+        (``require_lane_lock_holders``, ``lane_is_free``).  Both knobs are
+        floored at one read, so an unreadable table still RAISES.
+        """
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids,
+            lane_lock_holder_pids_strict,
+        )
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        holder = _locks_row(lock_path, 4242) + '\n'
+
+        for count in (0, -3):
+            locks = _ChunkedLocksPath(tmp_path / 'locks', snapshots=[holder])
+            assert lane_lock_holder_pids_strict(
+                lock_path, locks_path=locks, confirm_reads=count,
+            ) == [4242], (
+                f'confirm_reads={count} must still take the FIRST read, not '
+                f'silently answer "nobody holds it" having read nothing'
+            )
+            assert locks.reads == 1, (
+                f'confirm_reads={count} must floor to exactly one read; took '
+                f'{locks.reads}'
+            )
+
+        missing = _ChunkedLocksPath(
+            tmp_path / 'locks',
+            snapshots=[FileNotFoundError(errno.ENOENT, 'No such file', 'locks')],
+        )
+        with pytest.raises(FileNotFoundError):
+            lane_lock_holder_pids_strict(
+                lock_path, locks_path=missing, confirm_reads=0,
+            )
+        assert lane_lock_holder_pids(
+            lock_path, locks_path=missing, confirm_reads=0,
+        ) == [], 'the fail-safe wrapper still degrades, whatever the count'
+
+    def test_the_global_read_count_is_also_floored(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """The floor covers the MONKEYPATCH seam, not just the keyword.
+
+        ``confirm_reads`` resolves from the module global at CALL time, which
+        is the documented tuning seam.  A global set to 0 must be floored the
+        same way — otherwise the loudest reader in the module could be
+        silenced by a one-line config change with no error anywhere.
+        """
+        import orchestrator.verify_cancel as vc_mod
+        from orchestrator.verify_cancel import lane_lock_holder_pids_strict
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        monkeypatch.setattr(vc_mod, '_LOCKS_CONFIRM_READS', 0)
+        locks = _ChunkedLocksPath(
+            tmp_path / 'locks', snapshots=[_locks_row(lock_path, 4242) + '\n'],
+        )
+
+        assert lane_lock_holder_pids_strict(lock_path, locks_path=locks) == [4242]
+        assert locks.reads == 1, (
+            f'a zero global must floor to one read, not zero; took {locks.reads}'
+        )
+
+    def test_first_seen_order_is_preserved_across_reads(self, tmp_path: Path):
+        """(e) The ordering contract survives the union.
+
+        The docstring promises first-seen order, and with more than one read
+        "first seen" spans them: a holder observed only in read #2 must sort
+        AFTER one observed in read #1, even though the settled table lists it
+        first.  Sorting by the final table's textual order instead would be a
+        different, undocumented contract.
+        """
+        from orchestrator.verify_cancel import (
+            lane_lock_holder_pids,
+            lane_lock_holder_pids_strict,
+        )
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        first = _locks_row(lock_path, 4242) + '\n'
+        second = _locks_row(lock_path, 4243, row_id=309) + '\n'
+
+        # Read #1 shows only 4243; read #2 shows the settled table, which lists
+        # 4242 FIRST.  First-seen-across-reads therefore means [4243, 4242].
+        strict_locks = _ChunkedLocksPath(
+            tmp_path / 'locks', snapshots=[second, first + second],
+        )
+        assert lane_lock_holder_pids_strict(
+            lock_path, locks_path=strict_locks,
+        ) == [4243, 4242], (
+            'first-seen order must be taken across the whole confirm loop, '
+            'not re-derived from the last snapshot read'
+        )
+
+        wrapper_locks = _ChunkedLocksPath(
+            tmp_path / 'locks', snapshots=[second, first + second],
+        )
+        assert lane_lock_holder_pids(
+            lock_path, locks_path=wrapper_locks,
+        ) == [4243, 4242]
+
+
+# ---------------------------------------------------------------------------
 # Task 2306 step-7: LOCK_HOLDER_PGID_KEY + write/read/remove_lock_holder_pgid —
 # fixed-key holder-pgid rendezvous.  A waiter cannot know the holder's
 # per-dispatch --request-id, so this uses a request-id-independent fixed key
@@ -1067,6 +1796,209 @@ def test_cancel_request_reaps_start_new_session_escapes(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Task 4195 step-1: run_stdin_heartbeat — the PRODUCER half of the same
+# connection-death wire protocol whose CONSUMER (run_stdin_watchdog) is tested
+# in the block immediately below.
+#
+# The dispatcher writes one HEARTBEAT_TOKEN per interval down the ssh child's
+# stdin for the full verify span; the remote's watchdog fires when no beat (or
+# EOF) arrives in time.  Both halves now live in verify_cancel.py and are
+# tested side by side in the same idiom: injected syscall seams (write_fn /
+# close_fn mirroring the watchdog's select_fn / read_fn), fake callables, and
+# ZERO wall-clock — interval=0.0 makes threading.Event.wait return at once.
+# ---------------------------------------------------------------------------
+
+
+class TestRunStdinHeartbeat:
+    """run_stdin_heartbeat(write_fd, stop_event, *, interval, write_fn, close_fn)."""
+
+    def test_writes_one_token_per_tick_and_closes_the_fd_once(self):
+        """One HEARTBEAT_TOKEN per tick until stopped; the loop owns and closes write_fd once."""
+        from orchestrator.verify_cancel import HEARTBEAT_TOKEN, run_stdin_heartbeat
+
+        stop = threading.Event()
+        writes: list[tuple[int, bytes]] = []
+        closed: list[int] = []
+
+        def fake_write(fd, data):
+            writes.append((fd, data))
+            if len(writes) == 3:
+                stop.set()
+            return len(data)
+
+        run_stdin_heartbeat(7, stop, interval=0.0, write_fn=fake_write, close_fn=closed.append)
+
+        assert writes == [(7, HEARTBEAT_TOKEN)] * 3
+        assert closed == [7]  # the loop owns the fd and closes it exactly once
+
+    def test_returns_without_writing_when_already_stopped(self):
+        """A pre-set stop Event writes nothing at all and still closes the fd.
+
+        Pins two properties at once: the loop waits BEFORE each write (so the
+        first beat lands at t=interval, preserving today's cadence), and the
+        close lives in a ``finally`` rather than on the happy path only.
+        """
+        from orchestrator.verify_cancel import run_stdin_heartbeat
+
+        stop = threading.Event()
+        stop.set()
+        writes: list[tuple[int, bytes]] = []
+        closed: list[int] = []
+
+        run_stdin_heartbeat(
+            7, stop, interval=0.0, write_fn=lambda fd, data: writes.append((fd, data)),
+            close_fn=closed.append,
+        )
+
+        assert writes == []
+        assert closed == [7]
+
+    @pytest.mark.parametrize(
+        'benign_error', [BrokenPipeError, ConnectionResetError, BlockingIOError]
+    )
+    def test_swallows_a_dead_or_full_channel_and_keeps_beating(self, benign_error):
+        """A failed beat is swallowed and the loop beats on; the fd is still closed.
+
+        BrokenPipeError / ConnectionResetError are today's deliberate
+        suppression (the child is already gone — the transport-failure path
+        handles that outcome).  BlockingIOError is the non-blocking write
+        end's full-pipe signal, which proves the channel is alive but
+        undrained — not the condition the watchdog exists to detect.
+        """
+        from orchestrator.verify_cancel import run_stdin_heartbeat
+
+        stop = threading.Event()
+        attempts: list[int] = []
+        succeeded: list[int] = []
+        closed: list[int] = []
+
+        def fake_write(fd, data):
+            attempts.append(fd)
+            if len(attempts) <= 2:
+                raise benign_error('channel dead or full')
+            if len(attempts) == 3:
+                succeeded.append(fd)
+                return len(data)
+            stop.set()
+            return len(data)
+
+        run_stdin_heartbeat(7, stop, interval=0.0, write_fn=fake_write, close_fn=closed.append)
+
+        assert len(attempts) == 4  # a failed beat does NOT end the loop
+        assert succeeded == [7]
+        assert closed == [7]
+
+    def test_an_unexpected_error_ends_the_loop_but_still_closes_the_fd(self):
+        """EBADF has no benign reading: it propagates — and the finally still closes the fd."""
+        from orchestrator.verify_cancel import run_stdin_heartbeat
+
+        stop = threading.Event()
+        closed: list[int] = []
+
+        def fake_write(fd, data):
+            raise OSError(errno.EBADF, 'bad fd')
+
+        with pytest.raises(OSError) as excinfo:
+            run_stdin_heartbeat(7, stop, interval=0.0, write_fn=fake_write, close_fn=closed.append)
+
+        assert excinfo.value.errno == errno.EBADF
+        assert closed == [7]
+
+
+#: Wedge detector for the writer's stop, not a performance budget — paid only
+#: when the test is already failing.  Taken FROM production rather than
+#: re-pinned here: the number and the whole argument for it have one home, at
+#: verify_runner.HEARTBEAT_STOP_JOIN_SECS (SPOT, docs/code-quality.md #11), and
+#: these tests are cheaper the closer they stay to what production actually
+#: waits.
+HEARTBEAT_STOP_JOIN_CEILING_SECS = HEARTBEAT_STOP_JOIN_SECS
+
+#: Deliberately longer than that ceiling, and DERIVED from it so the pair keeps
+#: discriminating however production is retuned: an implementation whose timer
+#: is ``time.sleep(interval)`` cannot return inside the ceiling, where the
+#: ``Event.wait(interval)`` one returns at once.
+HEARTBEAT_SLOW_INTERVAL_SECS = 2 * HEARTBEAT_STOP_JOIN_CEILING_SECS
+
+
+class TestStartStdinHeartbeat:
+    """start_stdin_heartbeat spawns a daemon thread running run_stdin_heartbeat."""
+
+    def test_stop_ends_the_thread_well_inside_one_interval(self):
+        """stop() ends the writer at once rather than waiting out the interval."""
+        from orchestrator.verify_cancel import start_stdin_heartbeat
+
+        closed: list[int] = []
+        r_fd, w_fd = os.pipe()
+        try:
+            handle = start_stdin_heartbeat(
+                w_fd, interval=HEARTBEAT_SLOW_INTERVAL_SECS, close_fn=closed.append
+            )
+
+            assert handle.thread.is_alive()
+            assert handle.thread.daemon is True
+
+            handle.stop()
+            handle.thread.join(timeout=HEARTBEAT_STOP_JOIN_CEILING_SECS)
+
+            assert not handle.thread.is_alive()
+            assert closed == [w_fd]
+        finally:
+            os.close(r_fd)
+            os.close(w_fd)
+
+    def test_the_write_end_is_left_non_blocking(self):
+        """The spawner establishes O_NONBLOCK; callers do not have to know to.
+
+        Two documented guarantees rest on it and neither is checkable where it
+        is stated: run_stdin_heartbeat's BlockingIOError arm (a full pipe skips
+        one beat) and verify_runner.HEARTBEAT_STOP_JOIN_SECS's bound (os.write
+        can never park, so the join is a wedge detector rather than a wait).  A
+        caller that handed over a blocking fd would void both SILENTLY — the
+        writer parks forever on a full pipe and the join just expires — so the
+        mode belongs to the module that owns the writer, not to one call site.
+        """
+        from orchestrator.verify_cancel import start_stdin_heartbeat
+
+        closed: list[int] = []
+        r_fd, w_fd = os.pipe()
+        try:
+            assert os.get_blocking(w_fd) is True  # os.pipe()'s default
+
+            handle = start_stdin_heartbeat(
+                w_fd, interval=HEARTBEAT_SLOW_INTERVAL_SECS, close_fn=closed.append
+            )
+            try:
+                assert os.get_blocking(w_fd) is False
+            finally:
+                handle.stop()
+                handle.thread.join(timeout=HEARTBEAT_STOP_JOIN_CEILING_SECS)
+        finally:
+            os.close(r_fd)
+            os.close(w_fd)
+
+    def test_beats_reach_a_real_pipe(self):
+        """Real beats land on a real pipe's read end; the loop closes the write end itself."""
+        from orchestrator.verify_cancel import HEARTBEAT_TOKEN, start_stdin_heartbeat
+
+        r_fd, w_fd = os.pipe()
+        try:
+            handle = start_stdin_heartbeat(w_fd, interval=0.01)
+            # Blocking read: returns as soon as the first beat lands, so there
+            # is no deadline here to be flaky about.  A producer that never
+            # beats hangs and is caught by the file's pytest timeout.
+            data = os.read(r_fd, 64)
+
+            assert data != b''
+            assert data.replace(HEARTBEAT_TOKEN, b'') == b''
+
+            handle.stop()
+            handle.thread.join(timeout=HEARTBEAT_STOP_JOIN_CEILING_SECS)
+            assert not handle.thread.is_alive()
+        finally:
+            os.close(r_fd)
+
+
+# ---------------------------------------------------------------------------
 # Task 2308 γ step-1: run_stdin_watchdog — fd-0 trigger loop
 #
 # Connection-death heartbeat-watchdog (PRD: plans/laptop-warm-verify-flock-
@@ -1102,7 +2034,7 @@ class TestRunStdinWatchdog:
 
         run_stdin_watchdog(
             7,
-            lambda: fire_calls.append(True),
+            lambda trigger: fire_calls.append(True),
             heartbeat_timeout=5.0,
             select_fn=fake_select,
             read_fn=fake_read,
@@ -1131,7 +2063,7 @@ class TestRunStdinWatchdog:
 
         run_stdin_watchdog(
             7,
-            lambda: fire_calls.append(True),
+            lambda trigger: fire_calls.append(True),
             heartbeat_timeout=5.0,
             select_fn=fake_select,
             read_fn=fake_read,
@@ -1162,7 +2094,7 @@ class TestRunStdinWatchdog:
 
         run_stdin_watchdog(
             7,
-            lambda: fire_calls.append(True),
+            lambda trigger: fire_calls.append(True),
             heartbeat_timeout=5.0,
             select_fn=fake_select,
             read_fn=fake_read,
@@ -1187,7 +2119,7 @@ class TestFireWatchdogKill:
         """(a)-(d): descendants only, grace between passes, SIGKILL survivors, exit is final."""
         import signal
 
-        from orchestrator.verify_cancel import fire_watchdog_kill
+        from orchestrator.verify_cancel import WatchdogTrigger, fire_watchdog_kill
 
         # ppid_map: P(100) -> A(200) -> B(300); unrelated 999 (ppid 1, not a descendant of P)
         ppid_map = {200: 100, 300: 200, 999: 1}
@@ -1216,6 +2148,7 @@ class TestFireWatchdogKill:
 
         fire_watchdog_kill(
             100,
+            trigger=WatchdogTrigger.EOF,
             grace_secs=5.0,
             ppid_map_provider=lambda: ppid_map,
             kill=fake_kill,
@@ -1248,7 +2181,7 @@ class TestFireWatchdogKill:
 
     def test_dead_descendant_process_lookup_error_tolerated(self):
         """(e): a descendant already dead (ProcessLookupError) is tolerated; exit_fn still fires."""
-        from orchestrator.verify_cancel import fire_watchdog_kill
+        from orchestrator.verify_cancel import WatchdogTrigger, fire_watchdog_kill
 
         ppid_map = {200: 100}  # single descendant, already gone
         exit_calls = []
@@ -1268,6 +2201,7 @@ class TestFireWatchdogKill:
         # Must not raise despite kill() always raising ProcessLookupError.
         fire_watchdog_kill(
             100,
+            trigger=WatchdogTrigger.EOF,
             grace_secs=0.0,
             ppid_map_provider=lambda: ppid_map,
             kill=fake_kill,
@@ -1277,6 +2211,243 @@ class TestFireWatchdogKill:
         )
 
         assert exit_calls == [1]
+
+
+# ---------------------------------------------------------------------------
+# Task 4194 step-3: fire_watchdog_kill reports WHICH branch fired, on stderr
+#
+# The ssh stderr channel is the ONLY path from a self-killing remote back to
+# the dispatcher: stdout is deliberately suppressed on a fire (cli.py's
+# watchdog_fired gate never echoes a VerifyResult for a build it just killed),
+# and exit_fn is os._exit, which skips every structured return path AND skips
+# stdio flushing -- so the line must be written AND flushed before the exit or
+# it is silently lost.  It is written last, after the SIGKILL pass, so the
+# token survives a reader that keeps only a bounded tail.  And it is
+# best-effort: a diagnostic that could raise past exit_fn would strand the
+# abandoned verify-merge leader as exactly the setsid orphan the watchdog
+# exists to prevent.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingStderr:
+    """stderr double appending ('write', text) / ('flush',) to a shared ordered log."""
+
+    def __init__(self, events, *, raise_on_write=None, raise_on_flush=None):
+        self._events = events
+        self._raise_on_write = raise_on_write
+        self._raise_on_flush = raise_on_flush
+
+    def write(self, text):
+        self._events.append(('write', text))
+        if self._raise_on_write is not None:
+            raise self._raise_on_write
+        return len(text)
+
+    def flush(self):
+        self._events.append(('flush',))
+        if self._raise_on_flush is not None:
+            raise self._raise_on_flush
+
+
+def _fire_with_recording_stderr(trigger, events, *, stderr=None):
+    """Drive fire_watchdog_kill over a fixed 100 -> 200 -> 300 tree, recording onto *events*."""
+    import signal
+
+    from orchestrator.verify_cancel import fire_watchdog_kill
+
+    def fake_kill(pid, sig):
+        events.append(('term' if sig == signal.SIGTERM else 'kill', pid))
+
+    fire_watchdog_kill(
+        100,
+        trigger=trigger,
+        grace_secs=5.0,
+        ppid_map_provider=lambda: {200: 100, 300: 200, 999: 1},  # 999 is unrelated
+        kill=fake_kill,
+        killpg=lambda pgid, sig: events.append(('killpg', pgid)),
+        sleep=lambda secs: events.append(('sleep', secs)),
+        exit_fn=lambda code: events.append(('exit', code)),
+        stderr=stderr if stderr is not None else _RecordingStderr(events),
+    )
+    return events
+
+
+def _written(events):
+    """Everything the double was asked to write, in order."""
+    return ''.join(e[1] for e in events if e[0] == 'write')
+
+
+class TestFireWatchdogKillTriggerLine:
+    """fire_watchdog_kill writes one flushed, attributable trigger line before exiting."""
+
+    def test_writes_one_flushed_trigger_line_before_exit(self):
+        """One newline-terminated line naming the trigger, flushed, with exit_fn still last."""
+        from orchestrator.verify_cancel import WATCHDOG_FIRE_TRIGGER_TOKEN, WatchdogTrigger
+
+        events = _fire_with_recording_stderr(WatchdogTrigger.HEARTBEAT_STARVATION, [])
+
+        written = _written(events)
+        assert written.endswith('\n')
+        assert written.count('\n') == 1, f'expected exactly one line; got {written!r}'
+        assert f'{WATCHDOG_FIRE_TRIGGER_TOKEN}=heartbeat_starvation' in written
+
+        kinds = [e[0] for e in events]
+        assert kinds.index('write') < kinds.index('flush') < kinds.index('exit')
+        assert [e for e in events if e[0] == 'exit'] == [('exit', 1)]
+        assert events[-1] == ('exit', 1), 'exit_fn must stay the final action'
+
+    def test_eof_trigger_is_reported_verbatim(self):
+        """The EOF branch is distinguishable from starvation by the line alone."""
+        from orchestrator.verify_cancel import WATCHDOG_FIRE_TRIGGER_TOKEN, WatchdogTrigger
+
+        written = _written(_fire_with_recording_stderr(WatchdogTrigger.EOF, []))
+
+        assert f'{WATCHDOG_FIRE_TRIGGER_TOKEN}=eof' in written
+        assert 'heartbeat_starvation' not in written
+
+    def test_trigger_line_is_emitted_after_the_kill_sequence(self):
+        """The line is written after the SIGKILL pass, so the token is last on the channel."""
+        from orchestrator.verify_cancel import WatchdogTrigger
+
+        events = _fire_with_recording_stderr(WatchdogTrigger.EOF, [])
+
+        write_idx = [i for i, e in enumerate(events) if e[0] == 'write']
+        kill_idx = [i for i, e in enumerate(events) if e[0] == 'kill']
+        assert kill_idx, 'expected a SIGKILL pass'
+        assert min(write_idx) > max(kill_idx)
+
+    def test_kill_sequence_is_unchanged(self):
+        """NON-GOAL guard: reporting changed, fire behaviour did not."""
+        from orchestrator.verify_cancel import WatchdogTrigger
+
+        events = _fire_with_recording_stderr(WatchdogTrigger.HEARTBEAT_STARVATION, [])
+
+        assert {e[1] for e in events if e[0] == 'term'} == {200, 300}  # descendants only
+        assert {e[1] for e in events if e[0] == 'kill'} == {200, 300}
+
+        sleep_idx = events.index(('sleep', 5.0))
+        assert all(events.index(('term', pid)) < sleep_idx for pid in (200, 300))
+        assert all(events.index(('kill', pid)) > sleep_idx for pid in (200, 300))
+
+        assert [e for e in events if e[0] == 'killpg'] == []
+        assert len([e for e in events if e[0] == 'exit']) == 1
+
+    @pytest.mark.parametrize(
+        'raise_on_write,raise_on_flush',
+        [
+            (OSError('Broken pipe'), None),
+            (None, ValueError('I/O operation on closed file')),
+        ],
+        ids=['write-raises', 'flush-raises'],
+    )
+    def test_stderr_failure_never_prevents_exit(self, raise_on_write, raise_on_flush):
+        """A dead channel loses the diagnostic, never the self-exit that frees the flock."""
+        from orchestrator.verify_cancel import WatchdogTrigger
+
+        events = []
+        stderr = _RecordingStderr(
+            events, raise_on_write=raise_on_write, raise_on_flush=raise_on_flush
+        )
+
+        # Must not raise: the abandoned leader has to die even with no channel left.
+        _fire_with_recording_stderr(WatchdogTrigger.EOF, events, stderr=stderr)
+
+        assert [e for e in events if e[0] == 'exit'] == [('exit', 1)]
+        assert events[-1] == ('exit', 1)
+
+    def test_default_stream_is_sys_stderr_resolved_at_call_time(self, monkeypatch):
+        """With no stderr= override the token lands on stderr — never on stdout.
+
+        The channel is load-bearing, not cosmetic: on a remote verify stdout is
+        the VerifyResult JSON transport ``verify_runner.result_from_json`` parses,
+        so a default that resolved to stdout would turn every self-kill into an
+        unparseable-result RunnerUnavailable.  Every other test here injects
+        ``stderr=``, which would leave that resolution unexecuted.  Patching
+        ``sys.stderr`` after import also pins the resolution to CALL time.
+        """
+        import sys
+
+        from orchestrator.verify_cancel import (
+            WATCHDOG_FIRE_TRIGGER_TOKEN,
+            WatchdogTrigger,
+            fire_watchdog_kill,
+        )
+
+        err_events, out_events = [], []
+        monkeypatch.setattr(sys, 'stderr', _RecordingStderr(err_events))
+        monkeypatch.setattr(sys, 'stdout', _RecordingStderr(out_events))
+
+        fire_watchdog_kill(
+            100,
+            trigger=WatchdogTrigger.EOF,
+            grace_secs=0.0,
+            ppid_map_provider=dict,
+            kill=lambda pid, sig: None,
+            killpg=lambda pgid, sig: None,
+            sleep=lambda secs: None,
+            exit_fn=lambda code: None,
+        )
+
+        assert _written(err_events) == f'{WATCHDOG_FIRE_TRIGGER_TOKEN}=eof\n'
+        assert out_events == [], f'the trigger line must never reach stdout; got {out_events!r}'
+
+
+# ---------------------------------------------------------------------------
+# Task 4194 amend: elide_middle keeps exactly the two ends it is asked for
+#
+# ``text[-tail:]`` is ``text[0:]`` when tail is 0, so the "keep nothing from
+# this end" cell returned the WHOLE string behind a marker claiming characters
+# had been dropped — loud-over-silent inverted inside the helper that exists to
+# uphold it.  The sole call site takes the defaults, but the helper is public,
+# imported across modules, and its docstring invites tuning either end.  The
+# merge_queue tests reach it only through a formatted log record, so these are
+# the only assertions that touch the ends and the boundary directly.
+# ---------------------------------------------------------------------------
+
+
+class TestElideMiddle:
+    """elide_middle keeps the ends it is asked for and counts exactly what it dropped."""
+
+    def test_tail_zero_keeps_nothing_from_the_end(self):
+        """tail=0 is a count, not an offset: text[-0:] would keep everything."""
+        from orchestrator.verify_cancel import elide_middle
+
+        elided = elide_middle('A' * 100, head=10, tail=0)
+
+        assert elided == 'A' * 10 + '…<90 chars elided>…'
+        assert len(elided) < 100
+
+    def test_head_zero_keeps_nothing_from_the_start(self):
+        """The other end has always been a plain forward slice; pin it so both stay honest."""
+        from orchestrator.verify_cancel import elide_middle
+
+        elided = elide_middle('A' * 100, head=0, tail=10)
+
+        assert elided == '…<90 chars elided>…' + 'A' * 10
+
+    def test_marker_counts_exactly_the_dropped_characters(self):
+        """Everything is either kept at one end or accounted for by the marker."""
+        from orchestrator.verify_cancel import elide_middle
+
+        elided = elide_middle('HH' + 'M' * 47 + 'TTT', head=2, tail=3)
+
+        assert elided == 'HH…<47 chars elided>…TTT'
+
+    def test_text_of_exactly_head_plus_tail_is_verbatim(self):
+        """The bound is inclusive: nothing is dropped, so no marker is added."""
+        from orchestrator.verify_cancel import elide_middle
+
+        text = 'A' * 30
+
+        assert elide_middle(text, head=10, tail=20) == text
+
+    def test_one_character_over_the_bound_elides_that_character(self):
+        """The first cell past the bound drops exactly one character and says so."""
+        from orchestrator.verify_cancel import elide_middle
+
+        elided = elide_middle('A' * 31, head=10, tail=20)
+
+        assert elided == 'A' * 10 + '…<1 chars elided>…' + 'A' * 20
 
 
 # ---------------------------------------------------------------------------
@@ -1309,7 +2480,7 @@ class TestStartStdinWatchdog:
             read_fd=0,
             select_fn=fake_select,
             read_fn=fake_read,
-            fire=lambda: fire_calls.append(True),
+            fire=lambda trigger: fire_calls.append(True),
         )
 
         # (a) return value is a Thread with .daemon True; join() only succeeds if started
@@ -1320,3 +2491,247 @@ class TestStartStdinWatchdog:
 
         # (b) the injected fire was invoked exactly once (loop wired to on_fire)
         assert fire_calls == [True]
+
+
+# ---------------------------------------------------------------------------
+# Task 4194 step-1: WatchdogTrigger — which branch judged the channel dead
+#
+# run_stdin_watchdog has two fire branches whose causes and remedies have
+# nothing in common: EOF (the writing end closed the dispatch channel — the
+# orchestrator died, or ssh dropped) and heartbeat starvation (no beat
+# arrived inside the window — a hard partition, or a timeout tuned too tight
+# for the host).  Both call on_fire() with zero arguments today, so once the
+# process has self-exited nothing downstream can say WHICH one fired.  These
+# tests pin the branch identity through every hop of the callback chain
+# (run_stdin_watchdog -> start_stdin_watchdog's default fire -> cli's
+# _on_watchdog_fire -> fire_watchdog_kill); the stderr line that carries it
+# off the host is step-3.
+# ---------------------------------------------------------------------------
+
+
+class TestWatchdogTriggerThreading:
+    """The WatchdogTrigger naming the fired branch reaches every callback hop."""
+
+    def test_eof_branch_reports_eof_trigger(self):
+        """A b'' read (writing end closed) fires once with WatchdogTrigger.EOF."""
+        from orchestrator.verify_cancel import WatchdogTrigger, run_stdin_watchdog
+
+        triggers = []
+
+        def record(trigger):
+            triggers.append(trigger)
+
+        def fake_select(rlist, wlist, xlist, timeout):
+            return (rlist, [], [])  # fd ready
+
+        def fake_read(fd, size):
+            return b''  # EOF
+
+        run_stdin_watchdog(
+            7,
+            record,
+            heartbeat_timeout=5.0,
+            select_fn=fake_select,
+            read_fn=fake_read,
+        )
+
+        assert len(triggers) == 1
+        assert triggers[0] is WatchdogTrigger.EOF
+
+    def test_timeout_branch_reports_heartbeat_starvation_trigger(self):
+        """An empty ready set fires once with HEARTBEAT_STARVATION, without ever reading."""
+        from orchestrator.verify_cancel import WatchdogTrigger, run_stdin_watchdog
+
+        triggers = []
+        read_calls = []
+
+        def record(trigger):
+            triggers.append(trigger)
+
+        def fake_select(rlist, wlist, xlist, timeout):
+            return ([], [], [])  # timeout -- nothing ready
+
+        def fake_read(fd, size):
+            read_calls.append((fd, size))
+            return b'\n'  # must never be reached
+
+        run_stdin_watchdog(
+            7,
+            record,
+            heartbeat_timeout=5.0,
+            select_fn=fake_select,
+            read_fn=fake_read,
+        )
+
+        assert len(triggers) == 1
+        assert triggers[0] is WatchdogTrigger.HEARTBEAT_STARVATION
+        assert read_calls == []  # starvation fires without ever reading
+
+    def test_trigger_values_are_the_wire_tokens(self):
+        """The enum is the single definition of both spellings that cross the ssh channel."""
+        from orchestrator.verify_cancel import WATCHDOG_FIRE_TRIGGER_TOKEN, WatchdogTrigger
+
+        assert {t.value for t in WatchdogTrigger} == {'eof', 'heartbeat_starvation'}
+        assert WATCHDOG_FIRE_TRIGGER_TOKEN == 'watchdog_fire_trigger'
+
+    def test_default_fire_forwards_the_trigger(self, monkeypatch):
+        """With no fire= override the default callback forwards the EOF trigger."""
+        import orchestrator.verify_cancel as verify_cancel
+        from orchestrator.verify_cancel import WatchdogTrigger, start_stdin_watchdog
+
+        kill_calls = []
+        monkeypatch.setattr(
+            verify_cancel,
+            'fire_watchdog_kill',
+            lambda pgid, **kwargs: kill_calls.append((pgid, kwargs)),
+        )
+
+        thread = start_stdin_watchdog(
+            12345,
+            heartbeat_timeout=5.0,
+            grace_secs=1.0,
+            read_fd=0,
+            select_fn=lambda rlist, wlist, xlist, timeout: (rlist, [], []),
+            read_fn=lambda fd, size: b'',  # EOF
+        )
+        thread.join(timeout=5.0)
+
+        assert not thread.is_alive()
+        assert len(kill_calls) == 1
+        pgid, kwargs = kill_calls[0]
+        assert pgid == 12345
+        assert kwargs['grace_secs'] == 1.0
+        assert kwargs['trigger'] is WatchdogTrigger.EOF
+
+    def test_default_fire_forwards_starvation_trigger(self, monkeypatch):
+        """The same default callback forwards HEARTBEAT_STARVATION on the timeout branch."""
+        import orchestrator.verify_cancel as verify_cancel
+        from orchestrator.verify_cancel import WatchdogTrigger, start_stdin_watchdog
+
+        kill_calls = []
+        monkeypatch.setattr(
+            verify_cancel,
+            'fire_watchdog_kill',
+            lambda pgid, **kwargs: kill_calls.append((pgid, kwargs)),
+        )
+
+        thread = start_stdin_watchdog(
+            12345,
+            heartbeat_timeout=5.0,
+            grace_secs=1.0,
+            read_fd=0,
+            select_fn=lambda rlist, wlist, xlist, timeout: ([], [], []),  # starvation
+            read_fn=lambda fd, size: b'\n',  # must never be reached
+        )
+        thread.join(timeout=5.0)
+
+        assert not thread.is_alive()
+        assert len(kill_calls) == 1
+        pgid, kwargs = kill_calls[0]
+        assert pgid == 12345
+        assert kwargs['grace_secs'] == 1.0
+        assert kwargs['trigger'] is WatchdogTrigger.HEARTBEAT_STARVATION
+
+
+# ---------------------------------------------------------------------------
+# Task 4195 step-11: the watchdog deadline is DERIVED from the ssh transport's
+# own dead-peer verdict, not pinned independently of it.
+#
+# ssh declares a peer dead at ServerAliveInterval * ServerAliveCountMax and
+# exits non-zero, which the dispatcher already handles.  A watchdog deadline
+# below that opens a band in which the remote self-kills a healthy build on a
+# link ssh would have ridden through — the watchdog out-voting the transport on
+# a question the transport is the authority for.  These tests pin the
+# derivation and its invariant against the constants, never against the number.
+# ---------------------------------------------------------------------------
+
+
+class TestWatchdogTimeoutDerivedFromTransport:
+    """WATCHDOG_HEARTBEAT_TIMEOUT_SECS follows from the ssh keepalive constants."""
+
+    def test_timeout_is_the_transport_deadline_times_the_headroom(self):
+        """Every input is auditable: the value is a named multiple of a product."""
+        from orchestrator.verify_cancel import (
+            SSH_SERVER_ALIVE_COUNT_MAX,
+            SSH_SERVER_ALIVE_INTERVAL,
+            SSH_TRANSPORT_DEAD_PEER_SECS,
+            WATCHDOG_HEARTBEAT_TIMEOUT_SECS,
+            WATCHDOG_TRANSPORT_HEADROOM,
+        )
+
+        assert SSH_TRANSPORT_DEAD_PEER_SECS == (
+            SSH_SERVER_ALIVE_INTERVAL * SSH_SERVER_ALIVE_COUNT_MAX
+        )
+        assert WATCHDOG_HEARTBEAT_TIMEOUT_SECS == (
+            WATCHDOG_TRANSPORT_HEADROOM * SSH_TRANSPORT_DEAD_PEER_SECS
+        )
+
+    def test_the_watchdog_never_out_votes_the_transport(self):
+        """THE INVARIANT this task exists to establish."""
+        from orchestrator.verify_cancel import (
+            SSH_TRANSPORT_DEAD_PEER_SECS,
+            WATCHDOG_HEARTBEAT_TIMEOUT_SECS,
+        )
+
+        assert WATCHDOG_HEARTBEAT_TIMEOUT_SECS > SSH_TRANSPORT_DEAD_PEER_SECS, (
+            f'The watchdog would fire at {WATCHDOG_HEARTBEAT_TIMEOUT_SECS}s, inside ssh\'s own '
+            f'{SSH_TRANSPORT_DEAD_PEER_SECS}s dead-peer verdict. That opens a band in which the '
+            f'remote self-kills a healthy build on a link ssh would have ridden through — the '
+            f'watchdog out-voting the transport on a question the transport is the authority '
+            f'for. Lowering WATCHDOG_TRANSPORT_HEADROOM to <= 1.0 re-opens that band; the old '
+            f'independently-pinned 10.0s sat 6x inside it.'
+        )
+
+    def test_timeout_still_tolerates_many_missed_beats(self):
+        """The superseded ``2 * HEARTBEAT_INTERVAL_SECS`` definition's property, kept as a floor.
+
+        That definition existed to tolerate a single missed or delayed beat.
+        The derived value clears it by a wide margin (18 beats), but stating it
+        as an explicit floor means a future retune of either input cannot
+        silently drop back below it.
+        """
+        from orchestrator.verify_cancel import (
+            HEARTBEAT_INTERVAL_SECS,
+            WATCHDOG_HEARTBEAT_TIMEOUT_SECS,
+        )
+
+        assert WATCHDOG_HEARTBEAT_TIMEOUT_SECS >= 2 * HEARTBEAT_INTERVAL_SECS
+
+    def test_the_two_modules_agree_on_the_keepalive_pair(self):
+        """The dispatcher's keepalive values and the watchdog's deadline agree.
+
+        Stated as the property this can actually enforce, which is NOT what a
+        predecessor of this test claimed. That version asserted identity
+        (``is``) and said it proved verify_runner "does not keep a second
+        copy": 15 and 4 both sit inside CPython's small-int cache, so two
+        independently written literals ARE identical and a re-introduced
+        ``SSH_SERVER_ALIVE_INTERVAL = 15`` in verify_runner would have left it
+        green — it would have regained its advertised strength only if a future
+        retune happened to push a value past 256.
+
+        What IS enforceable is the consequence a second copy has the moment it
+        matters: it DRIFTS, and then the values the dispatcher sends stop
+        agreeing with the deadline the remote waits out. Equality catches that
+        at the drift.
+
+        An argv-level check — that verify_runner's private ``_SSH_BASE_OPTS``
+        interpolates verify_cancel's pair — was considered and deliberately not
+        made. It would be exactly as blind to a same-valued second copy (such a
+        copy renders identical flags), so it detects nothing this does not,
+        while reaching into a module internal from a test: the interface smell
+        docs/code-quality.md names, and one the merge-lane ratchet's
+        ``private_reads`` measure counts and forbids raising. The argv surface
+        is covered on its own side of the boundary by
+        ``test_verify_runner.py::test_all_four_sites_carry_identical_keepalive_flags``.
+        """
+        from orchestrator import verify_cancel, verify_runner
+
+        assert verify_runner.SSH_SERVER_ALIVE_INTERVAL == verify_cancel.SSH_SERVER_ALIVE_INTERVAL
+        assert verify_runner.SSH_SERVER_ALIVE_COUNT_MAX == verify_cancel.SSH_SERVER_ALIVE_COUNT_MAX
+
+        # ...and the deadline the remote waits out, from those same two names.
+        assert verify_cancel.WATCHDOG_HEARTBEAT_TIMEOUT_SECS == (
+            verify_cancel.WATCHDOG_TRANSPORT_HEADROOM
+            * verify_cancel.SSH_SERVER_ALIVE_INTERVAL
+            * verify_cancel.SSH_SERVER_ALIVE_COUNT_MAX
+        )

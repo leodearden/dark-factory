@@ -10,8 +10,8 @@ disk at the cost of making the corpus opaque to ``rg`` and forcing every reader
 to carry a gzip branch. This sweep converts the existing archive to ONE plain,
 greppable ``.jsonl`` corpus so those branches can be deleted.
 
-The ordering contract (INV-3 corroborate-before-destroy)
---------------------------------------------------------
+The ordering contract (INV-3 corroborate-before-acting)
+-------------------------------------------------------
 :func:`gunzip_one` executes STRICTLY in this order, and the order is the whole
 point of the module:
 

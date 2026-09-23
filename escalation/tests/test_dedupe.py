@@ -117,7 +117,8 @@ class TestSummaryDedupeKey:
 
 
 class TestEscalationDedupeFields:
-    """Escalation dataclass gains dedupe_count and dedupe_children fields."""
+    """Escalation dataclass gains dedupe_count, dedupe_children and
+    dedupe_children_truncated fields."""
 
     def _make_min_escalation(self):
         from escalation.models import Escalation
@@ -169,6 +170,45 @@ class TestEscalationDedupeFields:
         assert esc_b.dedupe_children == [], (
             'dedupe_children must use default_factory, not a shared class-level list'
         )
+
+    # --- dedupe_children_truncated: the growth bound's durable loss counter ---
+
+    def test_dedupe_children_truncated_defaults_to_zero(self):
+        """A new Escalation has shed nothing, so the counter starts at 0."""
+        esc = self._make_min_escalation()
+        assert esc.dedupe_children_truncated == 0
+
+    def test_dedupe_children_truncated_round_trips_via_json(self):
+        """The counter survives to_json / from_json.
+
+        Without this the loss would be log-only: the TRUE provenance total is
+        ``len(dedupe_children) + dedupe_children_truncated``, so a counter that
+        did not persist would make the shed unassertable from the record
+        (INV-8 / no-silent-fail-soft).
+        """
+        from escalation.models import Escalation
+        esc = self._make_min_escalation()
+        esc.dedupe_children_truncated = 7
+        restored = Escalation.from_json(esc.to_json())
+        assert restored.dedupe_children_truncated == 7
+
+    def test_from_dict_without_truncated_key_uses_default(self):
+        """Legacy on-disk JSON without the key loads with 0 — zero migration.
+
+        Same contract as every field added since: ``from_dict`` filters on
+        ``__dataclass_fields__``, so an absent key simply takes its default.
+        """
+        from escalation.models import Escalation
+        old_dict = {
+            'id': 'esc-1-1',
+            'task_id': '1',
+            'agent_role': 'implementer',
+            'severity': 'blocking',
+            'category': 'infra_issue',
+            'summary': 'connection lost',
+        }
+        esc = Escalation.from_dict(old_dict)
+        assert esc.dedupe_children_truncated == 0
 
 
 class TestFindDedupeParent:
@@ -1499,6 +1539,208 @@ class TestSubmitOrDedupe:
         assert result2['id'] == files[0].stem
 
 
+class TestDedupeHalves:
+    """``submit_or_dedupe``'s two halves, named and independently callable.
+
+    ``resolve_dedupe_parent`` is the pure READ — the two gates plus the
+    ``find_dedupe_parent`` scan — and ``attach_or_submit`` is the WRITE — the
+    TOCTOU guard, the fold, and the submit fall-through.  They are separately
+    named because only the READ half moves to a worker thread (task 5648), so
+    each has to be reachable on its own, and the read half has to be provably
+    free of writes.  That second property is not asserted once in a test of its
+    own: ``_resolve`` below re-checks it on EVERY call this class makes, so a
+    write that creeps into the read half fails whichever test introduced it.
+    """
+
+    def _make_infra_esc(self, esc_id: str, task_id: str = '42', summary: str = 'fused-memory connection timeout on port 8002'):
+        from escalation.models import Escalation
+        return Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='implementer',
+            severity='blocking',
+            category='infra_issue',
+            summary=summary,
+        )
+
+    def _queue_files(self, queue):
+        return sorted(queue.queue_dir.glob('esc-*.json'))
+
+    def _resolve(self, queue, esc, config, now=None):
+        """``resolve_dedupe_parent``, with its read-only contract enforced.
+
+        The queue root is snapshotted across the call, so the property step 4
+        relies on when it moves this function to a worker thread — it writes
+        nothing — is checked at every use rather than in one test a later
+        change could route around.
+        """
+        from escalation.dedupe import resolve_dedupe_parent
+
+        before = self._queue_files(queue)
+        result = resolve_dedupe_parent(queue, esc, config, now=now)
+        assert self._queue_files(queue) == before, (
+            'resolve_dedupe_parent is the READ half and must write nothing'
+        )
+        return result
+
+    # --- resolve_dedupe_parent: the one outcome that finds a parent ---
+
+    def test_resolve_returns_the_oldest_matching_parent(self, tmp_path):
+        """Both gates open and two same-key parents pending => the OLDER id."""
+        from datetime import UTC, datetime, timedelta
+
+        from escalation.dedupe import DedupeConfig
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        older = self._make_infra_esc('esc-1-1')
+        older.timestamp = (datetime.now(UTC) - timedelta(seconds=120)).isoformat()
+        queue.submit(older)
+        newer = self._make_infra_esc('esc-1-2')
+        newer.timestamp = (datetime.now(UTC) - timedelta(seconds=30)).isoformat()
+        queue.submit(newer)
+
+        candidate = self._make_infra_esc('esc-1-3', summary='Fused-memory  CONNECTION timeout!')
+
+        assert self._resolve(queue, candidate, DedupeConfig()) == older.id
+
+    # --- resolve_dedupe_parent: the three outcomes that return None ---
+
+    def test_resolve_returns_none_when_the_enabled_gate_is_shut(self, tmp_path):
+        """Gate 1 — a same-key pending parent exists and is still not returned."""
+        from escalation.dedupe import DedupeConfig
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(self._make_infra_esc('esc-1-1'))
+        candidate = self._make_infra_esc('esc-1-2', summary='Fused-memory  CONNECTION timeout!')
+
+        assert self._resolve(queue, candidate, DedupeConfig(infra_dedupe_enabled=False)) is None
+
+    def test_resolve_returns_none_for_a_category_outside_the_gate(self, tmp_path):
+        """Gate 2 — same summary tokens, category the stock config does not fold."""
+        from escalation.dedupe import DedupeConfig
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        parent = self._make_infra_esc('esc-1-1')
+        parent.category = 'design_concern'
+        queue.submit(parent)
+        candidate = self._make_infra_esc('esc-1-2')
+        candidate.category = 'design_concern'
+
+        assert self._resolve(queue, candidate, DedupeConfig()) is None
+
+    def test_resolve_returns_none_when_both_gates_open_but_nothing_matches(self, tmp_path):
+        """The scan itself found no parent — the outcome the two gates cannot produce."""
+        from escalation.dedupe import DedupeConfig
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(self._make_infra_esc('esc-1-1', summary='falkordb refused the connection'))
+        candidate = self._make_infra_esc('esc-1-2')
+
+        assert self._resolve(queue, candidate, DedupeConfig()) is None
+
+    # --- attach_or_submit: the three branches of the WRITE half ---
+
+    def test_attach_or_submit_folds_into_a_real_pending_parent(self, tmp_path):
+        """A live parent id yields the dedup_skipped shape and no second file."""
+        from escalation.dedupe import attach_or_submit
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        parent = self._make_infra_esc('esc-1-1')
+        queue.submit(parent)
+        child = self._make_infra_esc('esc-1-2', summary='Fused-memory  CONNECTION timeout!')
+
+        result = attach_or_submit(queue, child, parent.id)
+
+        assert result == {
+            'id': parent.id,
+            'status': 'dedup_skipped',
+            'parent_id': parent.id,
+            'child_id': child.id,
+            'level': child.level,
+        }
+        assert len(self._queue_files(queue)) == 1
+
+    def test_attach_or_submit_with_no_parent_submits(self, tmp_path):
+        """parent_id=None is the submit fall-through, reported from observed state."""
+        from escalation.dedupe import attach_or_submit
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_infra_esc('esc-1-1')
+
+        result = attach_or_submit(queue, esc, None)
+
+        assert result['id'] == esc.id
+        assert result['status'] == 'queued'
+        # 'level' is on every branch — the documented "the echo confirms the
+        # level landed" contract, which the halves must not drop.
+        assert result['level'] == esc.level
+        assert [p.stem for p in self._queue_files(queue)] == [esc.id]
+
+    def test_attach_or_submit_falls_through_when_the_parent_was_resolved(self, tmp_path):
+        """The TOCTOU guard, now exercised through the named half.
+
+        A parent resolved between the resolve and the attach must produce a
+        real submit, never a dropped record — which is why step 4 can put an
+        ``await`` between the two halves without adding race handling.
+        """
+        from escalation.dedupe import attach_or_submit
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        parent = self._make_infra_esc('esc-1-1')
+        queue.submit(parent)
+        queue.resolve(parent.id, resolution='raced')
+        child = self._make_infra_esc('esc-1-2', summary='Fused-memory  CONNECTION timeout!')
+
+        result = attach_or_submit(queue, child, parent.id)
+
+        assert result['status'] == 'queued', (
+            f'a stale parent id must fall through to submit; got: {result}'
+        )
+        assert [p.stem for p in self._queue_files(queue)] == [child.id]
+
+    # --- the composition ---
+
+    def test_submit_or_dedupe_is_exactly_the_two_halves_composed(self, tmp_path):
+        """Same inputs, same response — on the fold branch and the queued one.
+
+        Stated as an equality against the composition rather than by re-pinning
+        response shapes: ``TestSubmitOrDedupe`` above already owns those four
+        branches, and 15+ sync callers outside this package depend on them, so
+        a second copy of the expectations here would be the thing that drifts.
+        """
+        from escalation.dedupe import DedupeConfig, attach_or_submit, submit_or_dedupe
+        from escalation.queue import EscalationQueue
+
+        def _seeded(root):
+            queue = EscalationQueue(root)
+            queue.submit(self._make_infra_esc('esc-1-1'))
+            return queue
+
+        cfg = DedupeConfig()
+        for child_id, summary in (
+            ('esc-1-2', 'Fused-memory  CONNECTION timeout!'),   # folds
+            ('esc-1-3', 'falkordb refused the connection'),      # queues
+        ):
+            whole = _seeded(tmp_path / f'whole-{child_id}')
+            halves = _seeded(tmp_path / f'halves-{child_id}')
+
+            via_whole = submit_or_dedupe(whole, self._make_infra_esc(child_id, summary=summary), cfg)
+            esc = self._make_infra_esc(child_id, summary=summary)
+            via_halves = attach_or_submit(halves, esc, self._resolve(halves, esc, cfg))
+
+            assert via_whole == via_halves, (
+                f'submit_or_dedupe diverged from its halves on {summary!r}: '
+                f'{via_whole} != {via_halves}'
+            )
+
+
 class TestEscalationDedupeFingerprint:
     """Escalation.dedupe_fingerprint field — added for content-fingerprint dedup (A7a)."""
 
@@ -1661,3 +1903,145 @@ class TestCrossLevelDedupeIsolation:
 
         assert result['status'] == 'dedup_skipped', f'Expected a fold, got: {result}'
         assert result['parent_id'] == 'esc-42-1'
+
+
+class TestNormalisationLiftedToCanonical:
+    """The casefold/strip/collapse pipeline lives in ONE place: escalation.canonical.
+
+    dedupe.py had THREE uses of the two regexes — ``_normalize_description``
+    (feeding ``compute_content_fingerprint``) and ``summary_dedupe_key``'s direct
+    ``_NON_WORD_PATTERN.sub`` (feeding ``find_dedupe_parent``).  Both call sites
+    now delegate to the lifted helper under an explicitly-pinned
+    ``punctuation='strip'`` policy, and the tests below pin that delegation by
+    OUTPUT EQUALITY against ``canonical_text`` — not by the absence of any
+    particular private name.  The regexes themselves live on quite legitimately
+    inside ``escalation.canonical``, their one home, so their presence somewhere
+    was never the property worth asserting; DRIFT is.  A second implementation of
+    the pipeline is caught the moment it diverges by a single character: the
+    delegation-equality assertions and the digest/tuple characterisation pins
+    below then fail loudly (INV-5).  A copy that does not diverge is not the risk
+    INV-5 exists to catch.
+
+    The digests and key tuples below are CHARACTERISATION pins, not aspirations:
+    every value was obtained by RUNNING the pre-lift implementation.  They are
+    load-bearing because both outputs are already persisted across the live
+    corpus — a fingerprint digest that changes silently un-dedupes every recon
+    finding already on disk, and a ``summary_dedupe_key`` tuple that changes
+    silently re-partitions every dedupe cluster already keyed fleet-wide.
+    """
+
+    # (escalation_category, finding_category, description) -> sha256 hex digest,
+    # computed by running the PRE-LIFT dedupe implementation.
+    _FINGERPRINT_REFERENCE = {
+        ('infra_issue', 'flaky-test', 'Fused-memory  CONNECTION timeout!'):
+            '29d2adc399cddb4369e5ad754c054e0f6f595f43ba375846c3f6741e40f59ad4',
+        ('risk_identified', 'perf', 'cpu+memory leak in the sweep loop'):
+            '393e47310ab5186a41cd3554e656e52c7686aa7bb28e22dd3e61ac95896d52fc',
+        ('design_concern', 'coupling', '  Watcher lease STOLEN.  '):
+            '26b8b9918444def709c36684a7e1f1edce11a41bec7dab1169c04cf2278d460f',
+        ('cleanup_needed', 'dead-code', 'starvation:2370:persistent-lock-contention'):
+            '45538de967982d58f3aafd64bcfae927f51a41cbb445c2115134b927cb076dd2',
+    }
+
+    def test_normalize_description_delegates_to_the_strip_policy(self):
+        """_normalize_description IS canonical_text(..., punctuation='strip')."""
+        from escalation.canonical import canonical_text
+        from escalation.dedupe import _normalize_description
+
+        for text in [
+            'a.b, c',
+            'Fused-memory  CONNECTION timeout!',
+            '  Watcher lease STOLEN.  ',
+            'risk:3184',
+            '',
+            '::',
+        ]:
+            assert _normalize_description(text) == canonical_text(
+                text, punctuation='strip'
+            ), f'delegation diverged for {text!r}'
+
+    def test_normalize_description_keeps_its_measured_outputs(self):
+        """Characterisation of the pipeline itself, independent of the delegation."""
+        from escalation.dedupe import _normalize_description
+
+        assert _normalize_description('a.b, c') == 'ab c'
+        assert _normalize_description('Fused-memory  CONNECTION timeout!') == (
+            'fusedmemory connection timeout'
+        )
+        assert _normalize_description('  Watcher lease STOLEN.  ') == 'watcher lease stolen'
+        # STRIP, not separator: the fingerprint policy must stay deletion-flavoured.
+        assert _normalize_description('risk:3184') == 'risk3184'
+
+    def test_content_fingerprint_digests_are_byte_identical(self):
+        """The digests already on disk must not move.
+
+        If this fails, the strip policy was changed (or the delegation is not
+        byte-identical) and every already-fingerprinted recon finding has stopped
+        matching its own past self — a large, invisible regression.
+        """
+        from escalation.dedupe import compute_content_fingerprint
+
+        for (esc_cat, find_cat, description), expected in self._FINGERPRINT_REFERENCE.items():
+            actual = compute_content_fingerprint(esc_cat, find_cat, [], description)
+            assert actual == expected, (
+                f'fingerprint digest changed for {description!r}: '
+                f'{actual} != {expected} — the live recon corpus would silently un-dedupe'
+            )
+
+    def test_content_fingerprint_ignores_description_when_affected_ids_present(self):
+        """Unchanged contract, re-pinned because the lift touched its only helper."""
+        from escalation.dedupe import compute_content_fingerprint
+
+        with_ids = compute_content_fingerprint(
+            'infra_issue', 'flaky-test', ['task-1', 'task-2'], 'one description'
+        )
+        other_description = compute_content_fingerprint(
+            'infra_issue', 'flaky-test', ['task-1', 'task-2'],
+            'a COMPLETELY different description!!',
+        )
+        assert with_ids == other_description
+        assert with_ids == '3d46b1b1c93febe00abf8d28be40c8c30db39d0a6136e04dce8532a5228666f9'
+
+    def test_summary_dedupe_key_matches_its_documented_examples(self):
+        """The five docstring doctests, promoted to real assertions.
+
+        ``summary_dedupe_key`` feeds ``find_dedupe_parent`` and its tuples are
+        persisted fleet-wide, so the rewire onto the lifted helper has to be
+        byte-identical.  These cases already cover the interesting shapes:
+        internal punctuation, a symbol join, a doubled space, a trailing '!',
+        the empty string, and the >3-token truncation.
+        """
+        from escalation.dedupe import summary_dedupe_key
+
+        assert summary_dedupe_key('Fused-memory  CONNECTION timeout!') == (
+            'fusedmemory', 'connection', 'timeout',
+        )
+        assert summary_dedupe_key('fused-memory connection timeout on port 8002') == (
+            'fusedmemory', 'connection', 'timeout',
+        )
+        assert summary_dedupe_key('lost link') == ('lost', 'link')
+        assert summary_dedupe_key('') == ()
+        assert summary_dedupe_key('cpu+memory leak') == ('cpumemory', 'leak')
+
+    def test_summary_dedupe_key_equals_the_strip_policy_expression(self):
+        """The rewire is exactly ``canonical_text(s, 'strip').split()[:3]``.
+
+        Verified during planning over all 2796 real summaries in the live queue
+        (0 mismatches): the helper's extra whitespace-collapse-and-strip is
+        absorbed by the subsequent ``.split()``.
+        """
+        from escalation.canonical import canonical_text
+        from escalation.dedupe import summary_dedupe_key
+
+        for summary in [
+            'Fused-memory  CONNECTION timeout!',
+            'cpu+memory leak',
+            '  leading and trailing  ',
+            '\t\n',
+            '::',
+            'one two three four five',
+            'ロック競合 が 発生',
+        ]:
+            assert summary_dedupe_key(summary) == tuple(
+                canonical_text(summary, punctuation='strip').split()[:3]
+            ), f'summary_dedupe_key diverged from the lifted helper for {summary!r}'

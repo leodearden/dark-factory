@@ -11,42 +11,37 @@ is a plain unit test; the single I/O boundary (an injected
 """
 from __future__ import annotations
 
-import importlib.util
 import json
-import sys
-import types
+import logging
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from _fm_helpers import load_script_module
+from _store_mutation_preflight_contract import (
+    SENTINEL,
+    deny,
+    fail_closed_records,
+    neutralise_fixture,
+)
 
 from fused_memory import topic_slug as topic_slug_module
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'retro_stamp_topics.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load retro_stamp_topics.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    reflection-based decorators work correctly.
-    """
-    mod_name = 'retro_stamp_topics'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
+_mod = load_script_module(SCRIPT_PATH, mod_name='retro_stamp_topics')
 
 
-_mod = _load_module()
+_neutralise = neutralise_fixture(
+    _mod,
+    note="""``run(..., apply=True)`` runs the preflight before it scrolls (task
+    4293). This suite is deliberately MOCK-unit (an AsyncMock service, no live
+    store). ``TestRunApplyStoreMutationPreflight`` re-rigs this per test -- to
+    refuse, to record, or to pass -- so the guard's own behaviour is still
+    pinned explicitly rather than assumed away.""",
+)
 
 
 # ===========================================================================
@@ -189,9 +184,10 @@ class TestTopicSlugNamespaceIsShared:
     copy fail mechanically rather than by review.
 
     The thing to watch for when editing ``derive_topic_slug`` is a *second
-    anchored slug validator*.  The fold itself legitimately needs a
-    character-class pattern to collapse runs of punctuation, so ``re`` is
-    not forbidden here — what must not appear is a local pattern that
+    anchored slug validator*.  The fold legitimately needs a character-class
+    pattern to collapse runs of punctuation — but since task 4878 that
+    pattern lives in ε beside the fold, and this script imports ``re`` for
+    nothing at all.  What must not appear here is a local pattern that
     decides whether a slug is VALID, because that is the copy free to
     drift from ε while every test still passes.  Validity is settled by
     calling ``is_valid_topic_slug``; the identity assertions below prove
@@ -203,6 +199,18 @@ class TestTopicSlugNamespaceIsShared:
 
     def test_cap_is_the_same_object(self):
         assert _mod.TOPIC_SLUG_MAX_LEN is topic_slug_module.TOPIC_SLUG_MAX_LEN
+
+    def test_fold_is_the_same_object(self):
+        """The fold moved to ε (task 4878); this script must IMPORT it.
+
+        ``scripts/normalize_topic_slugs.py`` folds the same way over the
+        whole corpus.  Two copies of a fold that decides what a record's
+        topic BECOMES is exactly the drift the identity pins above exist
+        to catch, so the fold gets the same treatment as the constants:
+        an inlined re-definition here fails by design rather than by
+        review.
+        """
+        assert _mod.derive_topic_slug is topic_slug_module.derive_topic_slug
 
 
 # ===========================================================================
@@ -1493,6 +1501,12 @@ class TestStampOne:
         assert kwargs['metadata_patch'] == {'topic': 'topic-one'}
         assert kwargs['metadata_mode'] == 'merge'
         assert kwargs['_source'] == 'retro_stamp_topics'
+        assert kwargs['agent_id'] == 'retro_stamp_topics', (
+            'a metadata_patch write routes through '
+            '_apply_memory_metadata_validation, whose census/storm keying '
+            'reads agent_id (not _source) -- an unset agent_id keys every '
+            'row from this sweep to a null agent'
+        )
         assert 'content' not in kwargs, (
             f'a content argument would re-embed the record: {kwargs}'
         )
@@ -2697,3 +2711,150 @@ class TestReportRenderAndCli:
         )
         assert args.json_out == '/tmp/x.json'
         assert args.md_out == '/tmp/x.md'
+
+
+# ===========================================================================
+# Tests: --apply store-mutation preflight
+# ===========================================================================
+
+class TestRunApplyStoreMutationPreflight:
+    """``--apply`` refuses to START when this process cannot write mem0's store.
+
+    Ported from ``test_sweep_toolcall_xml_leak.TestRunApplyStoreMutationPreflight``
+    (task 3686), which is the in-repo precedent for this contract.
+
+    ``run`` stamps its targets in a sequential loop through ``stamp_one``,
+    whose write sits inside a per-target ``try/except Exception`` that files
+    the failure as an ``outcome: 'error'`` row and carries on.
+    ``StoreMutationUnavailable`` subclasses ``RuntimeError``, so a probe at
+    ``stamp_one``'s own ``--apply`` gate would be swallowed by that handler:
+    ``run`` would return a normally-shaped report and a success-ish exit code
+    while every target had been attempted against a store this process cannot
+    write a history for. Only a run-wide probe ahead of the scroll bounds that.
+    """
+
+    def _service(self) -> AsyncMock:
+        """Two stampable targets, so one-probe-per-RUN is distinguishable from
+        one-probe-per-target."""
+        service = _run_service()
+        service.seed(M1, M2)
+        return service
+
+    def _gates(self) -> tuple:
+        return (
+            _gate('topic-one', members=(M1,), gate_task_id='9998'),
+            _gate('topic-two', members=(M2,), gate_task_id='9999'),
+        )
+
+    async def _run(self, service, *, apply: bool):
+        return await _mod.run(
+            service,
+            projects=('dark_factory',),
+            apply=apply,
+            calibration_rows=[],
+            registry=_registry(),
+            gate_manifest=self._gates(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
+        self, monkeypatch
+    ):
+        """The whole point: refuse to start rather than half-complete.
+
+        The refusal must PROPAGATE. Swallowed at ``stamp_one``'s gate it would
+        become N ``outcome: 'error'`` rows inside a report that otherwise looks
+        like a completed sweep.
+        """
+        deny(_mod, monkeypatch)
+        service = self._service()
+
+        with pytest.raises(
+            _mod.StoreMutationUnavailable, match=SENTINEL
+        ):
+            await self._run(service, apply=True)
+
+        service.update_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_guard_sits_before_every_backend_read(self, monkeypatch):
+        """It aborts without a single round-trip: source (1)'s canonical scroll
+        is not paid for by a run that was never going to be allowed to stamp."""
+        deny(_mod, monkeypatch)
+        service = self._service()
+
+        with pytest.raises(_mod.StoreMutationUnavailable):
+            await self._run(service, apply=True)
+
+        service.get_memories_by_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_dry_run_is_never_gated_on_write_capability(self, monkeypatch):
+        """A rehearsal withholds only the writes, so it must not require the
+        ability to write -- the report stays obtainable from anywhere, with the
+        deny still installed."""
+        deny(_mod, monkeypatch)
+        service = self._service()
+
+        report = await self._run(service, apply=False)
+
+        assert report['apply'] is False
+        assert report['outcomes'].get('would_stamp') == 2
+        service.update_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_apply_is_unchanged_when_the_preflight_passes(self, monkeypatch):
+        """Happy path: a writable environment stamps exactly as before."""
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+        service = self._service()
+
+        report = await self._run(service, apply=True)
+
+        assert report['apply'] is True
+        assert report['outcomes'].get('stamped') == 2
+        assert service.update_memory.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_the_probe_names_the_operation_being_gated(self, monkeypatch):
+        """The refusal has to be attributable in a log, so the operation string
+        identifies this script and its mutating mode -- and with TWO stampable
+        targets in the manifest it is still probed once for the RUN, not once
+        per ``stamp_one`` call."""
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            _mod, 'assert_store_mutation_allowed', lambda **kw: calls.append(kw)
+        )
+        service = self._service()
+
+        report = await self._run(service, apply=True)
+
+        assert report['outcomes'].get('stamped') == 2
+        assert len(calls) == 1, 'probed ONCE per run, not once per target'
+        assert 'retro_stamp_topics' in calls[0]['operation']
+        assert '--apply' in calls[0]['operation']
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_is_loud(self, monkeypatch, caplog):
+        """The guard site logs its own fail-closed diagnosis before raising.
+
+        Nothing downstream will: ``main`` hands ``run`` to ``asyncio.run`` with
+        no handler, so without this record the operator sees a bare traceback
+        naming an exception class and no remedy. It is emitted through a
+        logger rather than ``print`` precisely so it stays off stdout, which
+        this script reserves for its machine-read markdown/JSON report.
+        """
+        deny(_mod, monkeypatch)
+        service = self._service()
+
+        with (
+            caplog.at_level(logging.ERROR),
+            pytest.raises(_mod.StoreMutationUnavailable),
+        ):
+            await self._run(service, apply=True)
+
+        assert fail_closed_records(caplog, 'retro_stamp_topics'), (
+            'nothing else explains this traceback -- the guard site must log '
+            'the fail-closed diagnosis before raising; got: '
+            f'{[rec.getMessage() for rec in caplog.records]}'
+        )
+        service.update_memory.assert_not_awaited()

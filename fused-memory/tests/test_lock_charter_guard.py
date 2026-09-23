@@ -111,7 +111,7 @@ _CANONICAL_EXTENSIONS = [
     'manifest', 'md', 'mjs', 'mts',
     'npmrc', 'png', 'py', 'python-version',
     'ri', 'rs', 'scss', 'service', 'sh', 'step', 'stl', 'svg',
-    'template', 'timer', 'toml', 'ts', 'tsx', 'txt', 'typed',
+    'template', 'timer', 'tombstones', 'toml', 'ts', 'tsx', 'txt', 'typed',
     'yaml', 'yml',
 ]
 
@@ -402,6 +402,10 @@ _ACCEPT_PATHS = [
     'gui/src-tauri/icons/icon.ico',  # reify
     'scripts/reify-audit-snapshot-filter.jq',  # reify
     'tree-sitter-reify/.npmrc',  # reify
+    # Widened 59 -> 60 for reify #6758 (spec-conformance α): the first tracked
+    # reify file with a `tombstones` extension; filename is PRD-normative
+    # (reify docs/prds/v0_6/spec-conformance-suite.md D3).
+    'docs/reify-language-spec.tombstones',  # reify
 ]
 
 
@@ -715,50 +719,38 @@ _DF_REPO_ROOT = Path(__file__).parents[2]
 # _REIFY_REPO_ROOT used to be defined here as `Path(__file__).parents[5] / 'reify'`
 # (a bare-checkout regression — task 3843). It now lives beside
 # _REIFY_GUARD_SCRIPT, above, resolved once via _resolve_reify_checkout() so both
-# reify call sites share one layout-independent resolution.
+# reify call sites share one layout-independent resolution.  The reachability
+# precondition that guards the sweeps below, `_skip_unless_checkout`, likewise
+# keeps only its local binding here: both its arms' wording lives in
+# `shared.reify_checkout.checkout_skip_reason` (task 4259).
 
 
 def _skip_unless_checkout(repo: str, repo_root: Path | None) -> Path:
     """Skip unless *repo_root* names a real checkout directory; else return it.
 
-    ONE reachability precondition for all three reify-parametrized sweeps
-    below, for the same reason ``_tracked_entries`` is one parse: three copies
-    of this guard would let the sweeps drift on what "the reify checkout is
-    missing" means, and a sweep that forgot the ``None`` arm would raise
-    ``AttributeError`` at the point it was supposed to skip.
+    Marker-bound adapter over `shared.reify_checkout.checkout_skip_reason`,
+    which owns BOTH arms' wording — why a discovery MISS is not an operator's
+    REIFY_ROOT typo, why the set-but-absent arm names the path verbatim, and why
+    it does not borrow the stronger marker-based reason.  Do not restate or
+    re-derive them here, and do not reintroduce a local copy of either arm; the
+    same helper in shared/tests/test_locking.py delegates to the identical
+    builder, which is the point (task 4259, consolidating what task 3843
+    established here).
 
-    The two arms are deliberately distinct, and the distinction is the whole
-    point of task 3843:
+    What is LOCAL is only the binding: this call site's guard-script marker, and
+    turning the reason into a ``pytest.skip`` — the shared module is pytest-free.
 
-    ``None`` — discovery MISS.  ``_resolve_reify_checkout`` walked every
-    ancestor and none carried ``reify/scripts/lock-charter-guard.sh``, with
-    REIFY_ROOT unset.  That is the legitimate standalone-checkout case, and its
-    WORDING comes from ``shared.reify_checkout`` so it cannot drift from what
-    the Tier-2 skipifs above (or orchestrator's verify gate) say about the same
-    condition.
-
-    set-but-absent — an operator's REIFY_ROOT names a path that is not there.
-    Honored verbatim rather than silently falling back to discovery, so the
-    skip reason NAMES the bad path and a typo is self-evident instead of
-    resolving to a different repo than the operator asked for.  That arm is the
-    ``is_dir()`` check below, kept local on purpose: these sweeps need a git
-    CHECKOUT, which is a weaker requirement than the guard script the Tier-2
-    gates need, so they must not borrow the shared marker-based reason.
+    Called through the module attribute on purpose, for the same reason
+    `_resolve_reify_checkout` notes above: the delegation pin in
+    TestSkipUnlessCheckout patches `reify_checkout.checkout_skip_reason`, which
+    a ``from ... import`` binding would put out of its reach.
     """
-    if repo_root is None:
-        # Only the reify parametrization can be None — _DF_REPO_ROOT is derived
-        # from __file__ and is always a path — and a None root is by
-        # construction the shared builder's discovery-miss arm.
-        reason = reify_checkout.reify_skip_reason(
-            _REIFY_GUARD_RELPATH, None, named_by_env=False
-        )
-        assert reason is not None, (
-            f'a None {repo} root is the discovery-miss arm, which always yields '
-            f'a reason — a falsy one here would turn this skip into a phantom pass'
-        )
+    reason = reify_checkout.checkout_skip_reason(
+        repo, repo_root, marker=_REIFY_GUARD_RELPATH
+    )
+    if reason is not None:
         pytest.skip(reason)
-    if not repo_root.is_dir():
-        pytest.skip(f'{repo} checkout not present at {repo_root}')
+    assert repo_root is not None  # narrows for the return
     return repo_root
 
 
@@ -1173,3 +1165,105 @@ class TestLockCharterError:
         result = lock_charter_error(['orchestrator/'])
         assert 'error' in result
         assert result['error_type'] == 'LockCharterViolation'
+
+
+class TestSkipUnlessCheckout:
+    """`_skip_unless_checkout` — this suite's binding to the shared skip builder.
+
+    Its FIRST direct coverage here (task 4259).  Until now it was exercised only
+    indirectly through the three parametrized sweeps below, which never observe
+    the ``None`` arm on a host where reify IS discoverable — the gap
+    shared/tests/test_locking.py's own TestSkipUnlessCheckout docstring already
+    called out in prose.  These cases call the helper directly, so both arms are
+    pinned host-independently.
+    """
+
+    def test_delegates_the_skip_decision_to_the_shared_builder(self, tmp_path, monkeypatch):
+        """The genuinely-RED pin: the DECISION must come from the shared builder.
+
+        The recomputed-equality cases below cannot tell delegation from a
+        hand-rolled string that happens to agree — which is exactly the state
+        both copies of this helper were in.  This one can: it patches the shared
+        builder to answer for a root that is a perfectly good directory, which a
+        local implementation would ADMIT.
+
+        RED before the rewire: the helper decides both arms itself, so a real
+        directory is returned unchanged and no skip is raised.
+        """
+        seen = {}
+
+        def _stub(repo, root, *, marker):
+            seen.update(repo=repo, root=root, marker=marker)
+            return 'stub reason from the shared builder'
+
+        monkeypatch.setattr(reify_checkout, 'checkout_skip_reason', _stub)
+
+        with pytest.raises(pytest.skip.Exception) as excinfo:
+            _skip_unless_checkout('reify', tmp_path)
+
+        assert str(excinfo.value) == 'stub reason from the shared builder', (
+            'this module must DELEGATE the skip decision to '
+            'shared.reify_checkout.checkout_skip_reason rather than keep a '
+            'private copy of the two arms'
+        )
+        assert seen['repo'] == 'reify'
+        assert seen['root'] == tmp_path
+        assert seen['marker'] == _REIFY_GUARD_RELPATH, (
+            "the shared builder must be bound to THIS call site's marker "
+            f'(expected {_REIFY_GUARD_RELPATH}, got {seen.get("marker")!r})'
+        )
+
+    def test_discovery_miss_skips_with_the_shared_wording(self):
+        """A None root is the discovery-miss arm — nobody has a reify sibling.
+
+        Two ways: the INDEPENDENT invariants first (the reason names the
+        override var and the marker), then the recomputed-call equality.  Green
+        either side of the rewire by construction — `checkout_skip_reason`
+        delegates its None arm to `reify_skip_reason`, which this helper already
+        called — and that is the point rather than a gap: a coincidental match
+        is indistinguishable from delegation from the outside.  What it adds is
+        that this suite and shared's cannot drift apart afterwards.
+        """
+        with pytest.raises(pytest.skip.Exception) as excinfo:
+            _skip_unless_checkout('reify', None)
+
+        reason = str(excinfo.value)
+        assert isinstance(reason, str) and reason, (
+            f'a falsy reason would turn this skip into a phantom pass: {reason!r}'
+        )
+        assert 'REIFY_ROOT' in reason, f'the skip must name the override: {reason!r}'
+        assert 'scripts/lock-charter-guard.sh' in reason, (
+            f'the skip must name the marker: {reason!r}'
+        )
+        assert reason == reify_checkout.checkout_skip_reason(
+            'reify', None, marker=_REIFY_GUARD_RELPATH
+        ), 'the discovery-miss wording must come from the shared builder'
+
+    def test_set_but_absent_root_skips_with_the_shared_wording(self, tmp_path):
+        """A REIFY_ROOT-shaped path that is not on disk must be NAMED.
+
+        Same two-way shape as above, against the set-but-absent arm — the
+        f-string that was hand-rolled identically here and in
+        shared/tests/test_locking.py before task 4259.
+        """
+        missing = tmp_path / 'no-such-reify-checkout'
+
+        with pytest.raises(pytest.skip.Exception) as excinfo:
+            _skip_unless_checkout('reify', missing)
+
+        reason = str(excinfo.value)
+        assert str(missing) in reason, (
+            f'the skip reason must name the bad path so a REIFY_ROOT typo is '
+            f'self-evident: {reason!r}'
+        )
+        assert reason == reify_checkout.checkout_skip_reason(
+            'reify', missing, marker=_REIFY_GUARD_RELPATH
+        ), 'the set-but-absent wording must come from the shared builder'
+
+    def test_present_directory_is_returned_unchanged(self, tmp_path):
+        """A real directory must be RETURNED, not skipped.
+
+        Otherwise the helper could skip everything vacuously and the three
+        sweeps it guards would never run against a real checkout.
+        """
+        assert _skip_unless_checkout('reify', tmp_path) == tmp_path

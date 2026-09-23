@@ -3753,6 +3753,462 @@ class TestPruneArchive:
         assert not older.exists(), 'Oldest .json file should be deleted to satisfy cap'
         assert newer.exists(), 'Newer .json file should remain'
 
+    # (f) junit reports are retained on GREEN runs too, so this budget is the
+    # only thing bounding them.
+    def test_old_junit_report_deleted(self, tmp_path: Path):
+        import os
+        import time
+        archive_root = tmp_path / 'archive'
+        archive_root.mkdir()
+        old_report = archive_root / 'attempt-1.junit-20260101T000000_000000Z.xml.gz'
+        old_report.write_bytes(b'\x1f\x8b')
+        old_mtime = time.time() - 31 * 86_400
+        os.utime(old_report, (old_mtime, old_mtime))
+        self._prune(archive_root, max_age_days=30)
+        assert not old_report.exists(), 'Old junit report should have been deleted'
+
+    def test_junit_report_counted_toward_size_budget(self, tmp_path: Path):
+        import os
+        import time
+        archive_root = tmp_path / 'archive'
+        archive_root.mkdir()
+        t = time.time() - 60
+        older = archive_root / 'attempt-1.junit-old.xml.gz'
+        newer = archive_root / 'attempt-2.junit-new.xml.gz'
+        older.write_bytes(b'x' * 60)
+        newer.write_bytes(b'x' * 60)
+        os.utime(older, (t, t))
+        os.utime(newer, (t + 10, t + 10))
+        self._prune(archive_root, max_age_days=365, max_total_bytes=100)
+        assert not older.exists(), 'Oldest junit report should be deleted to satisfy cap'
+        assert newer.exists(), 'Newer junit report should remain'
+
+
+@pytest.mark.asyncio
+class TestVerifyPlanPersistedBesideTheAttempt:
+    """``run_scoped_verification`` leaves the plan's REASONS on disk.
+
+    Asserted on the written artefact, not on the writer.
+    """
+
+    _ATTEMPT_ID = 7
+    _TASK_ID = '4242'
+
+    def _worktree(self, tmp_path: Path) -> Path:
+        (tmp_path / '.task').mkdir()
+        touched = tmp_path / 'pkg' / 'tests'
+        touched.mkdir(parents=True)
+        (touched / 'test_changed.py').write_text('def test_x(): pass\n')
+        return tmp_path
+
+    async def _run(self, worktree: Path, archive_root: 'Path | None'):
+        config = OrchestratorConfig(project_root=worktree)
+        module_configs = [ModuleConfig(prefix='pkg', test_command='pytest tests/')]
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            return await run_scoped_verification(
+                worktree, config, module_configs,
+                task_files=['pkg/tests/test_changed.py'],
+                attempt_id=self._ATTEMPT_ID,
+                task_id=self._TASK_ID,
+                archive_root=archive_root,
+            )
+
+    def _plan_path(self, worktree: Path) -> Path:
+        return worktree / '.task' / 'verify' / f'attempt-{self._ATTEMPT_ID}.plan.json'
+
+    async def test_plan_json_records_a_reason_for_every_planned_run(self, tmp_path: Path):
+        import json
+        worktree = self._worktree(tmp_path)
+        await self._run(worktree, None)
+
+        plan_path = self._plan_path(worktree)
+        assert plan_path.is_file(), f'plan artefact missing at {plan_path}'
+        plan = json.loads(plan_path.read_text())
+        assert plan['runs'], f'plan recorded no runs: {plan}'
+        for run in plan['runs']:
+            assert run['reason'], f'a planned run carries no reason: {run}'
+            assert run['scope_kind'], f'a planned run carries no scope_kind: {run}'
+
+    async def test_plan_survives_the_worktree_via_the_archive(self, tmp_path: Path):
+        import json
+        worktree = self._worktree(tmp_path)
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        await self._run(worktree, archive_root)
+
+        archived = list((archive_root / self._TASK_ID).glob(
+            f'attempt-{self._ATTEMPT_ID}.plan-*.json',
+        ))
+        assert len(archived) == 1, (
+            f'expected exactly one archived plan; got {archived}'
+        )
+        assert json.loads(archived[0].read_text()) == json.loads(
+            self._plan_path(worktree).read_text()
+        ), 'the archived plan must be the same record as the worktree copy'
+
+    async def test_no_archive_copy_without_an_archiving_caller(self, tmp_path: Path):
+        """``archive_root=None`` is how cold-shadow and drift probes opt out."""
+        worktree = self._worktree(tmp_path)
+        await self._run(worktree, None)
+        assert not (tmp_path / 'data').exists(), (
+            'a non-archiving caller must not create an archive tree'
+        )
+
+    async def test_fallback_scoped_run_persists_its_plan(self, tmp_path: Path):
+        """The no-module_configs fallback branch is a third plan call site."""
+        import json
+        worktree = tmp_path
+        (worktree / '.task').mkdir()
+        (worktree / 'pkg').mkdir()
+        (worktree / 'pkg' / 'mod.py').write_text('x = 1\n')
+        config = OrchestratorConfig(
+            project_root=worktree, test_command='pytest tests/',
+            lint_command='ruff check .', type_check_command='pyright',
+        )
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            await run_scoped_verification(
+                worktree, config, [], task_files=['pkg/mod.py'],
+                attempt_id=self._ATTEMPT_ID, task_id=self._TASK_ID,
+            )
+
+        plan = json.loads(self._plan_path(worktree).read_text())
+        assert plan['runs'], f'fallback branch persisted an empty plan: {plan}'
+
+
+@pytest.mark.asyncio
+class TestVerifyPlanOnTheMergePath:
+    """The merge lane carries NO attempt_id, and is the path this exists for.
+
+    ``verify_runner.LocalRunner.run_merge_verify`` passes ``task_id`` and
+    ``archive_root`` but no ``attempt_id``, so a plan writer gated on one
+    writes nothing on exactly the lane whose worktree is deleted minutes
+    later.  Both artefacts must land, under one joinable stem.
+    """
+
+    _TASK_ID = '4242'
+
+    def _worktree(self, tmp_path: Path) -> Path:
+        (tmp_path / 'pkg' / 'tests').mkdir(parents=True)
+        (tmp_path / 'pkg' / 'tests' / 'test_changed.py').write_text('def test_x(): pass\n')
+        return tmp_path
+
+    async def _run(self, worktree: Path, archive_root: Path, module_configs):
+        config = OrchestratorConfig(
+            project_root=worktree, merge_verify_breadth='full',
+        )
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if '--junitxml' in cmd:
+                parts = cmd.split()
+                report = Path(parts[parts.index('--junitxml') + 1])
+                report.parent.mkdir(parents=True, exist_ok=True)
+                report.write_text('<testsuites><testsuite name="pytest"/></testsuites>')
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            return await run_scoped_verification(
+                worktree, config, module_configs,
+                task_files=['pkg/tests/test_changed.py'],
+                is_merge_verify=True, role='merge',
+                task_id=self._TASK_ID, archive_root=archive_root,
+            )
+
+    async def test_plan_and_junit_land_under_one_stem_without_an_attempt_id(
+        self, tmp_path: Path,
+    ):
+        worktree = self._worktree(tmp_path)
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        await self._run(
+            worktree, archive_root,
+            [ModuleConfig(prefix='pkg', test_command='pytest tests/')],
+        )
+
+        archived = archive_root / self._TASK_ID
+        plans = list(archived.glob('attempt-*.plan-*.json'))
+        junits = list(archived.glob('attempt-*.junit-*.xml.gz'))
+        assert len(plans) == 1, f'merge-path plan not archived; got {plans}'
+        assert len(junits) == 1, f'merge-path junit not archived; got {junits}'
+        assert plans[0].name.split('.')[0] == junits[0].name.split('.')[0], (
+            'plan and junit must share an attempt-N stem so a census can join '
+            f'them; got {plans[0].name} vs {junits[0].name}'
+        )
+
+    async def test_per_module_fan_out_persists_its_plan(self, tmp_path: Path):
+        """force_workspace + breadth=full fans out per module — a plan site."""
+        import json
+        worktree = self._worktree(tmp_path)
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        config = OrchestratorConfig(
+            project_root=worktree, merge_verify_breadth='full',
+        )
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            await run_scoped_verification(
+                worktree, config,
+                [ModuleConfig(prefix='pkg', test_command='pytest tests/')],
+                task_files=None, force_workspace=True,
+                is_merge_verify=True, role='merge',
+                task_id=self._TASK_ID, archive_root=archive_root,
+            )
+
+        plans = list((archive_root / self._TASK_ID).glob('attempt-*.plan-*.json'))
+        assert len(plans) == 1, f'fan-out branch plan not archived; got {plans}'
+        assert json.loads(plans[0].read_text())['runs'], 'fan-out plan has no runs'
+
+
+@pytest.mark.asyncio
+class TestJunitReportRetention:
+    """The merge-path junit report is archived on GREEN runs as well as red.
+
+    The log archival beside it is gated on ``not passed``; copying that gate
+    would have yielded a red-only cost corpus.
+    """
+
+    _ATTEMPT_ID = 3
+    _TASK_ID = '4242'
+
+    def _fake_run_cmd_writing_junit(self, *, rc: int):
+        xml = (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            f'<testsuites><testsuite name="pytest" errors="0" failures="{int(rc != 0)}"'
+            ' tests="1"><testcase classname="tests.test_sample" name="test_one"'
+            ' time="0.001"/></testsuite></testsuites>\n'
+        )
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if '--junitxml' in cmd:
+                parts = cmd.split()
+                junit_path = Path(parts[parts.index('--junitxml') + 1])
+                junit_path.parent.mkdir(parents=True, exist_ok=True)
+                junit_path.write_text(xml)
+                return rc, 'output', False
+            return 0, 'ok', False
+
+        return fake_run_cmd
+
+    async def _run(self, tmp_path: Path, *, rc: int) -> Path:
+        config = OrchestratorConfig(
+            project_root=tmp_path, merge_verify_breadth='full',
+        )
+        module_config = ModuleConfig(
+            prefix='pkg', test_command='pytest tests/',
+            lint_command=None, type_check_command=None,
+        )
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        with patch(
+            'orchestrator.verify._run_cmd',
+            side_effect=self._fake_run_cmd_writing_junit(rc=rc),
+        ):
+            await run_verification(
+                tmp_path, config, module_config, max_retries=0, role='merge',
+                attempt_id=self._ATTEMPT_ID, task_id=self._TASK_ID,
+                archive_root=archive_root,
+            )
+        return archive_root
+
+    @pytest.mark.parametrize('rc', [0, 1])
+    async def test_junit_archived_whether_the_leg_passed_or_failed(
+        self, tmp_path: Path, rc: int,
+    ):
+        import gzip
+        archive_root = await self._run(tmp_path, rc=rc)
+        archived = list((archive_root / self._TASK_ID).glob(
+            f'attempt-{self._ATTEMPT_ID}.pkg.junit-*.xml.gz',
+        ))
+        assert len(archived) == 1, (
+            f'expected the junit report archived for rc={rc}; got {archived}'
+        )
+        assert '<testsuite' in gzip.decompress(archived[0].read_bytes()).decode(), (
+            'the archived copy must read back as the report itself, not a husk'
+        )
+
+    async def test_previous_passs_report_is_not_rearchived_as_this_run(
+        self, tmp_path: Path,
+    ):
+        """A merge worktree is reused across passes, and pytest only truncates
+        when it actually runs — so a leg that writes nothing must archive
+        nothing, not its predecessor's report under a fresh timestamp."""
+        stale = tmp_path / '.df-verify-junit' / 'report.pkg.xml'
+        stale.parent.mkdir(parents=True)
+        stale.write_text('<testsuites><testsuite name="STALE"/></testsuites>')
+
+        config = OrchestratorConfig(
+            project_root=tmp_path, merge_verify_breadth='full',
+        )
+        module_config = ModuleConfig(
+            prefix='pkg', test_command='pytest tests/',
+            lint_command=None, type_check_command=None,
+        )
+        archive_root = tmp_path / 'data' / 'verify-logs'
+
+        async def killed_before_writing(cmd, cwd, timeout, env=None, log_path=None, **kw):
+            return -9, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=killed_before_writing):
+            result = await run_verification(
+                tmp_path, config, module_config, max_retries=0, role='merge',
+                attempt_id=self._ATTEMPT_ID, task_id=self._TASK_ID,
+                archive_root=archive_root,
+            )
+
+        assert not list(archive_root.rglob('*.junit-*')), (
+            'a stale report from an earlier pass was archived as this run'
+        )
+        assert result.failing_test_ids is None, (
+            'the stale report must not be read back as this run\'s failing ids '
+            'either — "no report" is the degrade both readers already model'
+        )
+
+    async def test_first_pass_report_is_not_kept_by_a_killed_env_recovery_rerun(
+        self, tmp_path: Path,
+    ):
+        """pytest runs 1..N times inside ONE run_verification.
+
+        The env-recovery re-run fires regardless of ``max_retries``, so it is
+        live on the merge lane where every caller passes 0.  Seeding the
+        report outside the call cannot catch this: the first pass writes it
+        legitimately, and only the SECOND invocation must not inherit it.
+        """
+        env_transient = (
+            'pytest: error: unrecognized arguments: -n --dist --max-worker-restart=0'
+        )
+        first_pass_report = (
+            '<?xml version="1.0"?><testsuites><testsuite name="pytest" errors="0"'
+            ' failures="1" tests="1"><testcase classname="tests.test_old"'
+            ' name="test_from_first_pass"><failure message="x"/></testcase>'
+            '</testsuite></testsuites>'
+        )
+        config = OrchestratorConfig(
+            project_root=tmp_path, merge_verify_breadth='full',
+        )
+        module_config = ModuleConfig(
+            prefix='pkg', test_command='pytest tests/ -n auto',
+            lint_command=None, type_check_command=None,
+        )
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        test_leg_runs = 0
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            nonlocal test_leg_runs
+            if 'pytest' not in cmd:
+                return 0, '', False
+            test_leg_runs += 1
+            if test_leg_runs > 1:
+                return -9, '', False  # recovery run: killed, writes nothing
+            if '--junitxml' in cmd:
+                parts = cmd.split()
+                report = Path(parts[parts.index('--junitxml') + 1])
+                report.parent.mkdir(parents=True, exist_ok=True)
+                report.write_text(first_pass_report)
+            return 4, env_transient, False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(
+                tmp_path, config, module_config, max_retries=0, role='merge',
+                attempt_id=self._ATTEMPT_ID, task_id=self._TASK_ID,
+                archive_root=archive_root,
+            )
+
+        assert test_leg_runs == 2, (
+            f'expected the env-recovery re-run to fire; pytest ran {test_leg_runs}x'
+        )
+        assert result.failing_test_ids is None, (
+            'the recovery run never started pytest, so it owns no failing ids; '
+            f'got {result.failing_test_ids!r} from the first pass'
+        )
+        assert not list(archive_root.rglob('*.junit-*')), (
+            'the first pass\'s report was archived as the recovery run\'s cost'
+        )
+
+    async def test_a_leg_with_no_test_command_clears_nothing(self, tmp_path: Path):
+        """The unscoped type-check gate can never WRITE a report, so it must
+        not delete the scoped phase's one."""
+        report = tmp_path / '.df-verify-junit' / 'report.pkg.xml'
+        report.parent.mkdir(parents=True)
+        report.write_text('<testsuites><testsuite name="SCOPED PHASE"/></testsuites>')
+
+        config = OrchestratorConfig(
+            project_root=tmp_path, merge_verify_breadth='full',
+        )
+        type_only = ModuleConfig(
+            prefix='pkg', test_command=None,
+            lint_command=None, type_check_command='pyright',
+        )
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            await run_verification(
+                tmp_path, config, type_only, max_retries=0, role='merge',
+            )
+
+        assert report.is_file(), (
+            'a gate that never writes a junit report deleted one it did not own'
+        )
+
+    async def test_report_at_a_symlink_is_unlinked_as_a_link(self, tmp_path: Path):
+        """Clearing must remove the link, never follow it to its target."""
+        target = tmp_path / 'somebody_elses.xml'
+        target.write_text('<testsuites/>')
+        link = tmp_path / '.df-verify-junit' / 'report.pkg.xml'
+        link.parent.mkdir(parents=True)
+        link.symlink_to(target)
+
+        config = OrchestratorConfig(
+            project_root=tmp_path, merge_verify_breadth='full',
+        )
+        module_config = ModuleConfig(
+            prefix='pkg', test_command='pytest tests/',
+            lint_command=None, type_check_command=None,
+        )
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            await run_verification(
+                tmp_path, config, module_config, max_retries=0, role='merge',
+            )
+
+        assert target.is_file(), 'the symlink target was deleted instead of the link'
+        assert not link.is_symlink(), 'the stale link was not cleared'
+
+    async def test_no_junit_archived_when_none_was_written(self, tmp_path: Path):
+        """A non-pytest command injects no flag — absence, not degradation."""
+        config = OrchestratorConfig(
+            project_root=tmp_path, merge_verify_breadth='full',
+        )
+        module_config = ModuleConfig(
+            prefix='pkg', test_command='cargo test --workspace',
+            lint_command=None, type_check_command=None,
+        )
+        archive_root = tmp_path / 'data' / 'verify-logs'
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            return 0, 'ok', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            await run_verification(
+                tmp_path, config, module_config, max_retries=0, role='merge',
+                attempt_id=self._ATTEMPT_ID, task_id=self._TASK_ID,
+                archive_root=archive_root,
+            )
+
+        assert not list(archive_root.rglob('*.junit-*')), (
+            'no junit report was written, so none may be archived'
+        )
+
 
 @pytest.mark.asyncio
 class TestRunVerificationPersistence:
@@ -9724,3 +10180,179 @@ class TestRunVerificationThreadsEachLegsOwnDuration:
         assert result.summary == 'Failures: lint issues'
         assert result.category != 'infra_kill'
         assert SIGNAL_KILL_SUMMARY_MARKER not in result.summary
+
+
+# ---------------------------------------------------------------------------
+# Version pin survival through verify's scoping pipeline (task 3931)
+# ---------------------------------------------------------------------------
+
+# LOCAL literals, deliberately not derived from the committed YAML: these guards
+# state the scoper contract for a pinned clause independently of whether the
+# fleet chain is pinned. It is NOT — task 4538 pins the version out-of-band via
+# the repo-root package.json + `npm ci`, keeping all seven clauses bare — so a
+# derived fixture would test the unpinned spelling twice. The contract still
+# matters: verify runs against target projects whose own type_check_command may
+# spell `npx pyright@<version>` directly.
+_UNPINNED_TYPE_CHAIN_3931 = (
+    'cd fused-memory && npx pyright && cd ../orchestrator && npx pyright'
+    ' && cd ../dashboard && npx pyright && cd ../shared && npx pyright'
+    ' && cd ../escalation && npx pyright && cd ../sampler && npx pyright'
+    ' && cd ../cockpit && npx pyright'
+)
+_PINNED_TYPE_CHAIN_3931 = _UNPINNED_TYPE_CHAIN_3931.replace('npx pyright', 'npx pyright@1.1.408')
+_ESC_3805_FILE = 'orchestrator/tests/test_run_vllm_eval.py'
+
+
+class TestVersionPinSurvivesScoping:
+    """A pinned `npx pyright@<version>` must survive `_scope_to_keyword`.
+
+    Task 3931 / esc-3805-1. Assertions 1 and 2 below are the LOAD-BEARING
+    ones: without them, a version pin in dark-factory-orchestrator.yaml is
+    DECORATIVE on the exact FILE_SCOPED path that generated esc-3805-1 — it
+    reads as pinned in the config and runs unpinned in the gate.
+
+    MEASURED on this branch, before the step-6 change (and after the step-4
+    verify_cmd change, so this is verify.py's own stripping, not the parser's):
+
+        _scope_to_keyword(PINNED,   'pyright', [file])
+            -> 'npx pyright orchestrator/tests/test_run_vllm_eval.py'
+        _scope_to_keyword(UNPINNED, 'pyright', [file])
+            -> 'npx pyright orchestrator/tests/test_run_vllm_eval.py'
+
+    Byte-identical. ``retained = head[: idx + len(keyword)]`` (verify.py) is a
+    BYTE-OFFSET slice, so it cuts mid-token at the `@` and drops `@1.1.408`
+    before the string is ever re-parsed. The pin cannot survive a parser fix
+    alone; the truncation itself has to become token-aware.
+
+    A `.py`-touching diff takes exactly this FILE_SCOPED path: the leading
+    `cd` is folded away, leaving `npx pyright <repo-root-relative-file>` to run
+    FROM THE WORKTREE ROOT and then be wrapped by
+    `_scope_fallback_tool_to_subproject`.
+    """
+
+    def test_pinned_chain_keeps_its_version_through_scope_to_keyword(self):
+        scoped = verify._scope_to_keyword(_PINNED_TYPE_CHAIN_3931, 'pyright', [_ESC_3805_FILE])
+        assert scoped == f'npx pyright@1.1.408 {_ESC_3805_FILE}', (
+            f'_scope_to_keyword dropped the version pin, returning {scoped!r} '
+            '(task 3931, esc-3805-1). The byte-offset truncation '
+            '`head[: idx + len(keyword)]` slices mid-token at the `@`, so the '
+            'gate advertises a pinned pyright and runs whatever npx last '
+            'cached'
+        )
+
+    def test_pin_survives_the_uv_subproject_rescope(self):
+        scoped = verify._scope_to_keyword(_PINNED_TYPE_CHAIN_3931, 'pyright', [_ESC_3805_FILE])
+        rescoped = verify._scope_fallback_tool_to_subproject(scoped, 'pyright', 'orchestrator')
+        assert rescoped == (
+            f'uv run --project orchestrator npx pyright@1.1.408 {_ESC_3805_FILE}'
+        ), (
+            f'the pin did not survive the uv rescope, giving {rescoped!r} '
+            '(task 3931) — this is the command the FILE_SCOPED fallback path '
+            'actually dispatches for the esc-3805-1 diff'
+        )
+
+    def test_unpinned_chain_scopes_exactly_as_today(self):
+        """Regression floor: the bare spelling's scoped shape is unchanged."""
+        scoped = verify._scope_to_keyword(_UNPINNED_TYPE_CHAIN_3931, 'pyright', [_ESC_3805_FILE])
+        assert scoped == f'npx pyright {_ESC_3805_FILE}'
+        assert verify._scope_fallback_tool_to_subproject(scoped, 'pyright', 'orchestrator') == (
+            f'uv run --project orchestrator npx pyright {_ESC_3805_FILE}'
+        )
+
+    def test_a_longer_unrelated_token_is_not_absorbed_by_the_widening(self):
+        """The boundary rule: widen across an `@<version>` suffix ONLY.
+
+        Pins the chosen rule explicitly so the widening cannot creep into "keep
+        the whole token". `npx pyright-foo` is a DIFFERENT tool whose name
+        merely starts with the keyword; today the byte-offset slice truncates
+        it to `npx pyright` and this must stay byte-identical, because
+        retaining `pyright-foo` whole would reclassify the command (ToolKind.NPX)
+        and make `scope_to` replace the tool name with the touched file — the
+        very failure mode the pinned spelling suffered before step 4.
+
+        This assertion PASSES today and is a floor, not a RED: it is what
+        makes the step-6 widening provably narrow.
+        """
+        assert verify._scope_to_keyword('npx pyright-foo', 'pyright', [_ESC_3805_FILE]) == (
+            f'npx pyright {_ESC_3805_FILE}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# End-to-end capstone: the REAL committed config's FILE_SCOPED dispatch (3931)
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT_3931 = Path(__file__).resolve().parents[2]
+_DF_CONFIG_PATH_3931 = _REPO_ROOT_3931 / 'dark-factory-orchestrator.yaml'
+
+
+class TestFleetTypeCheckSurvivesTheRealFallbackPath:
+    """The committed config's type leg must still dispatch a scoped pyright.
+
+    Task 3931 / esc-3805-1. Every other guard in this task is over a LOCAL
+    literal or a single helper; this one runs the whole path end-to-end over
+    the config file the fleet actually loads.
+
+    This is precisely the esc-3805-1 shape: a diff touching one `.py` file
+    under a single subproject. `_build_fallback_config` takes the FILE_SCOPED
+    branch, `_scope_to_keyword` folds away the leading `cd fused-memory &&` and
+    emits `npx pyright <repo-root-relative-file>` to run FROM THE WORKTREE
+    ROOT — which is why that leg saw root-scoped pyright's 14 errors while
+    pre-commit's package-scoped leg saw 0 (closed by this task's extraPaths
+    change to orchestrator/pyproject.toml).
+
+    NOTE ON THE VERSION PIN. This class originally also asserted that the
+    dispatched command carried an inline `pyright@<version>`, because this
+    branch pinned the version by spelling it into all seven clauses of
+    `dark-factory-orchestrator.yaml`'s `type_check_command`. Task 4538 landed
+    on main first and pins the SAME version (1.1.408) a different way — one
+    authored declaration in the repo-root `package.json`, materialised into
+    every cold worktree's `node_modules/.bin` by the `npm ci` step in
+    `verify_cold_preprovision_command`, so the seven clauses stay BARE. Those
+    pin assertions were dropped on rebase rather than merged: they are the
+    exact inverse of the landed
+    `tests/scripts/test_pyright_version_pin.py::test_the_fleet_chain_stays_bare_npx_pyright`.
+    What survives here is the shape floor, which holds under either mechanism —
+    and the scoper's pin-preservation itself is still pinned, mechanism-side,
+    by `TestVersionPinSurvivesScoping` above over a local literal, so a target
+    project that DOES spell `npx pyright@<version>` in its own config is still
+    covered.
+    """
+
+    def _fallback_type_command(self) -> str:
+        from orchestrator.config import load_config
+
+        config = load_config(_DF_CONFIG_PATH_3931)
+        mc = _build_fallback_config([_ESC_3805_FILE], config=config)
+        assert mc is not None, (
+            '_build_fallback_config returned None for a single-.py diff (task '
+            '3931) — it only does that for a zero-.py diff, so the FILE_SCOPED '
+            'path this guard exists to cover was not exercised at all'
+        )
+        type_cmd = mc.type_check_command
+        assert type_cmd is not None, (
+            '_build_fallback_config produced a ModuleConfig with no '
+            'type_check_command for the esc-3805-1 diff (task 3931) — the '
+            'type gate would dispatch nothing at all, so there is no '
+            'pyright invocation left for this guard to inspect'
+        )
+        return type_cmd
+
+    def test_the_scoped_command_still_targets_only_the_touched_file(self):
+        """Regression floor: the FILE_SCOPED shape, whole-string.
+
+        If a version were ever mistaken for a target (the ToolKind.NPX misparse
+        this task's verify_cmd change fixed), `scope_to` would replace
+        `pyright@<version>` with the touched file and the command would lose
+        either its tool or its target. Asserting the exact whole string is what
+        pins that.
+        """
+        cmd = self._fallback_type_command()
+        assert cmd.startswith('npx pyright'), cmd
+        assert cmd.endswith(f' {_ESC_3805_FILE}'), cmd
+        assert cmd.count(_ESC_3805_FILE) == 1, cmd
+        assert 'cd ' not in cmd, (
+            f'{cmd!r} still carries a `cd` clause (task 3931) — the FILE_SCOPED '
+            'path runs from the worktree root, so a surviving cd would '
+            'misresolve the root-relative file path just scoped in'
+        )

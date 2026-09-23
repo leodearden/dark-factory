@@ -17,6 +17,7 @@ from escalation.models import (
     Escalation,
     EvidenceEntry,
     IndexHealthState,
+    LateResolution,
     TrainState,
     max_severity,
 )
@@ -599,12 +600,26 @@ class TestEscalationResolutionClass:
         """RESOLUTION_CLASSES is a frozenset."""
         assert isinstance(RESOLUTION_CLASSES, frozenset)
 
-    def test_resolution_classes_contains_exactly_the_three_legal_values(self):
+    def test_resolution_classes_contains_exactly_the_legal_values(self):
         """RESOLUTION_CLASSES contains exactly {'benign', 'actionable',
-        'moot-terminal-subject'} — no extras. 'moot-terminal-subject' is the
-        distinct, non-benign stamp the task-2724 revalidation sweep writes."""
-        assert frozenset({'benign', 'actionable', 'moot-terminal-subject'}) == RESOLUTION_CLASSES
+        'moot-terminal-subject', 'stale-strand'} — no extras.
+
+        'moot-terminal-subject' is the distinct, non-benign stamp the task-2724
+        revalidation sweep writes.
+
+        'stale-strand' (task 3172) is the distinguishable, NON-benign stamp the
+        startup restart dismissal (``EscalationQueue.dismiss_all_pending``)
+        writes for a level-0 escalation that had already been pending for
+        ``>= strand_age_secs`` when the orchestrator restarted.  It EXTENDS the
+        task-2724 vocabulary rather than forking a second scheme, so a 20h
+        strand and a 90s restart artifact stop reading identically.
+        """
+        assert (
+            frozenset({'benign', 'actionable', 'moot-terminal-subject', 'stale-strand'})
+            == RESOLUTION_CLASSES
+        )
         assert 'moot-terminal-subject' in RESOLUTION_CLASSES
+        assert 'stale-strand' in RESOLUTION_CLASSES
 
     # --- (c) round-trip to_dict/from_dict and to_json/from_json ---
 
@@ -1340,6 +1355,143 @@ class TestEscalationAmendments:
         )
 
 
+
+class TestEscalationLateResolutions:
+    """`late_resolutions` / `late_resolutions_truncated` — the non-lossy
+    already-terminal capture fields (task 4495, esc-3902-1).
+
+    `queue.resolve()`'s already-terminal branch is the SOLE writer: when a
+    substantive `resolve_issue` lands on a record an AUTOMATED sweep already
+    dismissed (the W9-δ steward auto-dismiss race), the incoming text used to be
+    dropped on the floor.  It is APPENDED here instead, and the record's own
+    terminal state (`status` / `resolution` / `resolved_at` / `resolved_by`) is
+    never overwritten — exactly the append-only shape `amendments` established.
+
+    Pinned by the same two properties this repo pins for amendments /
+    train_state / members / granted_files: a verbatim round-trip, and legacy
+    JSON without the keys deserialising to the defaults so no on-disk migration
+    is required.
+    """
+
+    def _seeded(self, **kwargs: Any) -> Escalation:
+        """An L0 an automated sweep already dismissed, plus whatever kwargs override."""
+        return Escalation(
+            id='esc-task-3902-1',
+            task_id='3902',
+            agent_role='implementer',
+            severity='blocking',
+            category='task_failure',
+            summary='original one-line summary',
+            detail='the ORIGINAL filing detail',
+            level=0,
+            status='dismissed',
+            resolution='Auto-dismissed: steward interrupted (attempt cap)',
+            resolved_by='auto-dismissed',
+            resolution_class='benign',
+            **kwargs,
+        )
+
+    def test_late_resolutions_field_roundtrips_and_defaults_empty(self):
+        """Late resolutions survive to_json/from_json verbatim; legacy JSON defaults to empty."""
+        # --- (a) DEFAULTS: an unpopulated record carries the empty/zero defaults.
+        fresh = self._seeded()
+        assert fresh.late_resolutions == [], (
+            f'late_resolutions must default to []: {fresh.late_resolutions!r}'
+        )
+        assert fresh.late_resolutions_truncated == 0, (
+            f'late_resolutions_truncated must default to 0: '
+            f'{fresh.late_resolutions_truncated!r}'
+        )
+        assert fresh.late_resolutions_chars_elided == 0, (
+            f'late_resolutions_chars_elided must default to 0: '
+            f'{fresh.late_resolutions_chars_elided!r}'
+        )
+
+        # --- (b) ROUND-TRIP: the entry dict and the counter survive verbatim,
+        # through BOTH the dict pair and the JSON pair (the on-disk path).
+        entry: LateResolution = {
+            'timestamp': '2026-09-06T00:00:00+00:00',
+            'resolution': "the steward's real finding",
+            'resolved_by': 'claude-task-3902-steward',
+            'dismiss': False,
+            'prior_resolution_class': 'benign',
+        }
+        esc = self._seeded(
+            late_resolutions=[entry],
+            late_resolutions_truncated=2,
+            late_resolutions_chars_elided=417,
+        )
+
+        via_dict = Escalation.from_dict(esc.to_dict())
+        assert via_dict.late_resolutions == [entry], (
+            f'entry lost or mangled through to_dict/from_dict: {via_dict.late_resolutions!r}'
+        )
+
+        restored = Escalation.from_json(esc.to_json())
+        assert restored.late_resolutions == [entry], (
+            f'entry lost or mangled through to_json/from_json: {restored.late_resolutions!r}'
+        )
+        assert restored.late_resolutions[0].keys() == entry.keys(), (
+            f'a LateResolution key was dropped in the round-trip: '
+            f'{sorted(restored.late_resolutions[0])} != {sorted(entry)}'
+        )
+        assert restored.late_resolutions_truncated == 2, (
+            f'truncation counter lost: {restored.late_resolutions_truncated!r}'
+        )
+        # The BYTE-side counter is what makes the per-entry elision's loss
+        # assertable from the record rather than log-only (INV-8), so it has to
+        # survive the round-trip too.
+        assert restored.late_resolutions_chars_elided == 417, (
+            f'elision counter lost: {restored.late_resolutions_chars_elided!r}'
+        )
+        # The record's OWN terminal state is a separate thing and is untouched by
+        # the capture — that separation is the whole point of appending.
+        assert restored.status == 'dismissed'
+        assert restored.resolution == 'Auto-dismissed: steward interrupted (attempt cap)'
+        assert restored.resolved_by == 'auto-dismissed'
+
+        # --- (c) ZERO MIGRATION: legacy on-disk JSON has neither key.
+        legacy = esc.to_dict()
+        del legacy['late_resolutions']
+        del legacy['late_resolutions_truncated']
+        del legacy['late_resolutions_chars_elided']
+
+        from_legacy = Escalation.from_dict(legacy)
+
+        assert from_legacy.late_resolutions == [], (
+            f'legacy record without the key must default to []: '
+            f'{from_legacy.late_resolutions!r}'
+        )
+        assert from_legacy.late_resolutions_truncated == 0, (
+            f'legacy record without the key must default to 0: '
+            f'{from_legacy.late_resolutions_truncated!r}'
+        )
+        assert from_legacy.late_resolutions_chars_elided == 0, (
+            f'legacy record without the key must default to 0: '
+            f'{from_legacy.late_resolutions_chars_elided!r}'
+        )
+
+    def test_default_late_resolutions_list_is_per_instance(self):
+        """field(default_factory=list), not a shared mutable default.
+
+        Without this, one record's captured late resolution would appear on
+        every other default-constructed Escalation in the process.
+        """
+        a = self._seeded()
+        b = self._seeded()
+        a.late_resolutions.append({
+            'timestamp': '2026-09-06T00:00:00+00:00',
+            'resolution': 'mine alone',
+            'resolved_by': 'claude-task-3902-steward',
+            'dismiss': False,
+            'prior_resolution_class': 'benign',
+        })
+        assert b.late_resolutions == [], (
+            'default late_resolutions list is SHARED between instances — '
+            "a mutable default leaked one record's captured resolution onto another"
+        )
+
+
 class TestTimestampIsStampedFromTheLiveClock:
     """REGRESSION PIN, not a fix — no timestamp defect exists (task 3236).
 
@@ -1473,3 +1625,370 @@ class TestSeverityRank:
         """(e) Unknown-vs-unknown resolves on the first argument, not arbitrarily."""
         assert max_severity('warn', 'wat') == 'warn'
         assert max_severity('wat', 'warn') == 'wat'
+
+
+class TestEscalationRootCauseVariants:
+    """`root_cause_variants` / `root_cause_variants_truncated` — over-fold evidence (task 3998).
+
+    Canonicalising the root-cause match makes MORE promotes fold, so its failure
+    mode is OVER-folding: distinct causes silently merged under one canonical
+    key.  These fields are that failure's only observable signature — the
+    DISTINCT pre-canonical spellings an L2 has been addressed by.
+    `queue.add_members_to_l2` is the SOLE writer and sole trimmer, exactly as for
+    `amendments`, whose shape they mirror one-for-one.
+    """
+
+    def _seeded(self, **kwargs: Any) -> Escalation:
+        return Escalation(
+            id='esc-task-1-0001',
+            task_id='task-1',
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='design_concern',
+            summary='original one-line hypothesis',
+            root_cause='Watcher lease stolen.',
+            level=2,
+            **kwargs,
+        )
+
+    def test_variant_fields_default_empty_and_zero(self):
+        """(a) An L2 minted today carries no variants and no truncation."""
+        esc = self._seeded()
+
+        assert esc.root_cause_variants == [], (
+            f'expected an empty variant list, got {esc.root_cause_variants!r}'
+        )
+        assert esc.root_cause_variants_truncated == 0, (
+            f'expected 0, got {esc.root_cause_variants_truncated!r}'
+        )
+
+    def test_legacy_json_without_the_keys_deserialises_to_defaults(self):
+        """(b) ZERO MIGRATION — the from_dict __dataclass_fields__ filter path.
+
+        Every L2 already on disk predates these fields, so a payload missing both
+        keys must hydrate to the defaults rather than raising.
+        """
+        legacy = json.loads(self._seeded().to_json())
+        del legacy['root_cause_variants']
+        del legacy['root_cause_variants_truncated']
+
+        from_legacy = Escalation.from_dict(legacy)
+
+        assert from_legacy.root_cause_variants == [], (
+            f'legacy record must default to []: {from_legacy.root_cause_variants!r}'
+        )
+        assert from_legacy.root_cause_variants_truncated == 0, (
+            f'legacy record must default to 0: {from_legacy.root_cause_variants_truncated!r}'
+        )
+
+    def test_variants_roundtrip_verbatim(self):
+        """(c) Both fields survive to_json -> from_json unchanged.
+
+        The TRUE distinct count is `len(root_cause_variants) +
+        root_cause_variants_truncated`, so the counter is as load-bearing as the
+        list — losing it would make the loss at the cap log-only (INV-8).
+        """
+        variants = ['Watcher lease stolen.', 'watcher  lease STOLEN', 'WATCHER-LEASE-STOLEN']
+        esc = self._seeded(root_cause_variants=variants, root_cause_variants_truncated=4)
+
+        restored = Escalation.from_json(esc.to_json())
+
+        assert restored.root_cause_variants == variants, (
+            f'variant spellings lost or reordered: {restored.root_cause_variants!r}'
+        )
+        assert restored.root_cause_variants_truncated == 4, (
+            f'truncation counter lost: {restored.root_cause_variants_truncated!r}'
+        )
+        assert len(restored.root_cause_variants) + restored.root_cause_variants_truncated == 7
+
+    def test_default_variant_list_is_not_shared_between_instances(self):
+        """The default_factory guard — a shared mutable default would cross-link records."""
+        a = self._seeded()
+        b = self._seeded()
+
+        a.root_cause_variants.append('a spelling')
+
+        assert b.root_cause_variants == [], (
+            'default root_cause_variants list is SHARED between instances — '
+            f'b saw {b.root_cause_variants!r}'
+        )
+
+    def test_unknown_extra_key_is_still_dropped(self):
+        """(d) from_dict's filter surface is unchanged by the two added fields."""
+        payload = json.loads(self._seeded().to_json())
+        payload['not_a_real_field'] = 'should be dropped, not raise'
+
+        restored = Escalation.from_dict(payload)
+
+        assert not hasattr(restored, 'not_a_real_field')
+        assert restored.root_cause_variants == []
+
+
+class TestCitationShaAndRefileSuppressionFields:
+    """`citation_sha` / `refiles_suppressed` — the auto-dismiss triple (task 4499).
+
+    `citation_sha` is the evidence commit whose landing a
+    `provenance_unattributed` filing could not attribute.  Stamped at FILING
+    time, it survives onto the RESOLUTION, where it becomes the identity half
+    of the `(task_id, category, citation_sha)` triple that suppresses an
+    identical refile — closing the close-then-refile ping-pong an absorbing
+    reject condition otherwise drives forever.  `refiles_suppressed` is that
+    suppression's INV-4 storm counter: how many identical refiles this
+    record's resolution has absorbed, kept as a durable structured fact rather
+    than log-only (INV-2).
+    """
+
+    def _seeded(self, **kwargs: Any) -> Escalation:
+        return Escalation(
+            id='esc-4499-1',
+            task_id='4499',
+            agent_role='harness-reconcile',
+            severity='blocking',
+            category='provenance_unattributed',
+            summary='landing evidence could not be attributed',
+            level=1,
+            **kwargs,
+        )
+
+    def test_citation_and_suppression_fields_default_to_none_and_zero(self):
+        """(a) A record minted today carries no citation and no absorbed refiles."""
+        esc = self._seeded()
+
+        assert esc.citation_sha is None, (
+            f'expected no citation identity, got {esc.citation_sha!r}'
+        )
+        assert esc.refiles_suppressed == 0, (
+            f'expected 0, got {esc.refiles_suppressed!r}'
+        )
+
+    def test_citation_and_counter_roundtrip_verbatim(self):
+        """(b) Both fields survive to_json -> from_json unchanged.
+
+        The suppression decision is made by re-reading the PERSISTED record, so
+        a field that did not round-trip would silently never suppress.
+        """
+        esc = self._seeded(citation_sha='b' * 40, refiles_suppressed=3)
+
+        restored = Escalation.from_json(esc.to_json())
+
+        assert restored.citation_sha == 'b' * 40, (
+            f'citation identity lost: {restored.citation_sha!r}'
+        )
+        assert restored.refiles_suppressed == 3, (
+            f'storm counter lost: {restored.refiles_suppressed!r}'
+        )
+
+    def test_legacy_json_without_the_keys_deserialises_to_defaults(self):
+        """(c) ZERO MIGRATION — the from_dict __dataclass_fields__ filter path.
+
+        Every archived provenance record already on disk predates these fields,
+        so a payload missing both keys must hydrate to the defaults rather than
+        raising.  Those legacy records are exactly what the suppression lookup
+        scans, so a hydration failure here would break the reject path.
+        """
+        legacy = json.loads(self._seeded().to_json())
+        del legacy['citation_sha']
+        del legacy['refiles_suppressed']
+
+        from_legacy = Escalation.from_dict(legacy)
+
+        assert from_legacy.citation_sha is None, (
+            f'legacy record must default to None: {from_legacy.citation_sha!r}'
+        )
+        assert from_legacy.refiles_suppressed == 0, (
+            f'legacy record must default to 0: {from_legacy.refiles_suppressed!r}'
+        )
+
+    def test_unknown_extra_key_is_still_dropped(self):
+        """(d) from_dict's filter surface is unchanged by the two added fields."""
+        payload = json.loads(self._seeded(citation_sha='b' * 40).to_json())
+        payload['not_a_real_field'] = 'should be dropped, not raise'
+
+        restored = Escalation.from_dict(payload)
+
+        assert not hasattr(restored, 'not_a_real_field')
+        assert restored.citation_sha == 'b' * 40
+
+
+class TestDeclaredPinMarker:
+    """`pin_declared_by` / `pin_declared_reason` — the declared-dependency marker (task 4377).
+
+    An OPEN escalation record is a PRESERVATION MECHANISM for its subject task
+    (`orchestrator/task_ground_truth.py::_RECOVERY` has no row for the pinned
+    shape, so it falls through to ``RecoveryAction.LEAVE``), which makes closing
+    a record a state-changing act on that task even under ``action='close_only'``.
+    These two fields are what makes that dependency DECLARABLE on the record
+    itself instead of living in prose nothing links from.
+
+    These tests pin the FIELDS' storage/round-trip behaviour only.  The
+    enforcement seam is `escalation/declared_pins.py::blocking_pin_declarations`
+    consulted by `escalation/server.py::resolve_issue`, exercised in
+    tests/test_declared_pins.py and tests/test_server.py.
+    """
+
+    #: A real declarer pair — WHAT relies on the record, not WHO stamped it.
+    DECLARED_BY = ['task-3546-second-deviation-notice', 'esc-3914-1']
+    REASON = 'mu-gate validation specimen; see task 3546 SECOND DEVIATION NOTICE'
+
+    def _make_base_esc(self) -> Escalation:
+        return Escalation(
+            id='esc-3105-3',
+            task_id='3105',
+            agent_role='implementer',
+            severity='blocking',
+            category='risk_identified',
+            summary='test escalation for the declared-pin marker',
+        )
+
+    def _seeded(self) -> Escalation:
+        esc = self._make_base_esc()
+        esc.pin_declared_by = list(self.DECLARED_BY)
+        esc.pin_declared_reason = self.REASON
+        return esc
+
+    # --- (a) Default values ---
+
+    def test_pin_declared_by_defaults_to_empty_list(self):
+        """A minimally-constructed Escalation has pin_declared_by=[] (not None)."""
+        assert self._make_base_esc().pin_declared_by == []
+
+    def test_pin_declared_reason_defaults_to_empty_string(self):
+        """A minimally-constructed Escalation has pin_declared_reason='' (not None)."""
+        assert self._make_base_esc().pin_declared_reason == ''
+
+    def test_default_pin_declared_by_is_not_shared_between_instances(self):
+        """The default list uses default_factory — instances do not share it."""
+        a = self._make_base_esc()
+        b = self._make_base_esc()
+
+        a.pin_declared_by.append('task-3546-second-deviation-notice')
+
+        assert b.pin_declared_by == [], (
+            'default pin_declared_by list is SHARED between instances — '
+            f'b saw {b.pin_declared_by!r}'
+        )
+
+    def test_construction_preserves_the_marker_verbatim(self):
+        """Both fields are stored verbatim (no parsing/normalisation at the model layer)."""
+        esc = Escalation(
+            id='esc-3105-3',
+            task_id='3105',
+            agent_role='implementer',
+            severity='blocking',
+            category='risk_identified',
+            summary='s',
+            pin_declared_by=list(self.DECLARED_BY),
+            pin_declared_reason=self.REASON,
+        )
+        assert esc.pin_declared_by == self.DECLARED_BY
+        assert esc.pin_declared_reason == self.REASON
+
+    # --- (b) both keys present in serialised JSON at their defaults ---
+
+    def test_both_keys_present_in_serialised_json_at_defaults(self):
+        """to_json() emits both keys even when unset — never silently dropped."""
+        payload = json.loads(self._make_base_esc().to_json())
+
+        assert 'pin_declared_by' in payload
+        assert 'pin_declared_reason' in payload
+        assert payload['pin_declared_by'] == []
+        assert payload['pin_declared_reason'] == ''
+
+    # --- (c) to_dict / to_json round-trips ---
+
+    def test_marker_round_trips_via_to_dict_from_dict(self):
+        """Escalation.from_dict(esc.to_dict()) round-trips both fields exactly."""
+        restored = Escalation.from_dict(self._seeded().to_dict())
+
+        assert restored.pin_declared_by == self.DECLARED_BY
+        assert restored.pin_declared_reason == self.REASON
+
+    def test_marker_round_trips_via_to_json_from_json(self):
+        """Escalation.from_json(esc.to_json()) round-trips both fields exactly."""
+        restored = Escalation.from_json(self._seeded().to_json())
+
+        assert restored.pin_declared_by == self.DECLARED_BY
+        assert restored.pin_declared_reason == self.REASON
+
+    def test_declarer_order_is_preserved(self):
+        """Declarer order survives a round-trip — the list is ordered, not a set."""
+        restored = Escalation.from_json(self._seeded().to_json())
+
+        assert restored.pin_declared_by[0] == 'task-3546-second-deviation-notice'
+        assert restored.pin_declared_by[1] == 'esc-3914-1'
+
+    # --- (e) legacy JSON backward compat (zero-migration) ---
+
+    def _legacy_payload(self) -> dict:
+        """A pre-4377 on-disk payload — every field EXCEPT the two marker keys."""
+        return {
+            'id': 'esc-task-1-0001',
+            'task_id': 'task-1',
+            'agent_role': 'implementer',
+            'severity': 'blocking',
+            'category': 'scope_violation',
+            'summary': 'legacy escalation without the declared-pin marker',
+            'detail': '',
+            'suggested_action': '',
+            'timestamp': '2026-01-01T00:00:00+00:00',
+            'status': 'pending',
+            'resolution': None,
+            'worktree': None,
+            'workflow_state': None,
+            'level': 0,
+            'resolved_at': None,
+            'resolved_by': None,
+            'resolution_turns': None,
+            'dedupe_count': 0,
+            'dedupe_children': [],
+            'dedupe_fingerprint': None,
+            'members': [],
+            'root_cause': '',
+            'options': [],
+            'evidence': [],
+            'train_state': None,
+            'index_health': None,
+            'resolution_action': None,
+            'resolution_class': None,
+            'triaged_at': None,
+            'triaged_by': None,
+            'triage_note': '',
+            'updated_at': None,
+            'granted_files': [],
+            'filing_claimant_run_id': None,
+            'amendments': [],
+            'amendments_truncated': 0,
+            'amendments_chars_elided': 0,
+            'root_cause_variants': [],
+            'root_cause_variants_truncated': 0,
+            'citation_sha': None,
+            'refiles_suppressed': 0,
+            # NOTE: pin_declared_by / pin_declared_reason are intentionally absent
+        }
+
+    def test_from_dict_legacy_payload_deserialises_to_defaults(self):
+        """Legacy JSON without the keys deserialises to []/'' — zero migration."""
+        restored = Escalation.from_dict(self._legacy_payload())
+
+        assert restored.pin_declared_by == []
+        assert restored.pin_declared_reason == ''
+
+    def test_from_json_legacy_payload_does_not_raise(self):
+        """Legacy JSON deserialises through from_json without raising."""
+        restored = Escalation.from_json(json.dumps(self._legacy_payload()))
+
+        assert restored.id == 'esc-task-1-0001'
+        assert restored.pin_declared_by == []
+        assert restored.pin_declared_reason == ''
+
+    # --- (f) the __dataclass_fields__ filter is not weakened ---
+
+    def test_unknown_extra_key_is_still_dropped(self):
+        """from_dict's filter surface is unchanged by the two added fields."""
+        payload = self._legacy_payload()
+        payload['not_a_real_field'] = 'should be dropped, not raise'
+
+        restored = Escalation.from_dict(payload)
+
+        assert not hasattr(restored, 'not_a_real_field')
+        assert restored.pin_declared_by == []

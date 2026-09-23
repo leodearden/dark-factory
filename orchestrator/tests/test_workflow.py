@@ -23,7 +23,13 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import pydantic_spec
+from _orch_helpers import (
+    MERGE_GATE_BARRIER_TIMEOUT,
+    MOCK_WORKFLOW_PROJECT_ROOT,
+    pydantic_spec,
+    wait_responsive,
+)
+from _recording_event_store import _RecordingEventStore
 from shared.task_statuses import TaskStatus
 
 from orchestrator.agents.invoke import AgentResult
@@ -119,6 +125,47 @@ class _CheckSequence:
         return self.results[idx]
 
 
+async def _await_waiter_count(registry, branch: str, count: int):
+    """Wait until *branch*'s in-flight entry has *count* waiters; return the entry.
+
+    A fixed number of ``sleep(0)`` yields is only enough while everything the
+    submit path awaits is in-process.  Once the tip classification runs a real
+    ``git cherry`` subprocess, the number of loop iterations it needs is
+    unbounded, so wait for the state itself and fail loudly on give-up.
+
+    The budget is the shared ``MERGE_GATE_BARRIER_TIMEOUT`` (15s nominal, 30s
+    wall cap) charged in event-loop-responsive time, so a descheduled worker
+    is handed back the time it was denied instead of being billed for it.
+    """
+    async def _poll():
+        while True:
+            entry = registry.entry(branch)
+            if entry is not None and len(entry.waiters) == count:
+                return entry
+            await asyncio.sleep(0.01)
+
+    return await wait_responsive(
+        _poll(),
+        timeout=MERGE_GATE_BARRIER_TIMEOUT,
+        label=f'{branch} reaching {count} in-flight waiters',
+    )
+
+
+def _merge_attempt_outcomes(store: _RecordingEventStore) -> list[str]:
+    """Every ``merge_attempt`` outcome an injected event store recorded.
+
+    Reading the store is what replaces patching ``_emit_merge_attempt``: the
+    production emitter is None-safe and writes the outcome under
+    ``data['outcome']`` as a StrEnum, so these stay plain string comparisons.
+    """
+    return [d['data']['outcome'] for t, d in store.events if 'merge_attempt' in t]
+
+
+def _merge_coalesced_count(store: _RecordingEventStore) -> int:
+    """How many ``merge_coalesced`` events an injected event store recorded."""
+    return sum(1 for t, _ in store.events if 'merge_coalesced' in t)
+
+
 @pytest.mark.asyncio
 class TestSubmitToMergeQueuePlanTightening:
     """Architect plan-tightening retry inside ``_submit_to_merge_queue``."""
@@ -145,14 +192,8 @@ class TestSubmitToMergeQueuePlanTightening:
             return 0, 'fake_head_sha\n', ''
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
-        emits: list[str] = []
-
-        def fake_emit(event_store, task_id, outcome, **kwargs):  # noqa: ARG001
-            emits.append(outcome)
-
-        monkeypatch.setattr(
-            'orchestrator.merge_queue._emit_merge_attempt', fake_emit,
-        )
+        events = _RecordingEventStore()
+        wf.event_store = events  # type: ignore[assignment]
 
         # Stub architect: write a narrowed plan to disk so read_plan() returns it.
         async def fake_invoke(role, prompt, cwd, **_kw):  # noqa: ARG001
@@ -166,16 +207,21 @@ class TestSubmitToMergeQueuePlanTightening:
         # Stub briefing helper used by _try_narrow_plan.
         wf.briefing.build_plan_tightening_prompt = AsyncMock(return_value='PROMPT')
 
-        # Stub enqueue: resolve future with a 'merged' outcome so we exit the
-        # happy path quickly.  We only assert the event emit list / no-L1,
+        # A REAL queue plus a drain coroutine, in place of a patched enqueue:
+        # the request genuinely lands on the queue and a stand-in merger
+        # resolves it with a 'done' outcome, so this test exercises the real
+        # register-and-enqueue path.  We only assert the recorded events / no-L1,
         # not the post-merge SHA pipeline.
-        from orchestrator.merge_queue import MergeOutcome, MergeRequest
+        from orchestrator.merge_queue import MergeOutcome
 
-        async def fake_enqueue(queue, req: MergeRequest, event_store, **_kwargs):  # noqa: ARG001
+        real_queue: asyncio.Queue = asyncio.Queue()
+        wf.merge_queue = real_queue
+
+        async def _merger():
+            req = await real_queue.get()
             req.result.set_result(MergeOutcome('done', merge_sha='deadbeef'))
-        monkeypatch.setattr(
-            'orchestrator.merge_queue.enqueue_merge_request', fake_enqueue,
-        )
+
+        merger_task = asyncio.create_task(_merger())
 
         mark_blocked = AsyncMock()
         wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
@@ -186,13 +232,15 @@ class TestSubmitToMergeQueuePlanTightening:
         )
 
         outcome = await wf._submit_to_merge_queue('task/2656', pre_rebased=False)
+        await merger_task
 
         assert outcome == WorkflowOutcome.DONE
         assert check_seq.calls == 2, (
             f'gate must re-check after narrowing; got {check_seq.calls} calls'
         )
-        assert 'plan_files_narrowed' in emits
-        assert 'plan_files_not_touched' not in emits
+        outcomes = _merge_attempt_outcomes(events)
+        assert 'plan_files_narrowed' in outcomes
+        assert 'plan_files_not_touched' not in outcomes
         mark_blocked.assert_not_awaited()
 
     async def test_architect_refuses_to_narrow_falls_through_to_l1(
@@ -216,13 +264,8 @@ class TestSubmitToMergeQueuePlanTightening:
             return 0, 'fake_head_sha\n', ''
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
-        emits: list[str] = []
-
-        def fake_emit(event_store, task_id, outcome, **kwargs):  # noqa: ARG001
-            emits.append(outcome)
-        monkeypatch.setattr(
-            'orchestrator.merge_queue._emit_merge_attempt', fake_emit,
-        )
+        events = _RecordingEventStore()
+        wf.event_store = events  # type: ignore[assignment]
 
         # Architect leaves plan.json untouched.
         async def fake_invoke(role, prompt, cwd, **_kw):  # noqa: ARG001
@@ -245,7 +288,7 @@ class TestSubmitToMergeQueuePlanTightening:
         # Caller must pass escalate_to_human=True.
         _, kwargs = mark_blocked.call_args
         assert kwargs.get('escalate_to_human') is True
-        assert 'plan_files_not_touched' in emits
+        assert 'plan_files_not_touched' in _merge_attempt_outcomes(events)
 
     async def test_architect_adds_new_file_rejected_no_recheck(
         self, tmp_path: Path, monkeypatch,
@@ -269,13 +312,8 @@ class TestSubmitToMergeQueuePlanTightening:
             return 0, 'fake_head_sha\n', ''
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
-        emits: list[str] = []
-
-        def fake_emit(event_store, task_id, outcome, **kwargs):  # noqa: ARG001
-            emits.append(outcome)
-        monkeypatch.setattr(
-            'orchestrator.merge_queue._emit_merge_attempt', fake_emit,
-        )
+        events = _RecordingEventStore()
+        wf.event_store = events  # type: ignore[assignment]
 
         async def fake_invoke(role, prompt, cwd, **_kw):  # noqa: ARG001
             assert wf.artifacts is not None
@@ -297,7 +335,7 @@ class TestSubmitToMergeQueuePlanTightening:
         mark_blocked.assert_awaited_once()
         _, kwargs = mark_blocked.call_args
         assert kwargs.get('escalate_to_human') is True
-        assert 'plan_files_not_touched' in emits
+        assert 'plan_files_not_touched' in _merge_attempt_outcomes(events)
 
     async def test_one_shot_guard_skips_architect_on_second_call(
         self, tmp_path: Path,
@@ -343,7 +381,7 @@ class TestSubmitToMergeQueueCrossRepo:
     """
 
     def _wire(self, wf, monkeypatch):
-        """Shared stubs: capture emits, forbid narrowing, stub _mark_blocked.
+        """Shared stubs: record events, forbid narrowing, stub _mark_blocked.
 
         Also stubs the not-touched gate so that WITHOUT the cross-repo
         short-circuit the flow deterministically reaches the
@@ -361,26 +399,22 @@ class TestSubmitToMergeQueueCrossRepo:
             fake_check,
         )
 
-        emits: list = []
-
-        def fake_emit(event_store, task_id, outcome, **kwargs):  # noqa: ARG001
-            emits.append(outcome)
-        monkeypatch.setattr(
-            'orchestrator.merge_queue._emit_merge_attempt', fake_emit,
-        )
+        events = _RecordingEventStore()
+        wf.event_store = events
 
         narrow = AsyncMock(return_value=False)
         wf._try_narrow_plan = narrow  # type: ignore[method-assign]
         mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
         wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
-        return emits, narrow, mark_blocked
+        return events, narrow, mark_blocked
 
-    def _assert_cross_repo(self, outcome, emits, narrow, mark_blocked):
+    def _assert_cross_repo(self, outcome, events, narrow, mark_blocked):
         from orchestrator.merge_gates import CROSS_REPO_DELIVERABLE_REASON_PREFIX
 
         assert outcome == WorkflowOutcome.BLOCKED
-        assert 'plan_files_cross_repo' in emits
-        assert 'plan_files_not_touched' not in emits
+        outcomes = _merge_attempt_outcomes(events)
+        assert 'plan_files_cross_repo' in outcomes
+        assert 'plan_files_not_touched' not in outcomes
         narrow.assert_not_awaited()
         mark_blocked.assert_awaited_once()
         args, kwargs = mark_blocked.call_args
@@ -403,11 +437,11 @@ class TestSubmitToMergeQueueCrossRepo:
             'orchestrator/src/orchestrator/offline_lane.py',
             'orchestrator/tests/test_offline_lane.py',
         ]}
-        emits, narrow, mark_blocked = self._wire(wf, monkeypatch)
+        events, narrow, mark_blocked = self._wire(wf, monkeypatch)
 
         outcome = await wf._submit_to_merge_queue('task/2656', pre_rebased=False)
 
-        self._assert_cross_repo(outcome, emits, narrow, mark_blocked)
+        self._assert_cross_repo(outcome, events, narrow, mark_blocked)
 
     async def test_absolute_foreign_no_marker_short_circuits(
         self, tmp_path: Path, monkeypatch,
@@ -420,11 +454,11 @@ class TestSubmitToMergeQueueCrossRepo:
             str(foreign / 'src' / 'x.py'),
             str(foreign / 'tests' / 'test_x.py'),
         ]}
-        emits, narrow, mark_blocked = self._wire(wf, monkeypatch)
+        events, narrow, mark_blocked = self._wire(wf, monkeypatch)
 
         outcome = await wf._submit_to_merge_queue('task/2656', pre_rebased=False)
 
-        self._assert_cross_repo(outcome, emits, narrow, mark_blocked)
+        self._assert_cross_repo(outcome, events, narrow, mark_blocked)
 
 
 @pytest.mark.asyncio
@@ -446,7 +480,7 @@ class TestSubmitToMergeQueueStalePathMessage:
     _NEVER_TOUCHED_SENTENCE = 'no commit on the branch touched them'
 
     def _wire(self, wf, monkeypatch, results):
-        """Stub the gate with *results*, capture emits and the block reason."""
+        """Stub the gate with *results*, record events and the block reason."""
         check_seq = _CheckSequence(results)
         monkeypatch.setattr(
             'orchestrator.merge_queue._check_plan_files_touched_in_branch',
@@ -457,18 +491,13 @@ class TestSubmitToMergeQueueStalePathMessage:
             return 0, 'fake_head_sha\n', ''
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
-        emits: list = []
-
-        def fake_emit(event_store, task_id, outcome, **kwargs):  # noqa: ARG001
-            emits.append(outcome)
-        monkeypatch.setattr(
-            'orchestrator.merge_queue._emit_merge_attempt', fake_emit,
-        )
+        events = _RecordingEventStore()
+        wf.event_store = events
 
         wf._try_narrow_plan = AsyncMock(return_value=False)  # type: ignore[method-assign]
         mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
         wf._mark_blocked = mark_blocked  # type: ignore[method-assign]
-        return emits, mark_blocked
+        return events, mark_blocked
 
     @staticmethod
     def _reason_of(mark_blocked) -> str:
@@ -492,7 +521,7 @@ class TestSubmitToMergeQueueStalePathMessage:
             missing_from_tree=[stale],
             resolved_renames={stale: resolved},
         )
-        emits, mark_blocked = self._wire(wf, monkeypatch, [result, result])
+        events, mark_blocked = self._wire(wf, monkeypatch, [result, result])
 
         outcome = await wf._submit_to_merge_queue('task/2656', pre_rebased=False)
 
@@ -512,7 +541,7 @@ class TestSubmitToMergeQueueStalePathMessage:
         )
         # Routing unchanged.
         assert outcome == WorkflowOutcome.BLOCKED
-        assert 'plan_files_not_touched' in emits
+        assert 'plan_files_not_touched' in _merge_attempt_outcomes(events)
         _, kwargs = mark_blocked.call_args
         assert kwargs.get('escalate_to_human') is True
 
@@ -1092,11 +1121,8 @@ class TestSubmitToMergeQueueAttachesAsPeer:
 
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
-        coalesced_calls: list[int] = []
-        monkeypatch.setattr(
-            'orchestrator.merge_queue._emit_merge_coalesced',
-            lambda *a, **kw: coalesced_calls.append(1),
-        )
+        events = _RecordingEventStore()
+        wf.event_store = events  # type: ignore[assignment]
 
         submit_task = asyncio.create_task(
             wf._submit_to_merge_queue('B', merge_phase=True)
@@ -1123,7 +1149,7 @@ class TestSubmitToMergeQueueAttachesAsPeer:
         assert outcome == WorkflowOutcome.DONE
 
         # (4) merge_coalesced event emitted
-        assert len(coalesced_calls) == 1
+        assert _merge_coalesced_count(events) == 1
 
     async def test_superset_tip_resnapshots_before_attach(
         self, tmp_path, monkeypatch,
@@ -1156,11 +1182,6 @@ class TestSubmitToMergeQueueAttachesAsPeer:
             return 0, '', ''
 
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
-        monkeypatch.setattr(
-            'orchestrator.merge_queue._emit_merge_coalesced',
-            lambda *a, **kw: None,
-        )
-
         re_snapshot_calls: list[tuple] = []
         real_re_snapshot = registry.re_snapshot
         registry.re_snapshot = lambda branch, tip: (  # type: ignore[method-assign]
@@ -1231,11 +1252,8 @@ class TestSubmitToMergeQueueAttachesAsPeer:
 
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
-        coalesced_calls: list[int] = []
-        monkeypatch.setattr(
-            'orchestrator.merge_queue._emit_merge_coalesced',
-            lambda *a, **kw: coalesced_calls.append(1),
-        )
+        events = _RecordingEventStore()
+        wf.event_store = events  # type: ignore[assignment]
 
         submit_task = asyncio.create_task(
             wf._submit_to_merge_queue('B', merge_phase=True)
@@ -1257,9 +1275,9 @@ class TestSubmitToMergeQueueAttachesAsPeer:
         )
 
         # (3) No merge_coalesced event for an independent re-enqueue
-        assert len(coalesced_calls) == 0, (
-            f'_emit_merge_coalesced must not be called for ATTACH_AND_CHAIN; '
-            f'calls={coalesced_calls}'
+        assert _merge_coalesced_count(events) == 0, (
+            f'no merge_coalesced event may be emitted for ATTACH_AND_CHAIN; '
+            f'events={events.events}'
         )
 
         # (4) The independently enqueued request is for branch 'B'
@@ -1280,8 +1298,10 @@ class TestSubmitToMergeQueueAttachesAsPeer:
 
         from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome
 
-        OLD = 'divold000000000001'
-        NEW = 'divnew000000000001'
+        # A REAL repo: `old` and `new` diverge topologically but carry the
+        # same patch-id, so the `git cherry` behind resolve_divergent really
+        # runs and really reports SUBSET.
+        OLD, NEW = _make_rebased_divergent_pair(tmp_path / 'divergent_repo')
 
         real_queue: asyncio.Queue = asyncio.Queue()
         registry = InFlightMergeRegistry()
@@ -1294,36 +1314,48 @@ class TestSubmitToMergeQueueAttachesAsPeer:
         )
 
         wf = self._make_attach_workflow(tmp_path, real_queue, registry)
-        # Neither is ancestor → DIVERGENT
+        # Neither tip is an ancestor of the other → DIVERGENT.  True of the
+        # real repo too; the stub only spares the workflow a real GitOps.
         wf.git_ops.is_ancestor = AsyncMock(return_value=False)
-        wf.git_ops.project_root = tmp_path
+        wf.git_ops.project_root = tmp_path / 'divergent_repo'
 
         async def fake_run(cmd, cwd=None, timeout=None):
             if 'rev-parse' in cmd:
                 return 0, NEW + '\n', ''
-            if 'cherry' in cmd:
-                # no '+' lines → all commits in NEW are in OLD → SUBSET
-                return 0, '- abc\n- def\n', ''
             return 0, '', ''
 
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
-        monkeypatch.setattr('orchestrator.merge_queue._run', fake_run)
-        monkeypatch.setattr(
-            'orchestrator.merge_queue._emit_merge_coalesced',
-            lambda *a, **kw: None,
+        # SUBSET and SUPERSET differ by exactly one observable call: the
+        # RESNAPSHOT arm re_snapshots and then falls through into the SAME
+        # attach the containment arm takes.  Without this spy the test passes
+        # even when `resolve_divergent` is forced to return SUPERSET.
+        re_snapshot_calls: list[tuple] = []
+        real_re_snapshot = registry.re_snapshot
+        registry.re_snapshot = lambda branch, tip: (  # type: ignore[method-assign]
+            re_snapshot_calls.append((branch, tip)) or real_re_snapshot(branch, tip)
         )
 
         submit_task = asyncio.create_task(
             wf._submit_to_merge_queue('B', merge_phase=True)
         )
-        for _ in range(10):
-            await asyncio.sleep(0)
+        entry = await _await_waiter_count(registry, 'B', 2)
 
         # Attached (ATTACH_CONTAINMENT action for SUBSET); no ValueError escaped
         assert real_queue.qsize() == 0
-        entry = registry.entry('B')
-        assert entry is not None
         assert len(entry.waiters) == 2
+
+        # SUBSET attaches WITHOUT re-snapshotting; a SUPERSET classification
+        # would have called re_snapshot before this same attach.
+        assert re_snapshot_calls == [], (
+            'SUBSET must attach without re_snapshot; a non-empty call list '
+            f'means the tip classified as SUPERSET instead: {re_snapshot_calls}'
+        )
+        # The same invariant read a second, independent way: re_snapshot is the
+        # sole writer of snapshot_tip, so an unchanged OLD is public proof it
+        # never ran.
+        post_entry = registry.entry('B')
+        assert post_entry is not None
+        assert post_entry.snapshot_tip == OLD
 
         P.set_result(MergeOutcome(status='done', merge_sha='sha'))
         await submit_task
@@ -1348,22 +1380,16 @@ class TestSubmitToMergeQueueAttachesAsPeer:
         )
 
         wf = self._make_attach_workflow(tmp_path, real_queue, registry)
-        wf.git_ops.is_ancestor = AsyncMock(return_value=False)
 
+        # rev-parse returns the SNAPSHOT tip, so the relation is SAME and the
+        # DIVERGENT patch-id resolution (the only `git cherry` caller) is never
+        # reached — this test is about the attach() race, not tip topology.
         async def fake_run(cmd, cwd=None, timeout=None):
             if 'rev-parse' in cmd:
                 return 0, TIP + '\n', ''
-            if 'cherry' in cmd:
-                return 0, '- abc\n', ''
             return 0, '', ''
 
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
-        monkeypatch.setattr('orchestrator.merge_queue._run', fake_run)
-        monkeypatch.setattr(
-            'orchestrator.merge_queue._emit_merge_coalesced',
-            lambda *a, **kw: None,
-        )
-
         # Force attach() to return False (entry released during classify await)
         registry.attach = lambda branch, waiter: False  # type: ignore[method-assign]
 
@@ -1439,11 +1465,6 @@ class TestAttachedWaiterOutcomeMapping:
             return 0, '', ''
 
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
-        monkeypatch.setattr(
-            'orchestrator.merge_queue._emit_merge_coalesced',
-            lambda *a, **kw: None,
-        )
-
         return wf, P, registry
 
     async def test_conflict_outcome_routes_to_resolve_and_resubmit(
@@ -1503,192 +1524,6 @@ class TestAttachedWaiterOutcomeMapping:
 
         assert len(mark_calls) == 1
         assert 'verification failed' in mark_calls[0]
-
-
-@pytest.mark.asyncio
-class TestSubmitToMergeQueueSoftCancelDetaches:
-    """Soft-cancel detaches the workflow waiter instead of cancelling the primary."""
-
-    async def test_soft_cancel_detaches_waiter_primary_lives(
-        self, tmp_path, monkeypatch,
-    ):
-        """Soft-cancel removes workflow waiter; primary stays alive for the MCP waiter."""
-        import asyncio
-
-        from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome
-
-        real_queue: asyncio.Queue = asyncio.Queue()
-        registry = InFlightMergeRegistry()
-
-        TIP = 'tip000000000000001'
-        P: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
-        registry.acquire(
-            'B', 'mcp-task', P,
-            request_id='mr-mcp', source='mcp',
-            submitted_tip=TIP, snapshot_tip=TIP,
-        )
-
-        assignment = MagicMock()
-        assignment.task_id = 'B'
-        assignment.task = {'id': 'B', 'title': 'T', 'description': 'd'}
-        assignment.modules = []
-
-        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-        config.git.branch_prefix = 'task/'  # task ν: real str prefix for QueuedBranch.parse
-        config.fused_memory.project_id = 'dark_factory'
-        config.fused_memory.url = 'http://localhost:8002'
-        config.max_review_cycles = 2
-        config.max_amendment_rounds = 1
-        config.lock_depth = 2
-        config.steward_completion_timeout = 300.0
-        config.project_root = tmp_path
-
-        wt = tmp_path / 'wt'
-        wt.mkdir(parents=True, exist_ok=True)
-
-        scheduler = MagicMock()
-        scheduler.get_status = AsyncMock(return_value='in-progress')
-
-        wf = TaskWorkflow(
-            assignment=assignment,
-            config=config,
-            git_ops=MagicMock(),
-            scheduler=scheduler,
-            briefing=MagicMock(),
-            mcp=MagicMock(),
-            merge_queue=real_queue,
-            merge_inflight_registry=registry,
-        )
-        wf.worktree = wt
-        wf.plan = {}
-        wf._base_commit = None
-        wf._module_configs = []
-        wf.git_ops.rebind_branch_to_head = AsyncMock(return_value=True)  # task-1923
-
-        async def fake_run(cmd, cwd=None, timeout=None):
-            if 'rev-parse' in cmd:
-                return 0, TIP + '\n', ''
-            return 0, '', ''
-
-        monkeypatch.setattr('orchestrator.workflow._run', fake_run)
-        monkeypatch.setattr(
-            'orchestrator.merge_queue._emit_merge_coalesced',
-            lambda *a, **kw: None,
-        )
-
-        # Pre-set cancel_event so the workflow soft-cancels after attaching
-        wf._cancel_event.set()
-
-        # W9-θ: cancel-win now raises WorkflowCancelled('soft') (propagating to
-        # run()'s single catch) instead of returning SOFT_CANCELLED directly —
-        # the DONE-vs-SOFT_CANCELLED status decision moved to
-        # _finalise_cancellation/_handle_soft_cancel (see TestHandleSoftCancelOutcome).
-        with pytest.raises(WorkflowCancelled) as excinfo:
-            await wf._submit_to_merge_queue('B', merge_phase=True)
-        assert excinfo.value.kind == 'soft'
-
-        # (1) Workflow waiter was detached; only MCP waiter 'mr-mcp' remains
-        entry = registry.entry('B')
-        assert entry is not None, 'entry must still be in-flight (primary not cancelled)'
-        assert len(entry.waiters) == 1
-        assert entry.waiters[0].request_id == 'mr-mcp'
-
-        # (2) Primary P is NOT cancelled
-        assert not P.cancelled()
-
-    async def test_re_attach_coalesces_after_soft_cancel(
-        self, tmp_path, monkeypatch,
-    ):
-        """A second _submit_to_merge_queue after soft-cancel re-attaches (2 waiters, no enqueue)."""
-        import asyncio
-
-        from orchestrator.merge_queue import InFlightMergeRegistry, MergeOutcome
-
-        real_queue: asyncio.Queue = asyncio.Queue()
-        registry = InFlightMergeRegistry()
-
-        TIP = 'tip000000000000002'
-        P: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
-        registry.acquire(
-            'B', 'mcp-task', P,
-            request_id='mr-mcp', source='mcp',
-            submitted_tip=TIP, snapshot_tip=TIP,
-        )
-
-        assignment = MagicMock()
-        assignment.task_id = 'B'
-        assignment.task = {'id': 'B', 'title': 'T', 'description': 'd'}
-        assignment.modules = []
-
-        config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-        config.git.branch_prefix = 'task/'  # task ν: real str prefix for QueuedBranch.parse
-        config.fused_memory.project_id = 'dark_factory'
-        config.fused_memory.url = 'http://localhost:8002'
-        config.max_review_cycles = 2
-        config.max_amendment_rounds = 1
-        config.lock_depth = 2
-        config.steward_completion_timeout = 300.0
-        config.project_root = tmp_path
-
-        wt = tmp_path / 'wt'
-        wt.mkdir(parents=True, exist_ok=True)
-
-        scheduler = MagicMock()
-        scheduler.get_status = AsyncMock(return_value='in-progress')
-
-        wf = TaskWorkflow(
-            assignment=assignment,
-            config=config,
-            git_ops=MagicMock(),
-            scheduler=scheduler,
-            briefing=MagicMock(),
-            mcp=MagicMock(),
-            merge_queue=real_queue,
-            merge_inflight_registry=registry,
-        )
-        wf.worktree = wt
-        wf.plan = {}
-        wf._base_commit = None
-        wf._module_configs = []
-        wf.git_ops.rebind_branch_to_head = AsyncMock(return_value=True)  # task-1923
-
-        async def fake_run(cmd, cwd=None, timeout=None):
-            if 'rev-parse' in cmd:
-                return 0, TIP + '\n', ''
-            return 0, '', ''
-
-        monkeypatch.setattr('orchestrator.workflow._run', fake_run)
-        monkeypatch.setattr(
-            'orchestrator.merge_queue._emit_merge_coalesced',
-            lambda *a, **kw: None,
-        )
-
-        # First call: soft-cancel → detach.  W9-θ: raises WorkflowCancelled('soft')
-        # instead of returning — the detach still happens in _await_cancellable's
-        # finally before the raise propagates.
-        wf._cancel_event.set()
-        with pytest.raises(WorkflowCancelled):
-            await wf._submit_to_merge_queue('B', merge_phase=True)
-        _entry = registry.entry('B')
-        assert _entry is not None
-        assert len(_entry.waiters) == 1  # detached
-
-        # Second call: re-attach (cancel_event still set, but entry still in-flight)
-        # Clear the cancel event so the second call can actually attach and await
-        wf._cancel_event.clear()
-        submit_task = asyncio.create_task(wf._submit_to_merge_queue('B', merge_phase=True))
-        for _ in range(10):
-            await asyncio.sleep(0)
-
-        # Re-attached: 2 waiters again, no enqueue
-        assert real_queue.qsize() == 0
-        _entry2 = registry.entry('B')
-        assert _entry2 is not None
-        assert len(_entry2.waiters) == 2
-
-        # Clean up: resolve P so the task can finish
-        P.set_result(MergeOutcome(status='done', merge_sha='sha2'))
-        await submit_task
 
 
 @pytest.mark.asyncio
@@ -1902,8 +1737,6 @@ class TestSubmitToMergeQueueEnqueuePathEdgeCases:
         registry = InFlightMergeRegistry()
         wf, real_queue = self._make_wf(tmp_path, registry=registry)
 
-        monkeypatch.setattr('orchestrator.merge_queue._emit_merge_coalesced', lambda *a, **kw: None)
-
         # Pre-set cancel_event; soft-cancel fires as soon as _await_cancellable runs.
         wf._cancel_event.set()
 
@@ -1950,8 +1783,6 @@ class TestSubmitToMergeQueueEnqueuePathEdgeCases:
             return 0, '', ''
 
         monkeypatch.setattr('orchestrator.workflow._run', fake_run_fail)
-        monkeypatch.setattr('orchestrator.merge_queue._emit_merge_coalesced', lambda *a, **kw: None)
-
         # Run without cancel so the test can drive completion normally.
         submit_task = asyncio.create_task(wf._submit_to_merge_queue('B', merge_phase=True))
         for _ in range(10):
@@ -1981,9 +1812,10 @@ class TestSubmitToMergeQueueEnqueuePathEdgeCases:
 class TestBoundaryTableWorkflow:
     """PRD §8 row 10: soft-cancel detach at the workflow seam.
 
-    Extends TestSubmitToMergeQueueSoftCancelDetaches with:
-    - The remaining-MCP-waiter-completes assertion (P resolves to 'done')
-    - The re-attach-coalesces assertion (entry waiter count back to 2)
+    Covers, at the ``_submit_to_merge_queue`` seam: the workflow waiter
+    detaching on soft-cancel, the mcp-source primary surviving that detach,
+    re-attach coalescing on retry, and the remaining MCP waiter still
+    completing once the entry resolves.
     """
 
     def _make_wf_with_peer(self, tmp_path, real_queue, registry, *, tip: str):
@@ -2042,7 +1874,7 @@ class TestBoundaryTableWorkflow:
         (2) Workflow outcome is REQUEUED.
         (3) On retry, re-attach coalesces (entry waiter count = 2, no enqueue).
         (4) Resolve P to 'done' — the remaining MCP waiter P is still done.
-        Extends TestSubmitToMergeQueueSoftCancelDetaches with (3) and (4).
+        (1) and (2) pin the detach itself; (3) and (4) pin what must survive it.
         """
         import asyncio
 
@@ -2067,11 +1899,6 @@ class TestBoundaryTableWorkflow:
             return 0, '', ''
 
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
-        monkeypatch.setattr(
-            'orchestrator.merge_queue._emit_merge_coalesced',
-            lambda *a, **kw: None,
-        )
-
         # ── (1)+(2) First call: soft-cancel → detach ───────────────────────
         # W9-θ: cancel-win now raises WorkflowCancelled('soft') instead of
         # returning SOFT_CANCELLED — propagates to run()'s single catch site.
@@ -2122,7 +1949,8 @@ class TestBoundaryTableWorkflow:
 
 # ---------------------------------------------------------------------------
 # TestHandleSoftCancelOutcome — unit tests for the 3-way decision in
-# _handle_soft_cancel: terminal → DONE, cancel_event set → SOFT_CANCELLED,
+# _handle_soft_cancel: terminal → that terminal (DONE / CANCELLED),
+# cancel_event set → SOFT_CANCELLED,
 # cancel cleared (spurious) → REQUEUED.
 # ---------------------------------------------------------------------------
 
@@ -2152,6 +1980,9 @@ class TestHandleSoftCancelOutcome:
 
         scheduler = MagicMock()
         scheduler.get_status = AsyncMock(return_value=status)
+        # Case 3 (spurious wakeup) re-pends the row before its REQUEUED exit
+        # as of task 3538 — a bare MagicMock attribute is not awaitable.
+        scheduler.set_task_status = AsyncMock()
 
         wf = TaskWorkflow(
             assignment=assignment,
@@ -2169,6 +2000,19 @@ class TestHandleSoftCancelOutcome:
         wf._cancel_event.set()  # even with event set, terminal wins
         outcome = await wf._handle_soft_cancel('merge')
         assert outcome == WorkflowOutcome.DONE
+
+    async def test_cancelled_status_returns_cancelled(self, tmp_path: Path):
+        """Scheduler status 'cancelled' → CANCELLED, not DONE (task 3538).
+
+        Case 1 reports the OBSERVED terminal rather than collapsing both
+        terminal statuses onto DONE: _OUTCOME_ALLOWED['done'] == {DONE}, so a
+        DONE exit here fails run()'s SM-2 assertion, and the completed tally
+        (outcome == DONE) counted a cancellation as a completion.
+        """
+        wf = self._make_wf(tmp_path, status='cancelled')
+        wf._cancel_event.set()  # terminal still wins
+        outcome = await wf._handle_soft_cancel('merge')
+        assert outcome == WorkflowOutcome.CANCELLED
 
     async def test_non_terminal_cancel_set_returns_soft_cancelled(self, tmp_path: Path):
         """Scheduler status non-terminal + cancel_event.is_set() → SOFT_CANCELLED."""
@@ -2198,7 +2042,6 @@ class TestGroupMergeUnionScope:
         After fix: both files and both ModuleConfigs are present in req.
         """
         import asyncio
-        from unittest.mock import patch
 
         from orchestrator.config import ModuleConfig
         from orchestrator.merge_queue import (
@@ -2274,16 +2117,17 @@ class TestGroupMergeUnionScope:
 
         captured: list[GroupMergeRequest] = []
 
-        async def _fake_register(queue, req, event_store, reg, **kw):
+        async def _merger():
+            req = await real_queue.get()
             captured.append(req)
             req.result.set_result(MergeOutcome(status='done', merge_sha='abc123'))
-            return True
 
-        with patch('orchestrator.merge_queue.register_and_enqueue_merge_request', _fake_register):
-            outcome = await wf._maybe_enqueue_group_merge()
+        merger_task = asyncio.create_task(_merger())
+        outcome = await wf._maybe_enqueue_group_merge()
+        await merger_task
 
         assert outcome == WorkflowOutcome.DONE, f'expected DONE, got {outcome!r}'
-        assert captured, '_fake_register must have been called (GroupMergeRequest enqueued)'
+        assert captured, 'a GroupMergeRequest must have reached the real merge queue'
         req = captured[0]
 
         # Union task_files: lower-member's file must be present alongside the tip's
@@ -2375,7 +2219,7 @@ def _make_wip_conflict_workflow(*, task_id: str = '2282') -> TaskWorkflow:
     config.fused_memory.url = 'http://localhost:8002'
     config.lock_depth = 2
     config.steward_completion_timeout = 300.0
-    config.project_root = Path('/tmp/non-existent-for-test')
+    config.project_root = MOCK_WORKFLOW_PROJECT_ROOT
 
     scheduler = MagicMock()
     scheduler.update_task = AsyncMock(return_value=True)
@@ -2806,6 +2650,39 @@ def _init_git_repo(path: Path) -> None:
     subprocess.run(
         ['git', 'commit', '-q', '-m', 'seed'], cwd=path, env=env, check=True,
     )
+
+
+def _make_rebased_divergent_pair(path: Path) -> tuple[str, str]:
+    """Build a repo whose two tips diverge topologically but share patch-ids.
+
+    Returns ``(old_tip, new_tip)``: neither is an ancestor of the other, yet
+    every commit in *new_tip* is already present in *old_tip* by patch-id --
+    the rebase/cherry-pick rewrite ``resolve_divergent`` must classify as
+    SUBSET.  Building it for real is what lets the DIVERGENT test drop its
+    ``merge_queue._run`` patch: ``git cherry`` genuinely reports no '+' lines.
+    """
+    _init_git_repo(path)
+    env = {
+        **os.environ,
+        'GIT_AUTHOR_NAME': 'T', 'GIT_AUTHOR_EMAIL': 't@e',
+        'GIT_COMMITTER_NAME': 'T', 'GIT_COMMITTER_EMAIL': 't@e',
+    }
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ['git', *args], cwd=path, env=env, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+
+    base = git('rev-parse', 'HEAD')
+    # Same change committed twice off the same base, under two different
+    # messages: two distinct SHAs, one shared patch-id.
+    for branch, message in (('old', 'add f'), ('new', 'add f (rebased)')):
+        git('checkout', '-q', '-b', branch, base)
+        (path / 'f.txt').write_text('X\n')
+        git('add', 'f.txt')
+        git('commit', '-q', '-m', message)
+    return git('rev-parse', 'old'), git('rev-parse', 'new')
 
 
 @pytest.mark.asyncio

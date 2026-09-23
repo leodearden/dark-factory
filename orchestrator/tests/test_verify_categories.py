@@ -32,10 +32,11 @@ import pytest
 # step-1: core surface
 # ---------------------------------------------------------------------------
 
-# The exact 15-member closed output domain of verify._classify_failure today
+# The exact 16-member closed output domain of verify._classify_failure today
 # (the 12 legacy category strings, task 2549's DISK_FULL/SEMAPHORE_TIMEOUT
-# host-infrastructure categories, and task 3173's INFRA_KILL external-signal
-# category), including the '' (NONE) empty-string sentinel (default of
+# host-infrastructure categories, task 3173's INFRA_KILL external-signal
+# category, and task 5580's PYTEST_USAGE_ERROR — the pytest-side analogue of
+# CARGO_CLI_ERROR), including the '' (NONE) empty-string sentinel (default of
 # _worst_category on empty input; a member of both _CATEGORY_PRIORITY and
 # _ARCHIVE_DENY_LIST).
 _EXPECTED_CATEGORY_VALUES = {
@@ -44,6 +45,7 @@ _EXPECTED_CATEGORY_VALUES = {
     'disk_full',
     'semaphore_timeout',
     'cargo_cli_error',
+    'pytest_usage_error',
     'compile_error',
     'tree_sitter_generate_error',
     'flock_error',
@@ -58,15 +60,15 @@ _EXPECTED_CATEGORY_VALUES = {
 
 
 class TestFailureCategoryMemberSet:
-    """FailureCategory is a StrEnum with exactly the 15 category strings."""
+    """FailureCategory is a StrEnum with exactly the 16 category strings."""
 
     def test_member_values_match_legacy_category_set_exactly(self):
         from orchestrator.verify_categories import FailureCategory
         assert {c.value for c in FailureCategory} == _EXPECTED_CATEGORY_VALUES
 
-    def test_member_count_is_fifteen(self):
+    def test_member_count_is_sixteen(self):
         from orchestrator.verify_categories import FailureCategory
-        assert len(list(FailureCategory)) == 15
+        assert len(list(FailureCategory)) == 16
 
     def test_is_strenum_subclass(self):
         from enum import StrEnum
@@ -148,9 +150,9 @@ class TestCategoryPolicyExhaustive:
         from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory
         assert set(CATEGORY_POLICY) == set(FailureCategory)
 
-    def test_row_count_is_fifteen(self):
+    def test_row_count_is_sixteen(self):
         from orchestrator.verify_categories import CATEGORY_POLICY
-        assert len(CATEGORY_POLICY) == 15
+        assert len(CATEGORY_POLICY) == 16
 
 
 class TestCategoryPolicyGoldenRows:
@@ -187,7 +189,50 @@ class TestCategoryPolicyGoldenRows:
     def test_none_row(self):
         from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory
         row = CATEGORY_POLICY[FailureCategory.NONE]
-        assert row.severity_rank == 14
+        assert row.severity_rank == 15
+
+    def test_pytest_usage_error_row(self):
+        """Task 5580. Four of the five fields are CARGO_CLI_ERROR's, because
+        "the tool rejected our invocation" must be adjudicated identically on
+        both sides of the table rather than re-reasoned from scratch.
+
+        archive=True — the rejected argv exists only in the per-attempt log,
+        and that log IS the diagnosis; finding it took a human session.
+
+        preexisting_probe=True — a config-caused usage error (a bad pyproject
+        addopts, an edited module test_command) genuinely IS pre-existing on
+        main, and should be found so. Also matches today's behaviour via
+        UNKNOWN_TEST_FAILURE, so no probe changes its mind.
+
+        is_infra_transient=False — deliberately NOT widening
+        INFRA_TRANSIENT_CATEGORIES, which drives bounded RETRY windows.
+        Re-running a byte-identical rejected argv cannot help: the windows
+        would burn their attempts and file a blocking L1 anyway.
+
+        verdict_indeterminate=False — predicate (2) FAILS. A diff CAN cause
+        this, so the leg keeps its veto over another host's PASS. Fail CLOSED,
+        exactly as PYTEST_INTERNALERROR and ENV_TRANSIENT do.
+        """
+        from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory, RetryKind
+        row = CATEGORY_POLICY[FailureCategory.PYTEST_USAGE_ERROR]
+        assert row.archive is True
+        assert row.preexisting_probe is True
+        assert row.is_infra_transient is False
+        assert row.verdict_indeterminate is False
+        assert row.retry_kind == RetryKind.NONE
+
+    def test_pytest_usage_error_outranks_every_verdict_bearing_category(self):
+        """"The suite never ran" must win a _worst_category contest.
+
+        When a usage-error leg co-occurs with a leg that did produce a
+        verdict, the category that survives must be the one that says no
+        verdict was reached — otherwise the summary reports a test result for
+        a run that never happened.
+        """
+        from orchestrator.verify_categories import CATEGORY_PRIORITY
+        usage = CATEGORY_PRIORITY.index('pytest_usage_error')
+        for weaker in ('test_failure', 'unknown_test_failure', 'passed'):
+            assert usage < CATEGORY_PRIORITY.index(weaker)
 
 
 # ---------------------------------------------------------------------------
@@ -237,13 +282,6 @@ class TestValidateExhaustive:
         _Synth, any_row = self._make_synth_policy()
         _validate_exhaustive(_Synth, {_Synth.A: any_row, _Synth.B: any_row})
 
-    def test_real_module_import_satisfies_its_own_guard(self):
-        # Importing the real module must succeed — its shipped table already
-        # satisfies _validate_exhaustive (this is F1 firing at import time).
-        import orchestrator.verify_categories as vc
-
-        vc._validate_exhaustive(vc.FailureCategory, vc.CATEGORY_POLICY)
-
 
 # ---------------------------------------------------------------------------
 # step-5: derived registries match today's verify.py literals byte-for-byte
@@ -264,6 +302,7 @@ class TestDerivedRegistriesByteIdentity:
             'disk_full',
             'semaphore_timeout',
             'cargo_cli_error',
+            'pytest_usage_error',
             'compile_error',
             'tree_sitter_generate_error',
             'flock_error',
@@ -382,23 +421,15 @@ class TestShouldArchive:
 
 
 class TestVerifyRegistriesSingleSourced:
-    """verify.py's four category registries must BE (identity, not just
-    value-equality) the verify_categories objects — the mechanism that
+    """verify.py's PUBLICLY NAMED category registries must BE (identity, not
+    just value-equality) the verify_categories objects — the mechanism that
     eliminates the hand-sync bug_history (task 2048: a single category
     change required 4 registry edits + 2 inline sets).
 
-    RED today: verify.py still holds hand-written literals for
-    _CATEGORY_PRIORITY / _ARCHIVE_DENY_LIST / PREEXISTING_BREAK_SKIP_CATEGORIES,
-    and INFRA_TRANSIENT_CATEGORIES does not exist on verify.py yet.
+    verify.py's other two registries are privately named, so they are pinned
+    by VALUE through the derived objects instead — see
+    TestDerivedRegistriesByteIdentity (task 5027 γ4).
     """
-
-    def test_category_priority_is_the_derived_object(self):
-        from orchestrator import verify, verify_categories
-        assert verify._CATEGORY_PRIORITY is verify_categories.CATEGORY_PRIORITY
-
-    def test_archive_deny_list_is_the_derived_object(self):
-        from orchestrator import verify, verify_categories
-        assert verify._ARCHIVE_DENY_LIST is verify_categories.ARCHIVE_DENY_LIST
 
     def test_preexisting_break_skip_categories_is_the_derived_object(self):
         from orchestrator import verify, verify_categories
@@ -410,24 +441,6 @@ class TestVerifyRegistriesSingleSourced:
     def test_infra_transient_categories_is_the_derived_object(self):
         from orchestrator import verify, verify_categories
         assert verify.INFRA_TRANSIENT_CATEGORIES is verify_categories.INFRA_TRANSIENT_CATEGORIES
-
-
-class TestShouldArchiveCategoryDelegatesToTable:
-    """verify._should_archive_category must delegate to
-    verify_categories.should_archive — no endswith('_error') heuristic.
-
-    RED today: the endswith heuristic makes an unrecognized '..._error'
-    string archive (True) instead of defaulting to False.
-    """
-
-    @pytest.mark.parametrize('category', sorted(_EXPECTED_CATEGORY_VALUES))
-    def test_matches_table_lookup_for_every_known_category(self, category):
-        from orchestrator import verify, verify_categories
-        assert verify._should_archive_category(category) == verify_categories.should_archive(category)
-
-    def test_unknown_error_suffixed_category_no_longer_auto_archives(self):
-        from orchestrator import verify
-        assert verify._should_archive_category('made_up_error') is False
 
 
 class TestClassifierByteIdentityGolden:
@@ -663,12 +676,6 @@ class TestSemaphoreTimeoutArchivesForHumanTriage:
         from orchestrator.verify_categories import should_archive
         assert should_archive('semaphore_timeout') is True
 
-    def test_verify_delegation_path_archives(self):
-        """The call site that actually decides whether the log survives —
-        mirrors TestShouldArchiveCategoryDelegatesToTable's style."""
-        from orchestrator import verify
-        assert verify._should_archive_category('semaphore_timeout') is True
-
 
 class TestDiskFullArchivesForHumanTriage:
     """task 3683: DISK_FULL must archive its verify log.
@@ -716,11 +723,6 @@ class TestDiskFullArchivesForHumanTriage:
     def test_should_archive_returns_true(self):
         from orchestrator.verify_categories import should_archive
         assert should_archive('disk_full') is True
-
-    def test_verify_delegation_path_archives(self):
-        """The call site that actually decides whether the log survives."""
-        from orchestrator import verify
-        assert verify._should_archive_category('disk_full') is True
 
 
 class TestPytestInternalerrorArchivesForHumanTriage:
@@ -773,11 +775,6 @@ class TestPytestInternalerrorArchivesForHumanTriage:
         from orchestrator.verify_categories import should_archive
         assert should_archive('pytest_internalerror') is True
 
-    def test_verify_delegation_path_archives(self):
-        """The call site that actually decides whether the log survives."""
-        from orchestrator import verify
-        assert verify._should_archive_category('pytest_internalerror') is True
-
 
 class TestEnvTransientArchivesForHumanTriage:
     """task 3683: ENV_TRANSIENT must archive its verify log.
@@ -826,11 +823,6 @@ class TestEnvTransientArchivesForHumanTriage:
     def test_should_archive_returns_true(self):
         from orchestrator.verify_categories import should_archive
         assert should_archive('env_transient') is True
-
-    def test_verify_delegation_path_archives(self):
-        """The call site that actually decides whether the log survives."""
-        from orchestrator import verify
-        assert verify._should_archive_category('env_transient') is True
 
 
 class TestAssertInfraTransientRowsArchive:
@@ -905,13 +897,6 @@ class TestAssertInfraTransientRowsArchive:
             _Synth.CODE_FAULT: self._row(archive=False, is_infra_transient=False),
         }
         _assert_infra_transient_rows_archive(policy)
-
-    def test_real_module_import_satisfies_its_own_guard(self):
-        # Importing the real module must succeed — its shipped table already
-        # satisfies the guard (this is it firing at import time).
-        import orchestrator.verify_categories as vc
-
-        vc._assert_infra_transient_rows_archive(vc.CATEGORY_POLICY)
 
     def test_no_infra_transient_category_is_archive_denied(self):
         """The human-legible form of the same invariant, asserted against the
@@ -1136,13 +1121,22 @@ class TestIndeterminateExclusionsAreAdjudicated:
         # Fails part (3), on the IDENTICAL residual shape as env_transient
         # above — leaving it True after fixing env_transient on these grounds
         # would repeat the very inconsistency the review flagged.
-        # verify_classify.py:438-453 records the task-2748/2821 "Known gap"
-        # verbatim: a deterministic SHELL-script gate assertion (the docstring's
-        # own example is a manifest-drift check — precisely a BRANCH-caused
-        # failure) that quotes a lock token plus a timeout token but emits no
-        # grounded verdict marker still satisfies the loose `_LOCK_TOKEN_RE` +
-        # `_TIMEOUT_TOKEN_RE` co-occurrence and is still classified
-        # SEMAPHORE_TIMEOUT.
+        #
+        # CORRECTED by task 4492, mirroring the row's own comment in
+        # verify_categories.py. The previous wording justified this by the
+        # loose `_LOCK_TOKEN_RE` + `_TIMEOUT_TOKEN_RE` co-occurrence; task
+        # 3679 DELETED both regexes and replaced them with a positive,
+        # line-anchored, wrapper-emitted marker, and task 4492 scoped that
+        # marker to output carrying no passing-suite attestation.
+        #
+        # Predicate (3) still fails, on a different residual: a branch can
+        # put a genuine column-0 emitter line OUTSIDE run_all's framing
+        # entirely (a new test shelling out to `lib_test_semaphore.sh` from a
+        # `cargo test`, or any producer emitting `@@REIFY_SLOT_TIMEOUT@@`
+        # outside an aggregated run), which neither the anchor nor the
+        # scoping can distinguish from a host event. So the row keeps
+        # verdict_indeterminate=False and fails CLOSED — the assertions below
+        # are unchanged.
         from orchestrator.verify_categories import (
             CATEGORY_POLICY,
             INDETERMINATE_VERDICT_CATEGORIES,

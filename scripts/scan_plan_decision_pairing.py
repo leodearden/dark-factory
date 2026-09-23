@@ -31,9 +31,19 @@ which is the single owner of the two marker literal sets and of the predicate
 (``DESIGN_DECISIONS_KEY``), not the two field names it reads out of an entry
 (``PAIRING_FIELDS``); it imports each and then discovers files, reports, and
 renders. The envelope verdict on each record likewise comes from
-``toolcall_markup.detect``, unmodified — so ONE report distinguishes the two
-damage classes and flags a plan carrying both (the task 3382 shape) instead of
-making an operator run two sweeps and join them by hand.
+``toolcall_markup``, unmodified — so ONE report distinguishes the two damage
+classes and flags a plan carrying both (the task 3382 shape) instead of making
+an operator run two sweeps and join them by hand.
+
+That verdict asks the PARAMETER-AWARE predicate ``detect_for`` rather than the
+blanket ``detect`` (task 4696). The blanket one enumerates a fixed literal set
+spelling none of plan-tools' own parameter names, so a field mis-closed with
+its OWN name-echoing tag — 296 of the corrupted ``rationale`` strings measured
+2026-08-25 — was reported envelope-CLEAN. On a report whose entire value is
+telling two damage classes apart, that is a WRONG column rather than a missing
+one. Nothing is re-spelled to fix it: the field name is already the loop
+variable and ``PAIRING_FIELDS`` is already imported, so the site becomes fully
+schema-aware for free (INV-5).
 
 ## Why there is no ``--apply`` and never will be
 
@@ -98,7 +108,7 @@ from shared.decision_pairing import (  # noqa: E402
     PAIRING_FIELDS,
     scan_design_decisions,
 )
-from shared.toolcall_markup import detect  # noqa: E402
+from shared.toolcall_markup import detect_for  # noqa: E402
 
 __all__ = [
     'DEFAULT_ROOT',
@@ -225,22 +235,28 @@ def _sort_key(task_id: str) -> tuple[int, int, str]:
 
 
 def _entry_has_envelope_residue(entry: object) -> bool:
-    """True if ``toolcall_markup.detect`` fires on either field of *entry*.
+    """True if ``toolcall_markup.detect_for`` fires on either field of *entry*.
 
     Total for adversarial shapes for the same reason the predicate is: this
-    walks plan documents nobody validated, and ``detect`` already returns
-    ``None`` for any non-``str``.
+    walks plan documents nobody validated, and ``detect_for`` already returns
+    ``None`` for any non-``str`` value, param or schema.
 
     The field names come from :data:`shared.decision_pairing.PAIRING_FIELDS`
     rather than being re-spelled here, so the two damage classes are always
     asked about the SAME two strings: a second spelling that drifted would
     report an envelope verdict for one field while the pairing predicate read
     another, which is a wrong column rather than a missing one.
+
+    That same tuple is ALSO what makes the verdict schema-aware for free (task
+    4696): the field being read is the parameter the value was received as, and
+    the tuple is the parameter vocabulary of the tool that wrote it — the two
+    arguments ``detect_for`` qualifies on. So the widening that closed the
+    blind gate costs this site nothing and enumerates nothing.
     """
     if not isinstance(entry, dict):
         return False
     return any(
-        detect(entry.get(field)) is not None
+        detect_for(entry.get(field), field, PAIRING_FIELDS) is not None
         for field in PAIRING_FIELDS
     )
 

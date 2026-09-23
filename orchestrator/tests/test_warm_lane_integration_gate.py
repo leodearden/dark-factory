@@ -41,6 +41,7 @@ from orchestrator.git_ops import (
     _run,
 )
 from orchestrator.harness import Harness, TaskReport
+from orchestrator.lane_lifecycle import LANE_STATE_DIRNAME
 from orchestrator.merge_queue import _classify_branch_presence
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.warm_lane_pool import LaneState
@@ -540,13 +541,13 @@ class TestPoolBoundedExhausted:
         # .lane-state is the W11-gamma durable lifecycle-record directory —
         # an expected metadata band (not a worktree, cold or otherwise),
         # written as a side effect of the successful acquire above.
-        lane_state_dirname = git_ops._lane_lifecycle.state_dir.name
         non_pool_dirs = [
             d for d in dirs
-            if not d.startswith('_lane-') and d not in ('_merge-verify', lane_state_dirname)
+            if not d.startswith('_lane-')
+            and d not in ('_merge-verify', LANE_STATE_DIRNAME)
         ]
         assert non_pool_dirs == [], (
-            f'Only _lane-*, _merge-verify, and {lane_state_dirname} dirs expected; '
+            f'Only _lane-*, _merge-verify, and {LANE_STATE_DIRNAME} dirs expected; '
             f'found extra dirs (cold worktrees?): {non_pool_dirs}'
         )
 

@@ -3,6 +3,7 @@
 import uuid
 from datetime import UTC, datetime, timedelta
 
+import aiosqlite
 import pytest
 import pytest_asyncio
 
@@ -11,6 +12,7 @@ from fused_memory.models.reconciliation import (
     EventType,
     ReconciliationEvent,
 )
+from fused_memory.reconciliation import event_buffer as event_buffer_mod
 from fused_memory.reconciliation.event_buffer import EventBuffer
 
 
@@ -262,7 +264,7 @@ async def test_burst_detection_enters_bursting(tmp_path):
         await buf.push(_make_event(agent_id='agent-1', timestamp=now))
         await buf.push(_make_event(agent_id='agent-1', timestamp=now + timedelta(seconds=5)))
 
-        db = buf._require_db()
+        db = buf._require_access().connection
         async with db.execute(
             "SELECT state FROM burst_state WHERE agent_id = 'agent-1'"
         ) as cursor:
@@ -294,7 +296,7 @@ async def test_burst_cooldown_exits_bursting(tmp_path):
         assert result is True
 
         # Verify state was updated
-        db = buf._require_db()
+        db = buf._require_access().connection
         async with db.execute(
             "SELECT state FROM burst_state WHERE agent_id = 'agent-1'"
         ) as cursor:
@@ -501,7 +503,7 @@ async def test_stale_lock_recovery(tmp_path):
         assert await buf_a.mark_run_active('test-project') is True
 
         # Simulate old heartbeat
-        db = buf_a._require_db()
+        db = buf_a._require_access().connection
         old = (datetime.now(UTC) - timedelta(seconds=10)).isoformat()
         await db.execute(
             'UPDATE reconciliation_locks SET heartbeat_at = ? WHERE project_id = ?',
@@ -525,7 +527,7 @@ async def test_agent_id_none_excluded_from_burst(tmp_path):
         await buf.push(_make_event())  # agent_id=None
         await buf.push(_make_event())
 
-        db = buf._require_db()
+        db = buf._require_access().connection
         async with db.execute('SELECT COUNT(*) as cnt FROM burst_state') as cursor:
             row = await cursor.fetchone()
         assert row is not None
@@ -592,7 +594,7 @@ async def test_expire_stale_bursts_transitions_old_agents(tmp_path):
         expired = await buf.expire_stale_bursts()
         assert expired == 1
 
-        db = buf._require_db()
+        db = buf._require_access().connection
         async with db.execute(
             "SELECT state FROM burst_state WHERE agent_id = 'agent-1'"
         ) as cursor:
@@ -620,7 +622,7 @@ async def test_expire_stale_bursts_preserves_recent_bursts(tmp_path):
         expired = await buf.expire_stale_bursts()
         assert expired == 0
 
-        db = buf._require_db()
+        db = buf._require_access().connection
         async with db.execute(
             "SELECT state FROM burst_state WHERE agent_id = 'agent-1'"
         ) as cursor:
@@ -642,7 +644,7 @@ async def test_should_trigger_expires_bursts_when_buffer_empty(tmp_path):
     try:
         # Create a stale burst state directly
         old_time = datetime.now(UTC) - timedelta(seconds=200)
-        db = buf._require_db()
+        db = buf._require_access().connection
         await db.execute(
             """INSERT INTO burst_state (agent_id, state, last_write_at, burst_started_at)
                VALUES (?, 'bursting', ?, ?)""",
@@ -683,7 +685,7 @@ async def test_cleanup_drained(tmp_path):
         assert deleted == 1
 
         # Recent drained event should still be there
-        db = buf._require_db()
+        db = buf._require_access().connection
         async with db.execute(
             "SELECT COUNT(*) as cnt FROM event_buffer WHERE status = 'drained'"
         ) as cursor:
@@ -705,7 +707,7 @@ async def test_cleanup_drained(tmp_path):
 
 async def _arrival_rollup(buf) -> dict[tuple[str, str, str], int]:
     """Read event_arrival_hourly as {(project_id, hour_bucket, event_type): count}."""
-    db = buf._require_db()
+    db = buf._require_access().connection
     async with db.execute(
         'SELECT project_id, hour_bucket, event_type, event_count FROM event_arrival_hourly'
     ) as cursor:
@@ -833,7 +835,7 @@ async def test_cleanup_drained_rollup_ignores_still_buffered_rows(tmp_path):
             ('test-project', '2026-07-25T13', 'memory_added'): 1,
         }
 
-        db = buf._require_db()
+        db = buf._require_access().connection
         async with db.execute(
             "SELECT COUNT(*) AS cnt FROM event_buffer WHERE status = 'buffered'"
         ) as cursor:
@@ -867,7 +869,7 @@ async def test_cleanup_drained_is_not_blockable_by_an_unparseable_timestamp(tmp_
         # Corrupt one drained row's timestamp behind the buffer's back — a
         # legacy/hand-edited row is the only way this can arise, since push()
         # always writes .isoformat().
-        db = buf._require_db()
+        db = buf._require_access().connection
         async with db.execute(
             "SELECT id FROM event_buffer WHERE status = 'drained' LIMIT 1"
         ) as cursor:
@@ -900,6 +902,232 @@ async def test_cleanup_drained_is_not_blockable_by_an_unparseable_timestamp(tmp_
 
         # And the path stays usable afterwards rather than wedging.
         assert await buf.cleanup_drained(max_age_seconds=0) == 0
+    finally:
+        await buf.close()
+
+
+# ── Bounded-chunk cursor consumption (task 4348) ───────────────────────
+#
+# The six cleanup_drained tests above all seed <= 6 rows, so under the shipped
+# 10_000-row _CLEANUP_FETCH_CHUNK they never exercise the chunk loop at all —
+# each completes in a single fetchmany call indistinguishable from a bare
+# fetchall. These tests monkeypatch _CLEANUP_FETCH_CHUNK down to 2-3 so the
+# multi-chunk paths run in milliseconds, and pin the shape of the cursor
+# consumption itself (bounded, chunked, terminating on an empty chunk) rather
+# than only the end result the tests above already cover.
+
+
+@pytest.mark.asyncio
+async def test_cleanup_drained_consumes_the_returning_cursor_in_bounded_chunks(
+    tmp_path, monkeypatch
+):
+    """cleanup_drained drains the DELETE...RETURNING cursor via bounded fetchmany
+    calls and never materialises the whole result set with fetchall."""
+    monkeypatch.setattr(event_buffer_mod, '_CLEANUP_FETCH_CHUNK', 3)
+
+    calls: list[tuple[str, int | None, int]] = []
+    orig_fetchmany = aiosqlite.Cursor.fetchmany
+    orig_fetchall = aiosqlite.Cursor.fetchall
+
+    async def spy_fetchmany(self, size=None):
+        rows = await orig_fetchmany(self, size)
+        # list(): fetchmany() is typed Iterable[Row], which pyright rejects
+        # for len() (61ae0ee799) — safe here since aiosqlite/sqlite3 hand
+        # back a real list, so this doesn't consume anything.
+        calls.append(('fetchmany', size, len(list(rows))))
+        return rows
+
+    async def spy_fetchall(self):
+        rows = await orig_fetchall(self)
+        calls.append(('fetchall', None, len(list(rows))))
+        return rows
+
+    monkeypatch.setattr(aiosqlite.Cursor, 'fetchmany', spy_fetchmany)
+    monkeypatch.setattr(aiosqlite.Cursor, 'fetchall', spy_fetchall)
+
+    buf = EventBuffer(db_path=tmp_path / 'chunked_cleanup.db')
+    await buf.initialize()
+    try:
+        hour_a = datetime(2026, 7, 25, 13, 30, tzinfo=UTC)
+        hour_b = datetime(2026, 7, 25, 14, 5, tzinfo=UTC)
+        for _ in range(4):
+            await buf.push(_make_event(
+                timestamp=hour_a, event_type=EventType.task_status_changed))
+        for _ in range(3):
+            await buf.push(_make_event(
+                timestamp=hour_b, event_type=EventType.memory_added))
+        await buf.drain('test-project')
+
+        calls.clear()
+        deleted = await buf.cleanup_drained(max_age_seconds=0)
+        sweep = list(calls)
+        calls.clear()
+
+        # The memory bound, expressed deterministically: the whole result set
+        # is never materialised in one go.
+        assert not [c for c in sweep if c[0] == 'fetchall']
+        # Every fetch requested exactly the configured chunk size. (Not
+        # separately asserting "every call was fetchmany" or "every chunk
+        # length <= 3": only fetchmany/fetchall are spied, so the preceding
+        # no-fetchall assertion already implies the former, and DB-API
+        # semantics — fetchmany(n) never returns more than n rows — already
+        # imply the latter given this assertion; amendment review, task 4348.)
+        assert {c[1] for c in sweep} == {3}
+        # 7 rows at chunk 3 is 3 + 3 + 1 + 0.
+        assert len(sweep) == 4
+        # LOAD-BEARING: the loop must terminate on an *empty* chunk, not a
+        # *short* one — fetchmany may legally return fewer rows than
+        # requested without meaning exhaustion.
+        assert sweep[-1][2] == 0
+        assert deleted == 7
+
+        assert await _arrival_rollup(buf) == {
+            ('test-project', '2026-07-25T13', 'task_status_changed'): 4,
+            ('test-project', '2026-07-25T14', 'memory_added'): 3,
+        }
+
+        db = buf._require_access().connection
+        async with db.execute(
+            "SELECT COUNT(*) AS cnt FROM event_buffer WHERE status = 'drained'"
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        assert row['cnt'] == 0
+    finally:
+        await buf.close()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_drained_poison_timestamp_does_not_truncate_a_multi_chunk_sweep(
+    tmp_path, monkeypatch
+):
+    """One malformed timestamp must not truncate a sweep spanning multiple chunks.
+
+    test_cleanup_drained_is_not_blockable_by_an_unparseable_timestamp already
+    pins this at 2 rows in a single chunk. This is the multi-chunk variant:
+    with _CLEANUP_FETCH_CHUNK monkeypatched to 2, a 7-row sweep spans four
+    chunks and SQLite gives no ordering guarantee for RETURNING output, so
+    the poison row can land in any of them — the assertions below hold for
+    every placement, by construction, so this is order-independent.
+
+    A break-on-ValueError variant of cleanup_drained would pass this at 1
+    chunk but fail here: it would return fewer than 7 while the DELETE still
+    removed all 7 rows (SQLite stages RETURNING output before the DELETE
+    completes — see the cleanup_drained docstring), permanently losing the
+    un-rolled-up rows from event_arrival_hourly.
+    """
+    monkeypatch.setattr(event_buffer_mod, '_CLEANUP_FETCH_CHUNK', 2)
+
+    buf = EventBuffer(db_path=tmp_path / 'chunked_poison.db')
+    await buf.initialize()
+    try:
+        hour = datetime(2026, 7, 25, 13, 30, tzinfo=UTC)
+        for _ in range(7):
+            await buf.push(_make_event(timestamp=hour, event_type=EventType.memory_added))
+        await buf.drain('test-project')
+
+        # Corrupt one drained row's timestamp behind the buffer's back — same
+        # recipe as test_cleanup_drained_is_not_blockable_by_an_unparseable_timestamp:
+        # the value both fails to parse AND sorts below the cutoff, so the
+        # DELETE genuinely reaches it.
+        db = buf._require_access().connection
+        async with db.execute(
+            "SELECT id FROM event_buffer WHERE status = 'drained' LIMIT 1"
+        ) as cursor:
+            victim = await cursor.fetchone()
+        assert victim is not None
+        await db.execute(
+            'UPDATE event_buffer SET timestamp = ? WHERE id = ?',
+            ('0001-01-01 not a timestamp', victim['id']),
+        )
+        await db.commit()
+
+        deleted = await buf.cleanup_drained(max_age_seconds=0)
+        assert deleted == 7
+
+        async with db.execute(
+            "SELECT COUNT(*) AS cnt FROM event_buffer WHERE status = 'drained'"
+        ) as cursor:
+            remaining = await cursor.fetchone()
+        assert remaining is not None
+        assert remaining['cnt'] == 0
+
+        # Only the six well-formed rows reached the aggregate.
+        assert await _arrival_rollup(buf) == {
+            ('test-project', '2026-07-25T13', 'memory_added'): 6,
+        }
+    finally:
+        await buf.close()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_drained_mid_stream_fault_rolls_the_whole_sweep_back(
+    tmp_path, monkeypatch
+):
+    """A fault raised partway through a chunked sweep rolls back atomically.
+
+    AtomicConnection.write() rolls back on any BaseException and re-raises, and
+    it suppresses every exception from the rollback itself — so a rollback that
+    silently failed would strand the writer lock. This pins that it does not:
+    after the fault, the buffer is still usable and a fresh sweep recovers
+    the full rollup, not just that the exception propagates.
+    """
+    monkeypatch.setattr(event_buffer_mod, '_CLEANUP_FETCH_CHUNK', 2)
+
+    buf = EventBuffer(db_path=tmp_path / 'chunked_fault.db')
+    await buf.initialize()
+    try:
+        hour = datetime(2026, 7, 25, 13, 30, tzinfo=UTC)
+        for _ in range(7):
+            await buf.push(_make_event(timestamp=hour, event_type=EventType.memory_added))
+        await buf.drain('test-project')
+
+        # event_buffer.py does `from ...throughput import utc_hour_bucket`,
+        # rebinding the name into event_buffer's own module namespace — so
+        # that (not throughput.utc_hour_bucket) is what must be patched.
+        real_bucket = event_buffer_mod.utc_hour_bucket
+        call_count = 0
+
+        def faulty_bucket(ts):
+            nonlocal call_count
+            call_count += 1
+            # Calls 1-3 succeed (first chunk of 2 plus one row of the
+            # second), call 4 faults — genuinely mid-cursor, not on the
+            # first or last chunk. RuntimeError, deliberately not a
+            # ValueError, so it is NOT swallowed by cleanup_drained's
+            # per-row except ValueError handler.
+            if call_count > 3:
+                raise RuntimeError('injected mid-stream fault')
+            return real_bucket(ts)
+
+        monkeypatch.setattr(event_buffer_mod, 'utc_hour_bucket', faulty_bucket)
+
+        with pytest.raises(RuntimeError, match='injected mid-stream fault'):
+            await buf.cleanup_drained(max_age_seconds=0)
+
+        # Atomic: nothing from the aborted sweep took effect.
+        db = buf._require_access().connection
+        async with db.execute(
+            "SELECT COUNT(*) AS cnt FROM event_buffer WHERE status = 'drained'"
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        assert row['cnt'] == 7
+        assert await _arrival_rollup(buf) == {}
+
+        # Not wedged: restore the real bucketer and confirm a fresh sweep —
+        # and the writer lock it needs — still works. A targeted restore
+        # (not monkeypatch.undo(), which would also revert
+        # _CLEANUP_FETCH_CHUNK to the shipped 10_000 and silently collapse
+        # the recovery sweep to a single chunk) keeps the recovery sweep
+        # chunked at 2, so it actually exercises multi-chunk recovery as
+        # this test's name claims — amendment review, task 4348.
+        monkeypatch.setattr(event_buffer_mod, 'utc_hour_bucket', real_bucket)
+
+        assert await buf.cleanup_drained(max_age_seconds=0) == 7
+        assert await _arrival_rollup(buf) == {
+            ('test-project', '2026-07-25T13', 'memory_added'): 7,
+        }
     finally:
         await buf.close()
 
@@ -954,7 +1182,7 @@ async def test_claim_deferred_writes_project_isolation_and_ordering(buf):
     # Insert project-a rows with explicit, deterministic past timestamps so the
     # ordering assertion cannot flake due to same-microsecond created_at values.
     base = datetime(2020, 1, 1, tzinfo=UTC)
-    db = buf._require_db()
+    db = buf._require_access().connection
     for i, content in enumerate(['a-first', 'a-second', 'a-third']):
         await db.execute(
             'INSERT INTO deferred_writes'
@@ -1018,7 +1246,7 @@ async def test_release_stale_claims_boundary(buf):
     # Backdate the 'old' row's claimed_at to 200 seconds ago via direct SQL
     old_item = next(item for item in claimed if item['content'] == 'old')
     stale_ts = (datetime.now(UTC) - timedelta(seconds=200)).isoformat()
-    db = buf._require_db()
+    db = buf._require_access().connection
     await db.execute(
         'UPDATE deferred_writes SET claimed_at = ? WHERE id = ?',
         (stale_ts, old_item['id']),
@@ -1120,7 +1348,7 @@ async def test_get_lock_status_returns_instance_and_heartbeat_age(tmp_path):
         assert 0.0 <= age < 5.0  # freshly acquired, age should be near-zero
 
         # Backdate heartbeat_at past stale_lock_seconds → swept → (None, None)
-        db = buf._require_db()
+        db = buf._require_access().connection
         very_old = (
             datetime.now(UTC) - timedelta(seconds=buf.stale_lock_seconds + 100)
         ).isoformat()
@@ -1445,7 +1673,7 @@ async def test_migrate_drops_legacy_idx_dw_project(tmp_path):
     buf = EventBuffer(db_path=db_path)
     await buf.initialize()
 
-    db_inner = buf._require_db()
+    db_inner = buf._require_access().connection
 
     # Legacy single-column index must be gone.
     async with db_inner.execute(
@@ -1493,7 +1721,7 @@ async def test_mark_project_dead_letter_transitions_buffered_only(buf):
     assert n == 2, f'Expected 2 rows quarantined, got {n}'
 
     # Assert: raw DB status counts.
-    db = buf._require_db()
+    db = buf._require_access().connection
     async with db.execute(
         "SELECT status, COUNT(*) as cnt FROM event_buffer GROUP BY status ORDER BY status"
     ) as cursor:
@@ -1541,7 +1769,7 @@ async def test_event_buffer_has_drained_by_run_id_column_and_migration_is_idempo
     buf = EventBuffer(db_path=tmp_path / 'migrate.db')
     await buf.initialize()
     try:
-        db = buf._require_db()
+        db = buf._require_access().connection
         async with db.execute('PRAGMA table_info(event_buffer)') as cursor:
             columns = {row['name'] async for row in cursor}
         assert 'drained_by_run_id' in columns, (
@@ -1585,7 +1813,7 @@ async def test_restore_drained_scoped_to_run_id_does_not_clobber_other_runs(buf)
     assert restored_r1 == 2
     assert (await buf.get_buffer_stats('test-project'))['size'] == 2
 
-    db = buf._require_db()
+    db = buf._require_access().connection
     async with db.execute(
         "SELECT status FROM event_buffer WHERE id IN ({})".format(
             ','.join('?' for _ in r2_ids)
@@ -1636,7 +1864,7 @@ async def test_get_drained_events_reads_run_scoped_without_restoring(buf):
     again = await buf.get_drained_events('test-project', 'R1')
     assert {e.id for e in again} == r1_ids
 
-    db = buf._require_db()
+    db = buf._require_access().connection
     async with db.execute(
         "SELECT status FROM event_buffer WHERE id IN ({})".format(
             ','.join('?' for _ in r1_ids)
@@ -1675,7 +1903,7 @@ async def test_mark_drained_run_id_attributes_pre_drained_events_to_a_run(buf):
 
     # ...and id3/id4 (never attributed) remain 'drained'.
     async def _status(event_id: str) -> str:
-        async with buf._require_db().execute(
+        async with buf._require_access().connection.execute(
             'SELECT status, drained_by_run_id FROM event_buffer WHERE id = ?',
             (event_id,),
         ) as cursor:
@@ -1710,7 +1938,7 @@ async def test_mark_drained_run_id_attributes_pre_drained_events_to_a_run(buf):
     # A DIFFERENT (non-matching, i.e. id3 not included) call for another run_id
     # must not overwrite id3's existing 'RY' attribution.
     await buf.mark_drained_run_id('test-project', [id4], 'RW')
-    async with buf._require_db().execute(
+    async with buf._require_access().connection.execute(
         'SELECT drained_by_run_id FROM event_buffer WHERE id = ?', (id3,)
     ) as cursor:
         row = await cursor.fetchone()
@@ -1779,7 +2007,7 @@ async def test_restore_drained_include_unattributed_sweeps_null_rows_for_recover
     assert restored == 4  # orphan's 2 + the 2 unattributed legacy rows
 
     async def _status(event_id: str) -> str:
-        async with buf._require_db().execute(
+        async with buf._require_access().connection.execute(
             'SELECT status FROM event_buffer WHERE id = ?', (event_id,),
         ) as cursor:
             row = await cursor.fetchone()
@@ -1813,7 +2041,7 @@ async def test_restore_drained_default_excludes_unattributed_rows(buf):
     restored = await buf.restore_drained('test-project', run_id='R1')
     assert restored == 1
 
-    async with buf._require_db().execute(
+    async with buf._require_access().connection.execute(
         'SELECT status FROM event_buffer WHERE id = ?', (events_null[0].id,),
     ) as cursor:
         row = await cursor.fetchone()

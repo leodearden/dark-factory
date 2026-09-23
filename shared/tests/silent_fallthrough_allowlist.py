@@ -99,13 +99,6 @@ ALLOWLIST_ENTRIES: list[tuple[str, str, str, str]] = [
         "dict (dashboard display only, not on critical path)",
     ),
     (
-        "fused-memory/src/fused_memory/reconciliation/flag_dedup.py",
-        "filter_terminal_metadata_flags._safe_get_task",
-        "673e1da28bdc",
-        "debug-logged fail-safe with exc context: task-lookup error preserves "
-        "reconciliation flag in-place (explicit fail-safe comment in code)",
-    ),
-    (
         "orchestrator/src/orchestrator/agents/briefing.py",
         "BriefingAssembler._mcp_search",
         "9c9af4cd3b98",
@@ -153,13 +146,6 @@ ALLOWLIST_ENTRIES: list[tuple[str, str, str, str]] = [
         "933d5ce757a9",
         "debug-logged fail-safe: get_main_sha failure returns None to skip "
         "sweep entirely (background probe, non-critical)",
-    ),
-    (
-        "orchestrator/src/orchestrator/verify.py",
-        "run_main_tip_sweep",
-        "e2a807e01521",
-        "debug-logged fail-safe: unexpected error during main-tip sweep "
-        "returns None; sweeps are background checks, not on critical path",
     ),
     (
         "scripts/orchestrator-watchdog.py",

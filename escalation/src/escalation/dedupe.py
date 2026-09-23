@@ -22,8 +22,14 @@ Provides:
 
 Design contracts (see plan.json design_decisions for rationale):
 - find_dedupe_parent() does NOT check DedupeConfig.infra_dedupe_enabled.
-  That gate is the caller's responsibility (server._submit_or_dedupe).
-  This keeps the function pure/testable and avoids action-at-a-distance.
+  That gate belongs to resolve_dedupe_parent(), the READ half of the
+  orchestration wrapper.  This keeps the matcher pure/testable and avoids
+  action-at-a-distance.
+- submit_or_dedupe() is exactly resolve_dedupe_parent() (the two gates and
+  the scan; writes nothing) followed by attach_or_submit() (the TOCTOU guard
+  and the write).  submit_or_dedupe_off_loop() composes the same two halves
+  with the scan on a worker thread; only the read may hop, and the rationale
+  block above it is the one home for why.
 - Cross-task: get_pending() scans all tasks, so infra fan-out (same
   summary from 30 task_ids simultaneously) collapses into a single parent.
 - Cross-LEVEL folding never happens (task 3236): find_dedupe_parent
@@ -40,24 +46,33 @@ from __future__ import annotations
 
 __all__ = [
     'DedupeConfig',
+    'attach_or_submit',
     'compute_content_fingerprint',
     'content_fingerprint_key',
     'find_dedupe_parent',
     'gate_backlog_fingerprint_key',
+    'resolve_dedupe_parent',
     'submit_or_dedupe',
+    'submit_or_dedupe_off_loop',
     'summary_dedupe_key',
 ]
 
+import asyncio
 import hashlib
 import logging
 import math
-import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from shared.timestamps import parse_timestamp_or_warn
+
+# The casefold/non-word/whitespace transform is NOT owned here — it lives once
+# in the leaf module escalation.canonical, which queue.py also imports for
+# root-cause matching.  Both call sites in this module pin punctuation='strip'
+# (the legacy, deletion-flavoured policy); see _normalize_description.
+from escalation.canonical import canonical_text
 
 # observed_submit_response lives next to the record it re-reads (queue), not
 # here — this module owns fold logic only.  Re-exported by neither module's
@@ -75,9 +90,6 @@ KeyFn = Callable[['Escalation'], Any]
 
 logger = logging.getLogger(__name__)
 
-_NON_WORD_PATTERN = re.compile(r'[^\w\s]', flags=re.UNICODE)  # strips punctuation, symbols, control; keeps word chars and whitespace
-_WHITESPACE_PATTERN = re.compile(r'\s+')  # collapse runs of whitespace
-
 # Unit separator: never appears in category names or entity IDs, so the join is
 # collision-free without hashing the readable prefix components.
 _FIELD_SEP = '\x1f'
@@ -86,17 +98,19 @@ _FIELD_SEP = '\x1f'
 def _normalize_description(text: str) -> str:
     """Normalise a description string for the empty-affected_ids tiebreak.
 
-    Steps:
-    1. Casefold (Unicode-aware lower-case).
-    2. Strip all non-word, non-whitespace characters (reuses _NON_WORD_PATTERN).
-    3. Collapse multiple whitespace runs to a single space and strip edges.
+    Delegates to the single implementation in :mod:`escalation.canonical`
+    (casefold -> map non-word chars -> collapse whitespace -> strip).
 
-    Reuses _NON_WORD_PATTERN so the normalisation is consistent with
-    summary_dedupe_key's stripping stage.
+    THE ``strip`` POLICY IS PINNED HERE DELIBERATELY and must NOT be changed to
+    the ``separator`` policy the root-cause match site uses.  This function's
+    only consumer is :func:`compute_content_fingerprint`, whose sha256 digests
+    are already persisted across the live recon corpus: under separator
+    semantics every digest changes, so every already-fingerprinted recon finding
+    stops matching its own past self and the whole corpus silently un-dedupes.
+    ``tests/test_dedupe.py::TestNormalisationLiftedToCanonical`` pins four
+    reference digests against exactly that drift.
     """
-    casefolded = text.casefold()
-    stripped = _NON_WORD_PATTERN.sub('', casefolded)
-    return _WHITESPACE_PATTERN.sub(' ', stripped).strip()
+    return canonical_text(text, punctuation='strip')
 
 
 def compute_content_fingerprint(
@@ -410,7 +424,15 @@ def summary_dedupe_key(summary: str) -> tuple[str, ...]:
         >>> summary_dedupe_key("cpu+memory leak")
         ('cpumemory', 'leak')
     """
-    normalised = _NON_WORD_PATTERN.sub('', summary.casefold())
+    # Same single implementation as _normalize_description, and the ``strip``
+    # policy is pinned here for the same reason: these tuples are already
+    # persisted fleet-wide as find_dedupe_parent's key, so a change to the
+    # transform silently re-partitions every existing dedupe cluster.  The
+    # helper's extra whitespace-collapse-and-strip (which the old inline
+    # expression did not do) is absorbed by the .split() below — verified
+    # byte-identical on the five examples above and on all 2796 real summaries
+    # in the live queue.
+    normalised = canonical_text(summary, punctuation='strip')
     tokens = normalised.split()
     return tuple(tokens[:3])
 
@@ -521,21 +543,57 @@ def find_dedupe_parent(
     return min(matches, key=lambda pair: pair[0])[1]
 
 
-def submit_or_dedupe(
+def resolve_dedupe_parent(
     queue: EscalationQueue,
     esc: Escalation,
     config: DedupeConfig,
     now: datetime | None = None,
-) -> dict[str, Any]:
-    """Submit *esc* to *queue* or fold it into an existing pending parent.
+) -> str | None:
+    """Return the id of the pending parent *esc* should fold into, or None.
 
-    This is the central gated orchestration wrapper that centralises:
+    The READ half of ``submit_or_dedupe``:
+
     - Gate 1: ``config.infra_dedupe_enabled``
     - Gate 2: ``esc.category in config.infra_dedupe_categories``
     - Parent lookup via ``find_dedupe_parent``
-    - TOCTOU guard: ``attach_dedupe_child`` returns ``None`` when the parent
-      was resolved between the find scan and the attach call; in that case
-      fall through to ``queue.submit()`` so the escalation is never dropped.
+
+    Both gates short-circuit in PURE MEMORY before any disk I/O, so a filing
+    the config does not fold costs no scan at all.  The stock ``DedupeConfig``
+    folds only ``'infra_issue'``, so on the agent filing path that is the one
+    category whose filings reach ``find_dedupe_parent``.
+
+    Writes nothing and mutates nothing.  That is a deliberate property rather
+    than an incidental one, and it is why this half carries its own name: a
+    scheduling decision can then be taken about the scan alone, without
+    reaching the write.
+
+    *now* is forwarded to ``find_dedupe_parent`` for deterministic testing.
+    """
+    if not (
+        config.infra_dedupe_enabled
+        and esc.category in config.infra_dedupe_categories
+    ):
+        return None
+    return find_dedupe_parent(queue, esc, config, now=now)
+
+
+def attach_or_submit(
+    queue: EscalationQueue,
+    esc: Escalation,
+    parent_id: str | None,
+) -> dict[str, Any]:
+    """Fold *esc* into *parent_id*, or submit it as a record of its own.
+
+    The WRITE half of ``submit_or_dedupe``.  It is HANDED the parent id rather
+    than finding one, which is what makes the find schedulable independently
+    of the write.
+
+    TOCTOU guard: ``attach_dedupe_child`` returns ``None`` when the parent was
+    resolved/archived between the find and this call; in that case fall
+    through to ``queue.submit()`` so the escalation is never dropped.  A
+    ``parent_id`` that has gone stale since it was resolved is therefore
+    SAFE input, not a caller error — which is precisely what lets the find run
+    on another thread, or in another process.
 
     Response shapes (identical to server._submit_or_dedupe).  ``level`` is on
     EVERY branch, so the documented "echo confirms the level landed" contract
@@ -544,9 +602,18 @@ def submit_or_dedupe(
     - Auto-resolved/dismissed (the record was NOT pending after the write —
       e.g. a concurrent sweep won the race): ``{'id', 'status', 'resolution',
       'resolved_by', 'level'}``.  See ``queue.observed_submit_response``: the
-      response reports observed post-write state, never write intent, and
-      fails open to ``'queued'`` (still carrying ``level``) if the re-read is
-      unavailable.
+      response reports observed post-write state, never write intent.
+    - Unpersisted: ``{'id', 'status': 'accepted_unpersisted', 'persist_check',
+      'level'}`` when the post-write re-read could not confirm the write, so the
+      filer keeps driving its blocked task rather than standing down.  What that
+      status does and does not claim, and the ``persist_check`` verdicts, are
+      stated once in
+      ``escalation/src/escalation/queue.py::observed_submit_response`` (task
+      5368).  The part local to THIS gate: the filer's re-file is bounded by
+      ``escalate_blocker``'s docstring and the role prompt, NOT here — a repeat
+      folds only when ``resolve_dedupe_parent`` hands this function a parent,
+      so on any category the config does not fold each repeat mints a fresh
+      record.
     - Dedup-skipped: ``{'id': parent_id, 'status': 'dedup_skipped',
                         'parent_id': parent_id, 'child_id': esc.id,
                         'level': esc.level}``
@@ -555,33 +622,101 @@ def submit_or_dedupe(
       additive.  It is the CHILD's level, which since task 3236 equals the
       parent's: ``find_dedupe_parent`` requires ``parent.level ==
       candidate.level``, so no extra read is needed to report it.)
-
-    Recon (A7b) calls this directly with ``DedupeConfig.for_recon()`` instead
-    of ``queue.submit()``, routing through the same gate + TOCTOU logic used
-    by the infra path.
-
-    *now* is forwarded to ``find_dedupe_parent`` for deterministic testing.
     """
-    # Gate 1 (enabled) and Gate 2 (category membership) both short-circuit
-    # in pure memory before any disk I/O via find_dedupe_parent.
     # NOTE: the post-write response is shaped by observed_submit_response, not
     # by a hardcoded 'queued' — see that function's docstring.
-    if config.infra_dedupe_enabled and esc.category in config.infra_dedupe_categories:
-        parent_id = find_dedupe_parent(queue, esc, config, now=now)
-        # TOCTOU guard: attach_dedupe_child returns None when the parent was
-        # resolved/archived between the find scan and this call.  Fall through
-        # to submit() so the escalation is not silently dropped.
-        if parent_id is not None and queue.attach_dedupe_child(parent_id, esc.id, child_severity=esc.severity) is not None:
-            return {
-                'id': parent_id,
-                'status': 'dedup_skipped',
-                'parent_id': parent_id,
-                'child_id': esc.id,
-                # Level-scoped folding (task 3236) means the parent's level is
-                # the child's, so echoing esc.level costs no extra read and
-                # keeps the 'level' key present on every response branch.
-                'level': esc.level,
-            }
+    if parent_id is not None and queue.attach_dedupe_child(parent_id, esc.id, child_severity=esc.severity) is not None:
+        return {
+            'id': parent_id,
+            'status': 'dedup_skipped',
+            'parent_id': parent_id,
+            'child_id': esc.id,
+            # Level-scoped folding (task 3236) means the parent's level is
+            # the child's, so echoing esc.level costs no extra read and
+            # keeps the 'level' key present on every response branch.
+            'level': esc.level,
+        }
     esc_id = queue.submit(esc)
     return observed_submit_response(queue, esc_id, fallback_level=esc.level)
 
+
+def submit_or_dedupe(
+    queue: EscalationQueue,
+    esc: Escalation,
+    config: DedupeConfig,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Submit *esc* to *queue* or fold it into an existing pending parent.
+
+    The central gated orchestration wrapper, and exactly the composition of
+    its two halves: ``resolve_dedupe_parent`` (the gates and the scan — a pure
+    READ) then ``attach_or_submit`` (the TOCTOU guard and the write).  Each
+    half carries its own contract; this function adds no policy of its own, so
+    for the gate ordering read the first and for the four response shapes read
+    the second rather than a copy here.
+
+    Recon (A7b) calls THIS function directly with ``DedupeConfig.for_recon()``
+    instead of ``queue.submit()``, routing through the same gate + TOCTOU logic
+    used by the infra path.
+
+    *now* is forwarded to ``find_dedupe_parent`` for deterministic testing.
+    """
+    return attach_or_submit(queue, esc, resolve_dedupe_parent(queue, esc, config, now=now))
+
+
+# WHY THE READ HOPS, AND WHY THE WRITE BESIDE IT DOES NOT.  This is the single
+# home for both halves of that boundary; `server.py::get_pending_escalations`
+# and `tests/test_write_path_scans_off_loop.py` point here rather than
+# restating it.
+#
+# THE READ.  This server has no process of its own:
+# `orchestrator/src/orchestrator/harness.py::Harness._start_escalation_server`
+# runs it under `asyncio.create_task` on the ORCHESTRATOR's loop.  So an
+# inline `get_pending()` glob does not stall a dedicated server — it stalls the
+# scheduler and the merge worker.  The same measurement task 4391 took on the
+# read path applies unchanged here (the scan is the same one), and it grows
+# with LIFETIME escalation count rather than with the pending set.
+#
+# THE WRITE, which deliberately stays on the caller's thread.  `queue.submit`
+# fires `_notify_callback` (queue.py, inside `submit`), wired in production to
+# `harness.py::Harness._on_escalation`, whose body is
+# `self._escalation_events.get(task_id).set()` over a
+# `dict[str, asyncio.Event]` built in `Harness.__init__`.  `asyncio.Event.set()`
+# is NOT thread-safe: called from a worker thread it reaches `loop.call_soon`
+# with no self-pipe write, so the waiting workflow/steward's wake-up is delayed
+# indefinitely, and under `loop.set_debug(True)` it raises `RuntimeError` —
+# which `submit`'s own `except Exception` around the callback swallows to a
+# WARNING.  That is a SILENTLY dropped workflow wake-up, i.e. a stranded
+# blocked task, on the hottest path in the system.  The same argument covers
+# `submit_resolved`, `attach_dedupe_child` and `add_members_to_l2`.
+#
+# Moving the write therefore needs that wake made thread-safe FIRST.  The
+# pattern already exists one method away — `harness.py::_schedule_coro_threadsafe`
+# solves exactly this problem for the coroutine half, `_on_escalation_resolved`
+# — but has never been applied to the `event.set()` half, and doing so is a
+# change to the orchestrator harness's hot callback with its own tests.  Its
+# own task.
+#
+# What the yield point between the two halves costs here is ONE missed fold: a
+# same-key sibling submitted in the window mints its own pending record instead
+# of folding.  `find_dedupe_parent`'s contract already tolerates that (a miss
+# costs a duplicate, never corruption), and it is already reachable from the
+# other writer PROCESSES against the same queue root.  A parent that
+# disappears in the window is covered by `attach_or_submit`'s TOCTOU guard.
+async def submit_or_dedupe_off_loop(
+    queue: EscalationQueue,
+    esc: Escalation,
+    config: DedupeConfig,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """``submit_or_dedupe`` with the parent scan moved to a worker thread.
+
+    Same composition, same four response shapes, same *now* contract — see the
+    sync sibling and the two halves it names.  The only difference is WHERE the
+    read runs, which is the axis this function exists to vary.
+
+    For a caller NOT already on an event loop, ``submit_or_dedupe`` is the one
+    to use: recon (A7b) and the fused-memory middlewares call it directly.
+    """
+    parent_id = await asyncio.to_thread(resolve_dedupe_parent, queue, esc, config, now)
+    return attach_or_submit(queue, esc, parent_id)

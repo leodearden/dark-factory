@@ -171,6 +171,42 @@ def test_union_age_and_count_reasons():
     assert decision.reasons[old_d] == "age+count"
 
 
+def test_prune_reason_vocabulary_is_single_sourced():
+    """AMENDMENT (review): the reason tags are emitted from the REASON_*
+    constants the count-cap classifier consumes, not from parallel literals.
+
+    The tags are wire format — they land in the JSON report's `reason_counts`,
+    in the per-dir log lines, and in the count-axis classification the alarm
+    keys on. Two independently editable sets of literals would let a rename at
+    the emit site silently stop the alarm firing (a non-count reason simply
+    falls through the `_COUNT_REASONS` filter) rather than raising. This pins
+    both halves: the constants ARE the wire strings, and the classifier's set
+    is derived from them.
+    """
+    assert (gct.REASON_AGE, gct.REASON_COUNT, gct.REASON_AGE_COUNT) == (
+        "age",
+        "count",
+        "age+count",
+    )
+    assert gct._COUNT_ONLY_REASON == gct.REASON_COUNT
+    assert set(gct._COUNT_REASONS) == {gct.REASON_COUNT, gct.REASON_AGE_COUNT}
+    # ...and the emitter really draws from that vocabulary: across both axes,
+    # every reason select_prunable produces is one of the three constants.
+    task_dirs = [
+        (_dir("a"), NOW),
+        (_dir("b"), NOW - DAY),
+        (_dir("c"), NOW - 100 * DAY),
+    ]
+    vocabulary = {gct.REASON_AGE, gct.REASON_COUNT, gct.REASON_AGE_COUNT}
+
+    tight = set(select_prunable(task_dirs, NOW, 90, 1).reasons.values())
+    slack = set(select_prunable(task_dirs, NOW, 90, HIGH_COUNT_CAP).reasons.values())
+
+    assert tight == {gct.REASON_COUNT, gct.REASON_AGE_COUNT}
+    assert slack == {gct.REASON_AGE}
+    assert (tight | slack) == vocabulary  # all three exercised, none invented
+
+
 # ---------------------------------------------------------------------------
 # step-5: scan_task_dirs(root) against a real filesystem archive
 # ---------------------------------------------------------------------------
@@ -406,7 +442,11 @@ def test_default_constants_match_orchestrator_config():
     assert TranscriptArchiveConfig().root == gct.ARCHIVE_ROOT_RELATIVE
     assert gct.ARCHIVE_ROOT_RELATIVE == "data/orchestrator/agent-transcripts"
     assert gct.DEFAULT_MAX_AGE_DAYS == RetentionConfig().max_age_days == 90
-    assert gct.DEFAULT_MAX_TASK_DIRS == RetentionConfig().max_task_dirs == 5000
+    # max_task_dirs is a DERIVED bound, re-derived against the live archive by
+    # test_max_task_dirs_is_derived_from_live_archive_rate below. Kept as exact
+    # equality on both sides: this guard exists to catch one site moving
+    # without the others, which an inequality would let through.
+    assert gct.DEFAULT_MAX_TASK_DIRS == RetentionConfig().max_task_dirs == 50000
 
 
 # ---------------------------------------------------------------------------
@@ -536,3 +576,883 @@ def test_cli_absent_root_is_noop(tmp_path):
     assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
     report = json.loads(result.stdout)
     assert report["removed"] == 0
+
+
+# ---------------------------------------------------------------------------
+# step-1 (task 3621): observed_daily_rate(task_dirs) — the DERIVED task-dir
+# arrival-rate sampler that sizes the count cap.
+#
+# The cap must be a DERIVED bound that re-derives itself against real archive
+# throughput, not a magic number that silently binds when the fleet speeds up.
+# These tests pin the sampler against a SYNTHETIC archive with a per-day
+# arrival pattern known by construction, fed through the production
+# scan_task_dirs so the sampler consumes exactly the (path, mtime) shape the
+# GC already prunes on.
+# ---------------------------------------------------------------------------
+
+# The UTC day bucket holding NOW, so a synthetic archive can be stamped into
+# known consecutive day buckets exactly the way scan_task_dirs' mtimes fall.
+NOW_DAY = int(NOW // DAY)
+
+
+def _archive_with_daily_arrivals(root: Path, counts: list[int]) -> None:
+    """Materialise an archive whose task dirs land in KNOWN consecutive UTC day
+    buckets: ``counts[i]`` task dirs in the i-th day, OLDEST day first, with the
+    last entry landing in NOW's own day bucket.
+
+    Each dir holds one transcript stamped MID-day, so the bucket a dir falls in
+    is unambiguous regardless of rounding. ``counts[0]`` and ``counts[-1]`` must
+    be > 0: they define the observed span's boundary buckets, which
+    observed_daily_rate drops as partial by construction.
+    """
+    first_day = NOW_DAY - (len(counts) - 1)
+    for offset, count in enumerate(counts):
+        mtime = (first_day + offset) * DAY + DAY / 2
+        for n in range(count):
+            _touch(root / f"d{offset}_{n}" / "enc" / "session.jsonl", mtime)
+
+
+def _rate_for(root: Path):
+    """Derive the observed rate the same way the live guard does: scan the
+    archive with the production scanner, then sample its mtimes."""
+    return gct.observed_daily_rate(gct.scan_task_dirs(root))
+
+
+def test_observed_rate_peak_is_the_busiest_complete_day(tmp_path):
+    """(a) peak_per_day IS the injected burst-day dir count, and the other
+    fields report the sample honestly rather than only the buckets that
+    happened to drive the peak."""
+    root = tmp_path / "agent-transcripts"
+    #        boundary  <------------ interior (8 days) ------------>  boundary
+    counts = [3,        1, 1, 5, 1, 1, 1, 1, 1,                       2]
+    _archive_with_daily_arrivals(root, counts)
+
+    rate = _rate_for(root)
+
+    assert rate is not None
+    assert rate.peak_per_day == 5          # the injected burst day
+    assert rate.complete_days == 8         # span minus the two partial ends
+    assert rate.span_days == 10            # every observed bucket, ends included
+    assert rate.sample_dirs == sum(counts) == 17   # the WHOLE sample, honestly
+    assert rate.mean_per_day == pytest.approx(12 / 8)  # interior dirs / interior days
+
+
+def test_observed_rate_counts_idle_interior_days_as_days(tmp_path):
+    """(b) A zero-arrival interior day IS a day: it lowers the mean and does
+    NOT shrink complete_days. The live archive has genuinely idle days, and
+    dropping them would inflate the mean and overstate steady-state throughput.
+    """
+    root = tmp_path / "agent-transcripts"
+    #        bnd  <-------- interior: 3 of the 8 days are idle -------->  bnd
+    counts = [1,   2, 0, 0, 2, 2, 2, 0, 2,                                1]
+    _archive_with_daily_arrivals(root, counts)
+
+    rate = _rate_for(root)
+
+    assert rate is not None
+    # Idle days are still days. Were they dropped instead, this would read
+    # complete_days == 5 and mean_per_day == 2.0.
+    assert rate.complete_days == 8
+    assert rate.mean_per_day == pytest.approx(10 / 8)
+    assert rate.peak_per_day == 2
+    assert rate.sample_dirs == sum(counts) == 12
+
+
+def test_observed_rate_drops_partial_boundary_buckets(tmp_path):
+    """(c) The FIRST and LAST day buckets are partial BY CONSTRUCTION (the
+    sample starts and ends mid-day), so neither may set the peak — even when it
+    holds more dirs than any complete interior day.
+
+    Direction matters: a partial trailing bucket UNDERSTATES the rate (the live
+    archive's trailing bucket held a handful of dirs against a ~90-dir peak), and
+    silently weakening the derived bound is the exact failure the derived cap
+    exists to prevent.
+    """
+    root = tmp_path / "agent-transcripts"
+    #        BIG boundary  <---- interior: every day holds 1 ---->  BIG boundary
+    counts = [12,           1, 1, 1, 1, 1, 1, 1, 1,                 9]
+    _archive_with_daily_arrivals(root, counts)
+
+    rate = _rate_for(root)
+
+    assert rate is not None
+    assert rate.peak_per_day == 1, (
+        "a partial boundary bucket must never set the peak"
+    )
+    assert rate.complete_days == 8
+    assert rate.span_days == 10
+    # The dropped dirs are still reported in the raw sample size — dropping them
+    # from the RATE is a methodology choice, not a reason to under-report.
+    assert rate.sample_dirs == sum(counts) == 29
+
+
+def test_observed_rate_is_none_for_absent_root(tmp_path):
+    """(d) An absent archive root yields no sample — None, never a zero rate.
+
+    A zero rate would satisfy any cap trivially, so absence MUST be
+    distinguishable from "measured and fine".
+    """
+    assert _rate_for(tmp_path / "does-not-exist") is None
+
+
+def test_observed_rate_is_none_for_empty_root(tmp_path):
+    """(d) An existing-but-empty archive root likewise yields None."""
+    root = tmp_path / "agent-transcripts"
+    root.mkdir(parents=True)
+
+    assert _rate_for(root) is None
+
+
+def test_observed_rate_is_none_below_min_sample_days(tmp_path):
+    """(d) A sample with fewer than MIN_RATE_SAMPLE_DAYS COMPLETE interior days
+    is too sparse to read a peak from, and returns None rather than a weak
+    number. Pinned either side of the threshold, driven off the constant."""
+    min_days = gct.MIN_RATE_SAMPLE_DAYS
+
+    # span = min_days + 1  ->  complete interior days = min_days - 1: too sparse.
+    sparse = tmp_path / "sparse"
+    _archive_with_daily_arrivals(sparse, [1] * (min_days + 1))
+    assert _rate_for(sparse) is None
+
+    # One more day of span clears the bar: complete interior days == min_days.
+    enough = tmp_path / "enough"
+    _archive_with_daily_arrivals(enough, [1] * (min_days + 2))
+    rate = _rate_for(enough)
+    assert rate is not None
+    assert rate.complete_days == min_days
+
+
+def test_observed_rate_is_none_for_single_day_sample(tmp_path):
+    """(d) A one-day span has NO complete interior bucket at all (both ends are
+    partial), so it must return None rather than a degenerate zero-day mean."""
+    root = tmp_path / "agent-transcripts"
+    _archive_with_daily_arrivals(root, [5])
+
+    assert _rate_for(root) is None
+
+
+# ---------------------------------------------------------------------------
+# step-3 (task 3621): required_max_task_dirs(...) — the NON-VACUITY proof.
+#
+# The live derived-bound guard (below) is inert in a fresh checkout by design:
+# with no archive to measure it skips. So the guarantee that the bound is a
+# REAL check and not arithmetic-on-literals-that-can-never-fail has to be made
+# here, host-independently: over a synthetic archive whose peak is known by
+# construction, the exact comparison the live guard makes is shown to FAIL for
+# a too-small cap and PASS for an adequate one.
+# ---------------------------------------------------------------------------
+
+def test_required_max_task_dirs_is_falsifiable_against_a_known_peak(tmp_path):
+    """(a)+(b) The live guard's comparison CAN fail.
+
+    Over an archive whose derived peak is 5/day by construction, a
+    deliberately-small cap sits BELOW the requirement and an adequate one
+    clears it — the same `cap >= required_max_task_dirs(peak, age, factor)`
+    expression, evaluating both ways.
+    """
+    root = tmp_path / "agent-transcripts"
+    #        bnd  <---- interior: 8 days, busiest holds 5 ---->  bnd
+    _archive_with_daily_arrivals(root, [1, 1, 5, 1, 1, 1, 1, 1, 1, 1])
+
+    rate = _rate_for(root)
+    assert rate is not None
+    assert rate.peak_per_day == 5  # known by construction
+
+    required = gct.required_max_task_dirs(
+        rate.peak_per_day, gct.DEFAULT_MAX_AGE_DAYS, gct.RETENTION_SAFETY_FACTOR
+    )
+    # 5/day x 90 days x factor — nothing here is a literal the test controls.
+    assert required == 5 * gct.DEFAULT_MAX_AGE_DAYS * gct.RETENTION_SAFETY_FACTOR
+
+    too_small = required - 1
+    assert not (too_small >= required), (
+        "the derived-bound comparison must be able to FAIL — a guard that "
+        "cannot go red is measuring nothing"
+    )
+    # ...and it CLEARS for an adequate cap. Both sides use the shipped
+    # constant rather than a value this test made up, so neither direction is
+    # arithmetic on locally-chosen numbers.
+    assert required <= gct.DEFAULT_MAX_TASK_DIRS
+
+    # AND THE SHIPPED CAP ITSELF IS REACHABLE. The two assertions above show
+    # the COMPARISON can go either way; this one shows the live guard's actual
+    # subject can. A plausible throughput rise — ~2x today's measured peak,
+    # against a peak that already moved 71 -> ~90/day in the 15 days between
+    # the PRD's measurement and this task's — really does exceed the cap we
+    # ship. Without this, raising DEFAULT_MAX_TASK_DIRS to 10**9 would leave
+    # every test in this file green while the live guard became permanently
+    # vacuous, which is the exact failure mode this section exists to rule out.
+    doubled_peak = 200
+    required_at_doubled_peak = gct.required_max_task_dirs(
+        doubled_peak, gct.DEFAULT_MAX_AGE_DAYS, gct.RETENTION_SAFETY_FACTOR
+    )
+    assert required_at_doubled_peak > gct.DEFAULT_MAX_TASK_DIRS, (
+        f"a {doubled_peak}/day peak requires "
+        f"{required_at_doubled_peak} dirs but DEFAULT_MAX_TASK_DIRS is "
+        f"{gct.DEFAULT_MAX_TASK_DIRS} — the shipped cap is now so large that "
+        "no realistic archive rate can trip the live derived-bound guard, "
+        "which makes that guard vacuous. Either the cap was raised far beyond "
+        "its derivation, or this test's reference peak needs re-deriving from "
+        "a fresh measurement (see the RETENTION_SAFETY_FACTOR comment in "
+        "scripts/gc_agent_transcripts.py)."
+    )
+
+
+def test_required_max_task_dirs_strictly_increases_with_peak_rate():
+    """(c) A throughput RISE genuinely raises the bar; it is not absorbed.
+
+    This is the property that makes the cap re-derive rather than sit green
+    forever — the live peak already moved 71 -> ~90/day between the PRD's
+    measurement and this task's.
+    """
+    requirements = [
+        gct.required_max_task_dirs(peak, gct.DEFAULT_MAX_AGE_DAYS, gct.RETENTION_SAFETY_FACTOR)
+        for peak in (1, 2, 50, 90, 91, 200)
+    ]
+    assert requirements == sorted(requirements)
+    assert len(set(requirements)) == len(requirements)  # STRICTLY increasing
+
+
+def test_required_max_task_dirs_strictly_increases_with_safety_factor():
+    """(c) A larger safety factor demands a larger cap, monotonically."""
+    requirements = [
+        gct.required_max_task_dirs(90, gct.DEFAULT_MAX_AGE_DAYS, factor)
+        for factor in (1, 1.5, 2, 3, 5)
+    ]
+    assert requirements == sorted(requirements)
+    assert len(set(requirements)) == len(requirements)  # STRICTLY increasing
+
+
+def test_required_max_task_dirs_rounds_up():
+    """(d) A fractional requirement rounds UP, never down into false headroom.
+
+    Rounding 1.5 down to 1 would report the cap as adequate when it is half a
+    dir short — small per-day, but it is the direction that hides truncation.
+    """
+    assert gct.required_max_task_dirs(1, 1, 1.5) == 2
+    assert gct.required_max_task_dirs(2.5, 1, 1) == 3
+    assert gct.required_max_task_dirs(1, 3, 1.1) == 4  # 3.3 -> 4
+    # An exact integer is NOT inflated by the rounding.
+    assert gct.required_max_task_dirs(2, 3, 2) == 12
+
+
+def test_retention_safety_factor_is_at_least_one():
+    """(e) A factor below 1 would size the cap UNDER the plain 90-day
+    projection of the observed rate — quietly re-admitting the very truncation
+    the derived bound exists to prevent."""
+    assert gct.RETENTION_SAFETY_FACTOR >= 1
+
+
+# ---------------------------------------------------------------------------
+# step-5 (task 3621): the count cap re-derived against the LIVE archive.
+#
+# Meaningful on a live host, inert in a fresh checkout: with no archive (or too
+# sparse a one) it SKIPS rather than passing, so silence stays legible in the
+# pytest output as "not measured" instead of masquerading as a green check.
+# ---------------------------------------------------------------------------
+
+def test_max_task_dirs_is_derived_from_live_archive_rate():
+    """DERIVED BOUND: max_task_dirs must hold a FULL max_age_days window of the
+    archive's real peak throughput, with headroom.
+
+    The count cap prunes OLDEST-FIRST, so if it binds it truncates the 90-day
+    retention window from the forensic end while the sweep still reports a
+    90-day policy. This guard re-measures the live archive every run, so a
+    fleet that speeds up trips the test instead of silently losing history.
+    """
+    root = gct.default_archive_root()
+    if not root.is_dir():
+        pytest.skip(
+            f"no live archive at {root} — nothing to derive the cap from "
+            "(host-independent falsifiability is covered by "
+            "test_required_max_task_dirs_is_falsifiable_against_a_known_peak)"
+        )
+
+    scanned = gct.scan_task_dirs(root)
+    rate = gct.observed_daily_rate(scanned)
+    if rate is None:
+        pytest.skip(
+            f"live archive at {root} holds {len(scanned)} task dirs spanning "
+            f"fewer than {gct.MIN_RATE_SAMPLE_DAYS} complete days — too sparse "
+            "to derive a rate from"
+        )
+
+    # NON-DEGENERATE before it is consumed. A zero rate would make the bound
+    # below satisfiable by ANY cap, leaving this guard permanently green while
+    # measuring nothing — the exact vacuity trap it exists to avoid.
+    assert rate.sample_dirs > 0, "degenerate sample: no task dirs measured"
+    assert rate.peak_per_day > 0, "degenerate sample: zero peak arrival rate"
+
+    required = gct.required_max_task_dirs(
+        rate.peak_per_day, gct.DEFAULT_MAX_AGE_DAYS, gct.RETENTION_SAFETY_FACTOR
+    )
+
+    assert required <= gct.DEFAULT_MAX_TASK_DIRS, (
+        "retention count cap is too small for the archive's MEASURED "
+        "throughput: it will prune oldest-first and silently truncate the "
+        f"{gct.DEFAULT_MAX_AGE_DAYS}-day retention window.\n"
+        f"  archive root ..... {root}\n"
+        f"  sample ........... {rate.sample_dirs} task dirs over "
+        f"{rate.span_days} days ({rate.complete_days} complete)\n"
+        f"  observed peak .... {rate.peak_per_day}/day "
+        f"(mean {rate.mean_per_day:.1f}/day)\n"
+        f"  safety factor .... {gct.RETENTION_SAFETY_FACTOR} (provenance and "
+        "the measurement it was derived from are in the "
+        "RETENTION_SAFETY_FACTOR comment in scripts/gc_agent_transcripts.py — "
+        "re-measure before trusting it)\n"
+        f"  REQUIRED cap ..... {required} = ceil({rate.peak_per_day}/day"
+        f" x {gct.DEFAULT_MAX_AGE_DAYS} days x {gct.RETENTION_SAFETY_FACTOR})\n"
+        f"  current cap ...... {gct.DEFAULT_MAX_TASK_DIRS}\n"
+        "TO FIX: re-derive the cap from the numbers above (ruling: "
+        "plans/transcript-preservation-seam-prd.md D8) and raise ALL FIVE "
+        "lock-step sites in ONE commit, or any single commit is red:\n"
+        "  1. orchestrator/src/orchestrator/config.py  RetentionConfig.max_task_dirs\n"
+        "  2. scripts/gc_agent_transcripts.py  DEFAULT_MAX_TASK_DIRS (+ the "
+        "module docstring's --max-task-dirs usage example)\n"
+        "  3. orchestrator/tests/test_transcript_archive_config.py  defaults test\n"
+        "  4. orchestrator/tests/test_transcript_archive_config.py  whole-submodel "
+        "reload rider assertion\n"
+        "  5. scripts/tests/test_transcript_archival_boundary_gate.py  the E8 "
+        "gate's default-caps no-op assertion\n"
+        "  ...plus this file's test_default_constants_match_orchestrator_config "
+        "drift guard.\n"
+        "The authoritative list is whatever "
+        "`grep -rn 'DEFAULT_MAX_TASK_DIRS\\|max_task_dirs' --include='*.py' "
+        "--include='*.yaml'` returns outside plans/ and .worktrees/ — that "
+        "grep found site 5 only AFTER a commit raising the other four left the "
+        "tree red (esc-3621-2). Re-run it; do not trust this list to have "
+        "stayed complete."
+    )
+
+
+# ---------------------------------------------------------------------------
+# step-7 (task 3621): summarize_count_cap(task_dirs, decision, now,
+# max_task_dirs, max_age_days) — a binding count cap is a STRUCTURED FACT, not
+# a silent one.
+#
+# The count axis prunes OLDEST-FIRST, so when it binds it truncates the age
+# window from the forensic end while the sweep still reports the full
+# max_age_days policy. The defect this leaf fixes is that the two prune causes
+# are INDISTINGUISHABLE in the output. These tests pin the pure summariser
+# that makes them distinguishable, driven through the production
+# select_prunable so the reasons under test are the ones the GC really emits.
+#
+# The alarm is deliberately NARROW: it fires only on a dir whose reason is
+# EXACTLY 'count' — fresh enough to keep by age, dropped by count. A dir tagged
+# 'age+count' would have died of age anyway, so the cap cost nothing and
+# warning about it would be a false positive (INV-4 is loud-over-silent, not
+# noisy-over-useful: an alarm that cries wolf trains operators to ignore it).
+# ---------------------------------------------------------------------------
+
+# Every count_cap block carries exactly these keys, bound or not, so a machine
+# reader keys on `bound` and never has to branch on key presence.
+COUNT_CAP_KEYS = {
+    "bound",
+    "age_axis_disabled",
+    "max_task_dirs",
+    "pruned",
+    "truncated",
+    "oldest_dropped_age_days",
+    "effective_window_days",
+}
+
+
+def _summarize(task_dirs, *, max_age_days, max_task_dirs):
+    """Classify *task_dirs* through the production select_prunable, then
+    summarise the count axis over that real decision."""
+    decision = select_prunable(task_dirs, NOW, max_age_days, max_task_dirs)
+    return gct.summarize_count_cap(
+        task_dirs, decision, NOW, max_task_dirs, max_age_days
+    )
+
+
+def test_count_cap_unbound_when_nothing_was_pruned():
+    """Nothing pruned at all — the cap is slack, which is the normal posture
+    the raised (derived) cap is sized to guarantee."""
+    block = _summarize(_fresh_dirs(3), max_age_days=90, max_task_dirs=HIGH_COUNT_CAP)
+
+    assert block["bound"] is False
+    assert block["max_task_dirs"] == HIGH_COUNT_CAP
+    assert block["pruned"] == 0
+    assert block["truncated"] == 0
+    # Age fields are None (not 0) when the count axis dropped nothing: absence
+    # of a measurement must not read as a measured zero.
+    assert block["oldest_dropped_age_days"] is None
+    assert block["effective_window_days"] is None
+    assert set(block) == COUNT_CAP_KEYS
+
+
+def test_count_cap_unbound_when_only_the_age_axis_pruned():
+    """An AGE prune is the policy working as designed — it must never raise
+    the count-cap alarm."""
+    task_dirs = [
+        (_dir("a"), NOW),
+        (_dir("b"), NOW - DAY),
+        (_dir("old"), NOW - 100 * DAY),
+    ]
+
+    decision = select_prunable(task_dirs, NOW, 90, 5)
+    assert decision.reasons == {_dir("old"): "age"}  # the count axis is slack
+
+    block = gct.summarize_count_cap(task_dirs, decision, NOW, 5, 90)
+    assert block["bound"] is False
+    assert block["pruned"] == 0
+    assert block["truncated"] == 0
+    assert block["oldest_dropped_age_days"] is None
+    assert block["effective_window_days"] is None
+
+
+def test_count_cap_unbound_when_the_axis_is_disabled():
+    """A non-positive cap DISABLES the count axis; a disabled axis cannot be
+    binding, whatever the age axis did."""
+    task_dirs = [
+        (_dir("a"), NOW),
+        (_dir("b"), NOW - DAY),
+        (_dir("c"), NOW - 2 * DAY),
+    ]
+
+    for disabled in (0, -1):
+        block = _summarize(task_dirs, max_age_days=90, max_task_dirs=disabled)
+        assert block["bound"] is False, disabled
+        assert block["pruned"] == 0
+        assert block["truncated"] == 0
+        assert block["max_task_dirs"] == disabled
+        assert set(block) == COUNT_CAP_KEYS
+
+
+def test_count_cap_reports_when_the_AGE_axis_is_disabled():
+    """AMENDMENT (review): under count-only retention the block SAYS so.
+
+    With ``max_age_days <= 0`` the age axis is off, so select_prunable tags
+    every count drop exactly 'count' and `bound` is True on every single sweep.
+    Design decision 1 rules that fire correct — with the age axis off the count
+    cap genuinely IS the only retention policy — so `bound` is left alone. What
+    was missing is the CONTEXT that makes it readable: there is no advertised
+    age window for the cap to have truncated, so the window-truncation claim
+    and its 'x max_age_days x rate x factor' remediation do not apply. That is
+    now a structured fact rather than something a reader has to infer from
+    `caps`, and a consumer wanting only genuine truncation reads
+    `bound and not age_axis_disabled`.
+    """
+    task_dirs = [
+        (_dir("a"), NOW),
+        (_dir("b"), NOW - DAY),
+        (_dir("c"), NOW - 2 * DAY),
+    ]
+
+    for disabled in (0, -1):
+        block = _summarize(task_dirs, max_age_days=disabled, max_task_dirs=1)
+
+        assert block["age_axis_disabled"] is True, disabled
+        # D1 stands: the count cap is the only policy, so it still fires.
+        assert block["bound"] is True, disabled
+        assert block["pruned"] == 2
+        assert block["truncated"] == 2
+        assert set(block) == COUNT_CAP_KEYS
+
+    # ...and the flag is keyed on the AGE cap alone: an enabled age axis reads
+    # False whether or not the count axis is the thing that bound.
+    for max_task_dirs in (1, HIGH_COUNT_CAP):
+        block = _summarize(task_dirs, max_age_days=90, max_task_dirs=max_task_dirs)
+        assert block["age_axis_disabled"] is False, max_task_dirs
+
+
+def test_count_cap_unbound_when_every_count_drop_would_have_died_of_age():
+    """THE FALSE-ALARM CASE. The count axis dropped dirs, but every one is
+    tagged 'age+count' — each fails the age cap independently, so the count cap
+    cost no forensic window and must NOT alarm. `pruned` still reports the
+    drops honestly; only `truncated` (and therefore `bound`) stays at zero."""
+    task_dirs = [
+        (_dir("a"), NOW),                  # rank 0 — kept
+        (_dir("b"), NOW - DAY),            # rank 1 — kept
+        (_dir("c"), NOW - 100 * DAY),      # rank 2 — beyond cap AND past age
+        (_dir("d"), NOW - 120 * DAY),      # rank 3 — beyond cap AND past age
+    ]
+
+    decision = select_prunable(task_dirs, NOW, 90, 2)
+    assert decision.reasons == {_dir("c"): "age+count", _dir("d"): "age+count"}
+
+    block = gct.summarize_count_cap(task_dirs, decision, NOW, 2, 90)
+    assert block["bound"] is False
+    assert block["pruned"] == 2       # the count axis really did touch both
+    assert block["truncated"] == 0    # ...but neither cost a day of window
+    assert block["oldest_dropped_age_days"] == 120.0
+    # No dir was dropped INSIDE the age window, so there is no truncated
+    # window depth to report.
+    assert block["effective_window_days"] is None
+
+
+def test_count_cap_bound_when_a_dir_fresh_enough_to_keep_is_dropped_by_count():
+    """THE ALARM CASE. A dir tagged EXACTLY 'count' was fresh enough for the
+    age policy to keep and was dropped anyway — that is the 90-day window being
+    truncated from the forensic end."""
+    task_dirs = [
+        (_dir("a"), NOW),                  # rank 0 — kept
+        (_dir("b"), NOW - DAY),            # rank 1 — kept
+        (_dir("c"), NOW - 2 * DAY),        # rank 2 — 'count': fresh, dropped
+        (_dir("d"), NOW - 3 * DAY),        # rank 3 — 'count': fresh, dropped
+        (_dir("e"), NOW - 100 * DAY),      # rank 4 — 'age+count'
+    ]
+
+    decision = select_prunable(task_dirs, NOW, 90, 2)
+    assert decision.reasons[_dir("c")] == "count"
+    assert decision.reasons[_dir("e")] == "age+count"
+
+    block = gct.summarize_count_cap(task_dirs, decision, NOW, 2, 90)
+    assert block["bound"] is True
+    assert block["max_task_dirs"] == 2
+    assert block["pruned"] == 3        # every dir the count axis dropped
+    assert block["truncated"] == 2     # ...of which 2 cost real window
+    # The oldest dir the count axis dropped, over the whole count-reason set.
+    assert block["oldest_dropped_age_days"] == 100.0
+    # The NEWEST count-only drop: everything younger than this survived, so
+    # this is the depth the retention window has ACTUALLY been truncated to —
+    # 2 days, against a declared 90-day policy.
+    assert block["effective_window_days"] == 2.0
+    assert set(block) == COUNT_CAP_KEYS
+
+
+def test_count_cap_effective_window_tracks_the_newest_count_only_drop():
+    """`effective_window_days` is the newest count-ONLY drop, not the newest
+    count-reason drop: an 'age+count' dir cannot define the surviving window
+    because the age policy was discarding it anyway."""
+    task_dirs = [(_dir("keep"), NOW)]
+    # Ranks 1..3: fresh, dropped by count at ages 10/20/30 days.
+    task_dirs += [(_dir(f"c{d}"), NOW - d * DAY) for d in (10, 20, 30)]
+    # Rank 4: past the age cap, so it must not set the effective window.
+    task_dirs.append((_dir("ancient"), NOW - 200 * DAY))
+
+    block = _summarize(task_dirs, max_age_days=90, max_task_dirs=1)
+
+    assert block["bound"] is True
+    assert block["pruned"] == 4
+    assert block["truncated"] == 3
+    assert block["oldest_dropped_age_days"] == 200.0
+    assert block["effective_window_days"] == 10.0
+
+
+def test_count_cap_bound_with_no_measurable_age_reports_unknown(caplog, monkeypatch, tmp_path):
+    """AMENDMENT (review): the never-raise defensive branch is EXERCISED.
+
+    `bound` is derived from the prune REASONS while the ages come from joining
+    those paths back to their scanned mtimes, so a caller that hands
+    summarize_count_cap a decision referencing a path absent from `task_dirs`
+    is bound with no age to report. That is a programming error, not an
+    operational one — but this module's contract is never-raise / always-exit-0
+    and loud-over-silent, so the documented response is to say `unknown`
+    LOUDLY, not to crash and not to fall silent about a truncated window.
+
+    Nothing exercised it before, which left a `%d`-style formatting slip in the
+    one code path that is supposed to guarantee never-raise discoverable only
+    in production. Covered here in both halves: the pure block, and the alarm
+    actually rendering through main().
+    """
+    ghost = Path("/archive/ghost")
+    decision = gct.GcDecision(keep=[], prune=[(ghost, gct.REASON_COUNT)])
+
+    # (a) the pure summariser: bound on the REASON, ages honestly absent.
+    block = gct.summarize_count_cap([], decision, NOW, 1, 90)
+    assert block["bound"] is True
+    assert block["pruned"] == 1          # counted from the reason, not the join
+    assert block["truncated"] == 1
+    assert block["oldest_dropped_age_days"] is None
+    assert block["effective_window_days"] is None
+    assert block["age_axis_disabled"] is False
+    assert set(block) == COUNT_CAP_KEYS
+
+    assert gct._fmt_days(None) == "unknown"
+    assert gct._fmt_days(2.0) == "2.0"    # a real measurement still renders
+
+    # (b) end-to-end through main(), which is where the format string lives.
+    # scan_task_dirs returns nothing, so every prune path is unjoinable.
+    monkeypatch.setattr(gct, "scan_task_dirs", lambda root: [])
+    monkeypatch.setattr(
+        gct, "select_prunable", lambda *args, **kwargs: decision
+    )
+    monkeypatch.setattr(
+        gct, "prune_task_dirs", lambda records, *, dry_run: gct.PruneOutcome()
+    )
+
+    with caplog.at_level(logging.WARNING, logger="gc_agent_transcripts"):
+        assert gct.main(
+            ["--root", str(tmp_path), "--now", str(NOW),
+             "--max-task-dirs", "1", "--max-age-days", "90", "--check"]
+        ) == 0
+
+    alarms = [
+        record.getMessage()
+        for record in caplog.records
+        if COUNT_CAP_MARKER in record.getMessage()
+    ]
+    assert len(alarms) == 1, f"expected exactly one alarm, got {alarms!r}"
+    # It renders — no ValueError/TypeError from the format string — and it says
+    # `unknown` rather than a fabricated 0.0.
+    assert "unknown" in alarms[0]
+    assert "0.0 days" not in alarms[0]
+
+
+def test_gc_report_carries_a_stable_count_cap_block_bound_and_unbound():
+    """The `count_cap` key is ALWAYS present in the JSON report under the same
+    schema, so a cron/watchdog reader never branches on key presence (INV-2:
+    the emitter had the fact in a variable; it must not make a consumer
+    re-derive it from the log)."""
+    task_dirs = [
+        (_dir("a"), NOW),
+        (_dir("b"), NOW - DAY),
+        (_dir("c"), NOW - 2 * DAY),
+    ]
+
+    def _report(max_task_dirs):
+        decision = select_prunable(task_dirs, NOW, 90, max_task_dirs)
+        return gct.build_gc_report(
+            root=Path("/archive"),
+            scanned=task_dirs,
+            decision=decision,
+            outcome=gct.PruneOutcome(),
+            caps=(90, max_task_dirs),
+            now=NOW,
+            check=True,
+        )
+
+    bound = _report(1)["count_cap"]
+    unbound = _report(HIGH_COUNT_CAP)["count_cap"]
+
+    assert set(bound) == COUNT_CAP_KEYS
+    assert set(unbound) == COUNT_CAP_KEYS
+    assert bound["bound"] is True
+    assert bound["truncated"] == 2
+    assert bound["effective_window_days"] == 1.0
+    assert unbound["bound"] is False
+    assert unbound["truncated"] == 0
+    assert unbound["effective_window_days"] is None
+    # The block reports the cap that was ACTUALLY applied, matching `caps`.
+    assert bound["max_task_dirs"] == 1
+    assert unbound["max_task_dirs"] == HIGH_COUNT_CAP
+
+
+# ---------------------------------------------------------------------------
+# step-9 (task 3621): the sweep SAYS SO — CLI end-to-end over a real archive.
+#
+# step-7/8 made the count-cap bind a structured fact in the JSON report. This
+# closes the loop on the operator-facing half: a bind must also be LOUD on
+# stderr, and the two prune causes must be DISTINGUISHABLE in the output —
+# which is the exact defect this leaf fixes.
+# ---------------------------------------------------------------------------
+
+# The operator-facing GREP CONTRACT. This substring is what a human or a
+# cron/watchdog wrapper searches stderr for, so it is pinned deliberately:
+# changing it is a breaking change to the alarm, not a wording tweak.
+COUNT_CAP_MARKER = "COUNT CAP BOUND"
+
+
+def _count_cap_warnings(stderr: str) -> list[str]:
+    """The count-cap alarm records in a CLI run's stderr.
+
+    ``logging.basicConfig`` writes one ``LEVELNAME:logger:message`` line per
+    record, so a line-wise filter recovers exactly the alarm records — and
+    lets an assertion address the WARNING itself rather than the whole stream,
+    which in a dry-run also carries the pre-existing 'would prune' INFO lines.
+    """
+    return [
+        line
+        for line in stderr.splitlines()
+        if line.startswith("WARNING:") and COUNT_CAP_MARKER in line
+    ]
+
+
+def test_cli_count_cap_bind_is_loud_and_carries_the_same_numbers(tmp_path):
+    """(a) The age axis is ON and the cap still bites, so the dropped dirs are
+    tagged 'count' — fresh enough to keep, dropped anyway. stderr must carry a
+    LOUD, greppable WARNING, and stdout's JSON must carry the SAME numbers, so
+    a cron/watchdog wrapper never has to re-parse the log to recover a fact the
+    emitter already held in a variable (INV-2)."""
+    root = tmp_path / "agent-transcripts"
+    _make_cli_archive(root, _five_fresh_specs())
+
+    result = _run_cli(
+        "--root", str(root),
+        "--now", str(NOW),
+        "--max-task-dirs", "2",
+        "--max-age-days", "90",  # age axis ON — every drop below is 'count'
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+
+    block = json.loads(result.stdout)["count_cap"]
+    assert block["bound"] is True
+    assert block["max_task_dirs"] == 2
+    assert block["pruned"] == 3
+    assert block["truncated"] == 3          # all three were inside the age window
+    assert block["oldest_dropped_age_days"] == 4.0
+    assert block["effective_window_days"] == 2.0
+    # A 90-day policy that in practice retains 2 days: the whole point.
+    assert block["effective_window_days"] < 90
+
+    warnings = _count_cap_warnings(result.stderr)
+    assert len(warnings) == 1, f"expected exactly one alarm, got {warnings!r}"
+    alarm = warnings[0]
+
+    assert LOG_PREFIX in alarm                        # greppable prefix
+    assert f"max_task_dirs={block['max_task_dirs']}" in alarm
+    assert str(block["truncated"]) in alarm
+    assert f"{block['oldest_dropped_age_days']:.1f}" in alarm
+    assert f"{block['effective_window_days']:.1f}" in alarm
+    # It must tell the operator what to DO, not merely that something happened.
+    assert "re-derive" in alarm.lower()
+    assert "plans/transcript-preservation-seam-prd.md" in alarm
+    # (d) The alarm is not a dry-run line. The pre-existing
+    # test_cli_count_cap_prunes_oldest_over_cap asserts 'would prune' is absent
+    # from a REAL run's stderr and must keep passing unmodified.
+    assert "would prune" not in alarm
+    # ...and it is not a per-removal line either. 'pruned task dir' is the
+    # greppable marker of the per-dir removal log, which the E8 boundary gate
+    # counts by grepping for it. An alarm carrying that substring silently
+    # inflates that count by one — an earlier draft read 'count-pruned task
+    # dirs' and broke the gate exactly this way. The alarm must be greppable
+    # as ITSELF, never as one of the lines it sits beside.
+    assert "pruned task dir" not in alarm
+
+
+def test_cli_age_only_prune_is_not_a_count_cap_alarm(tmp_path):
+    """(b) An age prune is the retention policy working as designed. It must
+    emit NO alarm and report bound=False — the two prune causes are now
+    DISTINGUISHABLE, which is the defect this leaf fixes."""
+    root = tmp_path / "agent-transcripts"
+    _make_cli_archive(
+        root,
+        [("100", NOW), ("101", NOW - DAY), ("ancient", NOW - 200 * DAY)],
+    )
+
+    result = _run_cli(
+        "--root", str(root),
+        "--now", str(NOW),
+        "--max-task-dirs", "10",  # count axis slack
+        "--max-age-days", "90",
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+
+    report = json.loads(result.stdout)
+    assert report["removed"] == 1                     # the age axis really pruned
+    assert report["reason_counts"] == {"age": 1}
+    block = report["count_cap"]
+    assert block["bound"] is False
+    assert block["pruned"] == 0
+    assert block["truncated"] == 0
+    assert block["oldest_dropped_age_days"] is None
+    assert block["effective_window_days"] is None
+
+    assert _count_cap_warnings(result.stderr) == []
+
+
+def test_cli_check_still_warns_while_deleting_nothing(tmp_path):
+    """(c) A dry run is PRECISELY when an operator wants to hear that the cap
+    is about to truncate the window, so --check must still alarm."""
+    root = tmp_path / "agent-transcripts"
+    _make_cli_archive(root, _five_fresh_specs())
+
+    result = _run_cli(
+        "--root", str(root),
+        "--now", str(NOW),
+        "--max-task-dirs", "2",
+        "--max-age-days", "90",
+        "--check",
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    for i in range(5):
+        assert (root / str(100 + i)).exists()  # dry-run deletes nothing
+
+    report = json.loads(result.stdout)
+    assert report["check"] is True
+    assert report["removed"] == 0
+    assert report["count_cap"]["bound"] is True       # classified, not deleted
+    assert report["count_cap"]["truncated"] == 3
+
+    warnings = _count_cap_warnings(result.stderr)
+    assert len(warnings) == 1, f"expected exactly one alarm, got {warnings!r}"
+    # (d) at its sharpest: this stderr DOES carry the pre-existing dry-run
+    # 'would prune' INFO lines, and the alarm is still a separate record that
+    # does not contain that substring.
+    assert "would prune" in result.stderr
+    assert "would prune" not in warnings[0]
+
+
+def test_cli_count_only_retention_alarms_without_the_window_claim(tmp_path):
+    """AMENDMENT (review): with the AGE axis disabled the alarm must not claim
+    a truncated age window, nor print a remediation that evaluates to zero.
+
+    `--max-age-days 0` is a supported fail-safe config (two CLI tests above run
+    in it) under which the count cap is deliberately the only retention bound.
+    Every count drop is then tagged exactly 'count', so `bound` is True on
+    every sweep — which design decision 1 rules correct, and which this test
+    does NOT contest. What it pins is that the LINE stays true in that mode:
+    the previous single wording asserted 'the effective retention window is now
+    X days ... against max_age_days=0' (there is no such window) and told the
+    operator to 're-derive the cap as max_age_days x rate x factor' (which is
+    0 x rate x factor). Both are gone; the count-only variant reports what the
+    cap actually costs instead.
+    """
+    root = tmp_path / "agent-transcripts"
+    _make_cli_archive(root, _five_fresh_specs())
+
+    result = _run_cli(
+        "--root", str(root),
+        "--now", str(NOW),
+        "--max-task-dirs", "2",
+        "--max-age-days", "0",  # age axis OFF — count-only retention
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+
+    report = json.loads(result.stdout)
+    block = report["count_cap"]
+    assert block["age_axis_disabled"] is True
+    assert block["bound"] is True           # D1: the count cap is the only policy
+    assert block["pruned"] == 3
+
+    warnings = _count_cap_warnings(result.stderr)
+    assert len(warnings) == 1, f"expected exactly one alarm, got {warnings!r}"
+    alarm = warnings[0]
+
+    # Still LOUD and still greppable as the same alarm.
+    assert LOG_PREFIX in alarm
+    assert COUNT_CAP_MARKER in alarm
+    assert f"max_task_dirs={block['max_task_dirs']}" in alarm
+    # It SAYS the age axis is what is missing, and points at the real remedy.
+    assert "--max-age-days=0" in alarm
+    assert "disables the age axis" in alarm
+    # ...and it makes NEITHER false claim.
+    assert "re-derive" not in alarm.lower(), (
+        "the cap-re-derivation remedy is max_age_days x rate x factor, which "
+        "is zero when the age axis is off — it must not be printed there"
+    )
+    assert "against max_age_days=0" not in alarm
+    assert "retention window is now" not in alarm
+    # The wording constraints of the other variant hold here too: the alarm is
+    # not a dry-run line and not a per-removal line.
+    assert "would prune" not in alarm
+    assert "pruned task dir" not in alarm
+
+
+def test_cli_age_enabled_bind_keeps_the_window_truncation_wording(tmp_path):
+    """The count-only variant must not have swallowed the ORIGINAL alarm: with
+    the age axis ON, a bind still gets the window-truncation wording and its
+    re-derivation remedy (the case the whole leaf exists for)."""
+    root = tmp_path / "agent-transcripts"
+    _make_cli_archive(root, _five_fresh_specs())
+
+    result = _run_cli(
+        "--root", str(root),
+        "--now", str(NOW),
+        "--max-task-dirs", "2",
+        "--max-age-days", "90",
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert json.loads(result.stdout)["count_cap"]["age_axis_disabled"] is False
+
+    warnings = _count_cap_warnings(result.stderr)
+    assert len(warnings) == 1, f"expected exactly one alarm, got {warnings!r}"
+    assert "re-derive" in warnings[0].lower()
+    assert "against max_age_days=90" in warnings[0]

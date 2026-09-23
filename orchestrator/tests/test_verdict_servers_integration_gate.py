@@ -274,8 +274,8 @@ def _fake_invoke_writes_merger_verdict(
 
 def _fake_invoke_writes_reviewer_verdict(
     *, verdict: str | None, issues: list | None = None, summary: str = '',
-    output: str = '', success: bool = True, role_name: str = 'reviewer_comprehensive',
-    session_id: str = 'sid',
+    output: str = '', success: bool = True, timed_out: bool = False,
+    role_name: str = 'reviewer_comprehensive', session_id: str = 'sid',
 ) -> Callable[..., Any]:
     """``verdict=None`` writes NO verdict at all (agent never called
     ``submit_review_verdict``). Routes a real write through
@@ -292,7 +292,7 @@ def _fake_invoke_writes_reviewer_verdict(
                 _artifacts_for(cwd), role_name, session_id, role_name, verdict,
                 issues or [], summary,
             )
-        return AgentResult(success=success, output=output)
+        return AgentResult(success=success, output=output, timed_out=timed_out)
 
     return _fake
 
@@ -502,10 +502,10 @@ class TestReviewerBoundary:
     """Scenarios 4-5: ``TaskWorkflow._run_reviewer`` driven through the REAL
     ``_invoke``, with only ``orchestrator.workflow.invoke_agent`` faked.
 
-    Plus one amendment scenario beyond the original 4-5: an invocation
-    failure is untrusted even when a valid PASS verdict was written before
-    it failed (I-FAIL-SAFE's "success" leg, distinct from the absent-verdict
-    leg already covered by scenario 5).
+    Plus the narrowed I-FAIL-SAFE "unsuccessful invocation" leg (distinct
+    from the absent-verdict leg already covered by scenario 5): a well-formed
+    verdict written by a failed-but-not-timed-out run is SALVAGED, while a
+    timed-out run still degrades to ERROR.
     """
 
     async def test_pass_verdict_is_aggregate_consumable_prose_ignored(
@@ -551,22 +551,51 @@ class TestReviewerBoundary:
         assert result['verdict'] == 'ERROR'
         assert result['reviewer'] == 'reviewer_comprehensive'
 
-    async def test_invocation_failure_is_untrusted_despite_valid_verdict(
+    async def test_invocation_failure_salvages_valid_verdict(
         self, config, git_ops, task_assignment, tmp_path, monkeypatch,
     ):
-        """An invocation failure is untrusted even when a valid PASS verdict
-        was written before it failed (workflow.py: ``not result.success or
-        ...`` — "an invocation failure ... is untrusted even if it happened
-        to write a verdict before failing"). A written PASS verdict must NOT
-        override success=False; the reviewer still degrades to the fail-safe
-        ERROR disposition.
+        """A well-formed verdict survives an unsuccessful (but not timed-out)
+        invocation — end-to-end through the REAL verdict-tools write path.
+
+        AMENDED from the pre-narrowing pin
+        (``test_invocation_failure_is_untrusted_despite_valid_verdict``):
+        ``result.success`` is downgraded by ``cli_invoke``'s
+        ~98%-false-positive ``ended_awaiting_background`` flag (task 3639),
+        so short-circuiting on it discarded verdicts the reviewer had
+        genuinely decided. See ``test_reviewer_verdict_routing.py`` (f1)-(f3)
+        for the unit-level contract.
         """
         workflow = _setup_reviewer_workflow(config, git_ops, task_assignment, tmp_path)
         monkeypatch.setattr(
             'orchestrator.workflow.invoke_agent',
             _fake_invoke_writes_reviewer_verdict(
                 verdict='PASS', summary='Looks good.', success=False,
-                output='crashed after writing verdict',
+                output='run flagged unsuccessful after writing verdict',
+            ),
+        )
+
+        result = await workflow._run_reviewer(REVIEWER_COMPREHENSIVE, 'diff --git a/x b/x')
+
+        assert result == {
+            'reviewer': 'reviewer_comprehensive',
+            'verdict': 'PASS',
+            'issues': [],
+            'summary': 'Looks good.',
+        }
+
+    async def test_timed_out_invocation_is_untrusted_despite_valid_verdict(
+        self, config, git_ops, task_assignment, tmp_path, monkeypatch,
+    ):
+        """The surviving half of the fe37ca04a8 fail-safe: a TIMED-OUT run is
+        untrusted even when a valid PASS verdict was written before the kill
+        — the run was aborted mid-flight, so the verdict may be partial.
+        """
+        workflow = _setup_reviewer_workflow(config, git_ops, task_assignment, tmp_path)
+        monkeypatch.setattr(
+            'orchestrator.workflow.invoke_agent',
+            _fake_invoke_writes_reviewer_verdict(
+                verdict='PASS', summary='Looks good.', success=False, timed_out=True,
+                output='killed after writing verdict',
             ),
         )
 

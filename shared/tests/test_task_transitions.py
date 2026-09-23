@@ -410,9 +410,14 @@ class TestOutcomeAllowsStatus:
         assert outcome_allows_status('blocked', 'cancelled') is True
         assert outcome_allows_status('blocked', 'deferred') is True
         assert outcome_allows_status('blocked', 'merge-deferred') is True
-        # Merge-halt escalation-wait paths (_handle_wip_recovery_no_advance /
-        # _handle_unmerged_state) return BLOCKED without ever rewriting
-        # status, leaving the row at whatever it was mid-merge.
+        # BLOCKED paths that deliberately PRESERVE the mid-flight row rather
+        # than parking it: spec §5's steward terminal-decision carve-out (the
+        # steward already adjudicated the row, so _mark_blocked returns BLOCKED
+        # without rewriting it), and the merge-gating bail. NOT the merge-halt
+        # trio — as of task 3537 those route through _mark_blocked and DO write
+        # the row (spec §7.9 / §8-E3, INV-6). See _OUTCOME_ALLOWED['blocked']:
+        # the member is retained on the remaining justifications; narrowing it
+        # is divergence E10's scope.
         assert outcome_allows_status('blocked', 'in-progress') is True
         # 'done'/'pending' are NOT legitimate BLOCKED exits — 'done' has its
         # own dedicated branch (never falls through to BLOCKED), and nothing

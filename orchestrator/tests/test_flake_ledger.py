@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import gc
 import logging
+import math
 import os
 import sqlite3
 import time
@@ -72,6 +73,54 @@ def _table_names(db_path: Path) -> list[str]:
 
 def _column_names(db_path: Path, table: str) -> list[str]:
     return [r['name'] for r in _rows(db_path, f'PRAGMA table_info({table})')]
+
+
+class _RecordingConnection:
+    """A ``sqlite3.Connection`` that appends every ``execute`` SQL string to a log.
+
+    Transparent by delegation, so the module under test sees an ordinary connection —
+    including the ``conn.row_factory = sqlite3.Row`` assignment, which is forwarded to
+    the real one so ``_to_debt_row``'s keyed access still works.
+
+    A proxy rather than a monkeypatch of ``sqlite3.Connection.execute``: that is a C
+    extension type and refuses attribute assignment.
+    """
+
+    def __init__(self, conn: sqlite3.Connection, log: list[str]) -> None:
+        self._conn = conn
+        self._log = log
+
+    def execute(self, sql, *args, **kwargs):
+        self._log.append(sql)
+        return self._conn.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def __setattr__(self, name, value) -> None:
+        if name in ('_conn', '_log'):
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._conn, name, value)
+
+
+def _count_connections(monkeypatch) -> list:
+    """Record every ``sqlite3.connect`` opened for the rest of the test.
+
+    Module level rather than a method, because BOTH the async
+    :class:`TestOneConnectionPerCall` and the sync :class:`TestReadDebtMany` state the
+    same one-connection-per-entry-point contract and must state it the same way.
+    """
+    opened: list = []
+    real_connect = sqlite3.connect
+
+    def _recording_connect(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(sqlite3, 'connect', _recording_connect)
+    return opened
 
 
 @contextlib.contextmanager
@@ -433,6 +482,215 @@ def _suppression(**overrides):
     }
     kwargs.update(overrides)
     return FlakeSuppression(**kwargs)
+
+
+class TestFlakeSuppressionFromWire:
+    """The READ half of the ``VerifyResult`` wire carrier (PRD §8 / §8.4, task ε).
+
+    ``result_to_dict`` is ``dataclasses.asdict`` and ``result_from_dict`` is a bare
+    ``VerifyResult(**d)``, so a JSON round-trip hands the nested suppression back with
+    ``verdict``/``call_site`` as plain ``str`` and ``test_ids`` as a ``list`` — NOT
+    equality-preserving, and not honest against the field's annotation.  This codec
+    coerces them back.
+
+    It NEVER raises.  ``RemoteRunner.run_merge_verify`` turns any ``TypeError`` /
+    ``ValueError`` out of ``result_from_json`` into a ``RunnerUnavailable``, which costs
+    a whole local re-verify — so letting one garbage sub-payload cost a re-verify would
+    be strictly worse than dropping one observation.
+
+    It is deliberately NOT a validator: an unrecognised vocabulary string is PRESERVED
+    so :func:`record_flake_occurrence`'s existing B12 coercion guard stays the single
+    write-time policy instead of being duplicated here.
+    """
+
+    @staticmethod
+    def _wire(s) -> dict:
+        """Exactly what ``result_to_dict`` -> ``json.dumps`` -> ``json.loads`` produces
+        for the nested field: enum members flattened to strings, tuple to list."""
+        import dataclasses
+        import json
+
+        return json.loads(json.dumps(dataclasses.asdict(s), sort_keys=True))
+
+    @staticmethod
+    def _warnings(caplog) -> list:
+        return [
+            r
+            for r in caplog.records
+            if r.name == 'orchestrator.flake_ledger' and r.levelno == logging.WARNING
+        ]
+
+    def test_round_trip_compares_equal_to_the_original(self) -> None:
+        """(a) The whole point: a wire round-trip is LOSSLESS, so the annotation on
+        ``VerifyResult.flake_suppression`` is true on the deserialized path too."""
+        from orchestrator.flake_ledger import (
+            FlakeCallSite,
+            FlakeSuppression,
+            FlakeVerdict,
+            flake_suppression_from_wire,
+        )
+
+        s = _suppression(test_ids=('a::t1', 'b::t2'))
+        d = self._wire(s)
+        # Pin the wire shape itself, so this test still fails loudly if `asdict` ever
+        # stops flattening the enums (which would make the coercion below vacuous).
+        assert d['verdict'] == 'passes_in_isolation' and not isinstance(d['verdict'], FlakeVerdict)
+        assert d['test_ids'] == ['a::t1', 'b::t2']
+
+        rt = flake_suppression_from_wire(d)
+        assert isinstance(rt, FlakeSuppression)
+        assert rt == s
+        assert isinstance(rt.verdict, FlakeVerdict) and rt.verdict is FlakeVerdict.passes_in_isolation
+        assert isinstance(rt.call_site, FlakeCallSite) and rt.call_site is FlakeCallSite.merge_gate
+        assert isinstance(rt.test_ids, tuple) and rt.test_ids == ('a::t1', 'b::t2')
+
+    def test_round_trip_of_an_unconfirmable_observation(self) -> None:
+        """(a), for the verdict that carries a reason and may name no tests."""
+        from orchestrator.flake_ledger import (
+            FlakeSuppression,
+            FlakeVerdict,
+            flake_suppression_from_wire,
+        )
+
+        s = _suppression(
+            verdict=FlakeVerdict.unconfirmable,
+            test_ids=(),
+            psi_cpu_some10=None,
+            unconfirmable_reason='node-ids mapped to no discovered subproject',
+        )
+        rt = flake_suppression_from_wire(self._wire(s))
+        assert isinstance(rt, FlakeSuppression)
+        assert rt == s
+        assert rt.verdict is FlakeVerdict.unconfirmable
+        assert rt.test_ids == ()
+        assert rt.unconfirmable_reason == 'node-ids mapped to no discovered subproject'
+
+    def test_none_returns_none_without_warning(self, caplog) -> None:
+        """(b) ``None`` is the ordinary "no observation" case — the B13 old-remote
+        shape — not a fault, so it must not log.
+
+        The SILENCE is the assertion, not an afterthought: on a mixed-version fleet
+        this is by far the most frequent input, so a regression that made it warn
+        would put one WARNING on every single merge.  Asserting only the ``None``
+        return would leave that regression green.
+        """
+        from orchestrator.flake_ledger import flake_suppression_from_wire
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            assert flake_suppression_from_wire(None) is None
+
+        assert self._warnings(caplog) == [], 'the no-observation case must be silent'
+
+    @pytest.mark.parametrize(
+        'bogus',
+        ['passes_in_isolation', ['a', 'b'], 17, 3.5, True],
+        ids=['str', 'list', 'int', 'float', 'bool'],
+    )
+    def test_a_non_dict_degrades_to_none_loudly(self, caplog, bogus) -> None:
+        """(b) Never a raise — a malformed sub-payload must cost one observation, not a
+        whole re-verify."""
+        from orchestrator.flake_ledger import flake_suppression_from_wire
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            assert flake_suppression_from_wire(bogus) is None
+
+        assert self._warnings(caplog), 'expected a loud WARNING, not a silent drop'
+
+    @pytest.mark.parametrize(
+        'missing', ['verdict', 'test_ids', 'observed_at', 'call_site', 'runner']
+    )
+    def test_a_dict_missing_a_required_key_degrades_to_none_loudly(self, caplog, missing) -> None:
+        """(c) A truncated payload is a producer bug; report it and drop the one
+        observation."""
+        from orchestrator.flake_ledger import flake_suppression_from_wire
+
+        d = self._wire(_suppression())
+        d.pop(missing)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            assert flake_suppression_from_wire(d) is None
+
+        assert self._warnings(caplog), 'expected a loud WARNING, not a silent drop'
+
+    def test_an_unknown_extra_key_is_dropped_and_the_rest_reconstructs(self) -> None:
+        """(d) Forward-compat with a NEWER producer: a field this version has never
+        heard of must not cost the observation it rides along with."""
+        from orchestrator.flake_ledger import (
+            FlakeSuppression,
+            FlakeVerdict,
+            flake_suppression_from_wire,
+        )
+
+        s = _suppression()
+        d = self._wire(s)
+        d['some_field_from_the_future'] = {'nested': [1, 2, 3]}
+
+        rt = flake_suppression_from_wire(d)
+        assert isinstance(rt, FlakeSuppression)
+        assert rt == s
+        assert rt.verdict is FlakeVerdict.passes_in_isolation
+        assert not hasattr(rt, 'some_field_from_the_future')
+
+    @pytest.mark.parametrize('field_name', ['verdict', 'call_site'])
+    def test_an_unrecognised_vocabulary_string_is_preserved_not_rejected(
+        self, caplog, field_name
+    ) -> None:
+        """(e) ONE coercion policy, and it lives at write time.  ``flaky_test`` is §5.5's
+        anti-vocabulary: preserving it here lets ``record_flake_occurrence``'s existing
+        B12 guard reject it with the log line operators already know, instead of this
+        codec silently deleting the evidence that a producer went off-vocabulary."""
+        from orchestrator.flake_ledger import flake_suppression_from_wire
+
+        d = self._wire(_suppression())
+        d[field_name] = 'flaky_test'
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            rt = flake_suppression_from_wire(d)
+
+        assert rt is not None
+        assert getattr(rt, field_name) == 'flaky_test'
+        # Every other field still reconstructs — one bad string is not a lost payload.
+        assert rt.test_ids == ('tests/test_a.py::test_one',)
+        assert rt.runner == 'local'
+
+    def test_a_bare_str_test_ids_becomes_a_one_tuple(self) -> None:
+        """``tuple('a::t')`` explodes a node-id into one entry PER CHARACTER — the same
+        hazard ``record_flake_occurrence`` guards, and now literally the same code:
+        both route through ``flake_ledger.py::_coerce_test_ids`` so the wrap-not-drop
+        rule cannot drift between the wire path and the write path."""
+        from orchestrator.flake_ledger import flake_suppression_from_wire
+
+        d = self._wire(_suppression())
+        d['test_ids'] = 'tests/test_a.py::test_one'
+
+        rt = flake_suppression_from_wire(d)
+        assert rt is not None
+        assert rt.test_ids == ('tests/test_a.py::test_one',)
+
+    def test_optional_nones_are_not_coerced_to_falsy_scalars(self) -> None:
+        """(f) ``psi_cpu_some10=None`` means "PSI was unreadable", NEVER "the host was
+        idle" — a fabricated 0.0 would be a lie θ's class-3 check would read as fact."""
+        from orchestrator.flake_ledger import flake_suppression_from_wire
+
+        d = self._wire(_suppression(psi_cpu_some10=None, unconfirmable_reason=None))
+        assert d['psi_cpu_some10'] is None
+
+        rt = flake_suppression_from_wire(d)
+        assert rt is not None
+        assert rt.psi_cpu_some10 is None
+        assert rt.unconfirmable_reason is None
+
+    def test_the_reconstruction_is_frozen_like_the_original(self) -> None:
+        """A wire-built suppression is a value too — the recorder must not be able to
+        amend an observation it merely transports."""
+        import dataclasses
+
+        from orchestrator.flake_ledger import flake_suppression_from_wire
+
+        rt = flake_suppression_from_wire(self._wire(_suppression()))
+        assert rt is not None
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            rt.runner = 'somewhere-else'  # type: ignore[misc]
 
 
 class TestRecordFlakeOccurrence:
@@ -1764,6 +2022,294 @@ class TestDebtReEntry:
         assert row.opened_at == self.T4.isoformat()
 
 
+def _seed_debt_raw(
+    db_path: Path,
+    *,
+    test_id: str,
+    opened_at: str = '2026-08-06T12:00:00+00:00',
+    resolved_at: str | None = None,
+    owner_task_id: str | None = '4396',
+    open_count: int = 1,
+    prior_resolved_at: str | None = None,
+    prior_resolving_commit: str | None = None,
+) -> None:
+    """Insert one ``flake_debt`` row with raw sqlite3 — never through ``open_debt``.
+
+    Same bypass-the-module-under-test convention :func:`_rows` follows: the batched
+    reader's job is to report what is ON DISK, so seeding it through the write path
+    would let a shared bug in the two hide the discrepancy.
+    """
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            'INSERT INTO flake_debt '
+            '(test_id, project_id, opened_at, resolved_at, owner_task_id, open_count, '
+            ' prior_resolved_at, prior_resolving_commit, last_occurrence_at) '
+            "VALUES (?, 'dark_factory', ?, ?, ?, ?, ?, ?, ?)",
+            (
+                test_id,
+                opened_at,
+                resolved_at,
+                owner_task_id,
+                open_count,
+                prior_resolved_at,
+                prior_resolving_commit,
+                opened_at,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class TestReadDebtMany:
+    """The BATCHED debt reader ι's report needs so its chain build is O(1) connections.
+
+    ``read_debt`` is a primary-key lookup, and a report that calls it once per test pays
+    α's full ``_open`` cost per test — ``parent.mkdir`` → ``connect`` → the five-pragma
+    durability triad (including a ``journal_mode=WAL`` switch and ``synchronous=FULL``)
+    → ``executescript(_SCHEMA)`` — against the live ``runs.db`` the merge lane holds a
+    5s busy timeout on.  This reader answers the same question for a whole batch on ONE
+    connection.
+
+    The contract pinned here is that it is a faithful BATCHED FORM of ``read_debt``, not
+    a second reader with its own semantics: a miss is an ABSENT KEY (so a call site's
+    ``.get()`` reproduces ``read_debt``'s ``DebtRow | None`` exactly), and RESOLVED rows
+    come back, which is the entire point — the between-cycles chain is what needs them.
+    """
+
+    OPEN_A = 'tests/test_a.py::test_one'
+    OPEN_B = 'tests/test_b.py::test_two'
+    RESOLVED = 'tests/test_resolved.py::test_three'
+    NEVER_SEEN = 'tests/test_never.py::test_nope'
+
+    T_OPENED = '2026-08-06T12:00:00+00:00'
+    T_RESOLVED = '2026-08-07T12:00:00+00:00'
+    T_PRIOR = '2026-08-01T12:00:00+00:00'
+
+    def _seeded(self, tmp_path: Path) -> Path:
+        from orchestrator.flake_ledger import ensure_schema
+
+        db_path = tmp_path / 'runs.db'
+        ensure_schema(db_path)
+        _seed_debt_raw(db_path, test_id=self.OPEN_A, opened_at=self.T_OPENED)
+        _seed_debt_raw(db_path, test_id=self.OPEN_B, opened_at=self.T_OPENED)
+        # BETWEEN CYCLES: resolved, so `list_open_debt` will not carry it — the case
+        # this reader exists to serve.
+        _seed_debt_raw(
+            db_path,
+            test_id=self.RESOLVED,
+            opened_at=self.T_OPENED,
+            resolved_at=self.T_RESOLVED,
+            open_count=3,
+            prior_resolved_at=self.T_PRIOR,
+            prior_resolving_commit='c0ffee',
+        )
+        return db_path
+
+    def test_returns_a_dict_of_debt_rows_keyed_by_test_id(self, tmp_path: Path) -> None:
+        from orchestrator.flake_ledger import DebtRow, read_debt_many
+
+        db_path = self._seeded(tmp_path)
+
+        result = read_debt_many(db_path, [self.OPEN_A, self.OPEN_B])
+
+        assert set(result) == {self.OPEN_A, self.OPEN_B}
+        assert all(isinstance(row, DebtRow) for row in result.values())
+        assert result[self.OPEN_A].test_id == self.OPEN_A
+        assert result[self.OPEN_A].opened_at == self.T_OPENED
+        assert result[self.OPEN_A].resolved_at is None
+        assert result[self.OPEN_A].owner_task_id == '4396'
+
+    def test_an_id_with_no_debt_row_is_absent_never_mapped_to_none(self, tmp_path: Path) -> None:
+        """A MISS is an absent key, not a ``None`` value.
+
+        That is what makes ``read_debt_many(db, ids).get(t)`` reproduce
+        ``read_debt(db, t)``'s ``DebtRow | None`` contract with no adaptation at the call
+        site — and it keeps "we looked and found nothing" from being indistinguishable
+        from "we never asked", which a ``dict[str, DebtRow | None]`` would collapse.
+        """
+        from orchestrator.flake_ledger import read_debt_many
+
+        db_path = self._seeded(tmp_path)
+
+        result = read_debt_many(db_path, [self.OPEN_A, self.NEVER_SEEN])
+
+        assert self.NEVER_SEEN not in result
+        assert result.get(self.NEVER_SEEN) is None
+        assert set(result) == {self.OPEN_A}
+
+    def test_resolved_rows_are_returned_with_every_prior_cycle_field(
+        self, tmp_path: Path
+    ) -> None:
+        """The between-cycles case that motivates the batched reader at all.
+
+        §5.2 retains resolved rows DELIBERATELY because η's recurrence trigger reads
+        them, and ι's chain goes blank exactly when a test is between cycles unless they
+        come back here.  All four prior-cycle fields are round-tripped, not just
+        ``resolved_at``, because the report prints the whole cycle.
+        """
+        from orchestrator.flake_ledger import read_debt_many
+
+        db_path = self._seeded(tmp_path)
+
+        row = read_debt_many(db_path, [self.RESOLVED])[self.RESOLVED]
+
+        assert row.resolved_at == self.T_RESOLVED
+        assert row.open_count == 3
+        assert row.prior_resolved_at == self.T_PRIOR
+        assert row.prior_resolving_commit == 'c0ffee'
+
+    def test_is_a_drop_in_batched_form_of_read_debt(self, tmp_path: Path) -> None:
+        """DROP-IN EQUIVALENCE, over a mixed batch of open, resolved and unknown ids.
+
+        The strongest available pin that this is the same reader one level up rather
+        than a second one free to drift: whatever ``read_debt`` says for each id
+        individually is exactly what the batch says collectively.
+        """
+        from orchestrator.flake_ledger import read_debt, read_debt_many
+
+        db_path = self._seeded(tmp_path)
+        ids = [self.OPEN_A, self.RESOLVED, self.NEVER_SEEN, self.OPEN_B]
+
+        assert read_debt_many(db_path, ids) == {
+            test_id: row for test_id in ids if (row := read_debt(db_path, test_id)) is not None
+        }
+
+    def test_an_empty_batch_returns_an_empty_dict(self, tmp_path: Path) -> None:
+        from orchestrator.flake_ledger import read_debt_many
+
+        assert read_debt_many(self._seeded(tmp_path), []) == {}
+
+    def test_opens_no_connection_for_an_empty_batch(self, tmp_path: Path, monkeypatch) -> None:
+        """ZERO connections, not one that finds nothing.
+
+        ι's binding contract is that printing a report never WRITES, and `_open` does
+        ``parent.mkdir`` → ``connect`` (which creates the file) → ``executescript``.  An
+        empty batch is the normal case for a project whose every chain is already served
+        from ``list_open_debt``, so a connection here would provision a ledger — plus its
+        WAL sidecars — as a side effect of an empty lookup.
+        """
+        from orchestrator.flake_ledger import read_debt_many
+
+        db_path = self._seeded(tmp_path)
+        opened = _count_connections(monkeypatch)
+
+        assert read_debt_many(db_path, []) == {}
+
+        assert opened == [], f'expected 0 connections, got {len(opened)}'
+
+    def _seed_n(self, tmp_path: Path, n: int) -> tuple[Path, list[str]]:
+        """*n* debt rows in ONE raw transaction — bulk, so a 1200-row fixture stays fast."""
+        from orchestrator.flake_ledger import ensure_schema
+
+        db_path = tmp_path / 'runs.db'
+        ensure_schema(db_path)
+        test_ids = [f'tests/test_{i:04d}.py::test_x' for i in range(n)]
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.executemany(
+                'INSERT INTO flake_debt '
+                '(test_id, project_id, opened_at, open_count, last_occurrence_at) '
+                "VALUES (?, 'dark_factory', ?, 1, ?)",
+                [(t, self.T_OPENED, self.T_OPENED) for t in test_ids],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return db_path, test_ids
+
+    def test_one_connection_regardless_of_chunk_count(self, tmp_path: Path, monkeypatch) -> None:
+        """The chunk loop runs on ONE connection — the module's per-entry-point contract
+        must not quietly degrade to one-connection-per-chunk.
+
+        A per-chunk connection would reintroduce, at 1/500th the rate, precisely the
+        amplification this reader exists to remove: each one pays the full five-pragma
+        durability triad and re-runs the schema DDL against the live ``runs.db``.
+        """
+        from orchestrator import flake_ledger
+        from orchestrator.flake_ledger import read_debt_many
+
+        db_path, test_ids = self._seed_n(tmp_path, 7)
+        monkeypatch.setattr(flake_ledger, '_READ_DEBT_CHUNK_SIZE', 2)  # -> 4 chunks
+        opened = _count_connections(monkeypatch)
+
+        assert len(read_debt_many(db_path, test_ids)) == 7
+
+        assert len(opened) == 1, f'expected 1 connection, got {len(opened)}'
+
+    @pytest.mark.parametrize('n', [4, 5], ids=['exact_multiple', 'ragged_remainder'])
+    def test_chunk_boundaries_neither_drop_nor_duplicate(self, tmp_path: Path, monkeypatch, n
+                                                         ) -> None:
+        """The off-by-one guard on the ``range(0, len(ids), k)`` slicing.
+
+        Both shapes are covered because they fail differently: an exact multiple exposes
+        a phantom trailing chunk, a ragged remainder exposes a dropped tail.
+        """
+        from orchestrator import flake_ledger
+        from orchestrator.flake_ledger import read_debt_many
+
+        db_path, test_ids = self._seed_n(tmp_path, n)
+        monkeypatch.setattr(flake_ledger, '_READ_DEBT_CHUNK_SIZE', 2)
+
+        result = read_debt_many(db_path, test_ids)
+
+        assert set(result) == set(test_ids)
+        assert [result[t].test_id for t in test_ids] == test_ids
+
+    def test_chunking_actually_issues_multiple_selects(self, tmp_path: Path, monkeypatch) -> None:
+        """Chunking is proven BEHAVIOURALLY — by the SELECTs on the wire — rather than by
+        trusting that the constant is read.
+
+        Asserting only the returned dict would pass just as happily against one giant
+        ``IN (...)``, which is the form that trips ``SQLITE_MAX_VARIABLE_NUMBER`` on the
+        999-limit builds the chunking exists for and which this host (32766) cannot
+        reproduce.
+        """
+        from orchestrator import flake_ledger
+        from orchestrator.flake_ledger import read_debt_many
+
+        db_path, test_ids = self._seed_n(tmp_path, 7)
+        monkeypatch.setattr(flake_ledger, '_READ_DEBT_CHUNK_SIZE', 2)
+
+        executed: list[str] = []
+        real_open = flake_ledger._open
+        monkeypatch.setattr(
+            flake_ledger, '_open', lambda p: _RecordingConnection(real_open(p), executed)
+        )
+
+        assert len(read_debt_many(db_path, test_ids)) == 7
+
+        selects = [sql for sql in executed if 'FROM flake_debt' in sql]
+        assert len(selects) == math.ceil(7 / 2), executed
+
+    def test_more_ids_than_the_legacy_variable_limit(self, tmp_path: Path) -> None:
+        """1200 ids in one call, unchunked-by-hand — no ``sqlite3.OperationalError``.
+
+        A regression guard aimed at the 999-variable builds, not at this host: SQLite
+        3.50.4 here measures ``SQLITE_MAX_VARIABLE_NUMBER`` at 32766, so this passes
+        either way locally.  It is kept because the ledger ships to 8 projects and the
+        test universe a report covers is unbounded — and because B12 would turn the
+        failure it guards into a SILENT empty report rather than a raise.
+        """
+        from orchestrator.flake_ledger import read_debt_many
+
+        db_path, test_ids = self._seed_n(tmp_path, 1200)
+
+        assert set(read_debt_many(db_path, test_ids)) == set(test_ids)
+
+    def test_duplicate_ids_collapse_to_one_entry(self, tmp_path: Path) -> None:
+        """The call site passes a set difference, but the parameter is an ``Iterable``:
+        a caller handing the same id twice must not waste two of the bounded SQLite
+        variable budget on it, and must not get a different answer for doing so."""
+        from orchestrator.flake_ledger import read_debt_many
+
+        db_path = self._seeded(tmp_path)
+
+        assert read_debt_many(db_path, [self.OPEN_A, self.OPEN_A, self.OPEN_A]) == read_debt_many(
+            db_path, [self.OPEN_A]
+        )
+
 def _blocked_path(tmp_path: Path) -> Path:
     """A db_path whose parent DIRECTORY cannot be created — a FILE sits where the
     directory must go, so ``mkdir(parents=True)`` raises.  Portable: no chmod, no root
@@ -1839,6 +2385,20 @@ class TestNeverRaisesSync:
             assert read_debt(make_path(tmp_path), 'tests/test_a.py::test_one') is None
         _assert_logged_loudly(caplog)
 
+    def test_read_debt_many(self, tmp_path: Path, caplog, make_path) -> None:
+        """The batched reader degrades to ``{}`` — the WHOLE call, not a partial result.
+
+        Uniform with every sibling here (``read_occurrences`` / ``list_open_debt`` →
+        ``[]``, ``read_debt`` → ``None``), and honest for the failures that actually
+        occur: a corrupt, truncated or lock-contended ``runs.db`` is broken per-DATABASE,
+        not per-row, so there is no chunk that could have succeeded.
+        """
+        from orchestrator.flake_ledger import read_debt_many
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            assert read_debt_many(make_path(tmp_path), ['tests/test_a.py::test_one']) == {}
+        _assert_logged_loudly(caplog)
+
     def test_list_open_debt(self, tmp_path: Path, caplog, make_path) -> None:
         from orchestrator.flake_ledger import list_open_debt
 
@@ -1892,24 +2452,11 @@ class TestOneConnectionPerCall:
     NOW = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
     TEST_ID = 'tests/test_a.py::test_one'
 
-    @staticmethod
-    def _count_connections(monkeypatch) -> list:
-        opened: list = []
-        real_connect = sqlite3.connect
-
-        def _recording_connect(*args, **kwargs):
-            conn = real_connect(*args, **kwargs)
-            opened.append(conn)
-            return conn
-
-        monkeypatch.setattr(sqlite3, 'connect', _recording_connect)
-        return opened
-
     async def test_open_debt_opens_one_connection(self, tmp_path: Path, monkeypatch) -> None:
         from orchestrator.flake_ledger import open_debt
 
         db_path = tmp_path / 'runs.db'
-        opened = self._count_connections(monkeypatch)
+        opened = _count_connections(monkeypatch)
         row = await open_debt(db_path, 'dark_factory', self.TEST_ID, now=self.NOW)
 
         assert len(opened) == 1, f'expected 1 connection, got {len(opened)}'
@@ -1923,7 +2470,7 @@ class TestOneConnectionPerCall:
         db_path = tmp_path / 'runs.db'
         await open_debt(db_path, 'dark_factory', self.TEST_ID, now=self.NOW)
 
-        opened = self._count_connections(monkeypatch)
+        opened = _count_connections(monkeypatch)
         await resolve_debt(
             db_path, 'dark_factory', self.TEST_ID, resolving_commit='deadbee', now=self.NOW
         )
@@ -1934,12 +2481,13 @@ class TestOneConnectionPerCall:
         from orchestrator.flake_ledger import (
             list_open_debt,
             read_debt,
+            read_debt_many,
             read_occurrences,
             record_flake_occurrence,
         )
 
         db_path = tmp_path / 'runs.db'
-        opened = self._count_connections(monkeypatch)
+        opened = _count_connections(monkeypatch)
 
         for call in (
             lambda: record_flake_occurrence(
@@ -1947,6 +2495,7 @@ class TestOneConnectionPerCall:
             ),
             lambda: read_occurrences(db_path),
             lambda: read_debt(db_path, self.TEST_ID),
+            lambda: read_debt_many(db_path, [self.TEST_ID]),
             lambda: list_open_debt(db_path),
         ):
             opened.clear()

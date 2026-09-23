@@ -12,8 +12,13 @@ Lifecycle:
 - Each escalation gets up to steward_max_attempts total attempts (default 1) before re-escalating to level-1.
 - **Every give-up path dismisses its own L0 before publishing an outcome**
   (task 3170) — via ``_auto_escalate_to_human`` when it files an L1, via
-  ``_dismiss_capped_l0`` when it deliberately does not (the wip-gated,
-  task-2060 resume-plan branches).  No pending L0 survives a steward give-up.
+  ``_give_up_with_wip`` → ``_dismiss_capped_l0`` when it deliberately does not
+  (the wip-gated, task-2060 resume-plan branches).  No pending L0 survives a
+  steward give-up.  That dismissal is OBSERVED, not fire-and-forget (task
+  4495): ``EscalationQueue.resolve`` is an atomic check-and-set, so a
+  ``resolve_issue`` still in flight from the killed agent session can win it —
+  and ``_give_up_with_wip`` then publishes ``StewardResolved`` rather than
+  misreporting a genuine resolution as a benign interruption.
 - A capped escalation is TERMINAL for this steward: ``_mark_capped`` records
   it and ``_handle_escalation`` becomes a no-op for that id.
 - Stopped by the workflow after task completion + grace period.
@@ -40,6 +45,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from escalation.classify import classify_resolver_tier
 from shared.cli_invoke import (
     AllAccountsCappedException,
     invoke_with_cap_retry,
@@ -436,7 +442,8 @@ class TaskSteward:
         outcome** (task 3170) — ``_auto_escalate_to_human`` does it as part of
         filing the L1, and the two wip-gated branches (which deliberately file
         no L1, per task-2060 resume-plan semantics) do it via
-        ``_dismiss_capped_l0``.  No pending L0 may survive a give-up: the
+        ``_give_up_with_wip``, THE single converged body behind both of them.
+        No pending L0 may survive a give-up: the
         ``run()``-ESCALATED waiter never reads the outcome channel, so a
         publish-without-dismiss is invisible to it and strands the workflow.
         Any NEW early return added here inherits that obligation.
@@ -498,15 +505,15 @@ class TaskSteward:
                 # must resume the plan, not be triaged as "steward failed" via
                 # an L1.  Skip _auto_escalate_to_human entirely — but still
                 # dismiss the L0 first, per the converged give-up contract
-                # (task 3170; see this method's docstring).  Dismiss-THEN-
-                # publish: the dismissal wakes the run()-ESCALATED waiter via
-                # the resolve callback, the publish hands the typed outcome to
-                # the _mark_blocked waiter.  Both downstream dismissal sites
-                # (_mark_blocked's loop, _await_steward_completion's override)
-                # remain as idempotent backstops — EscalationQueue.resolve is a
-                # documented no-op on a non-pending record.
-                self._dismiss_capped_l0(escalation, 'attempt_cap')
-                self._publish_outcome(outcome)
+                # (task 3170).  _give_up_with_wip owns dismiss-THEN-publish and
+                # the task-4495 race branch; it is THE single body behind both
+                # wip-gated guards, so the drift this comment used to only warn
+                # about is now structurally impossible.  Both downstream
+                # dismissal sites (_mark_blocked's loop,
+                # _await_steward_completion's override) remain as idempotent
+                # backstops — EscalationQueue.resolve is a documented no-op on
+                # a non-pending record.
+                self._give_up_with_wip(escalation, outcome)
             else:
                 self._auto_escalate_to_human(
                     escalation,
@@ -525,10 +532,10 @@ class TaskSteward:
             outcome = StewardInterrupted(reason='timeout', wip_commits_present=wip)
             if wip:
                 # Same converged give-up contract as the attempt-cap branch
-                # above (task 3170): dismiss THEN publish, so neither wip
-                # branch can drift from the other.
-                self._dismiss_capped_l0(escalation, 'timeout')
-                self._publish_outcome(outcome)
+                # above (task 3170), now literally the same code: both call
+                # _give_up_with_wip, which reads the reason off the outcome, so
+                # neither wip branch CAN drift from the other.
+                self._give_up_with_wip(escalation, outcome)
             else:
                 self._auto_escalate_to_human(
                     escalation,
@@ -628,6 +635,12 @@ class TaskSteward:
                     'retry_count': retry_count,
                     'account_name': result.account_name,
                     'timed_out': is_timeout,
+                    # Sibling of the workflow._invoke emitter (task 3639): keep
+                    # the two agent-invocation row shapes symmetric so one
+                    # runs.db query covers both roles.  Emitted unconditionally,
+                    # False included, so the false-positive rate has a
+                    # denominator.
+                    'ended_awaiting_background': result.ended_awaiting_background,
                 },
             )
 
@@ -1050,7 +1063,9 @@ class TaskSteward:
         """
         self._capped_escalations.add(escalation_id)
 
-    def _dismiss_capped_l0(self, escalation: Escalation, reason: str) -> None:
+    def _dismiss_capped_l0(
+        self, escalation: Escalation, reason: str,
+    ) -> Escalation | None:
         """Dismiss *escalation* on a give-up that files no L1 (task 3170).
 
         The wip-gated cap branches deliberately skip
@@ -1067,8 +1082,20 @@ class TaskSteward:
         harness wires to ``_escalation_events[task_id].set()`` — the ONLY
         signal that wakes ``TaskWorkflow._wait_for_resolution`` on the
         ``run()``-ESCALATED path.
+
+        Returns what ``resolve()`` returned: the record AS STORED after the
+        call, or ``None`` when the id is unknown.  The dismissal is therefore
+        OBSERVED, not fire-and-forget (task 4495) — ``resolve()``'s status
+        check is an atomic check-and-set inside ``escalation_id_lock``, so a
+        ``resolve_issue`` already in flight from the killed agent session can
+        win it and leave the returned record carrying the AGENT's close
+        (``'resolved'``, or ``'dismissed'`` for an ``abandon``) rather than this
+        steward's.  :meth:`_give_up_with_wip` is the sole caller and owns that
+        branch (see :func:`_dismissal_was_overtaken`), including the give-up
+        WARNING, which used to live here and moved out because it is FALSE on
+        the lost-race path.
         """
-        self.escalation_queue.resolve(
+        stored = self.escalation_queue.resolve(
             escalation.id,
             f'Auto-dismissed: steward interrupted ({reason}) with WIP present '
             f'— resuming plan, not escalating',
@@ -1078,16 +1105,94 @@ class TaskSteward:
 
         # Same cleanup as _auto_escalate_to_human: cap-fire paths skip the
         # success-path cleanup, so the dicts would otherwise retain stale
-        # entries for this escalation id.
+        # entries for this escalation id.  Unconditional — the counters are
+        # this steward's own bookkeeping and the give-up is terminal for it
+        # regardless of which side won the race above.
         self._retry_counts.pop(escalation.id, None)
         self._timeout_counts.pop(escalation.id, None)
         self._empty_output_counts.pop(escalation.id, None)
 
+        return stored
+
+    def _give_up_with_wip(
+        self, escalation: Escalation, outcome: StewardInterrupted,
+    ) -> None:
+        """The wip-gated give-up, converged: dismiss, OBSERVE, then publish.
+
+        THE single body behind both wip-gated cap branches in
+        :meth:`_handle_escalation` (the attempt cap and the timeout-kill cap),
+        whose comments have long warned that neither may drift from the other.
+        They previously shared only a two-line call sequence, which is exactly
+        how far apart two copies can drift before anything notices.  *reason*
+        is read off ``outcome.reason`` rather than passed separately so the
+        dismissal text and the published outcome cannot disagree about WHY the
+        steward gave up.
+
+        Dismiss-THEN-publish is preserved verbatim: the dismissal wakes the
+        ``run()``-ESCALATED waiter via the resolve callback, the publish hands
+        the typed outcome to the ``_mark_blocked`` waiter.
+
+        THE RACE (task 4495, esc-3902-1).  A ``resolve_issue`` already in
+        flight from the killed agent session can land between the steward's
+        early return and this call — the wip probe alone is a ``git rev-list``
+        subprocess, so the window is tens to hundreds of ms wide.
+        ``EscalationQueue.resolve`` is already a correct atomic check-and-set,
+        so exactly one side wins and the dismissal is correctly a no-op when it
+        loses; what was wrong was that nothing LOOKED.  A lost race therefore
+        published ``StewardInterrupted`` — telling the workflow to resume the
+        plan because the steward was cut short — for a record an agent session
+        had in fact just closed, and logged that it had dismissed an L0 it had
+        not.
+
+        Prevention cannot close this: the steward cannot observe a tool call
+        that has left the agent process but has not yet reached the escalation
+        server.  Reporting truthfully can, and does.
+
+        WHICH side won is read off the RETURNED RECORD by
+        :func:`_dismissal_was_overtaken` — any terminal record not attributed to
+        an automated sweep is one this steward did not close, covering the
+        winner's ``'resolved'`` and ``'dismissed'`` outcomes alike (an
+        ``abandon``/``close_only`` ``resolve_issue`` wins the same check-and-set
+        and would otherwise be misreported as a steward interruption, telling
+        the workflow to resume a plan an agent deliberately abandoned).
+
+        Reading the record rather than ``resolve()``'s ``ResolveOutcome``
+        out-param is load-bearing for the existing suite: ``test_steward.py``
+        drives a ``MagicMock`` queue whose ``resolve()`` returns a bare
+        ``MagicMock``, which the predicate's status membership test rejects, so
+        every one of those tests keeps today's behaviour unchanged.
+        ``test_steward_dismiss_race.py`` pins that as a behaviour of this
+        steward, not of ``unittest.mock``.
+
+        ``StewardMetrics`` is deliberately untouched on the race-lost path:
+        this steward did not resolve the escalation — it lost to the agent
+        session it had already given up on — so counting it as a handled
+        escalation would overstate what the steward did.
+        """
+        stored = self._dismiss_capped_l0(escalation, outcome.reason)
+
+        if stored is not None and _dismissal_was_overtaken(stored):
+            logger.warning(
+                f'Steward for task {self.task_id}: gave up on {escalation.id} '
+                f'({outcome.reason}) with WIP present, but an in-flight resolve '
+                f'had ALREADY closed the record (status={stored.status!r}, '
+                f'resolved_by={stored.resolved_by!r}) — the dismissal was an '
+                f'atomic no-op; publishing that resolution instead of a '
+                f'resume-plan interruption'
+            )
+            self._publish_outcome(
+                StewardResolved(
+                    resolution_text=stored.resolution or escalation.summary,
+                )
+            )
+            return
+
         logger.warning(
             f'Steward for task {self.task_id}: gave up on {escalation.id} '
-            f'({reason}) with WIP present — dismissed the L0 and published a '
-            f'resume-plan interruption (no L1 filed)'
+            f'({outcome.reason}) with WIP present — dismissed the L0 and '
+            f'published a resume-plan interruption (no L1 filed)'
         )
+        self._publish_outcome(outcome)
 
     # ------------------------------------------------------------------
     # Auto-escalation to level-1 (human)
@@ -1177,6 +1282,41 @@ class TaskSteward:
                 logger.warning(
                     f'Failed to patch steward metadata on {escalation_id}: {e}'
                 )
+
+
+def _dismissal_was_overtaken(stored: Escalation) -> bool:
+    """Did something OTHER than an automated dismissal close *stored* first?
+
+    The question :meth:`TaskSteward._give_up_with_wip` has to answer about the
+    record ``EscalationQueue.resolve`` handed back: did MY dismissal apply, or
+    did an in-flight ``resolve_issue`` from the killed agent session win the
+    atomic check-and-set?  The steward always dismisses with
+    ``resolved_by='auto-dismissed'``, so a terminal record attributed to
+    anything outside the ``'reaper-sweep'`` tier is one this steward did not
+    close — whichever terminal state the winner produced.
+
+    BOTH terminal states count.  A winning ``resolve_issue`` lands
+    ``'resolved'`` for ``resume``/``restart`` but ``'dismissed'`` for the
+    dismissing actions (``abandon`` / ``close_only``, ``server._DISMISS_ACTIONS``),
+    and the steward's own call was an atomic no-op either way — reading only
+    ``'resolved'`` would report a deliberate agent abandon as a steward
+    interruption and tell the workflow to resume the plan for it, the same
+    class of misreport task 4495 exists to fix, one door over.
+
+    ANOTHER automated sweep winning (``harness-orphan-reaper`` et al.) is
+    deliberately NOT a lost race: it closed the record the same way this
+    steward was about to, carrying no agent finding to publish.  The tier test
+    goes through ``escalation.classify`` rather than an inline
+    ``'auto-dismissed'`` literal so that membership stays single-sited (INV-5).
+
+    MagicMock-safe by construction, which is load-bearing for the ~150
+    ``test_steward.py`` cases whose mock queue returns a bare ``MagicMock``
+    from ``resolve()``: the status test is a membership check that a MagicMock
+    fails, and it short-circuits before the tier lookup ever sees one.
+    """
+    if stored.status not in ('resolved', 'dismissed'):
+        return False
+    return classify_resolver_tier(stored.resolved_by) != 'reaper-sweep'
 
 
 def _strip_hash_prefix(detail: str) -> str:

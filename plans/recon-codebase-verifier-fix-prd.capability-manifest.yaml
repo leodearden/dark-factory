@@ -1,0 +1,153 @@
+prd: plans/recon-codebase-verifier-fix-prd.md
+schema_version: 1
+tasks:
+- label: α
+  task_id: 4722
+  title: Thread per-task codebase root into CodebaseVerifier.verify + AgentLoop cwd;
+    fail-closed refusal
+  capabilities:
+  - name: caller-scope-available
+    binding: capability→producer (wired on main) — TargetedReconciliation.reconcile_task
+      builds ProjectScope(ProjectId, ProjectRoot) after require_project_root
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: pre-existing substrate; a regression gate on unowned substrate is the
+        false-FAIL shape (merge-worktree precedent)
+  - name: refusal-token-contract
+    binding: capability→producer — task α lands the contract-fixed literal (PRD §Contract,
+      D4)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: codebase_root_unresolved
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/
+      expect: present
+  - name: verifier-drops-global-root
+    binding: capability→producer — task α removes the global root read from verify.py
+      (PRD D3)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: explore_codebase_root
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/verify.py
+      expect: absent
+  - name: audited-agent-failed-path
+    binding: capability→producer (wired on main) — task 4343's verify|codebase outcome-row
+      contract carries failure_token
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: pre-existing substrate (task 4343, done, on main)
+- label: β
+  task_id: 4723
+  title: Verdict-specific memory templates + prompt hardening + contradicted → L1
+    escalation
+  capabilities:
+  - name: old-shared-template-retired
+    binding: capability→producer — task β replaces the shared template (PRD D7.1)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: Completed task '\{title\}'
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/targeted.py
+      expect: absent
+  - name: contradicted-files-l1-escalation
+    binding: capability→producer — task β files category risk_identified (existing
+      vocabulary, no enum-promotion trigger)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: risk_identified
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/targeted.py
+      expect: present
+  - name: escalation-substrate
+    binding: capability→producer (wired on main) — _sweep_escalate_l1 + _HAS_ESCALATION
+      guard, the production precedent
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: pre-existing substrate; β mirrors it
+  - name: no-status-mutation-on-verdict
+    binding: rejection-mechanism inverse — β adds no status write; alert-not-action
+      (INV-3, esc-3105-3)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: judged by β's tests, not mechanically greppable
+- label: γ
+  task_id: 4724
+  title: Correct the schema_salvaged docstring in shared/src/shared/cli_invoke.py
+  capabilities:
+  - name: false-claim-retired
+    binding: capability→producer — task γ retires the upstream ancestor of the refuted
+      claim
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: commonly ``error_max_turns`` paired
+      paths:
+      - shared/src/shared/cli_invoke.py
+      expect: absent
+- label: δ
+  task_id: 3241
+  title: 'ADOPTED existing task 3241: land branch task/3241 (_AGENT_CLI_MAX_TURNS
+    = 10)'
+  capabilities:
+  - name: per-invocation-cap-raised
+    binding: capability→producer — branch task/3241 tip 0c8459f273 defines and passes
+      the constant
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: max_turns=_AGENT_CLI_MAX_TURNS
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/agent_loop.py
+      expect: present
+  - name: unit-cap-call-site-gone
+    binding: capability→producer — call-site form only; the branch keeps 'max_turns=1
+      ->' in a measurement-table comment
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: max_turns=1,
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/agent_loop.py
+      expect: absent
+  - name: regression-test-pins-floor
+    binding: capability→producer — branch test asserts kwargs['max_turns'] >= 3; verified
+      to fail on revert
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: test property; the >= 3 invariant is the guard, not a grep
+  - name: branch-merges-clean
+    binding: measured 2026-08-24 — merge-tree rc=0, merge-result suite 461 passed;
+      re-check at landing
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: point-in-time measurement; main moves
+- label: ε
+  task_id: 4725
+  title: 'Soak gate: verify-census shows the verifier live and correctly scoped'
+  capabilities:
+  - name: census-instrument-exists
+    binding: capability→producer (wired on main) — task 4343's one-outcome-row-per-invocation
+      contract
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: pre-existing substrate (task 4343)
+  - name: census-moved
+    binding: premise achievable — probe mt=10 → 3/3 on CLI 2.1.241; 8 pre-regression
+      production verdict memories prove the end-to-end chain
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: operational ruling against the production DB; no success-rate assertion
+        (stochastic; 4344's residual unreproduced)

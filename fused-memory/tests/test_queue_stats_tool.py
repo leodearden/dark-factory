@@ -221,6 +221,104 @@ class TestGetQueueStatsReconciliationBacklog:
         assert 'reconciliation_backlog' not in result
 
 
+# ── task 3583 (b): per-operation dead breakdown on get_queue_stats ──────────
+
+
+class TestGetQueueStatsDeadByOperation:
+    """The tool must surface `dead_by_operation` — WHICH operation is dying.
+
+    The `durable_write_dead_letter` escalation is the push alarm; this is the
+    pull confirmation an operator or watcher probes. The tool assigns
+    `get_stats()`'s dict through verbatim (grafting only
+    `reconciliation_backlog` / `reconciliation_halt` on top), so this asserts
+    against a REAL queue: a mocked `get_stats` return would test only the
+    assignment, which already worked.
+    """
+
+    @pytest.mark.asyncio
+    async def test_dead_by_operation_on_per_project_and_global_calls(self, tmp_path):
+        """Both the scoped and the unscoped call carry the breakdown, and the
+        scoped one counts only its own project's deaths."""
+        execute = AsyncMock(side_effect=RuntimeError('fail'))
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=execute,
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=1,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+        )
+        await q.initialize()
+        try:
+            for i in range(2):
+                await q.enqueue(
+                    group_id='proj_a', operation='add_episode',
+                    payload={'content': f'a{i}', 'group_id': 'proj_a', 'name': f'a{i}'},
+                )
+            await q.enqueue(
+                group_id='proj_b', operation='add_memory_graphiti',
+                payload={'content': 'b0', 'group_id': 'proj_b'},
+            )
+            await _poll_until_dead(q, expected_dead=3)
+
+            svc = AsyncMock()
+            svc.durable_queue = q
+            server = create_mcp_server(svc)
+
+            stats_a = await server._tool_manager.call_tool(
+                'get_queue_stats', {'project_id': 'proj_a'},
+            )
+            stats_b = await server._tool_manager.call_tool(
+                'get_queue_stats', {'project_id': 'proj_b'},
+            )
+            stats_global = await server._tool_manager.call_tool('get_queue_stats', {})
+
+            assert stats_a['dead_by_operation'] == {'add_episode': 2}, (
+                f'got {stats_a.get("dead_by_operation")!r}'
+            )
+            assert stats_b['dead_by_operation'] == {'add_memory_graphiti': 1}, (
+                f'got {stats_b.get("dead_by_operation")!r}'
+            )
+            assert stats_global['dead_by_operation'] == {
+                'add_episode': 2,
+                'add_memory_graphiti': 1,
+            }, (
+                'the global call reports every project\'s deaths; got '
+                f'{stats_global.get("dead_by_operation")!r}'
+            )
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_dead_by_operation_present_and_empty_on_a_healthy_queue(self, tmp_path):
+        """A healthy queue reports `{}`, never omits the key — a watcher must
+        not have to tell "no deaths" apart from "an older server"."""
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(return_value={'ok': True}),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=1,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+        )
+        await q.initialize()
+        try:
+            svc = AsyncMock()
+            svc.durable_queue = q
+            server = create_mcp_server(svc)
+
+            result = await server._tool_manager.call_tool('get_queue_stats', {})
+
+            assert 'dead_by_operation' in result, (
+                f'key must always be present; got keys {sorted(result)}'
+            )
+            assert result['dead_by_operation'] == {}
+        finally:
+            await q.close()
+
+
 # ── unhalt_reconciliation auto-closes the halt escalation (task 2998) ───────
 
 

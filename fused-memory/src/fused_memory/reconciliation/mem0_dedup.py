@@ -70,6 +70,13 @@ async def find_prior_memories(
             project_id=project_id,
             categories=categories,
             limit=limit,
+            # OPT OUT of topic-anchored recall (task 3111).  This is an
+            # IDEMPOTENCY check whose window is post-filtered by task_id, so a
+            # prior record displaced out of it reads as "no prior memory" and
+            # the caller re-writes a duplicate recon record -- the exact
+            # failure this function exists to prevent.  The pin promotes rather
+            # than adds, so it can only ever cost this window a genuine hit.
+            anchor_topics=False,
         )
     except Exception as e:
         # Singular 'find_prior_memory' phrasing is the historical canonical grep term.  Both

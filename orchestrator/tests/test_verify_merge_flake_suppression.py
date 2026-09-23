@@ -17,8 +17,12 @@ monkeypatched so no real subprocess runs).
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.verify import VerifyResult
@@ -304,14 +308,24 @@ _B3_TEST_OUTPUT = 'ERROR orchestrator/tests/test_x.py\n'
 
 class TestConfirmMergeVerifyFlakeSuppressible:
     """confirm_merge_verify_flake_suppressible(config, failing_result, *,
-    worktree, module_configs) -> list[str] | None — the PURE gate (PRD task α).
+    worktree, module_configs) -> FlakeSuppression — the PURE gate (PRD task α,
+    widened by task ε).
 
     SAME-TREE (re-runs in the given merge worktree, no fresh probe worktree),
-    single-shot per node-id group, returns the suppressed node-ids on a
-    confirmed flake or None (fail-closed to red) otherwise. NEVER raises.
+    single-shot per node-id group. NEVER raises.
+
+    It now returns the discriminator's OBSERVATION unchanged instead of
+    collapsing it to `list[str] | None`. Every scenario below is the same one
+    it always was; what changes is that a non-suppressing outcome must now name
+    WHICH non-suppressing outcome it was — `fails_in_isolation` (a real red) vs
+    `unconfirmable` plus its reason (we could not tell). β deliberately
+    collapsed that distinction; ε is the first caller that needs it, because
+    the ledger row and θ's class-1 unconfirmable RATE are computed from it.
     """
 
     def _run(self, config, failing_result, worktree, module_configs):
+        """Returns a FlakeSuppression — ALWAYS, never None (the discriminator
+        is TOTAL, INV-2)."""
         from orchestrator.verify import confirm_merge_verify_flake_suppressible
 
         return asyncio.run(
@@ -320,13 +334,26 @@ class TestConfirmMergeVerifyFlakeSuppressible:
             )
         )
 
+    @staticmethod
+    def _assert_not_suppressing(s, verdict, *, reason=None):
+        """Shared shape for the fail-closed cases: not a suppression, and the
+        SPECIFIC verdict that says why."""
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        assert s.verdict is not FlakeVerdict.passes_in_isolation, s
+        assert s.verdict is verdict, s
+        if reason is not None:
+            assert s.unconfirmable_reason == reason, s
+
     # -- B1: suppress a confirmed flake -----------------------------------
 
     def test_b1_suppresses_when_isolated_rerun_passes(self, tmp_path: Path) -> None:
-        """FAILED + node-down node-ids both pass on isolated re-run -> returns
-        the extracted node-id list, and the isolated ModuleConfig carries the
-        serial + generous-timeout recovery command with null lint/type."""
+        """FAILED + node-down node-ids both pass on isolated re-run -> a
+        `passes_in_isolation` observation naming the extracted node-ids, and the
+        isolated ModuleConfig carries the serial + generous-timeout recovery
+        command with null lint/type."""
         from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
 
         _materialize(tmp_path, 'orchestrator/tests/test_x.py')
         config = _make_config(tmp_path)
@@ -339,7 +366,9 @@ class TestConfirmMergeVerifyFlakeSuppressible:
         with patch.object(verify_module, 'run_verification', rv):
             result = self._run(config, failing, tmp_path, [_orch_module_config()])
 
-        assert result == [_B1_FAILED_ID, _B1_CRASH_ID], result
+        assert result.verdict is FlakeVerdict.passes_in_isolation, result
+        assert list(result.test_ids) == [_B1_FAILED_ID, _B1_CRASH_ID], result
+        assert result.unconfirmable_reason is None, result
 
         rv.assert_awaited()
         # The isolated re-run's ModuleConfig: serial + generous timeout, null gates.
@@ -357,8 +386,11 @@ class TestConfirmMergeVerifyFlakeSuppressible:
     # -- B2: never mask a still-real red ----------------------------------
 
     def test_b2_no_suppress_when_isolated_rerun_still_fails(self, tmp_path: Path) -> None:
-        """The isolated re-run still FAILS -> None (merge stays red)."""
+        """The isolated re-run still FAILS -> `fails_in_isolation` (merge stays
+        red). A REAL red, not "we could not tell" — the distinction θ's class-1
+        rate divides by."""
         from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
 
         _materialize(tmp_path, 'orchestrator/tests/test_x.py')
         config = _make_config(tmp_path)
@@ -371,15 +403,16 @@ class TestConfirmMergeVerifyFlakeSuppressible:
         with patch.object(verify_module, 'run_verification', rv):
             result = self._run(config, failing, tmp_path, [_orch_module_config()])
 
-        assert result is None
+        self._assert_not_suppressing(result, FlakeVerdict.fails_in_isolation)
         rv.assert_awaited()
 
     # -- B3: whole-file collection error re-errors -> not suppressed ------
 
     def test_b3_collection_error_not_suppressed(self, tmp_path: Path) -> None:
         """A bare `ERROR file.py` collection error yields a whole-file target;
-        the isolated re-run re-errors (not passed) -> None."""
+        the isolated re-run re-errors (not passed) -> `fails_in_isolation`."""
         from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
 
         _materialize(tmp_path, 'orchestrator/tests/test_x.py')
         config = _make_config(tmp_path)
@@ -392,14 +425,19 @@ class TestConfirmMergeVerifyFlakeSuppressible:
         with patch.object(verify_module, 'run_verification', rv):
             result = self._run(config, failing, tmp_path, [_orch_module_config()])
 
-        assert result is None
+        self._assert_not_suppressing(result, FlakeVerdict.fails_in_isolation)
 
     # -- fail-closed: no recoverable node-id, no re-run at all -------------
 
-    def test_no_node_id_returns_none_without_rerun(self, tmp_path: Path) -> None:
-        """Opaque/lint/type failure output (no pytest node-id) -> None WITHOUT
-        calling run_verification (cheap early-out, fail-closed to red)."""
+    def test_no_node_id_is_unconfirmable_without_rerun(self, tmp_path: Path) -> None:
+        """Opaque/lint/type failure output (no pytest node-id) -> `unconfirmable`
+        WITHOUT calling run_verification (cheap early-out, fail-closed to red).
+
+        NOT `fails_in_isolation`: nothing was re-run, so this is "we could not
+        tell", and reporting it as a red would launder a gate-blind case into a
+        verdict about the code."""
         from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
 
         config = _make_config(tmp_path)
         failing = VerifyResult(
@@ -412,15 +450,21 @@ class TestConfirmMergeVerifyFlakeSuppressible:
         with patch.object(verify_module, 'run_verification', rv):
             result = self._run(config, failing, tmp_path, [_orch_module_config()])
 
-        assert result is None
+        self._assert_not_suppressing(
+            result, FlakeVerdict.unconfirmable, reason='no_recoverable_node_ids',
+        )
+        assert result.test_ids == (), result
         rv.assert_not_awaited()
 
     # -- fail-closed: node-id maps to no subproject -----------------------
 
-    def test_unmapped_node_id_returns_none(self, tmp_path: Path) -> None:
-        """A node-id whose file exists under no given subproject -> None.
-        (No file materialized on disk -> the existence mapping fails.)"""
+    def test_unmapped_node_id_is_unconfirmable(self, tmp_path: Path) -> None:
+        """A node-id whose file exists under no given subproject ->
+        `unconfirmable`, and the examined node-ids ARE named (PRD B6 — we know
+        exactly which tests we could not place). (No file materialized on disk
+        -> the existence mapping fails.)"""
         from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
 
         config = _make_config(tmp_path)
         failing = VerifyResult(
@@ -432,14 +476,21 @@ class TestConfirmMergeVerifyFlakeSuppressible:
         with patch.object(verify_module, 'run_verification', rv):
             result = self._run(config, failing, tmp_path, [_orch_module_config()])
 
-        assert result is None
+        self._assert_not_suppressing(
+            result, FlakeVerdict.unconfirmable,
+            reason='node_ids_unmapped_to_subproject',
+        )
+        assert list(result.test_ids) == ['some/other/tests/test_q.py::test_z'], result
 
     # -- fail-closed: infra-sentinel re-run is never trusted --------------
 
-    def test_infra_transient_rerun_category_returns_none(self, tmp_path: Path) -> None:
+    def test_infra_transient_rerun_category_is_unconfirmable(self, tmp_path: Path) -> None:
         """An isolated re-run whose category is in INFRA_TRANSIENT_CATEGORIES
-        is never trusted as confirmation, even paired with passed=True -> None."""
+        is never trusted as confirmation, even paired with passed=True ->
+        `unconfirmable`, with the sentinel category named in the reason so θ can
+        tell an infra-blind gate from a genuinely red one."""
         from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
 
         _materialize(tmp_path, 'orchestrator/tests/test_x.py')
         config = _make_config(tmp_path)
@@ -452,7 +503,10 @@ class TestConfirmMergeVerifyFlakeSuppressible:
         with patch.object(verify_module, 'run_verification', rv):
             result = self._run(config, failing, tmp_path, [_orch_module_config()])
 
-        assert result is None
+        self._assert_not_suppressing(
+            result, FlakeVerdict.unconfirmable,
+            reason='infra_transient_rerun:pytest_internalerror',
+        )
 
     # -- task-3290: node-id -> subproject mapping DELEGATES to the shared
     # -- helper (_group_node_ids_by_subproject), plus the characterization
@@ -516,19 +570,23 @@ class TestConfirmMergeVerifyFlakeSuppressible:
             call.kwargs
         )
         # The helper's groups drive the re-run, which confirms green -> suppress.
-        assert result == [_B1_FAILED_ID, _B1_CRASH_ID], result
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        assert result.verdict is FlakeVerdict.passes_in_isolation, result
+        assert list(result.test_ids) == [_B1_FAILED_ID, _B1_CRASH_ID], result
 
     def test_helper_returning_none_fails_closed_without_rerunning(
         self, tmp_path: Path
     ) -> None:
         """`None` from the helper (an unmappable node-id) fails CLOSED to red
         end-to-end THROUGH the delegation boundary: no isolated re-run is
-        attempted and the gate returns None.
+        attempted and the gate reports `unconfirmable`, never a suppression.
 
         RED today: the inline copy ignores the spy and maps the materialized
         file successfully, so the gate re-runs and suppresses.
         """
         from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
 
         _materialize(tmp_path, 'orchestrator/tests/test_x.py')
         config = _make_config(tmp_path)
@@ -541,7 +599,10 @@ class TestConfirmMergeVerifyFlakeSuppressible:
         ):
             result = self._run(config, self._b1_failing(), tmp_path, [_orch_module_config()])
 
-        assert result is None, f'Expected None (fail-closed to red), got {result!r}'
+        self._assert_not_suppressing(
+            result, FlakeVerdict.unconfirmable,
+            reason='node_ids_unmapped_to_subproject',
+        )
         rv.assert_not_awaited()
 
     def test_helper_returning_empty_dict_fails_closed(self, tmp_path: Path) -> None:
@@ -566,6 +627,7 @@ class TestConfirmMergeVerifyFlakeSuppressible:
         RED today: no such guard exists (the inline loop cannot produce {}).
         """
         from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
 
         _materialize(tmp_path, 'orchestrator/tests/test_x.py')
         config = _make_config(tmp_path)
@@ -578,9 +640,13 @@ class TestConfirmMergeVerifyFlakeSuppressible:
         ):
             result = self._run(config, self._b1_failing(), tmp_path, [_orch_module_config()])
 
-        assert result is None, (
-            f'Expected None: an empty group dict is zero evidence, not '
-            f'"all groups clean" — got {result!r}'
+        assert result.verdict is not FlakeVerdict.passes_in_isolation, (
+            f'an empty group dict is zero evidence, not "all groups clean" — '
+            f'got {result!r}'
+        )
+        self._assert_not_suppressing(
+            result, FlakeVerdict.unconfirmable,
+            reason='node_ids_unmapped_to_subproject',
         )
         rv.assert_not_awaited()
 
@@ -615,7 +681,10 @@ class TestConfirmMergeVerifyFlakeSuppressible:
                 config, failing, tmp_path, [_module_config('alpha'), _module_config('beta')],
             )
 
-        assert result == ['tests/test_dup.py::test_dup'], result
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        assert result.verdict is FlakeVerdict.passes_in_isolation, result
+        assert list(result.test_ids) == ['tests/test_dup.py::test_dup'], result
         rv.assert_awaited()
         cmd = rv.call_args.args[2].test_command
         assert 'alpha/tests/test_dup.py::test_dup' in cmd, (
@@ -662,7 +731,12 @@ class TestConfirmMergeVerifyFlakeSuppressible:
         ):
             result = self._run(config, failing, tmp_path, [_orch_module_config()])
 
-        assert result is None
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        self._assert_not_suppressing(
+            result, FlakeVerdict.unconfirmable,
+            reason='node_ids_unmapped_to_subproject',
+        )
         rendered = [_fmt_log(call) for call in mock_logger.info.call_args_list]
         logged = any(
             'not suppressing' in msg and 'some/other/tests/test_q.py::test_z' in msg
@@ -676,18 +750,26 @@ class TestConfirmMergeVerifyFlakeSuppressible:
 
 class TestApplyMergeFlakeSuppression:
     """apply_merge_flake_suppression(failing_result, *, worktree, config,
-    module_configs, merge_sha, event_store=None, escalation_queue=None,
-    task_id=None, _confirm=...) — the merge-verify result handler (PRD task α).
+    module_configs, _confirm=...) — the merge gate's result handler, now a PURE
+    ATTACH (task ε).
 
-    On a confirmed flake: emits the merge_flake_suppressed fact, bumps the
-    storm streak, and returns a PASSED VerifyResult (category
-    'merge_flake_suppressed') so the merge proceeds into the unscoped gate.
-    On a non-confirmation: returns the ORIGINAL failing result unchanged, with
-    no fact and no streak bump.
+    It OBSERVES and ATTACHES; it does not record. On `passes_in_isolation` it
+    shapes the suppressed PASS (category 'merge_flake_suppressed') so the merge
+    proceeds into the unscoped gate; on every other verdict it returns the
+    failing result. On BOTH branches it attaches the discriminator's
+    FlakeSuppression to the returned VerifyResult, which carries it to the
+    DISPATCHER — the only scope that has event_store, escalation_queue,
+    project_root, merge_sha and task_id at once (PRD §5.8).
+
+    The side-effects that used to happen here — the merge_flake_suppressed
+    emit and the INV-4 storm-streak bump — are GONE from this function. They
+    ran on whatever host executed the gate, which on the remote path is a host
+    with no event store and a private copy of the streak counter: the fact was
+    dropped and the storm detector silently disarmed exactly where load is
+    highest.
     """
 
-    def _apply(self, failing, tmp_path, *, confirm, event_store=None,
-               escalation_queue=None, task_id='2768'):
+    def _apply(self, failing, tmp_path, *, confirm):
         from orchestrator import verify as verify_module
 
         return asyncio.run(
@@ -696,67 +778,219 @@ class TestApplyMergeFlakeSuppression:
                 worktree=tmp_path,
                 config=_make_config(tmp_path),
                 module_configs=[_orch_module_config()],
-                merge_sha=_MERGE_SHA,
-                event_store=event_store,
-                escalation_queue=escalation_queue,
-                task_id=task_id,
                 _confirm=confirm,
             )
         )
 
-    def test_b1_suppression_returns_passed_result_and_emits_fact(self, tmp_path: Path) -> None:
-        from orchestrator.event_store import EventType
+    @staticmethod
+    def _confirming(verdict, *, test_ids=None, reason=None):
+        """An injected _confirm returning a real FlakeSuppression."""
+        from orchestrator.flake_ledger import FlakeCallSite, FlakeSuppression
+
+        s = FlakeSuppression(
+            verdict=verdict,
+            test_ids=tuple(_SUPPRESSED_IDS if test_ids is None else test_ids),
+            observed_at='2026-08-06T12:00:00+00:00',
+            call_site=FlakeCallSite.merge_gate,
+            runner='local',
+            psi_cpu_some10=41.5,
+            unconfirmable_reason=reason,
+        )
+        return s, AsyncMock(return_value=s)
+
+    # -- (a) passes_in_isolation: suppressed pass, carrying the observation --
+
+    def test_suppression_returns_passed_result_carrying_the_observation(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.flake_ledger import FlakeVerdict
 
         failing = _failing_with_logs()
-        confirm = AsyncMock(return_value=list(_SUPPRESSED_IDS))
-        es = _FakeEventStore()
+        s, confirm = self._confirming(FlakeVerdict.passes_in_isolation)
 
-        result = self._apply(failing, tmp_path, confirm=confirm, event_store=es)
+        result = self._apply(failing, tmp_path, confirm=confirm)
 
-        # Suppressed -> a PASSED result with the sentinel category.
         assert result.passed is True
         assert result.timed_out is False
         assert result.category == 'merge_flake_suppressed'
         # replace() preserves the original log paths (durable evidence).
         assert result.worktree_log_paths == ['/wt/verify.log']
         assert result.archive_log_paths == ['/archive/verify.log']
+        # The EXACT object, not a copy: the recorder needs observed_at / psi /
+        # runner, and re-deriving any of them downstream would be a second,
+        # divergent observation.
+        assert result.flake_suppression is s
 
-        # Exactly one structured fact, carrying the suppressed ids + sha + when.
-        assert len(es.emits) == 1
-        event_type, task_id, data = es.emits[0]
-        assert event_type == EventType.merge_flake_suppressed
-        assert task_id == '2768'
-        assert data['node_ids'] == _SUPPRESSED_IDS
-        assert data['merge_sha'] == _MERGE_SHA
-        assert data['measured_at']  # non-empty ISO timestamp
+    # -- (b) fails_in_isolation: still red, still carrying the observation ---
 
-    def test_b2_no_suppression_returns_original_unchanged_no_emit(self, tmp_path: Path) -> None:
+    def test_non_suppression_returns_a_still_failing_result_carrying_the_verdict(
+        self, tmp_path: Path,
+    ) -> None:
+        """§5.5 records the OBSERVATION, not the remedy: a confirmed REAL red is
+        an observation the ledger wants too, so it rides along on the failing
+        result rather than being dropped."""
+        from orchestrator.flake_ledger import FlakeVerdict
+
         failing = _failing_with_logs()
-        confirm = AsyncMock(return_value=None)
-        es = _FakeEventStore()
+        s, confirm = self._confirming(FlakeVerdict.fails_in_isolation)
 
-        result = self._apply(failing, tmp_path, confirm=confirm, event_store=es)
+        result = self._apply(failing, tmp_path, confirm=confirm)
 
-        # The SAME object is returned unchanged (merge stays red).
-        assert result is failing
         assert result.passed is False
-        assert es.emits == []
+        # EQUAL to the input, not identical: attaching a field means a new
+        # object, and `compare=False` on flake_suppression is what keeps the
+        # equality (and test_cli's wrapper-transparency invariant) intact.
+        assert result == failing
+        assert result.flake_suppression is not None
+        assert result.flake_suppression is s
+        assert result.flake_suppression.verdict is FlakeVerdict.fails_in_isolation
 
-    def test_suppression_tolerates_none_event_store(self, tmp_path: Path) -> None:
-        """A suppression with event_store=None must not crash (None-safe emit)."""
+    # -- (c) unconfirmable: same, and the reason survives --------------------
+
+    def test_unconfirmable_carries_its_reason_onto_the_failing_result(
+        self, tmp_path: Path,
+    ) -> None:
+        """θ's class-1 health check is an unconfirmable RATE, so the reason must
+        reach the recorder — this is the field that says WHY the gate was
+        blind."""
+        from orchestrator.flake_ledger import FlakeVerdict
+
         failing = _failing_with_logs()
-        confirm = AsyncMock(return_value=list(_SUPPRESSED_IDS))
+        s, confirm = self._confirming(
+            FlakeVerdict.unconfirmable,
+            test_ids=(),
+            reason='node_ids_unmapped_to_subproject',
+        )
 
-        result = self._apply(failing, tmp_path, confirm=confirm, event_store=None)
+        result = self._apply(failing, tmp_path, confirm=confirm)
 
-        assert result.passed is True
-        assert result.category == 'merge_flake_suppressed'
+        assert result.passed is False
+        assert result == failing
+        assert result.flake_suppression is not None
+        assert result.flake_suppression is s
+        assert (
+            result.flake_suppression.unconfirmable_reason
+            == 'node_ids_unmapped_to_subproject'
+        )
+
+    # -- (d) NO side effects at all -----------------------------------------
+
+    @pytest.mark.parametrize(
+        'verdict_name',
+        ['passes_in_isolation', 'fails_in_isolation', 'unconfirmable'],
+    )
+    def test_performs_no_side_effects_on_any_verdict(
+        self, tmp_path: Path, verdict_name,
+    ) -> None:
+        """The purity fence, mirroring TestConfirmIsolatedRerunVerdictIsPure.
+
+        No emit, no escalation, no streak bump — on ANY verdict. The stores are
+        constructed and deliberately NOT passable (the parameters are gone), so
+        this pins the ABSENCE structurally rather than by inspection.
+
+        The streak global is read off `flake_recorder`, its owner after task ε —
+        the producer must not touch the recorder's state any more than it touches
+        the stores.
+        """
+        from orchestrator import flake_recorder
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        flake_recorder._merge_flake_suppression_streak = 0
+        es = _FakeEventStore()
+        q = _FakeEscalationQueue()
+        _s, confirm = self._confirming(FlakeVerdict[verdict_name])
+
+        self._apply(_failing_with_logs(), tmp_path, confirm=confirm)
+
+        assert es.emits == [], es.emits
+        assert q.submitted == [], q.submitted
+        assert flake_recorder._merge_flake_suppression_streak == 0
+
+    # -- (e) the recording parameters are GONE from the signature ------------
+
+    @pytest.mark.parametrize(
+        'gone_kwarg',
+        [
+            {'event_store': None},
+            {'escalation_queue': None},
+            {'merge_sha': _MERGE_SHA},
+            {'task_id': '2768'},
+        ],
+        ids=['event_store', 'escalation_queue', 'merge_sha', 'task_id'],
+    )
+    def test_recording_parameters_are_rejected(self, tmp_path: Path, gone_kwarg) -> None:
+        """STRUCTURAL: a future re-wiring of the side-effects back into the
+        producer would have to re-add one of these, and this catches it. The
+        producer runs wherever the worktree is — a host that on the remote path
+        has neither store."""
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        _s, confirm = self._confirming(FlakeVerdict.passes_in_isolation)
+        with pytest.raises(TypeError):
+            asyncio.run(
+                verify_module.apply_merge_flake_suppression(
+                    _failing_with_logs(),
+                    worktree=tmp_path,
+                    config=_make_config(tmp_path),
+                    module_configs=[_orch_module_config()],
+                    _confirm=confirm,
+                    **gone_kwarg,
+                )
+            )
+
+    # -- (f) the never-raise guard covers BOTH branches ----------------------
+
+    @pytest.mark.parametrize(
+        'verdict_name',
+        ['passes_in_isolation', 'fails_in_isolation', 'unconfirmable'],
+        ids=['suppressed_branch', 'failing_branch', 'unconfirmable_branch'],
+    )
+    def test_a_non_dataclass_result_degrades_loudly_on_every_branch(
+        self, tmp_path: Path, caplog, verdict_name,
+    ) -> None:
+        """The never-raise contract, actually exercised — and on EVERY branch.
+
+        ``dataclasses.replace`` raises ``TypeError`` on a non-dataclass, and BOTH
+        branches reach it: the suppressed one through
+        ``_merge_flake_suppressed_pass``, the other directly.  The guard originally
+        sat only on the second, so the exact input it defended against still raised
+        one branch over — a bookkeeping crash swallowing a real verdict, on a merge
+        path with no ``VerifyInfraError`` handler.  Parametrised over all three
+        verdicts so a future re-split of the branches cannot re-open the hole.
+
+        The verdict is returned UNCHANGED (never a suppressed pass — fail-closed on
+        a shape we do not understand) and the loss is LOUD.
+        """
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        class _NotADataclass:
+            """A Protocol-conformant stand-in: enough surface to be used as a
+            result, but nothing ``replace`` can copy."""
+
+            passed = False
+            category = 'test_failure'
+            flake_suppression = None
+
+        not_a_result = _NotADataclass()
+        _s, confirm = self._confirming(FlakeVerdict[verdict_name])
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            result = self._apply(not_a_result, tmp_path, confirm=confirm)
+
+        assert result is not_a_result, 'the caller keeps its own verdict'
+        assert 'not a VerifyResult dataclass' in caplog.text, caplog.text
+
+    # -- (g) the injected gate's call shape is unchanged ---------------------
 
     def test_confirm_called_with_config_and_failing_and_worktree(self, tmp_path: Path) -> None:
-        """The injected _confirm receives (config, failing_result) positionally
-        and worktree/module_configs as kwargs (the pure-gate contract)."""
+        """The injected _confirm still receives (config, failing_result)
+        positionally and worktree/module_configs as kwargs (the pure-gate
+        contract)."""
+        from orchestrator.flake_ledger import FlakeVerdict
+
         failing = _failing_with_logs()
-        confirm = AsyncMock(return_value=None)
+        _s, confirm = self._confirming(FlakeVerdict.fails_in_isolation)
 
         self._apply(failing, tmp_path, confirm=confirm)
 
@@ -764,89 +998,6 @@ class TestApplyMergeFlakeSuppression:
         assert confirm.call_args.args[1] is failing
         assert confirm.call_args.kwargs['worktree'] == tmp_path
         assert 'module_configs' in confirm.call_args.kwargs
-
-
-class TestSuppressionStormStreak:
-    """INV-4 storm detector: _bump_suppression_streak_and_maybe_escalate files
-    exactly ONE born-at-L2 escalation once the module-global suppression streak
-    reaches the threshold, then resets. Only suppressions bump it (task α, B4).
-    """
-
-    def _reset(self):
-        from orchestrator import verify as verify_module
-
-        verify_module._merge_flake_suppression_streak = 0
-        return verify_module
-
-    def test_storm_files_one_l2_escalation_at_threshold_and_resets(self) -> None:
-        vm = self._reset()
-        threshold = vm._MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD
-        q = _FakeEscalationQueue(open_l2=None)
-
-        for _ in range(threshold):
-            vm._bump_suppression_streak_and_maybe_escalate(q, '2768', _MERGE_SHA)
-
-        assert len(q.submitted) == 1, q.submitted
-        esc = q.submitted[0]
-        assert esc.level == 2
-        assert esc.severity == 'critical'
-        assert esc.agent_role.startswith('orchestrator-')
-        assert esc.category == 'merge_flake_suppression_storm'
-        # Counter cleared so the next window starts fresh (B4).
-        assert vm._merge_flake_suppression_streak == 0
-
-    def test_below_threshold_files_nothing(self) -> None:
-        vm = self._reset()
-        threshold = vm._MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD
-        q = _FakeEscalationQueue(open_l2=None)
-
-        for _ in range(threshold - 1):
-            vm._bump_suppression_streak_and_maybe_escalate(q, '2768', _MERGE_SHA)
-
-        assert q.submitted == []
-        assert vm._merge_flake_suppression_streak == threshold - 1
-
-    def test_dedup_skips_submit_when_open_l2_exists(self) -> None:
-        vm = self._reset()
-        threshold = vm._MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD
-        q = _FakeEscalationQueue(open_l2=object())  # a truthy open L2
-
-        for _ in range(threshold):
-            vm._bump_suppression_streak_and_maybe_escalate(q, '2768', _MERGE_SHA)
-
-        assert q.submitted == []
-        # get_by_task consulted for dedup on the same sentinel, at level=2.
-        assert q.get_by_task_calls, q.get_by_task_calls
-        assert q.get_by_task_calls[-1][2] == 2
-        assert vm._merge_flake_suppression_streak == 0
-
-    def test_none_queue_is_tolerated(self) -> None:
-        vm = self._reset()
-        threshold = vm._MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD
-
-        for _ in range(threshold):
-            vm._bump_suppression_streak_and_maybe_escalate(None, '2768', _MERGE_SHA)
-
-        # No crash; window resets without filing (no queue to file into).
-        assert vm._merge_flake_suppression_streak == 0
-
-    def test_non_suppression_does_not_bump_streak(self, tmp_path: Path) -> None:
-        vm = self._reset()
-        confirm = AsyncMock(return_value=None)
-
-        asyncio.run(
-            vm.apply_merge_flake_suppression(
-                _failing_with_logs(),
-                worktree=tmp_path,
-                config=_make_config(tmp_path),
-                module_configs=[_orch_module_config()],
-                merge_sha=_MERGE_SHA,
-                escalation_queue=_FakeEscalationQueue(),
-                _confirm=confirm,
-            )
-        )
-
-        assert vm._merge_flake_suppression_streak == 0
 
 
 # --- LocalRunner.run_merge_verify integration (step-9/10) ---------------------
@@ -885,10 +1036,12 @@ def _make_hook_runner(
     scoped_result: VerifyResult,
     unscoped_gate: MagicMock | None = None,
     event_store=None,
-    escalation_queue=None,
 ) -> tuple[LocalRunner, AsyncMock, AsyncMock]:
     """A LocalRunner whose scoped phase fails (so the α hook fires), with a
-    fake unscoped gate + optional event_store / escalation_queue threaded in.
+    fake unscoped gate + optional event_store threaded in.
+
+    No ``escalation_queue``: task ε removed it from LocalRunner, because the
+    only thing it fed — the storm-streak bump — now happens on the dispatcher.
     """
     run_scoped = AsyncMock(return_value=scoped_result)
     run_unscoped = AsyncMock(
@@ -903,7 +1056,6 @@ def _make_hook_runner(
         run_unscoped=run_unscoped,
         task_id='2768',
         event_store=event_store,
-        escalation_queue=escalation_queue,
     )
     return runner, run_scoped, run_unscoped
 
@@ -956,6 +1108,66 @@ class TestLocalRunnerMergeFlakeSuppressionHook:
         assert result.passed is False
         assert result.category == UNSCOPED_TYPECHECK_FAILED_CATEGORY
 
+    # -- the suppression must SURVIVE an independent unscoped-gate red -----
+
+    def test_suppression_survives_a_broken_unscoped_gate(self, tmp_path: Path) -> None:
+        """A suppressed scoped red followed by a BROKEN unscoped typecheck gate
+        must still carry the observation to the dispatcher.
+
+        run_merge_verify constructs a FRESH VerifyResult on the gate.broken
+        branch, which would drop the field — and that would silently REGRESS an
+        emission that happens today, since before task ε the suppression had
+        already emitted inline by this point. It is also the compound failure
+        most likely to occur under load, so dropping it here would under-count
+        the ledger and disarm the INV-4 streak exactly when it matters most.
+        """
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+        from orchestrator.verify_runner import UNSCOPED_TYPECHECK_FAILED_CATEGORY
+
+        s, _confirm = TestApplyMergeFlakeSuppression._confirming(
+            FlakeVerdict.passes_in_isolation,
+        )
+        suppressed = _result(True, category='merge_flake_suppressed')
+        suppressed = dataclasses.replace(suppressed, flake_suppression=s)
+
+        runner, _run_scoped, run_unscoped = _make_hook_runner(
+            tmp_path, scoped_result=_result(False), unscoped_gate=_broken_unscoped_gate(),
+        )
+        apply = AsyncMock(return_value=suppressed)
+
+        with patch.object(verify_module, 'apply_merge_flake_suppression', apply):
+            result = asyncio.run(runner.run_merge_verify(_MERGE_VERIFY_SHA, _merge_spec()))
+
+        run_unscoped.assert_awaited_once()
+        assert result.passed is False
+        assert result.category == UNSCOPED_TYPECHECK_FAILED_CATEGORY
+        assert result.flake_suppression is s, result
+
+    def test_suppression_survives_a_clean_unscoped_gate(self, tmp_path: Path) -> None:
+        """The mirrored positive: the ordinary suppressed pass carries it too."""
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        s, _confirm = TestApplyMergeFlakeSuppression._confirming(
+            FlakeVerdict.passes_in_isolation,
+        )
+        suppressed = dataclasses.replace(
+            _result(True, category='merge_flake_suppressed'), flake_suppression=s,
+        )
+
+        runner, _run_scoped, _run_unscoped = _make_hook_runner(
+            tmp_path, scoped_result=_result(False),
+        )
+        apply = AsyncMock(return_value=suppressed)
+
+        with patch.object(verify_module, 'apply_merge_flake_suppression', apply):
+            result = asyncio.run(runner.run_merge_verify(_MERGE_VERIFY_SHA, _merge_spec()))
+
+        assert result.passed is True
+        assert result.category == 'merge_flake_suppressed'
+        assert result.flake_suppression is s, result
+
     # -- (b) non-suppression is byte-identical to today's short-circuit ----
 
     def test_non_suppression_returns_failing_and_skips_unscoped(self, tmp_path: Path) -> None:
@@ -995,18 +1207,24 @@ class TestLocalRunnerMergeFlakeSuppressionHook:
         run_unscoped.assert_awaited_once()
         assert result.passed is True
 
-    # -- (c) event_store/escalation_queue thread into the hook call --------
+    # -- (c) the hook call is NARROWED to the four producer arguments -------
 
-    def test_init_threads_event_store_and_escalation_queue_into_hook(self, tmp_path: Path) -> None:
-        """LocalRunner.__init__ accepts event_store=/escalation_queue= and passes
-        them (plus worktree/config/module_configs/merge_sha/task_id) to the hook."""
+    def test_hook_receives_only_the_producer_arguments(self, tmp_path: Path) -> None:
+        """The hook gets what the OBSERVATION needs and nothing the RECORDING
+        needs: worktree/config/module_configs only.
+
+        event_store, escalation_queue, merge_sha and task_id are deliberately
+        NOT threaded here — LocalRunner runs wherever the worktree is, and on
+        the CLI/remote path that host has no event store and a private copy of
+        the streak counter. Passing them here is what made the remote path drop
+        the fact and silently disarm the INV-4 detector.
+        """
         from orchestrator import verify as verify_module
 
         es = _FakeEventStore()
-        eq = _FakeEscalationQueue()
         failing = _result(False)
         runner, _run_scoped, _run_unscoped = _make_hook_runner(
-            tmp_path, scoped_result=failing, event_store=es, escalation_queue=eq,
+            tmp_path, scoped_result=failing, event_store=es,
         )
         apply = AsyncMock(side_effect=lambda fr, **kw: fr)
 
@@ -1017,23 +1235,43 @@ class TestLocalRunnerMergeFlakeSuppressionHook:
         # The failing scoped result is passed positionally as the first arg.
         assert apply.call_args.args[0] is failing
         kwargs = apply.call_args.kwargs
-        assert kwargs['event_store'] is es
-        assert kwargs['escalation_queue'] is eq
         assert kwargs['worktree'] == tmp_path
-        assert kwargs['merge_sha'] == _MERGE_VERIFY_SHA
-        assert kwargs['task_id'] == '2768'
         assert kwargs['module_configs'] == [_orch_module_config()]
         assert 'config' in kwargs
+        for gone in ('event_store', 'escalation_queue', 'merge_sha', 'task_id'):
+            assert gone not in kwargs, (gone, kwargs)
 
-    def test_init_defaults_event_store_and_escalation_queue_to_none(self, tmp_path: Path) -> None:
-        """Omitting event_store/escalation_queue defaults both to None and
-        threads None into the hook (byte-identical CLI/test construction)."""
+    def test_local_runner_no_longer_accepts_an_escalation_queue(self, tmp_path: Path) -> None:
+        """STRUCTURAL: the parameter fed only the storm-streak bump, which moved
+        to the dispatcher — leaving it would invite re-wiring the side-effect
+        back onto the host that cannot perform it."""
+        with pytest.raises(TypeError):
+            LocalRunner(
+                merge_wt=tmp_path,
+                config=_make_config(tmp_path),
+                module_configs=[_orch_module_config()],
+                task_files=None,
+                run_scoped=AsyncMock(return_value=_result(False)),
+                run_unscoped=AsyncMock(return_value=_clean_unscoped_gate()),
+                task_id='2768',
+                # pyright agreeing the parameter is gone IS the static half of
+                # this assertion; the raises() below is the runtime half.
+                escalation_queue=_FakeEscalationQueue(),  # type: ignore[reportCallIssue]
+            )
+
+    def test_init_defaults_event_store_to_none_and_still_runs_the_gate(
+        self, tmp_path: Path,
+    ) -> None:
+        """Omitting event_store defaults it to None and the suppression gate
+        still runs — a LocalRunner with no stores at all (the CLI / remote
+        in-worktree construction) is now the NORMAL case, not a degraded one,
+        because the gate no longer needs a store to do its job."""
         from orchestrator import verify as verify_module
 
         failing = _result(False)
         run_scoped = AsyncMock(return_value=failing)
         run_unscoped = AsyncMock(return_value=_clean_unscoped_gate())
-        # Construct WITHOUT event_store/escalation_queue (default None).
+        # Construct WITHOUT event_store (defaults to None).
         runner = LocalRunner(
             merge_wt=tmp_path,
             config=_make_config(tmp_path),
@@ -1048,6 +1286,7 @@ class TestLocalRunnerMergeFlakeSuppressionHook:
         with patch.object(verify_module, 'apply_merge_flake_suppression', apply):
             asyncio.run(runner.run_merge_verify(_MERGE_VERIFY_SHA, _merge_spec()))
 
+        apply.assert_awaited_once()
         kwargs = apply.call_args.kwargs
-        assert kwargs['event_store'] is None
-        assert kwargs['escalation_queue'] is None
+        assert 'event_store' not in kwargs, kwargs
+        assert 'escalation_queue' not in kwargs, kwargs

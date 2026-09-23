@@ -284,6 +284,17 @@ class TestCrossAccountResume:
             oauth_token=token,
             **_INVOKE_DEFAULTS,
         )
+        # Same capacity guard as every other success-asserting test in this
+        # class.  This one was the lone omission, and it went red for real on
+        # 2026-08-26 (task 3517 verify): account A answered
+        # "You've hit your weekly limit · resets Aug 28, 1pm (Europe/London)"
+        # with api_error_status=429, which says nothing about whether a healthy
+        # invocation returns a session_id — the property under test.  The guard
+        # must precede BOTH asserts: a capped call is not a meaningful sample
+        # for session_id either, even though that assert happened to hold in
+        # the observed transcript.
+        if not result.success and result_looks_like_capacity_failure(result):
+            pytest.skip(f'Capacity failure: {result.output!r}')
         assert result.session_id, f'Expected session_id, got: {result.session_id!r}'
         assert result.success
 

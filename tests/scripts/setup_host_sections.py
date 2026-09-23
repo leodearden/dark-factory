@@ -16,7 +16,8 @@ verbatim, to run in a hermetic tmp tree.
 Endpoints are DERIVED from markers, never pinned line numbers, so a slice
 follows a reflow of its block instead of silently shifting off it.
 
-MARKERS ARE CODE, NOT COMMENT PROSE. Each parity block hoists a uniquely-named
+MARKERS ARE CODE, NOT COMMENT PROSE — enforced, not merely stated: every
+marker is located on a non-comment line. Each parity block hoists a uniquely-named
 `_<gate>_parity_script="$REPO_ROOT/scripts/check_<x>_unit_parity.py"`
 assignment at its top, and that line is the anchor. Anchoring on the section
 comment instead would make CI red for a reworded comment or a fixed typo — zero
@@ -28,24 +29,72 @@ keys on, so both mechanisms share one anchor.
 
 NOTHING HERE TOUCHES REAL SYSTEMD. `repo_root` and `unit_dir` are always
 tmp_path trees supplied by the caller, and `systemctl` is always a PATH stub
-that exits 0 — the sliced sections do call `systemctl --user enable`.
+that exits 0 — the sliced sections do call `systemctl --user enable`. That stub
+also RECORDS its argv into tmp_path, readable via `systemctl_calls` /
+`enabled_units`, so the enable half of an install is observable rather than
+merely assumed. Always, with no opt-in flag: a caller that never reads the log
+is unaffected, and a flag would give the harness two behaviours to reason about
+while letting a future caller silently lose the observability.
 
-Generalized from the reference implementation at
-tests/scripts/test_check_orchestrator_unit_parity.py:1044-1119 (task 3424).
-That file deliberately still carries its own copy: migrating it needs an edit
-to a file this task holds no lock on. See the amendment note in the commit that
-introduced this paragraph.
+Generalized from the reference implementation in
+tests/scripts/test_check_orchestrator_unit_parity.py (task 3424) and migrated
+onto this module by task 3909, so all four parity suites now share one slicer,
+one preamble and one stub.
+
+THIS MODULE IS NOW A THIN BINDER. Task 4488 needed the same slicer for
+export-data.sh and import-data.sh, so the script-agnostic core — `find_in_code`,
+`slice_section`, `slice_shell_function`, `stub_bin_dir`, `write_stub` and the
+generic runner — moved to tests/scripts/shell_sections.py parameterized by
+script path. What stays here is exactly what is SETUP-HOST-SPECIFIC: the path
+binding, the four log shims, the `_parity_verdict` preamble, the recording
+`systemctl` stub, and the checker/unit helpers. The public API is unchanged
+byte-for-byte, so this module's four consumer suites needed no edits and are
+the regression net for that move.
+
+`stub_bin_dir` and `write_stub` are RE-EXPORTED rather than re-implemented: the
+stub directory's PATH literal is owned once, in shell_sections. A caller that
+drops stubs of its own alongside the harness's `systemctl` imports that
+accessor — from either module, they are the same function — instead of
+re-deriving ``tmp_path / "stub-bin"`` and depending on a private choice by
+string equality.
 """
 
 from __future__ import annotations
 
-import os
 import pathlib
 import subprocess
 from collections.abc import Iterable
 
-REPO_ROOT = pathlib.Path(__file__).parents[2]
+from shell_sections import (
+    REPO_ROOT,
+    run_with_preamble,
+    stub_bin_dir,
+    write_stub,
+)
+from shell_sections import slice_section as _slice_section
+from shell_sections import slice_shell_function as _slice_shell_function
+
 SETUP_HOST_PATH = REPO_ROOT / "scripts" / "setup-host.sh"
+
+# Re-exported so `from setup_host_sections import stub_bin_dir, write_stub`
+# keeps resolving for this module's consumers; they are shell_sections' own
+# functions, not copies.
+__all__ = [
+    "REPO_ROOT",
+    "SETUP_HOST_PATH",
+    "SYSTEMCTL_LOG",
+    "checker_repo",
+    "enabled_units",
+    "run_section",
+    "setup_host_text",
+    "slice_section",
+    "slice_shell_function",
+    "stub_bin_dir",
+    "systemctl_calls",
+    "usage_error_checker",
+    "write_checker",
+    "write_stub",
+]
 
 # The four logging shims, reduced to PLAIN TEXT so assertions can match on
 # prefixes without ANSI escapes. Prefixes mirror the reference harness.
@@ -60,14 +109,42 @@ _SHIMS = (
 )
 
 
+# Where the systemctl stub appends one line per invocation, relative to the
+# caller's tmp_path.
+SYSTEMCTL_LOG = "systemctl-calls.log"
+
+
+# setup-host.sh defines `_parity_verdict` once, below the log shims and above
+# every parity call site, so a sliced block that calls it needs it in scope.
+# Named, not spelled out as start/end markers: `slice_shell_function` already
+# derives both endpoints of a shell definition from the name, and a second
+# hand-written pair here would be the same slice expressed twice.
+_VERDICT_HELPER = "_parity_verdict"
+
+
 def _preamble(repo_root: pathlib.Path, unit_dir: pathlib.Path) -> str:
-    """setup-host.sh's own `set` flags and variables, plus the plain-text shims."""
+    """setup-host.sh's own `set` flags and variables, the shims, and the verdict helper.
+
+    The helper is SLICED LIVE out of setup-host.sh, never carried here as a
+    hand-written copy — unlike the four log shims above, which are deliberately
+    reduced to plain text. The shims are reduced for a stated reason (stripping
+    ANSI so assertions can match on prefixes) and their bodies are trivial
+    `printf`s with no logic to drift. `_parity_verdict` IS the logic under
+    test: a copied body would let the version the suite exercises and the
+    version setup-host.sh ships diverge silently — which is precisely the
+    "reports green because it never ran" class this whole gate family exists to
+    catch, reproduced one level up in its own harness.
+
+    Slicing also fails LOUDLY (`slice_section`, under `slice_shell_function`,
+    asserts naming the marker) if the helper is ever renamed, rather than
+    leaving the suite testing a helper the installer no longer has.
+    """
     return (
         "set -euo pipefail\n"
         f'REPO_ROOT="{repo_root}"\n'
         f'UNIT_DIR="{unit_dir}"\n'
         'mkdir -p "$UNIT_DIR"\n'
-    ) + _SHIMS
+    ) + _SHIMS + slice_shell_function(_VERDICT_HELPER)
 
 
 def setup_host_text() -> str:
@@ -75,44 +152,27 @@ def setup_host_text() -> str:
     return SETUP_HOST_PATH.read_text(encoding="utf-8")
 
 
-def slice_section(start_marker: str, end_marker: str) -> str:
-    """Return setup-host.sh from the line carrying *start_marker* through *end_marker*.
+def slice_section(
+    start_marker: str, end_marker: str, *, end_after: str | None = None
+) -> str:
+    """`shell_sections.slice_section` bound to setup-host.sh — see it for the rules.
 
-    The slice runs from the START of the line containing the first instance of
-    *start_marker* through the END of the line containing the first
-    *end_marker* at or after it — both endpoints derived, so the slice survives
-    a reflow of the block.
-
-    Raises AssertionError NAMING the missing marker when either is absent. That
-    matters: the silent alternative is a slice of the wrong (or empty) region,
-    which runs cleanly and produces a vacuously green test — the same
-    "reported green because it never ran" failure these tests exist to catch.
+    Endpoints derived from CODE anchors (never line numbers), *end_after* an
+    optional third anchor, and a missing marker raises an AssertionError naming
+    it rather than silently slicing the wrong region.
     """
-    text = setup_host_text()
-
-    pos = text.find(start_marker)
-    assert pos != -1, (
-        f"start_marker {start_marker!r} not found in {SETUP_HOST_PATH}. A "
-        f"renamed anchor must fail here, not slice an empty region."
+    return _slice_section(
+        SETUP_HOST_PATH, start_marker, end_marker, end_after=end_after
     )
 
-    start = text.rfind("\n", 0, pos) + 1
 
-    end_pos = text.find(end_marker, pos)
-    assert end_pos != -1, (
-        f"end_marker {end_marker!r} not found in {SETUP_HOST_PATH} at or after "
-        f"{start_marker!r}."
-    )
-    # Search for the line end from the marker's LAST character, not its first.
-    # An end_marker may itself span lines (`"\nfi\n"` is the natural way to name
-    # a column-0 `fi` without also matching an indented inner one); starting the
-    # search at end_pos would then land on the marker's own leading newline and
-    # cut the slice one line short — dropping the very `fi` it was asked for.
-    marker_last = end_pos + len(end_marker) - 1
-    line_end = text.find("\n", marker_last)
-    end = len(text) if line_end == -1 else line_end + 1
+def slice_shell_function(name: str) -> str:
+    """`shell_sections.slice_shell_function` bound to setup-host.sh.
 
-    return text[start:end]
+    Lifts the SHIPPED definition of ``name``, so a slice that calls it exercises
+    the installer's own helper rather than a copy this harness wrote.
+    """
+    return _slice_shell_function(SETUP_HOST_PATH, name)
 
 
 def run_section(
@@ -125,28 +185,46 @@ def run_section(
 ) -> subprocess.CompletedProcess:
     """Execute *section_text* under bash with setup-host.sh's own preamble.
 
-    A stub `systemctl` that exits 0 is written into a tmp dir and PREPENDED to
-    PATH, so a slice containing `systemctl --user enable` neither touches the
-    host nor fails under `set -e`.
+    A stub `systemctl` is written into a tmp dir and PREPENDED to PATH, so a
+    slice containing `systemctl --user enable` neither touches the host nor
+    fails under `set -e`. It RECORDS its argv (one call per line) into
+    ``tmp_path / SYSTEMCTL_LOG`` before exiting 0 — see the module docstring
+    for why that is unconditional.
     """
-    stub_bin = tmp_path / "stub-bin"
-    stub_bin.mkdir(exist_ok=True)
-    systemctl = stub_bin / "systemctl"
-    systemctl.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-    systemctl.chmod(0o755)
-
-    script = tmp_path / "section.sh"
-    script.write_text(
-        _preamble(repo_root, unit_dir) + section_text,
-        encoding="utf-8",
+    write_stub(
+        stub_bin_dir(tmp_path),
+        "systemctl",
+        f"printf '%s\\n' \"$*\" >> {tmp_path / SYSTEMCTL_LOG}\nexit 0\n",
+    )
+    return run_with_preamble(
+        tmp_path,
+        _preamble(repo_root, unit_dir),
+        section_text,
+        env_extra=env_extra,
     )
 
-    env = dict(os.environ)
-    env["PATH"] = f"{stub_bin}:{env.get('PATH', '')}"
-    env.update(env_extra or {})
-    return subprocess.run(
-        ["bash", str(script)], capture_output=True, text=True, env=env
-    )
+
+def systemctl_calls(tmp_path: pathlib.Path) -> list[list[str]]:
+    """Every `systemctl` invocation the run made, as argv token lists."""
+    log = tmp_path / SYSTEMCTL_LOG
+    if not log.is_file():
+        return []
+    return [
+        line.split() for line in log.read_text(encoding="utf-8").splitlines() if line
+    ]
+
+
+def enabled_units(tmp_path: pathlib.Path) -> list[str]:
+    """The units passed to `systemctl ... enable <unit>` during the run.
+
+    Token-matched rather than substring-matched: `enable` naming one unit must
+    never be satisfied by a line naming a different one.
+    """
+    enabled: list[str] = []
+    for argv in systemctl_calls(tmp_path):
+        if "enable" in argv:
+            enabled.extend(argv[argv.index("enable") + 1 :])
+    return enabled
 
 
 def usage_error_checker(script_name: str, usage_flags: str, rejected: str) -> str:
@@ -155,8 +233,14 @@ def usage_error_checker(script_name: str, usage_flags: str, rejected: str) -> st
     One of the two ways a parity checker exits 2 without having checked
     anything (the other is `python3` refusing to open a script that was renamed
     or moved). Its stderr deliberately carries bracketed tokens — `[-h]`,
-    `[--fix]` — because a marker match that is not line-anchored would read
-    those as a report and hand the gate a verdict the checker never gave.
+    `[--fix]` — so that a gate matching brackets LOOSELY rather than matching
+    its checker's specific `[<tag>]` would read those as a report and hand the
+    gate a verdict the checker never gave.
+
+    (That hazard used to be worded as "a marker match that is not
+    line-anchored". No gate is line-anchored any more — all five now test
+    containment of one specific tag — but the stub is still exactly the right
+    imposter, for the reason above: it emits no tag at all.)
     """
     return (
         "import sys\n"

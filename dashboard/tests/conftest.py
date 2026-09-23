@@ -57,6 +57,7 @@ from _dashboard_helpers import RECONCILIATION_SCHEMA, apply_isolated_env  # noqa
 from df_pytest_isolation import (  # noqa: E402
     _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
     _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
+    _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
     reject_unsafe_basetemp,
 )
 from starlette.testclient import TestClient  # noqa: E402
@@ -131,7 +132,7 @@ def two_url_config(tmp_path):
     """Create a DashboardConfig with two test URLs (ports 9000, 9001).
 
     Port 9000 is used as the failing server in fallback tests; port 9001
-    responds successfully. Using ports distinct from the default (8002)
+    responds successfully. Using ports distinct from the suite-wide default
     makes the test intent explicit.
     """
     from dashboard.config import DashboardConfig
@@ -146,8 +147,13 @@ def two_url_config(tmp_path):
 def client():
     """Create a TestClient for the dashboard FastAPI app.
 
-    Its lifespan runs against the session-scoped ``_isolated_project_root``
-    temp dir, never the operator's live checkout (task 3503).
+    Its lifespan is isolated on BOTH axes by the session-scoped
+    ``_isolated_project_root`` fixture: the DB paths it opens resolve under a
+    pytest-owned temp dir rather than the operator's live checkout (task
+    3503), and its fused-memory fan-out dials a measured-dead loopback port
+    rather than the operator's live instance on 8002 (task 5185).  The second
+    half is not cosmetic: without it every lifespan here makes two real MCP
+    round trips, and one slow response wedges ``TestClient.__exit__``.
     """
     from dashboard.app import app
 
@@ -374,3 +380,105 @@ async def empty_recon_conn(empty_reconciliation_db):
     async with aiosqlite.connect(str(empty_reconciliation_db)) as conn:
         conn.row_factory = aiosqlite.Row
         yield conn
+
+
+# ---------------------------------------------------------------------------
+# Shared served-asset fixtures (task 3549).
+#
+# The suite asserts structural contracts against the *served* .jsx/.js/.html
+# text, so nearly every such module needs a TestClient and the response body of
+# one or more static assets.  Nine modules used to carry byte-identical private
+# copies of exactly these fixtures; they live here now so a change lands once.
+#
+# SCOPE — module, matching the copies they replace.  Each CONSUMING MODULE pays
+# one app lifespan, not each test.  conftest's other TestClient fixture,
+# ``client`` above, is function-scoped and is a different thing: swapping these
+# onto it would stand up and tear down the app once per test across the whole
+# suite.  test_jsx_source_helpers.py pins the scope so that cannot happen
+# silently.
+#
+# ISOLATION — unchanged from the copies.  These lifespans still run under the
+# session-scoped autouse ``_isolated_project_root`` above (task 3503), so the
+# app opens its WAL databases inside a pytest temp root and never touches the
+# operator's live checkout.  That fixture is session-scoped precisely because a
+# module-scoped TestClient like this one cannot request a function-scoped
+# monkeypatch.
+#
+# SHADOWING IS INTENDED, BUT IT MUST SAY SO AT THE SITE.  A module that defines
+# its own ``_client`` overrides this one; that is not automatically a leftover to
+# be cleaned up.  test_fixture_isolation.py in particular MUST keep its copy —
+# there the module-scoped TestClient is the SUBJECT UNDER TEST (its docstring:
+# "only a *session*-scoped fix satisfies both" scopes), so deleting it would
+# delete the coverage.
+#
+# The MECHANISM that records such an exception is a
+# ``# noqa: module-local-testclient — <reason>`` pragma on the line above the
+# construction, enforced by
+# ``fused-memory/scripts/check_module_local_testclient.py`` (task 4485) from
+# dashboard's ``lint_command`` and ``hooks/project-checks``.  Without that pragma
+# the lint rejects the fixture and names conftest's shared ``_client`` as the
+# remedy — so this note and the gate cannot drift apart, which is exactly what
+# happened before: task 3571 deleted five copies, asserted in its own commit
+# message that conftest and test_fixture_isolation.py were the only survivors,
+# and left a byte-identical copy in test_tab_tasks_offline_banner.py that no
+# human reviewer or purpose-built guard caught.  Task 4485 burned that copy down.
+#
+# APPEND ONLY BELOW THE sys.path BLOCK.  Adding a top-level non-stdlib import
+# above it fails test_conftest_import_guard.py's AST ordering guard.
+# ``TestClient`` is already imported at the top of this file, so this block adds
+# no import at all.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope='module')
+def _client():
+    """Module-scoped TestClient for static-asset and wiring assertions."""
+    from dashboard.app import app
+
+    with TestClient(app) as c:
+        yield c
+
+
+@pytest.fixture(scope='module')
+def index_html_body(_client):
+    return _client.get('/static/redux/index.html').text
+
+
+@pytest.fixture(scope='module')
+def data_js_body(_client):
+    return _client.get('/static/redux/data.js').text
+
+
+@pytest.fixture(scope='module')
+def app_jsx_body(_client):
+    return _client.get('/static/redux/app.jsx').text
+
+
+@pytest.fixture(scope='module')
+def shell_jsx_body(_client):
+    return _client.get('/static/redux/shell.jsx').text
+
+
+@pytest.fixture(scope='module')
+def tabs_jsx_body(_client):
+    return _client.get('/static/redux/tabs.jsx').text
+
+
+@pytest.fixture(scope='module')
+def charts_jsx_body(_client):
+    return _client.get('/static/redux/charts.jsx').text
+
+
+@pytest.fixture(scope='module')
+def tab_analytics_jsx_body(_client):
+    return _client.get('/static/redux/tab_escalation_analytics.jsx').text
+
+
+@pytest.fixture(scope='module')
+def tab_escalations_jsx_body(_client):
+    return _client.get('/static/redux/tab_escalations.jsx').text
+
+
+@pytest.fixture(scope='module')
+def tab_tasks_jsx_body(_client):
+    return _client.get('/static/redux/tab_tasks.jsx').text

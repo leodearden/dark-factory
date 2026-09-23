@@ -56,6 +56,7 @@ if str(REPO_ROOT) not in sys.path:
 os.environ.setdefault('ORCH_DEBUG_ASSERTS', '1')
 
 from _orch_helpers import (  # noqa: E402
+    CLAIMANT_TTL_SECS,
     drain_async_mock_coroutines,
     idle_psi_sample,
     pydantic_spec,
@@ -65,12 +66,16 @@ from _orch_helpers import (  # noqa: E402
 )
 from df_pytest_isolation import (  # noqa: E402
     _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
+    _df_fleet_dir_redirect,  # noqa: F401  — the binding IS the wiring
     _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
+    _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
+    _df_no_synthetic_heartbeats_in_live_fleet,  # noqa: F401  — the binding IS the wiring
     reject_unsafe_basetemp,
 )
 from shared.config_models import UsageCapConfig  # noqa: E402
 
 from orchestrator import merge_queue  # noqa: E402
+from orchestrator.agents.briefing import BriefingAssembler  # noqa: E402
 from orchestrator.config import (  # noqa: E402
     EscalationConfig,
     FusedMemoryConfig,
@@ -240,6 +245,27 @@ def repo_root() -> Path | None:
         if (parent / '.git').exists():
             return parent
     return None
+
+
+@pytest.fixture
+def briefing(tmp_path: Path) -> BriefingAssembler:
+    """Minimal BriefingAssembler over a stub OrchestratorConfig (no I/O).
+
+    Shared by ``test_roles_wait_pattern.py`` and
+    ``test_roles_background_warning.py`` (task 3747 — the two files were
+    forked from a common ancestor and carried byte-identical copies of this
+    fixture until they were consolidated here).
+    """
+    config = OrchestratorConfig(
+        project_root=tmp_path,
+        git=GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+        ),
+    )
+    return BriefingAssembler(config)
 
 
 @pytest.fixture(autouse=True)
@@ -810,37 +836,62 @@ def _drain_async_mock_coroutines():
 def make_steward(tmp_path: Path):
     """Build a minimal ``TaskSteward`` on a fixture-OWNED, ``tmp_path``-rooted worktree.
 
-    This is the suite's steward factory, with ONE documented exception (below).
-    Task 3461 merged the two near-identical ``_make_steward`` copies from
-    ``test_suggestion_triage.py`` and ``test_workflow_state_machine_boundary.py``;
-    task 3514 folded in the two that remained —
-    ``test_out_of_band_routing.py``'s ``_steward_config`` / ``_build_steward``,
-    and ``test_steward.py``'s five-fixture graph (whose ``worktree`` /
-    ``mock_config`` / ``mock_queue`` / ``mock_mcp`` / ``mock_briefing`` names
-    survive there as one-line views onto this factory's build).  If you are here
-    to add another, EXTEND this one instead.
+    This is the suite's steward factory, and THE SINGLE OWNER of the rationale
+    for every construction that sits outside it.  Task 3461 merged the two
+    near-identical ``_make_steward`` copies from ``test_suggestion_triage.py``
+    and ``test_workflow_state_machine_boundary.py``; task 3514 folded in the two
+    that remained — ``test_out_of_band_routing.py``'s ``_steward_config`` /
+    ``_build_steward``, and ``test_steward.py``'s five-fixture graph (whose
+    ``worktree`` / ``mock_config`` / ``mock_queue`` / ``mock_mcp`` /
+    ``mock_briefing`` names survive there as one-line views onto this factory's
+    build).  If you are here to add another, EXTEND this one instead.
 
-    The exception, examined and left standing by task 3551:
-    ``test_workflow_escalated_steward_stall.py``'s ``_make_steward_config``.  It
-    structurally cannot fold in, for three independent reasons — recorded here so
-    the next reader does not re-litigate it:
+    THE SPLIT IS PERMANENT — a RULING, closed by task 3647, not a deferral.
+    Say so plainly because 3461, 3514 and 3551 each recorded their findings in
+    prose and each successor re-litigated them from scratch anyway.  Task 3647
+    re-derived the census one final time and confirmed:
 
-    1. it feeds ``_CapFiringSteward``, a ``TaskSteward`` SUBCLASS that module
-       declares inside ``_make_real_steward_factory``, whereas this fixture
-       returns a constructed ``TaskSteward``;
-    2. that construction passes ``config_dir=``, a parameter this fixture does
-       not accept;
-    3. ``_make_real_steward_factory`` returns a CALLBACK the workflow invokes
-       later, with a worktree the *workflow* chooses — it is not a fixture and
-       cannot request ``tmp_path`` at the moment of construction, whereas this
-       one owns its worktree by design.
+    * ``test_steward.py`` and ``test_out_of_band_routing.py`` have NOTHING left
+      to fold — 3514 already did it.  ``test_steward.py``'s ``mock_config`` is
+      literally ``return steward.config``, and what remains in
+      ``test_out_of_band_routing.py`` (``_review_config`` / ``_unblock_config`` /
+      ``_full_role_config``) are ReviewCheckpoint / unblock_auto /
+      byte-equivalence configs, not steward factories;
+    * ``test_workflow_escalated_steward_stall.py``'s ``_make_steward_config``
+      structurally cannot fold, for three independent reasons:
 
-    Absorbing all three would mean adding ``steward_cls=`` / ``config_dir=``
-    surface AND relaxing the strictly-below-``tmp_path`` worktree assertion below
-    (which task 3514 promoted from convention to an enforced invariant) to serve
-    exactly one consumer.  That factory instead adopted this one's ``project_root``
-    recipe directly (task 3551), so the sandbox invariant is shared even though
-    the construction is not.
+      1. it feeds ``_CapFiringSteward``, a ``TaskSteward`` SUBCLASS that module
+         declares inside ``_make_real_steward_factory``, whereas this fixture
+         returns a constructed ``TaskSteward``;
+      2. that construction passes ``config_dir=``, a parameter this fixture does
+         not accept;
+      3. ``_make_real_steward_factory`` returns a CALLBACK the workflow invokes
+         later, with a worktree the *workflow* chooses — it is not a fixture and
+         cannot request ``tmp_path`` at the moment of construction, whereas this
+         one owns its worktree by design.
+
+      Absorbing it would mean adding ``steward_cls=`` / ``config_dir=`` surface
+      AND relaxing the strictly-below-``tmp_path`` worktree assertion below
+      (which task 3514 promoted from convention to an enforced invariant) to
+      serve exactly one consumer.  That factory instead adopted this one's
+      ``project_root`` recipe directly (task 3551), so the sandbox invariant is
+      shared even though the construction is not;
+    * a THIRD sanctioned site exists, which the lineage had missed:
+      ``test_verdict_servers_integration_gate.py``'s
+      ``_build_steward_for_triage``, added by task 2488 AFTER the 3514
+      consolidation.  It takes a REAL ``OrchestratorConfig`` and a real on-disk
+      meta-root, which this fixture's ``spec_set`` ``MagicMock`` cannot supply;
+      whether to grow a ``config=`` passthrough for it is filed as a follow-up,
+      not decided here.
+
+    ENFORCEMENT, so the ruling is checkable rather than merely asserted in prose
+    a fourth time: ``test_steward_scaffolding_guards.py`` censuses every steward
+    construction in this tree against an allowlist that carries the reason for
+    each.  A fourth idiom cannot appear silently — its author must either use
+    this fixture or record why they cannot.  That module also owns the
+    recurrence guard for the sandboxed-``project_root`` block; the assertion
+    itself is ``_orch_helpers.assert_sandboxed_project_root``, which the
+    ``project_root`` recipe below must keep satisfying.
 
     Lives in conftest.py — rather than ``_orch_helpers.py``, which is scoped to
     non-fixture helpers — because it must close over ``tmp_path`` to own the
@@ -1073,6 +1124,13 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     # _claimant_heartbeat_loop (workflow.py:2113) under load-exposed
     # teardown ordering, raising TypeError.
     config.claimant_heartbeat_interval_secs = 60.0
+    # Task 3540: harness._resume_repend_liveness feeds this straight into
+    # timedelta(seconds=...); a spec_set MagicMock attribute raises
+    # TypeError there. THIS is the single owner of the value for the suite —
+    # no test should re-pin it locally. Sourced from _orch_helpers so the
+    # knob and the fixture rows built by `claimant_row` (whose fresh/stale
+    # ages are 0.5x/2x this) can never drift apart.
+    config.claimant_liveness_ttl_secs = CLAIMANT_TTL_SECS
     config.orphan_l0_check_interval_secs = 60.0
     config.orphan_l0_reaper_enabled = False
     config.orphan_l0_timeout_secs = 600.0

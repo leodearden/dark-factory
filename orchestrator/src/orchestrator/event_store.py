@@ -66,6 +66,21 @@ class EventType(StrEnum):
     # Escalations
     escalation_created = 'escalation_created'
     escalation_resolved = 'escalation_resolved'
+    # Stale-L0 strand swept at startup (task 3172, origin records esc-5189-7
+    # pending 20h58m with a workflow parked on it vs esc-5685-1 pending ~90s).
+    # Emitted by Harness._dismiss_stale_escalations, once per level-0 whose
+    # pending age had already crossed the strand threshold when the restart
+    # sweep closed it.  Keyed on the STRANDED escalation's REAL task_id so the
+    # rows stay joinable against task_completed for that task.
+    # data: {escalation_id, pending_secs, severity, workflow_blocked, category,
+    #        agent_role, resolution_class}
+    #
+    # Why a dedicated member rather than a flag on escalation_resolved: the one
+    # query this task exists to enable is "how many strands did this restart
+    # destroy, and which" — a GROUP BY that must separate a strand from routine
+    # restart noise.  `WHERE event_type = 'stale_l0_strand_dismissed'` answers
+    # it directly; a json_extract discriminator over every resolution would not.
+    stale_l0_strand_dismissed = 'stale_l0_strand_dismissed'
 
     # Waste detection
     waste_detected = 'waste_detected'
@@ -97,6 +112,63 @@ class EventType(StrEnum):
     # Both keys are ALWAYS present (None when not narrowed) so the survey's
     # runtime mining (milestone 5254) reads a uniform data.get('retry_scope')
     # and can NEVER miscount a narrowed retry as a full green gate.
+    # PLUS one always-present deep merge-ahead key (task 3185, PRD γ):
+    #   chain_items  int, ALWAYS >= 1, NEVER None.  The count, in CHAIN-ITEM
+    #                units, of the items contained in the tree this verify
+    #                actually exercised: the dispatching item is chain item #1
+    #                and each chained successor actually built adds one.
+    #                1 = an ordinary single-item verify (head or
+    #                adjacent speculative); >= 2 = a deep merge-ahead tip
+    #                verify covering that many stacked items.
+    #                DELIBERATELY FRONTIER-INDEPENDENT: an ordinary adjacent
+    #                speculative verify is 1 no matter how many other verifies
+    #                are in flight ahead of it (that height is `depth`'s job,
+    #                below), so under the shipped merge_deep.chain_cap=0 kill
+    #                switch NOTHING can emit >= 2.  That is precisely what
+    #                scripts/merge-deep-canary-predicate.sh:84 depends on --
+    #                it classifies a deep verify as `chain_items >= 2`, and
+    #                that expression is both ζ's "first deep verify observed"
+    #                deploy signal and η1's deep-fail-rate DENOMINATOR.  A
+    #                frontier-inclusive reading would fire it on day one and
+    #                count rounds that chained nothing.  The floor is 1
+    #                rather than 0/None because every merge verify exercises
+    #                at least the item it was created for, so there is no
+    #                "absent" state to represent -- which is what lets a
+    #                reader treat data['chain_items'] as unconditionally
+    #                present and lets the deep-canary predicate count deep
+    #                verifies as `chain_items >= 2`.
+    #                SUPERSEDES reliance on `depth` as a depth signal: a
+    #                firing speculation probe (task 2359) relabels `depth`
+    #                into an attribution fact about a stack that was never
+    #                verified (see ProbePlacement's known-limitation note), so
+    #                probe-era `depth` values are excluded from calibration.
+    #                `chain_items` is derived from the tree that actually ran
+    #                and carries no such caveat.
+    # PLUS its always-present-but-NULLABLE companion (task 3185 amend,
+    # reviewer_comprehensive performance):
+    #   chain_build_ms  int | None.  Wall-clock milliseconds the deep chain
+    #                build that produced this verify's tree cost.  None
+    #                whenever no chain was built -- i.e. on every event with
+    #                chain_items == 1, which under the shipped chain_cap=0
+    #                kill switch is EVERY event.  Non-None therefore implies
+    #                chain_items >= 2, and the two fields are read together.
+    #                Nullable where chain_items is not, and correctly so: a
+    #                verify that chained nothing paid no build, so there IS a
+    #                genuine "absent" state here and 0 would be a lie rather
+    #                than an absence (whereas every verify exercises at least
+    #                one item, so chain_items has no absent state at all).
+    #                WHY IT EXISTS: the chain build is awaited INLINE on the
+    #                merge worker's dispatch path, so for its whole duration
+    #                _verifier_loop cannot run FINALIZE-HEAD -- an
+    #                already-green head verify can neither finalize nor land,
+    #                and nothing else can dispatch.  That is a per-round
+    #                DISPATCH STALL, not verify time, and the PRD's whole
+    #                justification for deep merge-ahead is throughput, so the
+    #                cost must be measurable before ζ raises the cap.  η1 reads
+    #                it alongside drain-time for exactly that attribution.
+    #                Measured by _deep_chain_placement, not by build_chain, so
+    #                it covers the FULL stall: lane acquisition, the sequential
+    #                merges, and the asyncio.timeout wrapper's overhead.
     merge_verify = 'merge_verify'
     # A merge-role scoped-verify red that the isolated-rerun-confirm gate
     # (verify.apply_merge_flake_suppression, PRD task α) demonstrated was a
@@ -117,6 +189,20 @@ class EventType(StrEnum):
     # /unblock, /do) submit branches without emitting it -> classifier
     # degrades to INDETERMINATE by design.
     workflow_verify = 'workflow_verify'
+    # Local-vs-remote verdict AGREEMENT.  THREE producers emit this member with
+    # deliberately DIFFERENT data shapes — read the producer before the payload:
+    #   - verify_runner.DriftDetector.check (the off-lane drift detective) emits
+    #     {merge_sha, local_runner, remote_runner, passed, local_category,
+    #     remote_category}.  The two *_category keys are ALWAYS present, carrying
+    #     '' for a clean arm, so a consumer never has to tell an absent key apart
+    #     from a clean result.  A non-empty value such as 'merge_flake_suppressed'
+    #     marks an arm whose green came from a flake-suppression rerun
+    #     (verify.apply_merge_flake_suppression) rather than a clean first pass —
+    #     i.e. the two hosts agreed, but one of them only agreed on a retry.
+    #   - merge_queue's land-time remote-green cross-check emits the same first
+    #     four keys WITHOUT the categories.
+    #   - merge_shadow's warm/cold compare emits a wholly different
+    #     {merge_commit, shadow_compare, warm_test_count, cold_test_count}.
     verdict_parity_ok = 'verdict_parity_ok'
     # Land-time remote-green cross-check (task 2822, fix b) telemetry. The
     # AGREE case reuses verdict_parity_ok above; these two give the divergence
@@ -148,8 +234,13 @@ class EventType(StrEnum):
     # Emitted from enqueue_merge_request's terminal done-callback when a
     # MergeRequest future reaches its final state (resolved, cancelled, or
     # exception).  Payload shape: {request_id, branch, state, snapshot_tip,
-    # merge_sha}.  state is one of MergeOutcome.status values, 'abandoned'
-    # (cancelled future), or 'error' (unexpected exception).
+    # merge_sha, superseded_by, generation, reason, landed_via_chain}.  state
+    # is one of MergeOutcome.status values, 'abandoned' (cancelled future), or
+    # 'error' (unexpected exception).  landed_via_chain is 1 on an item landed
+    # by a deep merge-ahead chain walk and None otherwise (task 3186 δ); it is
+    # what scripts/merge-deep-canary-predicate.sh sums for its items-landed-
+    # per-deep-verify statistic.  (superseded_by/generation/reason had been
+    # emitted but undocumented here; listed now rather than left stale.)
     merge_finalized = 'merge_finalized'
     # Unconditional observability of the generic merge-blocked fall-through in
     # TaskWorkflow._submit_to_merge_queue.  Emitted BEFORE _mark_blocked and
@@ -158,6 +249,18 @@ class EventType(StrEnum):
     # escalation (task 2757; Reify 5120 RCA RC-2).  task_id-keyed; payload shape:
     # {reason, category, failure_category, cause_hint}.
     merge_blocked = 'merge_blocked'
+    # PRD merge-worktree-lifecycle-integrity §4 C4 (task 2930/η): the serial-lane
+    # TRIPWIRE — a second concurrent LOCAL merge verify was dispatched while the
+    # _MERGE_AHEAD_BOUND-derived per-host in-flight bound is 1.  DETECTION ONLY:
+    # the dispatch is NOT blocked (C4: "no hard block"); this is the cheap net for
+    # a request-identity leak of the task/5326 class (two journal entries for one
+    # branch, both enqueued — 2026-07-22 12:10:26).  Sole emit site:
+    # merge_liveness.alarm_serial_lane_breach, reached from
+    # SpeculativeMergeWorker._inflight_append.  data:
+    #   {local_inflight, per_host_bound, merge_ahead_bound, num_hosts,
+    #    branch, request_id, host}
+    # task_id = the dispatching item's task_id; phase = 'merge'.
+    merge_serial_lane_breached = 'merge_serial_lane_breached'
     speculative_merge = 'speculative_merge'
     speculative_discard = 'speculative_discard'
     # Emitted by verify.run_scoped_verification when the merge gate (the
@@ -228,36 +331,56 @@ class EventType(StrEnum):
     # session was present for the dispatched task:
     #   session_resume          — an eligible session was injected as --resume.
     #   session_resume_fallback — an ineligible session degraded to fresh
-    #                             dispatch; data.reason ∈ {stale, no_transcript,
-    #                             reseeded}.
-    #   session_resume_capped   — resume_count reached max_resumes_per_task;
-    #                             by-design throttling, degrades to fresh dispatch.
+    #                             dispatch; data.reasons is a SORTED list of
+    #                             EVERY reason it was ineligible, drawn from
+    #                             {stale, capped, no_transcript, reseeded}.
+    #   session_resume_capped   — resume_count reached max_resumes_per_task and
+    #                             was the ONLY disqualifier; by-design
+    #                             throttling of an otherwise healthy session,
+    #                             degrades to fresh dispatch. A capped session
+    #                             that ALSO failed freshness or corroboration
+    #                             emits session_resume_fallback instead, with
+    #                             `capped` still present in data.reasons — it
+    #                             would not have resumed anyway, so counting it
+    #                             as throttling would overstate that population.
     # (enabled=False degrades silently — no event.)
     #
     # Of the fallback reasons, `reseeded` is EXPECTED, not a failure (task
     # 3256): warm-lane acquire ALWAYS re-seeds a lane from base, wiping
     # <lane>/.task/ and the whole claude-config transcript store with it, so a
-    # session adopted at boot routinely finds its store gone by re-dispatch. It
-    # therefore does NOT feed the fallback-storm streak (like
-    # session_resume_capped); only {stale, no_transcript} do. The event is still
-    # emitted so the rate stays measurable (PRD open question 3 — lane-collision
-    # rate is read off these reasons post-deploy).
+    # session adopted at boot routinely finds its store gone by re-dispatch. The
+    # event is still emitted so the rate stays measurable (PRD open question 3 —
+    # lane-collision rate is read off these reasons post-deploy). Which reasons
+    # feed the fallback-storm streak is a SEPARATE question from which event is
+    # emitted; the _run_slot guard's streak branch in harness.py is the answer.
     #
     # Ratio recipe: there is no separate "attempt" row — attempts are the SUM of
     # the three outcome events (session_resume + session_resume_fallback +
     # session_resume_capped) for a window, since the guard emits exactly one per
     # dispatch that carried a recovered session. Read the fallback RATE as a
     # ratio against that denominator rather than as an absolute count, and split
-    # the numerator by json_extract(data, '$.reason') to separate expected
-    # reseeds from genuine corroboration failures. (enabled=False emits nothing,
-    # so a zero total means either no recovered sessions or the kill switch.)
+    # the numerator by json_extract(data, '$.reasons'). Because the list is
+    # SORTED, that expression is a stable string and a plain GROUP BY 1 is a
+    # CO-OCCURRENCE census — '["no_transcript","stale"]' is its own bucket,
+    # distinct from '["stale"]' — with no json_each needed. (enabled=False emits
+    # nothing, so a zero total means either no recovered sessions or the kill
+    # switch.)
+    #
+    # TIME SPLIT — rows emitted BEFORE task 3728 carry a SCALAR '$.reason'
+    # holding only the FIRST matching reason, and no '$.reasons' at all. A naive
+    # lifetime query therefore mixes two code generations: '$.reasons' silently
+    # skips every pre-change row, and '$.reason' silently skips every one after,
+    # each returning a confident partial answer rather than an error. Bound any
+    # query by ts, or coalesce the two fields deliberately — and do not compare
+    # a pre-change reason census against a post-change one, because the older
+    # generation UNDER-counts every reason that lost a first-match race.
     #
     # session_resume_fallback additionally carries `data.archive_available: bool`
-    # (task 3727) on BOTH reasons — reseeded and {stale, no_transcript} alike —
+    # (task 3727) on EVERY fallback — reseeded and genuine alike —
     # answering "was this session actually RECOVERABLE from the durable
     # transcript archive?", i.e. did its transcript survive outside the wiped
     # worktree. Query it as json_extract(data, '$.archive_available') alongside
-    # the existing '$.reason' split, so the fallback population can be cut into
+    # the '$.reasons' split, so the fallback population can be cut into
     # recoverable vs genuinely lost.
     #
     # session_resume and session_resume_capped deliberately do NOT carry the
@@ -271,6 +394,150 @@ class EventType(StrEnum):
     session_resume = 'session_resume'
     session_resume_fallback = 'session_resume_fallback'
     session_resume_capped = 'session_resume_capped'
+
+    # session_config_dir_ambiguous (task 3620) — the surviving worktree holds
+    # config-dir candidates but NOT the one this session's transcript would be
+    # in, so the recovered session cannot be corroborated at all.
+    #
+    # Emitted by orchestrator/src/orchestrator/harness.py::Harness._adopt_recovered_session,
+    # at BOOT during crash recovery — NOT by the _run_slot dispatch guard that
+    # emits the three events above. The config dir is DERIVED from the adopted
+    # task id (the sole creator, shared/src/shared/config_dir.py::TaskConfigDir,
+    # names it `claude-config-<task_id>`); when that derived dir is absent but
+    # other `claude-config-*` dirs are present, the worktree belongs to some
+    # other owner — e.g. the `claude-config-<task_id>-unblock` dir created by
+    # orchestrator/src/orchestrator/dry_run_unblock.py::dry_run_unblock. Nothing
+    # is stashed, so the ensuing dispatch is a GUARANTEED 'no_transcript'
+    # fallback. Before this event that outcome was silent: the resolver stashed
+    # a lexically-first candidate, the dispatch-time re-glob found no transcript
+    # there, and the session degraded with zero operator signal.
+    #
+    # NOT part of the ratio recipe's denominator above, and this is the one
+    # thing to get right when querying it — the same trap
+    # session_resume_failed's own comment warns about, restated because this
+    # member sits inside the family block. The three outcome events are one per
+    # DISPATCH that carried a recovered session; this one is one per ADOPTION
+    # that could not resolve. Adding it to that sum would mix populations
+    # counted on different units and inflate the attempt count.
+    #
+    # Emitted IF AND ONLY IF candidates exist and the derived dir is absent. An
+    # empty `.task/` — no `claude-config-*` at all — stays SILENT: that is
+    # ABSENCE, not ambiguity, and it is the dominant recovered-session
+    # population (warm-lane acquire always re-seeds a lane from base, wiping the
+    # transcript store, which is why `reseeded` is a by-design fallback reason
+    # above). Emitting there would fire on nearly every recovered lane and put
+    # the most-expected outcome in the same bucket as a genuine defect. That
+    # population is already instrumented at dispatch by
+    # session_resume_fallback's '$.archive_available'.
+    #
+    # data: {expected, found, session_id, task_id} — `expected` the derived
+    # path, `found` a SORTED list of every candidate path as a string so
+    # json_extract(data, '$.found') is a stable group key (same discipline as
+    # '$.reasons'), `session_id` the sidecar's session, `task_id` the adopted
+    # key (also passed as the row's task_id, so it stays joinable).
+    #
+    # SQL: which derived path was missing, and what was there instead —
+    #   SELECT json_extract(data, '$.expected'), json_extract(data, '$.found'),
+    #          COUNT(*)
+    #     FROM events WHERE event_type = 'session_config_dir_ambiguous'
+    #    GROUP BY 1, 2;
+    # A nonzero count is a definite lost resume with a definite cause, unlike a
+    # fallback census — which is why it also files a deduped L1 (one open at a
+    # time, under harness.py::Harness._CONFIG_DIR_AMBIGUOUS_SENTINEL) rather
+    # than being counted against a storm threshold.
+    #
+    # It consequently does NOT feed the session-resume fallback-storm streak,
+    # and that exclusion is STRUCTURAL rather than a carve-out: this is
+    # detected at BOOT during adoption, while the streak is only ever touched
+    # in the _run_slot DISPATCH guard — unlike the by-design `capped` case,
+    # which sits inside that same guard block and therefore does need an
+    # explicit branch. So config.fallback_storm_threshold has no effect here
+    # and an ambiguity L1 appearing alone is not evidence of a resume storm.
+    session_config_dir_ambiguous = 'session_config_dir_ambiguous'
+
+    # session_resume_failed (task 3578) — an ARMED resume that then failed to
+    # happen. It closes the population that was previously journal-only and
+    # runs.db-INVISIBLE: an armed --resume whose transcript the CLI could not
+    # resolve exits before it ever contacts the API, so none of the three
+    # events above, and no cost or cap row, ever recorded that the session was
+    # lost.
+    #
+    # WHICH PRODUCER ARMED IT is not what this used to say. The original text
+    # read "a resume that was ADOPTED by the _run_slot guard above", and the
+    # data says otherwise: measured 2026-09-16 against runs.db, all 10 rows are
+    # stage='cli', spanning 2026-08-24..2026-09-15, and NOT ONE of their
+    # session ids (or task ids) appears among the 8 session_resume rows the
+    # guard has ever emitted — whose nearest neighbours in time, 2026-08-20 and
+    # 2026-09-16, fall outside the failure span entirely. The only other writer
+    # of TaskWorkflow._pending_resume_session_id is the IN-WORKFLOW
+    # progress-timeout re-arm (workflow.py::TaskWorkflow, the re-arm beside the
+    # progress-timeout handler), so that is what armed all ten.
+    #
+    # That is also why this population, and not the guard's, is dense enough to
+    # carry an alarm — see the streak note below.
+    #
+    # THE INV-4 STORM STREAK'S SOLE GENUINE FEEDER since task ε/3733. Every row
+    # here is also reported to Harness.note_resume_failed, which subtracts the
+    # by-design carve-out and counts what is left as a chained run. FEEDS the
+    # streak: stage='cli' always (the restore ran a phase earlier and is not
+    # what failed), and stage='pre_flight' with restore 'fault' or 'published'.
+    # Does NOT feed it: restore 'disabled' (the kill switch) and 'miss' (the
+    # archive-COVERAGE signal, which belongs on a RATE watch rather than a
+    # consecutive-run detector) — harness.py::_BY_DESIGN_RESTORE_OUTCOMES. A
+    # restore outcome added later is GENUINE by default and must be added to
+    # that constant to be exempted. No new EventType was introduced for the
+    # feeder and no fourth term was added to the ratio denominator below: these
+    # rows already ARE the population, and a second event would be a second
+    # source of truth for one fact.
+    #
+    # NOT part of the ratio recipe's denominator above, and this is the one
+    # thing to get right when querying it. The three events above are emitted by
+    # the _run_slot guard, exactly once per DISPATCH that carried a recovered
+    # session. This one is emitted by TaskWorkflow._invoke, i.e. once per
+    # INVOCATION — and a single dispatch invokes several roles — so adding it to
+    # that sum would compare populations counted on different units and silently
+    # inflate the attempt count.
+    #
+    # data.stage splits the two ways an adopted resume dies:
+    #   pre_flight — _invoke corroborated the session against the config dir it
+    #                was about to export as CLAUDE_CONFIG_DIR, found no
+    #                transcript there (and could not rehydrate one from the
+    #                durable archive), and dispatched FRESH instead of arming a
+    #                --resume the CLI would reject. data: {stage, session_id,
+    #                role, restore} — `restore` is the rehydration OUTCOME, one
+    #                of 'disabled' (session_resume.restore_from_archive off),
+    #                'miss' (the archive genuinely holds no entry for that
+    #                session and nothing else — the archive-COVERAGE signal),
+    #                'fault' (the restore raised: archive-root composition OR
+    #                the restore's own I/O, the latter reaching this arm only
+    #                because _invoke calls the helper with strict=True — see
+    #                the restore_outcome vocabulary comment in workflow.py) or
+    #                'published' (restore claimed success yet the CLI-facing
+    #                locator still cannot see it: pathological, unreachable by
+    #                construction, counted rather than assumed away).
+    #   cli        — the resume WAS armed and the CLI rejected it;
+    #                invoke_with_cap_retry silently retried fresh and returned a
+    #                SUCCESS, so nothing else anywhere records the loss. data:
+    #                {stage, session_id, session_ids, role, fallbacks}, where
+    #                `fallbacks` is AgentResult.resume_fallbacks — the count of
+    #                fresh retries this one invocation had to make — and
+    #                `session_ids` are the ids those retries dropped, oldest
+    #                first (`session_id` is the first of them, i.e. the resume
+    #                the orchestrator itself adopted). Emitted ONLY when _invoke
+    #                armed the resume: the shared/ counter also increments for a
+    #                resume its retry loop re-armed internally after a cap hit,
+    #                which a plain fresh dispatch can reach, and counting those
+    #                would inflate the ratio below past 1.
+    #
+    # SQL split, alongside session_resume_fallback's '$.reasons' /
+    # '$.archive_available' ones:
+    #   SELECT json_extract(data, '$.stage') AS stage, COUNT(*)
+    #     FROM events WHERE event_type = 'session_resume_failed'
+    #    GROUP BY stage;
+    # Read it against session_resume (the adopted-resume count) rather than
+    # against the three-event sum: it answers "of the resumes we decided to
+    # make, how many did not survive to the agent?".
+    session_resume_failed = 'session_resume_failed'
 
     # Scheduler fairness
     task_skipped = 'task_skipped'
@@ -477,6 +744,37 @@ class EventType(StrEnum):
     #   in_flight: len(Scheduler._dispatched) at decision time (int)
     #   floor:     config.psi_admission.min_inflight_floor (int)
     dispatch_deferred = 'dispatch_deferred'
+
+    # Per-tick latency breakdown for Scheduler.acquire_next, emitted once at
+    # the END of every tick (including the ones that dispatch nothing) from a
+    # `finally`, so a tick that short-circuits out of the phase loop is
+    # measured too.  Scheduler-scoped: task_id is the dispatched task when the
+    # tick produced an assignment, else None (same shape as
+    # park_eviction_deferred_fm_unavailable).
+    #
+    # EXISTS BECAUSE THE TICK WAS PREVIOUSLY UNINSTRUMENTED.  There was no
+    # perf_counter anywhere in scheduler.py or harness.py and no duration event
+    # of any kind, so a regression that took the tick from seconds to ~14
+    # MINUTES — one uncached full-history `git log` per candidate in the
+    # already-landed gate — ran unnoticed for months and was only ever found by
+    # reconstructing a clock from an unrelated WARNING's cadence.  Dispatch
+    # rate is the orchestrator's headline throughput constraint; it should not
+    # be inferred from log archaeology.
+    #
+    # duration_ms is carried INSIDE data, not as the emit() column kwarg,
+    # because orchestrator/tests/_recording_event_store.py retains only
+    # (event_type, {task_id, data}) — a column-only duration is invisible to
+    # every existing test double.  verify_runner.py's merge_verify event sets
+    # the same precedent.
+    # data keys: {duration_ms, phases, terminal_phase, candidates}
+    #   duration_ms:    whole-tick wall time in ms (int)
+    #   phases:         {phase_label: ms} for each phase that ran (dict);
+    #                   a short-circuiting tick lists only the phases reached
+    #   terminal_phase: label of the phase that ended the tick, or None when
+    #                   the loop ran to completion without dispatching
+    #   candidates:     len(ctx.candidates) at the end of the tick, or None if
+    #                   the tick ended before candidates were built
+    scheduler_tick = 'scheduler_tick'
 
     # Paired (rebase → immediately-following verify) cost record.
     # Emitted once per real rebase (not short-circuit) in _verify_debugfix_loop.
