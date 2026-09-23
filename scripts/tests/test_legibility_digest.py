@@ -980,6 +980,96 @@ class TestSecondarySignals:
 
 
 # ---------------------------------------------------------------------------
+# Re-ingested content is excluded from EVERY signal bucket (task 5685), not
+# only the one it was first sighted in. Fixture shapes mirror the 2026-09-23
+# measurement over 35,882 dark-factory transcripts: the harness-injected
+# trickle-coder prompt embeds the digest it codes (908 sessions carried
+# phantom df_guard or interrupt hits from it), and a coder answer quotes that
+# digest back (273 of the 301 sessions it contaminated had df_guard hits).
+# ---------------------------------------------------------------------------
+
+def _trickle_coder_session_records():
+    """A synthetic whole-session reproduction of the b203a05c shape: the
+    harness-injected trickle-coder prompt, embedding the digest it codes, as
+    the one user turn, and the coder's answer as the one assistant text
+    block. Every signal literal in it is re-ingested."""
+    prompt = (
+        f'{_TRICKLE_CODER_PREAMBLE}\n\n=== SESSION DIGEST ===\n'
+        '## Guard Trips\n- (turn 21) blocked:\n'
+    )
+    answer = _coder_judgment(note="that's wrong: its turn 21 reads blocked: twice")
+    return [
+        _with_session_meta(_user_text(prompt)),
+        _with_session_meta(_assistant(_text(answer))),
+    ]
+
+
+class TestReingestedContentIsBucketAgnostic:
+    def test_df_guard_ignores_the_digest_a_coder_prompt_embeds(self):
+        records = [_user_text(f'{_TRICKLE_CODER_PREAMBLE}\n\n- (turn 21) blocked:')]
+
+        assert mod.iter_df_guards(records) == []
+
+    def test_df_guard_ignores_a_coder_judgment_quoting_a_trip(self):
+        records = [_assistant(_text(_coder_judgment(note='its turn 21 reads blocked:')))]
+
+        assert mod.iter_df_guards(records) == []
+
+    @pytest.mark.parametrize(
+        'record',
+        [_user_text('the merge got BLOCKED: again, why?'), _tool_result('tu-1', 'BLOCKED: real block')],
+        ids=['user_turn', 'tool_result'],
+    )
+    def test_df_guard_still_hits_the_same_literal_in_dialogue(self, record):
+        assert [h['pattern'] for h in mod.iter_df_guards([record])] == ['blocked:']
+
+    def test_not_found_ignores_foreign_material_carrying_a_harness_prompt(self):
+        # The measured Read-of-source / transcript-dump shape: a tool_result
+        # holding another session's material, harness marker and all.
+        records = [_tool_result(
+            'tu-1', f'{_TRICKLE_CODER_PREAMBLE}\n## Not Found\n- (turn 3) no such file or directory',
+        )]
+
+        assert mod.iter_not_found(records) == []
+
+    def test_not_found_ignores_a_tool_result_that_is_a_coder_judgment(self):
+        records = [_tool_result('tu-1', _coder_judgment(note='cat: x.py: No such file or directory'))]
+
+        assert mod.iter_not_found(records) == []
+
+    def test_not_found_still_hits_the_same_literal_in_an_ordinary_tool_result(self):
+        records = [_tool_result('tu-1', 'cat: x.py: No such file or directory', is_error=True)]
+
+        assert [h['pattern'] for h in mod.iter_not_found(records)] == ['no such file or directory']
+
+    def test_interrupt_ignores_the_digest_a_harness_prompt_embeds(self):
+        records = [_user_text(
+            f'{_TRICKLE_CODER_PREAMBLE}\n\n## Interrupts\n- (turn 7) request interrupted by user',
+        )]
+
+        assert mod.iter_interrupts(records) == []
+
+    def test_a_trickle_coder_session_reports_every_signal_zero(self):
+        counts = mod.signal_counts(_trickle_coder_session_records())
+
+        assert counts == dict.fromkeys(mod.SIGNAL_COUNT_KEYS, 0)
+
+    def test_classify_agent_class_still_reads_the_raw_carriers(self):
+        """Exists to stop _dialogue_text_sources being wired into
+        classify_agent_class, which classifies a session BY its injected
+        markers: reading the filtered layer would delete its own evidence and
+        collapse this orchestrated session to 'interactive'. The first
+        assertion is the premise that makes the second one discriminate."""
+        text = _briefing_text(
+            body_filler='Task ID: 42\nWorktree: /home/leo/src/dark-factory/.worktrees/42',
+        )
+        records = [_user_text(text)]
+
+        assert mod.is_reingested_content(text) is True
+        assert mod.classify_agent_class(records) == 'orchestrated-task'
+
+
+# ---------------------------------------------------------------------------
 # find_retry_loops — same tool name + canonical (sort_keys) input signature
 # recurring >= RETRY_MIN (3) times across the session. Deterministic,
 # dependency-free grouping -- no fuzzy string similarity.
