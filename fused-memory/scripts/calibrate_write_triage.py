@@ -127,6 +127,35 @@ def load_fixture(path: str | Path) -> list[dict[str, Any]]:
     return records
 
 
+def load_canonical_aliases(path: str | Path) -> dict[str, str]:
+    """Read the ``{old_cluster_canonical_id: current_memory_id}`` alias map.
+
+    Resolves a rotated-canonical corpus gap: a fixture's ``cluster_id``
+    that no longer exists in the live store because the cluster was
+    re-consolidated under a new id. The map is external, hand-verified
+    data (each entry's target must be confirmed live before it is trusted
+    — see the calibration run's provenance/summary for that evidence), not
+    something this script derives.
+
+    Strict like ``load_fixture``: a malformed file raises rather than
+    silently degrading to an empty map, which would make ``--canonical-
+    aliases`` a silent no-op indistinguishable from "nothing to resolve".
+    """
+    path = Path(path)
+    try:
+        raw = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise ValueError(f'{path}: malformed JSON: {exc}') from exc
+    if not isinstance(raw, dict):
+        raise ValueError(f'{path}: expected a JSON object, got {type(raw).__name__}')
+    for key, value in raw.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise ValueError(
+                f'{path}: alias entries must be str -> str, got {key!r} -> {value!r}',
+            )
+    return dict(raw)
+
+
 # ---------------------------------------------------------------------------
 # Pair construction
 # ---------------------------------------------------------------------------
@@ -410,20 +439,63 @@ def derive_bands(
 # Candidate-retrieval recall
 # ---------------------------------------------------------------------------
 
+def _first_match_rank(
+    candidates: Sequence[str],
+    match_ids: frozenset[str],
+    candidate_parents: Mapping[str, str],
+) -> int:
+    """1-based rank of the first *candidates* entry that reaches *match_ids*.
+
+    A candidate reaches *match_ids* by its own id, or — when
+    *candidate_parents* carries an entry for it — by the id it hoists to.
+    ``candidate_parents`` mirrors production's
+    ``write_triage.py::_canonical_id_of``: a sighting/amendment child is
+    counted as reaching whatever its ``metadata.parent_id`` resolves to,
+    the same hoist a live triaged write gets credit for. Returns -1 if no
+    candidate reaches *match_ids*.
+    """
+    for rank, candidate_id in enumerate(candidates, start=1):
+        if candidate_id in match_ids or candidate_parents.get(candidate_id) in match_ids:
+            return rank
+    return -1
+
+
 def compute_recall_at_k(
     retrievals: Sequence[dict[str, Any]],
     ks: Sequence[int],
+    aliases: Mapping[str, str] | None = None,
+    *,
+    count_absent_as_miss: bool = False,
 ) -> dict[str, Any]:
     """Measure how often the existing search surfaces the ground-truth canonical.
 
     Each retrieval carries ``memory_id``, ``canonical_id``,
-    ``canonical_present`` and the ranked ``candidates`` search returned.
+    ``canonical_present``, the ranked ``candidates`` search returned, and
+    optionally ``candidate_parents`` (candidate id -> its
+    ``metadata.parent_id``, for candidates that carry one).
 
-    Retrievals whose canonical is not in the corpus are listed under
-    ``canonical_absent`` and dropped from the denominator. The session's
-    duplicates were deleted, so an absent canonical is a CORPUS GAP rather
-    than a retrieval failure; scoring it as a miss would understate recall
-    and could push T_low lower than the evidence supports.
+    Three populations, chosen by the two keyword args (default: the
+    original legacy behaviour, unchanged):
+
+    - ``count_absent_as_miss=False``, ``aliases=None`` (default): retrievals
+      whose canonical is not in the corpus are listed under
+      ``canonical_absent`` and DROPPED from the denominator. A session's
+      duplicates were deleted, so an absent canonical is a CORPUS GAP rather
+      than a retrieval failure when nothing resolves it; scoring it as a
+      miss would understate recall and could push T_low lower than the
+      evidence supports.
+    - ``count_absent_as_miss=True``, ``aliases=None``: every retrieval is in
+      the denominator; an absent canonical scores a forced miss (it cannot
+      appear in ``candidates`` — it does not exist).
+    - ``count_absent_as_miss=True``, ``aliases={old_canonical: current_id}``:
+      same full denominator, but a candidate now also reaches an absent
+      canonical's *alias* (its rotated successor) or a child that hoists to
+      the canonical OR its alias via ``candidate_parents`` — mirroring
+      ``write_triage.py::_canonical_id_of``. A previously-forced miss can
+      become a genuine hit once the rotation is resolved.
+
+    ``canonical_absent`` is always populated from the raw ``canonical_present``
+    flag (informational), independent of which population is scored.
 
     An empty denominator reports ``recall=None``, not ``0.0`` — no
     measurement is not a measured zero.
@@ -431,9 +503,10 @@ def compute_recall_at_k(
     scorable: list[dict[str, Any]] = []
     absent: list[dict[str, str]] = []
     for item in retrievals:
-        if item.get('canonical_present'):
+        present = bool(item.get('canonical_present'))
+        if present or count_absent_as_miss:
             scorable.append(item)
-        else:
+        if not present:
             absent.append({
                 'memory_id': str(item.get('memory_id')),
                 'canonical_id': str(item.get('canonical_id')),
@@ -441,10 +514,19 @@ def compute_recall_at_k(
 
     per_k: list[dict[str, Any]] = []
     for k in ks:
-        hits = sum(
-            1 for item in scorable
-            if item['canonical_id'] in list(item.get('candidates') or [])[:k]
-        )
+        hits = 0
+        for item in scorable:
+            canonical_id = item['canonical_id']
+            match_ids = {canonical_id}
+            candidate_parents: Mapping[str, str] = {}
+            if aliases is not None:
+                alias = aliases.get(canonical_id)
+                if alias:
+                    match_ids.add(alias)
+                candidate_parents = item.get('candidate_parents') or {}
+            candidates = list(item.get('candidates') or [])[:k]
+            if _first_match_rank(candidates, frozenset(match_ids), candidate_parents) != -1:
+                hits += 1
         total = len(scorable)
         per_k.append({
             'k': k,
@@ -454,6 +536,45 @@ def compute_recall_at_k(
         })
 
     return {'per_k': per_k, 'canonical_absent': absent}
+
+
+def compute_first_hit_ranks(
+    retrievals: Sequence[dict[str, Any]],
+    aliases: Mapping[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Per-record rank at which its canonical first appears, or -1.
+
+    ``rank`` is the plain canonical-id-only rank — no aliasing, no
+    parent_id child-hoist — comparable across retrieval modes and to the
+    committed report's methodology.
+
+    ``alias_id`` / ``rank_with_aliases`` are present only for a record whose
+    ``canonical_id`` has an entry in *aliases*: ``rank_with_aliases`` is the
+    first rank reaching the canonical, its alias, or a child hoisting to
+    either (mirroring ``write_triage.py::_canonical_id_of``).
+
+    Both ranks are 1-based; -1 means the ranked candidates never reach it.
+    """
+    aliases = dict(aliases or {})
+    rows: list[dict[str, Any]] = []
+    for item in retrievals:
+        canonical_id = item['canonical_id']
+        candidates = list(item.get('candidates') or [])
+        row: dict[str, Any] = {
+            'memory_id': item['memory_id'],
+            'canonical_id': canonical_id,
+            'canonical_present': bool(item.get('canonical_present')),
+            'rank': _first_match_rank(candidates, frozenset({canonical_id}), {}),
+        }
+        alias = aliases.get(canonical_id)
+        if alias is not None:
+            candidate_parents = item.get('candidate_parents') or {}
+            row['alias_id'] = alias
+            row['rank_with_aliases'] = _first_match_rank(
+                candidates, frozenset({canonical_id, alias}), candidate_parents,
+            )
+        rows.append(row)
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -991,17 +1112,26 @@ def run_calibration(
     report_path: str | Path,
     ks: Sequence[int],
     provenance: dict[str, Any],
+    aliases: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Measure, derive, and write the report. Never writes config.
 
     ``embed_fn(memory_id, content)`` is called exactly ONCE per distinct
     record — embedding per pair would multiply API cost by O(n).
-    ``search_fn(record, k)`` returns ``{candidates, canonical_present}``.
+    ``search_fn(record, k)`` returns ``{candidates, canonical_present}``,
+    plus optionally ``candidate_parents`` (see ``compute_recall_at_k``).
 
     Neither callable's failure is caught. A swallowed embed error would
     silently shrink the measured population, producing a report whose
     thresholds look fine but were computed on a subset; a swallowed search
     error would be indistinguishable from a genuine recall miss.
+
+    ``aliases``, when given, is forwarded to ``compute_recall_at_k`` AND
+    switches its population to ``count_absent_as_miss=True`` — once a
+    rotated canonical has a resolved successor, the honest denominator
+    includes it rather than silently excluding a corpus gap that a caller
+    explicitly resolved. ``aliases=None`` (the default) keeps the original
+    legacy population, unchanged.
     """
     vectors = {r['memory_id']: embed_fn(r['memory_id'], r['content']) for r in records}
     logger.info('Embedded %d distinct record(s)', len(vectors))
@@ -1049,8 +1179,11 @@ def run_calibration(
             'canonical_id': record['cluster_id'],
             'canonical_present': bool(hit.get('canonical_present')),
             'candidates': list(hit.get('candidates') or []),
+            'candidate_parents': dict(hit.get('candidate_parents') or {}),
         })
-    recall = compute_recall_at_k(retrievals, list(ks))
+    recall = compute_recall_at_k(
+        retrievals, list(ks), aliases=aliases, count_absent_as_miss=aliases is not None,
+    )
 
     per_category_record_counts: dict[str, int] = {}
     for record in records:
@@ -1080,13 +1213,46 @@ def run_calibration(
     return {
         'report': report, 'scores_by_class': scores_by_class,
         't_high': t_high, 't_low': t_low, 'reason': reason,
-        'config_written': False,
+        'config_written': False, 'retrievals': retrievals,
     }
 
 
 # ---------------------------------------------------------------------------
 # Live edge / CLI
 # ---------------------------------------------------------------------------
+
+#: Valid ``--retrieval`` values (module constant so the CLI and the
+#: function below share one spelling of the vocabulary — INV-5/heuristic 12).
+RETRIEVAL_MODES = ('legacy', 'production')
+
+
+def search_kwargs_for_retrieval(retrieval_mode: str) -> dict[str, Any]:
+    """The extra ``MemoryService.search`` kwargs for *retrieval_mode*.
+
+    ``'production'`` passes EXACTLY what
+    ``fused_memory.server.write_triage::retrieve_candidates`` passes on a
+    live triaged write — the three Mem0-primary categories (sorted, as
+    that call site sorts them) and ``anchor_topics=False`` — so the
+    measured recall matches what write_triage actually sees, not a
+    reconstruction of it. ``'legacy'`` (the default) passes neither,
+    preserving the committed report's search shape for reproducibility.
+
+    A bad *retrieval_mode* raises rather than silently falling back to
+    legacy — an unrecognized mode is a caller bug, not a preference.
+    """
+    if retrieval_mode == 'production':
+        from fused_memory.models.enums import MEM0_PRIMARY  # noqa: PLC0415
+
+        return {
+            'categories': sorted(category.value for category in MEM0_PRIMARY),
+            'anchor_topics': False,
+        }
+    if retrieval_mode == 'legacy':
+        return {}
+    raise ValueError(
+        f'unknown --retrieval mode {retrieval_mode!r}; expected one of {RETRIEVAL_MODES}',
+    )
+
 
 def build_embed_fn(config: Any) -> Any:
     """Mirror Mem0's own embedder wiring — model + api_key, NO dimensions.
@@ -1117,11 +1283,15 @@ async def _run(args: Any) -> int:
     import os  # noqa: PLC0415
 
     from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+    from fused_memory.server.grouped_read import CHILD_KINDS, PARENT_ID_KEY  # noqa: PLC0415
     from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
 
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)
+
+    aliases = load_canonical_aliases(args.canonical_aliases) if args.canonical_aliases else None
+    retrieval_kwargs = search_kwargs_for_retrieval(args.retrieval)
 
     config = FusedMemoryConfig()
     memory = MemoryService(config)
@@ -1144,15 +1314,33 @@ async def _run(args: Any) -> int:
             # the fused_reify Qdrant collection), so mem0 is the store whose
             # recall the bands actually depend on. Measured on a 6-record
             # probe: 0/6 canonicals in top-10 unscoped vs 4/6 scoped to mem0.
+            #
+            # `retrieval_kwargs` is EMPTY under --retrieval legacy (today's
+            # committed-report shape) and, under --retrieval production, is
+            # EXACTLY write_triage.py::retrieve_candidates's own kwargs
+            # (categories=the 3 Mem0-primary values, anchor_topics=False) —
+            # see search_kwargs_for_retrieval.
             results = await memory.search(
                 query=record['content'], project_id=args.project_id, limit=k,
-                stores=['mem0'],
+                stores=['mem0'], **retrieval_kwargs,
             )
             rows = results.get('results', results) if isinstance(results, dict) else results
             # MemoryService.search returns pydantic MemoryResult rows, not dicts.
-            candidates = [
-                str(r['id'] if isinstance(r, dict) else r.id) for r in rows or []
-            ]
+            candidates: list[str] = []
+            candidate_parents: dict[str, str] = {}
+            for r in rows or []:
+                rid = str(r['id'] if isinstance(r, dict) else r.id)
+                candidates.append(rid)
+                meta = r.get('metadata') if isinstance(r, dict) else getattr(r, 'metadata', None)
+                meta = meta or {}
+                # Mirrors write_triage.py::_canonical_id_of's child-hoist rule
+                # exactly (same imported constants) — a sighting/amendment
+                # candidate is credited to its parent, not scored as a miss
+                # under its own never-matching child id.
+                if meta.get('kind') in CHILD_KINDS:
+                    parent_id = meta.get(PARENT_ID_KEY)
+                    if isinstance(parent_id, str) and parent_id:
+                        candidate_parents[rid] = parent_id
             canonical = await memory.get_memory_by_id(
                 args.project_id, record['cluster_id'],
             )
@@ -1162,7 +1350,10 @@ async def _run(args: Any) -> int:
                 present = bool(canonical.get('found', True))
             else:
                 present = bool(getattr(canonical, 'found', True))
-            return {'candidates': candidates, 'canonical_present': present}
+            return {
+                'candidates': candidates, 'candidate_parents': candidate_parents,
+                'canonical_present': present,
+            }
 
         # Pre-resolve retrievals on this loop, then hand run_calibration a
         # plain lookup — keeps the orchestrator fully synchronous and
@@ -1186,8 +1377,24 @@ async def _run(args: Any) -> int:
                 'embedder_dimensions': getattr(config.embedder, 'dimensions', None),
                 'search_stores': 'mem0 (MemoryService.search, stores=[mem0])',
                 'search_categories': 'all',
+                'retrieval_mode': args.retrieval,
+                'retrieval_search_kwargs': retrieval_kwargs,
+                'canonical_aliases_path': (
+                    package_relative(args.canonical_aliases) if args.canonical_aliases else None
+                ),
+                'canonical_aliases_count': len(aliases) if aliases else 0,
             },
+            aliases=aliases,
         )
+
+        if args.ranks_path:
+            ranks = compute_first_hit_ranks(result['retrievals'], aliases=aliases)
+            ranks_path = Path(args.ranks_path)
+            ranks_path.parent.mkdir(parents=True, exist_ok=True)
+            ranks_path.write_text(
+                '\n'.join(json.dumps(row) for row in ranks) + ('\n' if ranks else ''),
+            )
+            logger.info('Wrote %d rank row(s) to %s', len(ranks), ranks_path)
 
         print(json.dumps(result['report'], indent=2))
         logger.info(
@@ -1261,6 +1468,23 @@ def main() -> int:
     parser.add_argument('--write-config', dest='write_config', action='store_true',
                         help='Write the derived thresholds into config.yaml '
                              '(default: report only)')
+    parser.add_argument('--retrieval', choices=RETRIEVAL_MODES, default='legacy',
+                        help="'legacy' (default) reproduces the committed report's search "
+                             "shape; 'production' passes exactly the kwargs "
+                             'write_triage.py::retrieve_candidates passes on a live '
+                             'triaged write (categories=the 3 Mem0-primary values, '
+                             'anchor_topics=False) — see search_kwargs_for_retrieval.')
+    parser.add_argument('--canonical-aliases', dest='canonical_aliases', default=None,
+                        help='Path to a JSON {old_cluster_canonical_id: current_memory_id} '
+                             'map resolving rotated canonicals. When given, recall is '
+                             'measured against the full population (absent canonicals '
+                             'counted, resolved via their alias or a hoisted child) '
+                             'instead of the legacy present-only population.')
+    parser.add_argument('--ranks-path', dest='ranks_path', default=None,
+                        help='Optional path to write one JSON line per non-canonical '
+                             'record: the rank at which its canonical (or, with '
+                             '--canonical-aliases, its alias/hoisted child) first '
+                             'appears, or -1. See compute_first_hit_ranks.')
     args = parser.parse_args()
     if not args.k:
         args.k = [1, 3, 5, 10]

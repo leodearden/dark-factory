@@ -2391,7 +2391,7 @@ def _search_fn(hits: dict[str, list[str]] | None = None, present: set[str] | Non
     return search
 
 
-def _run(tmp_path: Path, records=None, embed=None, search=None, ks=(1, 5)):
+def _run(tmp_path: Path, records=None, embed=None, search=None, ks=(1, 5), aliases_map=None):
     return _mod().run_calibration(
         records=records if records is not None else _e2e_records(),
         embed_fn=embed if embed is not None else _embed_fn(),
@@ -2400,6 +2400,7 @@ def _run(tmp_path: Path, records=None, embed=None, search=None, ks=(1, 5)):
         ks=list(ks),
         provenance={'fixture_path': 'x.jsonl', 'embedder_model': 'text-embedding-3-small',
                     'embedder_dimensions': 1536},
+        aliases=aliases_map,
     )
 
 
@@ -2917,3 +2918,273 @@ class TestCommittedPerCategoryEvidenceIsRecorded:
                 f'appears in config as {by_category[category]!r} — "uncalibrated" '
                 f'must have exactly one spelling: absent'
             )
+
+
+# ---------------------------------------------------------------------------
+# compute_recall_at_k: aliases, count_absent_as_miss, parent_id child-hoist
+# ---------------------------------------------------------------------------
+
+def _retrieval_with_parents(
+    mid: str, canonical: str, candidates: list[str],
+    candidate_parents: dict[str, str] | None = None, *, present: bool = True,
+) -> dict:
+    return {
+        'memory_id': mid,
+        'canonical_id': canonical,
+        'canonical_present': present,
+        'candidates': candidates,
+        'candidate_parents': candidate_parents or {},
+    }
+
+
+class TestComputeRecallAtKAliasesAndPopulation:
+    """Production parity (task's retrieval-recall leaf): rotated-canonical
+    resolution and the child-hoist rule mirroring
+    write_triage.py::_canonical_id_of."""
+
+    def test_default_behaviour_is_byte_identical_to_the_legacy_call(self) -> None:
+        """No aliases, no count_absent_as_miss kwarg: must match the original
+        two-positional-arg call exactly — this is the reproducibility
+        contract the committed report depends on."""
+        retrievals = [
+            _retrieval('d1', 'c1', ['c1', 'z']),
+            _retrieval('d2', 'gone', ['z'], present=False),
+        ]
+        assert _mod().compute_recall_at_k(retrievals, [1]) == (
+            _mod().compute_recall_at_k(retrievals, [1], None)
+        )
+
+    def test_an_alias_widens_the_match_to_the_rotated_successor(self) -> None:
+        """A candidate carrying the ALIAS id (not the deleted original
+        canonical id) must count as a hit once an alias map is given."""
+        retrievals = [_retrieval('d1', 'old-canonical', ['x', 'new-canonical'], present=False)]
+        got = _mod().compute_recall_at_k(
+            retrievals, [1, 5], aliases={'old-canonical': 'new-canonical'},
+            count_absent_as_miss=True,
+        )
+        by_k = _recall_by_k(got)
+        assert by_k[1] == pytest.approx(0.0), 'rank 2 must not count at k=1'
+        assert by_k[5] == pytest.approx(1.0), 'the alias hit counts at k=5'
+
+    def test_without_count_absent_as_miss_an_absent_canonical_stays_excluded(
+        self,
+    ) -> None:
+        """Supplying aliases alone must not silently change the denominator —
+        that is a separate, explicit choice (count_absent_as_miss)."""
+        retrievals = [_retrieval('d1', 'gone', ['z'], present=False)]
+        got = _mod().compute_recall_at_k(retrievals, [1], aliases={'gone': 'z'})
+        assert got['per_k'][0]['total'] == 0, (
+            'aliases without count_absent_as_miss must not widen the denominator'
+        )
+
+    def test_count_absent_as_miss_widens_the_denominator_with_no_aliases(self) -> None:
+        """The (b) population: every retrieval counted, an absent canonical
+        that cannot be resolved scores a forced miss."""
+        retrievals = [
+            _retrieval('d1', 'c1', ['c1']),
+            _retrieval('d2', 'gone', ['z', 'y'], present=False),
+        ]
+        got = _mod().compute_recall_at_k(retrievals, [1, 5], count_absent_as_miss=True)
+        by_k = _recall_by_k(got)
+        assert got['per_k'][0]['total'] == 2, 'both retrievals must be in the denominator'
+        assert by_k[1] == pytest.approx(0.5)
+        assert by_k[5] == pytest.approx(0.5), (
+            'an unresolved absent canonical can never appear in candidates, '
+            'at any k — it does not exist'
+        )
+
+    def test_canonical_absent_is_still_reported_even_when_scored(self) -> None:
+        """canonical_absent stays informational regardless of the population
+        toggle — a reader must still be able to see which records were
+        corpus gaps even when count_absent_as_miss folds them into scoring."""
+        retrievals = [_retrieval('d1', 'gone', ['z'], present=False)]
+        got = _mod().compute_recall_at_k(retrievals, [1], count_absent_as_miss=True)
+        assert len(got['canonical_absent']) == 1
+
+    def test_a_child_candidate_hoists_to_its_parent_only_when_aliases_given(
+        self,
+    ) -> None:
+        """Mirrors write_triage.py::_canonical_id_of: a sighting/amendment
+        candidate whose metadata.parent_id is the canonical must count as a
+        hit — but only once the caller opts into alias-aware scoring
+        (aliases not None), matching the child-hoist rule to its documented
+        home in compute_recall_at_k's aliases contract."""
+        retrievals = [
+            _retrieval_with_parents(
+                'd1', 'c1', ['z', 'child-of-c1'], {'child-of-c1': 'c1'},
+            ),
+        ]
+        without_aliases = _mod().compute_recall_at_k(retrievals, [5])
+        assert without_aliases['per_k'][0]['hits'] == 0, (
+            'no aliases arg: the plain candidate-id-only match must not hoist'
+        )
+        with_aliases = _mod().compute_recall_at_k(retrievals, [5], aliases={})
+        assert with_aliases['per_k'][0]['hits'] == 1, (
+            'aliases={} (explicitly given, even if empty) enables the '
+            'child-hoist rule for every candidate that carries a parent_id'
+        )
+
+    def test_a_child_of_an_alias_also_hoists(self) -> None:
+        """A child of the ROTATED SUCCESSOR (not the original canonical)
+        must also count — the hoist target is matched against the full
+        {canonical, alias} set."""
+        retrievals = [
+            _retrieval_with_parents(
+                'd1', 'old', ['z', 'child-of-new'], {'child-of-new': 'new'},
+                present=False,
+            ),
+        ]
+        got = _mod().compute_recall_at_k(
+            retrievals, [5], aliases={'old': 'new'}, count_absent_as_miss=True,
+        )
+        assert got['per_k'][0]['hits'] == 1
+
+
+# ---------------------------------------------------------------------------
+# compute_first_hit_ranks
+# ---------------------------------------------------------------------------
+
+class TestComputeFirstHitRanks:
+    def test_reports_the_one_based_rank_of_the_canonical(self) -> None:
+        retrievals = [_retrieval('d1', 'c1', ['z', 'c1', 'y'])]
+        got = _mod().compute_first_hit_ranks(retrievals)
+        assert got == [{
+            'memory_id': 'd1', 'canonical_id': 'c1',
+            'canonical_present': True, 'rank': 2,
+        }]
+
+    def test_reports_minus_one_when_the_canonical_never_appears(self) -> None:
+        retrievals = [_retrieval('d1', 'c1', ['z', 'y'])]
+        got = _mod().compute_first_hit_ranks(retrievals)
+        assert got[0]['rank'] == -1
+
+    def test_omits_alias_fields_when_no_alias_is_known_for_the_canonical(self) -> None:
+        retrievals = [_retrieval('d1', 'c1', ['c1'])]
+        got = _mod().compute_first_hit_ranks(retrievals, aliases={'other': 'x'})
+        assert 'alias_id' not in got[0]
+        assert 'rank_with_aliases' not in got[0]
+
+    def test_rank_with_aliases_can_improve_on_the_plain_rank(self) -> None:
+        retrievals = [_retrieval('d1', 'old', ['z', 'new', 'y'], present=False)]
+        got = _mod().compute_first_hit_ranks(retrievals, aliases={'old': 'new'})
+        row = got[0]
+        assert row['rank'] == -1, 'the plain (unaliased) rank must not resolve'
+        assert row['alias_id'] == 'new'
+        assert row['rank_with_aliases'] == 2
+
+    def test_covers_every_non_canonical_retrieval(self) -> None:
+        retrievals = [
+            _retrieval('d1', 'c1', ['c1']),
+            _retrieval('d2', 'c2', ['z'], present=False),
+        ]
+        got = _mod().compute_first_hit_ranks(retrievals)
+        assert {row['memory_id'] for row in got} == {'d1', 'd2'}
+
+
+# ---------------------------------------------------------------------------
+# search_kwargs_for_retrieval — production parity
+# ---------------------------------------------------------------------------
+
+class TestSearchKwargsForRetrieval:
+    def test_legacy_passes_no_extra_kwargs(self) -> None:
+        assert _mod().search_kwargs_for_retrieval('legacy') == {}
+
+    def test_production_matches_write_triage_retrieve_candidates_exactly(self) -> None:
+        """The one figure that matters for this leaf: these kwargs must be
+        IDENTICAL to fused_memory.server.write_triage::retrieve_candidates's
+        own call — categories=sorted(MEM0_PRIMARY values), anchor_topics=False."""
+        from fused_memory.models.enums import MEM0_PRIMARY
+
+        got = _mod().search_kwargs_for_retrieval('production')
+        assert got == {
+            'categories': sorted(c.value for c in MEM0_PRIMARY),
+            'anchor_topics': False,
+        }
+
+    def test_an_unknown_mode_raises_rather_than_silently_defaulting(self) -> None:
+        with pytest.raises(ValueError, match='unknown --retrieval mode'):
+            _mod().search_kwargs_for_retrieval('bogus')
+
+    def test_a_fake_search_fn_sees_the_production_kwargs(self) -> None:
+        """Exercises the actual call shape a live ``memory.search(...,
+        **search_kwargs_for_retrieval(mode))`` produces, via a fake search
+        callable — the kwargs a real MemoryService.search would receive."""
+        captured: dict = {}
+
+        def fake_search(**kwargs):
+            captured.update(kwargs)
+            return []
+
+        fake_search(
+            query='q', project_id='reify', limit=10, stores=['mem0'],
+            **_mod().search_kwargs_for_retrieval('production'),
+        )
+        assert captured['categories'] == sorted(
+            ['observations_and_summaries', 'preferences_and_norms', 'procedural_knowledge'],
+        )
+        assert captured['anchor_topics'] is False
+        assert captured['stores'] == ['mem0']
+
+
+# ---------------------------------------------------------------------------
+# load_canonical_aliases
+# ---------------------------------------------------------------------------
+
+class TestLoadCanonicalAliases:
+    def test_reads_a_valid_map(self, tmp_path: Path) -> None:
+        path = tmp_path / 'aliases.json'
+        path.write_text(json.dumps({'old': 'new'}))
+        assert _mod().load_canonical_aliases(path) == {'old': 'new'}
+
+    def test_rejects_malformed_json(self, tmp_path: Path) -> None:
+        path = tmp_path / 'aliases.json'
+        path.write_text('{not json')
+        with pytest.raises(ValueError, match='malformed JSON'):
+            _mod().load_canonical_aliases(path)
+
+    def test_rejects_a_non_object_top_level(self, tmp_path: Path) -> None:
+        path = tmp_path / 'aliases.json'
+        path.write_text(json.dumps(['old', 'new']))
+        with pytest.raises(ValueError, match='expected a JSON object'):
+            _mod().load_canonical_aliases(path)
+
+    def test_rejects_a_non_string_value(self, tmp_path: Path) -> None:
+        path = tmp_path / 'aliases.json'
+        path.write_text(json.dumps({'old': 123}))
+        with pytest.raises(ValueError, match='str -> str'):
+            _mod().load_canonical_aliases(path)
+
+
+# ---------------------------------------------------------------------------
+# run_calibration: aliases wiring + retrievals in the returned result
+# ---------------------------------------------------------------------------
+
+class TestRunCalibrationAliasesWiring:
+    def test_the_result_carries_the_raw_retrievals(self, tmp_path: Path) -> None:
+        got = _run(tmp_path)
+        assert 'retrievals' in got
+        memory_ids = {r['memory_id'] for r in got['retrievals']}
+        assert memory_ids == {'d1', 'd2'}, 'one retrieval per non-canonical fixture record'
+
+    def test_no_aliases_keeps_the_legacy_present_only_population(self, tmp_path: Path) -> None:
+        got = _run(
+            tmp_path,
+            search=_search_fn(hits={'d1': ['c1']}, present={'c1'}),
+        )
+        assert got['report']['recall_at_k']['per_k'][0]['total'] == 1, (
+            'd2 (canonical absent) must stay excluded when aliases is not given'
+        )
+
+    def test_aliases_switches_to_the_full_population(self, tmp_path: Path) -> None:
+        got = _run(
+            tmp_path,
+            search=_search_fn(hits={'d1': ['c1']}, present={'c1'}),
+            aliases_map={'c2': 'c2-alias'},
+        )
+        assert got['report']['recall_at_k']['per_k'][0]['total'] == 2, (
+            'aliases given: d2 must now be scored (as a miss, since its alias '
+            "never appears among the fake search_fn's candidates) rather than "
+            'excluded'
+        )
+
+
