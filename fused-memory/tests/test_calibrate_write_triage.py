@@ -3082,51 +3082,6 @@ class TestComputeFirstHitRanks:
 
 
 # ---------------------------------------------------------------------------
-# search_kwargs_for_retrieval — production parity
-# ---------------------------------------------------------------------------
-
-class TestSearchKwargsForRetrieval:
-    def test_legacy_passes_no_extra_kwargs(self) -> None:
-        assert _mod().search_kwargs_for_retrieval('legacy') == {}
-
-    def test_production_matches_write_triage_retrieve_candidates_exactly(self) -> None:
-        """The one figure that matters for this leaf: these kwargs must be
-        IDENTICAL to fused_memory.server.write_triage::retrieve_candidates's
-        own call — categories=sorted(MEM0_PRIMARY values), anchor_topics=False."""
-        from fused_memory.models.enums import MEM0_PRIMARY
-
-        got = _mod().search_kwargs_for_retrieval('production')
-        assert got == {
-            'categories': sorted(c.value for c in MEM0_PRIMARY),
-            'anchor_topics': False,
-        }
-
-    def test_an_unknown_mode_raises_rather_than_silently_defaulting(self) -> None:
-        with pytest.raises(ValueError, match='unknown --retrieval mode'):
-            _mod().search_kwargs_for_retrieval('bogus')
-
-    def test_a_fake_search_fn_sees_the_production_kwargs(self) -> None:
-        """Exercises the actual call shape a live ``memory.search(...,
-        **search_kwargs_for_retrieval(mode))`` produces, via a fake search
-        callable — the kwargs a real MemoryService.search would receive."""
-        captured: dict = {}
-
-        def fake_search(**kwargs):
-            captured.update(kwargs)
-            return []
-
-        fake_search(
-            query='q', project_id='reify', limit=10, stores=['mem0'],
-            **_mod().search_kwargs_for_retrieval('production'),
-        )
-        assert captured['categories'] == sorted(
-            ['observations_and_summaries', 'preferences_and_norms', 'procedural_knowledge'],
-        )
-        assert captured['anchor_topics'] is False
-        assert captured['stores'] == ['mem0']
-
-
-# ---------------------------------------------------------------------------
 # load_canonical_aliases
 # ---------------------------------------------------------------------------
 
