@@ -2481,6 +2481,18 @@ class TestAuthorizedRaiseLedger:
         assert path.read_text(encoding='utf-8') == metrics.render_ledger(committed)
 
 
+def _ledger_record(task_id: str, reason: str = 'net-additive work') -> dict:
+    """One ledger entry, built by the real writer rather than hand-written."""
+    return metrics.authorization_record(
+        metrics.RaiseAuthorization(task_id=task_id, reason=reason),
+        [metrics.Violation.rose('lines', _MQ, 21550, 21653)],
+    )
+
+
+def _ledger(*records: dict) -> dict:
+    return {**metrics.empty_ledger(), 'raises': list(records)}
+
+
 class TestLedgerAppendedEntries:
     """The ledger delta, and what makes append_authorization's promise checkable.
 
@@ -2492,28 +2504,17 @@ class TestLedgerAppendedEntries:
     that checks it.
     """
 
-    @staticmethod
-    def _record(task_id: str, reason: str = 'net-additive work') -> dict:
-        return metrics.authorization_record(
-            metrics.RaiseAuthorization(task_id=task_id, reason=reason),
-            [metrics.Violation.rose('lines', _MQ, 21550, 21653)],
-        )
-
-    @classmethod
-    def _ledger(cls, *records: dict) -> dict:
-        return {**metrics.empty_ledger(), 'raises': list(records)}
-
     def test_an_unchanged_ledger_appended_nothing(self) -> None:
-        ledger = self._ledger(self._record('5485'))
+        ledger = _ledger(_ledger_record('5485'))
 
         assert metrics.ledger_appended_entries(ledger, copy.deepcopy(ledger)) == []
 
     def test_the_appended_suffix_is_returned_in_order(self) -> None:
-        history = self._record('5485')
-        first, second = self._record('5722'), self._record('5723')
+        history = _ledger_record('5485')
+        first, second = _ledger_record('5722'), _ledger_record('5723')
 
         appended = metrics.ledger_appended_entries(
-            self._ledger(history), self._ledger(history, first, second)
+            _ledger(history), _ledger(history, first, second)
         )
 
         assert appended == [first, second]
@@ -2521,19 +2522,17 @@ class TestLedgerAppendedEntries:
     def test_the_day_one_shape_is_the_whole_list(self) -> None:
         # Previous is the fail-CLOSED empty ledger -- the state a commit that
         # authorizes the very first raise starts from.
-        record = self._record('5722')
+        record = _ledger_record('5722')
 
         assert metrics.ledger_appended_entries(
-            metrics.empty_ledger(), self._ledger(record)
+            metrics.empty_ledger(), _ledger(record)
         ) == [record]
 
     def test_dropping_a_historical_entry_is_refused_by_name(self) -> None:
-        history = [self._record('5485'), self._record('5675')]
+        history = [_ledger_record('5485'), _ledger_record('5675')]
 
         with pytest.raises(metrics.MetricsError) as excinfo:
-            metrics.ledger_appended_entries(
-                self._ledger(*history), self._ledger(history[0])
-            )
+            metrics.ledger_appended_entries(_ledger(*history), _ledger(history[0]))
 
         message = str(excinfo.value)
         assert 'append-only' in message
@@ -2545,20 +2544,113 @@ class TestLedgerAppendedEntries:
         # LENGTH EQUALITY IS NOT PREFIX EQUALITY. A rewrite keeps the count
         # identical, so any check that compared lengths would pass it -- and a
         # rewritten `reason` is exactly how a raise stops reading as what it was.
-        history = self._record('5485')
-        forged = self._record('5485', reason='actually it was a refactor')
+        history = _ledger_record('5485')
+        forged = _ledger_record('5485', reason='actually it was a refactor')
 
         with pytest.raises(metrics.MetricsError):
-            metrics.ledger_appended_entries(
-                self._ledger(history), self._ledger(forged)
-            )
+            metrics.ledger_appended_entries(_ledger(history), _ledger(forged))
 
     def test_reordering_history_is_refused(self) -> None:
-        first, second = self._record('5485'), self._record('5675')
+        first, second = _ledger_record('5485'), _ledger_record('5675')
 
         with pytest.raises(metrics.MetricsError):
             metrics.ledger_appended_entries(
-                self._ledger(first, second), self._ledger(second, first)
+                _ledger(first, second), _ledger(second, first)
+            )
+
+
+class TestLedgerMergedEntries:
+    """The ledger delta of a MERGE commit, read against BOTH parents' histories.
+
+    A conflicted merge finished with `git commit` runs pre-commit with
+    MERGE_HEAD set (esc-3620-11), so its staged ledger descends from two
+    recorded histories, not one. Each side's entries must survive whole, in
+    whichever block order the resolver kept them, and only what follows both is
+    the merge's OWN -- the one thing that may cover a raise the merge makes.
+    """
+
+    @staticmethod
+    def _entries() -> tuple[dict, dict, dict]:
+        """History both parents share, then one entry only ours / only theirs added."""
+        return _ledger_record('5485'), _ledger_record('5722'), _ledger_record('3620')
+
+    def test_a_parent_without_a_ledger_constrains_nothing(self) -> None:
+        # THE INCIDENT'S SHAPE: the task branch predates the ledger, so HEAD
+        # reads as the fail-closed empty one and main's entries are history.
+        _history, _ours_own, theirs_own = self._entries()
+
+        assert metrics.ledger_merged_entries(
+            metrics.empty_ledger(), _ledger(theirs_own), _ledger(theirs_own)
+        ) == []
+
+    def test_one_sides_additions_are_history_not_the_merges_own(self) -> None:
+        history, _ours_own, theirs_own = self._entries()
+
+        assert metrics.ledger_merged_entries(
+            _ledger(history),
+            _ledger(history, theirs_own),
+            _ledger(history, theirs_own),
+        ) == []
+
+    @pytest.mark.parametrize(
+        'theirs_first', [True, False], ids=['theirs-then-ours', 'ours-then-theirs']
+    )
+    def test_both_sides_additions_are_accepted_in_either_block_order(
+        self, theirs_first: bool
+    ) -> None:
+        # A resolver facing a both-sides-appended conflict keeps both blocks in
+        # whichever order the conflict shows them; neither order rewrites
+        # anything either parent recorded.
+        history, ours_own, theirs_own = self._entries()
+        blocks = [theirs_own, ours_own] if theirs_first else [ours_own, theirs_own]
+
+        assert metrics.ledger_merged_entries(
+            _ledger(history, ours_own),
+            _ledger(history, theirs_own),
+            _ledger(history, *blocks),
+        ) == []
+
+    def test_the_merges_own_additions_are_returned_in_order(self) -> None:
+        history, ours_own, theirs_own = self._entries()
+        first, second = _ledger_record('5792'), _ledger_record('5793')
+
+        appended = metrics.ledger_merged_entries(
+            _ledger(history, ours_own),
+            _ledger(history, theirs_own),
+            _ledger(history, theirs_own, ours_own, first, second),
+        )
+
+        assert appended == [first, second]
+
+    @pytest.mark.parametrize('dropped', ['ours', 'theirs'])
+    def test_dropping_an_entry_either_side_recorded_is_refused(
+        self, dropped: str
+    ) -> None:
+        # BOTH histories, not either: a merge resolved on main that kept only
+        # the task's entries would silently drop main's recorded ones.
+        history, ours_own, theirs_own = self._entries()
+        kept = theirs_own if dropped == 'ours' else ours_own
+
+        with pytest.raises(metrics.AppendOnlyViolation) as excinfo:
+            metrics.ledger_merged_entries(
+                _ledger(history, ours_own),
+                _ledger(history, theirs_own),
+                _ledger(history, kept),
+            )
+
+        assert 'append-only' in str(excinfo.value)
+
+    def test_rewriting_an_entry_one_side_recorded_is_refused(self) -> None:
+        # Same count, changed `reason`: length equality is not prefix equality
+        # here either.
+        history, ours_own, theirs_own = self._entries()
+        forged = _ledger_record('3620', reason='actually it was a refactor')
+
+        with pytest.raises(metrics.AppendOnlyViolation):
+            metrics.ledger_merged_entries(
+                _ledger(history, ours_own),
+                _ledger(history, theirs_own),
+                _ledger(history, forged, ours_own),
             )
 
 
