@@ -493,12 +493,30 @@ class EvalPlan:
     ``provenance`` is the plan's OWN disclosure — the fields that describe how
     the slates were obtained. It is merged UNDER the caller's, so nothing here
     can overwrite what the operator asked for.
+
+    A case routed to the judge must show it at least one candidate, and that
+    is checked at construction, before anything is spent or written.
     """
 
     cases: tuple[dict[str, Any], ...]
     records_by_id: Mapping[str, Mapping[str, Any]]
     record_count: int
     provenance: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        unseen = [
+            f"{case['memory_id']} ({case['expected_class']})"
+            for case in self.cases
+            if case['band'] == OUTCOME_JUDGE and not case['candidates']
+        ]
+        if unseen:
+            raise ValueError(
+                f'{len(unseen)} judge-band case(s) have an EMPTY slate: '
+                f'{", ".join(unseen)}. judge_write answers those `stored` with no '
+                'provider call, so the eval would count a verdict nobody gave. A '
+                'single-cluster run leaves the distractor control nothing to draw '
+                'from: widen --limit or the fixture.',
+            )
 
 
 def seeded_plan(
