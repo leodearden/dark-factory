@@ -17,6 +17,7 @@ including one case where the observation was genuinely wire-deserialized.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -533,6 +534,71 @@ class TestRecordOpensDebt:
     """
 
     ONE_ID = ('orchestrator/tests/test_x.py::test_y',)
+
+    # -- (a0) the bounds (task 4974) -------------------------------------------
+
+    async def test_filings_are_capped_per_observation(
+        self, tmp_path: Path, caplog, monkeypatch,
+    ) -> None:
+        """Ten carried tests against a cap of three: three filings, three debt rows,
+        TEN occurrence rows, and a WARNING that names the seven left out.
+
+        The cap protects the merge path, not the evidence: the occurrence row is
+        recorded for every test unconditionally, and a test past the cap simply gets
+        its debt row on its next suppression.
+        """
+        from orchestrator import flake_recorder
+
+        monkeypatch.setattr(flake_recorder, '_DEBT_FILINGS_PER_OBSERVATION_CAP', 3)
+        ids = tuple(f'orchestrator/tests/test_burst.py::test_{i}' for i in range(10))
+        client = _FakeLedgerTaskClient()
+
+        with caplog.at_level(logging.WARNING):
+            await _record(_result(_suppression(test_ids=ids)), tmp_path, task_client=client)
+
+        assert len(client.submit_calls) == 3, client.submit_calls
+        rows = list_open_debt(ledger_db_path(tmp_path))
+        assert {r.test_id for r in rows} == set(ids[:3]), rows
+        assert all(r.owner_task_id for r in rows), rows
+        assert len(_occurrences(tmp_path)) == 10
+        capped = [r for r in caplog.records if 'filing cap' in r.getMessage()]
+        assert len(capped) == 1, caplog.text
+        assert 'the last 7' in capped[0].getMessage(), capped[0].getMessage()
+        assert ids[9] in capped[0].getMessage()
+
+    async def test_filing_phase_is_time_bounded(
+        self, tmp_path: Path, caplog, monkeypatch,
+    ) -> None:
+        """A filing that never returns costs at most the budget, never the merge.
+
+        The client hangs on its first ``submit_task``; with the budget shrunk the
+        recorder must come back, keep the occurrence row it wrote first, and report the
+        unfinished filings as a lost signal.  The outer ``wait_for`` is the test's own
+        alarm: without the bound, this call would never return at all.
+        """
+        from orchestrator import flake_recorder
+
+        monkeypatch.setattr(flake_recorder, '_DEBT_FILING_BUDGET_SECS', 0.05)
+        never = asyncio.Event()
+
+        class _Hanging(_FakeLedgerTaskClient):
+            async def submit_task(self, arguments: dict) -> str:
+                self.submit_calls.append(arguments)
+                await never.wait()
+                return 'unreachable'
+
+        client = _Hanging()
+        with caplog.at_level(logging.WARNING):
+            await asyncio.wait_for(
+                _record(_result(_suppression()), tmp_path, task_client=client),
+                timeout=5,
+            )
+
+        assert len(client.submit_calls) == 1, client.submit_calls
+        assert len(_occurrences(tmp_path)) == len(_IDS)
+        lost = [r for r in caplog.records if '[debt-filing-budget]' in r.getMessage()]
+        assert len(lost) == 1, caplog.text
+        assert client.commit_calls == [], 'a cancelled filing must not have committed'
 
     # -- (a) the verdict gate -------------------------------------------------
 

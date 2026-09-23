@@ -43,6 +43,7 @@ import cycle with either.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -107,6 +108,25 @@ _MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD = 5
 #: Fixed dedup sentinel task_id for the storm escalation — the signal is a
 #: global fleet-health condition, not tied to any one merge task.
 _MERGE_FLAKE_SUPPRESSION_STORM_SENTINEL = 'merge-flake-suppression-storm'
+
+#: Upper bound on de-flake filings ONE observation may attempt (task 4974).  A filing
+#: is up to three MCP round trips (``get_statuses`` / ``submit_task`` /
+#: ``commit_planning``) awaited SERIALLY on the merge post-verify path, and
+#: ``FlakeSuppression.test_ids`` is uncapped, so without a bound a broad flake burst
+#: against a degraded fused-memory could hold the merge queue for as long as it liked.
+#: Tests past the cap still get their occurrence row (recorded above, unconditionally);
+#: they get a debt row on their NEXT suppression instead.  Not a timeout, so §5.5's
+#: never-widen rule does not apply — but do not raise it as a "fix" for a burst either:
+#: a burst that large is INV-4's storm, and the escape for it is the streak, not more
+#: filings.
+_DEBT_FILINGS_PER_OBSERVATION_CAP = 8
+
+#: Wall-clock budget, in seconds, for the WHOLE filing phase of one observation
+#: (task 4974).  Bounds the per-filing worst case (~75 s of MCP timeouts) times the cap
+#: above to something the merge queue can absorb; on expiry the remaining filings are
+#: a lost signal (logged loudly, like every other lost signal here), never a stalled
+#: merge.  This is an added bound, not a widened one.
+_DEBT_FILING_BUDGET_SECS = 120.0
 
 
 def _bump_suppression_streak_and_maybe_escalate(
@@ -411,13 +431,38 @@ async def record_merge_flake_suppression(
             return
         carried: list[str] = []
         _guarded('debt-test-ids', lambda: carried.extend(s.test_ids))
-        for carried_test_id in carried:
-            await _guarded_async(
-                'debt',
-                lambda tid=carried_test_id: open_debt(
-                    ledger_db_path(project_root),
-                    project_id,
-                    tid,
-                    task_client=task_client,
-                ),
+        cap = _DEBT_FILINGS_PER_OBSERVATION_CAP
+        if len(carried) > cap:
+            logger.warning(
+                'flake_recorder: %d test(s) carried on one observation exceed the '
+                'per-observation de-flake filing cap of %d; the last %d get an '
+                'occurrence row but no debt row this time (merge_sha=%s, task_id=%s): %s',
+                len(carried),
+                cap,
+                len(carried) - cap,
+                merge_sha,
+                task_id,
+                carried[cap:],
             )
+            carried = carried[:cap]
+
+        async def _file_all() -> None:
+            for carried_test_id in carried:
+                await _guarded_async(
+                    'debt',
+                    lambda tid=carried_test_id: open_debt(
+                        ledger_db_path(project_root),
+                        project_id,
+                        tid,
+                        task_client=task_client,
+                    ),
+                )
+
+        # BOUNDED (task 4974): the filing phase as a whole gets one wall-clock budget.
+        # Expiry cancels whichever filing is in flight and skips the rest — a lost
+        # signal, reported through the same `_lost` as every other one — so a degraded
+        # fused-memory can delay a merge by at most the budget, never stall it.
+        try:
+            await asyncio.wait_for(_file_all(), timeout=_DEBT_FILING_BUDGET_SECS)
+        except TimeoutError:
+            _lost('debt-filing-budget')
