@@ -10,6 +10,11 @@ spelling over the repair. This module tests the detector for that regeneration
 hazard. Neither the detector nor these tests ever mutate a task record or a
 manifest file.
 
+Task 4907 added the second direction, task -> sidecar. A manifest-bearing task
+whose ``prd_task_label`` its tracked sidecar does not declare is an UNBOUND
+LABEL: the stamper binds nothing for it and copies it no delivered_checks. Those
+rows are reported as their own list, never mixed into the drift findings.
+
 Mirrors test_audit_combine_gate_marker_loss.py: pure functions get direct pytest
 coverage; ``main()`` gets subprocess coverage.
 
@@ -54,6 +59,7 @@ from audit_manifest_descriptor_drift import (
     ManifestBinding,
     ProjectAudit,
     TaskStoreScan,
+    UnboundLabel,
     _is_dirty,
     audit_project,
     format_json,
@@ -803,6 +809,177 @@ def test_widening_the_loader_changed_neither_existing_output(make_tasks_db):
     assert scan.row_ids == {1, 2, 3}
     assert scan.delivered_checks == {2: {"gate": gate}, 3: {"cap": cap}}
     assert [b.task_id for b in scan.manifest_bindings] == [3]
+
+
+# ---------------------------------------------------------------------------
+# THE LABEL-BINDING DIRECTION — task -> sidecar (task 4907).
+#
+# The drift walk is keyed on each sidecar's STAMPED task_id, so it cannot see a
+# task whose prd_task_label matches no sidecar entry at all. This direction
+# walks the other way, from every task the stamper would admit to the sidecar
+# it would open, and lists each label that sidecar does not declare in
+# `unbound_labels`, never in `findings`.
+# ---------------------------------------------------------------------------
+
+def _declaring(*labels, prd="plans/x-prd.md"):
+    """A sidecar declaring exactly *labels*, in that order, every entry unstamped.
+
+    No block carries a capability: the label-binding direction reads labels
+    only.
+    """
+    return {"prd": prd, "schema_version": 1,
+            "tasks": [{"label": label, "task_id": None, "capabilities": []}
+                      for label in labels]}
+
+
+def _unbound_pairs(audit) -> list[tuple[int, str]]:
+    return [(row.task_id, row.label) for row in audit.unbound_labels]
+
+
+def test_a_label_its_tracked_sidecar_does_not_declare_is_one_unbound_row(
+        tmp_path, make_tasks_db):
+    """THE ROW SHAPE. It carries the labels the sidecar DOES declare, in the
+    sidecar's own order, so a reader can act without opening the file."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_labelled(7, status="pending", label="ω")],
+        manifests=[("plans/x-prd.capability-manifest.yaml", _declaring("η0", "α"))],
+    )
+
+    audit = audit_project(str(root))
+
+    assert audit.unbound_labels == [UnboundLabel(
+        task_id=7, label="ω", status="pending",
+        manifest="plans/x-prd.capability-manifest.yaml",
+        declared_labels=("η0", "α"),
+    )]
+    assert audit.findings == []
+
+
+def test_a_declared_label_is_bound_whatever_its_entry_task_id_says(
+        tmp_path, make_tasks_db):
+    """The stamper matches on LABEL, not task_id (manifest_stamping step 4).
+
+    So a declared label is bound while its entry is still unstamped
+    (``task_id: null``), and even while the entry carries another task's id.
+    """
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_labelled(7, label="α"), _labelled(8, label="β")],
+        manifests=[("plans/x-prd.capability-manifest.yaml", {
+            "prd": "plans/x-prd.md", "schema_version": 1,
+            "tasks": [{"label": "α", "task_id": None, "capabilities": []},
+                      {"label": "β", "task_id": 5, "capabilities": []}],
+        })],
+    )
+
+    assert audit_project(str(root)).unbound_labels == []
+
+
+def test_a_task_whose_derived_sidecar_is_not_tracked_is_no_row(
+        tmp_path, make_tasks_db):
+    """No sidecar, no promise. The stamper's step 2 opens only a sidecar that
+    exists, so a task whose derived sidecar is absent is a complete no-op. An
+    UNTRACKED file is not part of the corpus this sweep reads (see
+    _tracked_manifest_paths). Neither case is an unbound label."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_labelled(7, prd_path="plans/absent-prd.md", label="α"),
+               _labelled(8, prd_path="plans/untracked-prd.md", label="α")],
+    )
+    _write_manifest(root, "plans/untracked-prd.capability-manifest.yaml",
+                    _declaring("β", prd="plans/untracked-prd.md"))
+
+    assert audit_project(str(root)).unbound_labels == []
+
+
+def test_label_matching_is_exact_so_a_transliteration_is_a_row(
+        tmp_path, make_tasks_db):
+    """'gamma-1' is not 'γ1'. This is task 4590's defect shape, and the reason
+    this direction exists: the stamper compares the two strings exactly, so a
+    transliterated label silently binds nothing."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_labelled(7, label="gamma-1")],
+        manifests=[("plans/x-prd.capability-manifest.yaml", _declaring("γ1"))],
+    )
+
+    assert _unbound_pairs(audit_project(str(root))) == [(7, "gamma-1")]
+
+
+def test_two_undeclared_labels_on_one_sidecar_are_two_rows(tmp_path, make_tasks_db):
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_labelled(7, label="ω"), _labelled(8, label="ψ")],
+        manifests=[("plans/x-prd.capability-manifest.yaml", _declaring("α"))],
+    )
+
+    assert _unbound_pairs(audit_project(str(root))) == [(7, "ω"), (8, "ψ")]
+
+
+def test_unbound_rows_sort_by_manifest_then_numeric_task_id(tmp_path, make_tasks_db):
+    """Manifest relpath first, then NUMERIC task id ("30" < "4" as strings), so
+    a report built from these rows diffs cleanly between runs."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_labelled(30, prd_path="plans/b-prd.md", label="ω"),
+               _labelled(4, prd_path="plans/b-prd.md", label="ψ"),
+               _labelled(200, prd_path="plans/a-prd.md", label="ω")],
+        manifests=[
+            ("plans/b-prd.capability-manifest.yaml", _declaring("α", prd="plans/b-prd.md")),
+            ("plans/a-prd.capability-manifest.yaml", _declaring("α", prd="plans/a-prd.md")),
+        ],
+    )
+
+    rows = audit_project(str(root)).unbound_labels
+
+    assert [(row.manifest, row.task_id) for row in rows] == [
+        ("plans/a-prd.capability-manifest.yaml", 200),
+        ("plans/b-prd.capability-manifest.yaml", 4),
+        ("plans/b-prd.capability-manifest.yaml", 30),
+    ]
+
+
+# The drift dimension's coverage fields: the whole of AuditCoverage as it stood
+# before the label-binding direction was added.
+_DRIFT_COVERAGE_FIELDS = (
+    "manifests_swept",
+    "mechanical_capabilities_seen",
+    "mechanical_capabilities_compared",
+    "capabilities_without_task_entry",
+    "task_entries_with_no_sidecar_capability",
+    "manifest_tasks_without_db_row",
+    "malformed_task_entries",
+    "unconvertible_sidecar_descriptors",
+    "manifest_parse_failures",
+    "manifest_parse_failure_details",
+    "uncomparable_details",
+    "git_discovery_failed",
+)
+
+
+def test_unbound_rows_leave_the_drift_findings_and_coverage_untouched(
+        tmp_path, make_tasks_db):
+    """Two dimensions, reported separately. Adding tasks whose labels bind
+    nothing changes neither the drift findings nor any drift counter."""
+    drifted = [_entry("gate", {**_GREP_CHECK, "pattern": "def bar"})]
+    manifests = [("plans/a-prd.capability-manifest.yaml",
+                  _manifest_doc(100, prd="plans/a-prd.md"))]
+    baseline = audit_project(str(_make_project(
+        tmp_path, make_tasks_db, name="baseline",
+        tasks=[_task(100, drifted)], manifests=manifests)))
+    with_unbound = audit_project(str(_make_project(
+        tmp_path, make_tasks_db, name="with-unbound",
+        tasks=[_task(100, drifted),
+               _labelled(200, prd_path="plans/a-prd.md", label="ω"),
+               _labelled(201, prd_path="plans/a-prd.md", label="ψ")],
+        manifests=manifests)))
+
+    assert _unbound_pairs(with_unbound) == [(200, "ω"), (201, "ψ")]
+    assert baseline.findings != []
+    assert with_unbound.findings == baseline.findings
+    for field in _DRIFT_COVERAGE_FIELDS:
+        assert getattr(with_unbound.coverage, field) == getattr(baseline.coverage, field), field
 
 
 # ---------------------------------------------------------------------------
