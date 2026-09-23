@@ -2393,6 +2393,47 @@ class TestCoderJudgmentPayloadClassifier:
 
 
 # ---------------------------------------------------------------------------
+# is_reingested_content -- the ONE predicate every signal bucket consults
+# (task 5685). It answers "is this carrier machine content re-ingested as
+# session material rather than this session's own dialogue?", and its two
+# known members are a prior coder judgment and a harness-injected prompt or
+# briefing.
+# ---------------------------------------------------------------------------
+
+class TestReingestedContentClassifier:
+    @pytest.mark.parametrize(
+        'text', [_coder_judgment(), _json_fenced(_coder_judgment())],
+        ids=['bare', 'json_fenced'],
+    )
+    def test_a_coder_judgment_is_reingested(self, text):
+        assert mod.is_reingested_content(text) is True
+
+    @pytest.mark.parametrize(
+        'text', [_briefing_text(), _CENSUS_MEMORY_CONTEXT_TURN, _TRICKLE_CODER_PREAMBLE],
+        ids=['briefing', 'census_memory_context', 'trickle_coder_prompt'],
+    )
+    def test_a_harness_prompt_or_briefing_is_reingested(self, text):
+        assert mod.is_reingested_content(text) is True
+
+    @pytest.mark.parametrize(
+        'resume_prompt', [CAP_HIT_RESUME_PROMPT, CRASH_RECOVERY_RESUME_PROMPT],
+        ids=['usage_limit', 'crash_recovery'],
+    )
+    def test_resume_prompt_is_reingested_lockstep(self, resume_prompt):
+        # LOCKSTEP, as in test_resume_prompt_is_excluded_lockstep: asserted
+        # against each canonical constant, never a restated literal.
+        assert mod.is_reingested_content(resume_prompt) is True
+
+    @pytest.mark.parametrize(
+        'text',
+        ['please fix the bug in the merge worker', "Actually, that's wrong — use the other branch", ''],
+        ids=['ordinary_turn', 'genuine_self_correction', 'empty'],
+    )
+    def test_dialogue_is_not_reingested(self, text):
+        assert mod.is_reingested_content(text) is False
+
+
+# ---------------------------------------------------------------------------
 # Run-review-prompt exclusion via is_harness_injected_turn -- R1 (confusion
 # census 2026-07-31 §1.1 facet (b), :81/:85): 5 sightings across 5 sessions
 # where the flagged "User Correction" is a full Reconciliation Run Review.
