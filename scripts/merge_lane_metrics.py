@@ -82,6 +82,7 @@ import tokenize
 from collections.abc import Sequence
 from io import StringIO
 from pathlib import Path
+from typing import Any
 
 from shared import safe_io
 
@@ -2046,6 +2047,75 @@ def compare_baseline_files(previous: Path, current: Path) -> list[Violation]:
     one workflow ``resolve_cluster_paths`` prescribes.
     """
     return _measure_raises(load_baseline(Path(current)), load_baseline(Path(previous)))
+
+
+def _magnitude(value: Any) -> int:
+    """One measure's size: a name list by its DISTINCT names, as ``_check_tests`` counts."""
+    return len(set(value)) if isinstance(value, list) else int(value)
+
+
+def _merged_value(base: Any, ours: Any, theirs: Any) -> Any:
+    """What a 3-way merge of one measure may hold, where None means absent.
+
+    Each side's own move stands, up or down, and a deletion stands unless the
+    other side moved the entry (a modify/delete keeps the modification). Where
+    both sides moved one measure, the higher side bounds it.
+    """
+    if ours == base:
+        return theirs
+    if theirs in (base, ours):
+        return ours
+    if ours is None or theirs is None:
+        return theirs if ours is None else ours
+    if isinstance(ours, dict) and isinstance(theirs, dict):
+        return _merged_mapping(base if isinstance(base, dict) else {}, ours, theirs)
+    return max(ours, theirs, key=_magnitude)
+
+
+def _merged_mapping(base: dict, ours: dict, theirs: dict) -> dict:
+    """:func:`_merged_value` key by key, dropping every key the merge leaves absent."""
+    merged = {
+        key: _merged_value(base.get(key), ours.get(key), theirs.get(key))
+        for key in base.keys() | ours.keys() | theirs.keys()
+    }
+    return {key: value for key, value in merged.items() if value is not None}
+
+
+def _merge_bound(base: dict, ours: dict, theirs: dict) -> dict:
+    """The per-path sections a merge of *ours* and *theirs* over *base* may hold."""
+    return {
+        name: _merged_mapping(
+            _section(base, name), _section(ours, name), _section(theirs, name)
+        )
+        for name in _PER_PATH_SECTIONS
+    }
+
+
+def compare_merged_baseline_files(
+    *, base: Path | None, ours: Path | None, theirs: Path | None, current: Path
+) -> list[Violation]:
+    """Every raise a MERGE commit's *current* baseline makes over its parents' bound.
+
+    The bound is what git does to the file text, applied per measure against the
+    merge *base*: a measure only one side moved stands at that side's value, up
+    or down, and one both sides moved is bounded by the higher side. An absent
+    *base* is the empty image git merges unrelated histories against, and an
+    absent parent moved nothing, so it stands in as the base.
+
+    NOT "clean against either parent": that admits keeping one side's stale
+    value over the other side's lowering, which is an unrecorded widening on
+    whichever branch the merge lands on.
+
+    KEYWORD-ONLY: four same-typed paths make a crossed call -- one that reads
+    CLEAN -- the hazard ``test_the_argument_order_cannot_read_clean_when_crossed``
+    pins for two.
+    """
+    base_image = load_baseline(Path(base)) if base is not None else {}
+    ours_image = load_baseline(Path(ours)) if ours is not None else base_image
+    theirs_image = load_baseline(Path(theirs)) if theirs is not None else base_image
+    return _measure_raises(
+        load_baseline(Path(current)), _merge_bound(base_image, ours_image, theirs_image)
+    )
 
 
 
