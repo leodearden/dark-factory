@@ -12,6 +12,7 @@ import logging
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import httpx
 from fastapi import APIRouter, Request
@@ -34,7 +35,6 @@ from dashboard.data.task_snapshot import (
     as_served,
     classify,
     measured_terminal_total,
-    unmeasured_snapshot,
 )
 from dashboard.data.utils import resolve_now
 
@@ -43,33 +43,56 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _unknown_after_contract_break(what: str, broken: DatumContractError) -> Datum[Any]:
+    """The UNKNOWN stand-in for *what*, a datum this handler cannot emit as built.
+
+    THE one fallback for both kinds of datum this handler emits, a root's
+    snapshot and the ``?terminal=`` window, so a break is logged and explained
+    the same way wherever it happens. The producer validates what it builds,
+    so reaching this means a datum crossed a seam it should not have.
+    Degrading that one fact, and logging it with its traceback, keeps one bug
+    from 500-ing a payload whose other facts are fine. The reason names the
+    invariant, so a reader is not left guessing which one broke.
+    """
+    logger.warning(
+        '%s breaks the %s datum invariant and is served as UNKNOWN for this '
+        'render; this is a BUG, not an outage',
+        what, broken.invariant.value, exc_info=broken,
+    )
+    return Datum(
+        None, None, DatumState.UNKNOWN,
+        f'{what} broke the {broken.invariant.value} invariant: {broken}',
+        FRESHNESS_BOUND_SECONDS,
+    )
+
+
 def _validated(
     label: str, snapshot: TaskSnapshot, served_at: datetime,
 ) -> TaskSnapshot:
-    """*snapshot*, or a fully-unknown stand-in if it breaks the envelope contract.
+    """*snapshot*, or a stand-in unknown on both halves if it breaks the envelope contract.
 
-    The producer already validates what it builds, so reaching this fallback
-    means a datum crossed a seam it should not have. Degrading THAT ROOT and
-    logging it applies the rule ``collect_tasks_with_counts._one`` already
-    enforces one layer down — one bad root must never blank the whole tab — at
-    the layer where the break would otherwise 500 the entire fan-out.
+    Degrading THAT ROOT applies the rule ``collect_tasks_with_counts._one``
+    already enforces one layer down, and routes it the same way: one bad root
+    must never blank the whole tab, and this is the layer where the break
+    would otherwise 500 the entire fan-out.
 
-    The stand-in is unknown on both halves rather than a partial copy: the
-    break is in the envelope itself, so no half of it can be trusted, and the
-    reason names the invariant so a reader is not left guessing which.
+    Unknown on both halves rather than a partial copy, because the break is in
+    the envelope itself and no half of it can be trusted. The halves are built
+    here from nothing, not by ``unmeasured_snapshot``. That function falls
+    back to the root's last good census, and a unit that broke its own
+    contract must borrow no value. It is also keyed by root, and this layer
+    holds only the label.
     """
     try:
         validate_datum(snapshot.census, served_at)
         validate_datum(snapshot.rows, served_at)
     except DatumContractError as broken:
-        logger.warning(
-            'project %s: its task snapshot breaks the %s datum invariant and '
-            'is served as UNKNOWN for this render; this is a BUG, not an outage',
-            label, broken.invariant.value, exc_info=True,
+        unknown = _unknown_after_contract_break(
+            f'the task snapshot of project {label}', broken,
         )
-        return unmeasured_snapshot(
-            label, now=served_at,
-            reason=f'snapshot broke the {broken.invariant.value} invariant: {broken}',
+        return replace(
+            snapshot, census=unknown, rows=unknown,
+            in_progress_live=None, in_progress_stranded=None, skew_seconds=None,
             failure=SnapshotFailure.UNREACHABLE,
         )
     return snapshot
@@ -288,21 +311,12 @@ async def api_tasks(request: Request) -> JSONResponse:
             http_client, config, terminal, snapshots, served_at=served_at,
         )
         # Validated here like every other emitted datum, and by the same rule:
-        # a break is a BUG in this layer, so it degrades this one key rather
-        # than 500-ing a payload whose other facts are fine.
+        # a break degrades this one key.
         try:
             validate_datum(window, served_at)
         except DatumContractError as broken:
-            logger.warning(
-                'terminal window for %s breaks the %s datum invariant and is '
-                'served as UNKNOWN; this is a BUG, not an outage',
-                terminal, broken.invariant.value, exc_info=True,
-            )
-            window = Datum(
-                None, None, DatumState.UNKNOWN,
-                f'terminal window broke the {broken.invariant.value} '
-                f'invariant: {broken}',
-                FRESHNESS_BOUND_SECONDS,
+            window = _unknown_after_contract_break(
+                f'the terminal window for {terminal}', broken,
             )
         payload[_terminal_key(terminal)] = window.to_wire()
     # ...and the same N goes on the wire as TASKS_PROJECT_COUNT, so the banner

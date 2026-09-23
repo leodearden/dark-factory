@@ -434,6 +434,118 @@ def test_a_unit_another_render_refreshed_later_is_not_a_contract_break(client, c
     ]
 
 
+def _bug_warnings(caplog):
+    return [
+        record.getMessage() for record in caplog.records
+        if 'this is a BUG, not an outage' in record.getMessage()
+    ]
+
+
+def test_a_snapshot_that_breaks_the_envelope_borrows_no_last_good(client, caplog):
+    """A root whose unit breaks the contract is unknown on BOTH halves, by construction.
+
+    The stand-in used to come from ``unmeasured_snapshot(label, ...)``, whose
+    first argument keys the ROOT-keyed last-good store. A label never matched a
+    real root's key, so the stand-in came out unknown only because the two key
+    spaces happened not to meet. Here they meet: a last good sits under the
+    very key the label spells. The stand-in must still borrow nothing, because
+    no half of a unit that broke its own envelope can be trusted.
+    """
+    import asyncio
+    import logging
+    from dataclasses import replace
+    from datetime import UTC, datetime, timedelta
+    from pathlib import Path
+
+    import httpx
+    from test_task_snapshot import CannedMCP, _raw_row
+
+    import dashboard.data.task_snapshot as snapshot_mod
+    from dashboard.data.datum import DatumInvariant
+
+    label = 'p0'
+    config = client.app.state.config
+    canned = CannedMCP(
+        rows=[_raw_row(1, 'in-progress')], status_map={1: 'in-progress', 2: 'done'},
+        status_page_size=2000,
+    )
+
+    async def _measure_earlier():
+        async with httpx.AsyncClient() as http_client:
+            await snapshot_mod.acquire_snapshot(
+                http_client, config, label, now=datetime.now(UTC) - timedelta(seconds=10),
+            )
+
+    healthy = _snapshot()
+    broken = replace(
+        healthy,
+        census=replace(healthy.census, as_of=datetime.now(UTC) + timedelta(hours=1)),
+    )
+    snapshot_mod._snapshot_cache_clear()
+    try:
+        with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+            asyncio.run(_measure_earlier())
+        with patch(
+            'dashboard.api.tasks.collect_tasks_with_counts',
+            new=AsyncMock(return_value=([], {label: broken})),
+        ), patch(
+            'dashboard.api.tasks._all_project_roots',
+            new=lambda config: [Path('/proj') / label],
+        ), caplog.at_level(logging.WARNING):
+            resp = client.get('/api/v2/dashboard/tasks')
+    finally:
+        snapshot_mod._snapshot_cache_clear()
+
+    assert resp.status_code == 200, resp.text
+    entry = resp.json()['TASKS_SNAPSHOT'][label]
+    for half in ('census', 'rows'):
+        assert entry[half]['state'] == 'unknown', entry[half]
+        assert entry[half]['value'] is None and entry[half]['as_of'] is None
+    assert DatumInvariant.FRESHNESS_BOUND.value in entry['census']['reason']
+    assert (entry['in_progress_live'], entry['in_progress_stranded']) == (None, None)
+    assert entry['skew_seconds'] is None
+    assert len(_bug_warnings(caplog)) == 1, _bug_warnings(caplog)
+
+
+def test_a_terminal_window_that_breaks_the_envelope_is_unknown_not_a_500(client, caplog):
+    """The window degrades to unknown by the same rule as a root's snapshot.
+
+    A ``lower_bound`` datum with no reason breaks the envelope. The key still
+    answers, as an explained unknown, and the rest of the payload survives.
+    """
+    import logging
+    from datetime import UTC, datetime
+    from pathlib import Path
+
+    from dashboard.data.datum import Datum, DatumInvariant, DatumState
+    from dashboard.data.task_snapshot import FRESHNESS_BOUND_SECONDS
+
+    label = 'p0'
+    unexplained = Datum(
+        [], datetime.now(UTC), DatumState.LOWER_BOUND, None, FRESHNESS_BOUND_SECONDS,
+    )
+    with patch(
+        'dashboard.api.tasks.collect_tasks_with_counts',
+        new=AsyncMock(return_value=([], _snapshots([label]))),
+    ), patch(
+        'dashboard.api.tasks._all_project_roots',
+        new=lambda config: [Path('/proj') / label],
+    ), patch(
+        'dashboard.api.tasks.acquire_terminal_window',
+        new=AsyncMock(return_value=unexplained),
+    ), caplog.at_level(logging.WARNING):
+        resp = client.get(f'/api/v2/dashboard/tasks?terminal={label}')
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    window = body[f'TASKS_TERMINAL:{label}']
+    assert window['state'] == 'unknown', window
+    assert window['value'] is None and window['as_of'] is None
+    assert DatumInvariant.REASON_REQUIRED.value in window['reason']
+    assert body['TASKS_SNAPSHOT'][label]['census']['state'] == 'fresh'
+    assert len(_bug_warnings(caplog)) == 1, _bug_warnings(caplog)
+
+
 _TASK_ROW_KEYS = frozenset({
     'id', 'project', 'title', 'description', 'details', 'status', 'agent',
     'loops', 'attempts', 'lane', 'phase', 'lane_state', 'runtime_offline',
