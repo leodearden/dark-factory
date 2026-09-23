@@ -781,8 +781,56 @@ async def judge_write(*, memory_service, content, project_id, decision,
 '''
 
 
+#: What a judge stand-in's own provider seam writes to stderr when a drive
+#: reaches it. The probe must never let one get that far.
+PROVIDER_REACHED_MARKER = 'fixture judge: the model provider was reached'
+
+#: The renderer bound under a second name at import, so replacing
+#: ``build_judge_prompt`` on the module never intercepts the call, and the
+#: drive runs on into the module's provider seam.
+_JUDGE_BINDS_BUILDER_BY_ALIAS = r'''
+
+import sys as _sys
+
+
+def build_judge_prompt(content, candidates, *, attach_target_id=None):
+    return _render(content, candidates, marked=attach_target_id)
+
+
+_prompt_for = build_judge_prompt
+
+
+async def _call_llm(*, prompt):
+    _sys.stderr.write({marker} + '\n')
+    return OUTCOME_RESTATED
+
+
+async def judge_write(*, memory_service, content, project_id, decision,
+                      candidates=()):
+    attach_target_id = getattr(decision, 'canonical_id', None)
+    return await _call_llm(
+        prompt=_prompt_for(content, candidates, attach_target_id=attach_target_id),
+    )
+'''.replace('{marker}', repr(PROVIDER_REACHED_MARKER))
+
+
+#: An operator's Ctrl-C, arriving while the probe drives judge_write.
+_JUDGE_INTERRUPTED = r'''
+
+def build_judge_prompt(content, candidates, *, attach_target_id=None):
+    return _render(content, candidates, marked=attach_target_id)
+
+
+async def judge_write(*, memory_service, content, project_id, decision,
+                      candidates=()):
+    raise KeyboardInterrupt
+'''
+
+
 #: judge variant name -> the tail appended to :data:`JUDGE_PREAMBLE`.
 JUDGE_VARIANT_TAILS: dict[str, str] = {
+    'binds_builder_by_alias': _JUDGE_BINDS_BUILDER_BY_ALIAS,
+    'interrupted': _JUDGE_INTERRUPTED,
     'feeds_attach_target': _JUDGE_FEEDS_TARGET,
     'feeds_attach_target_after_raising': _JUDGE_FEEDS_TARGET_AFTER_RAISING,
     'no_target_parameter': _JUDGE_NO_TARGET_PARAMETER,

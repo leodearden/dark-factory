@@ -67,7 +67,7 @@ import logging
 import re
 import sys
 import textwrap
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, NamedTuple
@@ -152,11 +152,14 @@ _TARGET_NAME_RE = re.compile(r'attach|target|candidate_id', re.IGNORECASE)
 _CANONICAL_ATTR = 'canonical_id'
 _DECISION_KWARG = 'decision'
 
-#: Backstop bound on the one ``judge_write`` call this probe makes. The
-#: recorder below is the primary guarantee that no model request goes out --
-#: it aborts the call at the prompt -- and this is what covers a ref that
-#: renders AFTER its request rather than before it. Small against the gate's
-#: 45s per-probe budget, because nothing correct here takes any time at all.
+#: The judge module's model-provider seam, stubbed for the drive alongside the
+#: renderer (see :func:`_fed_target`).
+_PROVIDER_NAME = '_call_llm'
+
+#: Backstop bound on the one ``judge_write`` call this probe makes, for a ref
+#: that reaches a model some way neither stand-in in :func:`_fed_target`
+#: intercepts. Small against the gate's per-probe budget: nothing correct here
+#: takes any time at all.
 _JUDGE_DRIVE_TIMEOUT = 5.0
 
 #: THE ONE MACHINE-READABLE LINE saying which branch satisfied item 5, and the
@@ -697,11 +700,8 @@ class _JudgeAborted(Exception):
 class _PromptRecorder:
     """Stands in for ``build_judge_prompt``: records its call, then aborts.
 
-    THE RAISE IS LOAD-BEARING. ``judge_write`` builds the prompt and posts it
-    to a model provider; a recorder that RETURNED a string would let that
-    request go out — from a before_done predicate, against a 45s bound, on the
-    operator's key. So the recorder never returns: it records and raises, which
-    unwinds the call before the request is made.
+    It never returns, because ``judge_write`` posts whatever it renders to a
+    model provider. Raising here unwinds the call before any request exists.
     """
 
     def __init__(self) -> None:
@@ -710,6 +710,25 @@ class _PromptRecorder:
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         self.calls.append((args, kwargs))
         raise _JudgeAborted
+
+
+def _refuse_provider_call(*_args: Any, **_kwargs: Any) -> Any:
+    """Stands in for the provider seam: no model request, whatever reached it."""
+    raise _JudgeAborted
+
+
+@contextlib.contextmanager
+def _replaced(module: Any, name: str, stand_in: Any) -> Iterator[None]:
+    """``module.<name>`` is *stand_in* for the duration, if the module has one."""
+    if not hasattr(module, name):
+        yield
+        return
+    original = getattr(module, name)
+    setattr(module, name, stand_in)
+    try:
+        yield
+    finally:
+        setattr(module, name, original)
 
 
 class _Fed(NamedTuple):
@@ -776,16 +795,15 @@ def _judge_decision(module: Any, canonical_id: str) -> Any:
 def _drive_judge_write(writer: Any, decision: Any, slate: list[Any]) -> None:
     """Run ``judge_write`` far enough to see what it tells the renderer.
 
-    Every exception is swallowed, including the recorder's own abort: what is
-    measured is the recorder's log, and a judge that blows up against this
-    probe's fake service has told it nothing about the attach target either
-    way — which is what :func:`_statically_fed_target` then covers.
+    Whatever the REF raises is swallowed, the stand-ins' own aborts included:
+    what is measured is the recorder's log, and a judge that blows up against
+    this probe's fake service has told it nothing either way — which is what
+    :func:`_statically_fed_target` then covers. ``SystemExit`` is the ref's
+    too. ``KeyboardInterrupt`` is the operator's, and is let through to
+    :func:`main`, which fails closed on it.
     """
     service = _Service(_SearchResults())
-    # BaseException, for :func:`main`'s reason: a SystemExit out of the ref's
-    # own judge is not an Exception, and letting one through here would end
-    # the probe mid-report carrying the REF's exit code.
-    with contextlib.suppress(BaseException):
+    with contextlib.suppress(Exception, SystemExit, asyncio.CancelledError):
         asyncio.run(
             asyncio.wait_for(
                 writer(
@@ -933,13 +951,18 @@ def _fed_target(
     The DYNAMIC route first, because it measures rather than reads; the static
     one only where the dynamic route never saw a render, so a module that
     demonstrably renders is judged on what it actually passed.
+
+    Both the renderer and the provider seam are replaced for the drive. The
+    recorder only intercepts a renderer ``judge_write`` looks up as a module
+    global at call time; one bound any other way renders for real, and the
+    provider stand-in is what then stops the request.
     """
     recorder = _PromptRecorder()
-    setattr(judge_module, _BUILDER_NAME, recorder)
-    try:
+    with (
+        _replaced(judge_module, _BUILDER_NAME, recorder),
+        _replaced(judge_module, _PROVIDER_NAME, _refuse_provider_call),
+    ):
         _drive_judge_write(writer, decision, slate)
-    finally:
-        setattr(judge_module, _BUILDER_NAME, builder)
     fed = [
         seen
         for seen in (

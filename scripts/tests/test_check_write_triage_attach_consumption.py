@@ -43,6 +43,7 @@ if str(_HERE) not in sys.path:
 
 from write_triage_attach_fixtures import (  # noqa: E402
     JUDGE_STATIC_NEAR_MISS_VARIANTS,
+    PROVIDER_REACHED_MARKER,
     write_fake_judge,
     write_fake_triage,
 )
@@ -478,6 +479,35 @@ class TestJudgeModuleAttachTarget:
         assert proc.returncode != 0, f'{proc.stdout}\n{proc.stderr}'
         assert _PASS not in proc.stdout, proc.stdout
         assert _NEVER_FED in proc.stdout, proc.stdout
+
+    def test_the_judge_drive_never_reaches_the_model_provider(self, tmp_path):
+        """No model request, even from a judge the recorder cannot intercept.
+
+        This judge binds its renderer under a second name at import, so
+        replacing ``build_judge_prompt`` on the module never stops the call,
+        and the drive runs on into the module's provider seam — from a
+        before_done predicate, on whatever key the operator's shell carries.
+        """
+        src_root = _src_with(
+            tmp_path, triage='band_top1', judge='binds_builder_by_alias',
+        )
+        proc = _run_probe(src_root)
+        assert PROVIDER_REACHED_MARKER not in proc.stderr, proc.stderr
+        assert PROVIDER_REACHED_MARKER not in proc.stdout, proc.stdout
+
+    def test_an_interrupt_during_the_judge_drive_stops_the_probe(self, tmp_path):
+        """Ctrl-C belongs to the operator, not to the ref.
+
+        Swallowed along with the ref's own exceptions, it would leave the
+        probe driving the write eight more times and then reporting an
+        ordinary verdict on a run nobody wanted finished. It fails closed
+        instead.
+        """
+        src_root = _src_with(tmp_path, triage='band_top1', judge='interrupted')
+        proc = _run_probe(src_root)
+        assert proc.returncode != 0, f'{proc.stdout}\n{proc.stderr}'
+        assert _UNVERIFIABLE in proc.stdout, proc.stdout
+        assert _NOT_CONSUMED not in proc.stdout, proc.stdout
 
     def test_a_judge_with_no_target_parameter_does_not_satisfy_item_5(
         self, tmp_path,
