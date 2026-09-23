@@ -26,8 +26,10 @@ middleware itself already do.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -43,7 +45,12 @@ import pytest
 import test_consolidate_memories_tool as _consolidate
 from fastmcp.exceptions import ToolError
 from shared.mcp_markup_middleware import RepairPolicy
-from shared.toolcall_markup import CANONICAL_OPENER_PREFIX, closer_for
+from shared.toolcall_markup import (
+    CANONICAL_OPENER_PREFIX,
+    ENVELOPE_LITERALS,
+    INVOKE_CLOSER,
+    closer_for,
+)
 
 from fused_memory.server.main import _install_safe_tool_wrapper
 from fused_memory.server.markup_guard import (
@@ -1351,3 +1358,68 @@ class TestUnrepairableResidueIsPreserved:
         assert payload['error_type'] == 'mcp_markup_unrepairable'
         assert payload['escalation_id'] is None
         mock_service.add_system_record.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Source-hygiene guards (task 4948): the AUTHORING RULE in this module's
+# docstring, enforced mechanically rather than by convention alone. Modelled
+# on tests/server/test_markup_tripwire.py's block (task 4228). Its needle set
+# and scanner are COPIED here rather than imported: a guard whose needles
+# another module can edit is not a per-file guard.
+# ---------------------------------------------------------------------------
+
+#: Every ENVELOPE_LITERALS member plus the two structural prefixes a
+#: hand-spelled specimen could use instead of the enumerated literals — the
+#: bare closing-tag prefix (catches any closer, not just the enumerated ones)
+#: and the ``parameter`` opening-tag prefix with no trailing space (so it also
+#: catches an attribute-less opener spelling).
+_RAW_SENTINEL_NEEDLES = (*ENVELOPE_LITERALS, chr(60) + '/', chr(60) + 'parameter')
+
+
+def _raw_sentinel_hits(source: str) -> dict[str, list[int]]:
+    """Map each offending needle found in ``source`` to its 1-based lines."""
+    source_lines = source.splitlines()
+    return {
+        needle: [i + 1 for i, line in enumerate(source_lines) if needle in line]
+        for needle in _RAW_SENTINEL_NEEDLES
+        if needle in source
+    }
+
+
+def test_the_guard_source_spells_no_raw_envelope_literal():
+    """CROSS-FILE: markup_guard.py's own source must carry no raw literal.
+
+    Paired with an anti-vacuity check that its module docstring still names
+    INVOKE_CLOSER after decoding — a bare "no raw literal" scan would be
+    trivially satisfiable by deleting the explanatory sentence instead of
+    escaping it. That docstring names only the one literal, so only that one
+    is checked.
+
+    The path is resolved from this file rather than ``markup_guard.__file__``:
+    an editable install can resolve the import to ANOTHER checkout's source,
+    and the guard must read the tree this test came from.
+    """
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / 'src'
+        / 'fused_memory'
+        / 'server'
+        / 'markup_guard.py'
+    )
+    assert source_path.is_file(), f'expected markup_guard.py at {source_path}'
+    source = source_path.read_text(encoding='utf-8')
+
+    hits = _raw_sentinel_hits(source)
+    assert not hits, (
+        f'{source_path.name} contains raw envelope sentinel(s) {hits!r}. Spell '
+        'them with the \\x3c escape instead — see shared/src/shared/'
+        'toolcall_markup.py\'s "Sentinel-literal hazard" section for why.'
+    )
+
+    doc = ast.get_docstring(ast.parse(source))
+    assert doc is not None, f'{source_path.name} lost its module docstring'
+    assert INVOKE_CLOSER in doc, (
+        'INVOKE_CLOSER is missing from the decoded docstring of '
+        f'{source_path.name} — escaping must not delete the specimen it '
+        'explains.'
+    )
