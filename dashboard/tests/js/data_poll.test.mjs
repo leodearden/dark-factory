@@ -1820,10 +1820,11 @@ const TERMINAL_KEY = `TASKS_TERMINAL:${TERMINAL_PROJECT}`;
 // is pinned against an expectation rather than against itself.
 const TERMINAL_STATE_KEY = `${TASKS_PATH}#terminal:${TERMINAL_PROJECT}`;
 
-// A Datum as the terminal endpoint will serve one: a lower_bound, because a
-// terminal listing is truncated by construction.
+// A Datum as the terminal endpoint serves one: a lower_bound, because a
+// terminal listing is truncated by construction, whose value is the row LIST
+// itself — the PRD's `Datum[list]`, and what api/tasks.py puts on the wire.
 const SERVED_TERMINAL_DATUM = Object.freeze({
-  value: { rows: [{ id: '5588' }] },
+  value: [{ id: '5588' }],
   as_of: '2026-09-20T09:00:00+00:00',
   state: 'lower_bound',
   reason: 'terminal window truncated at 200 rows',
@@ -1869,7 +1870,7 @@ test('on-demand: one request, one fetch, and a validated Datum under the built k
   const stored = win.DF_DATA[TERMINAL_KEY];
   assert.ok(stored, `nothing was applied to DF_DATA['${TERMINAL_KEY}']`);
   assert.equal(stored.state, 'lower_bound');
-  assert.deepEqual(stored.value, { rows: [{ id: '5588' }] });
+  assert.deepEqual(stored.value, [{ id: '5588' }]);
   assert.equal(stored._served_at, '2026-09-20T09:00:01+00:00', 'the receipt must come from the body');
   assert.equal(stored._received_at, 4242, 'the receipt must come from the injected clock');
   assert.notEqual(stored, SERVED_TERMINAL_DATUM, 'the wire payload must not be stored by reference');
@@ -1878,12 +1879,13 @@ test('on-demand: one request, one fetch, and a validated Datum under the built k
 test('on-demand: a non-Datum body is refused, so no unprovenanced value reaches a terminal key', async () => {
   // Same guarantee applyKey gives every datum-kinded polled row; asserted here
   // because this is the FIRST row declared datum-kinded, so it is the first
-  // path on which the refusal is reachable at all.
+  // path on which the refusal is reachable at all. The payload is the served
+  // value stripped of its envelope — the likeliest shape of the regression.
   const { api, window: win } = loadDataJs();
   const deps = {
     fetchImpl: () => Promise.resolve({
       ok: true,
-      json: async () => ({ served_at: null, [TERMINAL_KEY]: { rows: [] } }),
+      json: async () => ({ served_at: null, [TERMINAL_KEY]: SERVED_TERMINAL_DATUM.value }),
     }),
     now: () => 1,
   };

@@ -751,11 +751,85 @@ def _terminal_render(
     finally:
         tasks_mod._fetch_tasks_cache_clear()
     assert resp.status_code == 200, resp.text
-    return resp.json(), calls
+    body = resp.json()
+    # data.js::ON_DEMAND_KEYS.terminal.key names the body key AND the DF_DATA
+    # key, and refreshOne applies body[key] verbatim, so the window must answer
+    # under exactly one flat per-project key. A nested TASKS_TERMINAL map would
+    # pass every read below and never reach the browser.
+    assert _terminal_keys(body) == [f'TASKS_TERMINAL:{terminal}'], (
+        'the window must answer under the ONE flat key the client reads, and '
+        f'under no other terminal key; got {_terminal_keys(body)}'
+    )
+    return body, calls
+
+
+def _terminal_keys(body):
+    """Every key of *body* naming a terminal window, bare or per-project."""
+    return sorted(key for key in body if key.startswith('TASKS_TERMINAL'))
 
 
 def _terminal_get_tasks(calls):
     return [call for call in calls if call['tool'] == 'get_tasks']
+
+
+def _node():
+    """The ``node`` binary: a skip locally, a FAILURE under CI.
+
+    The ``test_chip_label_disambiguation.py::_node`` idiom — CI carries node,
+    so its absence there is a toolchain regression, not an optional extra.
+    """
+    import os
+    import shutil
+
+    path = shutil.which('node')
+    if not path:
+        if os.environ.get('CI'):
+            pytest.fail('node is required in CI but not found on PATH')
+        pytest.skip('node not available')
+    return path
+
+
+# The REAL client's on-demand path, run over a body handed in on stdin. The
+# three scripts load in index.html's order because each destructures the one
+# before it at module scope, and `document` stays undefined on purpose: data.js
+# starts polling only in a real browser document, so without one it loads
+# inert (data_poll.test.mjs::loadDataJs records why).
+_ON_DEMAND_CLIENT = r"""
+const fs = require('fs');
+const path = require('path');
+const [redux, project] = process.argv.slice(1);
+const body = JSON.parse(fs.readFileSync(0, 'utf8'));
+globalThis.window = { dispatchEvent() {} };
+require(path.join(redux, 'endpoint_staleness.js'));
+require(path.join(redux, 'datum.js'));
+const api = require(path.join(redux, 'data.js'));
+api.requestOnDemand('terminal', project, {
+  state: api.createPollState(),
+  deps: { fetchImpl: () => Promise.resolve({ ok: true, json: async () => body }), now: () => 1 },
+}).then(outcome => {
+  const datum = api.datumFor(`TASKS_TERMINAL:${project}`);
+  process.stdout.write(JSON.stringify({ outcome, datum }));
+});
+"""
+
+
+def _request_on_demand(body, project):
+    """``(outcome, datum)`` from data.js's REAL ``requestOnDemand`` over *body*."""
+    import json
+    import subprocess
+    from pathlib import Path
+
+    redux = Path(__file__).parent.parent / 'src' / 'dashboard' / 'static' / 'redux'
+    result = subprocess.run(
+        [_node(), '-e', _ON_DEMAND_CLIENT, str(redux), project],
+        input=json.dumps(body), capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, (
+        f'the client driver exited {result.returncode}\n'
+        f'--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}'
+    )
+    applied = json.loads(result.stdout)
+    return applied['outcome'], applied['datum']
 
 
 class TestTerminalWindow:
@@ -788,7 +862,7 @@ class TestTerminalWindow:
             done={'dark-factory': 10},
         )
 
-        entry = body['TASKS_TERMINAL']['dark-factory']
+        entry = body['TASKS_TERMINAL:dark-factory']
         assert entry['state'] == 'lower_bound', (
             'a windowed read is a measured value known to under-report — the '
             f'state is the disclosure, got {entry["state"]!r}'
@@ -834,7 +908,7 @@ class TestTerminalWindow:
 
         emitted = sorted(
             int(row['id'].rsplit('T-', 1)[-1])
-            for row in body['TASKS_TERMINAL']['dark-factory']['value']
+            for row in body['TASKS_TERMINAL:dark-factory']['value']
         )
         assert emitted == [107, 108, 109], (
             f'the window must reach the high-id end, got {emitted}'
@@ -898,7 +972,7 @@ class TestTerminalWindow:
         )
 
         assert _terminal_get_tasks(calls)[0]['args'].get('offset') == 0
-        assert len(body['TASKS_TERMINAL']['dark-factory']['value']) == 6
+        assert len(body['TASKS_TERMINAL:dark-factory']['value']) == 6
         assert not [
             record for record in caplog.records
             if record.name == 'dashboard.data.task_snapshot'
@@ -951,7 +1025,7 @@ class TestTerminalWindow:
             count_unknown=['dark-factory'], window=3,
         )
 
-        entry = body['TASKS_TERMINAL']['dark-factory']
+        entry = body['TASKS_TERMINAL:dark-factory']
         assert entry['state'] == 'unknown'
         assert entry['value'] is None, (
             'omitting the rows is honest; showing the OLDEST as the newest is not'
@@ -983,7 +1057,7 @@ class TestTerminalWindow:
             done={'dark-factory': 10},
         )
 
-        entry = body['TASKS_TERMINAL']['no-such-project']
+        entry = body['TASKS_TERMINAL:no-such-project']
         assert entry['state'] == 'unknown'
         assert entry['value'] is None
         assert 'no-such-project' in (entry['reason'] or ''), (
@@ -992,7 +1066,7 @@ class TestTerminalWindow:
         assert _terminal_get_tasks(calls) == []
 
     def test_no_terminal_query_carries_no_terminal_key(self, client):
-        """(f) The key is ABSENT, not empty — an empty dict is a claim."""
+        """(f) No terminal key at all, bare or per-project — an empty one is a claim."""
         with patch(
             'dashboard.api.tasks.collect_tasks_with_counts',
             new=AsyncMock(return_value=([], _snapshots(['dark-factory']))),
@@ -1001,7 +1075,7 @@ class TestTerminalWindow:
 
         assert resp.status_code == 200
         body = resp.json()
-        assert 'TASKS_TERMINAL' not in body
+        assert _terminal_keys(body) == []
         assert set(body) == _TASKS_KEYS
 
     def test_the_terminal_fetch_spends_the_third_roster_slot(
@@ -1038,6 +1112,41 @@ class TestTerminalWindow:
             f'arithmetic is not about it: {PER_PROJECT_MCP_CALLS}'
         )
         assert PER_CALL_TIMEOUT * len(PER_PROJECT_MCP_CALLS) <= _TASKS_PER_PROJECT_BUDGET
+
+    def test_the_real_client_applies_the_window_this_endpoint_serves(
+        self, client, monkeypatch
+    ):
+        """(h) Both halves of the key contract, run against each other.
+
+        ``data.js::ON_DEMAND_KEYS.terminal.key`` names the body key AND the
+        DF_DATA key, and ``refreshOne`` applies ``body[key]`` verbatim. Each
+        side once pinned only its own literal, both suites were green, and the
+        pair still disagreed: this endpoint nested the window under
+        ``TASKS_TERMINAL`` while the client read ``TASKS_TERMINAL:<project>``,
+        so the window would never have applied — and nothing would have said
+        so, because ``applied`` is reported for a body that merely LACKS the
+        key. Feeding this endpoint's own JSON through the REAL
+        ``requestOnDemand`` fails on a rename on either side.
+        """
+        body, _calls = _terminal_render(
+            client, monkeypatch, terminal='dark-factory',
+            terminal_rows=[_terminal_row(i) for i in range(100, 110)],
+            done={'dark-factory': 10},
+        )
+
+        outcome, stored = _request_on_demand(body, 'dark-factory')
+
+        assert outcome == 'applied'
+        assert stored['state'] == 'lower_bound', (
+            'the client found no window under the key it reads, so it still '
+            f'holds its pre-request placeholder: {stored}'
+        )
+        assert stored['_served_at'] == body['served_at'], (
+            'the receipt must come from the body the window arrived in'
+        )
+        assert stored['value'] == body['TASKS_TERMINAL:dark-factory']['value'], (
+            'the client must store the row list the server served, unchanged'
+        )
 
 
 def test_memory_returns_memory_status(client):
