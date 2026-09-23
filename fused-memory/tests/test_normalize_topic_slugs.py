@@ -2018,20 +2018,25 @@ class TestConsolidationGateCensus:
 # run(), the fail-closed preflight, the artifacts and the CLI
 # ===========================================================================
 
-async def run_sweep(service, **kwargs) -> dict:
-    """``_mod.run`` under a name that reads as a sweep at the call site."""
-    return await _mod.run(service, **kwargs)
-
-
-def resolve_exit(report: dict) -> int:
-    return _mod.resolve_exit_code(report)
-
-
 def _census(*, covered=('dark_factory',), tasks=(), failures=(), roots=('/repo',)) -> object:
     """A ``GateCensus`` built by hand, as ``census_consolidation_gates`` returns one."""
     return _mod.GateCensus(
         roots=tuple(roots), tasks=tuple(tasks),
         covered_projects=frozenset(covered), failures=tuple(failures))
+
+
+async def run_sweep(service, **kwargs) -> dict:
+    """``_mod.run`` under a name that reads as a sweep at the call site.
+
+    These fixture corpora carry no gates, so the census defaults to a
+    complete, gate-free one over the swept projects.
+    """
+    kwargs.setdefault('gates', _census(covered=kwargs.get('projects', _mod.DEFAULT_PROJECTS)))
+    return await _mod.run(service, **kwargs)
+
+
+def resolve_exit(report: dict) -> int:
+    return _mod.resolve_exit_code(report)
 
 
 def _census_failure(root: str) -> dict:
@@ -2814,6 +2819,11 @@ def _e2e_corpus() -> tuple[dict[str, list[dict]], list[dict]]:
     return records, gates
 
 
+def _e2e_census(gates: list[dict]) -> object:
+    """A complete census over both projects, carrying the fixture's gates."""
+    return _census(covered=('dark_factory', 'reify'), tasks=gates)
+
+
 _E2E_RENAMED = {'df2', 'df3', 'df7', 'rf2'}
 _E2E_UNTOUCHED = {
     'df1': 'good-topic', 'df4': 'dup_topic', 'df5': 'dup-topic',
@@ -2832,7 +2842,7 @@ class TestEndToEnd:
 
         report = await run_sweep(
             service, projects=('dark_factory', 'reify'),
-            apply=False, client=client, gate_tasks=gates)
+            apply=False, client=client, gates=_e2e_census(gates))
 
         assert report['outcomes'].get('would_rename') == len(_E2E_RENAMED)
         assert len(report['skips']['slug_collision']) == 1
@@ -2850,7 +2860,7 @@ class TestEndToEnd:
 
         report = await run_sweep(
             service, projects=('dark_factory', 'reify'), apply=True,
-            client=_stateful_gate_client(gates), gate_tasks=gates)
+            client=_stateful_gate_client(gates), gates=_e2e_census(gates))
 
         assert report['outcomes'].get('renamed') == len(_E2E_RENAMED)
         assert {mid for mid, _patch in corpus.writes} == _E2E_RENAMED
@@ -2866,7 +2876,7 @@ class TestEndToEnd:
 
         await run_sweep(
             service, projects=('dark_factory', 'reify'), apply=True,
-            client=_stateful_gate_client(gates), gate_tasks=gates)
+            client=_stateful_gate_client(gates), gates=_e2e_census(gates))
 
         for memory_id, topic in _E2E_UNTOUCHED.items():
             project = 'reify' if memory_id.startswith('rf') else 'dark_factory'
@@ -2879,7 +2889,7 @@ class TestEndToEnd:
 
         report = await run_sweep(
             service, projects=('dark_factory', 'reify'), apply=True,
-            client=_stateful_gate_client(gates), gate_tasks=gates)
+            client=_stateful_gate_client(gates), gates=_e2e_census(gates))
 
         assert gates[0]['metadata'][_mod.GATE_METADATA_KEY]['topic'] == 'gate-slug'
         assert [r['outcome'] for r in report['gate_results']] == ['gate_patched']
@@ -2891,7 +2901,7 @@ class TestEndToEnd:
 
         report = await run_sweep(
             service, projects=('dark_factory', 'reify'), apply=True,
-            client=_stateful_gate_client(gates), gate_tasks=gates)
+            client=_stateful_gate_client(gates), gates=_e2e_census(gates))
 
         assert report['skips']['legacy_slug_residue'] == []
 
@@ -2902,7 +2912,7 @@ class TestEndToEnd:
 
         report = await run_sweep(
             service, projects=('dark_factory', 'reify'), apply=True,
-            client=_stateful_gate_client(gates), gate_tasks=gates)
+            client=_stateful_gate_client(gates), gates=_e2e_census(gates))
 
         assert resolve_exit(report) == 1
         assert report['outcomes'].get('slug_collision') == 1
@@ -2916,11 +2926,11 @@ class TestEndToEnd:
 
         first = await run_sweep(
             service, projects=('dark_factory', 'reify'), apply=True,
-            client=client, gate_tasks=gates)
+            client=client, gates=_e2e_census(gates))
         writes_after_first = len(corpus.writes)
         second = await run_sweep(
             service, projects=('dark_factory', 'reify'), apply=True,
-            client=client, gate_tasks=gates)
+            client=client, gates=_e2e_census(gates))
 
         assert writes_after_first == len(_E2E_RENAMED)
         assert len(corpus.writes) == writes_after_first
@@ -2939,7 +2949,7 @@ class TestEndToEnd:
 
         report = await run_sweep(
             service, projects=('dark_factory', 'reify'),
-            client=_stateful_gate_client(gates), gate_tasks=gates)
+            client=_stateful_gate_client(gates), gates=_e2e_census(gates))
 
         # clean_slug, dup_topic, '!!!', gate_slug in dark_factory; other_slug
         # in reify -- five distinct VALUES over six non-conforming records.
@@ -2956,7 +2966,7 @@ class TestEndToEnd:
 
         report = await run_sweep(
             service, projects=('dark_factory', 'reify'), apply=True,
-            client=_stateful_gate_client(gates), gate_tasks=gates)
+            client=_stateful_gate_client(gates), gates=_e2e_census(gates))
 
         rendered = _mod.render_markdown(report)
         assert '### slug_collision: 1' in rendered

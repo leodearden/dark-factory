@@ -138,6 +138,7 @@ __all__ = [
     'DEFAULT_PROJECTS',
     'GATE_METADATA_KEY',
     'GateCensus',
+    'GateCensusIncomplete',
     'GateGroup',
     'WriteRejectedError',
     'assert_write_accepted',
@@ -185,6 +186,7 @@ ERROR_OUTCOMES: frozenset[str] = frozenset({
     'topic_moved_since_plan',
     'update_failed',
     'rename_error',
+    'gate_census_incomplete',
     'gate_ambiguous',
     'gate_lockstep_failed',
     'legacy_slug_residue',
@@ -208,6 +210,8 @@ SKIP_BUCKETS: tuple[str, ...] = (
     'topic_moved_since_plan',
     'update_failed',
     'rename_error',
+    # from census_consolidation_gates, measured against the swept projects
+    'gate_census_incomplete',
     # from pair_gate_blocks / rename_group — the two-store lockstep
     'orphan_gate_topic',
     'gate_ambiguous',
@@ -1510,13 +1514,57 @@ REMEASURE_COMMAND = (
 DEFAULT_PROJECTS: tuple[str, ...] = ('dark_factory', 'reify')
 
 
+def _describe_gap(gap: dict) -> str:
+    return ', '.join(
+        f'{key}={gap[key]!r}'
+        for key in ('project_id', 'project_root', 'error')
+        if gap.get(key)
+    )
+
+
+class GateCensusIncomplete(RuntimeError):
+    """``--apply`` refused: the gate census cannot vouch for every swept project.
+
+    Carries the gap entries, the same structured facts a dry run files under
+    ``gate_census_incomplete``.
+    """
+
+    def __init__(self, gaps: list[dict]):
+        super().__init__(
+            'gate census incomplete: ' + '; '.join(_describe_gap(gap) for gap in gaps))
+        self.gaps = gaps
+
+
+def _census_gaps(gates: GateCensus, projects) -> list[dict]:
+    """Every reason this sweep cannot trust its gate pairing, as report entries.
+
+    A swept project the census does not cover, plus every root it could not
+    read.  A failure is a gap even when every swept project is covered: the
+    root that failed may be the one store holding a gate this run would
+    otherwise treat as absent.
+    """
+    uncovered = [
+        {
+            'reason': 'gate_census_incomplete',
+            'project_id': project_id,
+            'error': (
+                'no task store answered for this project, so its consolidation '
+                'gates are unknown'
+            ),
+        }
+        for project_id in projects
+        if project_id not in gates.covered_projects
+    ]
+    return uncovered + [dict(failure) for failure in gates.failures]
+
+
 async def run(
     memory_service,
     *,
+    gates: GateCensus,
     projects: tuple[str, ...] = DEFAULT_PROJECTS,
     apply: bool = False,
     client: Any = None,
-    gate_tasks: list[dict] | None = None,
     page_size: int = DEFAULT_PAGE_SIZE,
     max_pages: int = DEFAULT_MAX_PAGES,
 ) -> dict:
@@ -1538,14 +1586,21 @@ async def run(
         client: The MCP client for the gate half.  ``None`` is fine for a
             sweep that reaches no gate; a GATED group with no client is
             refused exactly like a refused gate.
-        gate_tasks: Consolidation-gate tasks, each stamped with the
-            ``project_id`` whose corpus its topic lives in.  Injected so the
-            tests never open a socket.
+        gates: The consolidation-gate census, REQUIRED: an optional gate list
+            whose absence read as "no gates" is how the live path once renamed
+            gated slugs without their gates.  ``--apply`` refuses
+            (:class:`GateCensusIncomplete`) unless it covers every swept
+            project with no failure; a dry run files the gap under
+            ``gate_census_incomplete`` instead.  Only the swept projects'
+            gates are paired — another project's gate is neither this run's
+            work nor its orphan.
 
     Returns:
         The report dict — rendered by :func:`render_json` /
         :func:`render_markdown` and graded by :func:`resolve_exit_code`.
     """
+    gaps = _census_gaps(gates, projects)
+
     # Fail-CLOSED capability preflight: ONE probe per run, ABOVE the scroll.
     #
     # ``run`` is the choke point precisely because ``rename_one``'s own
@@ -1577,6 +1632,22 @@ async def run(
                 'without --apply.'
             )
             raise
+        # The same shape and placement as the preflight: one decision per
+        # run, above the scroll, through the logger.
+        if gaps:
+            logger.error(
+                'normalize_topic_slugs: --apply NOT started (fail-closed) -- '
+                'the consolidation-gate census cannot vouch for every swept '
+                'project: %s. Renaming a gated slug without moving its gate '
+                "leaves the gate's closure check scrolling a slug no record "
+                'carries, so the gate could never close. Nothing was scrolled '
+                'and no record was renamed. Pass --project-root <that '
+                "project's checkout> for every swept project, and resolve any "
+                'root that failed. To see the gap safely, re-run without '
+                '--apply.',
+                '; '.join(_describe_gap(gap) for gap in gaps),
+            )
+            raise GateCensusIncomplete(gaps)
 
     # Pre-seeded, because an ABSENT bucket reads as "nothing was skipped",
     # which is a different claim from "we looked and found nothing".
@@ -1592,6 +1663,8 @@ async def run(
         """
         for entry in entries:
             skips.setdefault(entry.get('reason', 'unclassified'), []).append(entry)
+
+    _record_skips(gaps)
 
     coverage: dict[str, dict] = {}
     coverage_complete = True
@@ -1625,7 +1698,10 @@ async def run(
         _record_skips(plan_skips)
         all_renames.extend(renames)
 
-    groups, gate_skips = pair_gate_blocks(all_renames, gate_tasks or [])
+    groups, gate_skips = pair_gate_blocks(
+        all_renames,
+        [task for task in gates.tasks if task.get('project_id') in projects],
+    )
     _record_skips(gate_skips)
 
     results: list[dict] = []
@@ -1687,6 +1763,14 @@ async def run(
         'outcomes': outcomes,
         'results': results,
         'gate_results': gate_results,
+        # Sorted LISTS: a frozenset through render_json's default=str would
+        # render in hash order and break the byte-comparable artifact.
+        'gate_census': {
+            'roots': sorted(gates.roots),
+            'covered_projects': sorted(gates.covered_projects),
+            'gate_count': len(gates.tasks),
+            'complete': not gaps,
+        },
         'skips': skips,
         # Scope item 4: the delta, computed here so the next reader inherits
         # it instead of re-deriving it (and re-deriving it differently).
@@ -1732,12 +1816,12 @@ DEFAULT_MD_OUT = str(_REPO_ROOT / 'plans' / 'topic-slug-normalization-report.md'
 #: than a dump: rows that land in error buckets carry a whole ``response``
 #: envelope, which would bury the fields that identify the record.
 _SKIP_DETAIL_KEYS: tuple[str, ...] = (
-    'project_id', 'category', 'memory_id', 'memory_ids', 'gate_task_id',
-    'gate_task_ids', 'topic', 'raw_topic', 'old_topic', 'new_topic', 'gate_topic',
-    'legacy_topic', 'existing_topic', 'target_topic', 'source_topics',
-    'canonical_memory_ids', 'incumbent_ids', 'record_count', 'residue_count',
-    'expected', 'scrolled', 'recount', 'delta', 'half', 'error', 'error_type',
-    'undo_failures', 'note',
+    'project_id', 'project_root', 'category', 'memory_id', 'memory_ids',
+    'gate_task_id', 'gate_task_ids', 'topic', 'raw_topic', 'old_topic',
+    'new_topic', 'gate_topic', 'legacy_topic', 'existing_topic',
+    'target_topic', 'source_topics', 'canonical_memory_ids', 'incumbent_ids',
+    'record_count', 'residue_count', 'expected', 'scrolled', 'recount',
+    'delta', 'half', 'error', 'error_type', 'undo_failures', 'note',
 )
 
 
@@ -1762,6 +1846,20 @@ def _render_skip_entry(entry: dict) -> str:
     # An entry the renderer does not recognise is exactly the one worth
     # showing verbatim, rather than as a bare bullet.
     return '- ' + (', '.join(parts) if parts else repr(entry))
+
+
+def _render_gate_census(census: dict) -> str:
+    verdict = (
+        'complete' if census.get('complete')
+        else 'INCOMPLETE — see the gate_census_incomplete bucket; --apply '
+             'refuses until every swept project is covered'
+    )
+    return (
+        f'**Gate census:** {verdict} '
+        f'(roots: {", ".join(census.get("roots") or []) or "none"}; '
+        f'covered: {", ".join(census.get("covered_projects") or []) or "none"}; '
+        f'gates read: {census.get("gate_count", 0)})'
+    )
 
 
 def render_markdown(report: dict) -> str:
@@ -1840,7 +1938,10 @@ def render_markdown(report: dict) -> str:
         lines.append('- _nothing to rename_')
 
     gate_results = report.get('gate_results') or []
+    gate_census = report.get('gate_census')
     lines += ['', '## Consolidation gates', '']
+    if gate_census:
+        lines += [_render_gate_census(gate_census), '']
     if gate_results:
         for row in gate_results:
             lines.append(
@@ -1848,6 +1949,8 @@ def render_markdown(report: dict) -> str:
                 f'`{row.get("new_topic")}` — {row.get("outcome")}'
                 + (f' ({row.get("error")})' if row.get('error') else '')
             )
+    elif gate_census and not gate_census.get('complete'):
+        lines.append('_gate-backed topics in an uncovered project are UNKNOWN, not absent_')
     else:
         lines.append('_no gate-backed topic in this sweep_')
 
