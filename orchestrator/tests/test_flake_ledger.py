@@ -2389,6 +2389,28 @@ class TestOpenDebtClosesAFinishedCycle:
 
         assert client.calls == ['get_task', 'get_statuses', 'submit_task', 'commit_planning']
 
+    async def test_a_naive_now_warns_once_when_wired(self, tmp_path: Path, caplog) -> None:
+        """One observation instant serves the resolution AND the upsert, so a naive
+        ``now`` is one caller bug, reported once under ``open_debt`` — not a second time
+        by the ``resolve_debt`` it is handed on to."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await _open_owned_debt(db_path, self.TEST_ID, now=self.NOW)
+        client = _FakeTaskClient(
+            tasks={'task-901': _done_task('task-901', self.COMMIT)}, submit_returns='task-902'
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            row = await open_debt(
+                db_path, 'dark_factory', self.TEST_ID,
+                task_client=client, now=datetime(2026, 8, 6, 13, 0),
+            )
+
+        assert row is not None and row.opened_at == self.LATER.isoformat()
+        naive = [r.getMessage() for r in caplog.records if 'naive' in r.getMessage()]
+        assert len(naive) == 1 and 'open_debt' in naive[0], naive
+
 
 @pytest.mark.asyncio
 class TestResolveDebt:

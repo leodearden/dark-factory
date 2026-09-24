@@ -432,6 +432,13 @@ def _canonicalize_utc(dt: datetime, *, origin: str | None = None) -> str:
     call site passing ``datetime.now()`` instead of ``datetime.now(UTC)``, producing a
     stamp that is wrong by the host offset while still looking canonical.
     """
+    return _aware(dt, origin=origin).astimezone(UTC).isoformat()
+
+
+def _aware(dt: datetime, *, origin: str | None = None) -> datetime:
+    """*dt* with UTC ATTACHED if it is naive — the half of :func:`_canonicalize_utc` a
+    caller needs when it must hand one instant on as a ``datetime``, so the naive
+    warning (same *origin* rule) fires once rather than once per consumer."""
     if dt.tzinfo is None:
         if origin is not None:
             logger.warning(
@@ -440,7 +447,7 @@ def _canonicalize_utc(dt: datetime, *, origin: str | None = None) -> str:
                 origin,
             )
         dt = dt.replace(tzinfo=UTC)
-    return dt.astimezone(UTC).isoformat()
+    return dt
 
 
 def _normalize_observed_at(raw: str) -> str:
@@ -1385,6 +1392,14 @@ async def open_debt(
     wrote it, with no owner; that is a legitimate degrade, logged, and rendered by ι as
     an invariant breach rather than hidden.
 
+    CLOSE, THEN UPSERT (task η).  With a ``task_client`` wired, the current cycle is
+    first closed via :func:`resolve_debt` if its stored owner reads back live-done, so
+    this observation RE-ENTERS the debt (``open_count`` +1, the fix's commit carried
+    forward) instead of ζ quietly replacing a finished owner.  That makes recurrence
+    detection race-free with no sweep at all: ``owner_task_id`` changes only inside this
+    function, so the done owner is still on the row when the next suppression arrives,
+    whether or not an eager sweep has run.  The eager sweep is task θ's.
+
     COUPLING RULE, binding: the ledger READS task status but never WRITES it, except
     for the initial filing (``submit_task`` plus the ``commit_planning`` that completes
     it).  It never marks a task done, never blocks one, never reprioritises one.
@@ -1404,18 +1419,26 @@ async def open_debt(
     (``datetime.now(UTC)``) — a naive ``now`` is coerced rather than rejected, to honour
     the never-raises invariant, but it also logs a loud warning, because here (unlike
     :func:`_normalize_observed_at`'s wire-supplied ``observed_at``) a missing offset is
-    a caller bug, not untrusted input.
+    a caller bug, not untrusted input.  It is ONE instant for the whole call: a
+    lazily-closed cycle's ``resolved_at`` and the re-entered ``opened_at`` are the same
+    observation.
     """
-    try:
-        if test_id == UNKNOWN_TEST_ID:
-            logger.warning(
-                'flake_ledger: refusing to open debt for the %s sentinel — it names no '
-                'test, so it can own no de-flake task',
-                UNKNOWN_TEST_ID,
-            )
-            return None
+    if test_id == UNKNOWN_TEST_ID:
+        logger.warning(
+            'flake_ledger: refusing to open debt for the %s sentinel — it names no '
+            'test, so it can own no de-flake task',
+            UNKNOWN_TEST_ID,
+        )
+        return None
 
-        stamp = _canonicalize_utc(now or datetime.now(UTC), origin='open_debt')
+    observed = _aware(now or datetime.now(UTC), origin='open_debt')
+    if task_client is not None:
+        # Outside the upsert's guard, and safe there: resolve_debt never raises, so a
+        # failed resolution costs only the resolution — never the occurrence below.
+        await resolve_debt(db_path, project_id, test_id, task_client=task_client, now=observed)
+
+    try:
+        stamp = _canonicalize_utc(observed)
         conn = _open(db_path)
         try:
             # ONE statement, deliberately.  SQL evaluates every SET right-hand side against
