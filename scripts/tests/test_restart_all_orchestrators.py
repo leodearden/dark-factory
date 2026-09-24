@@ -1890,60 +1890,30 @@ def test_busy_stale_busy_oscillation_does_not_reset_the_force_fire_anchor(tmp_pa
     must NOT get a fresh force-fire deadline on the second busy reading --
     the deadline is anchored to when the unit FIRST went busy.
 
-    A scheduled idle "trap" at t=15 is what makes this a TEXT-level
-    assertion rather than a wall-clock one, which is deliberately NOT
-    "simplified" into a timing check. The trap must sit strictly BETWEEN two
-    deadlines that differ only by whether the anchor reset, so the margin on
-    BOTH sides is the point (reviewer_comprehensive #1: the original t=12
-    trap, timed to sit just after an elapsed(8) >= FORCE_FIRE(6) force-fire,
-    measured as little as ~1.5s clear of the correct-path exit under 2x CPU
-    oversubscription). FORCE_FIRE=10 here (not 6) is what buys that margin:
-    it holds the correct path's force-fire a couple of poll cycles AFTER
-    busy is redetected at t~8 instead of on the very next check, which pushes
-    the reset path's hypothetical deadline out to ~18-19 and opens a wider
-    window to place the trap in.
-      - Anchor PRESERVED (correct): busy is redetected at t~8-9, still short
-        of the UNRESET deadline (start~0 + FORCE_FIRE(10) = ~10). The outer
-        loop force-fires the first time elapsed reaches 10 -- around
-        t~10-11 -- and never reads the heartbeat again, so the t=15 trap is
-        unreachable BY THE SCRIPT: it prints the force line and no resume
-        line. (The trap's timer may still FIRE in this process afterwards
-        if the run is slow -- see below; that says nothing about the
-        anchor.)
-      - Anchor RESET (the regression): start_secs restarts at t~8-9, so the
-        new deadline is ~8-9 + FORCE_FIRE(10) = ~18-19 -- AFTER the trap.
-        The loop keeps polling past t=15, its own (unguarded-by-FORCE_FIRE)
-        idle check reads the trap's heartbeat, and it prints "resuming
-        restart of <unit>: drained" with NO force line (the reset deadline
-        would not have been reached until t~18-19).
-    The two counterfactuals differ in OUTPUT, not merely in duration, so
-    every assertion below is text-level, read off the subprocess's STDOUT:
-    exactly two defer lines (the initial one plus the re-defer after the
-    stale interlude -- itself independent corroboration that the
-    oscillation happened), a force line PRESENT, and a resume line ABSENT.
-    That pair discriminates both counterfactuals completely, and stdout is
-    a record of what the script actually reached, which no amount of host
-    load can perturb.
-
-    The trap is therefore observed through stdout and NEVER through this
-    process's timer. A negative `assert "idle-trap" not in fired` used to
-    stand here and was deleted (task 4890): `fired` is appended by a
-    `threading.Timer` armed in the TEST process and cancelled only when
-    `_run_script` returns, so it reports "the script's total wall clock
-    exceeded 15s" -- a quantity measured varying 11.3s-39.7s across five
-    runs at loadavg 90 on 32 cores, i.e. a property of the host, not of
-    the anchor. It failed 2/10 isolated reruns while the code was correct.
-    `test_fired_records_elapsed_wall_clock_not_script_reachability` (above)
-    pins that premise directly.
-
-    DO NOT, on a recurrence here: widen the trap delay, raise FORCE_FIRE,
-    or re-add a negative `fired` assertion in any form. The trap ENTRY at
-    t=15 stays -- it is load-bearing, being what makes the reset path print
-    a resume line instead of merely force-firing later -- but its only
-    legitimate observation is the stdout pair above.
+    The unit goes stale once the gate has seen it busy, comes back busy once
+    the gate has polled the stale state _polls_outlasting(F) times (F =
+    _SHORT_FORCE_FIRE_SECS), and drains -- the idle TRAP -- once the gate
+    has polled busy again. By _polls_outlasting's lemma, that counted stale
+    run alone carries the script at least F seconds past its first defer, so
+    the two counterfactuals differ in what the script does next, measured in
+    its own clock:
+      - Anchor PRESERVED (correct): elapsed already exceeds F when the unit
+        re-defers, so the very next loop-top check force-fires. Exactly one
+        busy poll follows the stale run and the trap is never read: a force
+        line and no resume line.
+      - Anchor RESET (the regression): elapsed restarts at 0, so the loop
+        polls again, reads the trap and prints "resuming restart of <unit>:
+        drained". Even if the trap lands late, the ledger shows a second busy
+        poll after the stale run.
+    Every assertion below reads what the script itself did -- its stdout and
+    its own poll ledger -- which no amount of host load can perturb: exactly
+    two defer lines (the initial one plus the re-defer after the stale
+    interlude, itself independent corroboration that the oscillation
+    happened), a force line PRESENT, a resume line ABSENT, and a ledger that
+    ends on the stale run followed by exactly one busy poll.
     """
     # ORCH_DRAIN_UNKNOWN_GRACE_SECS is a must-never-elapse bound here (the
-    # unit resumes busy on its own at t=8, well inside it), so this site wants
+    # unit comes back busy on its own a few polls into it), so this site wants
     # the LARGEST spawn timeout a wait-proving test may legally take -- which
     # is precisely what WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS is defined to be.
     # The 22 -> wait_proof_grace_secs(22)=88 <= 90 derivation, and why that
@@ -1955,39 +1925,55 @@ def test_busy_stale_busy_oscillation_does_not_reset_the_force_fire_anchor(tmp_pa
     # test_the_spawn_timeout_cap_is_the_largest_the_ceiling_permits, which
     # pins the constant but cannot see a copy of its arithmetic.
     spawn_timeout = WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS
+    outlasting = _polls_outlasting(_SHORT_FORCE_FIRE_SECS)
 
-    result, state, _ = _busy_unit_drain_run(
+    result, state, polls = _run_busy_unit_through(
         tmp_path,
         [
-            ("stale", _FIRST_TRANSITION_DELAY_SECS, _HB_STALE),
-            ("busy", 8.0, _HB_BUSY),
-            ("idle-trap", 15.0, _HB_IDLE),
+            _Rewrite(after="busy", to=_HB_STALE),
+            _Rewrite(after="stale", to=_HB_BUSY, polls=outlasting),
+            _Rewrite(after="busy", to=_HB_IDLE),  # the TRAP -- see the docstring
         ],
         spawn_timeout=spawn_timeout,
-        ORCH_RESTART_FORCE_FIRE_AFTER_SECS="10",
+        ORCH_RESTART_FORCE_FIRE_AFTER_SECS=str(_SHORT_FORCE_FIRE_SECS),
         ORCH_DRAIN_UNKNOWN_GRACE_SECS=str(wait_proof_grace_secs(spawn_timeout)),
     )
 
-    assert result.returncode == 0, (
-        f"stdout={result.stdout!r} stderr={result.stderr!r}"
-    )
+    context = f"ledger={polls!r} stdout={result.stdout!r}"
+    assert result.returncode == 0, f"{context} stderr={result.stderr!r}"
     defer_count = result.stdout.count(f"deferring restart of {UNIT_R}: mid-merge")
     assert defer_count == 2, (
         f"expected exactly two defer lines (initial + re-defer after the "
         f"stale interlude), which also independently catches a disabled "
-        f"stale/absent handoff; got count={defer_count} stdout={result.stdout!r}"
-    )
-    assert f"force-restarting {UNIT_R}" in result.stdout, (
-        f"expected the anchor to force-fire once elapsed(~8-9) >= 10; got "
-        f"stdout={result.stdout!r}"
+        f"stale/absent handoff; got count={defer_count} {context}"
     )
     # THE ANCHOR PROOF -- see the docstring's two counterfactuals.
     assert f"resuming restart of {UNIT_R}: drained" not in result.stdout, (
         f"expected NO resume line -- one here means start_secs was reset "
-        f"on the busy-resumption arm; got stdout={result.stdout!r}"
+        f"on the busy-resumption arm; {context}"
+    )
+    assert f"force-restarting {UNIT_R}" in result.stdout, (
+        f"expected the preserved anchor to force-fire on the loop-top check "
+        f"right after the re-defer: the counted stale run had already carried "
+        f"the script past F={_SHORT_FORCE_FIRE_SECS}s; {context}"
     )
     assert ["--user", "restart", UNIT_R] in state["calls"], (
         f"expected a restart call for {UNIT_R}; got calls={state['calls']!r}"
+    )
+    stale, busy = ("stale", UNIT_R), ("busy", UNIT_R)
+    assert polls.count(stale) >= outlasting, (
+        f"the ledger holds {polls.count(stale)} stale poll(s), expected >= "
+        f"{outlasting}: the busy rewrite waits for that many, so fewer means "
+        f"something other than that count ended the stale run, and the "
+        f"script may not have been past F={_SHORT_FORCE_FIRE_SECS}s when it "
+        f"re-deferred. {context}"
+    )
+    assert polls[-2:] == [stale, busy], (
+        f"the ledger's stale COUNT is fine; its ending is not. After the "
+        f"stale run the gate must poll busy exactly ONCE -- the re-defer read "
+        f"-- and then force-fire. A second poll means the loop kept polling "
+        f"past F, i.e. start_secs was reset on the busy-resumption arm. "
+        f"{context}"
     )
 
 
