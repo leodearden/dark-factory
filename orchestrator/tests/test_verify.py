@@ -9,6 +9,16 @@ from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
+from _xdist_crash_fixtures import (
+    XDIST_CRASH_ATTRIBUTED_FAILED_LINE,
+    XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT,
+    XDIST_FAILED_THEN_CRASHED_OUTPUT,
+    XDIST_IN_FLIGHT_NODEID,
+    XDIST_MAX_WORKERS_REACHED_OUTPUT,
+    XDIST_SESSION_ABORTED_OUTPUT,
+    XDIST_WORKER_CRASH_OUTPUT,
+    XDIST_WORKER_REPLACED_OUTPUT,
+)
 
 from orchestrator import verify, verify_plan
 from orchestrator.config import ModuleConfig, OrchestratorConfig
@@ -2400,16 +2410,6 @@ class TestExtractCauseHint:
     # complete result.
     # ---------------------------------------------------------------------
 
-    _TRUNCATED_SESSION_OUTPUT = (
-        'orchestrator/tests/test_config.py ....\n'
-        '[gw3] node down: Not properly terminated\n'
-        "worker gw3 crashed while running "
-        "'orchestrator/tests/test_config.py::TestFoo::test_bar'\n"
-        'FAILED orchestrator/tests/test_config.py::TestFoo::test_bar\n'
-        '=========== xdist: worker gw3 crashed and worker restarting disabled ===========\n'
-        '1 failed, 728 passed, 1 skipped in 209.67s\n'
-    )
-
     def test_worker_death_truncated_session_does_not_blame_crashed_test(self):
         """The crashed worker's in-flight test is never named as the cause.
 
@@ -2417,7 +2417,7 @@ class TestExtractCauseHint:
         names passes in isolation.  Naming it sends the debugger after a
         failure that never happened.
         """
-        hint = _extract_cause_hint(self._TRUNCATED_SESSION_OUTPUT)
+        hint = _extract_cause_hint(XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT)
         assert WORKER_DEATH_SUMMARY_MARKER in hint, f'Unexpected hint: {hint!r}'
         assert 'test_config.py::TestFoo::test_bar' not in hint, (
             f'Unexpected hint: {hint!r}'
@@ -2431,7 +2431,7 @@ class TestExtractCauseHint:
         reported 19622 passed (esc-4176-6).  Quoting it as a cause reads as a
         complete result.
         """
-        hint = _extract_cause_hint(self._TRUNCATED_SESSION_OUTPUT)
+        hint = _extract_cause_hint(XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT)
         assert '1 failed, 728 passed' not in hint, f'Unexpected hint: {hint!r}'
 
     def test_worker_death_hint_still_names_a_surviving_real_failure(self):
@@ -2445,7 +2445,7 @@ class TestExtractCauseHint:
         information without discarding any.
         """
         output = (
-            self._TRUNCATED_SESSION_OUTPUT
+            XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT
             + 'FAILED orchestrator/tests/test_x.py::test_real - AssertionError\n'
         )
         hint = _extract_cause_hint(output)
@@ -2460,18 +2460,44 @@ class TestExtractCauseHint:
         come back byte-identical.
         """
         output = (
-            'orchestrator/tests/test_config.py ....\n'
-            '[gw3] node down: Not properly terminated\n'
-            "worker gw3 crashed while running "
-            "'orchestrator/tests/test_config.py::TestFoo::test_bar'\n"
-            'FAILED orchestrator/tests/test_config.py::TestFoo::test_bar\n'
-            '========== 1 failed, 2 passed in 5.00s ==========\n'
+            XDIST_WORKER_CRASH_OUTPUT
+            + XDIST_CRASH_ATTRIBUTED_FAILED_LINE
+            + '========== 1 failed, 2 passed in 5.00s ==========\n'
         )
         hint = _extract_cause_hint(output)
-        assert hint == 'FAILED orchestrator/tests/test_config.py::TestFoo::test_bar', (
-            f'Unexpected hint: {hint!r}'
-        )
+        assert hint == f'FAILED {XDIST_IN_FLIGHT_NODEID}', f'Unexpected hint: {hint!r}'
 
+    @pytest.mark.parametrize(
+        'surviving_line',
+        [
+            'INTERNALERROR> Traceback (most recent call last):',
+            'ERROR orchestrator/tests/test_other.py::test_needs_fixture - Exception: setup failed',
+            "ERROR orchestrator/tests/test_broken.py - ImportError: cannot import name 'foo'",
+        ],
+        ids=['internalerror', 'error-nodeid', 'error-file'],
+    )
+    def test_worker_death_hint_names_a_surviving_error_surface(self, surviving_line):
+        """Truncation must not MASK an INTERNALERROR or ERROR line either.
+
+        xdist synthesizes only a FAILED report for the crashed test, so these
+        surfaces are never its artefact: with no surviving FAILED line, the
+        hint names them beside the abort marker instead of quoting only the
+        bailout — the INTERNALERROR rung 2 would have quoted stays visible.
+        """
+        hint = _extract_cause_hint(XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT + surviving_line + '\n')
+        assert WORKER_DEATH_SUMMARY_MARKER in hint, f'Unexpected hint: {hint!r}'
+        assert surviving_line in hint, f'Unexpected hint: {hint!r}'
+
+    def test_worker_death_hint_names_a_test_that_failed_before_its_worker_died(self):
+        """The crashed worker's in-flight test on TWO FAILED lines genuinely failed.
+
+        It failed in its call phase and then its worker died in teardown.
+        xdist synthesizes at most one report per node-id, so the other line is
+        a real verdict and the hint must name the test rather than hide it.
+        """
+        hint = _extract_cause_hint(XDIST_FAILED_THEN_CRASHED_OUTPUT)
+        assert WORKER_DEATH_SUMMARY_MARKER in hint, f'Unexpected hint: {hint!r}'
+        assert XDIST_IN_FLIGHT_NODEID in hint, f'Unexpected hint: {hint!r}'
 
 
 # ---------------------------------------------------------------------------
@@ -2487,17 +2513,6 @@ class TestExtractCauseHint:
 # of the identical command), yet the flat literal 'tests failed' claims a
 # complete measured verdict, and `merge_queue` surfaces it verbatim.
 # ---------------------------------------------------------------------------
-
-_TRUNCATED_TEST_LEG_OUTPUT = (
-    'orchestrator/tests/test_config.py ....\n'
-    '[gw3] node down: Not properly terminated\n'
-    "worker gw3 crashed while running "
-    "'orchestrator/tests/test_config.py::TestFoo::test_bar'\n"
-    'FAILED orchestrator/tests/test_config.py::TestFoo::test_bar\n'
-    '=========== xdist: worker gw3 crashed and worker restarting disabled ===========\n'
-    '1 failed, 728 passed, 1 skipped in 209.67s\n'
-)
-
 
 class TestWorkerDeathLegSummary:
     """A truncated test leg contributes a worker-death note, not 'tests failed'."""
@@ -2517,14 +2532,14 @@ class TestWorkerDeathLegSummary:
 
     def test_truncated_test_leg_does_not_claim_a_complete_verdict(self):
         """The facet-2 core: 'tests failed' is a claim the gate cannot make."""
-        summary = self._summarize(1, _TRUNCATED_TEST_LEG_OUTPUT)
+        summary = self._summarize(1, XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT)
         assert WORKER_DEATH_SUMMARY_MARKER in summary, f'Unexpected summary: {summary!r}'
         assert 'tests failed' not in summary, f'Unexpected summary: {summary!r}'
 
     def test_failures_envelope_is_preserved(self):
         """Every existing consumer prefix- or substring-matches on this
         envelope (task 3173's wording for the same requirement)."""
-        summary = self._summarize(1, _TRUNCATED_TEST_LEG_OUTPUT)
+        summary = self._summarize(1, XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT)
         assert summary.startswith('Failures: '), f'Unexpected summary: {summary!r}'
         assert summary != 'Failures: ', f'Unexpected summary: {summary!r}'
 
@@ -2538,7 +2553,7 @@ class TestWorkerDeathLegSummary:
         prevent, and the constraint `_killed_leg_note`'s docstring already
         pins for the signal-kill note.
         """
-        summary = self._summarize(1, _TRUNCATED_TEST_LEG_OUTPUT)
+        summary = self._summarize(1, XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT)
         note_fragment = summary.removeprefix('Failures: ')
         assert ', ' not in note_fragment, (
             f'a comma+space in the note splits it across `.split(", ")` in '
@@ -2557,7 +2572,7 @@ class TestWorkerDeathLegSummary:
         regress just because the (necessarily truncated) output it did capture
         happens to carry a bailout marker.
         """
-        summary = self._summarize(-9, _TRUNCATED_TEST_LEG_OUTPUT)
+        summary = self._summarize(-9, XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT)
         assert SIGNAL_KILL_SUMMARY_MARKER in summary, f'Unexpected summary: {summary!r}'
         assert 'killed by signal 9' in summary, f'Unexpected summary: {summary!r}'
         assert WORKER_DEATH_SUMMARY_MARKER not in summary, (
@@ -2570,7 +2585,50 @@ class TestWorkerDeathLegSummary:
         summary = self._summarize(1, 'FAILED orchestrator/tests/test_x.py::y\n')
         assert summary == 'Failures: tests failed', f'Unexpected summary: {summary!r}'
 
+    @pytest.mark.parametrize(
+        'output',
+        [XDIST_SESSION_ABORTED_OUTPUT, XDIST_MAX_WORKERS_REACHED_OUTPUT],
+        ids=['restart-disabled', 'max-crashed-workers-reached'],
+    )
+    def test_either_bailout_spelling_labels_the_leg(self, output):
+        """Both literals xdist prints before `triggershutdown()` mean the rest
+        of the suite was abandoned: a cap of 0, and a non-zero cap exceeded."""
+        summary = self._summarize(1, output)
+        assert WORKER_DEATH_SUMMARY_MARKER in summary, f'Unexpected summary: {summary!r}'
+        assert 'tests failed' not in summary, f'Unexpected summary: {summary!r}'
 
+    def test_a_replaced_worker_run_keeps_its_verdict(self):
+        """THE LOAD-BEARING DISCRIMINATION: xdist replaced the crashed worker
+        and the session ran to COMPLETION, so its verdict is complete.
+
+        The fixture carries the same crash notice as the truncated specimen
+        and no bailout line, so this verdict can only come from keying on the
+        bailout literal rather than on the crash signature — which would
+        relabel every ``--max-worker-restart > 0`` target's complete run.
+        """
+        assert 'crashed while running' in XDIST_WORKER_REPLACED_OUTPUT
+        assert 'xdist:' not in XDIST_WORKER_REPLACED_OUTPUT
+        summary = self._summarize(1, XDIST_WORKER_REPLACED_OUTPUT)
+        assert summary == 'Failures: tests failed', f'Unexpected summary: {summary!r}'
+
+    @pytest.mark.parametrize(
+        'surviving_line',
+        [
+            'FAILED orchestrator/tests/test_x.py::test_real - AssertionError',
+            'INTERNALERROR> Traceback (most recent call last):',
+            'ERROR orchestrator/tests/test_other.py::test_needs_fixture - Exception: setup failed',
+        ],
+        ids=['failed', 'internalerror', 'error'],
+    )
+    def test_a_surviving_failure_is_reported_beside_the_note(self, surviving_line):
+        """BOTH facts, never just one: a truncated leg that still measured a
+        failure the dead worker did not fabricate reports 'tests failed' AND
+        the note — each its own aggregation fragment."""
+        summary = self._summarize(1, XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT + surviving_line + '\n')
+        fragments = summary.removeprefix('Failures: ').split(', ')
+        assert len(fragments) == 2, f'Unexpected summary: {summary!r}'
+        assert fragments[0] == 'tests failed', f'Unexpected summary: {summary!r}'
+        assert WORKER_DEATH_SUMMARY_MARKER in fragments[1], f'Unexpected summary: {summary!r}'
 
 
 def _worker_death_child(*, module: str = 'orchestrator') -> VerifyResult:
@@ -2583,14 +2641,14 @@ def _worker_death_child(*, module: str = 'orchestrator') -> VerifyResult:
     from orchestrator.verify import _summarize_checks
 
     _, category, cause_hint, summary, failing_legs = _summarize_checks(
-        1, _TRUNCATED_TEST_LEG_OUTPUT, False, 'uv run pytest',
+        1, XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT, False, 'uv run pytest',
         0, '', False, 'ruff check',
         0, '', False, 'pyright',
         test_duration=209.67,
     )
     return VerifyResult(
         passed=False,
-        test_output=_TRUNCATED_TEST_LEG_OUTPUT,
+        test_output=XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT,
         lint_output='',
         type_output='',
         summary=summary,
@@ -2657,8 +2715,6 @@ class TestAggregateResultsKeepsWorkerDeathNote:
         )
 
 
-
-
 class TestFailureReportNamesTheAbortedSession:
     """`VerifyResult.failure_report()` must LEAD with the truncation caveat.
 
@@ -2686,13 +2742,13 @@ class TestFailureReportNamesTheAbortedSession:
         )
 
     def test_report_carries_the_section(self):
-        report = self._result(_TRUNCATED_TEST_LEG_OUTPUT).failure_report()
+        report = self._result(XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT).failure_report()
         assert self.HEADING in report, f'Unexpected report: {report!r}'
 
     def test_section_leads_the_report_ahead_of_the_failure_cause(self):
         """Placement matches the `## Verify Timed Out` precedent: the caveat
         comes BEFORE the cause, so it cannot be read as an afterthought."""
-        report = self._result(_TRUNCATED_TEST_LEG_OUTPUT).failure_report()
+        report = self._result(XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT).failure_report()
         assert '## Failure Cause' in report, f'Unexpected report: {report!r}'
         assert report.index(self.HEADING) < report.index('## Failure Cause'), (
             f'Unexpected report: {report!r}'
@@ -2700,7 +2756,7 @@ class TestFailureReportNamesTheAbortedSession:
 
     def test_section_says_the_tally_is_partial(self):
         """A reader must not mistake ``1 failed, 728 passed`` for complete."""
-        report = self._result(_TRUNCATED_TEST_LEG_OUTPUT).failure_report()
+        report = self._result(XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT).failure_report()
         section = report.split(self.HEADING, 1)[1].split('\n## ', 1)[0].lower()
         assert 'partial' in section, f'Unexpected section: {section!r}'
         assert 'never ran' in section, f'Unexpected section: {section!r}'
@@ -2708,23 +2764,14 @@ class TestFailureReportNamesTheAbortedSession:
     def test_section_warns_the_failed_line_may_be_a_crash_artefact(self):
         """esc-4292-3: the FAILED line naming the crashed worker's in-flight
         test is xdist's own synthesis, not a verdict."""
-        report = self._result(_TRUNCATED_TEST_LEG_OUTPUT).failure_report()
+        report = self._result(XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT).failure_report()
         section = report.split(self.HEADING, 1)[1].split('\n## ', 1)[0].lower()
         assert 'crash' in section, f'Unexpected section: {section!r}'
 
     def test_a_recovered_worker_crash_gets_no_section(self):
         """NEGATIVE: a crash signature with NO bailout marker completed
         normally, so the section must stay inert."""
-        recovered = (
-            'orchestrator/tests/test_config.py ....\n'
-            '[gw3] node down: Not properly terminated\n'
-            "worker gw3 crashed while running "
-            "'orchestrator/tests/test_config.py::TestFoo::test_bar'\n"
-            'replacing crashed worker gw3\n'
-            'FAILED orchestrator/tests/test_x.py::test_real - AssertionError\n'
-            '========== 1 failed, 19621 passed in 953.70s ==========\n'
-        )
-        report = self._result(recovered).failure_report()
+        report = self._result(XDIST_WORKER_REPLACED_OUTPUT).failure_report()
         assert self.HEADING not in report, f'Unexpected report: {report!r}'
 
     def test_an_ordinary_failure_report_is_byte_identical(self):
@@ -2737,7 +2784,6 @@ class TestFailureReportNamesTheAbortedSession:
         report = ordinary.failure_report()
         assert self.HEADING not in report, f'Unexpected report: {report!r}'
         assert report.startswith('## Failure Cause'), f'Unexpected report: {report!r}'
-
 
 
 class TestVerifyResultCauseHint:

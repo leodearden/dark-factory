@@ -35,6 +35,13 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _xdist_crash_fixtures import (
+    XDIST_CRASH_ATTRIBUTED_FAILED_LINE,
+    XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT,
+    XDIST_FAILED_THEN_CRASHED_OUTPUT,
+    XDIST_IN_FLIGHT_NODEID,
+    XDIST_WORKER_CRASH_OUTPUT,
+)
 
 from orchestrator import verify
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -646,23 +653,9 @@ class TestClassifyFailureXdistUsageErrorPytestScoped:
         assert self._classify(output, rc=4, timed_out=False) == 'env_transient'
 
 
-# task 2365: bare pytest-xdist worker-crash signature. Grounded in
-# config.yaml's task-2361 comment (under host CPU oversubscription a starved
-# xdist worker crosses the per-test wall-clock ceiling, gets os._exit()'d by
-# pytest-timeout's thread method, and --max-worker-restart=0 turns that into
-# a false-failing per-test "node down" on whatever test happens to be
-# running) and test_cli.py's grounded wording:
-# ``[gwN] node down: Not properly terminated``. NO ^E  /^FAILED /failed-summary
-# lines — a hard os._exit() worker kill produces no assertion traceback.
-_XDIST_WORKER_CRASH_OUTPUT = (
-    'orchestrator/tests/test_config.py ....\n'
-    '[gw3] node down: Not properly terminated\n'
-    "worker gw3 crashed while running 'orchestrator/tests/test_config.py::TestFoo::test_bar'\n"
-)
-
 # esc-2971-13 (steward-verified): the installed pytest-xdist actually quotes
 # the worker id too — ``worker 'gw24' crashed while running '<nodeid>'`` —
-# not just the trailing nodeid as _XDIST_WORKER_CRASH_OUTPUT above models.
+# not just the trailing nodeid as XDIST_WORKER_CRASH_OUTPUT models.
 # This models the FULL real-world combined output, where the node-down line
 # and the quoted worker-crash line appear together. On its own it does NOT
 # prove quote-tolerance: the ``[gwNN] node down`` line here already matches
@@ -680,7 +673,7 @@ _XDIST_WORKER_CRASH_QUOTED_WORKER_ID_OUTPUT = (
 # FAILED line from the dead worker's run) — the conservative discriminator
 # must treat this as a real failure and NOT reclassify it.
 _XDIST_CRASH_WITH_REAL_FAILURE_OUTPUT = (
-    _XDIST_WORKER_CRASH_OUTPUT
+    XDIST_WORKER_CRASH_OUTPUT
     + 'E   AssertionError: expected 3, got 4\n'
     + 'FAILED orchestrator/tests/test_x.py::test_real - AssertionError\n'
     + '========== 1 failed, 2 passed in 5.00s ==========\n'
@@ -695,7 +688,7 @@ _XDIST_CRASH_WITH_REAL_FAILURE_OUTPUT = (
 # the known flake, not a real regression, so this must still reclassify as a
 # bare crash.
 _XDIST_CRASH_WITH_KNOWN_LOAD_FLAKE_OUTPUT = (
-    _XDIST_WORKER_CRASH_OUTPUT
+    XDIST_WORKER_CRASH_OUTPUT
     + 'E   AssertionError: expected process group to be alive\n'
     + 'FAILED orchestrator/tests/test_cli.py::test_verify_merge_cancel_end_to_end - '
     'AssertionError: expected process group to be alive\n'
@@ -717,7 +710,7 @@ _XDIST_CRASH_KNOWN_FLAKE_PLUS_GENUINE_OUTPUT = (
 # ``.py::`` substring — e.g. a doctest target). "No extractable node-id"
 # must be treated the same as "not on the allow-list": False.
 _XDIST_CRASH_WITH_UNPARSEABLE_FAILED_NODEID_OUTPUT = (
-    _XDIST_WORKER_CRASH_OUTPUT
+    XDIST_WORKER_CRASH_OUTPUT
     + 'E   AssertionError: doctest output mismatch\n'
     + 'FAILED some_doctest.txt::x\n'
     + '========== 1 failed, 2 passed in 5.00s ==========\n'
@@ -793,7 +786,7 @@ _XDIST_CRASH_REAL_LOG_2829_OUTPUT = (
 # above, its direct analogue); the no-FAILED-lines fallback had not, and that
 # asymmetry is the defect.
 _XDIST_CRASH_NO_FAILED_PLUS_INTERNALERROR_OUTPUT = (
-    _XDIST_WORKER_CRASH_OUTPUT
+    XDIST_WORKER_CRASH_OUTPUT
     + 'INTERNALERROR> Traceback (most recent call last):\n'
     + 'INTERNALERROR> KeyError: <WorkerController gw35>\n'
 )
@@ -802,7 +795,7 @@ _XDIST_CRASH_NO_FAILED_PLUS_INTERNALERROR_OUTPUT = (
 # short-summary line ONLY. Same isolation discipline as above — no tally, no
 # FAILED, no ``E   `` line.
 _XDIST_CRASH_NO_FAILED_PLUS_ERROR_NODEID_OUTPUT = (
-    _XDIST_WORKER_CRASH_OUTPUT
+    XDIST_WORKER_CRASH_OUTPUT
     + 'ERROR orchestrator/tests/test_other.py::test_needs_fixture - '
     'Exception: fixture setup failed\n'
 )
@@ -810,7 +803,7 @@ _XDIST_CRASH_NO_FAILED_PLUS_ERROR_NODEID_OUTPUT = (
 # task 4066, ISOLATING fixture: crash signature + a whole-module collection
 # ERROR (bare file, no ``::``) ONLY. Same isolation discipline as above.
 _XDIST_CRASH_NO_FAILED_PLUS_COLLECTION_ERROR_OUTPUT = (
-    _XDIST_WORKER_CRASH_OUTPUT
+    XDIST_WORKER_CRASH_OUTPUT
     + "ERROR orchestrator/tests/test_broken.py - ImportError: cannot import name 'foo'\n"
 )
 
@@ -822,7 +815,7 @@ _XDIST_CRASH_NO_FAILED_PLUS_COLLECTION_ERROR_OUTPUT = (
 # it: ``1 failed, 1 passed in 0.02s``); verify-log 2829's INTERNALERROR abort
 # produces the same undecorated shape.
 _XDIST_CRASH_NO_FAILED_PLUS_UNDECORATED_SUMMARY_OUTPUT = (
-    _XDIST_WORKER_CRASH_OUTPUT
+    XDIST_WORKER_CRASH_OUTPUT
     + '8 failed, 6971 passed, 216 warnings in 131.42s (0:02:11)\n'
 )
 
@@ -837,7 +830,7 @@ _XDIST_CRASH_NO_FAILED_PLUS_UNDECORATED_SUMMARY_OUTPUT = (
 # _XDIST_CRASH_REAL_LOG_2829_OUTPUT above, with the real run's failures
 # removed — which is precisely what makes it the isolating counterpart.
 _XDIST_CRASH_INDUCED_LOADSCOPE_INTERNALERROR_OUTPUT = (
-    _XDIST_WORKER_CRASH_OUTPUT
+    XDIST_WORKER_CRASH_OUTPUT
     + 'INTERNALERROR> Traceback (most recent call last):\n'
     + 'INTERNALERROR>   File ".../xdist/scheduler/loadscope.py", line 336, in _reschedule\n'
     + 'INTERNALERROR>     self._assign_work_unit(node)\n'
@@ -847,84 +840,6 @@ _XDIST_CRASH_INDUCED_LOADSCOPE_INTERNALERROR_OUTPUT = (
 )
 
 
-# task 5082, facet 2: xdist's BAILOUT marker — the literal it prints on
-# exactly the branch that gives up. `xdist/dsession.py::DSession.worker_workerdown`
-# increments `_failed_nodes_count`, and when the configured
-# `--max-worker-restart` cap is exceeded it sets
-# ``msg = f"worker {node.gateway.id} crashed and worker restarting disabled"``
-# (the `--max-worker-restart=0` case dark-factory configures at
-# orchestrator/pyproject.toml) or ``f"maximum crashed workers reached: {N}"``,
-# reports it, and calls `triggershutdown()` — abandoning every test still
-# queued on every worker. `pytest_terminal_summary` then re-emits the same
-# message through `terminalreporter.write_sep("=", f"xdist: {msg}")`, which is
-# the ``=``-barred form transcribed here.
-#
-# The tally below it is therefore PARTIAL. Modelled on the esc-4176-6
-# measurement: the truncated run reported ``1 failed, 728 passed, 1 skipped``
-# while a clean re-run of the identical command reported ``19622 passed, 17
-# skipped`` — i.e. ~97% of the suite never ran, yet the shape is structurally
-# indistinguishable from an ordinary complete red run.
-_XDIST_SESSION_ABORTED_OUTPUT = (
-    _XDIST_WORKER_CRASH_OUTPUT
-    + '=========== xdist: worker gw3 crashed and worker restarting disabled ===========\n'
-    + '1 failed, 728 passed, 1 skipped in 209.67s\n'
-)
-
-# task 5082, facet 2, the DISCRIMINATION fixture: the SIBLING branch of the
-# same `if maximum_reached:` in dsession.py — a target configured with
-# ``--max-worker-restart > 0`` prints ``replacing crashed worker gwN``, clones
-# the node, and the session runs to COMPLETION with a full, trustworthy tally.
-# verify.py verifies multiple projects (see the multi-project rationale on
-# verify._KNOWN_LOAD_FLAKE_NODEID_RES), so this shape is reachable. It carries
-# the identical crash signature as the aborted fixture above — which is
-# precisely why detection must key on the bailout literal and NOT on
-# _XDIST_WORKER_CRASH_RE: keying on the crash signature would stamp "session
-# aborted" on a complete run, trading the reported inaccuracy for a new one in
-# the opposite direction.
-_XDIST_WORKER_REPLACED_OUTPUT = (
-    _XDIST_WORKER_CRASH_OUTPUT
-    + 'replacing crashed worker gw3\n'
-    + '19622 passed, 17 skipped in 953.70s\n'
-)
-
-# task 5082: the non-zero-cap spelling of the same bailout. dsession.py emits
-# this wording instead whenever ``--max-worker-restart`` is set above 0 and the
-# cap is then exceeded — same `triggershutdown()`, same truncation.
-_XDIST_MAX_WORKERS_REACHED_OUTPUT = (
-    _XDIST_WORKER_CRASH_OUTPUT
-    + '=========== xdist: maximum crashed workers reached: 2 ===========\n'
-    + '3 failed, 402 passed in 88.10s\n'
-)
-
-
-# task 5082, facet 1 — the esc-4292-3 shape, VERBATIM in structure: a worker
-# died mid-test, xdist's `handle_crashitem` (dsession.py) FABRICATED a
-# ``outcome="failed"`` / ``when="???"`` report for the test that worker had in
-# flight, and pytest's terminal reporter dutifully printed a ``FAILED`` short
-# summary line for it and counted it in the tally. esc-4292-3's measurement:
-# "the single test reported on a FAILED summary line was THE SAME test the
-# crashed worker was running, and that test passes in isolation."
-#
-# The FAILED line here deliberately carries NO `` - worker 'gwN' crashed while
-# running ...`` suffix, pinning the HARD case rather than the easy one. pytest
-# renders that suffix through `_pytest/terminal.py::_format_trimmed`, which
-# ellipsizes it to the remaining terminal width and returns None when even the
-# ellipsis will not fit — so it survives only under `running_on_ci()` or
-# ``-vv``. A detector that parsed the suffix would pass in CI and silently
-# fail locally, which is why detection correlates the node-id against the
-# UNTRIMMED crash notice in the FAILURES body instead.
-#
-# Note the node-id: it is the SAME one _XDIST_WORKER_CRASH_OUTPUT's crash
-# notice names, which is the whole point. _XDIST_CRASH_WITH_REAL_FAILURE_OUTPUT
-# above pins a FAILED line on a DIFFERENT test, so that fixture's False verdict
-# is preserved by construction under the widened predicate.
-_XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT = (
-    _XDIST_WORKER_CRASH_OUTPUT
-    + 'FAILED orchestrator/tests/test_config.py::TestFoo::test_bar\n'
-    + '=========== xdist: worker gw3 crashed and worker restarting disabled ===========\n'
-    + '1 failed, 728 passed, 1 skipped in 209.67s\n'
-)
-
 # task 5082, facet 1 STRICTNESS guard: the crash-attributed FAILED line PLUS a
 # genuine, independently-failing test. Widening the acceptance predicate must
 # never become a licence to discount every FAILED line just because a worker
@@ -932,7 +847,7 @@ _XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT = (
 # _is_bare_xdist_worker_crash, and that task 4066 billed a concrete incident
 # for (8 genuine failures silently reclassified as infra).
 _XDIST_CRASH_ATTRIBUTED_PLUS_GENUINE_OUTPUT = (
-    _XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT
+    XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT
     + 'E   AssertionError: expected 3, got 4\n'
     + 'FAILED orchestrator/tests/test_x.py::test_real - AssertionError\n'
 )
@@ -943,10 +858,29 @@ _XDIST_CRASH_ATTRIBUTED_PLUS_GENUINE_OUTPUT = (
 # INTERNALERROR produces no FAILED line of its own, so the per-FAILED-line
 # check would never see it.
 _XDIST_CRASH_ATTRIBUTED_PLUS_INTERNALERROR_OUTPUT = (
-    _XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT
+    XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT
     + 'INTERNALERROR> Traceback (most recent call last):\n'
     + 'INTERNALERROR> KeyError: <WorkerController gw35>\n'
 )
+
+# task 5082, facet 1: a worker death with NO ``crashed while running`` notice —
+# the shape a run without a FAILURES body (e.g. ``--tb=no``) leaves behind —
+# plus a FAILED line for the test that was in flight. Nothing attributes that
+# line to the crash, so it must be treated as the verdict it claims to be.
+_XDIST_FAILED_LINE_WITHOUT_CRASH_NOTICE_OUTPUT = (
+    'orchestrator/tests/test_config.py ....\n'
+    '[gw3] node down: Not properly terminated\n'
+    + XDIST_CRASH_ATTRIBUTED_FAILED_LINE
+)
+
+
+# The crash notice XDIST_WORKER_CRASH_OUTPUT carries for its in-flight test.
+_IN_FLIGHT_CRASH_NOTICE = f"crashed while running '{XDIST_IN_FLIGHT_NODEID}'"
+
+
+def _failed_lines(output: str) -> list[str]:
+    """The ``FAILED`` short-summary lines of a fixture, read off its text."""
+    return [line for line in output.splitlines() if line.startswith('FAILED ')]
 
 
 class TestBareXdistWorkerCrashDetector:
@@ -957,7 +891,7 @@ class TestBareXdistWorkerCrashDetector:
 
     def test_bare_worker_crash_is_true(self):
         """A bare node-down/worker-crash signature with no real failure marker -> True."""
-        assert verify._is_bare_xdist_worker_crash(_XDIST_WORKER_CRASH_OUTPUT) is True
+        assert verify._is_bare_xdist_worker_crash(XDIST_WORKER_CRASH_OUTPUT) is True
 
     def test_bare_worker_crash_with_quoted_worker_id_is_true(self):
         """esc-2971-13: the real pytest-xdist quoted form -- ``worker 'gwNN'
@@ -1222,7 +1156,6 @@ class TestBareXdistWorkerCrashDetector:
 
         assert verify._is_bare_xdist_worker_crash(output) is False
 
-
     def test_crash_attributed_failed_line_is_true(self):
         """task 5082: a FAILED line naming the CRASHED WORKER'S OWN in-flight
         test is an xdist artefact, not a verdict -> True.
@@ -1235,21 +1168,15 @@ class TestBareXdistWorkerCrashDetector:
         the DEBUGGER to chase a test that never actually failed (and passes in
         isolation), instead of to the bounded infra retry.
 
-        The marker profile is pinned first so the verdict is attributable: the
-        crash signature is present, there is EXACTLY ONE FAILED line, and none
-        of the INTERNALERROR / ERROR vetoes fire. Without that, a later fixture
-        or regex edit could silently decay this into a tautology.
+        The marker profile is pinned on the fixture text first so the verdict
+        is attributable: the crash notice and the ONLY FAILED line name the
+        same test, and no INTERNALERROR / ERROR surface is present to veto.
         """
-        output = _XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT
-        assert verify._XDIST_WORKER_CRASH_RE.search(output) is not None
-        assert len(verify._PYTEST_FAILED_LINE_RE.findall(output)) == 1
-        assert verify._PYTEST_INTERNALERROR_RE.search(output) is None
-        assert verify._ERROR_LINE_NODEID_RE.search(output) is None
-        assert verify._ERROR_LINE_FILE_RE.search(output) is None
-        # The FAILED line names exactly the node-id the crash notice blames.
-        assert verify._crash_attributed_nodeids(output) == {
-            'orchestrator/tests/test_config.py::TestFoo::test_bar'
-        }
+        output = XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT
+        assert _failed_lines(output) == [f'FAILED {XDIST_IN_FLIGHT_NODEID}']
+        assert _IN_FLIGHT_CRASH_NOTICE in output
+        assert 'INTERNALERROR' not in output
+        assert not any(line.startswith('ERROR ') for line in output.splitlines())
 
         assert verify._is_bare_xdist_worker_crash(output) is True
 
@@ -1263,12 +1190,10 @@ class TestBareXdistWorkerCrashDetector:
         task 4066 bills a concrete incident for that direction of error.
         """
         output = _XDIST_CRASH_ATTRIBUTED_PLUS_GENUINE_OUTPUT
-        # Pin that BOTH failed lines are present, so a False verdict here can
-        # only come from the second (non-crash-attributed) one.
-        assert len(verify._PYTEST_FAILED_LINE_RE.findall(output)) == 2
-        assert 'orchestrator/tests/test_x.py::test_real' not in (
-            verify._crash_attributed_nodeids(output)
-        )
+        # Pin that BOTH failed lines are present and that no crash notice names
+        # the second, so a False verdict here can only come from that one.
+        assert len(_failed_lines(output)) == 2
+        assert "crashed while running 'orchestrator/tests/test_x.py::test_real'" not in output
 
         assert verify._is_bare_xdist_worker_crash(output) is False
 
@@ -1281,74 +1206,46 @@ class TestBareXdistWorkerCrashDetector:
         per-line loop and must stay there untouched.
         """
         output = _XDIST_CRASH_ATTRIBUTED_PLUS_INTERNALERROR_OUTPUT
-        # Isolate: every FAILED line here IS crash-attributed, so without the
-        # veto the widened predicate alone would green this.
-        assert len(verify._PYTEST_FAILED_LINE_RE.findall(output)) == 1
-        assert len(verify._PYTEST_INTERNALERROR_RE.findall(output)) > 0
+        # Isolate: the only FAILED line IS the crash-attributed one, so without
+        # the veto the widened predicate alone would green this.
+        assert _failed_lines(output) == _failed_lines(XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT)
+        assert 'INTERNALERROR>' in output
 
         assert verify._is_bare_xdist_worker_crash(output) is False
 
+    def test_crashed_test_that_had_already_failed_is_false(self):
+        """The crashed worker's in-flight test on TWO FAILED lines -> False.
 
-class TestWorkerDeathTruncatedSession:
-    """task 5082 step-1: the two facet-2 detection primitives.
-
-    ``verify._is_worker_death_truncated_session(output)`` answers "did
-    pytest-xdist give up and abandon the remaining tests", and
-    ``verify._crash_attributed_nodeids(output)`` answers "which node-ids did
-    xdist itself blame on a dead worker rather than on a real verdict".
-
-    RED today: neither helper exists yet (AttributeError).
-    """
-
-    def test_bailout_marker_is_true(self):
-        """The ``worker gwN crashed and worker restarting disabled`` bailout -> True."""
-        assert verify._is_worker_death_truncated_session(_XDIST_SESSION_ABORTED_OUTPUT) is True
-
-    def test_maximum_crashed_workers_reached_is_true(self):
-        """The non-zero-cap spelling of the same bailout -> True."""
-        assert (
-            verify._is_worker_death_truncated_session(_XDIST_MAX_WORKERS_REACHED_OUTPUT)
-            is True
-        )
-
-    def test_replaced_worker_session_is_false(self):
-        """A worker CRASH whose session nevertheless ran to completion -> False.
-
-        The load-bearing discrimination. This fixture carries the identical
-        crash signature as _XDIST_SESSION_ABORTED_OUTPUT — pinned below before
-        the verdict — so a green verdict here proves the predicate keys on the
-        BAILOUT literal and not on _XDIST_WORKER_CRASH_RE. Keying on the crash
-        signature would relabel every ``--max-worker-restart > 0`` target's
-        complete run as truncated.
+        It failed in its call phase and THEN its worker died in teardown, so
+        xdist forwarded the genuine report before adding its synthesized one.
+        `handle_crashitem` synthesizes at most one report per node-id, so the
+        second line is a real verdict and must reach the debugger: a crash
+        notice naming a test is no licence to discount every line naming it.
         """
-        assert verify._XDIST_WORKER_CRASH_RE.search(_XDIST_WORKER_REPLACED_OUTPUT) is not None
+        output = XDIST_FAILED_THEN_CRASHED_OUTPUT
+        # Both FAILED lines name the crash-attributed test, so a False verdict
+        # can only come from the one-artefact-per-node-id rule.
+        assert _failed_lines(output) == [
+            f'FAILED {XDIST_IN_FLIGHT_NODEID} - AssertionError',
+            f'FAILED {XDIST_IN_FLIGHT_NODEID}',
+        ]
+        assert _IN_FLIGHT_CRASH_NOTICE in output
 
-        assert (
-            verify._is_worker_death_truncated_session(_XDIST_WORKER_REPLACED_OUTPUT)
-            is False
-        )
+        assert verify._is_bare_xdist_worker_crash(output) is False
 
-    def test_empty_output_is_false(self):
-        """Falsy output carries no marker, so it can never claim truncation."""
-        assert verify._is_worker_death_truncated_session('') is False
+    def test_failed_line_without_a_crash_notice_is_false(self):
+        """A worker died, but no notice names the test it was running -> False.
 
-    def test_crash_attributed_nodeids_names_the_in_flight_test(self):
-        """The crashed worker's in-flight node-id is recovered from the crash notice.
-
-        This is the node-id xdist's own ``handle_crashitem`` synthesizes a
-        ``outcome="failed"``/``when="???"`` report for — the esc-4292-3 shape,
-        where the single FAILED summary line names a test that passes in
-        isolation.
+        Attribution is read only from xdist's ``crashed while running`` notice,
+        never guessed from the crash signature alone, so a FAILED line that no
+        notice names stays the verdict it claims to be.
         """
-        assert verify._crash_attributed_nodeids(_XDIST_SESSION_ABORTED_OUTPUT) == {
-            'orchestrator/tests/test_config.py::TestFoo::test_bar'
-        }
+        output = _XDIST_FAILED_LINE_WITHOUT_CRASH_NOTICE_OUTPUT
+        assert 'node down: Not properly terminated' in output
+        assert 'crashed while running' not in output
+        assert _failed_lines(output) == [f'FAILED {XDIST_IN_FLIGHT_NODEID}']
 
-    def test_crash_attributed_nodeids_is_empty_without_a_crash_notice(self):
-        """Output with no crash notice attributes nothing — never guess."""
-        output = 'FAILED orchestrator/tests/test_y.py::test_y - AssertionError\n'
-        assert verify._crash_attributed_nodeids(output) == set()
-        assert verify._crash_attributed_nodeids('') == set()
+        assert verify._is_bare_xdist_worker_crash(output) is False
 
 
 class TestPytestFailureSummaryRegex:
@@ -1487,7 +1384,7 @@ class TestRunVerificationXdistWorkerCrashRetry:
 
         async def fake_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             if 'pytest' in cmd:
-                return 1, _XDIST_WORKER_CRASH_OUTPUT, False
+                return 1, XDIST_WORKER_CRASH_OUTPUT, False
             return 0, '', False
 
         with (
@@ -1565,7 +1462,7 @@ class TestRunVerificationXdistWorkerCrashRetry:
 
         async def fake_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             if 'pytest' in cmd:
-                return 1, _XDIST_WORKER_CRASH_OUTPUT, False
+                return 1, XDIST_WORKER_CRASH_OUTPUT, False
             return 0, '', False
 
         with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
@@ -1589,7 +1486,7 @@ class TestRunVerificationXdistWorkerCrashRetry:
 
         async def fake_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             if 'pytest' in cmd:
-                return 1, _XDIST_WORKER_CRASH_OUTPUT, False
+                return 1, XDIST_WORKER_CRASH_OUTPUT, False
             if 'lint' in cmd:
                 return 1, 'file.py:10:1: E501 line too long\n', False
             return 0, '', False
@@ -1607,7 +1504,7 @@ class TestRunVerificationXdistWorkerCrashRetry:
 
         async def fake_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             if 'pytest' in cmd:
-                return 1, _XDIST_WORKER_CRASH_OUTPUT, False
+                return 1, XDIST_WORKER_CRASH_OUTPUT, False
             if 'type' in cmd:
                 return 1, 'file.py:3: error: Incompatible return value type\n', False
             return 0, '', False
