@@ -3450,7 +3450,7 @@ class TestActiveAndTerminalReadsAreDeduped:
 
     Regression for the task-3857 review finding. The active and terminal
     reads are separately cached, so a task completing between them appears
-    in BOTH — and both loops emit a row sharing one ``_task_uid``, the id
+    in BOTH — and both loops emit a row sharing one ``task_uid``, the id
     the React tab uses as its map key and selection identity.
     """
 
@@ -3800,7 +3800,7 @@ class TestCollectTasksWithCountsConcurrency:
         ``_project_label`` is the directory BASENAME, so two configured roots
         can share one (``/a/proj`` and ``/b/proj``). Keying the gathered
         results by label collapses them: the survivor's rows are extended into
-        ``all_active`` TWICE — duplicate ``_task_uid``s, which the React tab
+        ``all_active`` TWICE — duplicate ``task_uid``s, which the React tab
         uses as its map key — and the other root's rows vanish with no
         offline or degraded marker naming them. That is silent DATA LOSS, and
         it is the invisible-failure class this whole task exists to close.

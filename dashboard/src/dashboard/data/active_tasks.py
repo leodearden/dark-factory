@@ -339,6 +339,17 @@ def _all_project_roots(config: DashboardConfig) -> list[Path]:
     return roots
 
 
+def project_roots_for_label(config: DashboardConfig, label: str) -> list[Path]:
+    """Every configured root whose display label is *label*, primary first.
+
+    A LIST, because the label is the directory basename and two configured
+    roots can share one — the collision ``collect_tasks_with_counts`` keys by
+    root to survive. A caller that needs one root must refuse rather than guess
+    when the list is not exactly one long.
+    """
+    return [root for root in _all_project_roots(config) if _project_label(root) == label]
+
+
 # Admission-order rotation offset for `collect_tasks_with_counts`, advanced by
 # one slot per render. Module state, like the `_*_cache` objects elsewhere in
 # this package, with a matching `_reset_root_rotation()` test hook.
@@ -404,7 +415,7 @@ def _rotated_project_roots(config: DashboardConfig) -> list[Path]:
     return roots[offset:] + roots[:offset]
 
 
-def _task_uid(project: str, task_id: int) -> str:
+def task_uid(project: str, task_id: int) -> str:
     """Project-scoped unique id used by the React tasks tab as a map key."""
     return f'{project}/T-{task_id}'
 
@@ -680,7 +691,7 @@ def _resolve_deps(
         dep_task = by_id.get(dep_id)
         if dep_task is not None:
             deps.append({
-                'id': _task_uid(project, dep_id),
+                'id': task_uid(project, dep_id),
                 'title': dep_task.get('title') or '',
                 'done': dep_task.get('status') == 'done',
             })
@@ -689,7 +700,7 @@ def _resolve_deps(
         if dep_status is None:
             continue
         deps.append({
-            'id': _task_uid(project, dep_id),
+            'id': task_uid(project, dep_id),
             'title': '',
             'done': dep_status == 'done',
         })
@@ -898,7 +909,7 @@ async def _shape_one_project(
             # DEDUP, not concatenate. The two fetches are separate cached
             # reads, so a task that completed between them appears in BOTH:
             # once from the active read, once from the terminal read. Emitting
-            # both yields two rows sharing one _task_uid — the id the React
+            # both yields two rows sharing one task_uid — the id the React
             # tab uses as a map key and as its selection identity — so the
             # task renders twice, as pending AND as done.
             #
@@ -964,7 +975,7 @@ async def _shape_one_project(
         task_id = task['id']
         rt = _runtime_fields(runtime_index, runtime_status, task_id, now=effective_now)
 
-        uid = _task_uid(project, task_id)
+        uid = task_uid(project, task_id)
         row = _build_task_row(project, task, task_id, rt, uid, now=effective_now)
         # active rows: started from the runtime entry; deps from task tree.
         row['started'] = rt['started']
@@ -1003,7 +1014,7 @@ async def _shape_one_project(
                 continue
             if beyond_cap:
                 exempted_count += 1
-            uid = _task_uid(project, task_id)
+            uid = task_uid(project, task_id)
             rt = _runtime_fields(runtime_index, runtime_status, task_id, now=effective_now)
             row = _build_task_row(project, task, task_id, rt, uid, prd=prd, now=effective_now)
             # terminal rows: no meaningful start time; deps only for live-PRD
@@ -1252,7 +1263,7 @@ async def collect_tasks_with_counts(
     # Keyed by ROOT, never by label. `_project_label` is the directory
     # BASENAME, so two configured roots can share one (``/a/proj`` and
     # ``/b/proj``) — and a label-keyed dict collapses them, which would extend
-    # the survivor's rows into `all_active` TWICE (duplicate `_task_uid`s, the
+    # the survivor's rows into `all_active` TWICE (duplicate `task_uid`s, the
     # React tab's map key) and drop the other root's rows entirely. Roots are
     # deduped by `_all_project_roots`, so this pairing is total and 1:1;
     # `strict=True` says so rather than trusting it.
