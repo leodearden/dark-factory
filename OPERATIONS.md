@@ -1704,6 +1704,7 @@ cases, the same backing stores. **Check this table before adding a job** —
 | 03:30 | fused-memory flag-marker drain | `fused-memory-flag-marker-sweep.timer` |
 | 04:00 | Orphaned-worktree reclaim | `reclaim-orphaned-worktrees.timer` |
 | 04:00 | Legibility transcript check | `legibility-transcript-check@.timer` |
+| 04:30 | Legibility trickle health probe | `legibility-trickle-health@.timer` |
 | 05:00 | Canonical/topic coverage census + retro-stamp rehearsal | `memory-metadata-coverage-census.timer` |
 
 All timers carry `Persistent=true` (a night missed to a sleeping laptop is
@@ -1713,9 +1714,10 @@ caught up on next boot/login rather than silently skipped) and
 Per-job docs: [docs/flag-marker-sweep-recurring.md](docs/flag-marker-sweep-recurring.md)
 for the 03:30 job; the sections below for the 03:00 and 05:00 ones.
 
-**04:30 is free.** The nightly reify closure-staleness sweep and its
-`consume_redispatch_requests` drain that used to hold that slot were retired by
-task 5247 (Leo's 2026-09-09 ruling): the sweep's `gate_closure` predicate was a
+**04:30 was freed by task 5247 and is taken as of task 4514** by the legibility
+trickle health probe (see below). The nightly reify closure-staleness sweep and
+its `consume_redispatch_requests` drain that used to hold that slot were retired
+by task 5247 (Leo's 2026-09-09 ruling): the sweep's `gate_closure` predicate was a
 second, opposite-policy owner of the stranded-blocked population, and over the
 15 retained journal runs it cancelled 7 reify tasks as collateral. Its tracked
 units, wrapper, consumer and installer are deleted; the timer is **disabled**
@@ -1729,7 +1731,9 @@ names the deleted wrapper, so once this retirement is on main it fails
 `203/EXEC` nightly rather than sweeping anything. That population is now owned
 by the orchestrator scheduler's `_phase_redispatch_stranded_blocked`, the
 harness deterministic-recon sweep, and fused-memory's Stage 2 task-knowledge
-reconciliation.
+reconciliation. Those residual units do **not** collide with the new 04:30 job:
+they carry a different unit name, and a re-armed sweep would merely fail
+`203/EXEC` alongside it rather than contend for anything.
 
 ### Legibility trickle accounts (03:00)
 
@@ -1813,6 +1817,127 @@ legibility-trickle@<project>`):
   nothing is capped. Read the run's per-digest failures for what each account
   actually reported — a fleet-wide near-cap warning and a backend fault both
   land here.
+
+### Legibility trickle health probe (04:30)
+
+**What it does.** Runs both trickle probes once a night and files one
+escalation if the pipeline has stopped producing.
+
+**Why it exists** — this section is the single home for that argument; the
+code, unit and test sites cite it rather than restating it. Before task 4514
+nothing ran either probe. Every repo-wide reference to them was prose, a
+docstring, a test or PRD text, and the only bindings either ever had were the
+one-shot `before_done` milestone predicates on tasks 2587/2615 (both `done`;
+a completed milestone predicate never runs again). A probe nobody invokes is
+documentation. That absence is also why the `classify_run` vocabulary hole
+task 4514 closed stayed latent so long: nothing was reading the verdict that
+would have shown it.
+
+**Shipping an installer is not binding a probe**, which is why deploying this
+is tracked separately from landing it. The adjacent precedent:
+`legibility-transcript-check@.{service,timer}` and its installer shipped under
+task 2901 ("wire the transcript-persistence detector to run periodically"),
+that task is `done`, and the timer is **still** not installed on this host.
+Once the timer below is installed for a project, the "nothing runs the
+probes" claim becomes historical **for that project only** — a second project
+without the timer is back to the pre-4514 state.
+
+**Three artefacts, three different questions.** Do not merge them again:
+
+| Artefact | Answers |
+|---|---|
+| `scripts/legibility/check_trickle_liveness.sh` | Did the UNIT run? (reads `legibility-trickle@<project>.service`'s `Result`) |
+| `scripts/legibility/check_trickle_progress.py` | Did SIGNAL flow? (reads the recorded run state) |
+| `scripts/legibility/check_trickle_health.py` | Runs both on a timer and escalates |
+
+`check_trickle_health.py` **executes** the other two as subprocesses rather
+than re-deriving either verdict, so there is no lockstep duplication to keep
+in sync and `check_trickle_liveness.sh` stays byte-identical as its own
+header comment requires.
+
+It also runs in its **own** unit rather than as a second `ExecStart` on
+`legibility-trickle@` — a failing probe must not flip the nightly's unit to
+`Result=failed`, which is the very thing `check_trickle_liveness.sh` reads.
+The full argument lives where the change it forbids would be made, in
+`scripts/legibility-trickle-health@.service`.
+
+**Run it by hand:**
+
+```bash
+uv run --project shared python scripts/legibility/check_trickle_health.py --project-id <project>
+```
+
+**Deploy it** — once per project, from the MAIN checkout after this change
+has landed on main (the unit templates hardcode
+`WorkingDirectory=/home/leo/src/dark-factory`, so a timer enabled against a
+checkout without `check_trickle_health.py` goes `Result=failed` nightly):
+
+```bash
+scripts/legibility/install-trickle-health-timer.sh <project_id>
+```
+
+**Reading the verdict.** Each door has its own remedy, and conflating them
+is how an operator ends up tuning the sampler for a crashed coder:
+
+- **`failed` streak** — the run did not complete. Read `journalctl --user -u
+  legibility-trickle@<project>`. Raising `budgets.max_daily_digest_bytes` or
+  `sampling.top_fraction` will **not** help. The verdict reports
+  `selected_count` and says only what that counter supports: above zero,
+  signal DID reach the digest stage and the pipeline broke downstream of it;
+  at zero the night is simply unfinished and where signal stopped is
+  **unknown** (the nightly records its crash sentinel before the digest
+  stage, so a `failed` night with nothing selected is ordinary).
+- **`barren` streak** — the run completed and the sampler's doors dropped
+  everything. Compare `budgets.max_daily_digest_bytes` against
+  `sampling.top_fraction` / `per_stratum_min`; the verdict names which door
+  the records went out of.
+- **barren streak *carried forward*** — the streak is at threshold but the
+  last recorded run was `failed`, not `barren` (the recorder carries the
+  barren streak across a crash rather than advancing or resetting it). Both
+  findings are real and the crash is the one you can act on: clear it from
+  the journal first, then re-read the probe once a run has completed and
+  re-observed the doors. The verdict deliberately names **no** door — the
+  counters in that record belong to the crashed night, which legitimately
+  has none.
+- **`missing` / `malformed` / stale** — the recorder itself stopped. The
+  nightly is not writing state at all, so neither streak means anything yet.
+- **`quiet`** — a legitimately quiet night. Never alarms, by construction.
+
+**The escalation it files.** `task_id=legibility-trickle-health-<project_id>`
+(deliberately distinct from the nightly's own
+`legibility-trickle-<project_id>`, so the two histories stay separately
+readable), `category=infra_issue`, `severity=info`. It stays **silent** in two
+cases: a liveness-only failure (a unit that ran and failed is already owned by
+the nightly's own escalation for that same run) and the exact night the
+nightly's edge-triggered barren-streak escalation fired — **and, in that
+second case, only while that record is still fresh** (within the same
+`max_age_hours` window the progress probe uses). So it never doubles an alarm
+the nightly already raised, and no failure mode can silence it permanently: a
+recorder that stops on a night landing exactly on the barren threshold goes
+stale, and the probe takes over. A non-zero exit is the authoritative signal
+whether or not the POST landed.
+
+**Where the state file lives.**
+
+```
+<passwd home>/.local/state/dark-factory/legibility/<project_id>/trickle-state.json
+```
+
+Resolved from the invoking user's **passwd entry**, and deliberately **not**
+from `XDG_STATE_HOME` or `HOME`. This looks like an XDG violation and is not:
+the file's identity is "this host's legibility state for this user and
+project", not "this process's state dir", and two processes that must agree on
+one file cannot each resolve it from their own environment. The writer is
+`legibility-trickle@<project>.service` under the `systemd --user` manager
+(user-record `HOME`, no shell rc); the reader is this timer, a dev shell, or a
+future orchestrator-exec'd `before_done` predicate inheriting whatever shell
+launched the orchestrator. Nothing pinned those to agree, and under the old
+resolution they silently read and wrote different files.
+
+`DARK_FACTORY_LEGIBILITY_STATE_ROOT` is the single supported relocation
+lever. **No shipped unit sets it** — production always takes the anchored
+branch — and if you do set it, set it for **both** units at once: pinning one
+half is exactly how the writer/reader divergence comes back.
 
 ### Nightly canonical/topic coverage census (05:00)
 

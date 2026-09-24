@@ -89,6 +89,50 @@ def pytest_configure(config):
 
 
 # ---------------------------------------------------------------------------
+# Legibility trickle state isolation (task 4514).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _isolate_legibility_trickle_state(tmp_path_factory, monkeypatch):
+    """Point the legibility trickle state root at a per-test tmp dir.
+
+    WHAT IT PREVENTS. The operator's LIVE state files for two running
+    pipelines sit at ``~/.local/state/dark-factory/legibility/{dark_factory,
+    reify}/trickle-state.json``, carrying real ``last_productive_at`` stamps
+    and streak history. Before task 4514 this directory isolated itself from
+    them ONLY through ``XDG_STATE_HOME`` — ``test_legibility_nightly.py::
+    _isolate_trickle_state``, ``test_check_trickle_progress.py::_run_probe``
+    and ``::_seed`` (whose default ``project_id`` is the literal
+    ``"dark_factory"``), and ~15 sites in ``test_trickle_state.py``. Task 4514
+    makes ``scripts/legibility/trickle_state.py::trickle_state_path`` stop
+    honouring ``XDG_STATE_HOME`` and ``HOME`` entirely, at which instant every
+    one of those isolations becomes a silent no-op. Each is migrated to the
+    variable set here in the same commit as that change; this autouse fixture
+    is the belt to that pair of braces, catching any site the migration missed
+    and any test added later that forgets.
+
+    Directory-wide and autouse rather than opt-in, because the failure mode is
+    a test that never says it touches trickle state — a plain ``pytest`` run
+    overwriting the operator's live streak history is data loss, not a dirty
+    tmp dir.
+
+    A test that deliberately exercises the DEFAULT (passwd-anchored)
+    resolution must ``monkeypatch.delenv('DARK_FACTORY_LEGIBILITY_STATE_ROOT',
+    raising=False)`` first, and must then assert on the RESOLVED PATH only —
+    never call ``record_run``, which would write to the real file.
+
+    The literal is spelled out rather than imported because this fixture
+    predates the constant it mirrors and must stay inert until that
+    constant exists: ``scripts/legibility/trickle_state.py::STATE_ROOT_ENV``.
+    """
+    monkeypatch.setenv(
+        'DARK_FACTORY_LEGIBILITY_STATE_ROOT',
+        str(tmp_path_factory.mktemp('legibility-state')),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Shared tasks.db fixtures (task 3336).
 #
 # _TASKS_SCHEMA mirrors fused-memory's sqlite_task_backend.py _SCHEMA_SQL so

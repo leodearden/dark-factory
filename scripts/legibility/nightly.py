@@ -973,18 +973,47 @@ def _record_trickle_progress(
 
     Maps *sample*'s six conservation counters plus *result* onto
     :func:`trickle_state.record_run`, which classifies the run
-    productive/quiet/barren and folds it into the running barren streak
-    that :mod:`check_trickle_progress` reads. This is the write half of
-    the pair; ``check_trickle_liveness.sh`` still answers the separate
-    "did the unit run" question and is untouched.
+    failed/productive/quiet/barren and folds it into the running barren
+    and failed streaks that :mod:`check_trickle_progress` reads. This is
+    the write half of the pair; ``check_trickle_liveness.sh`` still
+    answers the separate "did the unit run" question and is untouched.
 
-    CLASSIFICATION USES THE SAMPLER COUNTERS, so a run that crashed AFTER
-    selecting digests still classifies ``productive``. That is deliberate:
-    crashes are already caught loudly by ``check_trickle_liveness.sh``
-    (``Result=failed``) and by the decision-8 escalations, so the progress
-    probe answers the DIFFERENT question "is signal flowing through the
-    pipeline". The recorded ``exit_code`` preserves the crash fact for an
-    operator reading the state file, so nothing is hidden.
+    CLASSIFICATION READS ``exit_code`` FIRST (task 4514). A non-zero exit
+    classifies ``failed`` whatever the sampler counters say, because the
+    counters answer "did signal flow IN" and cannot answer "did the
+    pipeline FINISH". The counters are still recorded in full, so the
+    first question stays answerable.
+
+    THE OLD CONTRACT WAS WRONG, AND NOT AS A MISLABEL. It read: "a run
+    that crashed AFTER selecting digests still classifies ``productive``".
+    On 2026-08-18 that was applied to a reify run exactly as prescribed —
+    six digests selected, exit 1, ``applied=0``, ``commit_made=false`` —
+    and recorded ``productive``. It was a VOCABULARY HOLE: a permanently
+    broken coder would sample > 0, storm, exit 1, and record
+    ``productive`` / streak 0 / a FRESH ``last_productive_at`` every night
+    forever, while ``check_trickle_progress.py`` printed "OK: last run was
+    productive 0h ago" indefinitely. That is the 2026-07-16..29
+    silent-degradation shape (task 3270) entering through a different
+    door.
+
+    THE MITIGATION IT LEANED ON WAS NOT OPERATIONALLY REAL. The old text
+    claimed crashes "are already caught loudly by
+    ``check_trickle_liveness.sh`` (``Result=failed``)". True as a
+    statement about that script's LOGIC; false as a claim about the
+    world, because NOTHING INVOKED IT — see OPERATIONS.md §"Legibility
+    trickle health probe (04:30)" for the full account. What runs the
+    probes now is ``legibility-trickle-health@<project>.timer`` ->
+    ``scripts/legibility/check_trickle_health.py``, and the old claim is
+    true again only while that timer is installed FOR THIS PROJECT. The
+    one partial mitigation that predates it is
+    :func:`_escalate_barren_streak`'s detail string ending "Probe on
+    demand with: check_trickle_progress.py ...", which is
+    DISCOVERABILITY, not level-triggering: it makes the probe
+    hand-runnable, not bound.
+
+    A FAILED NIGHT'S TARGET DATE IS GONE, NOT RETRIED. See
+    ``scripts/legibility-trickle@.timer``'s ``Persistent=true`` comment
+    for why, and for the decision to leave it that way.
 
     BEST-EFFORT, ALWAYS: the whole call is wrapped in ``try/except`` ->
     one WARNING, swallowed — mirroring :func:`post_escalation`'s
@@ -1067,6 +1096,13 @@ def _escalate_barren_streak(
     ``summary -- detail`` for this escalation (task 4511); this function
     does not log the pair itself, so a streak night produces exactly one
     such line.
+
+    The health probe's own non-zero exit is safe for exactly this reason,
+    and only this reason: it runs in a SEPARATE unit
+    (``legibility-trickle-health@<project>.service``), so it can never
+    flip ``legibility-trickle@<project>.service`` to ``Result=failed`` and
+    invert ``check_trickle_liveness.sh`` into the permanent false alarm
+    this paragraph refuses.
     """
     if not isinstance(doc, dict):
         return
@@ -1168,7 +1204,9 @@ def run_nightly(
     (``check_trickle_progress.py``) can tell a barren night from a quiet
     one — the distinction ``check_trickle_liveness.sh`` structurally
     cannot make, and the reason 2026-07-16..29 went unnoticed for 14
-    nights.
+    nights — and, since task 4514, a FAILED night from a productive one,
+    which is the distinction that let a crashed run read as productive
+    indefinitely. The seam's contract is all four outcomes.
 
     Happy-path wiring only in this step: inventory+sample -> digest ->
     code -> merge -> docs-only commit (only when the merge actually
