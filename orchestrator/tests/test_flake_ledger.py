@@ -2414,6 +2414,142 @@ class TestOpenDebtClosesAFinishedCycle:
 
 
 @pytest.mark.asyncio
+class TestOpenDebtNeverReplacesAFinishedOwner:
+    """ζ never replaces an owner that is live-DONE while its cycle is still open (task η).
+    ASYNC-ONLY CLASS.
+
+    With a client wired, the lazy close resolves a done owner's cycle and the re-entry
+    discharges that owner, so ζ can only SEE a done owner on an open row when that
+    resolution did NOT land: η's ``get_task`` read failed, raised or is missing, or the
+    owner went done between η's read and ζ's.  Replacing it there erases the only pointer
+    to the fix that did not hold, for good: the cycle never closes, no commit is carried
+    forward, and no ``regressed_after_resolution`` L2 ever fires.  Keeping it costs
+    nothing durable, because the next suppression's read closes the cycle.
+    """
+
+    NOW = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    LATER = datetime(2026, 8, 6, 13, 0, tzinfo=UTC)
+    LATEST = datetime(2026, 8, 6, 14, 0, tzinfo=UTC)
+    TEST_ID = 'tests/test_a.py::test_one'
+    COMMIT = 'c0ffee' + '0' * 34
+
+    # Every way η's resolution read can miss the done owner while ζ's status read sees it.
+    UNLANDED_RESOLUTIONS = [
+        {'task_error': RuntimeError('mcp down')},
+        {'task_raises': RuntimeError('mcp unreachable')},
+        {'task_raises': AttributeError('no get_task')},
+        {'tasks': {'task-901': {'id': 'task-901', 'status': 'in-progress', 'metadata': {}}}},
+    ]
+    UNLANDED_IDS = ['in_band_error', 'raises', 'missing_method', 'read_race']
+
+    @staticmethod
+    def _done_to_zeta(**kwargs) -> _FakeTaskClient:
+        return _FakeTaskClient(statuses={'task-901': 'done'}, submit_returns='task-902', **kwargs)
+
+    @pytest.mark.parametrize('kwargs', UNLANDED_RESOLUTIONS, ids=UNLANDED_IDS)
+    async def test_a_done_owner_on_an_open_cycle_is_kept(
+        self, tmp_path: Path, kwargs: dict
+    ) -> None:
+        """(a) Nothing is filed, nothing is invented, and the observation still lands."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await _open_owned_debt(db_path, self.TEST_ID, now=self.NOW)
+        client = self._done_to_zeta(**kwargs)
+
+        row = await open_debt(
+            db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.LATER
+        )
+
+        assert client.submit_calls == [] and client.commit_calls == []
+        (raw,) = _rows(db_path, 'SELECT * FROM flake_debt')
+        assert raw['owner_task_id'] == 'task-901'
+        assert row is not None and row.owner_task_id == 'task-901'
+        assert raw['open_count'] == 1
+        assert raw['resolved_at'] is None
+        assert raw['prior_resolved_at'] is None
+        assert raw['prior_resolving_commit'] is None
+        assert raw['last_occurrence_at'] == self.LATER.isoformat()
+
+    @pytest.mark.parametrize('kwargs', UNLANDED_RESOLUTIONS, ids=UNLANDED_IDS)
+    async def test_keeping_it_is_loud(self, tmp_path: Path, caplog, kwargs: dict) -> None:
+        """(b) The operator is told the regression check is DEFERRED, not dropped."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await _open_owned_debt(db_path, self.TEST_ID, now=self.NOW)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            await open_debt(
+                db_path, 'dark_factory', self.TEST_ID,
+                task_client=self._done_to_zeta(**kwargs), now=self.LATER,
+            )
+
+        deferred = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+            and self.TEST_ID in r.getMessage()
+            and 'task-901' in r.getMessage()
+            and 'regressed_after_resolution' in r.getMessage()
+        ]
+        assert deferred, caplog.text
+
+    async def test_the_regression_is_recovered_at_the_next_suppression(
+        self, tmp_path: Path
+    ) -> None:
+        """(c) The kept owner is what lets the next working read close the cycle, report
+        the regression with the fix's commit, and hand the new cycle a fresh owner."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await _open_owned_debt(db_path, self.TEST_ID, now=self.NOW)
+        await open_debt(
+            db_path, 'dark_factory', self.TEST_ID,
+            task_client=self._done_to_zeta(task_error=RuntimeError('mcp down')), now=self.LATER,
+        )
+        healed = _FakeTaskClient(
+            tasks={'task-901': _done_task('task-901', self.COMMIT)}, submit_returns='task-902'
+        )
+        seen: list = []
+
+        await open_debt(
+            db_path, 'dark_factory', self.TEST_ID,
+            task_client=healed, now=self.LATEST, on_regressed_after_resolution=seen.append,
+        )
+
+        assert len(seen) == 1, seen
+        assert seen[0].open_count == 2
+        assert seen[0].prior_resolving_commit == self.COMMIT
+        assert healed.calls == ['get_task', 'submit_task', 'commit_planning']
+        assert _owner(db_path, self.TEST_ID) == 'task-902'
+
+    @pytest.mark.parametrize(
+        'statuses', [{'task-901': 'cancelled'}, {}], ids=['cancelled', 'absent']
+    )
+    async def test_a_cancelled_or_absent_owner_is_still_replaced(
+        self, tmp_path: Path, statuses: dict
+    ) -> None:
+        """(d) The rule is done-ONLY: an owner that landed no fix, or no longer exists,
+        is still replaced even when η's read failed."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await _open_owned_debt(db_path, self.TEST_ID, now=self.NOW)
+        client = _FakeTaskClient(
+            statuses=statuses, submit_returns='task-902', task_error=RuntimeError('mcp down')
+        )
+
+        row = await open_debt(
+            db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.LATER
+        )
+
+        assert len(client.submit_calls) == 1
+        assert _owner(db_path, self.TEST_ID) == 'task-902'
+        assert row is not None and row.owner_task_id == 'task-902' and row.open_count == 1
+
+
+@pytest.mark.asyncio
 class TestOpenDebtRegressionHook:
     """``open_debt`` reports a re-entry — a test flaking again after its fix landed —
     EXACTLY ONCE, through ``on_regressed_after_resolution`` (task η).  ASYNC-ONLY CLASS.
@@ -4483,6 +4619,37 @@ class TestOpenDebtOverTheRealAdapter:
         assert row.open_count == 2
         assert row.prior_resolving_commit == commit
         assert _owner(db_path, self.TEST_ID) == 'task-902'
+
+    async def test_a_done_owner_whose_resolution_read_failed_is_kept(
+        self, tmp_path: Path
+    ) -> None:
+        """(f) The review's reproduction, composed: η's ``get_task`` answers with an
+        error while ζ's ``get_statuses`` reads the owner done.  No filing reaches the
+        wire, so the pointer the next suppression resolves through survives."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await self._seed(db_path)
+        scheduler = _RoutingStubScheduler(
+            {
+                'get_task': {'error': 'backend down', 'error_type': 'BackendUnavailable'},
+                'get_statuses': {'statuses': {'task-901': 'done'}},
+                'submit_task': {'task_id': 'task-902'},
+                'commit_planning': {'success': True},
+            }
+        )
+
+        row = await open_debt(
+            db_path,
+            'dark_factory',
+            self.TEST_ID,
+            task_client=self._client(scheduler),
+            now=self.LATER,
+        )
+
+        assert scheduler.dispatched == ['get_task', 'get_statuses']
+        assert _owner(db_path, self.TEST_ID) == 'task-901'
+        assert row is not None and row.owner_task_id == 'task-901'
 
 
 @pytest.mark.parametrize('make_path', _FAULTS, ids=['blocked_dir', 'corrupt_file'])
