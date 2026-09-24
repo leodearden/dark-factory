@@ -97,6 +97,7 @@ from fused_memory.services.live_workflow_detector import (
     corroboration_for_task,
     is_pure_gate_metadata,
     is_workflow_live_for_task,
+    worktree_index_kwargs,
 )
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.services.orchestrator_detector import (
@@ -5828,7 +5829,24 @@ class ReconciliationHarness:
                 except Exception:
                     _orch_started = None
 
-                def _task_is_live(tid: str) -> bool:
+                # Task 3778: hoist the whole-repo `git worktree list --porcelain`
+                # out of the cited-task fan-out below, the same way
+                # _render_live_workflow_section hoists it out of its per-task
+                # loop (and the same way the is_orchestrator_live_for hoist
+                # noted above already works here). It is invariant across every
+                # cited task in this pass, so the doubly-nested loop pays ONE
+                # worktree list rather than one per cited task.
+                #
+                # worktree_index_kwargs owns the three-valued contract for both
+                # hoisting call sites: fail-safe, WARNING on every unknown, and
+                # the unknown → omit-the-kwarg rule that makes each probe fall
+                # back to its own list rather than trusting an empty index from
+                # a hoisted ERROR (which would read as a project-wide "nothing
+                # is live" and fire stranded escalations for genuinely live
+                # tasks). A known-empty repo arrives as {'worktree_index': {}}.
+                _index_kwargs: dict = await worktree_index_kwargs(project_root)
+
+                async def _task_is_live(tid: str) -> bool:
                     """Is task *tid* covered by a live workflow right now?
 
                     Extracted verbatim (task 4821) from the per-cited-task body
@@ -5837,10 +5855,10 @@ class ReconciliationHarness:
                     same question of the exact same inputs.  A re-implementation
                     would be free to drift; a shared helper cannot.
 
-                    Closes over the four pass-local, loop-constant inputs
+                    Closes over the five pass-local, loop-constant inputs
                     (`task_by_id`, `_tasks_snapshot_at`, `_sched_state`,
-                    `_orch_started`) plus `project_root`, so the caller supplies
-                    only the task id.
+                    `_orch_started`, `_index_kwargs`) plus `project_root`, so
+                    the caller supplies only the task id.
 
                     Fail-safe direction is UNCHANGED from the inline version it
                     replaces: a corroboration error leaves the gate inert
@@ -5875,9 +5893,13 @@ class ReconciliationHarness:
                                 tid, _corr_exc,
                             )
                     try:
-                        return bool(is_workflow_live_for_task(
+                        # Awaited (task 3778): the detector's three git
+                        # probes are async now, so this gate no longer
+                        # blocks the loop this pass runs on.
+                        return bool(await is_workflow_live_for_task(
                             tid, project_root,
                             status=_status,
+                            **_index_kwargs,
                             task_kind=(
                                 _metadata.get('task_kind')
                                 if isinstance(_metadata, dict) else None
@@ -5962,7 +5984,7 @@ class ReconciliationHarness:
                         ]
                         any_live = False
                         for tid in cited_task_ids:
-                            if _task_is_live(tid):
+                            if await _task_is_live(tid):
                                 any_live = True
                                 break
                         if any_live:
@@ -6103,7 +6125,7 @@ class ReconciliationHarness:
                                 )
                             elif (
                                 routed_task_id not in cited_task_ids
-                                and _task_is_live(routed_task_id)
+                                and await _task_is_live(routed_task_id)
                             ):
                                 logger.info(
                                     'reconciliation.integrity_escalation_suppressed_live_workflow_routed_target',

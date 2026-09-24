@@ -63,6 +63,7 @@ PURE_STDLIB_LEAVES = (
     'branch_names',
     'cli_boundary',
     'config_dir',
+    'git_async',
     'governed_exceptions',
     'locking',
     'mcp_envelope',

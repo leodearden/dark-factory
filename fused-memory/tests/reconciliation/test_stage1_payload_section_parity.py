@@ -196,7 +196,13 @@ STAGE1_PAYLOAD_BUILDERS = _discover_stage1_payload_builders()
 
 
 def _aggregator_call(node: ast.AST) -> bool:
-    """True when *node* is a call to ``self._render_required_sections()``."""
+    """True when *node* is a call to ``self._render_required_sections()``.
+
+    The aggregator is a coroutine method (task 3778), so the call arrives
+    wrapped in ``await``; the wrapper is unwrapped before the check.
+    """
+    if isinstance(node, ast.Await):
+        node = node.value
     return bool(
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
@@ -331,7 +337,7 @@ class TestRenderRequiredSections:
 
         live_task_id = '4321'
 
-        def _fake_detect(task_id, project_root, **kwargs):
+        async def _fake_detect(task_id, project_root, **kwargs):
             return WorkflowLiveness(
                 is_live=str(task_id) == live_task_id,
                 worktree_registered=str(task_id) == live_task_id,
@@ -352,10 +358,11 @@ class TestRenderRequiredSections:
         )
         return stage
 
-    def test_renders_every_registry_header_when_all_sections_apply(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_renders_every_registry_header_when_all_sections_apply(self, monkeypatch):
         stage = self._make_live_stage(monkeypatch)
 
-        rendered = stage._render_required_sections()
+        rendered = await stage._render_required_sections()
 
         for section in MemoryConsolidator.REQUIRED_SECTIONS:
             assert section.header in rendered, (
@@ -365,7 +372,8 @@ class TestRenderRequiredSections:
                 f'aggregator is not dispatching to it. Rendered:\n{rendered!r}'
             )
 
-    def test_output_is_the_concatenation_of_the_registry_renderers_in_order(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_output_is_the_concatenation_of_the_registry_renderers_in_order(self, monkeypatch):
         """Registry order, no separator, no post-processing — pinned as literal text.
 
         Driven through a TWO-member STAND-IN registry of stub renderers rather
@@ -386,8 +394,14 @@ class TestRenderRequiredSections:
         stage = make_consolidator(project_root='/project')
         # Instance attributes, so getattr(self, section.renderer)() dispatches to
         # them exactly as it does to real bound methods.
-        monkeypatch.setattr(stage, '_stub_alpha', lambda: '\n### Alpha\nfirst\n', raising=False)
-        monkeypatch.setattr(stage, '_stub_beta', lambda: '\n### Beta\nsecond\n', raising=False)
+        async def _stub_alpha() -> str:
+            return '\n### Alpha\nfirst\n'
+
+        async def _stub_beta() -> str:
+            return '\n### Beta\nsecond\n'
+
+        monkeypatch.setattr(stage, '_stub_alpha', _stub_alpha, raising=False)
+        monkeypatch.setattr(stage, '_stub_beta', _stub_beta, raising=False)
         monkeypatch.setattr(
             MemoryConsolidator,
             'REQUIRED_SECTIONS',
@@ -397,7 +411,7 @@ class TestRenderRequiredSections:
             ),
         )
 
-        rendered = stage._render_required_sections()
+        rendered = await stage._render_required_sections()
 
         expected = '\n### Alpha\nfirst\n\n### Beta\nsecond\n'
         assert rendered == expected, (
@@ -408,12 +422,13 @@ class TestRenderRequiredSections:
             f'  expected: {expected!r}'
         )
 
-    def test_returns_empty_string_when_no_section_applies(self):
+    @pytest.mark.asyncio
+    async def test_returns_empty_string_when_no_section_applies(self):
         # filtered_task_tree left at the make_consolidator default (None), so
         # every registry renderer's guard fails.
         stage = make_consolidator(project_root='/project')
 
-        rendered = stage._render_required_sections()
+        rendered = await stage._render_required_sections()
 
         assert rendered == '', (
             "_render_required_sections() must return '' when no section applies — "
