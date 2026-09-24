@@ -831,6 +831,21 @@ _COVERAGE_CAVEAT = (
     "SAME task, and that pair IS drift even though neither row alone says so):"
 )
 
+_UNBOUND_CAVEAT = (
+    "  UNBOUND LABELS (a row is a manifest-bearing task whose prd_task_label "
+    "its tracked sidecar does not declare, so commit_planning's stamper binds "
+    "nothing for it and copies it no delivered_checks. A row is NOT by itself "
+    "a defect - a sidecar may deliberately omit a label, and the cases task "
+    "4907 adjudicated are recorded in the sidecars' .md twins under 'Unbound "
+    "task labels (task 4907 adjudication)'. A historical row's task is done or "
+    "cancelled, so no planning batch can touch it again; a LIVE row's task can "
+    "still be touched. Fixing a row is a separate, reviewed edit: realign a "
+    "misspelled or transliterated label on the task, clear prd_task_label "
+    "(keeping prd_path) on a task filed from outside the PRD's decomposition "
+    "plan, or complete the sidecar for a label that plan declares - never "
+    "invent a sidecar entry for a label the plan does not declare):"
+)
+
 # Printed ABOVE a git-discovery-failed project's rows, because a reader must
 # see that the zero below means "nothing was enumerated" before reading it as
 # "nothing was wrong".
@@ -854,6 +869,37 @@ def _format_finding_line(drift: DescriptorDrift) -> str:
         ("capability", drift.capability),
         ("fields", ",".join(drift.differing_fields)),
     ])
+
+
+def _format_unbound_line(row: UnboundLabel) -> str:
+    """One unbound-label row, in the sibling audits' ``key=value`` style.
+
+    ``hazard`` tells a LIVE row from a historical one at a glance and to a
+    grep; see :attr:`UnboundLabel.is_live`.
+    """
+    return format_kv_line([
+        ("manifest", row.manifest),
+        ("task_id", row.task_id),
+        ("label", row.label),
+        ("status", row.status),
+        ("hazard", "LIVE" if row.is_live else "historical"),
+    ])
+
+
+def _format_unbound_section(rows: list[UnboundLabel]) -> list[str]:
+    """Render the label-binding direction: header, caveat, then every row.
+
+    Printed even when *rows* is empty, and every row is NAMED, historical ones
+    included: a reader must be able to tell "looked and found none" from
+    "never looked", and a count alone would not say where to look. Each row's
+    continuation line lists what its sidecar DOES declare.
+    """
+    live = sum(row.is_live for row in rows)
+    lines = [f"  -- unbound task labels ({len(rows)}, {live} live) --", _UNBOUND_CAVEAT]
+    for row in rows:
+        lines.append(_format_unbound_line(row))
+        lines.append(f"      declared labels: {', '.join(row.declared_labels) or '(none)'}")
+    return lines
 
 
 def _format_coverage(coverage: AuditCoverage) -> list[str]:
@@ -904,8 +950,10 @@ def _format_coverage(coverage: AuditCoverage) -> list[str]:
 def format_report(audits: list[ProjectAudit]) -> str:
     """Render *audits* as a human-readable report.
 
-    Every project gets its COVERAGE block, INCLUDING projects with zero
-    findings — see :func:`_format_coverage`.
+    Every project gets both sections, drifted descriptors and unbound task
+    labels, and its COVERAGE block, INCLUDING projects with nothing to report —
+    see :func:`_format_unbound_section` and :func:`_format_coverage`. The
+    trailing total counts both dimensions, and how many unbound rows are live.
 
     Both roots are named on the header line so a ``--manifest-root`` run is
     unambiguous: a reader never has to guess which manifest tree was compared
@@ -914,7 +962,7 @@ def format_report(audits: list[ProjectAudit]) -> str:
     Pure: returns the text and never prints. ``main()`` does the single print.
     """
     lines: list[str] = []
-    total = 0
+    drifted = unbound = live = 0
     for audit in audits:
         if audit.manifest_root == audit.project_root:
             lines.append(f"{audit.project_root}:")
@@ -923,10 +971,10 @@ def format_report(audits: list[ProjectAudit]) -> str:
                 f"{audit.project_root} (manifests from {audit.manifest_root}):"
             )
         if audit.coverage.git_discovery_failed:
-            # ABOVE the rows on purpose — see _DISCOVERY_FAILED_NOTICE.
+            # ABOVE both sections on purpose — see _DISCOVERY_FAILED_NOTICE.
             lines.append(_DISCOVERY_FAILED_NOTICE)
 
-        total += len(audit.findings)
+        drifted += len(audit.findings)
         lines.append(f"  -- drifted descriptors ({len(audit.findings)}) --")
         for drift in audit.findings:
             lines.append(_format_finding_line(drift))
@@ -935,10 +983,14 @@ def format_report(audits: list[ProjectAudit]) -> str:
                     f"      {field}: sidecar={drift.sidecar_check[field]!r} "
                     f"task={drift.task_check[field]!r}"
                 )
+        unbound += len(audit.unbound_labels)
+        live += sum(row.is_live for row in audit.unbound_labels)
+        lines.extend(_format_unbound_section(audit.unbound_labels))
         lines.extend(_format_coverage(audit.coverage))
 
     lines.append(
-        f"{total} drifted descriptor(s) across {len(audits)} project(s)"
+        f"{drifted} drifted descriptor(s), {unbound} unbound task label(s) "
+        f"({live} live) across {len(audits)} project(s)"
     )
     return "\n".join(lines)
 
@@ -949,16 +1001,25 @@ def format_json(audits: list[ProjectAudit]) -> str:
     An object because the coverage block must travel WITH the findings: a
     machine consumer handed a bare finding array could read it as the whole
     corpus, which is the exact false-completeness the coverage block exists to
-    prevent. The caveat prose ships in the payload for the same reason.
+    prevent. The caveat prose ships in the payload for the same reason, each
+    dimension's under its own key.
+
+    Each unbound row carries ``is_live`` explicitly: it is a property, not a
+    NamedTuple field, so ``_asdict()`` alone would drop it.
     """
     return json.dumps({
         "caveat": _COVERAGE_CAVEAT,
+        "unbound_labels_caveat": _UNBOUND_CAVEAT,
         "projects": [
             {
                 "project_root": audit.project_root,
                 "manifest_root": audit.manifest_root,
                 "coverage": audit.coverage._asdict(),
                 "findings": [drift._asdict() for drift in audit.findings],
+                "unbound_labels": [
+                    {**row._asdict(), "is_live": row.is_live}
+                    for row in audit.unbound_labels
+                ],
             }
             for audit in audits
         ],
