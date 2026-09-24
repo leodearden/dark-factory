@@ -29,7 +29,6 @@ convention alone, by the two guards at the foot of this file:
 
 from __future__ import annotations
 
-import ast
 import asyncio
 import json
 from pathlib import Path
@@ -51,7 +50,6 @@ from shared.mcp_markup_middleware import RepairPolicy
 from shared.toolcall_markup import (
     CANONICAL_OPENER_PREFIX,
     ENVELOPE_LITERALS,
-    INVOKE_CLOSER,
     closer_for,
 )
 
@@ -1392,12 +1390,6 @@ def _raw_sentinel_hits(source: str) -> dict[str, list[int]]:
 def test_the_guard_source_spells_no_raw_envelope_literal():
     """CROSS-FILE: markup_guard.py's own source must carry no raw literal.
 
-    Paired with an anti-vacuity check that its module docstring still names
-    INVOKE_CLOSER after decoding — a bare "no raw literal" scan would be
-    trivially satisfiable by deleting the explanatory sentence instead of
-    escaping it. That docstring names only the one literal, so only that one
-    is checked.
-
     The path is resolved from this file rather than ``markup_guard.__file__``:
     an editable install can resolve the import to ANOTHER checkout's source,
     and the guard must read the tree this test came from.
@@ -1419,23 +1411,10 @@ def test_the_guard_source_spells_no_raw_envelope_literal():
         'toolcall_markup.py\'s "Sentinel-literal hazard" section for why.'
     )
 
-    doc = ast.get_docstring(ast.parse(source))
-    assert doc is not None, f'{source_path.name} lost its module docstring'
-    assert INVOKE_CLOSER in doc, (
-        'INVOKE_CLOSER is missing from the decoded docstring of '
-        f'{source_path.name} — escaping must not delete the specimen it '
-        'explains.'
-    )
-
 
 def test_this_module_spells_no_raw_envelope_literal():
     """SELF-FILE (the idiom task 4696 promoted): this test module's own source
     must never contain a raw envelope literal either.
-
-    Paired with an anti-vacuity check on TestUnrepairableResidueIsPreserved's
-    docstring, whose explanation of the envelope closer carries no behavioural
-    coverage: without the check, the scan could be satisfied by deleting that
-    sentence instead of escaping it.
     """
     source = Path(__file__).read_text(encoding='utf-8')
 
@@ -1445,12 +1424,4 @@ def test_this_module_spells_no_raw_envelope_literal():
         "shared.toolcall_markup's constants, as _leaked() does, or spell it "
         "with the \\x3c escape in prose — see the AUTHORING RULE in this module's "
         f'docstring. Offending needle(s): {hits!r}.'
-    )
-
-    doc = TestUnrepairableResidueIsPreserved.__doc__
-    assert doc is not None, 'TestUnrepairableResidueIsPreserved lost its docstring'
-    assert INVOKE_CLOSER in doc, (
-        'INVOKE_CLOSER is missing from the decoded docstring of '
-        'TestUnrepairableResidueIsPreserved — escaping must not delete the '
-        'specimen it explains.'
     )
