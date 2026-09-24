@@ -486,24 +486,39 @@ def build_judge_cases(
 class EvalPlan:
     """The cases of one run, the records their slates name, and how they were built.
 
-    ``records_by_id`` must resolve every id in every case's ``candidates``: a
-    judge handed a bare id has no text to compare and is answering noise, and
-    an unresolvable id narrows a slate the report claims was wider.
+    ``candidate_records`` is positional with ``cases``: entry *i* is case *i*'s
+    slate resolved to records, in slate order, because a judge handed a bare id
+    has no text to compare and is answering noise. Rows are never pooled across
+    cases: a retrieved row carries ITS query's cosine, which the shipped
+    selector re-sorts every slate by, so a borrowed row would hand one case
+    another query's order.
 
     ``provenance`` is the plan's OWN disclosure — the fields that describe how
     the slates were obtained. It is merged UNDER the caller's, so nothing here
     can overwrite what the operator asked for.
 
-    A case routed to the judge must show it at least one candidate, and that
-    is checked at construction, before anything is spent or written.
+    Checked at construction, before anything is spent or written: each case's
+    records are exactly its slate, and a case routed to the judge shows it at
+    least one candidate.
     """
 
     cases: tuple[dict[str, Any], ...]
-    records_by_id: Mapping[str, Mapping[str, Any]]
+    candidate_records: tuple[tuple[Mapping[str, Any], ...], ...]
     record_count: int
     provenance: Mapping[str, Any]
 
     def __post_init__(self) -> None:
+        shown = [[str(r['memory_id']) for r in records] for records in self.candidate_records]
+        unresolved = [
+            f"{case['memory_id']} ({case['expected_class']})"
+            for index, case in enumerate(self.cases)
+            if index >= len(shown) or shown[index] != case['candidates']
+        ]
+        if unresolved or len(shown) != len(self.cases):
+            raise ValueError(
+                f'{len(self.cases)} case(s), {len(shown)} resolved slate(s); not shown '
+                f'exactly their own slate, in order: {", ".join(unresolved) or "none"}',
+            )
         unseen = [
             f"{case['memory_id']} ({case['expected_class']})"
             for case in self.cases
@@ -525,10 +540,18 @@ def seeded_plan(
     distractors: int,
     aliases: Mapping[str, str] = _NO_ALIASES,
 ) -> EvalPlan:
-    """Today's construction: the cluster canonical seeded at slate position 0."""
+    """Today's construction: the cluster canonical seeded at slate position 0.
+
+    Each slate is resolved against the fixture HERE, so a dangling id raises
+    ``KeyError`` before anything is spent.
+    """
+    cases = tuple(build_judge_cases(records, distractors=distractors, aliases=aliases))
+    fixture = {str(r['memory_id']): r for r in records}
     return EvalPlan(
-        cases=tuple(build_judge_cases(records, distractors=distractors, aliases=aliases)),
-        records_by_id={str(r['memory_id']): r for r in records},
+        cases=cases,
+        candidate_records=tuple(
+            tuple(fixture[cid] for cid in case['candidates']) for case in cases
+        ),
         record_count=len(records),
         provenance={
             'slate_mode': SLATE_SEEDED,
@@ -563,10 +586,7 @@ def plan_from_slates(
             f'retrieval',
         )
     cases: list[dict[str, Any]] = []
-    records_by_id: dict[str, Mapping[str, Any]] = {}
     for record, slate in zip(labelled, slates, strict=True):
-        for candidate in slate.candidates:
-            records_by_id[str(candidate['memory_id'])] = candidate
         cases.append(_case(
             record,
             candidates=[str(c['memory_id']) for c in slate.candidates],
@@ -580,7 +600,7 @@ def plan_from_slates(
         ))
     return EvalPlan(
         cases=tuple(cases),
-        records_by_id=records_by_id,
+        candidate_records=tuple(tuple(slate.candidates) for slate in slates),
         record_count=len(records),
         provenance={'slate_mode': SLATE_RETRIEVED, **dict(provenance)},
     )
@@ -880,15 +900,19 @@ def case_row(
     index: int,
     case: Mapping[str, Any],
     answer: JudgeAnswer,
-    records_by_id: Mapping[str, Mapping[str, Any]],
+    candidate_records: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
     """Everything about one case that the aggregate numbers cannot be reread from.
+
+    A function of this case alone: *candidate_records* are the rows ITS judge
+    was shown, and the attach target is described only when it was one of them.
 
     JSON-serializable verbatim: this is the line appended to the cases file as
     each case completes, so a run interrupted partway keeps what it paid for.
     """
     target_id = case['attach_target_id']
-    target = records_by_id.get(str(target_id)) if target_id else None
+    shown = {str(record['memory_id']): record for record in candidate_records}
+    target = shown.get(str(target_id)) if target_id else None
     cluster_id = case['cluster_id']
     alias_id = case['canonical_alias_id']
     canonical_ids = {str(cluster_id), *([str(alias_id)] if alias_id else [])}
@@ -907,8 +931,7 @@ def case_row(
         'attach_target_label': target.get('label') if target else None,
         'attach_target_is_canonical': str(target_id) in canonical_ids,
         'canonical_in_slate': any(
-            _attachable_id(records_by_id[cid]) in canonical_ids
-            for cid in case['candidates']
+            _attachable_id(record) in canonical_ids for record in candidate_records
         ),
         'canonical_present': case['canonical_present'],
         'band': case['band'],
@@ -1275,8 +1298,8 @@ def run_judge_eval(
     indistinguishable from a genuine misclassification, so it would both
     shrink the measured population and depress the accuracy reported over it.
 
-    A dangling candidate id raises ``KeyError`` for the same reason — a
-    silently-skipped candidate narrows a slate the report claims was 5 wide.
+    A dangling candidate id already raised when *plan* was built: a
+    silently-skipped candidate would narrow a slate the report claims was 5 wide.
 
     THE MARKDOWN SIBLING NEVER OVERWRITES THE REPORT. :func:`markdown_sibling`
     composes it and RAISES on a *report_path* that composes back to itself —
@@ -1294,10 +1317,10 @@ def run_judge_eval(
 
     rows: list[dict[str, Any]] = []
     with _case_sink(cases_path) as emit:
-        for index, case in enumerate(cases, 1):
-            candidates = [plan.records_by_id[cid] for cid in case['candidates']]
-            answer = _as_answer(judge_fn(case, candidates))
-            row = case_row(index, case, answer, plan.records_by_id)
+        paired = zip(cases, plan.candidate_records, strict=True)
+        for index, (case, records) in enumerate(paired, 1):
+            answer = _as_answer(judge_fn(case, list(records)))
+            row = case_row(index, case, answer, records)
             emit(row)
             rows.append(row)
             if index % 10 == 0:
@@ -1713,8 +1736,7 @@ def _limited(
     """*limit* labelled records drawn ROUND-ROBIN across clusters, plus canonicals.
 
     Truncating RECORDS rather than cases, because a bare head-N slice can cut a
-    cluster's canonical while keeping its members and the runner would then
-    KeyError on an unresolvable slate partway through a paid run.
+    cluster's canonical while keeping its members, whose slates then cannot resolve.
 
     Round-robin and not a head slice: the fixture is grouped by cluster in file
     order, so `records[:5]` is five records of ONE cluster, `_distractor_pool`

@@ -4,18 +4,18 @@
 
 | class | n | correct | accuracy |
 |---|---|---|---|
-| duplicate | 75 | 70 | 0.9333 |
+| duplicate | 75 | 71 | 0.9467 |
 | distinct | 3 | 0 | 0.0 |
-| pseudo_contradiction | 6 | 4 | 0.6667 |
+| pseudo_contradiction | 6 | 5 | 0.8333 |
 | distractor | 0 | 0 | None |
 
 ## Confusion — expected class by observed verdict
 
 | class | amended | contested | restated | stored |
 |---|---|---|---|---|
-| duplicate | 58 | 2 | 12 | 3 |
+| duplicate | 58 | 1 | 13 | 3 |
 | distinct | 2 | 0 | 1 | 0 |
-| pseudo_contradiction | 3 | 2 | 1 | 0 |
+| pseudo_contradiction | 4 | 1 | 1 | 0 |
 | distractor | 0 | 0 | 0 | 0 |
 
 ## Where the writes attached, and which band answered
@@ -26,8 +26,8 @@
 - attaches on a `distinct`/`pseudo_contradiction`/`distractor` case: 9/9 = `1.0`
 - the case's canonical was ON the slate: 32/84 = `0.381`
 - cases whose canonical is no longer in the corpus: `21`
-- judge accuracy restricted to the MIDDLE band: 64/73 = `0.8767`
-- LLM calls made: `73`, tokens: `160435`
+- judge accuracy restricted to the MIDDLE band: 66/73 = `0.9041`
+- LLM calls made: `73`, tokens: `160432`
 
 ### Band split — expected class by the band that answered
 
@@ -40,12 +40,12 @@
 
 ## Duplicate attach split (a distribution, not an error term)
 
-- `restated`: 12
+- `restated`: 13
 - `amended`: 58
 
 ## Contested
 
-- contested verdicts observed: **4**, all of which are FALSE POSITIVES.
+- contested verdicts observed: **2**, all of which are FALSE POSITIVES.
 - ground truth available: `False`
 - `no_positive_contested_labels: the fixture carries 6 pseudo_contradiction records, every one curator-adjudicated NOT a contradiction, and 0 records labelled as a genuine contradiction. Contested recall and precision are therefore unmeasurable against this corpus; only the false-positive count below is a measurement.`
 

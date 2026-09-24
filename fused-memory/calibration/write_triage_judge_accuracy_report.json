@@ -2,8 +2,8 @@
   "per_class": {
     "duplicate": {
       "n": 75,
-      "correct": 70,
-      "accuracy": 0.9333
+      "correct": 71,
+      "accuracy": 0.9467
     },
     "distinct": {
       "n": 3,
@@ -12,8 +12,8 @@
     },
     "pseudo_contradiction": {
       "n": 6,
-      "correct": 4,
-      "accuracy": 0.6667
+      "correct": 5,
+      "accuracy": 0.8333
     },
     "distractor": {
       "n": 0,
@@ -24,8 +24,8 @@
   "confusion": {
     "duplicate": {
       "amended": 58,
-      "contested": 2,
-      "restated": 12,
+      "contested": 1,
+      "restated": 13,
       "stored": 3
     },
     "distinct": {
@@ -35,8 +35,8 @@
       "stored": 0
     },
     "pseudo_contradiction": {
-      "amended": 3,
-      "contested": 2,
+      "amended": 4,
+      "contested": 1,
       "restated": 1,
       "stored": 0
     },
@@ -48,10 +48,10 @@
     }
   },
   "duplicate_outcome_split": {
-    "restated": 12,
+    "restated": 13,
     "amended": 58
   },
-  "false_contested": 4,
+  "false_contested": 2,
   "production_shape": {
     "attach_outcomes": [
       "amended",
@@ -105,15 +105,6 @@
           "attach_target_id": "74b9430a-0d0d-4991-b864-8811fef451e7",
           "attach_target_cluster_id": null,
           "attach_target_category": "preferences_and_norms",
-          "attach_target_label": null
-        },
-        {
-          "memory_id": "03dbcd3a-9afe-4c6a-8c77-ebf75203bf89",
-          "expected_class": "duplicate",
-          "outcome": "amended",
-          "attach_target_id": "486c508d-ffd0-402e-948e-e265b0d3b406",
-          "attach_target_cluster_id": null,
-          "attach_target_category": "procedural_knowledge",
           "attach_target_label": null
         },
         {
@@ -209,7 +200,7 @@
         {
           "memory_id": "335028f7-0e0e-4aac-a4c3-9c47885c36f3",
           "expected_class": "duplicate",
-          "outcome": "contested",
+          "outcome": "amended",
           "attach_target_id": "1b38e25f-27e8-4908-bdeb-86f5b54ec161",
           "attach_target_cluster_id": null,
           "attach_target_category": "observations_and_summaries",
@@ -258,6 +249,15 @@
           "attach_target_id": "97a0199d-5a4a-4012-be33-39f489293809",
           "attach_target_cluster_id": null,
           "attach_target_category": "observations_and_summaries",
+          "attach_target_label": null
+        },
+        {
+          "memory_id": "ce42b17f-2c80-47c8-ae92-61f1f7bbef0e",
+          "expected_class": "duplicate",
+          "outcome": "amended",
+          "attach_target_id": "bb1285ec-7557-493c-be63-d80f3ac95b7d",
+          "attach_target_cluster_id": null,
+          "attach_target_category": "procedural_knowledge",
           "attach_target_label": null
         },
         {
@@ -497,7 +497,7 @@
         {
           "memory_id": "2b911b54-cd27-4a94-81f3-890926202be1",
           "expected_class": "duplicate",
-          "outcome": "amended",
+          "outcome": "restated",
           "attach_target_id": "f8286a29-df66-4c33-9fd8-d601cbd44fc3",
           "attach_target_cluster_id": null,
           "attach_target_category": "procedural_knowledge",
@@ -697,8 +697,8 @@
     },
     "middle_band": {
       "n": 73,
-      "correct": 64,
-      "accuracy": 0.8767
+      "correct": 66,
+      "accuracy": 0.9041
     },
     "canonical_in_slate": {
       "n": 84,
@@ -709,9 +709,9 @@
     "judge_calls": 73,
     "judge_spend": {
       "calls_with_usage": 73,
-      "prompt_tokens": 159854,
+      "prompt_tokens": 159851,
       "completion_tokens": 581,
-      "total_tokens": 160435
+      "total_tokens": 160432
     }
   },
   "contested_ground_truth": {
