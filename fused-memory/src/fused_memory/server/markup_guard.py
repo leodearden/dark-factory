@@ -87,9 +87,7 @@ expectation table and the per-specimen reasoning.
 The envelope closer above is spelled with the ``\\x3c`` escape, never a raw
 bracket: the "Sentinel-literal hazard" section of
 ``shared/src/shared/toolcall_markup.py``, the owner of this convention, says
-why, and
-``tests/test_markup_guard_fused_memory.py::test_the_guard_source_spells_no_raw_envelope_literal``
-enforces it.
+why.
 """
 
 from __future__ import annotations
