@@ -3013,7 +3013,14 @@ async def _run(args: argparse.Namespace) -> int:
 
     config = _schema.FusedMemoryConfig()
     memory = _service.MemoryService(config)
-    await memory.initialize()
+    try:
+        await memory.initialize()
+    except OSError as exc:
+        logger.error(
+            'ABORT: the memory store could not be opened (%s): %s',
+            type(exc).__name__, exc,
+        )
+        return 1
     try:
         # The ANN cutoff is READ from the calibration (or an explicit
         # override), PER CATEGORY. An empty mapping means no category is
@@ -3076,7 +3083,10 @@ async def _run(args: argparse.Namespace) -> int:
             ),
         )
         # stdout is task 3136's report contract — unchanged shape, one JSON doc.
+        # Flushed so a failed stdout stops the run HERE, before the metrics
+        # artifact and any --apply delete, whatever the buffering regime.
         print(json.dumps(plan, indent=2, default=str))
+        sys.stdout.flush()
 
         # build_sweep_plan owns the remap-stage losses (a cross-category or
         # unswept-category ANN pair), so the plan's echoed copy — not the dict
@@ -3122,9 +3132,16 @@ async def _run(args: argparse.Namespace) -> int:
                 corpus_counts={c: len(v) for c, v in records_by_category.items()},
                 eval_id=args.eval_id, run_stamp=stamp,
             )
-            metrics_path, _report, _details = emit_metrics_artifact(
-                series, details, args.metrics_root, stamp,
-            )
+            try:
+                metrics_path, _report, _details = emit_metrics_artifact(
+                    series, details, args.metrics_root, stamp,
+                )
+            except OSError as exc:
+                logger.error(
+                    'ABORT: cannot write the metrics artifact under %s: %s',
+                    args.metrics_root, exc,
+                )
+                return 1
             logger.info('Wrote metrics artifact %s', metrics_path)
 
         if not args.apply:
