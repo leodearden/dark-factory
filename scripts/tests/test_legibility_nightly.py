@@ -1319,6 +1319,32 @@ def test_default_census_launcher_argv_names_the_target_project(monkeypatch):
     )
 
 
+def test_default_census_launcher_argv_carries_config_path_when_given(monkeypatch):
+    """``--config`` pins the EXACT legibility.yaml the trickle itself loaded,
+    so the census cannot independently re-resolve to a different one."""
+    seen = _spy_subprocess_run(monkeypatch)
+    config_path = '/some/other/project/docs/legibility/legibility.yaml'
+
+    nightly._default_census_launcher('/some/other/project', config_path=config_path)
+
+    argv = seen['args']
+    assert _adjacent_pair(argv, '--config') == ['--config', config_path]
+    # ...riding the SAME argv as the project root, not replacing it.
+    assert _adjacent_pair(argv, '--project-root') == ['--project-root', '/some/other/project']
+
+
+def test_default_census_launcher_refuses_a_relative_config_path(monkeypatch):
+    seen = _spy_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError) as excinfo:
+        nightly._default_census_launcher(
+            '/some/project', config_path='docs/legibility/legibility.yaml',
+        )
+
+    assert 'docs/legibility/legibility.yaml' in str(excinfo.value)
+    assert seen == {}, 'a refused config path must never reach subprocess.run'
+
+
 def test_default_census_launcher_composes_project_root_with_the_pool_env(monkeypatch):
     """Task 3269's argv fix and task 5488's env overlay ride the SAME launch."""
     seen = _spy_subprocess_run(monkeypatch)
@@ -1377,6 +1403,56 @@ def test_evaluate_census_step_two_project_configs_produce_two_distinct_launches(
         )
 
     assert calls == [str(tmp_path / 'proj_a'), str(tmp_path / 'proj_b')]
+
+
+def test_evaluate_census_step_forwards_config_path_to_launcher(tmp_path):
+    config_path = _write_config(tmp_path / 'proj_a', project_id='proj_a')
+    cfg = load_config(config_path)
+    calls = []
+
+    def rec(project_root, *, config_path=None):
+        calls.append((project_root, config_path))
+
+    nightly.evaluate_census_step(
+        cfg, now=None, status_fetcher=None, decide=_fire_decide,
+        entrypoint_exists=lambda: True, launcher=rec, config_path=config_path,
+    )
+
+    assert calls == [(cfg.project_root, config_path)]
+
+
+def test_run_nightly_forwards_the_resolved_config_path_to_the_census_step(
+    tmp_path, monkeypatch,
+):
+    """The census is pinned to the legibility.yaml THIS run loaded -- made
+    absolute, so an operator's relative ``--config`` is never re-resolved
+    against the census subprocess's cwd."""
+    monkeypatch.chdir(tmp_path)
+    _write_config(tmp_path / 'proj_a', project_id='proj_a')
+    calls = []
+
+    def _spy_evaluate(cfg, **kwargs):
+        calls.append((cfg, kwargs))
+        return 'census trigger: NO-FIRE -- stub', False
+
+    monkeypatch.setattr(nightly, 'evaluate_census_step', _spy_evaluate)
+
+    nightly.run_nightly(
+        config_path='proj_a/docs/legibility/legibility.yaml',
+        projects_root=tmp_path / 'projects',
+        target_date=date(2026, 7, 13),
+        invoke=lambda prompt, model: '{"proposals": []}',
+        status_fetcher=lambda: {'statuses': {}},
+        poster=lambda url, envelope: None,
+    )
+
+    assert len(calls) == 1
+    cfg, kwargs = calls[0]
+    expected = (tmp_path / 'proj_a' / 'docs' / 'legibility' / 'legibility.yaml').resolve()
+    assert kwargs['config_path'] == expected
+    assert Path(kwargs['config_path']).is_absolute()
+    # The cfg and the config path name the SAME project.
+    assert cfg.project_root == str(tmp_path / 'proj_a')
 
 
 class TestRunNightlyBindsTheCensusLauncherToThePool:
@@ -4286,6 +4362,12 @@ def test_main_run_fires_the_tasks_landed_condition_end_to_end(
         'tasks-landed: 130 landed since last census (threshold 120) -> FIRE' in m
         for m in messages
     ), messages
+
+    # (iv) task 3269: the census launched from the systemd entry point is aimed
+    # at THIS project and THIS legibility.yaml, never at the process cwd.
+    launch_args, launch_kwargs = launcher_calls[0]
+    assert launch_args == (str(tmp_path),)
+    assert launch_kwargs['config_path'] == Path(config_path).resolve()
 
 
 def test_main_run_fails_safe_when_the_defaulted_fetcher_cannot_reach_fused_memory(
