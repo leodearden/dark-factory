@@ -2715,7 +2715,7 @@ class TestProbeReport:
 # The read-only claim is the load-bearing one in this whole leaf: an eval that
 # writes to the corpus it measures is not an eval. Asserting it in a docstring
 # proves nothing, so it is asserted as BEHAVIOUR — the probe is driven, end to
-# end through argparse and _run, against a MemoryService double whose every
+# end through argparse and main, against a MemoryService double whose every
 # write method raises. A run that completes is a run that never wrote.
 #
 # Still no thresholds: every assertion below is on a call, a flag, an exit
@@ -2903,9 +2903,9 @@ def _canned_hits(registry):
 def _install_double(monkeypatch, double):
     """Point the lazily-imported MemoryService at *double*.
 
-    No test-only seam in the script: `_run` imports MemoryService inside the
+    No test-only seam in the script: `_probe` imports MemoryService inside the
     function (the D8 pattern), so patching the module attribute is enough to
-    drive the real argparse/_run/emit path end to end.
+    drive the real argparse/main/emit path end to end.
     """
     import fused_memory.services.memory_service as ms  # noqa: PLC0415
 
