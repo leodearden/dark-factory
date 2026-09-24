@@ -1198,9 +1198,13 @@ _IN_LOOP_RESUME_SPAWN_TIMEOUT_SECS = 15
 # old timer-driven rewrites fired at.
 _SLOW_START_SECS = 4
 # Small, so each counted run (see _polls_outlasting) is a handful of polls. At
-# least 2, so the watcher's FIRST rewrite, which reacts to the gate's first busy
-# poll, still lands before the busy loop's last pre-force poll: bash's
-# whole-second $SECONDS can shrink an F-second deadline to about F-1 seconds.
+# least 2 because of the ONE wall-clock race the counted tests keep: the
+# watcher's first rewrite reacts to the gate's first busy poll and must land
+# before the busy loop's last pre-force poll, and bash's whole-second $SECONDS
+# can shrink an F-second deadline to about F-1 seconds, one poll interval at
+# F=2. Losing that race force-fires with no stale/absent detour, so the test
+# fails rather than passes. If it ever flakes, raise this constant, which only
+# adds polls via _polls_outlasting. Never put a wall-clock offset back.
 _SHORT_FORCE_FIRE_SECS = 2
 
 
@@ -1611,6 +1615,11 @@ def test_unit_that_drains_during_the_unknown_grace_resumes_after_the_await(
     line with no force line proves the idle was read INSIDE
     drain_await_fresh. Do not "simplify" the idle rewrite's
     `polls=_polls_outlasting(...)` count; it is the assertion.
+
+    That proof reads the script's own clock, but REACHING the scenario is
+    not load-proof: the stale/absent rewrite must still win the one race
+    documented at _SHORT_FORCE_FIRE_SECS. Losing it force-fires with no
+    detour, which fails the force-line assertion here and can never pass it.
     """
     # ORCH_DRAIN_UNKNOWN_GRACE_SECS is the must-never-elapse bound here (the
     # unit drains on its own a few polls into it); ONE binding still feeds it
@@ -1693,12 +1702,16 @@ def test_busy_stale_busy_oscillation_does_not_reset_the_force_fire_anchor(tmp_pa
         polls again, reads the trap and prints "resuming restart of <unit>:
         drained". Even if the trap lands late, the ledger shows a second busy
         poll after the stale run.
-    Every assertion below reads what the script itself did -- its stdout and
-    its own poll ledger -- which no amount of host load can perturb: exactly
-    two defer lines (the initial one plus the re-defer after the stale
-    interlude, itself independent corroboration that the oscillation
-    happened), a force line PRESENT, a resume line ABSENT, and a ledger that
-    ends on the stale run followed by exactly one busy poll.
+    Every assertion below reads what the script itself did, its stdout and
+    its own poll ledger: exactly two defer lines (the initial one plus the
+    re-defer after the stale interlude, itself independent corroboration
+    that the oscillation happened), a force line PRESENT, a resume line
+    ABSENT, and a ledger that ends on the stale run followed by exactly one
+    busy poll. Host load cannot turn a reset anchor into a pass. REACHING
+    the oscillation is not load-proof, though: the first (busy->stale)
+    rewrite must win the one race documented at _SHORT_FORCE_FIRE_SECS.
+    Losing it force-fires after a single defer, which fails the defer-count
+    assertion.
     """
     # ORCH_DRAIN_UNKNOWN_GRACE_SECS is a must-never-elapse bound here (the
     # unit comes back busy on its own a few polls into it), so this site wants
