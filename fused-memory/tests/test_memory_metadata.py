@@ -359,7 +359,18 @@ class TestKeyLayers:
                            # :2962). Included so a round-tripped search result
                            # re-written as metadata does not census-warn on the
                            # server's own field.
+            'unverified_claim',  # stamped by MemoryService.add_memory when the
+                                 # completion-claim gate flags a write (task 4715).
         }) == SERVER_STAMPED_KEYS
+
+    def test_unverified_claim_tag_is_a_server_stamped_key(self):
+        from fused_memory.memory_metadata import SERVER_STAMPED_KEYS, classify_unknown_keys
+        from fused_memory.services.completion_claim_gate import UNVERIFIED_CLAIM_TAG
+
+        assert UNVERIFIED_CLAIM_TAG in SERVER_STAMPED_KEYS
+        assert classify_unknown_keys(
+            {UNVERIFIED_CLAIM_TAG: True, 'category': 'procedural_knowledge'},
+        ) == []
 
     def test_reserved_vocabulary_keys(self):
         from fused_memory.memory_metadata import RESERVED_VOCABULARY_KEYS
