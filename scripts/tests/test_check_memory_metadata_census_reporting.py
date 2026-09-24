@@ -220,3 +220,99 @@ def test_not_installed_and_never_ran_are_told_apart(tmp_path):
 
     assert "not installed" in not_installed.stderr.lower(), not_installed.stderr
     assert not_installed.stderr != never_ran.stderr
+
+
+def _assert_named_failure(result, *fragments):
+    assert result.returncode != 0, result.stdout
+    assert "Traceback" not in result.stderr, result.stderr
+    for fragment in fragments:
+        assert fragment in result.stderr, (fragment, result.stderr)
+
+
+def test_empty_exit_timestamp_is_never_ran(tmp_path):
+    result = _run(
+        tmp_path, "48",
+        fields=_never_ran_fields(),
+        history=_history_with_newest_stamp(_hours_ago(2)),
+    )
+
+    _assert_named_failure(result, "never run")
+    assert "not installed" not in result.stderr.lower(), result.stderr
+
+
+def test_na_exit_timestamp_is_never_ran(tmp_path):
+    result = _run(
+        tmp_path, "48",
+        fields=_healthy_fields(ExecMainExitTimestamp="n/a"),
+        history=_history_with_newest_stamp(_hours_ago(2)),
+    )
+
+    _assert_named_failure(result, "never run")
+
+
+def test_last_run_older_than_window_is_stale(tmp_path):
+    result = _run(
+        tmp_path, "48",
+        fields=_healthy_fields(
+            ExecMainExitTimestamp=_systemd_timestamp(_hours_ago(72))
+        ),
+        history=_history_with_newest_stamp(_hours_ago(2)),
+    )
+
+    _assert_named_failure(result, "72.0h", "48h")
+
+
+def test_last_run_just_inside_window_passes(tmp_path):
+    result = _run(
+        tmp_path, "48",
+        fields=_healthy_fields(
+            ExecMainExitTimestamp=_systemd_timestamp(_hours_ago(47))
+        ),
+        history=_history_with_newest_stamp(_hours_ago(2)),
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_last_run_just_outside_window_fails(tmp_path):
+    result = _run(
+        tmp_path, "48",
+        fields=_healthy_fields(
+            ExecMainExitTimestamp=_systemd_timestamp(_hours_ago(49))
+        ),
+        history=_history_with_newest_stamp(_hours_ago(2)),
+    )
+
+    _assert_named_failure(result, "49.0h", "48h")
+
+
+def test_unparsable_exit_timestamp_fails_loud(tmp_path):
+    result = _run(
+        tmp_path, "48",
+        fields=_healthy_fields(ExecMainExitTimestamp="garbage"),
+        history=_history_with_newest_stamp(_hours_ago(2)),
+    )
+
+    _assert_named_failure(result, "'garbage'")
+    assert "never run" not in result.stderr, result.stderr
+
+
+def test_local_zone_exit_timestamp_fails_loud_rather_than_misdating(tmp_path):
+    local = _hours_ago(2).strftime("%a %Y-%m-%d %H:%M:%S BST")
+    result = _run(
+        tmp_path, "48",
+        fields=_healthy_fields(ExecMainExitTimestamp=local),
+        history=_history_with_newest_stamp(_hours_ago(2)),
+    )
+
+    _assert_named_failure(result, "BST")
+
+
+def test_unit_state_is_read_with_timestamps_pinned_to_utc(tmp_path):
+    _run(
+        tmp_path, "48",
+        fields=_healthy_fields(),
+        history=_history_with_newest_stamp(_hours_ago(2)),
+    )
+
+    assert _systemctl_state(tmp_path)["call_tz"] == ["UTC"]
