@@ -193,6 +193,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from shared.cli_boundary import LoudArgumentParser, run_cli
+
 from fused_memory.reconciliation.task_filter import (
     # `_CLAUSE_SPLIT_RE` is module-private BY CONTRACT — an AST scan over
     # `src/` and `scripts/` (tests/test_task_filter.py
@@ -3204,14 +3206,14 @@ never set here — see :func:`resolve_ann_threshold`.
 """
 
 
-def _build_parser() -> argparse.ArgumentParser:
+def _build_parser() -> LoudArgumentParser:
     """The CLI surface. Every flag added after the first release is optional.
 
     ``--project-id X`` and ``--project-id X --apply`` — the invocation task
     3136 schedules — must keep parsing byte-for-byte, so all of this task's
     flags carry defaults.
     """
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = LoudArgumentParser(description=__doc__)
     parser.add_argument(
         '--project-id', dest='project_id', required=True,
         help='Project id to scan for near-duplicate memories',
@@ -3272,4 +3274,4 @@ def main() -> int:
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(run_cli(main))

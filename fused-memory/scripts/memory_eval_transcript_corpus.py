@@ -233,6 +233,7 @@ from legibility.inventory import (  # type: ignore[reportMissingImports]  # noqa
     count_residual_gz,
     iter_json_lines,
 )
+from shared.cli_boundary import LoudArgumentParser, run_cli  # noqa: E402
 from shared.memory_eval_metrics import (  # noqa: E402
     RUN_STAMP_ENV_VAR,
     MetricSchemaError,
@@ -1091,8 +1092,8 @@ def default_archive_root() -> Path:
     return checkout / ARCHIVE_RELPATH
 
 
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+def _build_parser() -> LoudArgumentParser:
+    parser = LoudArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1190,4 +1191,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(run_cli(main))

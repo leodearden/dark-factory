@@ -86,6 +86,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
+from shared.cli_boundary import LoudArgumentParser, run_cli
+
 logger = logging.getLogger('memory_eval_retrieval_probe')
 
 # ---------------------------------------------------------------------------
@@ -2915,7 +2917,7 @@ class _ReplacingAppend(argparse.Action):
         setattr(namespace, self.dest, (*current, values))
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser() -> LoudArgumentParser:
     """The CLI. Every flag here is a read parameter; none of them mutate anything.
 
     There is deliberately no ``--apply``, ``--fix``, ``--prune`` or any other
@@ -2925,7 +2927,7 @@ def build_parser() -> argparse.ArgumentParser:
     # The module docstring carries an RST table that argparse's default
     # formatter reflows into rubble; the first line plus the guarantee is what
     # an operator at the terminal actually needs.
-    parser = argparse.ArgumentParser(
+    parser = LoudArgumentParser(
         description=(
             f'{(__doc__ or EVAL_ID).splitlines()[0]}\n\n'
             'This script never writes to the live corpus and never evaluates a\n'
@@ -3047,4 +3049,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(run_cli(main))
