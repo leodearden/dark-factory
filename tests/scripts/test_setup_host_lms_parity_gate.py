@@ -21,7 +21,7 @@ cause, each naming the other's helper.
 import re
 
 import pytest
-from setup_host_parsing import (  # pyright: ignore[reportMissingImports]
+from setup_host_parsing import (
     SETUP_HOST_PATH,
     shell_statements,
 )

@@ -145,14 +145,16 @@ def _make_fake_invoke(response_fn=None, *, default="{}"):
     return fake_invoke
 
 
-def _make_fake_submit_fn(*, id_prefix="task"):
+def _make_fake_submit_fn():
     """Fake curator-path `submit_fn(**kwargs) -> dict` seam. Records every
-    call's kwargs in `.calls` and returns an incrementing fake task id."""
+    call's kwargs in `.calls` and answers in the real curator-path shape
+    (census.py::_ticket_id_from_submit_result) with an incrementing ticket
+    id, `{"ticket": "tkt_<n>"}`."""
     calls = []
 
     def fake_submit_fn(**kwargs):
         calls.append(kwargs)
-        return {"id": f"{id_prefix}-{len(calls)}"}
+        return {"ticket": f"tkt_{len(calls)}"}
 
     fake_submit_fn.calls = calls
     return fake_submit_fn
@@ -771,6 +773,55 @@ def test_build_task_payloads_partial_target_override_falls_back_to_own_project()
 
 
 # ---------------------------------------------------------------------------
+# task 4965 step-1: RED — _ticket_id_from_submit_result(), the single source
+# of truth for what the REAL submit_task seam returns. Every shape below is
+# one the live tool actually produces; the helper is the only place census.py
+# is allowed to know that.
+# ---------------------------------------------------------------------------
+
+def test_ticket_id_from_submit_result_reads_the_curator_ticket_key():
+    # Source of truth: fused_memory/server/tools.py::submit_task docstring
+    # ("returns {'ticket': 'tkt_<id>'}") and
+    # fused_memory/middleware/task_interceptor.py::TaskInterceptor, which
+    # ends the curator path with `return {'ticket': ticket_id}`. There is NO
+    # "id" key on this path -- reading one is the defect task 4965 fixes.
+    assert mod._ticket_id_from_submit_result({"ticket": "tkt_42"}) == "tkt_42"
+
+
+def test_ticket_id_from_submit_result_rejects_the_error_shape():
+    # Source of truth: task_interceptor.py::TaskInterceptor answers a failed
+    # or rejected submit_task with
+    # `return {'error': str(exc), 'error_type': type(exc).__name__}` -- a dict
+    # with no ticket key. Nothing was filed, so nothing may be counted.
+    assert mod._ticket_id_from_submit_result(
+        {"error": "boom", "error_type": "ValueError"}
+    ) is None
+
+
+def test_ticket_id_from_submit_result_rejects_non_dict_results():
+    # A transport fault (or a seam that answers nothing at all) can yield a
+    # non-dict; a bare string is NOT a usable result even when it looks like
+    # a ticket id, because no contract says the seam ever returns one.
+    assert mod._ticket_id_from_submit_result(None) is None
+    assert mod._ticket_id_from_submit_result("tkt_1") is None
+    assert mod._ticket_id_from_submit_result(["tkt_1"]) is None
+
+
+def test_ticket_id_from_submit_result_rejects_empty_dict():
+    assert mod._ticket_id_from_submit_result({}) is None
+
+
+def test_ticket_id_from_submit_result_rejects_unusable_ticket_values():
+    # An unusable value must never reach the report as a bare "- ", "- None"
+    # or "- {'id': 1}" bullet -- the caller excludes on None, so the helper
+    # must answer None rather than pass it through.
+    assert mod._ticket_id_from_submit_result({"ticket": ""}) is None
+    assert mod._ticket_id_from_submit_result({"ticket": None}) is None
+    assert mod._ticket_id_from_submit_result({"ticket": {"id": 1}}) is None
+    assert mod._ticket_id_from_submit_result({"ticket": 42}) is None
+
+
+# ---------------------------------------------------------------------------
 # amend: _novel_clusters() dedup-by-title + titleless-candidate skip.
 # codebook.apply_coding_record groups new candidates BY TITLE (codebook.py:
 # 494), so verification must operate on the same set of resolvable titles --
@@ -1093,7 +1144,7 @@ def test_render_report_carries_each_piece_in_its_own_section():
     sections = _sections(
         matrix_md=matrix_md,
         synthesis_md="Fable synthesis prose goes here.",
-        filed_task_ids=["1234", "1235"],
+        filed_ticket_ids=["tkt_1234", "tkt_1235"],
         cost_note="~$3.42 across 20 Sonnet calls + 1 Fable call.",
     )
 
@@ -1117,8 +1168,8 @@ def test_render_report_carries_each_piece_in_its_own_section():
     assert matrix_md in _section_text(sections, mod.SECTION_MATRIX), "embedded verbatim"
     assert "Fable synthesis prose goes here." in _section_text(sections, mod.SECTION_SYNTHESIS)
     filed = _section_text(sections, mod.SECTION_FILED_TASKS)
-    assert "- 1234" in filed
-    assert "- 1235" in filed
+    assert "- tkt_1234" in filed
+    assert "- tkt_1235" in filed
     assert "~$3.42 across 20 Sonnet calls + 1 Fable call." in _section_text(
         sections, mod.SECTION_COST
     )
@@ -1141,7 +1192,7 @@ def test_render_report_is_deterministic_no_clock():
         matrix_md="matrix",
         mining_result=_sample_mining_result(),
         synthesis_md="prose",
-        filed_task_ids=["1"],
+        filed_ticket_ids=["tkt_1"],
         cost_note="cost",
     )
     assert mod.render_report(**kwargs) == mod.render_report(**kwargs)
@@ -1168,22 +1219,26 @@ prose
 
 ## Filed Tasks
 
-- 1
+_1 ticket(s) filed -- the curator's create/combine/drop decision is still pending, so no task id exists yet; resolve_ticket returns the task id once it does._
+
+- tkt_1
 
 ## Cost
 
 cost
 """
-"""Byte-for-byte `render_report` output for a FLAGLESS run, captured
-verbatim from the module BEFORE task 3280 added the operator cost-control
-flags (`--max-batches`, `--max-verify-clusters`, `--dry-run-filing`).
+"""Byte-for-byte `render_report` output for a FLAGLESS run, first captured
+from the module before task 3280 added the operator cost-control flags
+(`--max-batches`, `--max-verify-clusters`, `--dry-run-filing`).
 
 This is a LOCK, not a spec under development: every new report line those
 flags introduce must be gated on a non-None flag value, so a run that
 passes none of them renders exactly this. Do NOT regenerate this constant
 to make a failing run pass -- a diff here means a cost-control rendering
 leaked into the unflagged path (and therefore into the nightly trickle,
-which launches census.py with no extra argv)."""
+which launches census.py with no extra argv). A deliberate change to the
+flagless report may move this lock, in a commit whose message says why;
+that record is what distinguishes it from a leak."""
 
 
 def _capped_mining_result(*, stop_reason, max_batches, batches=2):
@@ -1306,7 +1361,7 @@ def _render_kwargs(**overrides) -> dict[str, Any]:
         matrix_md="matrix",
         mining_result=_sample_mining_result(),
         synthesis_md="prose",
-        filed_task_ids=["1"],
+        filed_ticket_ids=["tkt_1"],
         cost_note="cost",
     )
     kwargs.update(overrides)
@@ -1530,7 +1585,7 @@ _PAYLOADS_PATH = "/p/plans/confusion-census-2026-07-30-payloads.json"
 
 def test_render_report_dry_run_filing_section_names_count_and_path():
     sections = _sections(
-        filed_task_ids=[],
+        filed_ticket_ids=[],
         dry_run=mod.DryRunFiling(path=_PAYLOADS_PATH, payload_count=12),
     )
 
@@ -1549,27 +1604,56 @@ def test_render_report_dry_run_takes_precedence_over_empty_filed_ids():
     # past.
     dry_run_text = _section_text(
         _sections(
-            filed_task_ids=[],
+            filed_ticket_ids=[],
             dry_run=mod.DryRunFiling(path=_PAYLOADS_PATH, payload_count=3),
         ),
         mod.SECTION_FILED_TASKS,
     )
-    plain_text = _section_text(_sections(filed_task_ids=[]), mod.SECTION_FILED_TASKS)
+    plain_text = _section_text(_sections(filed_ticket_ids=[]), mod.SECTION_FILED_TASKS)
 
     assert dry_run_text != plain_text
     assert f"3 payload(s) written to {_PAYLOADS_PATH}" in dry_run_text
+    # Neither of the other two branches may leak in behind the dry-run wording.
+    assert "resolve_ticket" not in dry_run_text
+    assert "create/combine/drop" not in dry_run_text
+
+
+def test_render_report_filed_section_counts_lists_and_points_at_resolve_ticket():
+    # Behaviour only; the exact wording is _GOLDEN_FLAGLESS_REPORT's to lock.
+    section = _section_text(
+        _sections(filed_ticket_ids=["tkt_1", "tkt_2"]), mod.SECTION_FILED_TASKS
+    )
+
+    assert "2 ticket" in section, "the section must name how many tickets were filed"
+    bullets = [line for line in section.splitlines() if line.startswith("- ")]
+    assert bullets == ["- tkt_1", "- tkt_2"], "one bullet per ticket id, in the order filed"
+    assert "resolve_ticket" in section, (
+        "name the handle that turns a ticket id into the eventual task id"
+    )
 
 
 def test_render_report_without_dry_run_filed_tasks_section_unchanged():
     # Whole-section locks rather than substring probes: every line the section
     # renders is pinned, so a dry-run clause cannot leak into either branch
     # and no `"dry-run" not in ...` probe has to anticipate its wording.
-    assert _section(
-        _sections(filed_task_ids=["1234", "1235"]), mod.SECTION_FILED_TASKS
-    ).lines == ("", "## Filed Tasks", "", "- 1234", "- 1235")
+    #
+    # The filed branch's one prose line is pinned by POSITION only: its
+    # wording is _GOLDEN_FLAGLESS_REPORT's to lock, and what it must say is
+    # test_render_report_filed_section_counts_lists_and_points_at_resolve_ticket's.
+    filed = _section(
+        _sections(filed_ticket_ids=["tkt_1234", "tkt_1235"]), mod.SECTION_FILED_TASKS
+    ).lines
+    assert filed[:3] == ("", "## Filed Tasks", "")
+    assert len(filed) == 7 and filed[4] == "", (
+        f"one disclosure line, its blank, then the bullets; got {filed!r}"
+    )
+    assert filed[5:] == ("- tkt_1234", "- tkt_1235")
 
+    # The empty branch is UNCHANGED: no ticket count, no pending prose, just
+    # the placeholder. A run that filed nothing must not acquire a disclosure
+    # about a decision that was never triggered.
     assert _section(
-        _sections(filed_task_ids=[]), mod.SECTION_FILED_TASKS
+        _sections(filed_ticket_ids=[]), mod.SECTION_FILED_TASKS
     ).lines == ("", "## Filed Tasks", "", "_none filed._")
 
 
@@ -1618,7 +1702,7 @@ _REPORT_FLAG_CASES: dict[str, dict[str, Any]] = {
     "capped": {"mining_result": _capped_mining_result(stop_reason="capped", max_batches=2)},
     "verify_capped": {"verify_coverage": mod.VerifyCoverage(novel=5, offered=2, cap=2)},
     "dry_run_filing": {
-        "filed_task_ids": [],
+        "filed_ticket_ids": [],
         "dry_run": mod.DryRunFiling(path=_PAYLOADS_PATH, payload_count=12),
     },
     "unresolved_verdicts": {"dropped_verdicts": _sample_dropped_verdicts()},
@@ -1758,7 +1842,7 @@ def test_render_report_flagless_output_is_byte_identical_golden():
         matrix_md="matrix",
         mining_result=_sample_mining_result(),
         synthesis_md="prose",
-        filed_task_ids=["1"],
+        filed_ticket_ids=["tkt_1"],
         cost_note="cost",
     )
     assert report == _GOLDEN_FLAGLESS_REPORT
@@ -2078,7 +2162,7 @@ def test_run_census_happy_path_full_seam_wiring(tmp_path):
     # --- outcome: filed task ids + report path + saturation stop_reason ---
     assert outcome.status == "done"
     assert outcome.report_path == str(kwargs["report_path"])
-    assert outcome.filed_task_ids == ["task-1"]
+    assert outcome.filed_ticket_ids == ["tkt_1"]
     assert outcome.stop_reason == "exhausted"
 
 
@@ -2803,7 +2887,7 @@ def test_main_done_line_names_unresolved_verdicts_only_when_non_zero(
         monkeypatch.setattr(mod, "run_census", _make_fake_main_run_census(
             outcome=mod.CensusOutcome(
                 status="done", report_path="plans/confusion-census-2026-01-02.md",
-                filed_task_ids=["1234"], stop_reason="exhausted",
+                filed_ticket_ids=["tkt_1234"], stop_reason="exhausted",
                 unresolved_verdicts=unresolved,
             ),
         ))
@@ -2952,7 +3036,7 @@ def test_run_census_submit_fn_raising_is_best_effort_not_fatal(tmp_path, caplog)
         outcome = mod.run_census(**kwargs)
 
     assert outcome.status == "done", "one filing failure must not abort the pipeline"
-    assert outcome.filed_task_ids == []
+    assert outcome.filed_ticket_ids == []
     assert any("submit_fn" in r.message for r in caplog.records), "must log loudly, not swallow silently"
 
     # the codebook was already persisted before filing was attempted, and the
@@ -2998,16 +3082,68 @@ def test_run_census_submit_fn_non_dict_result_is_not_counted_as_filed(tmp_path, 
         outcome = mod.run_census(**kwargs)
 
     assert outcome.status == "done"
-    assert outcome.filed_task_ids == [], (
-        "a non-dict submit_fn result must not crash .get('id'), and must not "
-        "be counted as a genuinely-filed task"
+    assert outcome.filed_ticket_ids == [], (
+        "a non-dict submit_fn result must not crash the ticket read, and must "
+        "not be counted as a genuinely-filed ticket"
     )
-    assert any("no usable id" in r.message for r in caplog.records), "must log loudly, not swallow silently"
+    assert any("no ticket id" in r.message for r in caplog.records), "must log loudly, not swallow silently"
 
     report_text = kwargs["report_path"].read_text(encoding="utf-8")
     filed_section = report_text.split("## Filed Tasks")[1].split("## Cost")[0]
     assert "None" not in filed_section, "an id-less result must never render as a '- None' bullet"
     assert "_none filed._" in filed_section
+
+
+# ---------------------------------------------------------------------------
+# task 4965 step-3: the warn-and-exclude branch's REAL shape. A rejected or
+# failed submit_task answers `{'error': str(exc), 'error_type': ...}`
+# (fused_memory/middleware/task_interceptor.py::TaskInterceptor) -- a dict
+# with no ticket key. That, not the synthetic None above, is what actually
+# reaches this branch in production, so it is pinned here.
+# ---------------------------------------------------------------------------
+
+def test_run_census_submit_fn_error_shape_is_not_counted_as_filed(tmp_path, caplog):
+    batch = [
+        _hand_digest("dup-1", "nothing new here"),
+        _hand_digest("novel-verified", "a genuinely new confusion shape"),
+    ]
+    fake_invoke = _make_fake_invoke(_happy_invoke_response)
+    fake_verify_fn = _make_fake_verify_fn(verified_titles={"Silent no-op subagent contract"})
+
+    def error_returning_submit_fn(**kwargs):
+        return {"error": "backlog full", "error_type": "BacklogFull"}
+
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=fake_invoke,
+        batch_source=[batch],
+        verify_fn=fake_verify_fn,
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=error_returning_submit_fn,
+        escalate_fn=_poison("escalate_fn"),
+        status_fetcher=_make_fake_status_fetcher(0),
+        commit=_make_fake_commit(),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done", "a rejected filing must not abort the pipeline"
+    assert outcome.filed_ticket_ids == [], (
+        "an {'error', 'error_type'} result means NOTHING was filed -- it must "
+        "never inflate the filed-ticket count"
+    )
+    assert any("no ticket id" in r.message for r in caplog.records), (
+        "a rejected filing must be logged loudly, not swallowed silently"
+    )
+
+    report_text = kwargs["report_path"].read_text(encoding="utf-8")
+    filed_section = report_text.split("## Filed Tasks")[1].split("## Cost")[0]
+    assert "_none filed._" in filed_section
+    assert "backlog full" not in filed_section, (
+        "an error payload must never leak into the human-facing report as a bullet"
+    )
+    assert "None" not in filed_section, "an unfilable result must never render as a '- None' bullet"
 
 
 def test_run_census_promote_clamps_out_of_enum_severity_to_medium(tmp_path):
@@ -3578,9 +3714,9 @@ def test_run_census_dry_run_filing_writes_payloads_and_files_nothing(tmp_path, c
     assert str(kwargs["codebook_path"]) in committed
     assert str(kwargs["census_state_path"]) in committed
 
-    # (e) the outcome names the review file instead of a bare filed_tasks=0
+    # (e) the outcome names the review file instead of a bare filed_tickets=0
     assert outcome.status == "done"
-    assert outcome.filed_task_ids == []
+    assert outcome.filed_ticket_ids == []
     assert outcome.dry_run is not None
     assert outcome.dry_run.path == str(payloads_path)
     assert outcome.dry_run.payload_count == 1
@@ -3770,7 +3906,7 @@ def test_run_census_without_dry_run_files_normally_and_writes_no_payload_file(tm
     outcome = mod.run_census(**kwargs)
 
     assert len(fake_submit_fn.calls) == 1, "the flagless path still files per payload"
-    assert outcome.filed_task_ids == ["task-1"]
+    assert outcome.filed_ticket_ids == ["tkt_1"]
     assert outcome.dry_run is None
     assert list(tmp_path.glob("*-payloads.json")) == []
 
@@ -3920,7 +4056,7 @@ def _make_fake_main_run_census(outcome=None):
         calls.append(kwargs)
         return outcome or mod.CensusOutcome(
             status="done", report_path="plans/confusion-census-2026-01-02.md",
-            filed_task_ids=["1234"], stop_reason="exhausted",
+            filed_ticket_ids=["tkt_1234"], stop_reason="exhausted",
         )
 
     fake_run_census.calls = calls
@@ -4173,7 +4309,7 @@ def test_main_dry_run_summary_line_names_payload_file(tmp_path, monkeypatch, cap
         outcome=mod.CensusOutcome(
             status="done",
             report_path="plans/confusion-census-2026-07-30.md",
-            filed_task_ids=[],
+            filed_ticket_ids=[],
             stop_reason="capped",
             dry_run=mod.DryRunFiling(path=payloads_path, payload_count=7),
         )
@@ -4190,8 +4326,41 @@ def test_main_dry_run_summary_line_names_payload_file(tmp_path, monkeypatch, cap
     assert payloads_path in out
     assert "7 payload" in out
     assert "nothing filed" in out.lower()
-    # a bare filed_tasks=0 would read as "a normal run that filed nothing"
+    # a bare zero count would read as "a normal run that filed nothing".
+    # Both labels are asserted absent: filed_tasks= is the pre-4965 spelling
+    # (kept so this guard still refuses a revert to it), filed_tickets= is the
+    # live one -- without the second line the rename would have quietly left
+    # this guard vacuous.
     assert "filed_tasks=0" not in out
+    assert "filed_tickets=0" not in out
+
+
+def test_main_done_summary_line_counts_filed_tickets_not_tasks(tmp_path, monkeypatch, capsys):
+    # The operator reads this line to learn what the run produced. Filing
+    # yields tickets, not tasks (census.py::_ticket_id_from_submit_result),
+    # so "filed_tasks=N" would overclaim N tasks that may not exist.
+    _write_legibility_yaml(_default_config_path(tmp_path))
+    fake_run_census = _make_fake_main_run_census(
+        outcome=mod.CensusOutcome(
+            status="done",
+            report_path="plans/confusion-census-2026-07-30.md",
+            filed_ticket_ids=["tkt_1", "tkt_2", "tkt_3"],
+            stop_reason="exhausted",
+        )
+    )
+    monkeypatch.setattr(mod, "run_census", fake_run_census)
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+
+    exit_code = mod.main(["--project-root", str(tmp_path), "--force"])
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "filed_tickets=3" in out
+    assert "filed_tasks=" not in out, (
+        "the count is of tickets, not tasks -- the old label overclaimed"
+    )
+    assert "stop_reason=exhausted" in out
+    assert "plans/confusion-census-2026-07-30.md" in out
 
 
 def test_main_missing_config_returns_nonzero(tmp_path, monkeypatch):
@@ -6066,7 +6235,7 @@ def test_render_report_flagless_golden_is_untouched_by_the_new_parameter():
         matrix_md="matrix",
         mining_result=_sample_mining_result(),
         synthesis_md="prose",
-        filed_task_ids=["1"],
+        filed_ticket_ids=["tkt_1"],
         cost_note="cost",
         mass_rejection=None,
     )
@@ -6300,7 +6469,7 @@ def test_main_done_line_names_unresolved_verdicts_when_nonzero(
             outcome=mod.CensusOutcome(
                 status="done",
                 report_path="plans/confusion-census-2026-07-30.md",
-                filed_task_ids=["1234"],
+                filed_ticket_ids=["tkt_1234"],
                 stop_reason="exhausted",
                 unresolved_verdicts=unresolved,
             )
@@ -6318,5 +6487,5 @@ def test_main_done_line_names_unresolved_verdicts_when_nonzero(
     )
     assert zero_out == (
         "census: done -- report=plans/confusion-census-2026-07-30.md "
-        "filed_tasks=1 stop_reason=exhausted\n"
+        "filed_tickets=1 stop_reason=exhausted\n"
     )

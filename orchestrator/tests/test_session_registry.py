@@ -85,6 +85,12 @@ def _make_record(**overrides: object) -> sr.SessionRecord:
 # orchestrator/tests/test_reconcile_stranded.py:34).
 _DEAD_PID = 2**31 - 1
 
+# A pid that is not merely dead but UNREPRESENTABLE: larger than the platform's
+# C pid_t, so os.kill cannot even be asked about it. Sibling of _DEAD_PID and a
+# genuinely different class of input -- _DEAD_PID exercises the
+# ProcessLookupError branch, this one the OverflowError that branch never sees.
+_UNREPRESENTABLE_PID = 2**70
+
 _NOW = datetime(2026, 7, 7, 12, 0, 0, tzinfo=UTC)
 
 
@@ -392,6 +398,36 @@ def _make_decision(**overrides: object) -> sr.DecisionRecord:
     }
     fields.update(overrides)
     return sr.DecisionRecord(**fields)
+
+
+def _names_the_destination_token(message: str) -> bool:
+    """True when *message* names ``solar_challenge`` as a token in its OWN
+    right -- not merely as the tail of ``my_solar_challenge``.
+
+    Exists because the obvious spelling of that assertion is VACUOUS:
+    ``'solar_challenge' in msg`` is implied by ``'my_solar_challenge' in
+    msg``, so a regression that dropped the destination token entirely --
+    leaving the operator exactly where the silent zero-row no-op did --
+    passes it. The word-boundary lookaround is what makes the check
+    discriminating; a bare substring test is not.
+
+    Deliberately boundary-based rather than quote-based (``"'solar_challenge'"``
+    would also work today) so it survives a message that renders the token
+    without ``!r`` quoting -- it pins the CLAIM, not the formatting.
+    """
+    return re.search(r'(?<!\w)solar_challenge(?!\w)', message) is not None
+
+
+def _claims_zero_matches(message: str) -> bool:
+    """True when *message* asserts the passed token matched nothing.
+
+    The one wording pin in this area, and a deliberate one: that claim is
+    TRUE for ``reap-decisions`` (which matches) and FALSE for
+    ``write-decision`` (which creates, and files a row under exactly that
+    token one line later). Pinning it in both directions is what keeps the
+    hint's verb-awareness from silently regressing to a single message.
+    """
+    return re.search(r'matches (no|zero)\b', message, re.IGNORECASE) is not None
 
 
 def test_make_decision_defaults_to_the_unset_queue_sentinel() -> None:
@@ -5181,6 +5217,85 @@ def test_main_write_decision_already_canonical_project_logs_nothing(
     assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
 
+def test_main_write_decision_warns_on_a_declined_alias_target(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Passing a DECLINED alias target warns, and changes nothing else.
+
+    This is the load-bearing pair of assertions for task 3813: the record is
+    still filed under EXACTLY what the caller passed (we warn, we do not
+    silently move another project's rows -- rewriting here would be the very
+    cross-project behaviour change the task declined), and the return code
+    is unaffected (advisory, never a refusal -- contrast the two hard
+    refusals in _run_write_decision, which return without filing).
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    with caplog.at_level(logging.WARNING):
+        rc = sr.main(
+            [
+                'write-decision',
+                '--id',
+                'd-declined',
+                '--project',
+                'my_solar_challenge',
+                '--text',
+                'q?',
+                '--escalations-dir',
+                str(tmp_path / 'escalations'),
+            ]
+        )
+
+    assert rc == 0
+    # NOT rewritten: filed under exactly the token the caller passed.
+    assert sr.list_decisions(root=tmp_path)[0].project == 'my_solar_challenge'
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    # Non-vacuous on BOTH tokens: see _names_the_destination_token.
+    assert any('my_solar_challenge' in m and _names_the_destination_token(m) for m in warnings)
+    # ...and the message must be TRUE on this path. write-decision CREATES;
+    # it matches nothing by definition, and one line after this warning it
+    # files a row under this very token. A "matches no decisions" line here
+    # would be false the moment it is acted on.
+    assert not any(_claims_zero_matches(m) for m in warnings)
+
+
+def test_main_write_decision_recommended_solar_token_warns_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The token the skills recommend must stay silent.
+
+    Same strict no-noise assertion as
+    test_main_write_decision_already_canonical_project_logs_nothing: a
+    watcher following the documented ``--project solar_challenge`` guidance
+    must not be warned on every park, or the new hint is noise rather than
+    signal.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    with caplog.at_level(logging.WARNING):
+        rc = sr.main(
+            [
+                'write-decision',
+                '--id',
+                'd-solar-ok',
+                '--project',
+                'solar_challenge',
+                '--text',
+                'q?',
+                '--escalations-dir',
+                str(tmp_path / 'escalations'),
+            ]
+        )
+
+    assert rc == 0
+    assert sr.list_decisions(root=tmp_path)[0].project == 'solar_challenge'
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
 def test_main_write_decision_stamps_severity(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -6005,22 +6120,33 @@ def test_normalize_project_token_maps_none_to_the_unset_sentinel() -> None:
     assert sr.normalize_project_token(None) != 'none'
 
 
-def test_normalize_project_token_solar_challenge_gap_is_known_not_resolved() -> None:
-    """RESIDUAL GAP, pinned so it stays a known state rather than a surprise.
+def test_solar_challenge_alias_was_decided_and_declined() -> None:
+    """The naming mismatch is a DECIDED, standing state -- not a pending gap.
 
-    Folding DOES merge solar-challenge's two filed spellings into one bucket
-    -- an improvement, since a reap scoped to either previously missed the
-    other (live 2026-08-07: 3 OPEN under ``solar-challenge``, 2 under
-    ``solar_challenge``). But that bucket is ``solar_challenge``, while
+    Folding merges solar-challenge's two filed spellings into one bucket --
+    an improvement, since a reap scoped to either previously missed the
+    other (re-measured 2026-09-07 over 748 records: 3 OPEN under
+    ``solar-challenge``, 2 under ``solar_challenge``, ZERO under
+    ``my_solar_challenge``; unchanged from 2026-08-07). But that bucket is
+    ``solar_challenge``, while
     ``/home/leo/src/solar-challenge/dark-factory-orchestrator.yaml`` declares
     ``my_solar_challenge``, and no alias bridges them. So a reaper passing
     the config-declared token matches ZERO of those 5 rows.
 
-    This test exists so nobody reads the folding rows above as "solved" and
-    so the day an alias IS added (its own filed decision task, 3813) this
-    test fails loudly and must be updated deliberately -- rather than the
-    gap silently changing shape. The skills' ``--project`` guidance carries
-    the same caveat for the humans and watchers that read it.
+    Task 3813 was the decision task for that bridge, and it DECLINED it --
+    chiefly because the fold left no split to heal (an alias would rename a
+    populated bucket onto an empty one) and because the identity question is
+    an open human gate in that project, marked "Do NOT auto-act". See
+    ``sr.PROJECT_TOKEN_ALIASES_DECLINED`` for the full evidence.
+
+    So this is no longer "pending"; the assertions below pin a settled
+    outcome. They keep their fail-loudly-on-promotion property -- adding the
+    alias breaks the last two -- which
+    test_project_token_alias_declines_registry_shape now also enforces from
+    the other side, via the disjointness of the two tables. The skills'
+    ``--project`` guidance carries the same, now-permanent caveat for the
+    humans and watchers that read it, and both CLI verbs warn if you pass
+    the config-declared token.
     """
     assert sr.normalize_project_token('solar-challenge') == 'solar_challenge'
     assert sr.normalize_project_token('solar-challenge') == sr.normalize_project_token(
@@ -6041,6 +6167,167 @@ def test_project_token_aliases_maps_folded_to_folded() -> None:
     for alias, canonical in sr.PROJECT_TOKEN_ALIASES.items():
         assert sr.normalize_project_token(alias) == canonical
         assert sr.normalize_project_token(canonical) == canonical
+
+
+def test_project_token_alias_declines_registry_shape() -> None:
+    """The DECLINE registry is the mirror image of PROJECT_TOKEN_ALIASES, and
+    it is what makes task 3813's decision durable rather than prose.
+
+    A decision task's product has to survive the session that made it. Task
+    3807 already tried a docstring ("KNOWN RESIDUAL GAP ... owned by its own
+    filed decision task") and prose cannot fail a test -- someone could add
+    ``solar_challenge -> my_solar_challenge`` tomorrow and nothing would
+    object. The DISJOINTNESS assertion below is that objection: promoting a
+    declined alias into the live table without first REMOVING the decline
+    fails here by name, forcing the next editor to read the recorded
+    evidence instead of rediscovering it from scratch.
+    """
+    declined = sr.PROJECT_TOKEN_ALIASES_DECLINED
+    assert isinstance(declined, dict)
+
+    # Exactly one recorded decline: the solar-challenge alias (task 3813).
+    assert set(declined) == {'solar_challenge'}
+    assert declined['solar_challenge'][0] == 'my_solar_challenge'
+
+    # A decline can never be added without STATING WHY. Existence and
+    # non-emptiness of the reason field only -- deliberately not a pin on
+    # its wording.
+    for alias, entry in declined.items():
+        assert len(entry) == 2, alias
+        assert isinstance(entry[1], str), alias
+        assert entry[1].strip(), alias
+
+    # THE GUARD: the two tables partition the alias space. Adding a declined
+    # alias to the live table without removing the decline fails right here.
+    assert set(declined) & set(sr.PROJECT_TOKEN_ALIASES) == set()
+
+    # Same folded-to-folded hygiene invariant the live table carries (see
+    # test_project_token_aliases_maps_folded_to_folded), so promoting an
+    # entry is a one-line move between the two dicts.
+    for alias, (canonical, _reason) in declined.items():
+        assert sr.normalize_project_token(alias) == alias
+        assert sr.normalize_project_token(canonical) == canonical
+
+    # The decline is IN FORCE in the fold, not merely recorded beside it.
+    assert sr.normalize_project_token('solar_challenge') != sr.normalize_project_token(
+        'my_solar_challenge'
+    )
+
+
+def test_declined_project_token_hint_names_both_tokens() -> None:
+    """The hint must name BOTH tokens: what the operator typed, and where the
+    rows actually are.
+
+    Declining the alias makes the naming mismatch PERMANENT, so the honest
+    companion to the decline is that the mismatch announces itself. A message
+    naming only one side leaves the operator exactly where the silent
+    zero-row no-op did.
+    """
+    hint = sr.declined_project_token_hint('my_solar_challenge')
+
+    assert hint is not None
+    assert isinstance(hint, str)
+    # Token PRESENCE, deliberately not sentence wording. The destination
+    # token goes through _names_the_destination_token because the bare
+    # `'solar_challenge' in hint` spelling is VACUOUS -- it is implied by the
+    # line above it, so a message that named only the typed token would pass.
+    assert 'my_solar_challenge' in hint
+    assert _names_the_destination_token(hint)
+
+    # The fold runs FIRST, so a spelling variant still hits. This is the case
+    # that matters: an operator copying the config-declared value with
+    # different case/separators must still be warned.
+    assert sr.declined_project_token_hint('My-Solar-Challenge') is not None
+    assert sr.declined_project_token_hint('  MY_SOLAR_CHALLENGE  ') is not None
+
+
+def test_declined_project_token_hint_consequence_is_verb_aware() -> None:
+    """One message cannot be true for both callers, so *action* picks one.
+
+    ``reap-decisions`` MATCHES, so its consequence is a zero-row no-op.
+    ``write-decision`` CREATES: it matches nothing by definition, and one
+    line after the warning it files a row under exactly the token passed --
+    so the reap wording would be false the moment it is acted on. Its real
+    consequence is also the worse of the two (the row lands where no
+    documented reap scopes, and can never auto-close), which the shared
+    wording left unstated entirely.
+
+    Asserts on the CLAIM each message makes, not its sentences: the
+    zero-match claim must be present on the reap path and absent on the
+    write path, and every variant must still name both tokens.
+    """
+    reap = sr.declined_project_token_hint('my_solar_challenge', action='reap')
+    file_ = sr.declined_project_token_hint('my_solar_challenge', action='file')
+
+    assert reap is not None and file_ is not None
+    assert reap != file_
+    for message in (reap, file_):
+        assert 'my_solar_challenge' in message
+        assert _names_the_destination_token(message)
+
+    assert _claims_zero_matches(reap)
+    assert not _claims_zero_matches(file_)
+
+
+@pytest.mark.parametrize('action', ['', 'bogus-verb'])
+def test_declined_project_token_hint_unknown_action_stays_verb_neutral(action: str) -> None:
+    """An omitted or unrecognised *action* is not an error, and is not guessed.
+
+    Fail-soft in the direction that matters for a message a human acts on: a
+    future caller that forgets the argument gets the verb-neutral core --
+    less specific, but TRUE on any path -- rather than a confident
+    description of the wrong verb. Pinning this is what stops the default
+    from quietly being set to one of the two real verbs later.
+    """
+    hint = sr.declined_project_token_hint('my_solar_challenge', action=action)
+
+    assert hint is not None
+    assert 'my_solar_challenge' in hint
+    assert _names_the_destination_token(hint)
+    # No verb-specific claim, in either direction.
+    assert not _claims_zero_matches(hint)
+    assert hint != sr.declined_project_token_hint('my_solar_challenge', action='reap')
+    assert hint != sr.declined_project_token_hint('my_solar_challenge', action='file')
+    # The default really is the neutral variant, not one of the two verbs.
+    assert sr.declined_project_token_hint('my_solar_challenge') == hint
+
+
+@pytest.mark.parametrize(
+    'token',
+    [
+        'dark_factory',
+        # Aliases to dark_factory -- a healthy project must never be warned.
+        'df',
+        # The RECOMMENDED token, in both spellings. A warning here would be
+        # pure noise a watcher accrues every Main Loop cycle.
+        'solar_challenge',
+        'solar-challenge',
+        # The collapse-guard sibling: a distinct project root. A false
+        # warning here would be actively misleading.
+        'solar_challenge_platform',
+        'reify',
+        '',
+        '   ',
+    ],
+)
+def test_declined_project_token_hint_is_none_for_everything_else(token: str) -> None:
+    """The hint fires on the declined VALUE, never on the declined KEY.
+
+    The trap being closed is "operator reads their project's config, types
+    the declared ``memory.project_id``, matches zero rows". So the warning
+    must land on ``my_solar_challenge`` and stay SILENT on
+    ``solar_challenge`` -- the token both SKILL.md files tell people to
+    pass -- or the signal degrades into noise.
+    """
+    assert sr.declined_project_token_hint(token) is None
+
+
+@pytest.mark.parametrize('token', [None, 42, 3.5, Path('/tmp/x'), object()])
+def test_declined_project_token_hint_fail_soft_on_non_str(token: object) -> None:
+    """Fail-soft, mirroring normalize_project_token's contract: a helper a C8
+    watch loop calls on its filing path never raises into the caller.
+    """
+    assert sr.declined_project_token_hint(token) is None
 
 
 def test_read_escalation_status_reads_queue_root_file(tmp_path: Path) -> None:
@@ -6241,6 +6528,112 @@ def test_main_reap_decisions_leaves_pending_escalation_open(
     assert rc == 0
     listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
     assert listed['dec-cli-pending'] == sr.DecisionState.OPEN
+
+
+def test_main_reap_decisions_warns_on_a_declined_alias_target(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The operationally important half of task 3813's hint.
+
+    Filing under the wrong token is recoverable -- the record still exists
+    and is still visible. REAPING under it is the silent zero-row no-op that
+    started this whole thread: it looks exactly like "nothing to reap", and
+    the only way to discover otherwise today is the hand-run Counter
+    one-liner both SKILL.md files tell humans to paste.
+
+    A decision is seeded under ``solar_challenge`` so there IS a populated
+    bucket to miss, exactly as the live population has it.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    escalations_dir = tmp_path / 'esc'
+    archive_dir = escalations_dir / 'archive' / '2026-07-16'
+    archive_dir.mkdir(parents=True)
+    (archive_dir / 'esc-solar.json').write_text(json.dumps({'status': 'resolved'}))
+    sr.write_decision(
+        _make_decision(
+            id='dec-solar',
+            project='solar_challenge',
+            escalation_id='esc-solar',
+            escalations_dir=str(escalations_dir),
+            state=sr.DecisionState.OPEN,
+        ),
+        root=tmp_path,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        rc = sr.main(
+            [
+                'reap-decisions',
+                '--project',
+                'my_solar_challenge',
+                '--escalations-dir',
+                str(escalations_dir),
+            ]
+        )
+
+    assert rc == 0
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    # Non-vacuous on BOTH tokens: see _names_the_destination_token.
+    assert any('my_solar_challenge' in m and _names_the_destination_token(m) for m in warnings)
+    # On THIS path the zero-match claim is the true one -- the reap really is
+    # matching, and really does match none of the seeded rows.
+    assert any(_claims_zero_matches(m) for m in warnings)
+    # The warning changes NO reaping behaviour: the seeded decision would
+    # have been closed under the right token, and is still OPEN under this
+    # one. All the hint does is make the zero-match visible.
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-solar'] == sr.DecisionState.OPEN
+
+
+def test_main_reap_decisions_recommended_solar_token_warns_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Same fixture with the DOCUMENTED token: reaps, and stays silent.
+
+    A watcher reaping with the token both SKILL.md files recommend runs this
+    every Main Loop cycle, so a warning here would accumulate indefinitely
+    and drown the one case the hint exists to surface.
+
+    The ANSWERED assertion below also keeps its sibling honest: it proves
+    this fixture's decision really is reapable, so the sibling's "still
+    OPEN under my_solar_challenge" is a genuine contrast rather than a
+    vacuous pass for some unrelated reason.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    escalations_dir = tmp_path / 'esc'
+    archive_dir = escalations_dir / 'archive' / '2026-07-16'
+    archive_dir.mkdir(parents=True)
+    (archive_dir / 'esc-solar.json').write_text(json.dumps({'status': 'resolved'}))
+    sr.write_decision(
+        _make_decision(
+            id='dec-solar',
+            project='solar_challenge',
+            escalation_id='esc-solar',
+            escalations_dir=str(escalations_dir),
+            state=sr.DecisionState.OPEN,
+        ),
+        root=tmp_path,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        rc = sr.main(
+            [
+                'reap-decisions',
+                '--project',
+                'solar_challenge',
+                '--escalations-dir',
+                str(escalations_dir),
+            ]
+        )
+
+    assert rc == 0
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-solar'] == sr.DecisionState.ANSWERED
 
 
 def test_main_reap_decisions_scopes_to_project(
@@ -8987,3 +9380,33 @@ def test_main_migrate_decision_projects_fail_soft_when_fleet_root_under_a_file(
     assert rc == 0
     assert capsys.readouterr().out.strip() == ''
     assert not (blocker / 'fleet').exists()
+
+
+# ---------------------------------------------------------------------------
+# _pid_alive against an out-of-range pid (task 4755 review fix 1/4)
+#
+# This predicate is not only asked about pids this module itself recorded:
+# orchestrator/src/orchestrator/service_restart.py imports it to evaluate the
+# fleet-redeploy lease, whose pid is parsed out of JSON that
+# scripts/restart-all-orchestrators.sh wrote. A value no C pid_t can hold is
+# therefore ordinary untrusted input, and os.kill answers it with
+# OverflowError -- which is NOT an OSError, so the predicate's final except
+# clause does not catch it and it escapes to every caller.
+# ---------------------------------------------------------------------------
+
+
+def test_pid_alive_reports_dead_for_a_pid_too_large_for_the_platform() -> None:
+    """A pid larger than C ``pid_t`` reads as DEAD and must not raise.
+
+    ``os.kill(2**70, 0)`` raises ``OverflowError('Python int too large to
+    convert to C long')``. "Cannot name a live process" is exactly the
+    judgment the existing ``other OSError -> treated as dead`` branch already
+    makes for every other value the syscall refuses, so answering False here
+    is this predicate's own documented contract rather than a new tolerance.
+
+    It is also the contract ``service_restart.lease_is_live`` states
+    absolutely on this predicate's behalf -- "FAIL-OPEN throughout: a missing,
+    corrupt, unreadable or nonsensical lease reads as 'no sweep in flight' and
+    never raises" -- and that promise cannot hold if the pid check can throw.
+    """
+    assert sr._pid_alive(_UNREPRESENTABLE_PID) is False

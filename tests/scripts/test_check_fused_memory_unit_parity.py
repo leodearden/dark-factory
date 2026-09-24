@@ -686,7 +686,7 @@ def test_fm_checker_reuses_the_shared_find_dropins():
     behavioural test above while reproducing — inside the tooling built to
     report silent duplication — exactly the duplication it exists to report.
     """
-    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
+    import systemd_unit_parity
 
     mod = _load_checker()
 
@@ -1386,7 +1386,7 @@ def test_gate_still_names_fix_for_plain_directive_drift(tmp_path: pathlib.Path):
 # (step-7)
 # ---------------------------------------------------------------------------
 # Task 4796 made setup-host.sh render this unit through
-# scripts/render_dashboard_unit.py so a host's extra
+# scripts/render_systemd_unit.py so a host's extra
 # DASHBOARD_KNOWN_PROJECT_ROOTS entries survive a re-provision. The obvious
 # question is whether THIS checker then undoes it on the next run.
 #
@@ -1413,7 +1413,7 @@ _PRESERVED_NAME = "DASHBOARD_KNOWN_PROJECT_ROOTS"
 # The nine project roots measured on this host, the value the old truncating
 # `sed ... > "$UNIT_DIR/fused-memory.service"` collapsed to one on every
 # re-run. Spelled here rather than imported from
-# tests/scripts/test_render_dashboard_unit.py: a test module importing another
+# tests/scripts/test_render_systemd_unit.py: a test module importing another
 # test module makes collection order load-bearing, and this is fixture data
 # whose only contract is "more than one root, realistically shaped".
 _MULTI_ROOTS = ",".join(
@@ -1437,9 +1437,9 @@ _FM_UV_PATH = "/home/leo/.local/bin/uv"
 
 def _render_fused_unit(repo_root: str = _FM_REPO_ROOT) -> str:
     """The committed template rendered — through the REAL renderer's substitution."""
-    import render_dashboard_unit  # pyright: ignore[reportMissingImports]
+    import render_systemd_unit
 
-    return render_dashboard_unit.render_template(
+    return render_systemd_unit.render_template(
         TEMPLATE_PATH.read_text(encoding="utf-8"),
         repo_root=repo_root,
         uv_path=_FM_UV_PATH,
@@ -1508,22 +1508,22 @@ def test_preserved_names_are_disjoint_from_required_service_directives():
     is the host's", exact whole-line membership says "this value is the
     committed one", and when they disagree --fix wins by appending last.
 
-    Iterates render_dashboard_unit.UNITS rather than naming one variable, so a
+    Iterates render_systemd_unit.UNITS rather than naming one variable, so a
     third unit — or a second preserved name on an existing one — is covered the
     day it is registered.
 
     Held HERE rather than by an import in either module: check_* and render_*
-    deliberately do not import each other (see render_dashboard_unit's module
+    deliberately do not import each other (see render_systemd_unit's module
     docstring — a cross-module import would ImportError under the section-8
     tmp-repo tests that replace one of them with a stub).
     """
-    import render_dashboard_unit  # pyright: ignore[reportMissingImports]
+    import render_systemd_unit
 
     mod = _load_checker()
 
     preserved = {
         name
-        for spec in render_dashboard_unit.UNITS.values()
+        for spec in render_systemd_unit.UNITS.values()
         for name in spec.host_local_environment
     }
     required_env_vars = {
@@ -1534,7 +1534,7 @@ def test_preserved_names_are_disjoint_from_required_service_directives():
 
     overlap = preserved & required_env_vars
     assert not overlap, (
-        f"{sorted(overlap)} is BOTH preserved by scripts/render_dashboard_unit.py "
+        f"{sorted(overlap)} is BOTH preserved by scripts/render_systemd_unit.py "
         "and exact-matched by REQUIRED_SERVICE_DIRECTIVES. On a host whose value "
         "differs from the committed one, find_drift reports the required line as "
         "missing and --fix APPENDS it after the last [Service] line, where "
@@ -1584,7 +1584,7 @@ def test_a_required_known_project_roots_line_would_reclobber():
 
 # The SECOND anchor for the invariant above, and the reason it exists.
 #
-# (ii) derives `preserved` solely from render_dashboard_unit.UNITS[*].
+# (ii) derives `preserved` solely from render_systemd_unit.UNITS[*].
 # host_local_environment. That is one END of the coupling. The other end —
 # the one that makes a clobber DAMAGING rather than merely untidy — is that
 # fused_memory/models/scope.py reads the variable as reconciliation's
@@ -1704,20 +1704,20 @@ def test_scope_known_project_roots_env_is_actually_preserved_by_the_renderer():
     would be empty for the wrong reason, and the hazard would be reopened under
     a passing test. That state is precisely what goes red here.
     """
-    import render_dashboard_unit  # pyright: ignore[reportMissingImports]
+    import render_systemd_unit
 
     name = _scope_known_project_roots_env()
     assert isinstance(name, str) and name
 
     preserved = {
         preserved_name
-        for spec in render_dashboard_unit.UNITS.values()
+        for spec in render_systemd_unit.UNITS.values()
         for preserved_name in spec.host_local_environment
     }
 
     assert name in preserved, (
         f"{name} is read by {_SCOPE_PATH}::KNOWN_PROJECT_ROOTS_ENV but no "
-        f"render_dashboard_unit.UNITS spec preserves it (preserved: "
+        f"render_systemd_unit.UNITS spec preserves it (preserved: "
         f"{sorted(preserved)}). Either a re-render now silently drops this "
         "host's reconciliation scope, or the variable moved and this guard "
         "plus ::test_preserved_names_are_disjoint_from_required_service_"
@@ -1739,7 +1739,7 @@ def test_scope_known_project_roots_env_is_actually_preserved_by_the_renderer():
 # reconciliation scope — silently, because the post-install parity gate checks
 # only host-invariant safety directives and cannot see this variable's value.
 #
-# These tests live in THIS module rather than in test_render_dashboard_unit.py
+# These tests live in THIS module rather than in test_render_systemd_unit.py
 # because running a setup-host.sh slice needs subprocess and a stubbed PATH,
 # while that module's docstring pins "ALL FIXTURES ARE tmp_path OR IN-MEMORY
 # STRINGS" and it contains zero subprocess calls. Same split task 4793 used for
@@ -1789,7 +1789,7 @@ def _section_4_repo(tmp_path: pathlib.Path, *, with_renderer: bool = True) -> pa
         TEMPLATE_PATH.read_text(encoding="utf-8"), encoding="utf-8"
     )
     if with_renderer:
-        for name in ("render_dashboard_unit.py", "systemd_unit_parity.py"):
+        for name in ("render_systemd_unit.py", "systemd_unit_parity.py"):
             (repo / "scripts" / name).write_text(
                 (REPO_ROOT / "scripts" / name).read_text(encoding="utf-8"),
                 encoding="utf-8",
@@ -1970,7 +1970,7 @@ def test_section_4_render_failure_leaves_the_unit_alone(tmp_path: pathlib.Path):
     """
     repo = _section_4_repo(tmp_path)
     _write_env(repo)
-    (repo / "scripts" / "render_dashboard_unit.py").write_text(
+    (repo / "scripts" / "render_systemd_unit.py").write_text(
         _FAILING_FM_RENDERER, encoding="utf-8"
     )
     unit_dir = _gate_unit_dir(tmp_path, content=_multi_root_unit("/old/root"))

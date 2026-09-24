@@ -130,6 +130,7 @@ from orchestrator.scheduler import (
 )
 from orchestrator.service_restart import (
     FLEET_DEPLOY_CLOCK_RELPATH,
+    FLEET_LEASE_RELPATH,
     StaleServiceRestartCoordinator,
     schedule_detached_systemd_restart,
 )
@@ -3484,36 +3485,87 @@ class Harness:
             return None
         key = str(key)
         self._recovered_sessions[key] = session_data
-        # Best-effort: stash the surviving worktree's claude-config dir so the
-        # _run_slot guard (task γ) can RE-glob the transcript at dispatch. The
-        # dir name embeds the branch (``claude-config-<branch>``), not derivable
-        # from task_id at the pre-acquire dispatch point, so *entry* — the
-        # surviving worktree, known only here — is the last place to capture it.
-        # Never raises: a missing/globless .task simply leaves no stash, which
-        # the guard treats as 'no_transcript' (fail-safe fresh dispatch, I3).
+        # Best-effort: stash the surviving worktree's config dir so the
+        # _run_slot guard (task γ) can RE-glob the transcript at dispatch.
+        # *entry* — the surviving worktree — is known only here, which is why
+        # the capture happens at adoption rather than at the pre-acquire
+        # dispatch point.
+        #
+        # DERIVED, not searched. The dir name is a pure function of the task id
+        # by construction: the SOLE mkdir site in the tree is
+        # ``shared/src/shared/config_dir.py::TaskConfigDir.__init__``, which
+        # builds ``base / f'{CONFIG_DIR_PREFIX}{task_id}'`` from a task-id STEM,
+        # reached in production from
+        # ``orchestrator/src/orchestrator/workflow.py::TaskWorkflow`` as
+        # ``TaskConfigDir(self.task_id, base_dir=self.worktree / '.task')``.
+        # And ``key`` above IS the real task id at every call arity (the
+        # plan-derived recovery id, the v2 sidecar's own ``task_id``, or the
+        # cold worktree's dir name — all the same identity).
+        #
+        # Nothing else is EVER stashed: the one other creator,
+        # ``orchestrator/src/orchestrator/dry_run_unblock.py::dry_run_unblock``,
+        # deliberately produces ``claude-config-<task_id>-unblock``, a
+        # legitimate non-owner of this session's transcript.
+        #
+        # What the miss path signals, and the scoping it is emitted under, are
+        # stated once — at ``orchestrator/src/orchestrator/event_store.py::
+        # EventType.session_config_dir_ambiguous``. Read it there.
+        #
+        # Never raises: a missing .task simply leaves no stash, which the guard
+        # treats as 'no_transcript' (fail-safe fresh dispatch, I3). ``.exists()``
+        # can still raise on a broken mount, hence the retained guard.
         try:
-            config_dirs = sorted((entry / '.task').glob('claude-config-*'))
-            if config_dirs:
-                if len(config_dirs) > 1:
-                    # >1 claude-config-<branch> dir in a single surviving
-                    # worktree is abnormal: the lexically-first pick may not be
-                    # the one holding THIS session's transcript, in which case
-                    # the dispatch-time re-glob degrades to a 'no_transcript'
-                    # fresh dispatch. Warn (loud-over-silent) so that otherwise
-                    # silent missed resume is observable.
+            expected = entry / '.task' / f'{CONFIG_DIR_PREFIX}{key}'
+            if expected.exists():
+                self._recovered_session_config_dirs[key] = str(expected)
+            else:
+                # The candidate scan happens ONLY here, on the miss path: the
+                # healthy path costs one stat rather than a directory scan, and
+                # `found` exists solely to populate the signal below — with no
+                # miss there is no consumer for it. (Same reasoning as the
+                # `archive_available` emit site: build the payload inside the
+                # guard that needs it.)
+                found = sorted(
+                    str(p) for p in (entry / '.task').glob(f'{CONFIG_DIR_PREFIX}*')
+                )
+                if found:
+                    # Candidates but not the derived one: another owner's
+                    # worktree, so nothing here can corroborate the session. An
+                    # EMPTY .task/ falls through silently — that is absence, not
+                    # ambiguity (scoping stated at the EventType member cited
+                    # above).
                     logger.warning(
-                        'Recovery: %s has %d claude-config dirs %s — stashing the '
-                        'lexically-first (%s) for session %s; if it lacks the '
-                        'transcript the resume degrades to fresh dispatch',
-                        entry.name, len(config_dirs),
-                        [str(d) for d in config_dirs], config_dirs[0],
+                        'Recovery: %s holds %d config dir(s) %s but NOT the '
+                        'derived %s for session %s — not stashing; the resume '
+                        'will degrade to a fresh dispatch',
+                        entry.name, len(found), found, expected,
                         session_data.get('session_id'),
                     )
-                self._recovered_session_config_dirs[key] = str(config_dirs[0])
+                    if self.event_store:
+                        self.event_store.emit(
+                            EventType.session_config_dir_ambiguous,
+                            task_id=key,
+                            data={
+                                'expected': str(expected),
+                                'found': found,
+                                'session_id': session_data.get('session_id'),
+                                'task_id': key,
+                            },
+                        )
+                    # AFTER the emit, deliberately: the structured event lands
+                    # in runs.db even when filing is suppressed by dedup or
+                    # fails outright, so the census stays complete while the
+                    # escalation stays at one-open-at-a-time.
+                    self._file_config_dir_ambiguous_escalation(
+                        key=key,
+                        session_id=session_data.get('session_id'),
+                        expected=expected,
+                        found=found,
+                    )
         except OSError as e:
             logger.debug(
-                'Recovery: %s config-dir glob failed (%s) — guard will treat '
-                'the recovered session as uncorroborated', entry.name, e,
+                'Recovery: %s config-dir resolution failed (%s) — guard will '
+                'treat the recovered session as uncorroborated', entry.name, e,
             )
         logger.info(
             'Recovery: adopting agent session for task %s (role=%s, '
@@ -7381,6 +7433,18 @@ class Harness:
     _ARCHIVAL_STORM_SENTINEL: str = '__transcript_archival_storm__'
     _ARCHIVAL_STORM_ROLE: str = 'orchestrator-transcript-archival-storm'
 
+    # Synthetic task_id + agent_role for the recovered-config-dir ambiguity L1
+    # (task 3620, INV-4).  DEDICATED, not shared with any sentinel above: a
+    # shared sentinel lets a reap of one queue's resolved escalation close the
+    # OTHER queue's still-open gate (the cross-queue decision-id collision,
+    # task 3528).  Deduped via has_open_l1 — one open ambiguity L1 at a time,
+    # NOT counted against a threshold like the two storm escalations: a single
+    # ambiguous worktree is already a definite lost resume with a definite
+    # cause, whereas a storm needs a RUN to tell breakage from expected noise.
+    # There is consequently nothing to tune and no config knob to add.
+    _CONFIG_DIR_AMBIGUOUS_SENTINEL: str = '__session_config_dir_ambiguous__'
+    _CONFIG_DIR_AMBIGUOUS_ROLE: str = 'orchestrator-session-config-dir-ambiguous'
+
     @staticmethod
     def _errno_label(err: object) -> str:
         """Render a payload errno as ``ENOSPC(28)`` — symbol AND number.
@@ -7531,6 +7595,102 @@ class Harness:
         except Exception:
             logger.warning(
                 'Failed to file transcript-archival-storm escalation', exc_info=True,
+            )
+
+    def _file_config_dir_ambiguous_escalation(
+        self, *, key: str, session_id: object, expected: Path, found: list[str],
+    ) -> None:
+        """File an L1 when a recovered session's config dir cannot be resolved
+        (task 3620, INV-4).
+
+        Called from :meth:`_adopt_recovered_session` when the surviving worktree
+        holds ``claude-config-*`` candidates but NOT the derived
+        ``claude-config-<task_id>``.  Modelled on
+        ``_file_archival_storm_escalation`` / ``_file_pool_storage_absent_escalation``:
+        ``has_open_l1`` dedup so repeated boots do not stack duplicate L1s, a
+        bare-Harness guard so unit-test shapes stay green, and a blanket
+        ``except`` so filing can never break the recovery path it reports on.
+
+        Deduped rather than counted against a threshold: one ambiguous worktree
+        is already a definite lost resume with a definite cause, so there is no
+        RUN to wait for and nothing to tune.  What is at stake — a GUARANTEED
+        ``no_transcript`` fallback, degrading safely — is stated normatively at
+        ``event_store.py::EventType.session_config_dir_ambiguous``, which the
+        ``detail`` below points an operator at rather than restating.
+        """
+        if not self._escalation_queue:        # bare-Harness unit tests stay green
+            return
+        try:
+            if self._escalation_queue.has_open_l1(self._CONFIG_DIR_AMBIGUOUS_SENTINEL):
+                return                         # dedup: one open L1 at a time
+            from escalation.models import Escalation  # noqa: PLC0415
+            shown = found[:20]
+            more = len(found) - len(shown)
+            candidates = '\n'.join(f'  - {p}' for p in shown)
+            if more > 0:
+                # Never let a truncated list read as the whole list.
+                candidates += f'\n  ... and {more} more dir(s) not listed'
+            esc = Escalation(
+                id=self._escalation_queue.make_id(self._CONFIG_DIR_AMBIGUOUS_SENTINEL),
+                task_id=self._CONFIG_DIR_AMBIGUOUS_SENTINEL,
+                agent_role=self._CONFIG_DIR_AMBIGUOUS_ROLE,
+                severity='blocking',
+                category='infra_issue',
+                summary=(
+                    f'Recovered session for task {key} cannot be corroborated: '
+                    f'{expected.parent} holds {len(found)} config dir(s) but '
+                    f'not {expected.name} — the resume is lost'
+                )[:200],
+                detail=(
+                    f'Crash recovery adopted an agent session for task {key} '
+                    f'(session_id={session_id}) from the surviving worktree '
+                    f'{expected.parent.parent}, but could not resolve its '
+                    f'config dir.\n\n'
+                    f'Expected (derived from the task id, which is how '
+                    f'shared/src/shared/config_dir.py::TaskConfigDir names '
+                    f'every config dir it creates):\n  {expected}\n\n'
+                    f'Found instead:\n{candidates}\n\n'
+                    'Consequence: nothing was stashed, so the dispatch-time '
+                    'transcript re-glob has nothing to corroborate the session '
+                    'against. This task is a GUARANTEED session_resume_fallback '
+                    'with no_transcript — the resume is ALREADY LOST, safely, '
+                    'and the agent context it would have preserved is gone. '
+                    'The task itself re-dispatches fresh and completes '
+                    'normally; no manual repair of it is needed.\n\n'
+                    'Likely causes, in this cause\'s terms:\n'
+                    '  - a FOREIGN task\'s config dir left behind in a shared '
+                    'or warm lane (a lane holding claude-config-<other_id> '
+                    'alongside, or instead of, this task\'s);\n'
+                    '  - a NON-SESSION dir being the only candidate — notably '
+                    'claude-config-<task_id>-unblock, created by '
+                    'orchestrator/src/orchestrator/dry_run_unblock.py, which '
+                    'is a legitimate non-owner of this session\'s transcript.\n\n'
+                    'To census the whole population from runs.db, use the SQL '
+                    'recorded with the event itself — orchestrator/src/'
+                    'orchestrator/event_store.py::EventType.'
+                    'session_config_dir_ambiguous.\n\n'
+                    'This is NOT the session-resume fallback storm, does not '
+                    'feed its streak, and shares none of its remediation: '
+                    'clock skew, warm-lane reseeds and the $.reasons census '
+                    'are all irrelevant here.'
+                ),
+                suggested_action=(
+                    'Identify which process created the non-matching dir(s) '
+                    'listed above and whether they should have been cleaned '
+                    'up. Resolve this escalation once the worktree is reaped '
+                    'or the stray dir removed. Recovery already degraded '
+                    'safely, so this is a lost-resume/throughput signal rather '
+                    'than a correctness incident — no repair of the recovered '
+                    'task is required.'
+                ),
+                level=1,
+                filing_claimant_run_id=self._filing_claimant_run_id,
+            )
+            self._escalation_queue.submit(esc)
+            logger.warning('Filed L1 config-dir-ambiguous escalation %s', esc.id)
+        except Exception:
+            logger.warning(
+                'Failed to file config-dir-ambiguous escalation', exc_info=True,
             )
 
     def _file_pool_storage_absent_escalation(self) -> None:
@@ -12234,6 +12394,21 @@ class Harness:
           bounds rather than indefinitely vetoes. The check fails toward
           proceeding (no grace) on any internal error, so it can never itself
           introduce a new indefinite veto.
+        - ``lease_path`` / ``lease_max_age_secs`` (task 4755): the in-flight
+          fleet-redeploy lease, and THE ONLY gate on this coordinator that
+          reads disk at gate time. That is not an optimisation choice — it is
+          forced. ``_load_last_fire_wall`` runs once, inside
+          ``StaleServiceRestartCoordinator.__init__``, and is never re-read,
+          so nothing ``restart-all-orchestrators.sh`` writes during this
+          process's lifetime is otherwise observable here. The clock records
+          when a sweep FINISHED; only the lease says one is running NOW, which
+          is why a long sweep previously let this coordinator force-fire on
+          top of it (measured 2026-08-24/25: "pending restart owed 17300s").
+          Gates the polite and force-fire paths alike, defers without clearing
+          pending, and is fail-OPEN — a missing, corrupt or over-age lease
+          redeploys anyway, so a stranded file can never wedge the fleet.
+          The fused-memory and dashboard builders pass neither, leaving their
+          gate disabled and their behaviour byte-identical.
 
         ``require_idle=True`` and ``script_args=[]`` mirror the fused-memory
         coordinator (idle-only; restart-orchestrator.sh takes no positional
@@ -12286,6 +12461,10 @@ class Harness:
         # gets a non-zero cap — the fused-memory/dashboard builders keep the
         # 0.0 default (no gating), so their behaviour is unchanged.
         redeploy_state_path = Path(self.config.project_root) / FLEET_DEPLOY_CLOCK_RELPATH
+        # In-flight fleet-redeploy lease (task 4755). The clock above says when
+        # a sweep last FINISHED; this says one is running RIGHT NOW, which the
+        # clock structurally cannot -- see the builder docstring's lease bullet.
+        redeploy_lease_path = Path(self.config.project_root) / FLEET_LEASE_RELPATH
 
         return StaleServiceRestartCoordinator(
             git_ops=self.git_ops,
@@ -12312,6 +12491,14 @@ class Harness:
             # hold, byte-identical).
             merge_phase_hold=self._merge_phase_grace_active,
             merge_phase_grace_secs=self.config.orchestrator_restart_merge_phase_grace_secs,
+            # In-flight fleet-redeploy lease (task 4755). While
+            # restart-all-orchestrators.sh holds it, maybe_restart stands down
+            # on BOTH the polite and the force-fire path, so this coordinator
+            # cannot redeploy the fleet on top of a sweep still restarting it.
+            # The fused-memory/dashboard builders omit both (defaults None /
+            # the class max-age -> no gate, byte-identical).
+            lease_path=redeploy_lease_path,
+            lease_max_age_secs=self.config.orchestrator_restart_lease_max_age_secs,
             state_path=redeploy_state_path,
             # restart-all-orchestrators.sh is the SOLE on-disk clock writer,
             # stamping only on its verified-fresh exit-0 path — the watchdog
@@ -12320,9 +12507,13 @@ class Harness:
             # silently silence the backstop for a full min_interval_secs
             # window (task 2396, fleet-redeploy β; closes hole I2).
             # Caveat: this coordinator's OWN _last_fire_wall still re-seeds
-            # from state_path on every process restart, so it can transiently
-            # lag the script's post-restart stamp by one fire — see
-            # StaleServiceRestartCoordinator's stamp_clock_on_fire docstring.
+            # from state_path on every process restart, so it can lag the
+            # script's post-restart stamp. That used to be described here and
+            # in StaleServiceRestartCoordinator's stamp_clock_on_fire
+            # docstring as "by one fire"; the 2026-08-24/25 measurement
+            # falsified it (it recurred every cycle), and the coordinator's
+            # in-flight fleet-redeploy lease gate is what now covers the race
+            # — see that docstring for the measurement.
             stamp_clock_on_fire=False,
         )
 

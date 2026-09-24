@@ -492,11 +492,16 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
     merges spellings that differ only by case or separator; only an entry in
     `PROJECT_TOKEN_ALIASES` can bridge a project whose filed decisions fold to something *other*
     than its declared `memory.project_id`, and today `df → dark_factory` is the only such entry.
-    **solar-challenge is the known open case**: its config declares `my_solar_challenge`, but its
-    decisions are filed under `solar-challenge`/`solar_challenge` (which fold together, but not
-    onto `my_solar_challenge`), so reaping it with the declared token matches **zero** rows —
-    pass `solar_challenge` there until the alias decision (task 3813) lands. To check your own
-    project, list the tokens its rows actually carry:
+    **solar-challenge is the known standing case**: its config declares `my_solar_challenge`, but
+    its decisions are filed under `solar-challenge`/`solar_challenge` (which fold together, but
+    not onto `my_solar_challenge`), so reaping it with the declared token matches **zero** rows —
+    pass `solar_challenge` there. That guidance is **permanent, not provisional**: task 3813
+    decided the alias question and **declined** it (the fold left no split to heal, and the
+    identity question is an open human gate in that project marked "Do NOT auto-act"), recording
+    the evidence in `PROJECT_TOKEN_ALIASES_DECLINED`. You no longer have to remember this
+    unaided — `write-decision` and `reap-decisions` both **warn** if you pass
+    `my_solar_challenge`, so the mismatch announces itself instead of returning a silent
+    zero-row no-op. To check your own project, list the tokens its rows actually carry:
     ```bash
     python3 -c "import json,glob,collections;print(collections.Counter(json.load(open(f))['project'] for f in glob.glob('$HOME/.claude/fleet/decisions/*.json')))"
     ```
@@ -1341,6 +1346,17 @@ record's own pending status. If a probe fires, the ask flips from "human must de
 must ratify and propagate": recover the ruling, present it for ratification, and propagate it into
 the record via amendment. This applies equally to `risk_identified` parks below.
 
+<!-- scope-not-delivered:begin the two closure forms and the worked example live in the policy
+     document named below and are deliberately NOT copied here: that document is their authority,
+     exactly as this skill is the authority for the six conditions it declines to copy back. Held
+     by tests/scripts/test_shadow_ruling_doc_contract.py. -->
+**A `scope-not-delivered` record closes only two ways.** That is a record stating that ONE ITEM of
+a task's scope was not deliverable by that task; it closes only by one of the two closure forms in
+`docs/escalation-standing-policy.md`, never by a bare accept. That policy is IN FORCE now (Leo,
+2026-09-21, esc-4811-3) — not one of the shadow-mode candidate classes further down this file —
+and it grants no one authority to close such a record.
+<!-- scope-not-delivered:end -->
+
 #### Standing rule: accept verified info-level design deviations (Leo, 2026-09-17)
 
 The watcher may close a `design_concern` itself, without parking it, **only when ALL of these
@@ -1390,6 +1406,8 @@ human can revoke this rule at any time.
 - **Excluded: esc-4811-3.** "Fixture expansion (plan item 4) is not deliverable" is a *scope item
   not delivered*, bearing on a reason behind the human's write_triage HOLD. That fails condition 6
   even though it is info-level and well-evidenced, and its task was blocked on it (condition 4).
+  It is a `scope-not-delivered` record, so how it may be closed is governed by the closure policy
+  above rather than by this rule.
 
 ### `risk_identified` (info)
 

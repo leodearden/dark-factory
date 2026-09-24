@@ -3,6 +3,9 @@
 from fused_memory.reconciliation.consolidation_gate import (
     render_consolidation_gate_section,
 )
+from fused_memory.reconciliation.graphiti_degradation_probe import (
+    render_graphiti_degradation_probe_section,
+)
 from fused_memory.reconciliation.policies.autopilot_video import (
     AUTOPILOT_VIDEO_CONTAMINATION_GUARDRAIL as _AUTOPILOT_VIDEO_CONTAMINATION_GUARDRAIL,
 )
@@ -361,6 +364,8 @@ These two counters are orthogonal: a flag may appear as a Mem0 marker \
 (`stage1_mem0_flags_processed`) or as a structured analytical finding \
 (`stage1_analytical_findings_processed`) or both — count it in each dimension where \
 it was actually processed.
+
+{render_graphiti_degradation_probe_section(runs_probes=True)}
 
 {render_cycle_summary_section()}
 

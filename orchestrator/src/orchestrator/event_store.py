@@ -395,6 +395,66 @@ class EventType(StrEnum):
     session_resume_fallback = 'session_resume_fallback'
     session_resume_capped = 'session_resume_capped'
 
+    # session_config_dir_ambiguous (task 3620) — the surviving worktree holds
+    # config-dir candidates but NOT the one this session's transcript would be
+    # in, so the recovered session cannot be corroborated at all.
+    #
+    # Emitted by orchestrator/src/orchestrator/harness.py::Harness._adopt_recovered_session,
+    # at BOOT during crash recovery — NOT by the _run_slot dispatch guard that
+    # emits the three events above. The config dir is DERIVED from the adopted
+    # task id (the sole creator, shared/src/shared/config_dir.py::TaskConfigDir,
+    # names it `claude-config-<task_id>`); when that derived dir is absent but
+    # other `claude-config-*` dirs are present, the worktree belongs to some
+    # other owner — e.g. the `claude-config-<task_id>-unblock` dir created by
+    # orchestrator/src/orchestrator/dry_run_unblock.py::dry_run_unblock. Nothing
+    # is stashed, so the ensuing dispatch is a GUARANTEED 'no_transcript'
+    # fallback. Before this event that outcome was silent: the resolver stashed
+    # a lexically-first candidate, the dispatch-time re-glob found no transcript
+    # there, and the session degraded with zero operator signal.
+    #
+    # NOT part of the ratio recipe's denominator above, and this is the one
+    # thing to get right when querying it — the same trap
+    # session_resume_failed's own comment warns about, restated because this
+    # member sits inside the family block. The three outcome events are one per
+    # DISPATCH that carried a recovered session; this one is one per ADOPTION
+    # that could not resolve. Adding it to that sum would mix populations
+    # counted on different units and inflate the attempt count.
+    #
+    # Emitted IF AND ONLY IF candidates exist and the derived dir is absent. An
+    # empty `.task/` — no `claude-config-*` at all — stays SILENT: that is
+    # ABSENCE, not ambiguity, and it is the dominant recovered-session
+    # population (warm-lane acquire always re-seeds a lane from base, wiping the
+    # transcript store, which is why `reseeded` is a by-design fallback reason
+    # above). Emitting there would fire on nearly every recovered lane and put
+    # the most-expected outcome in the same bucket as a genuine defect. That
+    # population is already instrumented at dispatch by
+    # session_resume_fallback's '$.archive_available'.
+    #
+    # data: {expected, found, session_id, task_id} — `expected` the derived
+    # path, `found` a SORTED list of every candidate path as a string so
+    # json_extract(data, '$.found') is a stable group key (same discipline as
+    # '$.reasons'), `session_id` the sidecar's session, `task_id` the adopted
+    # key (also passed as the row's task_id, so it stays joinable).
+    #
+    # SQL: which derived path was missing, and what was there instead —
+    #   SELECT json_extract(data, '$.expected'), json_extract(data, '$.found'),
+    #          COUNT(*)
+    #     FROM events WHERE event_type = 'session_config_dir_ambiguous'
+    #    GROUP BY 1, 2;
+    # A nonzero count is a definite lost resume with a definite cause, unlike a
+    # fallback census — which is why it also files a deduped L1 (one open at a
+    # time, under harness.py::Harness._CONFIG_DIR_AMBIGUOUS_SENTINEL) rather
+    # than being counted against a storm threshold.
+    #
+    # It consequently does NOT feed the session-resume fallback-storm streak,
+    # and that exclusion is STRUCTURAL rather than a carve-out: this is
+    # detected at BOOT during adoption, while the streak is only ever touched
+    # in the _run_slot DISPATCH guard — unlike the by-design `capped` case,
+    # which sits inside that same guard block and therefore does need an
+    # explicit branch. So config.fallback_storm_threshold has no effect here
+    # and an ambiguity L1 appearing alone is not evidence of a resume storm.
+    session_config_dir_ambiguous = 'session_config_dir_ambiguous'
+
     # session_resume_failed (task 3578) — an ARMED resume that then failed to
     # happen. It closes the population that was previously journal-only and
     # runs.db-INVISIBLE: an armed --resume whose transcript the CLI could not

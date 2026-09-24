@@ -811,6 +811,18 @@ takes no arguments: it always re-reads that process's own
 - `config_key_census.*` (the unknown-key census escape hatch — see
   [§6a](#6a-unknown-config-key-census); green-tier on purpose, so a
   false-positive L2 can be cleared on a live unit)
+- `merge_disjoint_skip_requires_verified_drift` (the soundness gate on the
+  merge queue's disjoint-delta fast path — see
+  [§"Merge-halt semantics"](#merge-halt-semantics-wip_conflict--unmerged_state)'s
+  neighbourhood and `merge_gates._disjoint_skip_blockers`). When `true`
+  (the default) a rebase whose footprint is disjoint from the intervening
+  main delta is re-verified anyway unless that delta is a main tip **this
+  queue landed green**; drift from any other writer — an unattended nightly
+  job, a direct commit, a push — has unknown health. Green-tier on purpose
+  and for the same reason as the two bullets above: it is a safety kill
+  switch, it only ever ADDS one verify before an advance, and it cannot
+  split an in-flight merge's breadth. Contrast its **restart-only**
+  neighbour `merge_verify_breadth`, which does change breadth mid-merge.
 - `merge_deep.chain_cap` (the deep merge-ahead chain cap — see
   [§"Deep merge-ahead chains"](#deep-merge-ahead-chains-merge_deepchain_cap);
   `0` is the shipped default and the feature's kill switch). Green-tier on
@@ -1319,13 +1331,31 @@ inside one 8-hour window.** Two corrections measured 2026-08-24/25:
   Task **4754** has since landed the head-start half: both staleness tiers now
   hold their 30-minute head start until *after* their own min-interval
   expires, so the backstop no longer wins the boundary race purely on poll
-  cadence. That does NOT make the window collision-free. The residual case is
-  **4755**'s (in-flight lease, which also stops a liveness probe from
-  cancelling the sweep's own restart jobs): a sweep still stamps the clock
-  only on completion, so a long sweep can let the other tier's min-interval
-  check pass mid-sweep. Until 4755 lands, treat "one deploy per 8h" as the
-  intent, not a guarantee, and read the clock file's timestamp rather than
-  assuming it.
+  cadence.
+- Task **4755** landed the other half — an **in-flight lease**, the state the
+  clock structurally cannot carry. `scripts/restart-all-orchestrators.sh`
+  writes `data/orchestrator/fleet_redeploy_lease.json` at sweep start,
+  advances its `current_unit` as it works, and removes it on every catchable
+  exit path (success, verify failure, no-units, a trapped SIGTERM/SIGINT).
+  Three readers honor it: the staleness backstop and the merge-landed
+  coordinator both stand down while it is held, and the liveness probe skips
+  its restart for `current_unit` **only** — so a genuinely wedged *other* unit
+  is still revived immediately. A lease counts as held only while its recorded
+  pid is alive **and** it is younger than
+  `orchestrator_restart_lease_max_age_secs` (7200s), so a SIGKILLed sweep —
+  the one exit no trap can catch — costs at most one delayed window rather
+  than wedging the fleet.
+
+  **Still not guaranteed.** The 7200s bound is derived from the worst
+  *legitimate* sweep (~6270s: one permanently-busy unit burning the full
+  busy grace, plus unknown-grace and verify time for the rest). A sweep with
+  **two or more simultaneously-busy units** exceeds it, loses its lease
+  mid-sweep and degrades to exactly the pre-4755 collision. And the
+  **fused-memory tier has no lease at all** — `fused_memory_staleness_pass`
+  can still collide with its own in-flight `restart-fused-memory.sh`, because
+  fm's clock is likewise stamped only on completion. So "one deploy per 8h" is
+  now the normal case rather than merely the intent, but read the clock file's
+  timestamp and the `FLEET-LEASE:` line rather than assuming it.
 
 ### Reading a staleness redeploy's registration
 
@@ -1467,10 +1497,22 @@ neither failure evidence nor recovery).
 scripts/orchestrator-watchdog.py --report
 ```
 
-Strictly read-only — zero mutating `systemctl` calls, no clock write. In
-addition to the unit / start-time / newest-watched-commit / verdict
-columns, it prints:
+Strictly read-only — zero mutating `systemctl` calls, no clock write, and it
+never creates or removes the in-flight lease either. Above the table it prints
+one fleet-wide line, and in addition to the unit / start-time /
+newest-watched-commit / verdict columns, per unit:
 
+- **`FLEET-LEASE:`** — whether a fleet sweep is in flight right now, in one of
+  four states. `none` (no sweep). `live (pid N, unit U, age Xm)` — a sweep is
+  running and currently restarting U; the backstop and the coordinator are
+  standing down, and U's liveness probe is suppressed. `stale (pid N not
+  running, age Xm)` — the holder died, almost always a SIGKILL; the lease is
+  already being ignored by every reader. `expired (pid N, age Xh > Yh bound)`
+  — the holder is *still alive* but has overrun the max-age bound, so the
+  sweep has lost its protection and a collision is once again possible. The
+  last two are deliberately distinct: both mean "not live", but only the
+  second says a sweep is still running. `unreadable` means the file exists and
+  could not be parsed.
 - **DEPLOY-AGE** — time since the last *verified* fleet deploy (the shared
   clock), fleet-wide, in hours; `unknown` if the clock has never been
   stamped.

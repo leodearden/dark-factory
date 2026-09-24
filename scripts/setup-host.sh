@@ -215,7 +215,7 @@ UV_PATH="$(command -v uv)"
 # directives and is structurally incapable of seeing this variable's value.
 #
 # THE RENDERER OWNS THE DESTINATION rather than being redirected into it.
-# `python3 render_dashboard_unit.py ... > "$UNIT_DIR/<unit>"` would be the same
+# `python3 render_systemd_unit.py ... > "$UNIT_DIR/<unit>"` would be the same
 # defect one level up: bash truncates the destination before python ever opens
 # it, so the installed value would be gone before it could be read and the tool
 # would preserve nothing while reporting success. --output is read FIRST as the
@@ -240,7 +240,7 @@ UV_PATH="$(command -v uv)"
 # belongs in BOTH sites. The one INTENTIONAL divergence is documented at the
 # `restart` gate below — section 8 has no equivalent because the dashboard is
 # started by hand and never restarted by this script.
-_fm_render_script="$REPO_ROOT/scripts/render_dashboard_unit.py"
+_fm_render_script="$REPO_ROOT/scripts/render_systemd_unit.py"
 
 # Set to 1 only by the branch that actually rendered. `fail` here is a printf,
 # not an exit, so without this flag every degraded path still reached the
@@ -1045,7 +1045,7 @@ fi
 # script, so following the advice was what caused the loss.
 #
 # THE RENDERER OWNS THE DESTINATION rather than being redirected into it.
-# `python3 render_dashboard_unit.py ... > "$UNIT_DIR/<unit>"` would be the same
+# `python3 render_systemd_unit.py ... > "$UNIT_DIR/<unit>"` would be the same
 # defect one level up: bash truncates the destination before python ever opens
 # it, so the installed value would be gone before it could be read and the tool
 # would preserve nothing while reporting success. --output is read FIRST as the
@@ -1066,7 +1066,7 @@ fi
 # control flow or the failure modes here belongs in BOTH sites. Section 4's
 # extra `restart` gate has no counterpart here on purpose: the dashboard is
 # started by hand, never restarted by this script.
-_dash_render_script="$REPO_ROOT/scripts/render_dashboard_unit.py"
+_dash_render_script="$REPO_ROOT/scripts/render_systemd_unit.py"
 
 # Set to 1 only by the branch that actually rendered. The section's closing line
 # and the enable below are worded off it rather than printed unconditionally:

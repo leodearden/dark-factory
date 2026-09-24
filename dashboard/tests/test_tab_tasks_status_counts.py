@@ -196,8 +196,23 @@ class TestUnchangedHeaderElements:
         )
 
     def test_shown_count_label_still_rendered(self, tasks_tab_code):
+        """The "n/m shown" mono label and its `counts.total` denominator survive.
+
+        The NUMERATOR is deliberately UNPINNED here (`\\{[^}]*\\}`). This class
+        guards label SURVIVAL, not numerator provenance; the original spelling
+        `{filtered.length}` was pinned incidentally, and task 4137 changed it to
+        `{groupView.shownCount}` precisely because `filtered.length` counted an
+        array the group did not render (an "N/N shown" header over an empty
+        focus-mode graph).
+
+        Do NOT re-tighten this to a literal expression: that re-pins a stale
+        spelling and makes this task-3516 guard fail for a defect fix it has no
+        opinion about. The numerator's provenance is owned, more precisely, by
+        dashboard/tests/test_tab_tasks_focus_header.py — see
+        `test_header_no_longer_counts_the_pre_focus_array` there.
+        """
         assert re.search(
-            r'\{\s*filtered\.length\s*\}\s*/\s*\{\s*counts\.total\s*\}\s*shown',
+            r'\{[^}]*\}\s*/\s*\{\s*counts\.total\s*\}\s*shown',
             tasks_tab_code,
         ), 'the "n/m shown" mono label is no longer rendered'
 
