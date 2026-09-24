@@ -708,8 +708,10 @@ def test_scan_binds_a_manifest_bearing_task_to_its_derived_sidecar(make_tasks_db
 ], ids=["md-suffix", "no-md-suffix"])
 def test_scan_derives_the_sidecar_by_the_stampers_rule(make_tasks_db, prd_path, derived):
     """``re.sub(r'\\.md$', '', prd_path) + '.capability-manifest.yaml'`` —
-    manifest_stamping.py::_stamp_capability_manifests_impl step 1, exactly, so
-    the sweep opens the very sidecar a re-stamp would."""
+    manifest_stamping.py::_stamp_capability_manifests_impl step 1, exactly. The
+    scan stops there: resolving that path against the project root is step 2,
+    which the sweep applies (see
+    test_the_derived_sidecar_is_resolved_against_the_root_as_the_stamper_does)."""
     db = make_tasks_db([_labelled(7, prd_path=prd_path)])
 
     (binding,) = load_task_store_scan(str(db)).manifest_bindings
@@ -896,11 +898,76 @@ def test_a_task_whose_derived_sidecar_is_not_tracked_is_no_row(
     assert audit_project(str(root)).unbound_labels == []
 
 
+@pytest.mark.parametrize("spell_prd_path", [
+    pytest.param(lambda root: "./plans/x-prd.md", id="dot-slash"),
+    pytest.param(lambda root: str(root / "plans" / "x-prd.md"), id="absolute-in-root"),
+    pytest.param(lambda root: f"../{root.name}/plans/x-prd.md", id="re-entering-dotdot"),
+])
+def test_the_derived_sidecar_is_resolved_against_the_root_as_the_stamper_does(
+        tmp_path, make_tasks_db, spell_prd_path):
+    """The stamper's step 2 resolves the derived path against the project root
+    before it opens anything, so every in-root spelling reaches the one tracked
+    sidecar. Matching the raw string instead would count these tasks as having
+    no tracked sidecar: a miss that nothing reports."""
+    root = tmp_path / "proj"
+    prd_path = spell_prd_path(root)
+    _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_labelled(7, prd_path=prd_path, label="ω"),
+               _labelled(8, prd_path=prd_path, label="α")],
+        manifests=[("plans/x-prd.capability-manifest.yaml", _declaring("α"))],
+    )
+
+    audit = audit_project(str(root))
+
+    assert [(row.manifest, row.task_id) for row in audit.unbound_labels] == [
+        ("plans/x-prd.capability-manifest.yaml", 7)]
+    assert audit.coverage.tasks_bound_to_a_declared_label == 1
+    assert audit.coverage.tasks_without_a_tracked_sidecar == 0
+
+
+def test_a_derived_sidecar_outside_the_root_is_no_row(tmp_path, make_tasks_db):
+    """The stamper refuses to read a sidecar that resolves outside its project
+    root, so such a task is promised nothing: the same no-op as an absent
+    sidecar, even when a sidecar really exists out there."""
+    elsewhere = tmp_path / "elsewhere"
+    _write_manifest(elsewhere, "plans/x-prd.capability-manifest.yaml", _declaring("α"))
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_labelled(7, prd_path=str(elsewhere / "plans" / "x-prd.md"), label="ω"),
+               _labelled(8, prd_path="../elsewhere/plans/x-prd.md", label="ω")],
+        manifests=[("plans/x-prd.capability-manifest.yaml", _declaring("α"))],
+    )
+
+    audit = audit_project(str(root))
+
+    assert audit.unbound_labels == []
+    assert audit.coverage.tasks_without_a_tracked_sidecar == 2
+
+
+def test_an_unresolvable_sidecar_path_is_no_row_and_the_sweep_continues(
+        tmp_path, make_tasks_db):
+    """An embedded NUL makes the derived path unresolvable, so the stamper can
+    open nothing for it. One such row must never abort a sweep over thousands."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_labelled(7, prd_path="plans/x\x00-prd.md", label="ω"),
+               _labelled(8, label="ω")],
+        manifests=[("plans/x-prd.capability-manifest.yaml", _declaring("α"))],
+    )
+
+    audit = audit_project(str(root))
+
+    assert _unbound_pairs(audit) == [(8, "ω")]
+    assert audit.coverage.tasks_without_a_tracked_sidecar == 1
+
+
 def test_label_matching_is_exact_so_a_transliteration_is_a_row(
         tmp_path, make_tasks_db):
     """'gamma-1' is not 'γ1'. This is task 4590's defect shape, and the reason
     this direction exists: the stamper compares the two strings exactly, so a
-    transliterated label silently binds nothing."""
+    transliterated label binds nothing, and after its one planning-time
+    ``missing_labels`` entry nothing says so again."""
     root = _make_project(
         tmp_path, make_tasks_db,
         tasks=[_labelled(7, label="gamma-1")],
@@ -1881,9 +1948,6 @@ def test_the_21_measured_unbound_rows_are_reported_exactly(tmp_path, make_tasks_
     would go red on unrelated branches. A bare count could stay green while the
     sweep reported the WRONG rows; set equality cannot.
     """
-    assert [row[4] for row in _MEASURED_UNBOUND_ROWS].count("A1") == 15
-    assert [row[4] for row in _MEASURED_UNBOUND_ROWS].count("A2") == 4
-
     audit = audit_project(str(_unbound_rows_as_project(tmp_path, make_tasks_db)))
 
     assert len(audit.unbound_labels) == 21
