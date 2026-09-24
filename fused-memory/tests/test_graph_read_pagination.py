@@ -1955,3 +1955,152 @@ class TestStaleEmbeddingReadsPagination:
             stale = await getattr(backend, method)(expected_dim=1536, group_id='test')
         assert stale == []
         assert _warnings(caplog) == []
+
+
+# ---------------------------------------------------------------------------
+# task 4869: query_edges_by_time_range
+# ---------------------------------------------------------------------------
+#
+# Bounded only by the caller's window: any window spanning more than 10000
+# edges was silently truncated, and its consumer (CleanupManager.find_stale_edges)
+# feeds bulk_remove_edges. FakeCappedGraph does not evaluate WHERE, so each
+# corpus below IS the window's population.
+
+_WINDOW_START = '2026-03-22T17:50:00'
+_WINDOW_END = '2026-03-22T18:15:00'
+
+
+def make_windowed_edge_corpus(rows: int) -> list[list]:
+    """Build ``rows`` edges in the method's shape: (uuid, fact, name, valid_at, invalid_at)."""
+    return [
+        [f'edge-{i:07d}', f'fact-{i}', f'name-{i}', '2026-03-22T18:00:00', None]
+        for i in range(rows)
+    ]
+
+
+async def _edges_in_window(backend):
+    return await backend.query_edges_by_time_range(
+        start=_WINDOW_START, end=_WINDOW_END, group_id='test'
+    )
+
+
+class TestQueryEdgesByTimeRangePagination:
+    """A window wider than the cap returns every edge in it."""
+
+    WINDOW_EDGES = 12000  # comfortably above the 10000 cap
+
+    @pytest.mark.asyncio
+    async def test_every_edge_in_the_window_is_returned(self, mock_config, make_backend):
+        """HEADLINE: 12000 edges in the window, 12000 out — not 10000."""
+        backend = make_backend(mock_config)
+        _wire(backend, FakeCappedGraph(make_windowed_edge_corpus(self.WINDOW_EDGES)))
+        edges = await _edges_in_window(backend)
+        assert len(edges) == self.WINDOW_EDGES
+        assert len({e['uuid'] for e in edges}) == self.WINDOW_EDGES
+
+    @pytest.mark.asyncio
+    async def test_census_and_every_page_describe_the_same_window(
+        self, mock_config, make_backend
+    ):
+        backend = make_backend(mock_config)
+        graph = _wire(
+            backend, FakeCappedGraph(make_windowed_edge_corpus(self.WINDOW_EDGES))
+        )
+        await _edges_in_window(backend)
+        assert len(graph.census_queries) == 1
+        assert graph.page_queries
+        assert graph.params
+        window = {'start': _WINDOW_START, 'end': _WINDOW_END}
+        assert all(params == window for params in graph.params)
+
+    @pytest.mark.asyncio
+    async def test_emitted_cypher_pages_a_total_order_over_the_window(
+        self, mock_config, make_backend
+    ):
+        backend = make_backend(mock_config)
+        graph = _wire(
+            backend, FakeCappedGraph(make_windowed_edge_corpus(self.WINDOW_EDGES))
+        )
+        await _edges_in_window(backend)
+        where = 'e.valid_at >= $start AND e.valid_at <= $end'
+        assert len(graph.queries) == (
+            len(graph.census_queries) + len(graph.page_queries)
+        )
+        census = graph.census_queries[0]
+        assert where in census
+        assert census.rstrip().endswith('RETURN count(*)')
+        assert 'SKIP' not in census.upper()
+        population = census.rsplit('RETURN count(*)', 1)[0]
+        for page in graph.page_queries:
+            assert page.startswith(population)
+            assert where in page
+            assert 'e.uuid' in page.split('ORDER BY', 1)[1]
+
+    @pytest.mark.asyncio
+    async def test_a_uuid_re_emitted_across_pages_is_returned_once(
+        self, mock_config, make_backend
+    ):
+        """bulk_remove_edges must not be handed the same uuid twice."""
+        backend = make_backend(mock_config)
+        corpus = [
+            ['e1', 'first fact', 'n1', '2026-03-22T18:00:00', None],
+            ['e2', 'fact two', 'n2', '2026-03-22T18:00:00', None],
+            ['e1', 'later fact', 'n1', '2026-03-22T18:00:00', None],
+            ['e3', 'fact three', 'n3', '2026-03-22T18:00:00', None],
+        ]
+        _wire(backend, FakeCappedGraph(corpus, resultset_cap=None))
+        edges = await _edges_in_window(backend)
+        assert [e['uuid'] for e in edges] == ['e1', 'e2', 'e3']
+        assert edges[0]['fact'] == 'first fact'
+
+    @pytest.mark.asyncio
+    async def test_empirical_incompleteness_warns_and_returns(
+        self, mock_config, make_backend, caplog
+    ):
+        backend = make_backend(mock_config)
+        corpus = make_windowed_edge_corpus(self.WINDOW_EDGES)
+        _wire(backend, FakeCappedGraph(corpus, census_override=len(corpus) + 5000))
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            edges = await _edges_in_window(backend)
+        assert len(edges) == len(corpus)
+        assert any('query_edges_by_time_range' in m for m in _warnings(caplog))
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'force, kind_name',
+        [
+            pytest.param(_refusal, 'INCOMPLETE_STRUCTURAL_REFUSAL', id='refusal'),
+            pytest.param(_page_cap, 'INCOMPLETE_PAGE_CAP', id='page-cap'),
+        ],
+    )
+    async def test_structural_incompleteness_raises(
+        self, force, kind_name, mock_config, make_backend, monkeypatch
+    ):
+        from fused_memory.backends import graphiti_client
+
+        backend = make_backend(mock_config)
+        _wire(backend, FakeCappedGraph(make_windowed_edge_corpus(self.WINDOW_EDGES)))
+        force(monkeypatch)
+        with pytest.raises(graphiti_client.IncompleteEnumerationError) as exc:
+            await _edges_in_window(backend)
+        message = str(exc.value)
+        assert "'test'" in message
+        assert getattr(graphiti_client, kind_name) in message
+
+    @pytest.mark.asyncio
+    async def test_the_edge_dict_shape_is_preserved(self, mock_config, make_backend):
+        backend = make_backend(mock_config)
+        _wire(
+            backend,
+            FakeCappedGraph([
+                ['e1', 'a fact', 'a name', '2026-03-22T17:51:00', '2026-03-22T18:00:00'],
+            ]),
+        )
+        edges = await _edges_in_window(backend)
+        assert edges == [{
+            'uuid': 'e1',
+            'fact': 'a fact',
+            'name': 'a name',
+            'valid_at': '2026-03-22T17:51:00',
+            'invalid_at': '2026-03-22T18:00:00',
+        }]
