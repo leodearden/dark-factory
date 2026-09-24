@@ -869,9 +869,10 @@ _TICKET_ID_PREFIX = 'tkt_'
 
 
 class FlakeLedgerTaskClient(Protocol):
-    """The task-filing seam :func:`open_debt` needs to enforce §5.9 — declared
-    STRUCTURALLY (``typing.Protocol``) so it is machine-checked (INV-1) rather than
-    prose, and so no import edge is created to the module that satisfies it.
+    """The task seam :func:`open_debt` needs to enforce §5.9, and :func:`resolve_debt`
+    needs to corroborate a resolution — declared STRUCTURALLY (``typing.Protocol``) so
+    it is machine-checked (INV-1) rather than prose, and so no import edge is created to
+    the module that satisfies it.
 
     ``orchestrator/src/orchestrator/chronic_flake.py::SchedulerChronicFlakeTaskClient``
     is the concrete adapter.  It is NOT imported here, deliberately: this module depends
@@ -883,13 +884,14 @@ class FlakeLedgerTaskClient(Protocol):
     the opposite.)
 
     Every method must degrade rather than raise where it can, but the ledger does not
-    RELY on that — :func:`_ensure_owner_task` guards each call independently, because a
-    partial or older adapter (one lacking a method entirely, hence ``AttributeError``) is
-    a shape that really arrives.
+    RELY on that — :func:`_ensure_owner_task` and :func:`resolve_debt` guard each call
+    independently, because a partial or older adapter (one lacking a method entirely,
+    hence ``AttributeError``) is a shape that really arrives.
 
-    ``get_statuses`` goes further and reports its failure IN BAND, because degrading to
-    a bare ``{}`` is not a safe degrade at this seam: an empty mapping already MEANS
-    something here (see its docstring).
+    ``get_statuses`` and ``get_task`` go further and report their failures IN BAND,
+    because degrading to a bare ``{}`` or ``None`` is not a safe degrade at this seam:
+    an empty mapping and a missing task already MEAN something here (see their
+    docstrings).
     """
 
     async def submit_task(self, arguments: dict) -> str:
@@ -913,6 +915,21 @@ class FlakeLedgerTaskClient(Protocol):
         failure into ``{}`` is indistinguishable from a real absence at this seam, and
         the ledger will act on it — one duplicate de-flake task per suppression, for the
         length of the outage, with no rate limit to bound it.
+        """
+        ...
+
+    async def get_task(self, task_id: str) -> tuple[dict | None, Exception | None]:
+        """The task *task_id*, read LIVE, as a ``(task, error)`` pair that keeps failure
+        and absence machine-distinguishable (INV-1, the lesson of :meth:`get_statuses`):
+
+        - ``(task, None)`` — a task was read;
+        - ``(None, None)`` — a CORROBORATED ABSENCE: the server answered that no such
+          task exists;
+        - ``(None, exc)`` — a FAILED read: nothing is known about the task.
+
+        :func:`resolve_debt` stamps a resolution ONLY from a task it actually read, so
+        an absence and a failure both leave the cycle open; the pair is what lets its
+        log say which of the two happened.
         """
         ...
 
