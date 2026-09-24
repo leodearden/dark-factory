@@ -1327,6 +1327,17 @@ models:
   # Cache read is $0.25/Mtok (measured), so the swap premium is output + cache-create only.
   merger: claude-fable-5-1
 
+# Every role that runs Opus here drops effort max -> xhigh (Leo, 2026-09-24): early
+# reports on the newly released Opus show max burning many times the reasoning tokens
+# of xhigh for minimal improvement in results. This supersedes defaults.yaml's
+# eval-held architect max (task 2848). reviewer and steward already run Opus at high;
+# the merger runs Fable and keeps max. Hot-reloadable (green tier).
+effort:
+  architect: xhigh
+  implementer: xhigh
+  debugger: xhigh
+  deep_reviewer: xhigh
+
 # Model routing (Leo ruling D6, 2026-09-10; applied 2026-09-12). Admits claude-fable-5-1
 # for exactly two roles: the merger (via models.merger above) and the steward on its
 # second attempt (the steward rule below). The reviewer stays opus: the D5 campaign's
