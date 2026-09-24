@@ -165,7 +165,8 @@ def history_row_age(window_hours: float) -> float:
         raise NotReporting(
             f"STALE HISTORY ROW: the newest reading in {path} is {age:.1f}h old, "
             f"outside the {window_hours:g}h window, although {UNIT} reports a "
-            f"recent run; read commit-step= on the wrapper's 'done (...)' journal line"
+            f"recent successful run, so the census is aborting before it appends; "
+            f"look for ABORT in journalctl --user -u {UNIT} -n 100"
         )
     return age
 
