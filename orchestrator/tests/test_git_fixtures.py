@@ -3,15 +3,19 @@ from a freshly built one, to porcelain AND plumbing, and costs one git spawn.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import shlex
 import shutil
 import subprocess
+from collections.abc import Callable, Coroutine
 from pathlib import Path
+from typing import Any
 
 import pytest
 from _git_fixtures import README_SEED, RepoSeed, RepoTemplates, build_repo, seed_repo
 from _orch_helpers import git_env_with_ceiling
+from _workflow_helpers import _init_git_repo, _init_repo, _init_transcript_repo
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -194,3 +198,59 @@ def test_session_templates_live_under_this_runs_basetemp(
 ) -> None:
     basetemp = tmp_path_factory.getbasetemp().resolve()
     assert pristine_repo_templates.root.resolve().is_relative_to(basetemp)
+
+
+Seeder = Callable[[Path], Coroutine[Any, Any, None]]
+
+
+@pytest.mark.parametrize(('seeder', 'files', 'subject'), [
+    pytest.param(_init_git_repo, {'README.md': '# Test\n'}, 'init', id='_init_git_repo'),
+    pytest.param(
+        _init_repo,
+        {
+            'lib.py': 'def greet(name: str) -> str:\n    return f"Hello, {name}"\n',
+            'test_lib.py': (
+                'from lib import greet\n\ndef test_greet():\n'
+                '    assert greet("world") == "Hello, world"\n'
+            ),
+        },
+        'Initial commit',
+        id='_init_repo',
+    ),
+    pytest.param(
+        _init_transcript_repo,
+        {'lib.py': 'def greet(name): return name\n'},
+        'Initial commit',
+        id='_init_transcript_repo',
+    ),
+])
+class TestSharedWorkflowSeeders:
+    def test_seeds_the_legacy_contract(
+        self, seeder: Seeder, files: dict[str, str], subject: str, tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+
+        asyncio.run(seeder(repo))
+
+        assert _tracked_paths(repo) == set(files)
+        assert _worktree_files(repo) == files
+        assert _out(repo, 'log', '-1', '--format=%s') == subject
+        assert _out(repo, 'rev-list', '--count', 'HEAD') == '1'
+        assert _out(repo, 'symbolic-ref', 'HEAD') == 'refs/heads/main'
+        assert _out(repo, 'config', 'user.email') == 'test@test.com'
+        assert _out(repo, 'config', 'user.name') == 'Test'
+        assert _git(repo, 'diff-files', '--quiet').returncode == 0
+
+    def test_a_warm_call_costs_at_most_one_git_spawn(
+        self, seeder: Seeder, files: dict[str, str], subject: str,
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        (tmp_path / 'warm').mkdir()
+        asyncio.run(seeder(tmp_path / 'warm'))
+        log = _install_git_spawn_counter(monkeypatch, tmp_path / 'shim')
+        (tmp_path / 'measured').mkdir()
+
+        asyncio.run(seeder(tmp_path / 'measured'))
+
+        assert _spawns(log) <= 1
