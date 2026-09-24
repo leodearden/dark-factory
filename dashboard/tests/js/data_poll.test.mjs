@@ -54,6 +54,7 @@ const EXPECTED_FUNCTION_NAMES = [
   'pollKey',
   'datumFor',
   'requestOnDemand',
+  'onDemandView',
 ];
 
 // Full DF_DATA key set (data.js:41-127) — initialised so the first render
@@ -2166,4 +2167,123 @@ test('outcomes: the poll loop ignores them — refreshDFData still resolves to u
     deps: { fetchImpl: okResponse({}), now: () => 1 },
   });
   assert.equal(result, undefined);
+});
+
+// ---------------------------------------------------------------------------
+// taskProse — the Task Detail pane's description/details, fetched per selection
+//
+// The ACTIVE_TASKS rows no longer carry either field (task 5815); the pane asks
+// for the ONE selected task through the same on-demand seam the terminal row
+// uses. The row is addressed by the row's own uid (`<project>/T-<id>`), whose
+// segments are encoded one by one so the '/' between them stays a path
+// separator. PLAIN, not DATUM: prose is not a measurement.
+// ---------------------------------------------------------------------------
+
+const TASK_PROSE_PREFIX = '/api/v2/dashboard/task/';
+const PROSE_UID = 'dark-factory/T-19';
+const PROSE_KEY = `TASK_PROSE:${PROSE_UID}`;
+// Stated as a literal, not built from the row, for the same reason as
+// TERMINAL_STATE_KEY: the isolation is pinned against an expectation.
+const PROSE_STATE_KEY = '/api/v2/dashboard/task/dark-factory/T-19#taskProse:dark-factory/T-19';
+const SERVED_PROSE = Object.freeze({ description: 'why', details: 'how' });
+
+// Answers under the key rebuilt from the DECODED url, so the fixture cannot
+// hard-code the key the implementation is supposed to build.
+function taskProseResponse(prose = SERVED_PROSE) {
+  return url => {
+    const uid = url.slice(TASK_PROSE_PREFIX.length).split('/').map(decodeURIComponent).join('/');
+    return Promise.resolve({ ok: true, json: async () => ({ [`TASK_PROSE:${uid}`]: prose }) });
+  };
+}
+
+test('taskProse: the row builds a per-segment-encoded url, a TASK_PROSE key, and a plain spec', () => {
+  const { api } = loadDataJs();
+  const row = api.ON_DEMAND_KEYS.taskProse;
+
+  assert.ok(row, 'ON_DEMAND_KEYS.taskProse must be declared');
+  assert.equal(typeof row.url, 'function', 'the row must BUILD its url, not carry a template string');
+  assert.equal(typeof row.key, 'function', 'the row must BUILD its key, not carry a template string');
+  assert.equal(row.url(PROSE_UID), '/api/v2/dashboard/task/dark-factory/T-19');
+  const hostile = row.url('my proj#1/T-7');
+  assert.equal(hostile, '/api/v2/dashboard/task/my%20proj%231/T-7');
+  assert.ok(!/[ #?]/.test(hostile), `the encoded uid leaked a delimiter: ${hostile}`);
+  assert.equal(row.key(PROSE_UID), PROSE_KEY);
+  assert.equal(row.spec.kind, 'plain', 'prose is not a measurement, so it is not a Datum');
+});
+
+test('taskProse: one request, one fetch, the body value stored verbatim, under its own state key only', async () => {
+  const { api, window: win } = loadDataJs();
+  const state = api.createPollState();
+  const fetchUrls = [];
+  const inner = taskProseResponse();
+  const deps = { fetchImpl: url => { fetchUrls.push(url); return inner(url); }, now: () => 31 };
+
+  const outcome = await api.requestOnDemand('taskProse', PROSE_UID, { state, deps });
+
+  assert.equal(outcome, api.REFRESH_OUTCOMES.applied);
+  assert.deepEqual(fetchUrls, ['/api/v2/dashboard/task/dark-factory/T-19'], 'exactly one fetch, to the built url');
+  assert.equal(win.DF_DATA[PROSE_KEY], SERVED_PROSE, 'a plain value is stored as served, with no envelope');
+  assert.deepEqual([...state.keys()], [PROSE_STATE_KEY], 'flow control must live under the request\'s OWN key only');
+  assert.deepEqual(Object.keys(win.DF_DATA.__stale), [PROSE_STATE_KEY], 'staleness must live under the request\'s OWN key only');
+  assert.equal(state.get(TASKS_PATH), undefined, 'a prose request took over the POLLED tasks entry');
+  assert.equal(win.DF_DATA.__stale[TASKS_PATH], undefined, "a prose request wrote the polled tasks endpoint's __stale");
+});
+
+// ---------------------------------------------------------------------------
+// onDemandView — what a waiting caller shows, given the value and its outcome
+//
+// A pure decision beside REFRESH_OUTCOMES, because what each outcome MEANS to a
+// caller waiting on a value is knowledge of the outcome vocabulary: a value in
+// hand is shown whatever the latest attempt did; `null` (the caller's own
+// request has not settled) and skippedInFlight (someone else's request is still
+// coming) are both worth waiting for; anything else means nothing is coming.
+// ---------------------------------------------------------------------------
+
+test('onDemandView: the view vocabulary is a closed, frozen set', () => {
+  const { api } = loadDataJs();
+
+  assert.deepEqual(api.ON_DEMAND_VIEWS, { ready: 'ready', loading: 'loading', unavailable: 'unavailable' });
+  assert.ok(Object.isFrozen(api.ON_DEMAND_VIEWS));
+});
+
+test('onDemandView: a value in hand is ready whatever the latest attempt did, a failure included', () => {
+  const { api } = loadDataJs();
+  const O = api.REFRESH_OUTCOMES;
+
+  for (const outcome of [null, O.applied, O.failed, O.skippedInFlight, O.skippedBackoff]) {
+    assert.equal(
+      api.onDemandView(SERVED_PROSE, outcome), api.ON_DEMAND_VIEWS.ready,
+      `a fetched value must survive outcome ${outcome}`,
+    );
+  }
+  assert.equal(
+    api.onDemandView({ description: '', details: '' }, O.failed), api.ON_DEMAND_VIEWS.ready,
+    'empty prose is still an answer, not an absence',
+  );
+});
+
+test('onDemandView: with no value, an unsettled or in-flight request is loading', () => {
+  const { api } = loadDataJs();
+
+  for (const absent of [undefined, null]) {
+    assert.equal(api.onDemandView(absent, null), api.ON_DEMAND_VIEWS.loading, 'own request not settled yet');
+    assert.equal(
+      api.onDemandView(absent, api.REFRESH_OUTCOMES.skippedInFlight), api.ON_DEMAND_VIEWS.loading,
+      "another caller's request is still coming",
+    );
+  }
+});
+
+test('onDemandView: with no value, a settled request that brought none is unavailable', () => {
+  const { api } = loadDataJs();
+  const O = api.REFRESH_OUTCOMES;
+
+  for (const absent of [undefined, null]) {
+    for (const outcome of [O.failed, O.skippedBackoff, O.applied]) {
+      assert.equal(
+        api.onDemandView(absent, outcome), api.ON_DEMAND_VIEWS.unavailable,
+        `nothing is coming after outcome ${outcome}`,
+      );
+    }
+  }
 });
