@@ -109,6 +109,11 @@ class _FakeLedgerTaskClient:
     reports) and *statuses_raises* (a partial/older adapter that raises instead) mirror
     test_flake_ledger.py's ``_FakeTaskClient`` so the two doubles of one Protocol
     degrade identically.
+
+    ``get_task`` (task η) reads the SAME status map, so a task's live status agrees
+    across both reads; a ``done`` task carries ``metadata.done_provenance`` naming its
+    entry in *commits*, when it has one.  An unknown id is a corroborated absence,
+    ``(None, None)``.
     """
 
     def __init__(
@@ -117,18 +122,21 @@ class _FakeLedgerTaskClient:
         submit_raises: BaseException | None = None,
         status_after_submit: str = 'pending',
         statuses: dict[str, str] | None = None,
+        commits: dict[str, str] | None = None,
         statuses_error: Exception | None = None,
         statuses_raises: BaseException | None = None,
         order: list[str] | None = None,
     ) -> None:
         self.submit_calls: list[dict] = []
         self.statuses_calls: list[list[str]] = []
+        self.task_calls: list[str] = []
         self.commit_calls: list[list[str]] = []
         self.order: list[str] = order if order is not None else []
         self._n = 0
         self._submit_raises = submit_raises
         self._status_after_submit = status_after_submit
         self._statuses: dict[str, str] = dict(statuses or {})
+        self._commits: dict[str, str] = dict(commits or {})
         self._statuses_error = statuses_error
         self._statuses_raises = statuses_raises
 
@@ -155,25 +163,22 @@ class _FakeLedgerTaskClient:
             self._statuses_error,
         )
 
+    async def get_task(self, task_id: str) -> tuple[dict | None, Exception | None]:
+        self.order.append('get_task')
+        self.task_calls.append(task_id)
+        if task_id not in self._statuses:
+            return None, None
+        status = self._statuses[task_id]
+        metadata: dict = {}
+        if status == 'done' and task_id in self._commits:
+            metadata = {
+                'done_provenance': {'kind': 'merged', 'commit': self._commits[task_id]},
+            }
+        return {'id': task_id, 'status': status, 'metadata': metadata}, None
+
     async def commit_planning(self, task_ids: list[str]) -> None:
         self.order.append('commit_planning')
         self.commit_calls.append(list(task_ids))
-
-
-class _ReportsEveryTaskDone(_FakeLedgerTaskClient):
-    """Every task reads back live ``done``, its fix merged as *commit* — the owner state
-    in which η's ``resolve_debt`` closes a cycle (it reads the commit, never takes it)."""
-
-    def __init__(self, commit: str) -> None:
-        super().__init__()
-        self._commit = commit
-
-    async def get_task(self, task_id: str) -> tuple[dict | None, Exception | None]:
-        return {
-            'id': task_id,
-            'status': 'done',
-            'metadata': {'done_provenance': {'kind': 'merged', 'commit': self._commit}},
-        }, None
 
 
 @pytest.fixture(autouse=True)
@@ -633,7 +638,10 @@ class TestRecordOpensDebt:
         db = ledger_db_path(tmp_path)
         await _record(_result(_suppression(test_ids=(ids[0],))), tmp_path, task_client=client)
         assert await resolve_debt(
-            db, _PROJECT_ID, ids[0], task_client=_ReportsEveryTaskDone('f' * 40),
+            db, _PROJECT_ID, ids[0],
+            task_client=_FakeLedgerTaskClient(
+                statuses={'deflake-1': 'done'}, commits={'deflake-1': 'f' * 40},
+            ),
         )
         seeded = read_debt(db, ids[0])
         assert seeded is not None and seeded.resolved_at and seeded.owner_task_id

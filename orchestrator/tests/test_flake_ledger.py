@@ -2142,10 +2142,16 @@ class TestOpenDebtRecorroboratesTheOwner:
         assert _owner(db_path, self.TEST_ID) == 'task-901'
         assert row is not None and row.owner_task_id == 'task-901'
 
-    @pytest.mark.parametrize('status', ['done', 'cancelled'])
-    async def test_a_terminal_owner_is_replaced(self, tmp_path: Path, status: str) -> None:
+    @pytest.mark.parametrize(('status', 'open_count'), [('done', 2), ('cancelled', 1)])
+    async def test_a_terminal_owner_is_replaced(
+        self, tmp_path: Path, status: str, open_count: int
+    ) -> None:
         """The enforcement half: a debt row whose owner went terminal owes a NEW task,
-        or the ledger accumulates rows nothing is responsible for."""
+        or the ledger accumulates rows nothing is responsible for.
+
+        Since task η the two terminal states differ in WHICH cycle the new task owns: a
+        ``done`` owner closed its cycle, so this suppression is a re-entry
+        (``open_count`` 2); a ``cancelled`` one landed no fix, so it is the same cycle."""
         from orchestrator.flake_ledger import open_debt
 
         db_path = tmp_path / 'runs.db'
@@ -2160,6 +2166,7 @@ class TestOpenDebtRecorroboratesTheOwner:
         assert client.commit_calls == [['task-902']]
         assert _owner(db_path, self.TEST_ID) == 'task-902'
         assert row is not None and row.owner_task_id == 'task-902'
+        assert row.open_count == open_count
 
     @pytest.mark.parametrize(
         'statuses', [{}, {'some-other-task': 'pending'}], ids=['empty', 'other_ids_only']
@@ -2216,7 +2223,7 @@ class TestOpenDebtRecorroboratesTheOwner:
         'statuses',
         [
             {'task-901': 'pending'},
-            {'task-901': 'done'},
+            {'task-901': 'cancelled'},
             {'task-901': 'deferred'},
             {},
         ],
@@ -2228,7 +2235,11 @@ class TestOpenDebtRecorroboratesTheOwner:
         """THE point of B8, asserted in every branch: a live read really happens, on the
         stored id, exactly once.  Without this, an implementation that short-circuited
         on a non-NULL ``owner_task_id`` would pass the dedup case above and silently
-        fail the two that matter."""
+        fail the two that matter.
+
+        The terminal branch is ``cancelled``: a ``done`` owner is read live by η's
+        resolution instead, and the re-entry that follows discharges it, so ζ has no
+        stored owner left to corroborate (:class:`TestOpenDebtClosesAFinishedCycle`)."""
         from orchestrator.flake_ledger import open_debt
 
         db_path = tmp_path / 'runs.db'
@@ -2239,7 +2250,144 @@ class TestOpenDebtRecorroboratesTheOwner:
 
         assert client.statuses_calls == [['task-901']]
         # ...and it is consulted BEFORE anything is filed, not as an afterthought.
-        assert client.calls[0] == 'get_statuses'
+        filed_at = client.calls.index('submit_task') if 'submit_task' in client.calls else None
+        assert filed_at is None or client.calls.index('get_statuses') < filed_at, client.calls
+
+
+@pytest.mark.asyncio
+class TestOpenDebtClosesAFinishedCycle:
+    """``open_debt`` closes the current cycle FIRST when its owner is live-done — the
+    production call site of ``resolve_debt`` (task η).  ASYNC-ONLY CLASS.
+
+    The ledger learns the owner finished at the next suppression of the same test, which
+    is exactly when it matters.  ``owner_task_id`` changes only inside ``open_debt``, so
+    the done owner is still on the row when the recurrence arrives; closing first turns
+    it into a RE-ENTRY that cites the fix, where ζ alone would quietly file a
+    replacement with ``open_count`` stuck at 1 — the invisible chain of de-flake tasks.
+    """
+
+    NOW = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    LATER = datetime(2026, 8, 6, 13, 0, tzinfo=UTC)
+    TEST_ID = 'tests/test_a.py::test_one'
+    COMMIT = 'c0ffee' + '0' * 34
+
+    @staticmethod
+    def _raw(db_path: Path) -> dict:
+        (raw,) = _rows(db_path, 'SELECT * FROM flake_debt')
+        return raw
+
+    async def test_a_done_owner_turns_the_recurrence_into_a_re_entry(
+        self, tmp_path: Path
+    ) -> None:
+        """(a) The cycle task-901 fixed is closed at THIS observation and re-entered by
+        it: ``prior_resolved_at`` and the new ``opened_at`` are both this call's instant,
+        because the ledger records the resolution when it SAW it (§5.4).  The new cycle
+        gets its own owner."""
+        from orchestrator.flake_ledger import open_debt, read_debt
+
+        db_path = tmp_path / 'runs.db'
+        await _open_owned_debt(db_path, self.TEST_ID, now=self.NOW)
+        client = _FakeTaskClient(
+            tasks={'task-901': _done_task('task-901', self.COMMIT)}, submit_returns='task-902'
+        )
+
+        row = await open_debt(
+            db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.LATER
+        )
+
+        raw = self._raw(db_path)
+        assert row is not None and row == read_debt(db_path, self.TEST_ID)
+        assert row.open_count == raw['open_count'] == 2
+        assert row.resolved_at is None and raw['resolved_at'] is None
+        assert raw['prior_resolving_commit'] == self.COMMIT
+        assert raw['prior_resolved_at'] == raw['opened_at'] == self.LATER.isoformat()
+        assert row.owner_task_id == raw['owner_task_id'] == 'task-902'
+        assert len(client.submit_calls) == 1
+
+    async def test_a_cancelled_owner_is_replaced_not_resolved(self, tmp_path: Path) -> None:
+        """(b) A cancelled task landed no fix, so it never manufactures a regression:
+        the cycle stays the same one, and ζ's replacement still happens."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await _open_owned_debt(db_path, self.TEST_ID, now=self.NOW)
+        client = _FakeTaskClient(statuses={'task-901': 'cancelled'}, submit_returns='task-902')
+
+        await open_debt(db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.LATER)
+
+        raw = self._raw(db_path)
+        assert raw['open_count'] == 1
+        assert raw['prior_resolved_at'] is None
+        assert raw['prior_resolving_commit'] is None
+        assert raw['owner_task_id'] == 'task-902'
+        assert len(client.submit_calls) == 1
+
+    async def test_a_live_owner_makes_a_plain_repeat(self, tmp_path: Path) -> None:
+        """(c) The owner is still working on it: no resolution, no filing."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await _open_owned_debt(db_path, self.TEST_ID, now=self.NOW)
+        client = _FakeTaskClient(statuses={'task-901': 'pending'})
+
+        await open_debt(db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.LATER)
+
+        raw = self._raw(db_path)
+        assert raw['open_count'] == 1
+        assert raw['resolved_at'] is None
+        assert raw['owner_task_id'] == 'task-901'
+        assert client.submit_calls == []
+
+    async def test_an_unwired_call_is_alphas_repeat(self, tmp_path: Path) -> None:
+        """(d) With no client there is no live read: the row changes exactly as α's
+        repeat changed it, only ``last_occurrence_at`` advancing."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await _open_owned_debt(db_path, self.TEST_ID, now=self.NOW)
+        before = self._raw(db_path)
+
+        await open_debt(db_path, 'dark_factory', self.TEST_ID, now=self.LATER)
+
+        assert self._raw(db_path) == {**before, 'last_occurrence_at': self.LATER.isoformat()}
+
+    @pytest.mark.parametrize(
+        'kwargs',
+        [{'task_error': RuntimeError('mcp down')}, {'task_raises': RuntimeError('mcp unreachable')}],
+        ids=['in_band_error', 'raises'],
+    )
+    async def test_an_unreadable_owner_costs_only_the_resolution(
+        self, tmp_path: Path, kwargs: dict
+    ) -> None:
+        """(e) A failed corroboration costs the resolution, never the observation: the
+        occurrence is still upserted and the row returned."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await _open_owned_debt(db_path, self.TEST_ID, now=self.NOW)
+        client = _FakeTaskClient(statuses={'task-901': 'pending'}, **kwargs)
+
+        row = await open_debt(
+            db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.LATER
+        )
+
+        assert row is not None and row.open_count == 1
+        raw = self._raw(db_path)
+        assert raw['last_occurrence_at'] == self.LATER.isoformat()
+        assert raw['open_count'] == 1
+        assert raw['resolved_at'] is None
+
+    async def test_the_resolution_read_comes_first(self, tmp_path: Path) -> None:
+        """(f) The owner is read for resolution BEFORE ζ corroborates it or files."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await _open_owned_debt(db_path, self.TEST_ID, now=self.NOW)
+        client = _FakeTaskClient(statuses={'task-901': 'cancelled'}, submit_returns='task-902')
+
+        await open_debt(db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.LATER)
+
+        assert client.calls == ['get_task', 'get_statuses', 'submit_task', 'commit_planning']
 
 
 @pytest.mark.asyncio
@@ -3771,7 +3919,11 @@ class TestOpenDebtOwnerClaimIsConditional:
     ) -> None:
         """REPLACEMENT filing (a corroborated-terminal owner), rival re-points the row
         mid-await.  Same rule, guarded on the id this call actually corroborated rather
-        than on NULL: what is there now was corroborated by nobody here."""
+        than on NULL: what is there now was corroborated by nobody here.
+
+        ``cancelled``, because that is the terminal state that still reaches a
+        replacement: a ``done`` owner's cycle is closed and re-entered first (task η),
+        which discharges the owner and makes the filing a FRESH claim."""
         from orchestrator.flake_ledger import open_debt
 
         db_path = tmp_path / 'runs.db'
@@ -3784,14 +3936,14 @@ class TestOpenDebtOwnerClaimIsConditional:
             test_id=self.TEST_ID,
             rival_owner='task-winner',
             submit_returns='task-loser',
-            statuses={'task-stale': 'done'},
+            statuses={'task-stale': 'cancelled'},
         )
         with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
             await open_debt(
                 db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.LATER
             )
 
-        assert client.calls == ['get_statuses', 'submit_task'], client.calls
+        assert client.calls == ['get_task', 'get_statuses', 'submit_task'], client.calls
         assert _owner(db_path, self.TEST_ID) == 'task-winner'
         _assert_logged_loudly(caplog)
         assert 'task-loser' in caplog.text
@@ -3819,7 +3971,10 @@ class TestOpenDebtOwnerClaimIsConditional:
             db_path, 'dark_factory', self.TEST_ID, task_client=follow_up, now=self.LATER
         )
 
-        assert follow_up.calls == ['get_statuses'], follow_up.calls
+        # Two live reads of the winner — η's resolution check, then ζ's corroboration —
+        # and no filing.
+        assert follow_up.calls == ['get_task', 'get_statuses'], follow_up.calls
+        assert follow_up.task_calls == ['task-winner']
         assert follow_up.statuses_calls == [['task-winner']]
         assert _owner(db_path, self.TEST_ID) == 'task-winner'
 
@@ -3885,7 +4040,9 @@ class TestOpenDebtOwnerClaimIsConditional:
             await open_debt(
                 db_path, 'dark_factory', self.TEST_ID,
                 task_client=_FakeTaskClient(
-                    submit_returns='task-902', statuses={'task-901': 'done'},
+                    # `cancelled`: the terminal state that still takes the REPLACEMENT
+                    # path; a `done` owner is resolved and discharged first (task η).
+                    submit_returns='task-902', statuses={'task-901': 'cancelled'},
                 ),
                 now=self.LATER,
             )
@@ -4103,8 +4260,44 @@ class TestOpenDebtOverTheRealAdapter:
                 now=self.LATER + timedelta(hours=hour),
             )
 
-        assert scheduler.dispatched == ['get_statuses'] * 10
+        # Two failed live reads per suppression (η's resolution check, ζ's
+        # corroboration) and not one filing.
+        assert scheduler.dispatched == ['get_task', 'get_statuses'] * 10
         assert _owner(db_path, self.TEST_ID) == 'task-901'
+
+    async def test_a_done_owner_is_resolved_through_the_real_adapter(
+        self, tmp_path: Path
+    ) -> None:
+        """(e) η's lazy close over the composed path.  The owner's done task arrives in
+        the production JSON-RPC body, and the commit inside it is what the re-entered
+        cycle carries forward — a seam defect between ``_extract_task`` and
+        ``resolve_debt`` passes every fake-driven test and fails here."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await self._seed(db_path)
+        commit = 'c0ffee' + '0' * 34
+        scheduler = _RoutingStubScheduler(
+            {
+                'get_task': _done_task('task-901', commit),
+                'submit_task': {'task_id': 'task-902'},
+                'commit_planning': {'success': True},
+            }
+        )
+
+        row = await open_debt(
+            db_path,
+            'dark_factory',
+            self.TEST_ID,
+            task_client=self._client(scheduler),
+            now=self.LATER,
+        )
+
+        assert scheduler.dispatched == ['get_task', 'submit_task', 'commit_planning']
+        assert row is not None
+        assert row.open_count == 2
+        assert row.prior_resolving_commit == commit
+        assert _owner(db_path, self.TEST_ID) == 'task-902'
 
 
 @pytest.mark.parametrize('make_path', _FAULTS, ids=['blocked_dir', 'corrupt_file'])
@@ -4229,6 +4422,11 @@ class TestOneConnectionPerCall:
     the docstring used to claim a flat ONE while exercising only the unwired path, which
     is how a THIRD connection (a re-read of the row after the claim) sat here unnoticed.
 
+    Task η adds a PRE-READ to the wired path, making it THREE: ``open_debt`` first asks
+    ``resolve_debt`` whether the stored owner finished, and that read cannot share the
+    upsert's connection because the owner's live read — a network await — sits between
+    them.  A FOURTH would still mean the post-claim re-read is back.
+
     ``resolve_debt`` (task η) is the one entry point whose READ needs a connection of its
     own.  Its row read and its compare-and-set stamp straddle a network await — the
     owner's live ``get_task`` — so they cannot share a transaction, and holding one
@@ -4252,16 +4450,17 @@ class TestOneConnectionPerCall:
         assert row is not None
         assert row.test_id == self.TEST_ID
 
-    async def test_open_debt_with_an_owner_opens_two_connections(
+    async def test_open_debt_with_an_owner_opens_three_connections(
         self, tmp_path: Path, monkeypatch
     ) -> None:
         """The OWNED path — the one the class's flat "exactly ONE" claim never covered.
 
-        TWO is the floor, not a tolerance: the upsert must commit before the filing is
-        awaited (a lost filing must leave the row, not lose it), and the owner claim is
-        decided only afterwards.  A THIRD would mean the re-read is back — and with it
-        ``read_debt``'s present-vs-absent conflation, which is why this counts rather
-        than merely observing that the owner landed."""
+        THREE is the floor, not a tolerance: η's resolution pre-read must finish before
+        the upsert (a done owner's cycle closes first), the upsert must commit before the
+        filing is awaited (a lost filing must leave the row, not lose it), and the owner
+        claim is decided only afterwards.  A FOURTH would mean the re-read is back — and
+        with it ``read_debt``'s present-vs-absent conflation, which is why this counts
+        rather than merely observing that the owner landed."""
         from orchestrator.flake_ledger import open_debt
 
         db_path = tmp_path / 'runs.db'
@@ -4271,7 +4470,10 @@ class TestOneConnectionPerCall:
             db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.NOW
         )
 
-        assert len(opened) == 2, f'expected 2 connections (upsert + owner claim), got {len(opened)}'
+        assert len(opened) == 3, (
+            f'expected 3 connections (resolution pre-read + upsert + owner claim), '
+            f'got {len(opened)}'
+        )
         assert row is not None and row.owner_task_id == 'task-901'
         assert _owner(db_path, self.TEST_ID) == 'task-901'
 
