@@ -2334,7 +2334,11 @@ class TestResolveDebt:
 
     async def test_the_resolved_row_is_retained(self, tmp_path: Path) -> None:
         """§5.2: resolved rows are kept DELIBERATELY because η's recurrence trigger
-        reads them.  Deleting one here would silently disarm class 2(a)."""
+        reads them.  Deleting one here would silently disarm class 2(a).
+
+        The owner is retained too: a resolution alone does not clear it (the row still
+        names the task that closed the cycle, which ``flake_recorder._unowned_first``
+        reads).  Only a RE-ENTRY discharges it — :class:`TestReEntryDischargesTheOwner`."""
         from orchestrator.flake_ledger import read_debt
 
         db_path = tmp_path / 'runs.db'
@@ -2345,6 +2349,7 @@ class TestResolveDebt:
         row = read_debt(db_path, self.TEST_ID)
         assert row is not None
         assert row.resolved_at == self.LATER.isoformat()
+        assert row.owner_task_id == 'task-901'
 
     async def test_resolution_removes_the_row_from_the_open_set(self, tmp_path: Path) -> None:
         """Resolution's observable effect: it disappears from ``list_open_debt`` while
@@ -2823,6 +2828,141 @@ class TestDebtReEntry:
         assert row.prior_resolved_at == self.T3.isoformat()
         assert row.prior_resolving_commit == 'f00d'
         assert row.opened_at == self.T4.isoformat()
+
+
+@pytest.mark.asyncio
+class TestReEntryDischargesTheOwner:
+    """A re-entry DISCHARGES the resolved cycle's owner (task η).  ASYNC-ONLY CLASS.
+
+    The task that closed the last cycle is not responsible for the new one.  Left on the
+    re-opened row it would still read back ``done``, so a ``resolve_debt`` whose live
+    read straddled the re-entry (a concurrent lane's lazy close) could compare-and-set
+    on it and close a cycle that task never worked on: a phantom cycle, ``open_count``
+    +2, and a second, false regression L2.  With the column NULL, ζ's fresh-claim path
+    gives the new cycle an owner of its own.
+    """
+
+    T0 = datetime(2026, 8, 6, 10, 0, tzinfo=UTC)
+    T1 = datetime(2026, 8, 6, 11, 0, tzinfo=UTC)
+    T2 = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    T3 = datetime(2026, 8, 6, 13, 0, tzinfo=UTC)
+    TEST_ID = 'tests/test_a.py::test_one'
+    COMMIT = 'c0ffee' + '0' * 34
+
+    async def _own_and_resolve(self, db_path: Path) -> None:
+        """Cycle 1: owned by task-901, closed at T1 because task-901 is done."""
+        await _open_owned_debt(db_path, self.TEST_ID, now=self.T0)
+        assert await _resolve_as_done(db_path, self.TEST_ID, commit=self.COMMIT, now=self.T1)
+
+    @staticmethod
+    def _raw(db_path: Path) -> dict:
+        (raw,) = _rows(db_path, 'SELECT * FROM flake_debt')
+        return raw
+
+    async def test_a_re_entry_clears_the_owner_and_carries_the_rest(self, tmp_path: Path) -> None:
+        """(a) Unwired, so nothing refills the column: the owner is gone, while the
+        carry-forward the L2 cites survives the re-open verbatim."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await self._own_and_resolve(db_path)
+
+        await open_debt(db_path, 'dark_factory', self.TEST_ID, now=self.T2)
+
+        raw = self._raw(db_path)
+        assert raw['owner_task_id'] is None
+        assert raw['open_count'] == 2
+        assert raw['prior_resolving_commit'] == self.COMMIT
+        assert raw['prior_resolved_at'] == self.T1.isoformat()
+
+    async def test_a_repeat_keeps_the_owner(self, tmp_path: Path) -> None:
+        """(b) The clearing is RE-ENTRY-ONLY: a repeat inside an open cycle is the same
+        cycle, still that owner's responsibility."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await _open_owned_debt(db_path, self.TEST_ID, now=self.T0)
+
+        await open_debt(db_path, 'dark_factory', self.TEST_ID, now=self.T1)
+
+        raw = self._raw(db_path)
+        assert raw['owner_task_id'] == 'task-901'
+        assert raw['open_count'] == 1
+
+    async def test_the_discharged_owner_cannot_close_the_new_cycle(self, tmp_path: Path) -> None:
+        """(c) task-901 still reads back done, but it closed the LAST cycle; the new one
+        stays open and is not counted twice."""
+        from orchestrator.flake_ledger import open_debt, resolve_debt
+
+        db_path = tmp_path / 'runs.db'
+        await self._own_and_resolve(db_path)
+        await open_debt(db_path, 'dark_factory', self.TEST_ID, now=self.T2)
+        client = _FakeTaskClient(tasks={'task-901': _done_task('task-901', self.COMMIT)})
+
+        assert (
+            await resolve_debt(
+                db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.T3
+            )
+            is False
+        )
+
+        raw = self._raw(db_path)
+        assert raw['resolved_at'] is None
+        assert raw['open_count'] == 2
+
+    async def test_a_live_read_straddling_a_re_entry_cannot_close_the_new_cycle(
+        self, tmp_path: Path
+    ) -> None:
+        """(c) The race the discharge exists for.  This lane reads the row (open, owned
+        by task-901) and awaits task-901's live status; meanwhile another lane closes the
+        cycle and re-enters it.  task-901 still reads back done, but no longer owns the
+        row, so this lane's compare-and-set must miss rather than close the cycle the
+        other lane just opened."""
+        from orchestrator.flake_ledger import open_debt, resolve_debt
+
+        db_path = tmp_path / 'runs.db'
+        test_id, commit = self.TEST_ID, self.COMMIT
+        other_lane_resolves_at, other_lane_reenters_at = self.T1, self.T2
+        await _open_owned_debt(db_path, test_id, now=self.T0)
+
+        class _AnotherLaneReEntersMeanwhile(_FakeTaskClient):
+            async def get_task(self, task_id: str) -> tuple[dict | None, Exception | None]:
+                assert await _resolve_as_done(
+                    db_path, test_id, commit=commit, now=other_lane_resolves_at
+                )
+                await open_debt(db_path, 'dark_factory', test_id, now=other_lane_reenters_at)
+                return await super().get_task(task_id)
+
+        client = _AnotherLaneReEntersMeanwhile(tasks={'task-901': _done_task('task-901', commit)})
+
+        assert (
+            await resolve_debt(db_path, 'dark_factory', test_id, task_client=client, now=self.T3)
+            is False
+        )
+
+        raw = self._raw(db_path)
+        assert raw['resolved_at'] is None, 'the new cycle was closed by the old owner'
+        assert raw['open_count'] == 2
+
+    async def test_a_wired_re_entry_files_a_fresh_owner(self, tmp_path: Path) -> None:
+        """(d) With a client wired, the re-entered cycle gets its OWN owner through ζ's
+        fresh claim — there is no stored owner left to corroborate, so ``get_statuses``
+        is never consulted and the claim is taken on the NULL column."""
+        from orchestrator.flake_ledger import open_debt, read_debt
+
+        db_path = tmp_path / 'runs.db'
+        await self._own_and_resolve(db_path)
+        client = _FakeTaskClient(statuses={'task-901': 'done'}, submit_returns='task-902')
+
+        row = await open_debt(
+            db_path, 'dark_factory', self.TEST_ID, task_client=client, now=self.T2
+        )
+
+        assert client.calls == ['submit_task', 'commit_planning'], client.calls
+        assert row is not None and row.owner_task_id == 'task-902'
+        stored = read_debt(db_path, self.TEST_ID)
+        assert stored is not None and stored.owner_task_id == 'task-902'
+        assert stored.open_count == 2
 
 
 def _seed_debt_raw(
