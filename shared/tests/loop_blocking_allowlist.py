@@ -138,46 +138,6 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         ' Ticket: tkt_0RT7QZ4R9MQHJP4MKS78DXQ2Z9.',
     ),
 
-    # ---- middleware/task_curator.py ----
-    (
-        'fused-memory/src/fused_memory/middleware/task_curator.py',
-        'TaskCurator._maybe_blocklist_drop',
-        '8e71fbf93a3e',
-        'to_file',
-        'ROOT CAUSE (one defect, 2 rows): the two SIBLING async def '
-        '_maybe_* guards in this file lazily load a YAML registry off disk '
-        'on the loop thread with no asyncio.to_thread hop -- '
-        '_maybe_blocklist_drop -> load_blocklist '
-        '(cancelled_premise_blocklist.read_text + yaml.safe_load) and '
-        '_maybe_route_deterministic -> load_operational_registry '
-        '(operational_ask_registry.read_text + yaml.safe_load). Identical '
-        'shape to the two task 4201 owns, three lines apart, under the same '
-        'curator write lock -- and NEITHER had a task filed before task '
-        '4484 found them, which is the concrete cost of task 3778\'s '
-        'definition-side census. Follow-up filed by task 4484 step-9 (one '
-        'task: one shape, one file, and 4201 already owns the sibling).'
-        ' Ticket: tkt_0RT7QW5E7RQ3FHF2HQ0BRC6MH0.',
-    ),
-    (
-        'fused-memory/src/fused_memory/middleware/task_curator.py',
-        'TaskCurator._maybe_route_deterministic',
-        '0f0498be8607',
-        'to_file',
-        'ROOT CAUSE (one defect, 2 rows): the two SIBLING async def '
-        '_maybe_* guards in this file lazily load a YAML registry off disk '
-        'on the loop thread with no asyncio.to_thread hop -- '
-        '_maybe_blocklist_drop -> load_blocklist '
-        '(cancelled_premise_blocklist.read_text + yaml.safe_load) and '
-        '_maybe_route_deterministic -> load_operational_registry '
-        '(operational_ask_registry.read_text + yaml.safe_load). Identical '
-        'shape to the two task 4201 owns, three lines apart, under the same '
-        'curator write lock -- and NEITHER had a task filed before task '
-        '4484 found them, which is the concrete cost of task 3778\'s '
-        'definition-side census. Follow-up filed by task 4484 step-9 (one '
-        'task: one shape, one file, and 4201 already owns the sibling).'
-        ' Ticket: tkt_0RT7QW5E7RQ3FHF2HQ0BRC6MH0.',
-    ),
-
     # ---- middleware/ticket_janitor.py ----
     (
         'fused-memory/src/fused_memory/middleware/ticket_janitor.py',
