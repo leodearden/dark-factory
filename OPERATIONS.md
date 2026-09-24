@@ -1698,6 +1698,27 @@ Slots are staggered deliberately: these jobs share one machine and, in two
 cases, the same backing stores. **Check this table before adding a job** —
 04:00 is already double-booked.
 
+**A row here is a claim about the host, not about `scripts/`.** An installer
+committed to main installs nothing; only running it does. So a timer job is
+done when its timer is listed, not when its installer lands. The check is one
+command: `systemctl --user list-timers --all` must list an instance for every
+row, which for a templated `@` unit means one `@<project_id>` instance per
+project. An agent cannot run the installer, because `~/.config/systemd/user/`
+is outside the sandbox write-set
+(`orchestrator/src/orchestrator/agents/write_set.py`). The deploy is therefore
+a `task_kind='deterministic'` `before_done` task, one per project, paired with
+a liveness predicate so that a timer which stops firing is loud. Two rows were
+false when measured on 2026-09-24:
+
+- `legibility-transcript-check@.timer` sat here from task 2901 (2026-07-22)
+  while `systemctl --user list-unit-files` had no such unit, so the detector
+  behind it never ran. 2901 closed with `done_provenance.kind='found_on_main'`:
+  reconciliation saw the branch on main and closed the task, and the deploy
+  half was neither executed nor filed as a successor. Task 4557 deploys it.
+- `memory-metadata-coverage-census.timer` was in the same state; task 5351
+  owns it. Task 5400 owns the structural cause: no bootstrap seam and no
+  `LoadState` detector for these units.
+
 | Slot | Job | Units |
 |---|---|---|
 | 03:00 | Legibility trickle coder | `legibility-trickle@.timer` |
