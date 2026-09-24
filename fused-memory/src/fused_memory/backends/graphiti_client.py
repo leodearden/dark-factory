@@ -1088,6 +1088,46 @@ async def _paged_ro_query(
     )
 
 
+async def _read_all_group_episodes(
+    driver: GraphDriver,
+    group_ids: list[str],
+    *,
+    page_size: int = _DEFAULT_READ_PAGE_SIZE,
+    max_pages: int = _MAX_READ_PAGES,
+) -> list[EpisodicNode]:
+    """Read every episode in ``group_ids``, past the server's row cap.
+
+    A different mechanism from ``_paged_ro_query`` because this read goes
+    through graphiti-core, not ``ro_query``.  ``EpisodicNode.get_by_group_ids``'
+    own ``uuid_cursor`` is KEYSET paging (``uuid < cursor ORDER BY uuid DESC``),
+    and keyset pages never shift under concurrent insert.  Only an EMPTY page
+    ends the read, never a short one, so a server cap below ``page_size``
+    cannot truncate it — which is why neither ``_paged_ro_query``'s refusal
+    guard nor a census is needed.  See the RESULT-SET CAP AUDIT block above.
+
+    Raises:
+        IncompleteEnumerationError: ``max_pages`` ran out on a non-empty page.
+    """
+    episodes: list[EpisodicNode] = []
+    cursor: str | None = None
+    for _ in range(max_pages):
+        page = await EpisodicNode.get_by_group_ids(
+            driver, group_ids, limit=page_size, uuid_cursor=cursor
+        )
+        if not page:
+            return episodes
+        episodes.extend(page)
+        cursor = min(ep.uuid for ep in page)
+    raise IncompleteEnumerationError(
+        f'_read_all_group_episodes(group_ids={group_ids!r}): the enumeration '
+        f'was structurally incomplete (incomplete_kind={INCOMPLETE_PAGE_CAP!r}): '
+        f'max_pages={max_pages} exhausted at page_size={page_size} with '
+        f'episodes_seen={len(episodes)} and the last page non-empty, so the '
+        f'episodes read are a uuid-ordered prefix and sorting them by '
+        f'created_at would select the wrong most-recent episodes'
+    )
+
+
 def _apply_incompleteness_policy(
     paged: PagedRead,
     *,
@@ -1762,25 +1802,20 @@ class GraphitiBackend:
         """Retrieve recent episodes by group, ordered by created_at (most recent first) and truncated to last_n.
 
         EpisodicNode.get_by_group_ids truncates via ``ORDER BY uuid DESC LIMIT``,
-        which is unrelated to recency, so we fetch the group's full episode set
-        (limit=None) and sort/truncate by created_at ourselves.
+        which is unrelated to recency, so we read the group's full episode set
+        in keyset pages (``_read_all_group_episodes``, task 4869) and
+        sort/truncate by created_at ourselves.
+
+        Raises:
+            IncompleteEnumerationError: The keyset read ran out of page budget.
         """
         driver = self._driver_for(group_ids[0]) if group_ids else self._require_driver()
         try:
-            # Tradeoff: limit=None fetches the group's ENTIRE episode set on every
-            # call (no Cypher LIMIT), then we sort/truncate in Python. This is what
-            # makes the created_at ordering correct given that get_by_group_ids'
-            # own ORDER BY uuid DESC LIMIT truncates on the wrong key before we'd
-            # ever see the data. Acceptable today because episode reads are a cold
-            # path and per-project episode counts are bounded (reconciliation GC;
-            # last_n is separately capped at 1000 in tools.py). If per-group episode
-            # volume grows large, revisit with a created_at-indexed Cypher query
-            # (``ORDER BY e.created_at DESC LIMIT $limit``) to push the bound into
-            # the DB instead of transferring+sorting the full set here.
+            # The full set is still read, now in keyset pages, because the
+            # created_at sort must see every episode: a cap-truncated set would
+            # silently select the wrong episodes, not merely fewer of them.
             episodes = await asyncio.wait_for(
-                EpisodicNode.get_by_group_ids(
-                    driver, group_ids, limit=None
-                ),
+                _read_all_group_episodes(driver, group_ids),
                 timeout=self._read_timeout,
             )
             episodes = sorted(
