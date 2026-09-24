@@ -1419,7 +1419,7 @@ async def open_debt(
         conn = _open(db_path)
         try:
             # ONE statement, deliberately.  SQL evaluates every SET right-hand side against
-            # the PRE-UPDATE row, so all three CASE guards observe the OLD `resolved_at`
+            # the PRE-UPDATE row, so all four CASE guards observe the OLD `resolved_at`
             # even though the same clause sets it to NULL — which is what lets a re-entry
             # (was resolved) and an ordinary repeat (still open) be distinguished without a
             # prior SELECT.  Verified empirically on SQLite 3.50.4: open_count=2,
@@ -1432,6 +1432,13 @@ async def open_debt(
             # `prior_resolving_commit` is deliberately NOT touched — `resolve_debt` already
             # wrote it, and it must survive the re-open verbatim for η's
             # regressed_after_resolution citation.
+            #
+            # A re-entry DISCHARGES the resolved cycle's owner (`owner_task_id` -> NULL);
+            # a repeat keeps it.  Left on the re-opened row, the done owner would let a
+            # concurrent lane's `resolve_debt` — a compare-and-set on exactly that owner —
+            # close the new cycle it never worked on: a phantom cycle, open_count +2, and a
+            # duplicate L2.  With the column NULL, ζ's fresh claim (`owner_task_id IS
+            # NULL`) assigns the new cycle its own owner.
             conn.execute(
                 'INSERT INTO flake_debt (test_id, project_id, opened_at, open_count, '
                 ' last_occurrence_at) '
@@ -1444,6 +1451,8 @@ async def open_debt(
                 '                        THEN excluded.opened_at ELSE opened_at END, '
                 '    prior_resolved_at = CASE WHEN resolved_at IS NOT NULL '
                 '                        THEN resolved_at ELSE prior_resolved_at END, '
+                '    owner_task_id     = CASE WHEN resolved_at IS NOT NULL '
+                '                        THEN NULL ELSE owner_task_id END, '
                 '    resolved_at       = NULL',
                 (test_id, project_id, stamp, stamp),
             )
