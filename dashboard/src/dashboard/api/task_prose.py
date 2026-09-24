@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import assert_never
 
 import httpx
 from fastapi import APIRouter, Request
@@ -91,3 +92,5 @@ def _response_for(uid: str, read: TaskProseRead) -> JSONResponse:
             return JSONResponse(
                 {'error': 'fused_memory_unreachable', 'detail': detail}, status_code=502,
             )
+        case _:
+            assert_never(read)
