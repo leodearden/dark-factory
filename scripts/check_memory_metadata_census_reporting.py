@@ -83,10 +83,66 @@ def history_path() -> Path:
     return Path(os.environ.get("REPO") or DEFAULT_REPO) / HISTORY_RELPATH
 
 
+def load_history(path: Path) -> object:
+    try:
+        with path.open() as f:
+            return json.load(f)
+    except FileNotFoundError:
+        raise NotReporting(f"NO HISTORY: {path} does not exist") from None
+    except ValueError as exc:
+        raise NotReporting(
+            f"UNREADABLE HISTORY: {path} is not valid JSON ({exc})"
+        ) from None
+    except OSError as exc:
+        raise NotReporting(
+            f"UNREADABLE HISTORY: {path} could not be read ({exc})"
+        ) from None
+
+
 def newest_stamp(path: Path) -> datetime:
-    with path.open() as f:
-        history = json.load(f)
-    return datetime.fromisoformat(history["runs"][-1]["stamp"])
+    history = load_history(path)
+    runs = history.get("runs") if isinstance(history, dict) else None
+    if not isinstance(runs, list):
+        raise NotReporting(f"UNREADABLE HISTORY: {path} has no 'runs' list")
+    if not runs:
+        raise NotReporting(f"NO READINGS: 'runs' is empty in {path}")
+    newest = runs[-1]
+    stamp = newest.get("stamp") if isinstance(newest, dict) else None
+    if stamp is None:
+        raise NotReporting(
+            f"UNREADABLE HISTORY: the newest row in {path} has no 'stamp'"
+        )
+    return parse_row_stamp(stamp, path)
+
+
+def parse_row_stamp(stamp: object, path: Path) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(stamp) if isinstance(stamp, str) else None
+    except ValueError:
+        parsed = None
+    if parsed is None:
+        raise NotReporting(
+            f"UNREADABLE HISTORY: the newest row in {path} has stamp={stamp!r}, "
+            f"not an ISO-8601 timestamp"
+        )
+    if parsed.tzinfo is None:
+        raise NotReporting(
+            f"UNREADABLE HISTORY: the newest row in {path} has stamp={stamp!r} "
+            f"with no UTC offset"
+        )
+    return parsed
+
+
+def history_row_age(window_hours: float) -> float:
+    path = history_path()
+    age = age_hours(newest_stamp(path))
+    if age > window_hours:
+        raise NotReporting(
+            f"STALE HISTORY ROW: the newest reading in {path} is {age:.1f}h old, "
+            f"outside the {window_hours:g}h window, although {UNIT} reports a "
+            f"recent run; read commit-step= on the wrapper's 'done (...)' journal line"
+        )
+    return age
 
 
 def age_hours(then: datetime) -> float:
@@ -97,7 +153,7 @@ def assess(window_hours: float) -> str:
     state = read_unit_state()
     require_installed(state)
     run_age = last_run_age(state, window_hours)
-    row_age = age_hours(newest_stamp(history_path()))
+    row_age = history_row_age(window_hours)
     return (
         f"OK: {UNIT} last ran {run_age:.1f}h ago; "
         f"newest history row {row_age:.1f}h ago (window {window_hours:g}h)"
