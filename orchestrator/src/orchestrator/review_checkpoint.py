@@ -29,6 +29,23 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Step 4 of the deep-review prompt. Public because the fused-memory suite imports it to
+# certify its add_memory example against the live entities_gate. A .format() template
+# whose only fields are {project_id} and {review_id}: any literal brace must be written
+# {{ or }}, the hazard roles.py's MANDATED_STAGING_COMMAND note records.
+REFLECTION_INSTRUCTIONS = """\
+4. **Reflect on your findings** — write separate memories for each insight worth preserving:
+   - **Patterns and surprises** — recurring issues, unexpected gaps, systemic weaknesses
+     (`category="observations_and_summaries"`)
+   - **Discovered conventions** — implicit rules you noticed in the code that aren't documented
+     (`category="preferences_and_norms"`)
+   - **Architectural insights** — structural observations about how modules interact, where
+     coupling is tight or loose, where the design is fragile
+     (`category="decisions_and_rationale"`)
+   - Use `add_memory(content=..., category=..., project_id="{project_id}", agent_id="claude-review-{review_id}")`
+   - Write each insight as its own memory — don't batch into one blob
+   - Skip anything obvious from the code itself; focus on what a future agent couldn't easily rediscover"""
+
 
 @dataclass
 class ReviewReport:
@@ -413,6 +430,9 @@ class ReviewCheckpoint:
         project_root = str(self.config.project_root)
         project_id = self.config.fused_memory.project_id
 
+        reflection_block = REFLECTION_INSTRUCTIONS.format(
+            project_id=project_id, review_id=review_id
+        )
         submit_resolve_block = submit_only_instructions(
             f'{{"source": "review-cycle", "review_id": "{review_id}", '
             f'"files": ["path/to/file-or-directory", ...], '
@@ -510,17 +530,7 @@ violations are always bugs. Pay special attention to `stability_concerns`.
    - Ambiguous/architectural → `escalate_info(category=..., summary=...)`
    - Known/accepted → dismiss (don't report)
 
-4. **Reflect on your findings** — write separate memories for each insight worth preserving:
-   - **Patterns and surprises** — recurring issues, unexpected gaps, systemic weaknesses
-     (`category="observations_and_summaries"`)
-   - **Discovered conventions** — implicit rules you noticed in the code that aren't documented
-     (`category="preferences_and_norms"`)
-   - **Architectural insights** — structural observations about how modules interact, where
-     coupling is tight or loose, where the design is fragile
-     (`category="decisions_and_rationale"`)
-   - Use `add_memory(content=..., category=..., project_id="{project_id}", agent_id="claude-review-{review_id}")`
-   - Write each insight as its own memory — don't batch into one blob
-   - Skip anything obvious from the code itself; focus on what a future agent couldn't easily rediscover
+{reflection_block}
 
 5. **Output** structured JSON at the end of your response:
 
