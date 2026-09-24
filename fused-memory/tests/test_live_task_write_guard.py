@@ -41,6 +41,20 @@ LIVE_CLAIMANT = 'run-1/session-1/pid=123'
 RECON_AGENT_ID = 'recon-stage-task_knowledge_sync'
 
 
+def _async_detector(result: bool):
+    """Async stand-in for the now-coroutine ``is_workflow_live_for_task``.
+
+    Task 3778 made the live-workflow detector's git probes async (they await
+    ``shared.git_async.run_git``), so ``recon_write_policy.check`` awaits this
+    seam. A sync ``lambda *a, **k: <bool>`` fake would still be called, but
+    awaiting its bool return raises — every patch of this name must be async.
+    """
+    async def _fake(*args, **kwargs):
+        return result
+
+    return _fake
+
+
 def _flat(
     status: str = 'in-progress',
     claimant_run_id: str | None = LIVE_CLAIMANT,
@@ -755,7 +769,7 @@ class TestInterceptorSetTaskStatusLifecycleGuard:
         """(b) set_task_status recon-stage transition invokes the filer when
         the claimant resets un-requested."""
         monkeypatch.setattr(
-            recon_write_policy, 'is_workflow_live_for_task', lambda *a, **k: False,
+            recon_write_policy, 'is_workflow_live_for_task', _async_detector(False),
         )
         before = _live_claimant_before()
         after = _flat(status='review', claimant_run_id=None)
@@ -775,7 +789,7 @@ class TestInterceptorSetTaskStatusLifecycleGuard:
     async def test_benign_after_state_does_not_invoke_filer(self, interceptor, taskmaster, monkeypatch):
         """(c) a benign after-state (claimant unchanged) does NOT invoke the filer."""
         monkeypatch.setattr(
-            recon_write_policy, 'is_workflow_live_for_task', lambda *a, **k: False,
+            recon_write_policy, 'is_workflow_live_for_task', _async_detector(False),
         )
         before = _live_claimant_before()
         after = _flat(status='review', claimant_run_id=LIVE_CLAIMANT)
@@ -792,7 +806,7 @@ class TestInterceptorSetTaskStatusLifecycleGuard:
     async def test_non_recon_agent_id_does_not_invoke_filer(self, interceptor, taskmaster, monkeypatch):
         """(d) a non-recon agent_id does NOT invoke the filer and the write proceeds."""
         monkeypatch.setattr(
-            recon_write_policy, 'is_workflow_live_for_task', lambda *a, **k: True,
+            recon_write_policy, 'is_workflow_live_for_task', _async_detector(True),
         )
         before = _live_claimant_before()
         taskmaster.get_task = AsyncMock(return_value=before)
@@ -809,7 +823,7 @@ class TestInterceptorSetTaskStatusLifecycleGuard:
         """(e) with NO filer set (default), the write proceeds unchanged and
         nothing is filed — guards existing behavior."""
         monkeypatch.setattr(
-            recon_write_policy, 'is_workflow_live_for_task', lambda *a, **k: False,
+            recon_write_policy, 'is_workflow_live_for_task', _async_detector(False),
         )
         before = _live_claimant_before()
         after = _flat(status='review', claimant_run_id=None)
