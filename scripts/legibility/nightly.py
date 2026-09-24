@@ -595,7 +595,21 @@ def _default_entrypoint_exists() -> bool:
     return (Path(__file__).resolve().parent / _CENSUS_ENTRYPOINT_NAME).exists()
 
 
-def _default_census_launcher(project_root: str | Path, *, env=None) -> None:
+def _require_absolute_launch_arg(value: str | Path, *, what: str) -> str:
+    """Return *value* as a census argv string; REFUSE a relative one rather
+    than resolve it against whatever cwd this process happens to have."""
+    if not Path(value).is_absolute():
+        raise ValueError(
+            f'census {what} must be absolute, got {value!r}: a relative one '
+            "would resolve against the trickle's cwd "
+            "(legibility-trickle@.service's WorkingDirectory), task 3269's defect"
+        )
+    return str(value)
+
+
+def _default_census_launcher(
+    project_root: str | Path, *, config_path: str | Path | None = None, env=None,
+) -> None:
     """Best-effort subprocess launch of the census entrypoint (task η)
     against the project named by *project_root*.
 
@@ -603,9 +617,10 @@ def _default_census_launcher(project_root: str | Path, *, env=None) -> None:
     3269): ``legibility-trickle@.service`` pins one ``WorkingDirectory`` for
     every ``%i`` instance, so an argv-less launch censused dark_factory for
     every project. Fixing that in the unit file was rejected -- it would move
-    the invariant somewhere no test reaches. A relative *project_root* would
-    resolve against that same cwd, so it is refused with ``ValueError``
-    before anything is launched.
+    the invariant somewhere no test reaches. *config_path*, when given, also
+    pins the EXACT ``legibility.yaml`` the trickle loaded. A relative value
+    for either would resolve against that same cwd, so it is refused with
+    ``ValueError`` before anything is launched.
 
     Captures the census exit code and, on a NON-ZERO exit, emits ONE loud
     warning (PRD decision 8: degradation never silent -- the silent-census
@@ -622,17 +637,13 @@ def _default_census_launcher(project_root: str | Path, *, env=None) -> None:
     and what it must keep doing whenever no account is available: a census
     launch is best-effort, so a pool problem must never be able to block one.
     """
-    if not Path(project_root).is_absolute():
-        raise ValueError(
-            f'census target project_root must be absolute, got {project_root!r}: '
-            "a relative one would resolve against the trickle's cwd "
-            "(legibility-trickle@.service's WorkingDirectory), task 3269's defect"
-        )
     argv = [
         sys.executable,
         str(Path(__file__).resolve().parent / _CENSUS_ENTRYPOINT_NAME),
-        '--project-root', str(project_root),
+        '--project-root', _require_absolute_launch_arg(project_root, what='project_root'),
     ]
+    if config_path is not None:
+        argv += ['--config', _require_absolute_launch_arg(config_path, what='config_path')]
     result = subprocess.run(argv, check=False, env=env)
     if result.returncode != 0:
         logger.warning(
@@ -651,6 +662,7 @@ def evaluate_census_step(
     decide=census_trigger.decide_for_project,
     entrypoint_exists=None,
     launcher=None,
+    config_path: Path | str | None = None,
 ) -> tuple[str, bool]:
     """Evaluate the periodic-census trigger (ζ) at the end of a nightly
     run, returning ``(one_line_decision, fire)``.
@@ -667,7 +679,7 @@ def evaluate_census_step(
     The *launcher* seam's contract is ``launcher(project_root, *,
     config_path=None)``, always called with the CONFIG's ``project_root`` --
     never argv-less, so the census target is never left to the process cwd
-    (task 3269).
+    (task 3269). *config_path* is forwarded unchanged.
 
     This function never raises and never fails the run, and that guarantee is
     its OWN: both the *decide* call and the *launcher* call are guarded here,
@@ -747,7 +759,7 @@ def evaluate_census_step(
         return line, True
 
     try:
-        launcher(cfg.project_root)
+        launcher(cfg.project_root, config_path=config_path)
     except Exception as exc:  # noqa: BLE001 - best-effort, never fail the run
         logger.warning('legibility trickle: census launcher failed (best-effort): %s', exc)
 
@@ -1238,7 +1250,7 @@ def run_nightly(
     steps.
     """
     if config_path is not None:
-        resolved_config_path = Path(config_path)
+        resolved_config_path = Path(config_path).resolve()
     else:
         if project_id is None:
             raise ValueError('run_nightly requires either config_path or project_id')
@@ -1595,8 +1607,11 @@ def run_nightly(
         # chosen reflects the cap state the night has actually learned by now
         # (the trickle's own digests run first and may well have capped the
         # account that looked live at 03:00).
+        # Task 3269: the census is pinned to the config THIS run loaded -- never
+        # a fresh resolution, never the process cwd.
         census_line, census_fire = evaluate_census_step(
             cfg, now=now, status_fetcher=status_fetcher,
+            config_path=resolved_config_path,
             launcher=(
                 None if gate is None
                 else functools.partial(

@@ -1487,7 +1487,9 @@ class TestRunNightlyBindsTheCensusLauncherToThePool:
     def _capture_launcher(monkeypatch):
         seen = {}
 
-        def _spy_evaluate(cfg, *, now=None, status_fetcher=None, launcher=None):
+        def _spy_evaluate(
+            cfg, *, now=None, status_fetcher=None, launcher=None, config_path=None,
+        ):
             seen['launcher'] = launcher
             return 'census trigger: NO-FIRE -- stub', False
 
@@ -1600,7 +1602,9 @@ class TestRunNightlyDefaultsTheCensusStatusFetcher:
             factory_calls.append(project_root)
             return sentinel
 
-        def _spy_evaluate(cfg, *, now=None, status_fetcher=None, launcher=None):
+        def _spy_evaluate(
+            cfg, *, now=None, status_fetcher=None, launcher=None, config_path=None,
+        ):
             seen['status_fetcher'] = status_fetcher
             return 'census trigger: NO-FIRE -- stub', False
 
