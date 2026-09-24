@@ -1010,7 +1010,8 @@ def test_evaluate_census_step_fire_with_entrypoint_launches(tmp_path):
     launcher_calls = []
     line, fire = nightly.evaluate_census_step(
         cfg, now=None, status_fetcher=None, decide=fake_decide,
-        entrypoint_exists=lambda: True, launcher=lambda: launcher_calls.append(1),
+        entrypoint_exists=lambda: True,
+        launcher=lambda project_root, **kwargs: launcher_calls.append(1),
     )
 
     assert fire is True
@@ -1041,7 +1042,7 @@ def test_evaluate_census_step_logs_the_decision_before_launching(tmp_path, caplo
     # the way a timed-out/killed census does.
     logged_at_launch = []
 
-    def _dying_launcher():
+    def _dying_launcher(project_root, **kwargs):
         logged_at_launch.extend(r.getMessage() for r in caplog.records)
         raise subprocess.TimeoutExpired(cmd='census.py', timeout=1800)
 
@@ -1185,7 +1186,7 @@ def test_default_census_launcher_logs_loud_on_nonzero_exit(monkeypatch, caplog):
     monkeypatch.setattr(nightly.subprocess, "run", fake)
 
     with caplog.at_level("WARNING", logger="legibility.nightly"):
-        result = nightly._default_census_launcher()
+        result = nightly._default_census_launcher('/some/project')
 
     assert result is None, "the launcher never raises and returns None (never-crash-the-nightly)"
     assert any(
@@ -1203,7 +1204,7 @@ def test_default_census_launcher_quiet_on_zero_exit(monkeypatch, caplog):
     monkeypatch.setattr(nightly.subprocess, "run", fake0)
 
     with caplog.at_level("WARNING", logger="legibility.nightly"):
-        result = nightly._default_census_launcher()
+        result = nightly._default_census_launcher('/some/project')
 
     assert result is None
     assert not any(
@@ -1247,7 +1248,7 @@ def test_default_census_launcher_passes_an_explicit_env_through(monkeypatch):
     seen = _spy_subprocess_run(monkeypatch)
     env = {'CLAUDE_CODE_OAUTH_TOKEN': 'tok-from-the-pool'}
 
-    nightly._default_census_launcher(env=env)
+    nightly._default_census_launcher('/some/project', env=env)
 
     assert seen['env'] is env, (
         'the census subprocess must be spawned with the env it was given, or '
@@ -1268,7 +1269,7 @@ def test_default_census_launcher_inherits_the_parent_env_by_default(monkeypatch)
     """
     seen = _spy_subprocess_run(monkeypatch)
 
-    nightly._default_census_launcher()
+    nightly._default_census_launcher('/some/project')
 
     assert seen.get('env') is None
 
@@ -1422,7 +1423,7 @@ class TestRunNightlyBindsTheCensusLauncherToThePool:
         """Resolve *launcher* the way evaluate_census_step does, run it with
         subprocess.run spied, and return the env the census subprocess got."""
         seen = _spy_subprocess_run(monkeypatch)
-        (launcher if launcher is not None else nightly._default_census_launcher)()
+        (launcher if launcher is not None else nightly._default_census_launcher)('/some/project')
         return seen.get('env')
 
     def test_the_census_gets_a_pool_chosen_token_with_the_api_key_stripped(
@@ -4149,7 +4150,7 @@ def test_post_escalation_reports_false_on_a_tool_error_envelope(
 
 def _stub_census_launcher_and_pool(monkeypatch):
     """Stub both of a ``main()``-driven run's reaches into the real world, and
-    return the launcher's call list.
+    return the launcher's call list, one ``(args, kwargs)`` pair per call.
 
     MANDATORY, not cosmetic, on both counts. On FIRE the real launcher
     subprocess-runs scripts/legibility/census.py (real LLM spend + real git
@@ -4162,7 +4163,8 @@ def _stub_census_launcher_and_pool(monkeypatch):
     """
     launcher_calls = []
     monkeypatch.setattr(
-        nightly, '_default_census_launcher', lambda env=None: launcher_calls.append(1),
+        nightly, '_default_census_launcher',
+        lambda *args, **kwargs: launcher_calls.append((args, kwargs)),
     )
 
     class _EmptyPool:
@@ -4257,7 +4259,7 @@ def test_main_run_fires_the_tasks_landed_condition_end_to_end(
 
     # (i) condition (b) fired all the way through the production entrypoint.
     assert exit_code == 0
-    assert launcher_calls == [1], (
+    assert len(launcher_calls) == 1, (
         'the census launcher never fired end-to-end. Read the captured log '
         'BEFORE suspecting the wiring: task 4085 turns any exception out of '
         '`decide` into a quiet synthetic NO-FIRE line rather than a '

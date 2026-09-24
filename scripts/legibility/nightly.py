@@ -595,16 +595,25 @@ def _default_entrypoint_exists() -> bool:
     return (Path(__file__).resolve().parent / _CENSUS_ENTRYPOINT_NAME).exists()
 
 
-def _default_census_launcher(env=None) -> None:
-    """Best-effort subprocess launch of the census entrypoint (task η).
+def _default_census_launcher(project_root: str | Path, *, env=None) -> None:
+    """Best-effort subprocess launch of the census entrypoint (task η)
+    against the project named by *project_root*.
+
+    The target is an ARGUMENT, never inherited from the process cwd (task
+    3269): ``legibility-trickle@.service`` pins one ``WorkingDirectory`` for
+    every ``%i`` instance, so an argv-less launch censused dark_factory for
+    every project. Fixing that in the unit file was rejected -- it would move
+    the invariant somewhere no test reaches. A relative *project_root* would
+    resolve against that same cwd, so it is refused with ``ValueError``
+    before anything is launched.
 
     Captures the census exit code and, on a NON-ZERO exit, emits ONE loud
     warning (PRD decision 8: degradation never silent -- the silent-census
     incident, task 2952). census.py's own main() files the escalation for the
     failing stage; this loud log is the trickle-side trace so a failed census
-    is never invisible in the nightly's own journal. Keeps ``check=False`` and
-    never raises: census runs AFTER the trickle's own commit work, so a census
-    failure must never crash or fail the nightly run.
+    is never invisible in the nightly's own journal. Keeps ``check=False``:
+    census runs AFTER the trickle's own commit work, so a census failure must
+    never crash or fail the nightly run.
 
     *env*, when given, is the environment the census runs in -- an account
     drawn from the night's own pool (``account_pool.subprocess_env``), bound by
@@ -613,11 +622,18 @@ def _default_census_launcher(env=None) -> None:
     and what it must keep doing whenever no account is available: a census
     launch is best-effort, so a pool problem must never be able to block one.
     """
-    result = subprocess.run(
-        [sys.executable, str(Path(__file__).resolve().parent / _CENSUS_ENTRYPOINT_NAME)],
-        check=False,
-        env=env,
-    )
+    if not Path(project_root).is_absolute():
+        raise ValueError(
+            f'census target project_root must be absolute, got {project_root!r}: '
+            "a relative one would resolve against the trickle's cwd "
+            "(legibility-trickle@.service's WorkingDirectory), task 3269's defect"
+        )
+    argv = [
+        sys.executable,
+        str(Path(__file__).resolve().parent / _CENSUS_ENTRYPOINT_NAME),
+        '--project-root', str(project_root),
+    ]
+    result = subprocess.run(argv, check=False, env=env)
     if result.returncode != 0:
         logger.warning(
             "legibility trickle: census subprocess exited non-zero (returncode=%s) "
@@ -647,6 +663,11 @@ def evaluate_census_step(
     of ε, so a fired trigger before η lands must never crash or fail the
     nightly run. If the entrypoint is present, *launcher* (default:
     best-effort subprocess launch) is called once.
+
+    The *launcher* seam's contract is ``launcher(project_root, *,
+    config_path=None)``, always called with the CONFIG's ``project_root`` --
+    never argv-less, so the census target is never left to the process cwd
+    (task 3269).
 
     This function never raises and never fails the run, and that guarantee is
     its OWN: both the *decide* call and the *launcher* call are guarded here,
@@ -726,7 +747,7 @@ def evaluate_census_step(
         return line, True
 
     try:
-        launcher()
+        launcher(cfg.project_root)
     except Exception as exc:  # noqa: BLE001 - best-effort, never fail the run
         logger.warning('legibility trickle: census launcher failed (best-effort): %s', exc)
 
