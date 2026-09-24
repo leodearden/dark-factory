@@ -92,6 +92,7 @@ from fused_memory.reconciliation.standing_decision_writer import (
 from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.routing.router import ReadRouter
 from fused_memory.server.storm_counter import StormCounter
+from fused_memory.services.completion_claim_gate import UNVERIFIED_CLAIM_TAG
 from fused_memory.services.durable_queue import DeadLetterEvent, DurableWriteQueue
 from fused_memory.services.memory_metadata_census import (
     UnknownKeyStormDetector,
@@ -6355,10 +6356,17 @@ class MemoryService:
         metadata: dict | None = None,
         dual_write: bool = False,
         causation_id: str | None = None,
+        unverified_claim: bool = False,
         _source: str = 'mcp_tool',
         declared_referents: list[dict] | None = None,
     ) -> AddMemoryResponse:
         """Lightweight classified write — skip extraction pipeline.
+
+        ``unverified_claim`` (task 4715) is a LABEL set by the tool-layer
+        completion-claim gate, never a rejection: the write lands either way.
+        On the Graphiti leg it rides the queue payload exactly as add_episode's
+        does; on the Mem0 leg it is stamped into the record's metadata under
+        the same key episode-derived facts carry, and omitted when untagged.
 
         ``declared_referents`` (task 3669, PRD leaf delta) is the caller's
         EXPLICIT statement of which referents this write is about — the
@@ -6434,6 +6442,8 @@ class MemoryService:
         stores_written: list[SourceStore] = []
         meta = dict(metadata or {})
         meta['category'] = resolved_category.value
+        if unverified_claim:
+            meta[UNVERIFIED_CLAIM_TAG] = True
 
         # Normalize metadata.task_id to str at this shared write boundary
         # (task 2620, sibling of task 2454's flag_dedup-specific fix; shared
@@ -6533,6 +6543,10 @@ class MemoryService:
                         '_write_op_id': write_op_id,
                         # Popped and decoded by _execute_graphiti_write.
                         'referents': _encode_referents(resolution),
+                        # Popped by _execute_graphiti_write exactly as on
+                        # add_episode's payload, which prefixes the episodic
+                        # source_description with '[unverified_claim] '.
+                        'unverified_claim': unverified_claim,
                     },
                     callback_type='refresh_entity_summaries',
                 )
