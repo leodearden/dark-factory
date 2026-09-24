@@ -183,18 +183,25 @@ async def _await_heartbeat_refreshes(wf: TaskWorkflow, count: int = 1) -> None:
 _DISPATCH_STALL_SECS = 0.06
 
 
-def _stall_loop_at_dispatch(wf: TaskWorkflow, stall_secs: float) -> None:
+def _stall_loop_at_dispatch(wf: TaskWorkflow, stall_secs: float) -> asyncio.Event:
     """Freeze the loop thread for *stall_secs*, the way a descheduled xdist worker is frozen.
 
     The dispatch write is the seam: the heartbeat task is created right after it, so the
     stall runs AHEAD of the heartbeat's first step, once the test is already waiting.
+    Returns an event set once the stall has run, so a caller can check it landed there.
     """
     dispatch_write = cast(AsyncMock, wf.scheduler.set_task_status)
+    stall_ran = asyncio.Event()
+
+    def _stall() -> None:
+        time.sleep(stall_secs)
+        stall_ran.set()
 
     def _queue_stall(*_args, **_kwargs) -> None:
-        asyncio.get_running_loop().call_soon(time.sleep, stall_secs)
+        asyncio.get_running_loop().call_soon(_stall)
 
     dispatch_write.side_effect = _queue_stall
+    return stall_ran
 
 
 @pytest.mark.asyncio
@@ -229,15 +236,21 @@ async def test_heartbeat_loop_refreshes_heartbeat_only(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_heartbeat_loop_still_refreshes_after_a_loop_stall_at_dispatch(tmp_path: Path):
-    """A loop stall between the dispatch write and the heartbeat's first step
-    delays, but must not lose, the first refresh."""
+    """Regression guard for this file's heartbeat waits (task 5837): they wait for the
+    refresh itself, not a fixed wall-clock window, so a worker stall cannot cancel a
+    healthy loop before its first tick."""
     wf = _make_workflow(project_root=tmp_path, task_id='404', claimant_heartbeat_interval_secs=0.01)
-    _stall_loop_at_dispatch(wf, _DISPATCH_STALL_SECS)
+    stall_ran = _stall_loop_at_dispatch(wf, _DISPATCH_STALL_SECS)
 
     await _setup(wf)
+    assert not stall_ran.is_set(), (
+        'the stall ran inside _setup, so it no longer lands between the test starting '
+        "its wait and the heartbeat loop's first step"
+    )
     await _await_heartbeat_refreshes(wf)
     await wf._stop_claimant_heartbeat()
 
+    assert stall_ran.is_set(), 'the dispatch write never queued the stall, so none was exercised'
     assert cast(AsyncMock, wf.scheduler.set_task_claimant).await_count >= 1
 
 
