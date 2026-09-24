@@ -1166,9 +1166,10 @@ def _names_project_root(name: str) -> bool:
     """True if the bare identifier *name* denotes a ``project_root``.
 
     Split out from ``_is_project_root_target`` because the detector must apply
-    the SAME rule to an ``ast.arg``, whose ``.arg`` is a plain ``str`` and not an
-    expression node.  Two callers, one rule — a second spelling here is how the
-    parameter-default shape would drift out from under the assignment shape.
+    the SAME rule to an ``ast.arg`` and an ``ast.keyword``, whose ``.arg`` is a
+    plain ``str`` and not an expression node.  Three binding shapes, one rule —
+    a second spelling here is how the parameter-default or keyword shape would
+    drift out from under the assignment shape.
     """
     return name.lower().strip('_').endswith('project_root')
 
@@ -1239,9 +1240,9 @@ def _absolute_tmp_project_root_literals(tree: ast.Module) -> list[str]:
     Shape matches ``_steward_construction_sites``'s return so both censuses read
     the same way in a failure message.
 
-    WHAT IT MATCHES — two BINDING shapes, both of which put the literal in the
-    defining module rather than at a call site, and whose value is a ``/tmp``
-    string literal, bare or wrapped in ``Path(...)`` (see ``_tmp_literal``):
+    WHAT IT MATCHES — three BINDING shapes, each spelling ``project_root`` as an
+    identifier at the binding site, and whose value is a ``/tmp`` string
+    literal, bare or wrapped in ``Path(...)`` (see ``_tmp_literal``):
 
     * an ``ast.Assign`` or ``ast.AnnAssign`` whose target names a
       ``project_root`` (see ``_is_project_root_target``).  ``Assign.targets`` is
@@ -1259,26 +1260,17 @@ def _absolute_tmp_project_root_literals(tree: ast.Module) -> list[str]:
       very census the advice was meant to satisfy.  A remedy that opens a hole
       in its own detector is worse than no remedy, so the hole is closed rather
       than documented.
+    * a CALL KEYWORD — an ``ast.keyword`` whose name passes
+      ``_names_project_root`` (``**kwargs``, whose name is ``None``, is
+      skipped).  A keyword binds a real parameter, so it can carry a real
+      escape.  Task 5011 sandboxed all 14 keyword sites, one of them a measured
+      ``runs.db`` leak, so this arm added no allowlist entry.
 
-    WHAT IT DELIBERATELY DOES NOT MATCH, and this is a DECISION rather than a
-    limitation — ``ast.keyword``.  The line is drawn at DEFINITION versus CALL,
-    which is why a parameter default is in scope and a call keyword is not: a
-    default is one literal living in the module that owns the factory, exactly
-    like an assignment, whereas a keyword is one of N literals at N call sites
-    binding someone else's parameter.  The tree holds ~16 call-keyword sites
-    (``LandedReconciler(project_root='/tmp/proj')`` and friends:
-    test_merge_queue_landed_reconciler.py x13,
-    test_merge_queue_landed_dispatch_gate.py, test_multihost_verify_integration.py).
-    Those bind a real constructor/dataclass PARAMETER rather than an attribute on
-    a ``spec_set`` MagicMock — a structurally different population, and not the
-    one task 3551's sweep found or task 4389 was filed to adjudicate.  Widening
-    the rule to cover them would force this guard to either fix 16 out-of-scope
-    sites or pre-approve them wholesale in the allowlist, and a wholesale
-    sanction is precisely the silent appearance this guard family exists to stop
-    (see ``_Sanctioned.__doc__`` on why ``sites`` is a COUNT, not a flag).  So
-    the boundary is structural, it is pinned by a detector self-test so it reads
-    as deliberate rather than as an oversight, and the kwarg population is
-    carried by its own follow-up ticket.
+    WHAT IT DOES NOT MATCH, by decision — a binding with no ``project_root``
+    IDENTIFIER at the site.  A positional argument binds by position to a
+    callee signature a single-module AST walk cannot resolve, and a string dict
+    key is a meaningful string, not a binding.  Pinned by
+    ``test_the_detector_ignores_a_binding_with_no_project_root_identifier``.
 
     A REFERENCE is not a literal.  ``config.project_root = MOCK_WORKFLOW_PROJECT_ROOT``
     does not match: the literal lives once, in ``_orch_helpers``, where it is
@@ -1296,6 +1288,13 @@ def _absolute_tmp_project_root_literals(tree: ast.Module) -> list[str]:
                 if literal is not None:
                     sites.append(f'{default.lineno} ({literal})')
             continue
+        if isinstance(node, ast.keyword):
+            if node.arg is None or not _names_project_root(node.arg):
+                continue
+            literal = _tmp_literal(node.value)
+            if literal is not None:
+                sites.append(f'{node.value.lineno} ({literal})')
+            continue
         if isinstance(node, ast.Assign):
             targets: list[ast.expr] = list(node.targets)
         elif isinstance(node, ast.AnnAssign):
@@ -1307,9 +1306,9 @@ def _absolute_tmp_project_root_literals(tree: ast.Module) -> list[str]:
         literal = _tmp_literal(node.value)
         if literal is not None:
             sites.append(f'{node.lineno} ({literal})')
-    # Sorted because the walk is BFS over two different node kinds now, so source
-    # order is not the visit order; a census failure message is read by a human
-    # looking for a line number.
+    # Sorted because the walk is BFS over several node kinds, so source order is
+    # not the visit order; a census failure message is read by a human looking
+    # for a line number.
     return sorted(sites, key=lambda site: int(site.split(' ', 1)[0]))
 
 
@@ -1346,13 +1345,14 @@ class TestAbsoluteTmpProjectRootLiteralsAreCensused:
 
     THE POPULATION, named precisely rather than as "every literal", because a
     census that overstates its own reach is the failure it exists to prevent:
-    assignments and parameter DEFAULTS — the shapes that bind a ``/tmp`` literal
-    in the module that owns it.  Three shapes are outside it, each by a recorded
-    decision rather than by omission: ~16 call-KEYWORD sites
-    (``_absolute_tmp_project_root_literals.__doc__``, pinned by
-    ``test_the_detector_ignores_the_call_keyword_shape``), the COMPOUND
-    ``tmp_path or Path('/tmp/proj')`` form (``_tmp_literal.__doc__``), and
-    non-``/tmp`` absolute roots (pinned by
+    assignments, parameter DEFAULTS and call KEYWORDS — every binding that
+    spells ``project_root`` as an identifier at the site.  Four shapes are
+    outside it, each by a recorded decision rather than by omission: positional
+    arguments and string dict keys (``_absolute_tmp_project_root_literals.__doc__``,
+    pinned by
+    ``test_the_detector_ignores_a_binding_with_no_project_root_identifier``), the
+    COMPOUND ``tmp_path or Path('/tmp/proj')`` form (``_tmp_literal.__doc__``),
+    and non-``/tmp`` absolute roots (pinned by
     ``test_the_detector_ignores_an_absolute_literal_outside_tmp``).
 
     Same teeth as the steward census above, in both directions: a new
