@@ -8,14 +8,19 @@ rows and the prose route share.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 import pytest
 from _dashboard_helpers import mcp_init_response, mcp_notify_response, mcp_tool_response
+from fastapi import FastAPI
 
+from dashboard.api.task_prose import router as task_prose_router
 from dashboard.config import DashboardConfig
 from dashboard.data.active_tasks import project_roots_for_label, task_uid
 from dashboard.data.memory import reset_sessions
@@ -49,12 +54,14 @@ class _FusedMemory:
     """A MockTransport handler standing in for fused-memory, one answer per port.
 
     ``answers`` maps a port to the inner ``get_task`` result that URL returns,
-    or to an exception instance it raises on every post. Every post is recorded
-    in ``posts``, so a test can assert which URLs were contacted and exactly
-    what ``get_task`` was sent — or that nothing was sent at all.
+    to an exception instance it raises on every post, or to an
+    ``asyncio.Event`` its ``tools/call`` waits on (set by nothing: a hang).
+    Every post is recorded in ``posts``, so a test can assert which URLs were
+    contacted and exactly what ``get_task`` was sent — or that nothing was sent
+    at all.
     """
 
-    answers: dict[int, dict | Exception]
+    answers: dict[int, dict | Exception | asyncio.Event]
     posts: list[_Post] = field(default_factory=list)
 
     async def __call__(self, request: httpx.Request) -> httpx.Response:
@@ -70,6 +77,9 @@ class _FusedMemory:
             return mcp_init_response(body.get('id', 1))
         if method.startswith('notifications/'):
             return mcp_notify_response()
+        if isinstance(answer, asyncio.Event):
+            await answer.wait()
+            raise AssertionError('nothing sets the hang event')
         return mcp_tool_response(answer, body.get('id', 1))
 
     def tool_calls(self) -> list[_Post]:
@@ -79,15 +89,37 @@ class _FusedMemory:
         return {post.port for post in self.posts}
 
 
-def _project(tmp_path: Path, *urls: str) -> tuple[Path, DashboardConfig]:
-    root = tmp_path / 'proj'
-    root.mkdir()
-    return root, DashboardConfig(project_root=root, fused_memory_urls=list(urls))
+def _project(tmp_path: Path, *urls: str, name: str = 'proj') -> tuple[Path, DashboardConfig]:
+    (tmp_path / name).mkdir()
+    config = DashboardConfig(project_root=tmp_path / name, fused_memory_urls=list(urls))
+    return config.project_root, config
 
 
 async def _read(fused_memory: _FusedMemory, config: DashboardConfig, root: Path, task_id: int):
     async with httpx.AsyncClient(transport=httpx.MockTransport(fused_memory)) as client:
         return await fetch_task_prose(client, config, root, task_id)
+
+
+def _prose_path(uid: str) -> str:
+    """The route path for a row uid, each segment percent-encoded as the client does."""
+    return '/api/v2/dashboard/task/' + '/'.join(
+        quote(segment, safe='') for segment in uid.split('/')
+    )
+
+
+async def _get_prose(
+    config: DashboardConfig, fused_memory: _FusedMemory, path: str,
+) -> httpx.Response:
+    """GET *path* from an app serving ONLY the prose router, fused-memory mocked."""
+    app = FastAPI()
+    app.include_router(task_prose_router)
+    app.state.config = config
+    async with httpx.AsyncClient(transport=httpx.MockTransport(fused_memory)) as mcp_client:
+        app.state.http_client = mcp_client
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url='http://test',
+        ) as client:
+            return await client.get(path)
 
 
 class TestProjectRootsForLabel:
@@ -206,3 +238,93 @@ class TestFetchTaskProse:
         prose = TaskProse(description='d', details='t')
 
         assert prose.to_wire() == {'description': 'd', 'details': 't'}
+
+
+class TestTaskProseRoute:
+    """GET /api/v2/dashboard/task/{project}/T-{task_id}: one task's prose, by row uid."""
+
+    @pytest.mark.parametrize('name', ['proj', 'my proj#1'], ids=['plain', 'url-hostile'])
+    async def test_the_rows_uid_round_trips_to_get_task(self, tmp_path, name):
+        """The route template is task_uid's format: the uid addresses the right task."""
+        root, config = _project(tmp_path, _URL_1, name=name)
+        fused_memory = _FusedMemory({9101: {'id': '19', 'description': 'd', 'details': 't'}})
+        uid = task_uid(root.name, 19)
+
+        response = await _get_prose(config, fused_memory, _prose_path(uid))
+
+        assert response.status_code == 200
+        assert response.json() == {f'TASK_PROSE:{uid}': {'description': 'd', 'details': 't'}}
+        [call] = fused_memory.tool_calls()
+        assert call.params is not None
+        assert call.params['arguments'] == {'id': '19', 'project_root': str(root)}
+
+    async def test_an_unknown_project_is_404_and_never_asks_fused_memory(self, tmp_path):
+        _root, config = _project(tmp_path, _URL_1)
+        fused_memory = _FusedMemory({9101: {'id': '19'}})
+
+        response = await _get_prose(config, fused_memory, _prose_path('nope/T-19'))
+
+        assert response.status_code == 404
+        assert response.json() == {'error': 'unknown_project', 'project': 'nope'}
+        assert fused_memory.posts == []
+
+    async def test_a_label_naming_two_roots_is_409_and_never_asks_fused_memory(self, tmp_path):
+        """Picking one would show another task's prose under a correct-looking title."""
+        primary = tmp_path / 'a' / 'proj'
+        other = tmp_path / 'b' / 'proj'
+        for root in (primary, other):
+            root.mkdir(parents=True)
+        config = DashboardConfig(
+            project_root=primary, known_project_roots=[other], fused_memory_urls=[_URL_1],
+        )
+        fused_memory = _FusedMemory({9101: {'id': '19'}})
+
+        response = await _get_prose(config, fused_memory, _prose_path('proj/T-19'))
+
+        assert response.status_code == 409
+        assert response.json() == {
+            'error': 'ambiguous_project',
+            'project': 'proj',
+            'roots': [str(primary.resolve()), str(other.resolve())],
+        }
+        assert fused_memory.posts == []
+
+    async def test_a_missing_task_is_404_carrying_fused_memorys_message(self, tmp_path):
+        _root, config = _project(tmp_path, _URL_1)
+        message = 'No tasks found for ID(s): 19'
+        fused_memory = _FusedMemory({9101: {'error': message, 'error_type': 'TaskNotFoundError'}})
+
+        response = await _get_prose(config, fused_memory, _prose_path('proj/T-19'))
+
+        assert response.status_code == 404
+        assert response.json() == {'error': 'task_not_found', 'detail': message}
+
+    async def test_fused_memory_unreachable_is_502_with_a_detail(self, tmp_path):
+        _root, config = _project(tmp_path, _URL_1)
+        fused_memory = _FusedMemory({9101: httpx.ConnectError('refused')})
+
+        response = await _get_prose(config, fused_memory, _prose_path('proj/T-19'))
+
+        assert response.status_code == 502
+        body = response.json()
+        assert body['error'] == 'fused_memory_unreachable'
+        assert _URL_1 in body['detail']
+
+    async def test_a_hung_read_is_cut_at_the_budget_as_504(self, tmp_path, monkeypatch, caplog):
+        """Bounded: neither a hang nor a 500, and the expiry leaves a journal line."""
+        monkeypatch.setattr('dashboard.api.task_prose._TASK_PROSE_BUDGET', 0.05)
+        _root, config = _project(tmp_path, _URL_1)
+        fused_memory = _FusedMemory({9101: asyncio.Event()})
+
+        with caplog.at_level(logging.WARNING, logger='dashboard.api.task_prose'):
+            async with asyncio.timeout(5):
+                response = await _get_prose(config, fused_memory, _prose_path('proj/T-19'))
+
+        assert response.status_code == 504
+        body = response.json()
+        assert body['error'] == 'budget_exceeded'
+        assert body['detail']
+        assert fused_memory.tool_calls(), 'the read must have reached get_task before hanging'
+        [record] = [r for r in caplog.records if r.name == 'dashboard.api.task_prose']
+        assert 'proj' in record.getMessage()
+        assert '19' in record.getMessage()
