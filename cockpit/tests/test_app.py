@@ -4580,6 +4580,68 @@ class TestInFlightScanCannotUndoAKeypressWrite:
             with pytest.raises(RowDoesNotExist):
                 queue.get_row_index('decision:dec-1')
 
+    @pytest.mark.timeout(10)
+    async def test_the_scan_issued_before_a_boost_still_lands_its_sessions(self, tmp_path):
+        """The keypress re-reads decisions only, so it may void only the late
+        scan's decisions: the scan's sessions are still the freshest read.
+        Voiding the whole scan froze the session table for as long as
+        keypresses kept landing mid-scan -- on a large fleet, whose scan
+        outlasts the gap between presses, a whole triage burst.
+        """
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+        from cockpit.panes.session_table import SessionTable
+        from cockpit.priority import Priorities
+
+        older = sr.DecisionRecord(
+            id='dec-a',
+            project='df',
+            text='A?',
+            filed_at='2026-06-01T00:00:00+00:00',
+            manual_boost=0,
+        )
+        newer = sr.DecisionRecord(
+            id='dec-b',
+            project='df',
+            text='B?',
+            filed_at='2026-07-07T00:00:00+00:00',
+            manual_boost=0,
+        )
+        for d in (older, newer):
+            assert sr.write_decision(d, root=tmp_path)
+
+        fixed_now = datetime.fromisoformat('2026-07-07T00:00:00+00:00')
+        app = CockpitApp(
+            fleet_root=tmp_path,
+            backend=FakeBackend(),
+            poll_interval=60,
+            now_fn=lambda: fixed_now,
+            priorities=Priorities.default(),
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            table = app.query_one(SessionTable)
+            queue.move_cursor(row=queue.get_row_index('decision:dec-b'))
+            await pilot.pause()
+
+            sr.write_record(_make_record(session_slug='running-1'), root=tmp_path)
+            in_flight_seq = app._next_scan_seq()
+            records, decisions = app._scan_registry()
+            assert [r.session_slug for r in records] == ['running-1']
+
+            await pilot.press('b')
+            await pilot.pause()
+            assert table.row_count == 0
+
+            app._apply_scan(records, decisions, in_flight_seq)
+            await pilot.pause()
+            assert table.row_count == 1, "the keypress's re-read voided the scan's sessions"
+            assert queue.get_row_index('decision:dec-b') < queue.get_row_index('decision:dec-a'), (
+                "the late scan's decisions reverted the keypress's persisted boost"
+            )
+
 
 class TestDecisionQueueDetail:
     @pytest.mark.timeout(10)

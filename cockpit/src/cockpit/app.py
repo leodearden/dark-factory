@@ -274,15 +274,18 @@ class CockpitApp(App):
         # Monotonic scan-sequence guard (esc-2517-1, task 2606): _scan_seq is
         # the next-to-issue sequence number (see _next_scan_seq), bumped once
         # per scan INITIATED -- by refresh_registry, _poll_registry or
-        # _reread_decisions, all always on the main thread. _applied_scan_seq
-        # is the high-water mark of the newest sequence actually applied, by
-        # _apply_scan or by _reread_decisions' decisions-only read. A scan
-        # whose seq is older than that mark read the registry before a
-        # fresher scan already landed, and _apply_scan drops it rather than
-        # letting it regress the view. Like _scan_in_flight below, both are
-        # only ever mutated on the main thread, so neither needs a lock.
+        # _reread_decisions, all always on the main thread. Each of the two
+        # registries has its own high-water mark of the newest sequence
+        # actually applied: _applied_scan_seq for sessions, which only a full
+        # scan reads, and _applied_decisions_seq for decisions, which
+        # _reread_decisions' decisions-only read advances too. A read under
+        # an older seq than its registry's mark predates a fresher read that
+        # already landed, and _apply_scan discards it rather than letting it
+        # regress the view. Like _scan_in_flight below, all three are only
+        # ever mutated on the main thread, so none needs a lock.
         self._scan_seq = 0
         self._applied_scan_seq = 0
+        self._applied_decisions_seq = 0
         # Drop-tick backpressure for the threaded poll path (see
         # _poll_registry/_scan_registry_worker): True while a scan launched
         # by _poll_registry is still running. Only ever read/written on the
@@ -450,36 +453,41 @@ class CockpitApp(App):
         already torn down -- the threaded hand-off's shutdown-race hazard.
 
         Also guards against a stale threaded-poll result landing after a
-        fresher scan already applied (esc-2517-1, task 2606): *seq* is the
+        fresher read already applied (esc-2517-1, task 2606): *seq* is the
         monotonic sequence number the caller obtained from _next_scan_seq()
-        at scan-initiation time (see refresh_registry/_poll_registry). Any
-        seq strictly older than self._applied_scan_seq (the high-water mark
-        of the newest scan already applied) is dropped before the snapshot
-        diff even runs, so an in-flight background scan that read the
-        registry before a fresher one landed can never regress the view.
-        self._applied_scan_seq advances even on a no-op (snapshot-unchanged)
-        apply, so a later stale result is still correctly dropped.
+        at scan-initiation time (see refresh_registry/_poll_registry). Each
+        half of the result is checked against its own high-water mark. A
+        seq strictly older than self._applied_scan_seq (the newest scan
+        already applied) is dropped whole before the snapshot diff even
+        runs, so an in-flight background scan that read the registry before
+        a fresher one landed can never regress the view. A seq older only
+        than self._applied_decisions_seq keeps its sessions but not its
+        decisions, which give way to those a later _reread_decisions
+        already adopted: that re-read covers decisions alone, so it says
+        nothing about sessions. Both marks advance even on a no-op
+        (snapshot-unchanged) apply, so a later stale result is still
+        correctly discarded.
 
         Note: seq order tracks scan-*initiation* order, not measured
         read-completion order -- it is a proxy for freshness, not a direct
-        stamp of it. So a scan issued earlier (lower seq) that finishes its
-        registry read later than one issued after it is dropped even though
-        it is actually fresher. _reread_decisions opens exactly that window:
-        it can take a seq while a poll scan is in flight, so that
-        earlier-issued scan is dropped whole even if its read finished
-        after the keypress's write. A drop never regresses the view,
-        though: the next tick's scan re-reads everything, so the only cost
-        is lag until that scan lands, sessions included. Poll scans still
-        never race each other or refresh_registry: _scan_in_flight (see
+        stamp of it. Scans never race each other: _scan_in_flight (see
         _poll_registry) admits only one in-flight poll worker at a time,
         and refresh_registry only ever runs synchronously at on_mount,
-        before the poll timer is registered.
+        before the poll timer is registered. A keypress's _reread_decisions
+        can take a seq while a poll scan is in flight, though, so that
+        scan's decisions are discarded even when its read finished after
+        the re-read. That never regresses the view; anything only the
+        discarded read saw shows up with the next scan.
         """
         if not self.is_running:
             return
         if seq < self._applied_scan_seq:
             return
         self._applied_scan_seq = seq
+        if seq < self._applied_decisions_seq:
+            decisions = self._decisions
+        else:
+            self._applied_decisions_seq = seq
         new_snapshot = build_snapshot(records)
         new_decisions_snapshot = _decisions_snapshot(decisions)
         if (
@@ -1051,16 +1059,19 @@ class CockpitApp(App):
         the task-3812 project fold holds here as well.
 
         A SEQUENCED read: it takes a seq from _next_scan_seq() and advances
-        _applied_scan_seq, so a poll scan issued before the write, whose
-        read may predate it, is dropped by _apply_scan's stale-scan guard
-        when it lands. Unsequenced, that late landing reverted the write in
-        the view, and the next 'b' built on the stale boost and persisted
-        it, losing a press (task 5839).
+        _applied_decisions_seq, so a poll scan issued before the write,
+        whose read may predate it, lands without its decisions (see
+        _apply_scan's stale-scan guard). Unsequenced, that late landing
+        reverted the write in the view, and the next 'b' built on the stale
+        boost and persisted it, losing a press (task 5839). It leaves
+        _applied_scan_seq alone because it reads no sessions: advancing that
+        mark dropped the scan's sessions too, so keypresses landing mid-scan
+        froze the session table for as long as they kept coming.
         """
         seq = self._next_scan_seq()
         self._decisions = scan_decisions(self.fleet_root)
         self._decisions_snapshot = _decisions_snapshot(self._decisions)
-        self._applied_scan_seq = seq
+        self._applied_decisions_seq = seq
 
     def _decision_by_id(self, decision_id: str) -> DecisionRecord | None:
         return next((d for d in self._decisions if d.id == decision_id), None)
