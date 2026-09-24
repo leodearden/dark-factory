@@ -2908,13 +2908,11 @@ def test_main_done_line_names_unresolved_verdicts_only_when_non_zero(
 # task 3291: run_census() must never persist a FABRICATED done-count baseline.
 #
 # This is the test that would have caught the 2026-07-24 regression on the day
-# it happened. census.py's CLI DEFAULTED --project-root to "." and
-# nightly._default_census_launcher launched it with no arguments (both fixed
-# by task 3269), so the get_statuses call went out with a relative path;
-# fused-memory rejected it with a {"error", "error_type"} envelope on an
-# isError:false response; and
-# the old `(status.get("statuses") or {})` idiom silently read that as a
-# done-count of 0 and persisted it as a real baseline.
+# it happened. The get_statuses call went out with a relative path (the
+# pre-task-3269 --project-root default); fused-memory rejected it with a
+# {"error", "error_type"} envelope on an isError:false response; and the old
+# `(status.get("statuses") or {})` idiom silently read that as a done-count
+# of 0 and persisted it as a real baseline.
 # ---------------------------------------------------------------------------
 
 def _make_error_envelope_status_fetcher():
