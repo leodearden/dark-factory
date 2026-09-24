@@ -570,8 +570,9 @@ def _unbound_sort_key(row: UnboundLabel) -> tuple[str, int]:
 class LabelBindingSweep(NamedTuple):
     """The label-binding direction's rows, and the population they came from.
 
-    The four counts partition ``manifest_bearing_tasks`` together with
-    ``len(unbound_labels)`` — see :class:`AuditCoverage`.
+    The bound, no-tracked-sidecar and unparseable-sidecar counts, together with
+    ``len(unbound_labels)``, partition ``manifest_bearing_tasks`` — see
+    :class:`AuditCoverage`.
     """
 
     unbound_labels: list[UnboundLabel]
@@ -643,7 +644,9 @@ def _sweep_label_bindings(
 
 
 def audit_project(project_root: str, manifest_root: str | None = None) -> ProjectAudit:
-    """Compare every mechanical sidecar descriptor against its task-record twin.
+    """Run both directions for one project: compare every mechanical sidecar
+    descriptor against its task-record twin, and list every task label its
+    tracked sidecar does not declare (:func:`_sweep_label_bindings`).
 
     *manifest_root* defaults to *project_root*, so a single-checkout run and a
     multi-project sweep behave exactly as they would without the flag.
