@@ -1132,20 +1132,18 @@ def _tmp_literal(value: ast.expr) -> str | None:
     cost is that a hypothetical ``/tmpfoo`` would also match, which is a
     false-positive costing one allowlist line rather than a blind spot.
 
-    ONE DELIBERATE FALSE NEGATIVE, recorded so it reads as a decision and not an
-    oversight: a COMPOUND value is not inspected, so
-    ``test_harness_train_callbacks.py``'s
-    ``config.project_root = tmp_path or Path('/tmp/proj')`` does not match.  That
-    site is a hybrid — its ``_tc_config`` factory already takes the sandboxed
-    ``tmp_path`` keyword this task's remedy points authors at, and the ``/tmp``
-    literal is only the fallback when a caller omits it.  Recursing into
-    ``BoolOp``/``IfExp`` would flag it, but the census would then be asserting a
-    COUNT over sites whose literal may never be evaluated, which is a weaker
-    claim than the one the allowlist makes about the other 22.  It is left out
-    of the population rather than adjudicated into it.
+    COMPOUND values are seen through: every ``BoolOp`` operand and both
+    ``IfExp`` branches go through this same rule, but never an ``IfExp``
+    condition, which is not a bound value.  So
+    ``tmp_path or Path('/tmp/proj')`` matches.  A fallback literal escapes
+    whenever a caller omits the sandboxed argument, so it meets the same bar as
+    a plain one.  Task 5011 removed the only live instance (``_tc_config``).
     """
     if isinstance(value, ast.Constant) and isinstance(value.value, str):
         return value.value if value.value.startswith('/tmp') else None
+    if isinstance(value, ast.BoolOp | ast.IfExp):
+        operands = value.values if isinstance(value, ast.BoolOp) else [value.body, value.orelse]
+        return next(filter(None, map(_tmp_literal, operands)), None)
     if isinstance(value, ast.Call):
         called = (
             value.func.id if isinstance(value.func, ast.Name)
@@ -1242,7 +1240,8 @@ def _absolute_tmp_project_root_literals(tree: ast.Module) -> list[str]:
 
     WHAT IT MATCHES — three BINDING shapes, each spelling ``project_root`` as an
     identifier at the binding site, and whose value is a ``/tmp`` string
-    literal, bare or wrapped in ``Path(...)`` (see ``_tmp_literal``):
+    literal — bare, wrapped in ``Path(...)``, or inside a compound value (see
+    ``_tmp_literal``):
 
     * an ``ast.Assign`` or ``ast.AnnAssign`` whose target names a
       ``project_root`` (see ``_is_project_root_target``).  ``Assign.targets`` is
@@ -1346,12 +1345,12 @@ class TestAbsoluteTmpProjectRootLiteralsAreCensused:
     THE POPULATION, named precisely rather than as "every literal", because a
     census that overstates its own reach is the failure it exists to prevent:
     assignments, parameter DEFAULTS and call KEYWORDS — every binding that
-    spells ``project_root`` as an identifier at the site.  Four shapes are
-    outside it, each by a recorded decision rather than by omission: positional
-    arguments and string dict keys (``_absolute_tmp_project_root_literals.__doc__``,
-    pinned by
-    ``test_the_detector_ignores_a_binding_with_no_project_root_identifier``), the
-    COMPOUND ``tmp_path or Path('/tmp/proj')`` form (``_tmp_literal.__doc__``),
+    spells ``project_root`` as an identifier at the site — including a ``/tmp``
+    literal inside a COMPOUND value such as ``tmp_path or Path('/tmp/proj')``
+    (``_tmp_literal.__doc__``).  Three shapes are outside it, each by a
+    recorded decision rather than by omission: positional arguments and string
+    dict keys (``_absolute_tmp_project_root_literals.__doc__``, pinned by
+    ``test_the_detector_ignores_a_binding_with_no_project_root_identifier``),
     and non-``/tmp`` absolute roots (pinned by
     ``test_the_detector_ignores_an_absolute_literal_outside_tmp``).
 
