@@ -15,6 +15,7 @@ from fused_memory.reconciliation.prompts import (
     AMEND_AND_EPISODE_TOOLS_BLOCK,
     CITATION_REPAIR_TOOL_BLOCK,
     DUPLICATE_FINDING_SALVAGE_GUIDANCE,
+    REFERENT_DECLARATION_GUIDANCE,
     STALE_KNOWLEDGE_ANNOTATION_NORM,
     get_recon_report_tool_guidance,
     render_escalation_boundary_note,
@@ -342,6 +343,8 @@ genuinely older than the {_STAGE1_GATE_STALL_THRESHOLD_HOURS}h stall threshold \
 (`stage1_stall_detector.py::STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS`). A gate stamped \
 more recently than that is NOT stalled and must not be reported as such. This check \
 needs no escalation read at all: the stamp lives on the task record, which you do hold.
+
+{REFERENT_DECLARATION_GUIDANCE}
 
 ## Verifying Writes
 After calling `mcp__fused-memory__add_memory`, inspect the `memory_ids` field in the \
