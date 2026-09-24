@@ -207,10 +207,11 @@ def _rejection(example: DeclaredExample) -> str | None:
     )
     if block is None:
         return None
-    details = {k: block[k] for k in ('conflicts', 'content_referents') if k in block}
+    facts = [f'{key}={block[key]}' for key in ('conflicts', 'content_referents') if key in block]
+    verdict = ' '.join([block['error_type'], *facts])
     return (
-        f'{example.where}: {_DECLARATION_KEYWORD}={example.literal!r} -> '
-        f'{block["error_type"]} {details or ""}: {block.get("hint", block["error"])}'
+        f'{example.where}: {_DECLARATION_KEYWORD}={example.literal!r} -> {verdict}: '
+        f'{block.get("hint", block["error"])}'
     )
 
 
