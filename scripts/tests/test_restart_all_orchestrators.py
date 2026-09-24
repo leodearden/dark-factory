@@ -1666,8 +1666,8 @@ def test_unit_that_stops_heartbeating_mid_defer_drops_into_the_shorter_grace(
     # the point is that the run finishes long before this busy grace would.
     spawn_timeout = 15
 
-    result, state, fired = _busy_unit_drain_run(
-        tmp_path, [(verdict_label, _FIRST_TRANSITION_DELAY_SECS, overrides)],
+    result, state, polls = _run_busy_unit_through(
+        tmp_path, [_Rewrite(after="busy", to=overrides)],
         spawn_timeout=spawn_timeout,
         ORCH_RESTART_FORCE_FIRE_AFTER_SECS=str(wait_proof_grace_secs(spawn_timeout)),
         ORCH_DRAIN_UNKNOWN_GRACE_SECS="0",
@@ -1681,7 +1681,8 @@ def test_unit_that_stops_heartbeating_mid_defer_drops_into_the_shorter_grace(
     # drain_await_fresh, above the defer line -- prints a byte-identical
     # "proceeding" line but returns BEFORE any defer line, so this is what
     # proves the IN-LOOP re-classification block ran, not the top-level path
-    # with the unit simply starting stale/absent.
+    # with the unit simply starting stale/absent. The rewrite waits for the
+    # gate's first busy poll, so correct code cannot reach that top-level path.
     assert f"deferring restart of {UNIT_R}: mid-merge" in result.stdout, (
         f"expected a defer line before the re-classification; got "
         f"stdout={result.stdout!r}"
@@ -1699,8 +1700,9 @@ def test_unit_that_stops_heartbeating_mid_defer_drops_into_the_shorter_grace(
     assert ["--user", "restart", UNIT_R] in state["calls"], (
         f"expected a restart call for {UNIT_R}; got calls={state['calls']!r}"
     )
-    assert verdict_label in fired, (
-        f"the scheduled {verdict_label} transition never landed: fired={fired!r}"
+    assert (verdict_label, UNIT_R) in polls, (
+        f"the gate never READ the {verdict_label} rewrite: ledger={polls!r} "
+        f"stdout={result.stdout!r}"
     )
 
 
@@ -1718,19 +1720,19 @@ def test_unit_that_stops_heartbeating_mid_defer_proceeds_after_a_nonzero_grace_e
     drain_await_fresh call nested inside drain_gate's busy poll loop (rather
     than from drain_gate's own opening await), had no test at all (only the
     top-level entry point had a same-shaped zero-grace test; neither entry
-    had a nonzero one). A heartbeat that STAYS stale (no further scheduled
-    transition -- unlike this file's other timelines, this one deliberately
-    lets the grace genuinely elapse instead of racing a later flip) with a
-    small nonzero grace forces at least one real sleep-and-recheck cycle
-    before the grace elapses.
+    had a nonzero one). A heartbeat that STAYS stale once the gate has seen
+    it busy (no further rewrite -- unlike the tests below, which hand the
+    gate a fresh reading afterwards, this one deliberately lets the grace
+    genuinely elapse) with a small nonzero grace forces at least one real
+    sleep-and-recheck cycle before the grace elapses.
     """
     # ONE binding feeding both the grace and the timeout -- see
     # test_defer_withholds_restart_while_busy. Deliberately unreachable here.
     spawn_timeout = 15
     unknown_grace = 3
 
-    result, state, fired = _busy_unit_drain_run(
-        tmp_path, [("stale", _FIRST_TRANSITION_DELAY_SECS, _HB_STALE)],
+    result, state, polls = _run_busy_unit_through(
+        tmp_path, [_Rewrite(after="busy", to=_HB_STALE)],
         spawn_timeout=spawn_timeout,
         ORCH_RESTART_FORCE_FIRE_AFTER_SECS=str(wait_proof_grace_secs(spawn_timeout)),
         ORCH_DRAIN_UNKNOWN_GRACE_SECS=str(unknown_grace),
@@ -1756,8 +1758,9 @@ def test_unit_that_stops_heartbeating_mid_defer_proceeds_after_a_nonzero_grace_e
     assert ["--user", "restart", UNIT_R] in state["calls"], (
         f"expected a restart call for {UNIT_R}; got calls={state['calls']!r}"
     )
-    assert "stale" in fired, (
-        f"the scheduled stale transition never landed: fired={fired!r}"
+    assert ("stale", UNIT_R) in polls, (
+        f"the gate never READ the stale rewrite: ledger={polls!r} "
+        f"stdout={result.stdout!r}"
     )
 
 
