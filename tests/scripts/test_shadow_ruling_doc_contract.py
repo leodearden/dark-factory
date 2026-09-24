@@ -1,0 +1,611 @@
+"""Contract guards binding the shadow-ruling documents to the live module.
+
+Task 5374. ``skills/escalation-watcher/SKILL.md`` shows the L2 session an
+``x_shadow_ruling:`` payload to stamp, and ``docs/escalation-standing-policy.md``
+enumerates the slug vocabularies that payload draws on. Both are hand-written
+prose next to a real parser. A literal the skill presents but the parser rejects
+costs a sample of the very measurement it exists to feed — silently, because a
+rejected stamp is indistinguishable from a record nobody stamped.
+
+SCOPE — STRUCTURE ONLY, NEVER PROSE. Adopting the task-4095 precedent by name
+(``tests/scripts/test_unblock_skill_done_provenance_templates.py``): every word
+of guidance in both documents stays free to be rewritten, reordered or deleted.
+What is held is only that a payload literal the skill presents is one the parser
+accepts, and that a slug the policy document enumerates is one the code knows.
+Nothing about the SHADOW vocabularies is hand-copied here — they are read off the
+same frozensets the codec validates against.
+
+THE ``scope-not-delivered`` HALF guards a different failure. That standing
+policy (Leo, 2026-09-21, resolving esc-4811-3) is a policy statement with NO
+code side by ruling, so ``docs/escalation-standing-policy.md`` is the SINGLE
+normative home of its closure-form vocabulary. This file states no closure form
+of its own: it reads them back out of that document, asserts only that the
+document still carries some, and FAILS rather than dropping one it cannot parse.
+The hand-written tokens left are ``_POLICY_CLASS``, serving as the marker slug,
+and the two headings the spans must sit under — structural ANCHORS of exactly
+the kind ``tests/scripts/test_line_pin_policy.py::_MARKER_BEGIN`` is, not copies
+of a vocabulary. What is held is ABLATION: the ruling has two homes — the policy
+document a human is pointed at, and the skill the watcher actually loads — and
+silent deletion from either, or quiet detachment from the section that home
+sends a reader to, leaves a ruling half the readership never sees.
+``tests/scripts/test_line_pin_policy.py`` holds a two-home documentation policy
+exactly this way, with the same begin/end marker pair and the same refusal to
+assert on wording.
+
+COUNTER-EXAMPLES. The skill shows a REJECTED payload next to a good one, so a
+reader can recognise the shape that will be thrown away. Put
+``<!-- shadow-guard: negative -->`` on the same line as the fence opener to mark
+one: the extractor sorts it into the negative set, where it is required to FAIL
+the parser. An unmarked counter-example fails this guard, as it should.
+
+MUST NOT SKIP. No ``pytest.importorskip``, no try/except-and-skip. A missing
+SKILL.md, a missing policy document or an unimportable
+``escalation.shadow_ruling`` must FAIL here. A guard that skips reports green on
+exactly the breakage it was written to catch.
+"""
+from __future__ import annotations
+
+import importlib
+import json
+import pathlib
+import re
+
+import pytest
+from escalation.shadow_ruling import (
+    FIRST_TRANCHE_CLASSES,
+    HUMAN_FOREVER_GATES,
+    PAYLOAD_WIRE_KEYS,
+    REVERSIBLE_ACTIONS,
+    SHADOW_RULING_MARKER,
+    ShadowRuling,
+    main,
+    parse_shadow_ruling,
+)
+
+# Resolved by walking up from THIS file, never from cwd: the suite is run from
+# the repo root by its module config and from `tests/scripts/` by hand.
+REPO_ROOT = pathlib.Path(__file__).parents[2]
+
+SKILL = REPO_ROOT / "skills" / "escalation-watcher" / "SKILL.md"
+POLICY = REPO_ROOT / "docs" / "escalation-standing-policy.md"
+
+#: Marks a fenced literal the skill shows in order to be REJECTED.
+_NEGATIVE_MARKER = "<!-- shadow-guard: negative -->"
+
+#: The policy document's slug lists, keyed by the exact `## ` heading each sits
+#: under, and paired with the frozenset each must equal. Both directions are
+#: checked, so neither a documentation addition nor a code addition can drift
+#: alone.
+_SLUG_SECTIONS: tuple[tuple[str, frozenset[str]], ...] = (
+    ("Reversible actions", REVERSIBLE_ACTIONS),
+    ("Human-forever gates", HUMAN_FOREVER_GATES),
+    ("First-tranche candidate classes", FIRST_TRANCHE_CLASSES),
+)
+
+#: A slug bullet: a list item that OPENS with a backticked lowercase token.
+#: Leading-position only, so the surrounding prose in those sections may keep
+#: backticking whatever it likes without joining the vocabulary.
+_SLUG_BULLET = re.compile(r"^- `([a-z0-9_]+)`")
+
+#: The arguments the skill's quoted weekly-count command passes, captured from
+#: after the module spelling to the end of the (possibly `\`-continued) command.
+#: Read off the doc and driven through the live `main()`, so the flag vocabulary
+#: is checked in BOTH directions rather than pinned as a substring.
+_QUOTED_ARGV = re.compile(
+    r"python -m escalation\.shadow_ruling(?P<args>(?:[ \t]|\\\n|[-\w<>/.=:]+)*)"
+)
+
+#: The heading of the skill's shadow-mode section. Its content is read from here
+#: to the next top-level heading.
+_SHADOW_SECTION = "## Shadow-mode standing-policy rulings (measurement only)"
+
+#: The heading of the skill's `design_concern` handling, pinned as a literal the
+#: same way. Its body is read to the next `### ` heading, which INCLUDES the
+#: `#### Standing rule ...` subsection — `"#### ".startswith("### ")` is False,
+#: the fourth character being `#` rather than a space.
+_DESIGN_CONCERN_SECTION = "### `design_concern` (info or blocking)"
+
+#: The heading of the policy document's standing-policy section, pinned the same
+#: way. Its span is read from INSIDE this section, for the reason the skill's is
+#: read from inside `design_concern` handling: a span moved down to
+#: `## Pointers` still parses, and is still detached from the section `## Status`
+#: sends a reader to.
+_POLICY_SECTION = "## The `scope-not-delivered` closure policy, also in force"
+
+#: The standing-policy class ruled IN FORCE on 2026-09-21 — one token serving as
+#: both the class name and the marker slug, so the two cannot drift apart.
+_POLICY_CLASS = "scope-not-delivered"
+
+#: The marked span carrying the ruling, in each of its two homes. The opener is
+#: matched as a PREFIX, not as a whole comment, exactly as
+#: `tests/scripts/test_line_pin_policy.py::_MARKER_BEGIN` is: both homes carry
+#: their extraction contract inside the opening comment, and pinning the `-->`
+#: would forbid that.
+_POLICY_BEGIN = f"<!-- {_POLICY_CLASS}:begin"
+_POLICY_END = f"<!-- {_POLICY_CLASS}:end -->"
+
+#: A closure-form bullet. HYPHENATED, matching the spelling the policy
+#: vocabulary uses. That spelling is NOT what keeps this extractor and
+#: `_SLUG_BULLET` apart — a separator-free slug matches both, and `- `resume``
+#: (a live `REVERSIBLE_ACTIONS` member) is one, measured. The separation is
+#: REGIONAL: `_SLUG_BULLET` reads only the three `## ` vocabulary sections and
+#: this one only the marked span, and no line lies in both.
+_POLICY_BULLET = re.compile(r"^- `([a-z0-9-]+)`")
+
+
+def _read(path: pathlib.Path) -> str:
+    assert path.is_file(), (
+        f"{path.relative_to(REPO_ROOT)} is missing. This guard binds it to "
+        f"escalation.shadow_ruling and must FAIL rather than skip when it is gone."
+    )
+    return path.read_text()
+
+
+def _section(text: str, heading: str, level: str = "## ") -> str:
+    """The body under *heading*, up to the next heading at the same level."""
+    lines = text.splitlines()
+    starts = [i for i, line in enumerate(lines) if line.strip() == heading.strip()]
+    assert len(starts) == 1, f"expected exactly one {heading!r} heading, found {len(starts)}"
+    start = starts[0] + 1
+    end = next(
+        (i for i in range(start, len(lines)) if lines[i].startswith(level)),
+        len(lines),
+    )
+    return "\n".join(lines[start:end])
+
+
+def _marked_span(text: str, source: str) -> str:
+    """The body of the `scope-not-delivered` marked span in *text*.
+
+    Fails LOUDLY — never skips, never returns empty — on every shape that would
+    leave the guard pinning nothing: the opener absent, duplicated, unterminated
+    or inverted. Error shapes mirror
+    `scripts/tests/test_merge_state_vocabulary_consistency.py`, whose extractor
+    contract records why: an extractor that silently yields nothing turns every
+    downstream assertion green while holding nothing at all.
+    """
+    opens = text.count(_POLICY_BEGIN)
+    assert opens == 1, (
+        f"{source}: expected exactly one `{_POLICY_BEGIN}` marker, found {opens} "
+        f"(task 5723). This document is one of the two homes of the "
+        f"`{_POLICY_CLASS}` ruling; a missing opener means the ruling was "
+        f"deleted from it, and a second one means the span this guard reads is "
+        f"ambiguous."
+    )
+    closes = text.count(_POLICY_END)
+    assert closes == 1, (
+        f"{source}: expected exactly one `{_POLICY_END}` marker, found {closes} "
+        f"(task 5723) — the `{_POLICY_CLASS}` span is unterminated, so the rest "
+        f"of the file would be read as its body."
+    )
+
+    start = text.index(_POLICY_BEGIN)
+    end = text.index(_POLICY_END)
+    assert start < end, (
+        f"{source}: the `{_POLICY_END}` marker precedes `{_POLICY_BEGIN}` "
+        f"(task 5723) — the `{_POLICY_CLASS}` span is inverted and encloses "
+        f"nothing."
+    )
+    comment_close = text.find("-->", start)
+    assert comment_close != -1 and comment_close < end, (
+        f"{source}: the `{_POLICY_BEGIN}` comment is never closed with `-->` "
+        f"before the end marker (task 5723) — its own extraction-contract prose "
+        f"would be read as span content."
+    )
+    return text[comment_close + len("-->"):end]
+
+
+def _note_line(ruling_class: str, proposed_action: str) -> str:
+    """A hand-built `x_shadow_ruling:` line, keyed off the live wire spellings.
+
+    NOT rendered via `ShadowRuling.to_note_line`: that constructor validates on
+    construction and raises on a class outside `FIRST_TRANCHE_CLASSES`, so it
+    cannot produce the very payloads this guard needs the PARSER to reject. The
+    wire keys are still read off `PAYLOAD_WIRE_KEYS` rather than re-typed, for
+    the reason `test_payload_literals_are_json_objects_carrying_the_documented_keys`
+    records.
+    """
+    attributes = {
+        "ruling_class": ruling_class,
+        "proposed_action": proposed_action,
+        "evidence": "probe output quoted verbatim",
+        "confidence": 0.9,
+    }
+    payload = {wire: attributes[attribute] for wire, attribute in PAYLOAD_WIRE_KEYS.items()}
+    return f"{SHADOW_RULING_MARKER} {json.dumps(payload, sort_keys=True)}"
+
+
+def _fenced_payload_literals(text: str) -> tuple[list[str], list[str]]:
+    """Split fenced JSON literals in *text* into (positive, negative).
+
+    A literal qualifies when the marker token appears on the fence opener or
+    inside the block — that is what makes it a payload the skill is PRESENTING
+    rather than an unrelated JSON example.
+    """
+    positive: list[str] = []
+    negative: list[str] = []
+    for opener, body in re.findall(r"^(```[^\n]*)\n(.*?)^```", text, re.DOTALL | re.MULTILINE):
+        if SHADOW_RULING_MARKER not in opener and SHADOW_RULING_MARKER not in body:
+            continue
+        (negative if _NEGATIVE_MARKER in opener else positive).append(body)
+    return positive, negative
+
+
+def _marker_lines(block: str) -> list[str]:
+    """Every line the block PRESENTS as a stamp, returned VERBATIM.
+
+    Recognised by the stripped form, so an indented literal is still SEEN —
+    but returned unstripped, so the live parser judges exactly the bytes a
+    reader would copy. `parse_shadow_ruling` requires the marker at index 0
+    (`line.startswith(...)`, no strip), so stripping here would normalise away
+    the one difference that matters: an `x_shadow_ruling:` literal nested
+    inside a list item or a numbered step would pass this guard and still be
+    rejected in production, which is precisely the equivalence the guard
+    exists to hold.
+    """
+    return [
+        line for line in block.splitlines()
+        if line.strip().startswith(SHADOW_RULING_MARKER)
+    ]
+
+
+# ---------------------------------------------------------------------------
+# The skill's payload literals, against the live parser
+# ---------------------------------------------------------------------------
+
+
+def test_every_presented_payload_literal_parses_into_a_valid_ruling():
+    positive, _ = _fenced_payload_literals(_read(SKILL))
+    for block in positive:
+        lines = _marker_lines(block)
+        assert lines, (
+            f"a fenced literal mentions {SHADOW_RULING_MARKER} but carries no line "
+            f"beginning with it, so a reader copying it would stamp something the "
+            f"parser cannot see:\n{block}"
+        )
+        for line in lines:
+            ruling = parse_shadow_ruling(line)
+            assert isinstance(ruling, ShadowRuling), (
+                f"the skill presents a payload the live parser rejects — a reader "
+                f"following it would lose the sample silently:\n{line}"
+            )
+
+
+def test_an_indented_literal_is_caught_rather_than_normalised_away():
+    """Non-vacuity for `_marker_lines` returning the line VERBATIM.
+
+    The guard's whole claim is that a literal the skill presents is one the
+    parser accepts. Indentation is the one transformation that breaks that
+    equivalence without changing a single payload byte, so this drives a block
+    the extractor would have passed when it stripped: the line is still SEEN
+    (a silently-empty extraction would be the worse failure) and the live
+    parser still REJECTS it.
+    """
+    indented = "    " + ShadowRuling(
+        ruling_class=sorted(FIRST_TRANCHE_CLASSES)[0],
+        proposed_action=sorted(REVERSIBLE_ACTIONS)[0],
+        evidence="probe output quoted verbatim",
+        confidence=0.9,
+    ).to_note_line()
+
+    lines = _marker_lines(indented)
+
+    assert lines == [indented], (
+        "an indented literal must still be seen, or the guard reports green by "
+        "extracting nothing"
+    )
+    assert parse_shadow_ruling(lines[0]) is None, (
+        "the live parser requires the marker at index 0; if this now passes, "
+        "_marker_lines has started normalising the presented bytes again"
+    )
+    assert parse_shadow_ruling(lines[0].strip()) is not None, (
+        "sanity: the same payload unindented must parse, so the rejection "
+        "above is about the indentation and not a malformed fixture"
+    )
+
+
+def test_at_least_one_payload_literal_was_extracted():
+    """Non-vacuity: an extractor that silently matches nothing is worse than no
+    extractor, because it reports green forever."""
+    positive, _ = _fenced_payload_literals(_read(SKILL))
+    assert positive, (
+        f"no fenced {SHADOW_RULING_MARKER} literal found in "
+        f"{SKILL.relative_to(REPO_ROOT)} — either the section was removed or the "
+        f"extractor stopped matching it."
+    )
+
+
+def test_at_least_one_counter_example_is_really_rejected():
+    """A counter-example that silently validates is worse than none: it teaches
+    the reader that a broken shape is fine."""
+    _, negative = _fenced_payload_literals(_read(SKILL))
+    assert negative, (
+        f"the skill marks no {_NEGATIVE_MARKER} literal, so nothing shows a reader "
+        f"the shape that gets thrown away."
+    )
+    for block in negative:
+        lines = _marker_lines(block)
+        assert lines, f"a negative literal carries no marker line:\n{block}"
+        for line in lines:
+            assert parse_shadow_ruling(line) is None, (
+                f"this literal is marked as a counter-example but the parser ACCEPTS "
+                f"it:\n{line}"
+            )
+
+
+def test_payload_literals_are_json_objects_carrying_the_documented_keys():
+    """The skill's fenced literals must be readable as JSON by a human too —
+    a payload that only the parser's leniency saves is not a good example.
+
+    The key set is READ OFF `PAYLOAD_WIRE_KEYS`, never re-typed here: a
+    re-typed copy agrees with whichever of the encoder/decoder it happened to
+    match and goes on reporting green while the other drifts away from it.
+    """
+    positive, _ = _fenced_payload_literals(_read(SKILL))
+    for block in positive:
+        for line in _marker_lines(block):
+            payload = json.loads(line[len(SHADOW_RULING_MARKER):])
+            assert set(payload) == set(PAYLOAD_WIRE_KEYS)
+
+
+# ---------------------------------------------------------------------------
+# The policy document's slug vocabularies, against the live frozensets
+# ---------------------------------------------------------------------------
+
+
+# IDs are the headings alone, never the frozensets: a set's repr order varies
+# with each process's hash seed, so deriving an id from one makes every xdist
+# worker collect a differently-named test and the run dies in collection.
+@pytest.mark.parametrize(
+    ("heading", "expected"),
+    _SLUG_SECTIONS,
+    ids=[heading for heading, _ in _SLUG_SECTIONS],
+)
+def test_documented_slugs_equal_the_live_vocabulary(heading: str, expected: frozenset[str]):
+    body = _section(_read(POLICY), f"## {heading}")
+    documented = {m.group(1) for line in body.splitlines() if (m := _SLUG_BULLET.match(line))}
+
+    assert documented == expected, (
+        f"under '## {heading}', the policy document and escalation.shadow_ruling "
+        f"have drifted.\n"
+        f"  documented but unknown to the code: {sorted(documented - expected)}\n"
+        f"  known to the code but undocumented: {sorted(expected - documented)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The skill's shadow section points at things that exist
+# ---------------------------------------------------------------------------
+
+
+def test_the_shadow_section_names_the_policy_document_and_it_exists():
+    section = _section(_read(SKILL), _SHADOW_SECTION)
+    relative = str(POLICY.relative_to(REPO_ROOT))
+    assert relative in section, (
+        f"the shadow section must name {relative} — it is the authority for the "
+        f"classes it tells the session to stamp."
+    )
+    assert POLICY.is_file()
+
+
+def test_the_shadow_sections_quoted_command_actually_runs(tmp_path: pathlib.Path):
+    """The strongest form of the check below: the doc's OWN argv, driven
+    through the live `main()`.
+
+    `assert "--queue-dir" in section` — what this replaces — was a one-way
+    string pin on prose. It failed if the DOC dropped the flag and stayed green
+    if the CLI RENAMED it, which is the direction that actually costs the
+    operator a runnable command. Running the quoted arguments proves both
+    directions at once: an unknown flag exits 2 out of argparse, and a required
+    flag the doc forgot to quote does too.
+
+    Placeholders (`<project_root>/...`) are substituted with a real empty
+    directory, so this exercises the argument vocabulary and nothing else.
+
+    THE LIMIT, measured rather than assumed: argparse accepts an unambiguous
+    PREFIX of a long option, so renaming `--queue-dir` to `--queue-directory`
+    still parses and still passes here. A rename that is not a prefix of the
+    new spelling — the ordinary case — exits 2 and fails.
+    """
+    section = _section(_read(SKILL), _SHADOW_SECTION)
+    quoted = _QUOTED_ARGV.search(section)
+    assert quoted, (
+        "the shadow section must quote the weekly-count command with its "
+        "arguments, or the measurement half has no operator."
+    )
+
+    argv = [
+        str(tmp_path) if token.startswith("<") else token
+        for token in quoted.group("args").replace("\\\n", " ").split()
+    ]
+    assert argv, "the quoted command passes no arguments; --queue-dir is required"
+    assert main(argv) == 0, (
+        f"the command the shadow section tells the operator to run is not "
+        f"runnable as quoted: {argv}"
+    )
+
+
+def test_the_shadow_section_quotes_a_runnable_weekly_count_command():
+    """The module spelling is EXTRACTED from the doc and run against the
+    import system, never compared to a literal written here.
+
+    Asserting `escalation.shadow_ruling.__name__ == "escalation.shadow_ruling"`
+    cannot fail — a module's `__name__` is its import path by construction — so
+    it tested nothing the file-level import had not already proved, and a doc
+    quoting `python -m escalation.shadow_ruling_v2` would have passed it while
+    naming a module that does not exist.
+    """
+    section = _section(_read(SKILL), _SHADOW_SECTION)
+    quoted = re.findall(r"python -m ([A-Za-z_][\w.]*)", section)
+    assert quoted, (
+        "the shadow section must quote the weekly-count command, or the "
+        "measurement half has no operator."
+    )
+
+    for spelling in sorted(set(quoted)):
+        module = importlib.import_module(spelling)
+        assert callable(getattr(module, "main", None)), (
+            f"the shadow section quotes `python -m {spelling}`, but that module "
+            f"exposes no callable main() — the command it tells the operator to "
+            f"run is not runnable."
+        )
+
+
+# ---------------------------------------------------------------------------
+# The `scope-not-delivered` standing policy, in both of its homes
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def documented_closure_forms() -> frozenset[str]:
+    """The closure forms `docs/escalation-standing-policy.md` currently names.
+
+    ONE DERIVATION for the two guards below, each of which used to open with a
+    verbatim copy of it (heuristic 11, SPOT). Setup rather than assertion, so
+    the two still fail independently and each keeps its own message for the
+    claim it holds; `conftest.py::root_config` records that argument at length
+    for this same directory.
+
+    THE SPAN IS READ OUT OF ITS OWN SECTION, not out of the whole file, for the
+    reason the skill-side guard reads its span out of `design_concern` handling:
+    a span moved under `## Pointers` or below `## Provenance` still parses, and
+    is still detached from the section `## Status` sends a reader to. The
+    normative home gets the same anchoring as the other one.
+
+    EVERY BACKTICKED BULLET IN THE SPAN MUST BE EXTRACTED, and one this pattern
+    cannot match fails here instead of being dropped. `_POLICY_BULLET` is
+    hyphenated, so a form respelled with an underscore would otherwise vanish
+    from this set — leaving the un-stampability loop below quietly running over
+    one form fewer while both guards stayed green off the survivor, which is the
+    vacuity `_marked_span` exists to refuse one layer up.
+    """
+    section = _section(_read(POLICY), _POLICY_SECTION)
+    span = _marked_span(section, f"{POLICY.relative_to(REPO_ROOT)}, under {_POLICY_SECTION}")
+
+    bullets = [line for line in span.splitlines() if line.startswith("- `")]
+    unextracted = [line for line in bullets if not _POLICY_BULLET.match(line)]
+    assert not unextracted, (
+        f"{POLICY.relative_to(REPO_ROOT)}: every bullet opening with a backticked "
+        f"token inside the `{_POLICY_CLASS}` span is a closure form this file "
+        f"drives through the live codec, and `{_POLICY_BULLET.pattern}` did not "
+        f"match these (task 5723):\n"
+        + "\n".join(f"  {line}" for line in unextracted)
+        + "\nThe policy vocabulary is hyphenated — that span's own marker comment "
+        "says why — so respelling a form means changing the document and this "
+        "extractor together, not dropping the form from the checks silently."
+    )
+    return frozenset(m.group(1) for line in bullets if (m := _POLICY_BULLET.match(line)))
+
+
+def test_the_policy_document_carries_the_closure_form_ruling(
+    documented_closure_forms: frozenset[str],
+):
+    """The policy document is the AUTHORITY for how such a record may be closed.
+
+    Structure only, and deliberately not a vocabulary check: which closure forms
+    the ruling permits is that document's to name, rename or extend, so this
+    guard states none of them. What it holds is the human-facing half of the
+    two-home ablation failure — the marker pair is well-formed and still wraps a
+    closure-form bullet — exactly as
+    `tests/scripts/test_line_pin_policy.py::test_policy_is_documented_in_contributing`
+    holds its half.
+
+    Kept separate from `test_the_policy_class_cannot_be_stamped_as_a_shadow_ruling`,
+    which takes the same fixture, because the two answer different questions: is
+    the ruling still in its human-facing home, versus does the codec still
+    refuse to stamp it. Folding this one in would make the ablation guard vanish
+    silently the next time that test is narrowed.
+    """
+    assert documented_closure_forms, (
+        f"the `{_POLICY_CLASS}` span in {POLICY.relative_to(REPO_ROOT)} no longer "
+        f"wraps any closure-form bullet (task 5723). That span is one of the "
+        f"ruling's two homes and the normative one; the other is "
+        f"{SKILL.relative_to(REPO_ROOT)}. If you are reversing the policy, update "
+        f"both homes and this test together."
+    )
+
+
+def test_the_policy_class_cannot_be_stamped_as_a_shadow_ruling(
+    documented_closure_forms: frozenset[str],
+):
+    """Leo's ruling enforced against the LIVE codec, not merely restated.
+
+    `scope-not-delivered` is "a policy statement, not a shadow-measured autonomy
+    grant": it constrains HOW such a record may be closed, by anyone, and grants
+    nobody authority to close one. Adding it to `FIRST_TRANCHE_CLASSES` is
+    exactly what would invert that — membership there is what makes a class
+    stampable — so the un-stampability is checked BEHAVIOURALLY, by driving the
+    documented tokens through `parse_shadow_ruling`.
+
+    The tokens are read back OUT of the document by `documented_closure_forms`:
+    the marker slug succeeding is what proves the class token is in it, and the
+    closure forms come from its bullets. So the guard binds the document rather
+    than its own constants.
+    """
+    assert documented_closure_forms, (
+        f"non-vacuity: the `{_POLICY_CLASS}` span carries no closure-form bullet, "
+        f"so the rejections below would be asserted about nothing."
+    )
+
+    valid_class = sorted(FIRST_TRANCHE_CLASSES)[0]
+    valid_action = sorted(REVERSIBLE_ACTIONS)[0]
+    assert isinstance(parse_shadow_ruling(_note_line(valid_class, valid_action)), ShadowRuling), (
+        "positive control: a payload built the same way from the live vocabularies "
+        "must PARSE. Without it a typo in `_note_line` would reject everything and "
+        "the three rejections below would pass while proving nothing."
+    )
+
+    assert parse_shadow_ruling(_note_line(_POLICY_CLASS, valid_action)) is None, (
+        f"the live codec ACCEPTS `{_POLICY_CLASS}` in the `class` slot. That turns "
+        f"a constraint on how a record may be closed into a candidate for closing "
+        f"one autonomously — the inversion Leo's 2026-09-21 ruling forbids."
+    )
+    for form in sorted(documented_closure_forms):
+        assert parse_shadow_ruling(_note_line(valid_class, form)) is None, (
+            f"the live codec ACCEPTS the closure form `{form}` in the "
+            f"`proposed_action` slot. A closure form is a policy vocabulary, not a "
+            f"reversible action the shadow measurement proposes and scores."
+        )
+
+    for token in sorted({_POLICY_CLASS} | documented_closure_forms):
+        for name, vocabulary in (
+            ("FIRST_TRANCHE_CLASSES", FIRST_TRANCHE_CLASSES),
+            ("REVERSIBLE_ACTIONS", REVERSIBLE_ACTIONS),
+            ("HUMAN_FOREVER_GATES", HUMAN_FOREVER_GATES),
+        ):
+            assert token not in vocabulary, (
+                f"`{token}` has joined escalation.shadow_ruling.{name}. This class "
+                f"has no code side by ruling; a frozenset member here is a "
+                f"shadow-measurement vocabulary, which is the one thing it must "
+                f"not become."
+            )
+
+
+def test_the_watcher_skill_points_at_the_policy_document_from_design_concern_handling():
+    """The skill is the OTHER home of the ruling — the one the watcher loads.
+
+    A ruling surviving in the policy document but deleted from the skill is a
+    ruling the watcher never reads, and the deletion is silent. That is the
+    two-home ablation failure `tests/scripts/test_line_pin_policy.py` records,
+    and it is held here the same way: a begin/end marker pair per home, and
+    NOTHING asserted about the wording between them.
+
+    The span is read out of the `design_concern` handling rather than out of the
+    whole file, because WHERE it sits is the point: a span parked at the bottom
+    beside the failure modes is one that handling would never cite. Reusing
+    `_marked_span` also makes an unterminated or duplicated span fail
+    identically in both homes.
+    """
+    section = _section(_read(SKILL), _DESIGN_CONCERN_SECTION, level="### ")
+    source = f"{SKILL.relative_to(REPO_ROOT)}, under {_DESIGN_CONCERN_SECTION}"
+    span = _marked_span(section, source)
+
+    relative = str(POLICY.relative_to(REPO_ROOT))
+    assert relative in span, (
+        f"the `{_POLICY_CLASS}` span must name {relative}: that document is the "
+        f"authority for the two closure forms and the worked example, and this "
+        f"skill must POINT at it rather than restate them. A second copy of a "
+        f"two-item vocabulary, sitting in the file the watcher actually reads, "
+        f"would be the copy that drifts and the copy that gets believed."
+    )
+    assert POLICY.is_file()

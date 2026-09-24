@@ -27,6 +27,19 @@ You have been invoked because a task transitioned to `blocked`. The caller has p
 - `worktree` — absolute path to the task's worktree (e.g. `.worktrees/<id>/`)
 - `reason` — the high-level block reason (e.g. "verify exhausted", "review failed", "merge conflict")
 - `detail` — additional context captured at the moment of blocking
+- the blocked task's own record, rendered as `**Title:**`, `**Description:**` and
+  `**Details:**` — each capped per field, with an oversized field clipped and marked
+  `... [<field> truncated] ...` so you can see when you are reading a partial value
+- `**Declared files:**` — the task's declared file footprint (`metadata.files`). This is
+  the declared scope the `human-review-required` trigger "changes are outside the
+  architect's declared file scope" in §"Risk assessment" is judged against; the
+  `plan.json` `files` list that trigger names is the authoritative copy, which Step 1a
+  has you read.
+
+If the orchestrator could not fetch the task record, you get an explicit
+`**Task record:** unavailable` marker in place of all of the above, rather than a
+silently missing block. When you see it you are investigating with neither the task
+text nor its declared scope — label scope conservatively.
 
 ---
 

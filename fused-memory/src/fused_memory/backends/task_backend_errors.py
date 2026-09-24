@@ -203,6 +203,60 @@ class DoneProvenanceWriteAuthorityError(TaskmasterError):
         return done_provenance_via_update_task_error(self.task_id)
 
 
+class AppendUnsupportedFieldError(TaskmasterError):
+    """Raised when ``update_task`` combines ``append=True`` with a REPLACE-ONLY column.
+
+    ``title``, ``description`` and ``priority`` can only ever be REPLACED —
+    ``append`` has never governed them; it governs only the ``details`` /
+    ``prompt`` concatenation and the metadata merge mode. Before task 4039
+    the pair was accepted silently and the incoming text OVERWROTE the
+    column, destroying multi-KB authored prose with no error and no warning.
+
+    This mirrors the loud-over-silent guards
+    ``sqlite_task_backend.py::_resolve_metadata_mode`` already applies to the
+    two destructive metadata flag combinations (the task-2180 metadata-wipe
+    and the task-3581 nested-metadata clobber) — same method, same shape of
+    destructive combination, same principle — for the text columns that
+    cannot append at all.
+
+    Keeps ``code='TASKMASTER_TOOL_ERROR'`` so every existing ``except
+    TaskmasterError`` site and ``err.code == 'TASKMASTER_TOOL_ERROR'`` branch
+    keeps working unchanged (the same compatibility trick
+    :class:`TaskNotFoundError` uses); the subclass exists for ``isinstance``
+    discrimination and so the MCP boundary reports a specific
+    ``error_type='AppendUnsupportedFieldError'``. Deliberately has no
+    ``to_error_dict()`` — unlike the two write-authority errors above it has
+    no historical ``success: False`` wire shape to reproduce, and it reaches
+    callers by propagating raw to ``server/tool_errors.py::mcp_tool_errors``.
+
+    Attributes:
+        fields: The offending replace-only field name(s), in
+            ``sqlite_task_backend.py::_REPLACE_ONLY_FIELDS`` order.
+        task_id: The task the rejected write targeted (``None`` if not supplied).
+    """
+
+    def __init__(self, fields: tuple[str, ...], task_id: str | None = None) -> None:
+        self.fields = fields
+        self.task_id = task_id
+        named = ', '.join(fields)
+        plural = 's' if len(fields) > 1 else ''
+        super().__init__(
+            'TASKMASTER_TOOL_ERROR',
+            f'Refusing an append=True write to {named}: append has NEVER applied '
+            f'to the {named} column{plural} and never will — these columns are '
+            'REPLACE-ONLY, so this write would OVERWRITE the current value, not '
+            'concatenate onto it. Accepting it silently destroyed authored prose '
+            'in four recorded live repros, including reify task 6586 and reify '
+            'task 5791, the latter wiping ~17KB of a human-ratified decomposition '
+            'record that existed nowhere else. To EXTEND the field, read-modify-'
+            'write: call get_task to read the current text, concatenate locally, '
+            f'then resend the COMPLETE new {named} with append omitted. To '
+            'REPLACE it deliberately, drop append (or pass append=False) to '
+            'confirm the overwrite. If the append=True was meant for details/'
+            'prompt/metadata, split it into a separate update_task call.',
+        )
+
+
 __all__ = [
     'TASKMASTER_TOOL_ERROR',
     'TASKMASTER_UNAVAILABLE',
@@ -211,6 +265,7 @@ __all__ = [
     'TaskNotFoundError',
     'StatusWriteAuthorityError',
     'DoneProvenanceWriteAuthorityError',
+    'AppendUnsupportedFieldError',
     'status_via_update_task_error',
     'done_provenance_via_update_task_error',
 ]

@@ -48,5 +48,40 @@
     "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
     "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
     "escalation_refs": []
+  },
+  "context": {
+    "task": {
+      "title": "Add dashboard smoke test for index.html CDN script tags + cache-buster",
+      "description": "Add a Python test that GETs `/static/redux/index.html` and asserts the `marked` + `DOMPurify` script tags (with SRI integrity hashes) and the current `styles.css?v=N` reference are present, to catch silent cache-bust drift and CDN-tag removals.",
+      "test_strategy": "",
+      "details": "The MarkdownText component added by T-1227 depends on two CDN scripts (`marked`, `DOMPurify`) wired into `dashboard/src/dashboard/static/redux/index.html`. If a future edit silently drops a script tag, the renderer falls back to plain text \u2014 works \"well enough\" that the regression can ship unnoticed. Similarly, forgetting to bump `?v=N` on the JSX/CSS after a change is the dominant cause of \"Firefox shows stale dashboard\" reports.\n\n**Approach**\n\nAdd a small Python test (e.g. `dashboard/tests/test_index_html.py` or wherever existing dashboard tests live \u2014 check `dashboard/tests/` and the dashboard's `pyproject.toml` for the test framework / fixture setup).\n\nAssertions:\n1. `GET /static/redux/index.html` returns 200.\n2. Response body contains a `<script>` tag whose `src` matches `https://unpkg.com/marked@*` and has a non-empty `integrity=` attribute.\n3. Same for `https://unpkg.com/dompurify@*`.\n4. Response body references `tab_tasks.jsx?v=<current>` and `styles.css?v=<current>` \u2014 pin to the current numeric value parsed from the on-disk `index.html`, so the test fails when the on-disk file is bumped but the test isn't (forces awareness that the cache-buster moved).\n\nThe third assertion is the cheap one; the fourth is the higher-value drift guard.\n\n**Files**\n- New file under `dashboard/tests/` (exact path TBD by what's already there)\n\n**Out of scope**\n- JS-level testing of MarkdownText itself (would require a JS test harness \u2014 not present today).",
+      "authored": false,
+      "id": "1234",
+      "record_source": {
+        "path": ".taskmaster/tasks/tasks.db",
+        "tag": "master",
+        "read_at": "2026-09-11",
+        "updated_at": "2026-05-13T13:18:17.936Z",
+        "updated_after_merge": false,
+        "run_time_title_matches": true
+      }
+    },
+    "changed_files": [
+      "dashboard/tests/test_index_html.py"
+    ],
+    "base_sha": "7ff3b673b7071778f13b127a847036df59c54fd8",
+    "branch_sha": "612bc402b31f7269e7a43386bfdc78a46f91bc34",
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "no plan.json survives for this task. Absent: .worktrees/.task-meta/<id>/plan.json; data/orchestrator/agent-transcripts/<id>/; ~/.claude/projects/-home-leo-src-dark-factory--worktrees-<id>/; runs.db events with a plan payload (design_decisions/steps); runs.db plan-phase events (other than invocation/routing/phase bookkeeping) with a payload; data/orchestrator/landed_outbox.json entry. Wider hunt (escalations archive, fleet sessions, branch commit messages, branch tree, fused-memory) found nothing for this task",
+    "verification": {
+      "merge_sha": "2ac4e44909d18c143677c44d0292770104fe0017",
+      "merge_base_sha": "7ff3b673b7071778f13b127a847036df59c54fd8",
+      "diff_reproduces_from": "git diff 7ff3b673b7 2ac4e44909",
+      "diff_reproduces": true,
+      "merge_tree_equals_merge_commit_tree": true,
+      "changed_files_match_diff_headers": true,
+      "verified_at": "2026-09-11"
+    }
   }
 }

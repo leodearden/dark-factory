@@ -27,8 +27,9 @@ from unittest.mock import AsyncMock
 import pytest
 from _fm_helpers import FakeMemoryLookup, build_journal_with_closed_run
 
-from fused_memory.models.reconciliation import RunStatus
+from fused_memory.models.reconciliation import RunStatus, StageReport
 from fused_memory.reconciliation import citation_repair
+from fused_memory.reconciliation.citation_repair import CITATION_REPAIRS_KEY
 
 RUN_ID = '06a4466d-cdc0-49ac-8e99-e6723be39392'
 DANGLING = 'beacf7fc-b76a-4c0b-876d-f4cf6d906d42'
@@ -49,6 +50,27 @@ SUCCESSOR_RECORD: dict[str, Any] = {
     },
 }
 
+
+# The victim's OWN live record. The wrong-but-resolving class is the exact
+# inverse of the dangling one: the cited id resolves perfectly well, it simply
+# is not the memory that backs the finding.
+LIVE_VICTIM_RECORD: dict[str, Any] = {
+    'id': DANGLING,
+    'content': 'a live entry that does not back this finding',
+    'metadata': {
+        'category': 'observations_and_summaries',
+        'agent_id': 'recon-stage-memory_consolidator',
+        'created_at': '2026-07-18T11:02:44Z',
+    },
+}
+
+# The prose account a ``wrong_memory`` repair must carry, taken from the
+# incident: the durable ``citation_repairs`` record is the only surviving
+# statement of why a still-resolving citation was removed.
+WHY_WRONG = (
+    'mis-cites task 168 rolling summary; claim independently confirmed '
+    'via get_task(182)'
+)
 
 # A raw, non-StageReport ``stage_reports`` entry, shaped like the ones
 # ``harness`` actually writes. Note it carries ``failed_stage``, NOT ``stage``:
@@ -92,6 +114,53 @@ def _dump(run: Any) -> dict[str, Any]:
         for key, value in run.stage_reports.items()
     }
     return json.loads(json.dumps(serialized, sort_keys=True, default=str))
+
+
+def _assert_only_the_target_finding_moved(before: dict[str, Any], after: dict[str, Any]) -> None:
+    """Nothing outside ``items_flagged[0]``'s two citation keys changed.
+
+    The sibling finding, the raw non-StageReport entry and every stat/summary
+    field must survive a repair untouched, so the run's flagged_count and the
+    judge's stat verification stay exactly as the original run reported them.
+    """
+    assert after['_error'] == before['_error']
+    assert after['memory_consolidator']['items_flagged'][1] == (
+        before['memory_consolidator']['items_flagged'][1]
+    )
+    assert after['memory_consolidator']['stats'] == (
+        before['memory_consolidator']['stats']
+    )
+    moved = {'cited_memories', 'citation_repairs'}
+    assert {
+        k: v for k, v in after['memory_consolidator']['items_flagged'][0].items()
+        if k not in moved
+    } == {
+        k: v for k, v in before['memory_consolidator']['items_flagged'][0].items()
+        if k not in moved
+    }
+
+
+async def _assert_refused_before_any_io(
+    journal: Any, memory: FakeMemoryLookup, *, before: dict[str, Any], **call: Any
+) -> dict[str, Any]:
+    """Drive one repair call and pin that it refused without touching anything.
+
+    A shape gate earns its place at the top of the function only if it fires
+    ahead of BOTH reads, so the three facts that say so are asserted together:
+    no Mem0 lookup, no journal read, and a byte-identical durable blob. Returns
+    the outcome so the caller asserts which refusal it was.
+    """
+    original_get_run = journal.get_run
+    spy = AsyncMock(wraps=original_get_run)
+    journal.get_run = spy
+    try:
+        outcome = await citation_repair.repair_memory_citation(journal, memory, **call)
+    finally:
+        journal.get_run = original_get_run
+    assert memory.calls == []
+    assert spy.await_count == 0
+    assert _dump(await journal.get_run(RUN_ID)) == before
+    return outcome
 
 
 class TestRepairHappyPath:
@@ -166,25 +235,136 @@ class TestRepairHappyPath:
             assert utc_offset is not None
             assert utc_offset.total_seconds() == 0
 
-            # Nothing but the target finding moved: the sibling finding, the raw
-            # non-StageReport entry, and every stat/summary field are untouched,
-            # so the run's flagged_count and the judge's stat verification stay
-            # exactly as the original run reported them.
-            assert after['_error'] == before['_error']
-            assert after['memory_consolidator']['items_flagged'][1] == (
-                before['memory_consolidator']['items_flagged'][1]
+            _assert_only_the_target_finding_moved(before, after)
+        finally:
+            await journal.close()
+
+
+class TestRepairWrongButResolving:
+    """``reason='wrong_memory'``: the cited id RESOLVES but is the wrong memory.
+
+    The two defect classes corroborate opposite facts. ``memory_not_found``
+    requires the victim to be confirmed ABSENT; ``wrong_memory`` requires it to
+    be confirmed PRESENT, because the claim being repaired is "this id is real
+    and it does not back this finding". Both spellings of the repair — detach
+    (``replacement_memory_id=None``) and swap — are the same two already-working
+    code paths; only the corroboration gate differs.
+
+    A non-blank ``justification`` is the compensating control for the structural
+    property this class gives up ("the worst it can do is re-point a claim that
+    already had no backing"), so every case here supplies one and asserts it
+    reaches the durable provenance record.
+    """
+
+    @pytest.mark.asyncio
+    async def test_detaches_a_citation_that_still_resolves(self, tmp_path):
+        """``replacement_memory_id=None`` DROPS a live-but-wrong citation."""
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            status='completed',
+            findings=[
+                _finding('f-1', [_citation(DANGLING)]),
+                _finding('f-2', [_citation(SUCCESSOR)]),
+            ],
+            extra_stage_reports={'_error': RAW_ERROR_ENTRY},
+        )
+        try:
+            before = _dump(await journal.get_run(RUN_ID))
+            memory = FakeMemoryLookup(
+                {DANGLING: LIVE_VICTIM_RECORD, SUCCESSOR: SUCCESSOR_RECORD}
             )
-            assert after['memory_consolidator']['stats'] == (
-                before['memory_consolidator']['stats']
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=None,
+                repaired_by='run:caller-1',
+                reason='wrong_memory',
+                justification=WHY_WRONG,
             )
-            untouched_keys = {
-                k: v for k, v in repaired.items()
-                if k not in {'cited_memories', 'citation_repairs'}
+
+            assert outcome['status'] == 'repaired'
+            assert outcome['removed_count'] == 1
+            assert outcome['replacement_memory_id'] is None
+            # ``reason`` is echoed so a caller reading only the outcome knows
+            # which corroboration was asserted, without re-reading the blob.
+            assert outcome['reason'] == 'wrong_memory'
+            assert 'error' not in outcome
+
+            after = _dump(await journal.get_run(RUN_ID))
+            repaired = after['memory_consolidator']['items_flagged'][0]
+            assert [c['memory_id'] for c in repaired['cited_memories']] == []
+
+            record = repaired['citation_repairs'][-1]
+            assert record['memory_id'] == DANGLING
+            assert record['replacement_memory_id'] is None
+            assert record['reason'] == 'wrong_memory'
+            assert record['justification'] == WHY_WRONG
+
+            _assert_only_the_target_finding_moved(before, after)
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_swaps_a_citation_that_still_resolves(self, tmp_path):
+        """A supplied replacement re-points a live-but-wrong citation."""
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            status='completed',
+            findings=[
+                _finding('f-1', [_citation(DANGLING)]),
+                _finding('f-2', [_citation(SIBLING)]),
+            ],
+            extra_stage_reports={'_error': RAW_ERROR_ENTRY},
+        )
+        try:
+            before = _dump(await journal.get_run(RUN_ID))
+            memory = FakeMemoryLookup(
+                {DANGLING: LIVE_VICTIM_RECORD, SUCCESSOR: SUCCESSOR_RECORD}
+            )
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+                reason='wrong_memory',
+                justification=WHY_WRONG,
+            )
+
+            assert outcome['status'] == 'repaired'
+            assert outcome['removed_count'] == 1
+            assert outcome['reason'] == 'wrong_memory'
+            assert outcome['deduped'] is False
+
+            after = _dump(await journal.get_run(RUN_ID))
+            repaired = after['memory_consolidator']['items_flagged'][0]
+            assert [c['memory_id'] for c in repaired['cited_memories']] == [SUCCESSOR]
+            # The replacement's fingerprint is the REAL one, read off the record
+            # the corroboration already fetched — same as the dangling class.
+            assert repaired['cited_memories'][0]['metadata_fingerprint'] == {
+                'category': 'procedural_knowledge',
+                'agent_id': 'recon-stage-memory_consolidator',
+                'created_at': '2026-07-26T04:34:05Z',
             }
-            assert untouched_keys == {
-                k: v for k, v in before['memory_consolidator']['items_flagged'][0].items()
-                if k not in {'cited_memories', 'citation_repairs'}
-            }
+
+            record = repaired['citation_repairs'][-1]
+            assert record['memory_id'] == DANGLING
+            assert record['replacement_memory_id'] == SUCCESSOR
+            assert record['reason'] == 'wrong_memory'
+            assert record['justification'] == WHY_WRONG
+
+            _assert_only_the_target_finding_moved(before, after)
         finally:
             await journal.close()
 
@@ -314,6 +494,418 @@ class TestRepairCorroborationGates:
             # The raised type is carried as a FACT, not folded into prose.
             assert outcome['exception_type'] == 'TimeoutError'
             assert _dump(await journal.get_run(RUN_ID)) == before
+        finally:
+            await journal.close()
+
+
+class TestRepairReasonGate:
+    """The two defect classes assert OPPOSITE facts, and each one is checked.
+
+    ``reason`` is written verbatim into the durable ``citation_repairs``
+    record, so it is a factual claim about the citation rather than a mode
+    switch. Each class therefore has its own corroboration and its own refusal,
+    and each refusal's hint names the OTHER class — an operator who picked the
+    wrong one is told which applies instead of having to guess.
+    """
+
+    @pytest.mark.asyncio
+    async def test_wrong_memory_on_an_absent_victim_is_refused(self, tmp_path):
+        """An id that does not resolve is the OTHER class, not this one.
+
+        The exact inverse of ``citation_not_dangling``. Stamping
+        ``reason: wrong_memory`` on an id that does not exist would put a false
+        statement into the one durable record of the repair.
+        """
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[_finding('f-1', [_citation(DANGLING)])],
+        )
+        try:
+            before = _dump(await journal.get_run(RUN_ID))
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+                reason='wrong_memory',
+                justification=WHY_WRONG,
+            )
+
+            assert outcome['error'] == 'citation_not_resolving'
+            assert outcome['error_type'] == 'ReconCitationNotResolving'
+            assert 'status' not in outcome
+            assert outcome['target_run_id'] == RUN_ID
+            assert outcome['finding_id'] == 'f-1'
+            assert outcome['memory_id'] == DANGLING
+            # The hint must route the operator to the class that DOES apply.
+            assert 'memory_not_found' in outcome['hint']
+            assert _dump(await journal.get_run(RUN_ID)) == before
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'reason_kwargs',
+        [{}, {'reason': 'memory_not_found'}],
+        ids=['default', 'explicit'],
+    )
+    async def test_memory_not_found_on_a_live_victim_is_still_refused(
+        self, tmp_path, reason_kwargs
+    ):
+        """The pre-existing gate is unchanged, and it is still the DEFAULT.
+
+        Adding a second class must not widen the first one: an unqualified call
+        still cannot touch a citation that resolves.
+        """
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[_finding('f-1', [_citation(DANGLING)])],
+        )
+        try:
+            before = _dump(await journal.get_run(RUN_ID))
+            memory = FakeMemoryLookup(
+                {DANGLING: LIVE_VICTIM_RECORD, SUCCESSOR: SUCCESSOR_RECORD}
+            )
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+                **reason_kwargs,
+            )
+
+            assert outcome['error'] == 'citation_not_dangling'
+            assert outcome['error_type'] == 'ReconCitationNotDangling'
+            # Mirrored pointer: this operator wanted the other class.
+            assert 'wrong_memory' in outcome['hint']
+            assert _dump(await journal.get_run(RUN_ID)) == before
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_unrecognised_reason_is_refused_before_any_io(self, tmp_path):
+        """A typo must be a loud refusal, never a silent wrong corroboration.
+
+        The MCP tool gets schema-level rejection from its ``Literal`` type, but
+        the operator script and any in-process caller have no such boundary. A
+        ``reason`` that fell through to whichever branch the ``if`` happened to
+        default to would perform the WRONG check — the worst failure this path
+        has — so the enum is re-checked here, and refuses ahead of both reads.
+        """
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[_finding('f-1', [_citation(DANGLING)])],
+        )
+        try:
+            before = _dump(await journal.get_run(RUN_ID))
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+
+            outcome = await _assert_refused_before_any_io(
+                journal,
+                memory,
+                before=before,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+                reason='detach',
+            )
+
+            assert outcome['error'] == 'invalid_reason'
+            assert outcome['error_type'] == 'ReconCitationInvalidReason'
+            assert outcome['reason'] == 'detach'
+            assert outcome['accepted'] == ['memory_not_found', 'wrong_memory']
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('reason', 'justification'),
+        [('memory_not_found', None), ('wrong_memory', WHY_WRONG)],
+        ids=['memory_not_found', 'wrong_memory'],
+    )
+    async def test_raised_victim_lookup_licenses_neither_class(
+        self, tmp_path, reason, justification
+    ):
+        """A RAISED read is unknown: neither confirmed-absent nor confirmed-present.
+
+        The third branch wins over BOTH classes. Collapsing a Qdrant blip into
+        either verdict would let a transient backend failure license exactly one
+        of them at random.
+        """
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[_finding('f-1', [_citation(DANGLING)])],
+        )
+        try:
+            before = _dump(await journal.get_run(RUN_ID))
+            memory = FakeMemoryLookup(
+                {DANGLING: TimeoutError('qdrant read timed out'), SUCCESSOR: SUCCESSOR_RECORD}
+            )
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+                reason=reason,
+                justification=justification,
+            )
+
+            assert outcome['error'] == 'verification_error'
+            assert outcome['error_type'] == 'ReconCitationVerificationError'
+            assert outcome['exception_type'] == 'TimeoutError'
+            assert outcome['role'] == 'victim'
+            assert 'status' not in outcome
+            assert _dump(await journal.get_run(RUN_ID)) == before
+        finally:
+            await journal.close()
+
+
+class TestRepairJustificationGate:
+    """``wrong_memory`` must SAY WHY; ``memory_not_found`` need not.
+
+    The dangling-only design had a structural safety property — the worst a
+    repair could do was re-point a claim that already had no backing — and this
+    class deliberately gives it up. A required justification is what takes its
+    place: without one, a live and correct-looking citation could be stripped
+    from a historical audit record with nothing in the blob saying why. The
+    durable ``citation_repairs`` record is the only surviving account of the
+    change.
+
+    Absence is its own account, so ``memory_not_found`` stays optional — which
+    is also what keeps every existing caller working unchanged.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'justification',
+        [None, '', '   ', '\n\t'],
+        ids=['omitted', 'empty', 'spaces', 'whitespace'],
+    )
+    async def test_blank_justification_refuses_wrong_memory_before_any_io(
+        self, tmp_path, justification
+    ):
+        """Blank-after-strip is not an account, and is refused ahead of both reads."""
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[_finding('f-1', [_citation(DANGLING)])],
+        )
+        try:
+            before = _dump(await journal.get_run(RUN_ID))
+            memory = FakeMemoryLookup(
+                {DANGLING: LIVE_VICTIM_RECORD, SUCCESSOR: SUCCESSOR_RECORD}
+            )
+
+            outcome = await _assert_refused_before_any_io(
+                journal,
+                memory,
+                before=before,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+                reason='wrong_memory',
+                justification=justification,
+            )
+
+            assert outcome['error'] == 'justification_required'
+            assert outcome['error_type'] == 'ReconCitationJustificationRequired'
+            assert 'status' not in outcome
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_surrounding_whitespace_is_stripped_before_recording(self, tmp_path):
+        """One normalisation, applied once: the record stores the stripped text.
+
+        Emptiness-after-strip is what the gate checks, so the same stripped
+        value is what gets stored — otherwise the blob could carry padding the
+        gate had already decided was not part of the account.
+        """
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[_finding('f-1', [_citation(DANGLING)])],
+        )
+        try:
+            memory = FakeMemoryLookup(
+                {DANGLING: LIVE_VICTIM_RECORD, SUCCESSOR: SUCCESSOR_RECORD}
+            )
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=None,
+                repaired_by='run:caller-1',
+                reason='wrong_memory',
+                justification='  real reason  ',
+            )
+
+            assert outcome['status'] == 'repaired'
+            repaired = _dump(await journal.get_run(RUN_ID))[
+                'memory_consolidator'
+            ]['items_flagged'][0]
+            assert repaired['citation_repairs'][0]['justification'] == 'real reason'
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('justification', 'recorded'),
+        [(None, None), ('found deleted by the 2026-07 sweep', 'found deleted by the 2026-07 sweep')],
+        ids=['omitted', 'supplied'],
+    )
+    async def test_memory_not_found_never_requires_one_but_records_it(
+        self, tmp_path, justification, recorded
+    ):
+        """The confirmed absence IS the account — but a supplied one is kept.
+
+        Requiring prose here would break every existing caller, and absence is
+        already self-evidencing. An operator who supplies one anyway must still
+        see it survive into the durable record.
+        """
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[_finding('f-1', [_citation(DANGLING)])],
+        )
+        try:
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+                reason='memory_not_found',
+                justification=justification,
+            )
+
+            assert outcome['status'] == 'repaired'
+            record = _dump(await journal.get_run(RUN_ID))[
+                'memory_consolidator'
+            ]['items_flagged'][0]['citation_repairs'][0]
+            assert record['reason'] == 'memory_not_found'
+            assert record['justification'] == recorded
+        finally:
+            await journal.close()
+
+
+class TestRepairSelfSwapGate:
+    """Swapping a citation for ITSELF is a no-op, and must not report a repair.
+
+    A hazard the dangling-only design made unreachable: ``kept`` strips every
+    citation of ``memory_id`` and then appends the replacement only if it is not
+    already in ``kept``, so a self-swap removes the victim and puts it straight
+    back, leaving ``cited_memories`` unchanged.
+
+    What that produced BEFORE this gate, measured rather than assumed: the
+    read-after-write check notices the victim is still cited and answers
+    ``repair_clobbered`` — so the no-op is caught, but MISDIAGNOSED. Its hint
+    names a concurrent writer that never existed, sending an operator to look
+    for a race instead of at their own arguments; and the write has already
+    landed, so the durable blob keeps a ``citation_repairs`` record asserting a
+    repair that did not happen. Those records are append-only and nothing ever
+    removes one. A no-I/O refusal naming the real cause writes nothing at all.
+
+    Under ``memory_not_found`` it could not happen (an absent victim is an
+    absent replacement, so ``replacement_not_found`` fires first — also
+    measured), but the gate applies to BOTH classes: a self-swap is meaningless
+    under either, and a gate that fires for only one is a gate a reader has to
+    look up.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('reason', 'justification'),
+        [('memory_not_found', None), ('wrong_memory', WHY_WRONG)],
+        ids=['memory_not_found', 'wrong_memory'],
+    )
+    @pytest.mark.parametrize(
+        'spelling',
+        [DANGLING, DANGLING.upper()],
+        ids=['same_case', 'differing_case'],
+    )
+    async def test_replacement_equal_to_victim_is_refused_before_any_io(
+        self, tmp_path, spelling, reason, justification
+    ):
+        """Case-insensitively equal, because that is what ``_is_citation_of`` matches.
+
+        Neither backend normalises UUID case on read-back, so an
+        upper-cased replacement is the SAME citation and would be re-appended
+        by the same dedupe path — the refusal has to use the same comparison the
+        matcher does, or the gate has a hole exactly where the matcher does not.
+        """
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[_finding('f-1', [_citation(DANGLING)])],
+        )
+        try:
+            before = _dump(await journal.get_run(RUN_ID))
+            memory = FakeMemoryLookup(
+                {DANGLING: LIVE_VICTIM_RECORD, SUCCESSOR: SUCCESSOR_RECORD}
+            )
+
+            outcome = await _assert_refused_before_any_io(
+                journal,
+                memory,
+                before=before,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=spelling,
+                repaired_by='run:caller-1',
+                reason=reason,
+                justification=justification,
+            )
+
+            assert outcome['error'] == 'replacement_is_victim'
+            assert outcome['error_type'] == 'ReconCitationReplacementIsVictim'
+            assert 'status' not in outcome
+
+            # What the refusal bought: the blob is in exactly the state the
+            # no-op would have left it — victim still cited once — but WITHOUT
+            # the provenance record the pre-gate path had already written.
+            finding = _dump(await journal.get_run(RUN_ID))[
+                'memory_consolidator'
+            ]['items_flagged'][0]
+            assert [c['memory_id'] for c in finding['cited_memories']] == [DANGLING]
+            assert CITATION_REPAIRS_KEY not in finding
         finally:
             await journal.close()
 
@@ -721,8 +1313,35 @@ class TestRepairLiveRunRefusalAndDryRun:
             await journal.close()
 
     @pytest.mark.asyncio
-    async def test_dry_run_matches_applied_outcome_without_writing(self, tmp_path):
-        """``apply=False`` answers exactly what ``apply=True`` would, and writes nothing."""
+    @pytest.mark.parametrize(
+        ('reason', 'justification', 'recorded', 'victim_record'),
+        [
+            ('memory_not_found', None, None, None),
+            (
+                'wrong_memory',
+                f'  {WHY_WRONG}  ',
+                WHY_WRONG,
+                LIVE_VICTIM_RECORD,
+            ),
+        ],
+        ids=['memory_not_found', 'wrong_memory'],
+    )
+    async def test_dry_run_matches_applied_outcome_without_writing(
+        self, tmp_path, reason, justification, recorded, victim_record
+    ):
+        """``apply=False`` answers exactly what ``apply=True`` would, and writes nothing.
+
+        Parametrized over BOTH classes because the dry run is what an operator
+        runs first, and ``wrong_memory`` is the class whose corroboration is
+        the inverse of the default — a dry run that only ever exercised
+        ``memory_not_found`` would leave the flag combination the operator
+        script's own worked example instructs them to run entirely unpinned.
+
+        The justification is passed PADDED and asserted stripped: the outcome
+        echoes the normalised value, so ``apply=False`` shows the exact prose
+        the durable record would carry. There is no record to read yet, which
+        is why the echo is the only place a dry run can show it.
+        """
         journal = await build_journal_with_closed_run(
             tmp_path,
             run_id=RUN_ID,
@@ -730,9 +1349,11 @@ class TestRepairLiveRunRefusalAndDryRun:
         )
         try:
             before = _dump(await journal.get_run(RUN_ID))
-            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
-            spy = AsyncMock(wraps=journal.update_run_stage_reports)
-            journal.update_run_stage_reports = spy
+            memory = FakeMemoryLookup(
+                {DANGLING: victim_record, SUCCESSOR: SUCCESSOR_RECORD}
+            )
+            spy = AsyncMock(wraps=journal.compare_and_set_run_stage_reports)
+            journal.compare_and_set_run_stage_reports = spy
 
             call: dict[str, Any] = dict(
                 target_run_id=RUN_ID,
@@ -741,6 +1362,8 @@ class TestRepairLiveRunRefusalAndDryRun:
                 store='mem0',
                 replacement_memory_id=SUCCESSOR,
                 repaired_by='run:caller-1',
+                reason=reason,
+                justification=justification,
             )
             dry = await citation_repair.repair_memory_citation(
                 journal, memory, apply=False, **call
@@ -749,6 +1372,8 @@ class TestRepairLiveRunRefusalAndDryRun:
             assert dry['status'] == 'dry_run'
             assert spy.await_count == 0
             assert _dump(await journal.get_run(RUN_ID)) == before
+            assert dry['reason'] == reason
+            assert dry['justification'] == recorded
             # Both corroboration reads still happened — a dry-run that skipped
             # them would tell the operator nothing about whether the gates hold.
             assert [mid for _project, mid in memory.calls] == [DANGLING, SUCCESSOR]
@@ -763,6 +1388,12 @@ class TestRepairLiveRunRefusalAndDryRun:
             assert {k: v for k, v in dry.items() if k != 'status'} == {
                 k: v for k, v in applied.items() if k != 'status'
             }
+            # What the dry run PROMISED is what the write actually stored.
+            record = _dump(await journal.get_run(RUN_ID))[
+                'memory_consolidator'
+            ]['items_flagged'][0][CITATION_REPAIRS_KEY][0]
+            assert record['reason'] == dry['reason']
+            assert record['justification'] == dry['justification']
         finally:
             await journal.close()
 
@@ -1241,7 +1872,7 @@ class TestRepairJournalIoErrors:
         )
         try:
             memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
-            journal.get_run = AsyncMock(
+            journal.get_run_with_stage_reports_text = AsyncMock(
                 side_effect=OSError('unable to open database file')
             )
 
@@ -1282,7 +1913,7 @@ class TestRepairJournalIoErrors:
         try:
             before = _dump(await journal.get_run(RUN_ID))
             memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
-            journal.update_run_stage_reports = AsyncMock(
+            journal.compare_and_set_run_stage_reports = AsyncMock(
                 side_effect=OSError('attempt to write a readonly database')
             )
 
@@ -1319,15 +1950,11 @@ class TestRepairJournalIoErrors:
         try:
             memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
             real_get_run = journal.get_run
-            reads: list[int] = []
-
-            async def flaky_get_run(run_id: str):
-                reads.append(1)
-                if len(reads) > 1:  # the read-after-write
-                    raise OSError('database is locked')
-                return await real_get_run(run_id)
-
-            journal.get_run = flaky_get_run
+            # A plain raise, no read counter: the initial read now goes through
+            # ``get_run_with_stage_reports_text`` (it must return the CAS token
+            # from the same row), so ``get_run`` is reached ONLY by the
+            # read-after-write verification.
+            journal.get_run = AsyncMock(side_effect=OSError('database is locked'))
 
             outcome = await citation_repair.repair_memory_citation(
                 journal,
@@ -1358,17 +1985,21 @@ class TestRepairReadAfterWrite:
 
     @pytest.mark.asyncio
     async def test_clobbered_repair_is_refused_not_reported_as_repaired(self, tmp_path):
-        """A concurrent wholesale rewrite yields ``repair_clobbered``.
+        """A wholesale rewrite landing AFTER this write yields ``repair_clobbered``.
 
-        The terminal-status allowlist cannot see this: ``harness`` calls
-        ``complete_run(...)`` BEFORE its trailing ``update_run_stage_reports``,
-        so a run reads ``completed`` while a writer still holds a loaded copy it
-        is about to write back whole — and the operator script runs
-        out-of-process with an empty ``live_run_ids``, so the row status is its
-        only other guard. Two concurrent repairs lose one repair's provenance
-        the same way. Reporting ``repaired`` for a write that was overwritten is
-        the exact failure the liveness gate exists to prevent, so the
-        read-after-write turns it into a loud refusal.
+        This test owns the POST-write window specifically. A writer landing
+        BEFORE the write is refused as ``concurrent_modification`` by the
+        compare-and-set (see ``TestRepairConcurrentModification``), so the
+        competing write here is staged to land after a SUCCESSFUL CAS — which
+        is the window the compare-and-set structurally cannot see, and the one
+        the harness actually produces: it calls ``complete_run(...)`` BEFORE its
+        trailing ``update_run_stage_reports``, so a run reads ``completed``
+        while a writer still holds a loaded copy it is about to write back
+        whole — and the operator script runs out-of-process with an empty
+        ``live_run_ids``, so the row status is its only other guard. Reporting
+        ``repaired`` for a write that was overwritten is the exact failure the
+        liveness gate exists to prevent, so the read-after-write turns it into a
+        loud refusal.
         """
         journal = await build_journal_with_closed_run(
             tmp_path,
@@ -1384,14 +2015,21 @@ class TestRepairReadAfterWrite:
             other_writers_copy = await journal.get_run(RUN_ID)
             assert other_writers_copy is not None
             real_update = journal.update_run_stage_reports
+            real_cas = journal.compare_and_set_run_stage_reports
 
-            async def clobbering_update(run_id: str, stage_reports: Any):
-                # The competing writer wins wholesale, exactly as harness's
-                # end-of-stage rewrite does: the repair's own stage_reports
-                # argument is DISCARDED, which is the whole point.
+            async def cas_then_get_clobbered(run_id: str, stage_reports: Any, **kw: Any):
+                # The repair's own write SUCCEEDS — the CAS token was still
+                # valid, so this is not the concurrent_modification window.
+                applied = await real_cas(run_id, stage_reports, **kw)
+                assert applied is True
+                # Only THEN does the competing writer win wholesale, exactly as
+                # harness's end-of-stage rewrite does: it writes back its own
+                # loaded copy, which predates the repair, so the just-written
+                # provenance record is overwritten.
                 await real_update(run_id, other_writers_copy.stage_reports)
+                return applied
 
-            journal.update_run_stage_reports = clobbering_update
+            journal.compare_and_set_run_stage_reports = cas_then_get_clobbered
 
             outcome = await citation_repair.repair_memory_citation(
                 journal,
@@ -1409,8 +2047,66 @@ class TestRepairReadAfterWrite:
             assert 'status' not in outcome
             assert outcome['finding_id'] == 'f-1'
             # And the blob really is the other writer's, not a half-repair.
-            journal.update_run_stage_reports = real_update
+            journal.compare_and_set_run_stage_reports = real_cas
             assert _dump(await journal.get_run(RUN_ID)) == before
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_a_clobbering_blob_with_non_list_provenance_refuses_not_raises(
+        self, tmp_path
+    ):
+        """The one shape the pre-write malformed gate structurally cannot cover.
+
+        That gate inspects the copy read BEFORE the write; this membership test
+        runs against a re-read that a competing writer may have replaced. The
+        blob staged here is the only one that reaches it with a non-list: the
+        citations must already look repaired (else the two earlier
+        short-circuits answer first), while ``citation_repairs`` holds a
+        non-container. Without the shape check that is a ``TypeError`` out of an
+        MCP tool — the unstructured failure INV-2 forbids — instead of the
+        ``repair_clobbered`` a blob rewritten out from under the write deserves.
+        """
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[_finding('f-1', [_citation(DANGLING)])],
+        )
+        try:
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+
+            other_writers_copy = await journal.get_run(RUN_ID)
+            assert other_writers_copy is not None
+            other_writers_report = other_writers_copy.stage_reports['memory_consolidator']
+            assert isinstance(other_writers_report, StageReport)
+            clobbering_finding = other_writers_report.items_flagged[0]
+            clobbering_finding['cited_memories'] = [_citation(SUCCESSOR)]
+            clobbering_finding[citation_repair.CITATION_REPAIRS_KEY] = 'not-a-list'
+
+            real_update = journal.update_run_stage_reports
+            real_cas = journal.compare_and_set_run_stage_reports
+
+            async def cas_then_get_clobbered(run_id: str, stage_reports: Any, **kw: Any):
+                applied = await real_cas(run_id, stage_reports, **kw)
+                assert applied is True
+                await real_update(run_id, other_writers_copy.stage_reports)
+                return applied
+
+            journal.compare_and_set_run_stage_reports = cas_then_get_clobbered
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+            )
+
+            assert outcome['error'] == 'repair_clobbered'
+            assert 'status' not in outcome
         finally:
             await journal.close()
 
@@ -1476,5 +2172,272 @@ class TestRepairIncidentSequence:
             assert [r['memory_id'] for r in records] == [DANGLING, SIBLING]
             assert [r['replacement_memory_id'] for r in records] == [SUCCESSOR, None]
             assert {r['reason'] for r in records} == {'memory_not_found'}
+        finally:
+            await journal.close()
+
+
+class TestRepairConcurrentModification:
+    """A competing wholesale rewrite landing between the repair's READ and its
+    WRITE is refused, not silently lost.
+
+    The read-after-write ``repair_clobbered`` check narrows this window but
+    cannot close it, because it only ever observes the blob AFTER this call's
+    own write. The surviving interleaving:
+
+        A.read -> B.read -> A.write -> A.verify(sees own blob -> 'repaired')
+                          -> B.write (B's blob predates A's record -> A's LOST)
+                          -> B.verify(sees own blob -> 'repaired')
+
+    Both callers report ``repaired`` and one provenance record is gone. Losing
+    an audit write while reporting success is the silent failure this module
+    rejects, so the write is a compare-and-set against the text read at the
+    start of the call.
+    """
+
+    @pytest.mark.asyncio
+    async def test_competing_write_between_read_and_write_is_refused(self, tmp_path):
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[
+                _finding('f-1', [_citation(DANGLING)]),
+                _finding('f-2', [_citation(SIBLING)]),
+            ],
+        )
+        try:
+            before = _dump(await journal.get_run(RUN_ID))
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+
+            # The other writer's own loaded copy — a DISTINCT model instance. It
+            # carries a REAL mutation, on a finding this repair does not touch.
+            # An unmutated write-back would not do: the
+            # parse -> model_dump -> json.dumps round-trip is byte-identical, so
+            # re-writing an unchanged copy leaves the CAS token still valid —
+            # correctly, since nothing was lost. What the CAS must refuse is a
+            # competing write that changed something.
+            other_writers_copy = await journal.get_run(RUN_ID)
+            assert other_writers_copy is not None
+            other_writers_report = other_writers_copy.stage_reports['memory_consolidator']
+            assert isinstance(other_writers_report, StageReport)
+            other_writers_report.items_flagged[1]['description'] = (
+                'rewritten by the competing writer'
+            )
+
+            real_read = journal.get_run_with_stage_reports_text
+            competing_writes: list[int] = []
+
+            async def read_then_let_a_competitor_win(run_id: str):
+                # The repair gets a genuine parsed run + token, and only THEN
+                # does the competing wholesale rewrite land — which is precisely
+                # the interleaving the read-after-write cannot catch.
+                result = await real_read(run_id)
+                competing_writes.append(1)
+                await journal.update_run_stage_reports(
+                    run_id, other_writers_copy.stage_reports
+                )
+                return result
+
+            journal.get_run_with_stage_reports_text = read_then_let_a_competitor_win
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+            )
+
+            assert competing_writes == [1], 'the competing write never fired'
+            assert outcome['error'] == 'concurrent_modification'
+            assert outcome['error_type'] == 'ReconCitationConcurrentModification'
+            # Refusals never carry the outcome discriminator.
+            assert 'status' not in outcome
+            assert outcome['target_run_id'] == RUN_ID
+            assert outcome['finding_id'] == 'f-1'
+            assert outcome['memory_id'] == DANGLING
+            assert outcome['hint']
+
+            journal.get_run_with_stage_reports_text = real_read
+            after = _dump(await journal.get_run(RUN_ID))
+            flagged = after['memory_consolidator']['items_flagged']
+
+            # The repair left NO trace: f-1 is byte-for-byte what it was before.
+            assert flagged[0] == before['memory_consolidator']['items_flagged'][0]
+            assert 'citation_repairs' not in flagged[0]
+            assert [c['memory_id'] for c in flagged[0]['cited_memories']] == [DANGLING]
+
+            # And the durable blob is EXACTLY the other writer's — its mutation
+            # survived wholesale, which is what makes this a refusal rather than
+            # a lost update in either direction.
+            assert flagged[1]['description'] == 'rewritten by the competing writer'
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    async def test_uncontended_repair_still_applies(self, tmp_path):
+        """The CAS is not a blanket refusal — with no competing writer the same
+        call still repairs and persists."""
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[_finding('f-1', [_citation(DANGLING)])],
+        )
+        try:
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+            )
+
+            assert outcome['status'] == 'repaired'
+            assert 'error' not in outcome
+            repaired = _dump(await journal.get_run(RUN_ID))['memory_consolidator'][
+                'items_flagged'
+            ][0]
+            assert [c['memory_id'] for c in repaired['cited_memories']] == [SUCCESSOR]
+            assert len(repaired['citation_repairs']) == 1
+        finally:
+            await journal.close()
+
+
+class TestRepairMalformedProvenance:
+    """A finding whose ``citation_repairs`` key is not a list is refused
+    structurally, not with an ``AttributeError`` out of an MCP tool.
+
+    The successful-repair path ends in
+    ``finding.setdefault(CITATION_REPAIRS_KEY, []).append(record)``, which raises
+    ``AttributeError`` on a non-list — the unstructured failure INV-2 forbids,
+    and not reachable by any other test: the blob is hand-editable and a plain
+    dict value survives the ``StageReport`` round-trip untouched.
+
+    Scoped to the PRE-write copy this gate can see. The post-write re-read is a
+    different blob and a different window, guarded by ``_repair_is_persisted``'s
+    own shape check — see
+    ``TestRepairReadAfterWrite::test_a_clobbering_blob_with_non_list_provenance_refuses_not_raises``.
+
+    Two methods for one three-line gate: the apply path and the dry-run path
+    answer through DIFFERENT code (the dry run never reaches the append), and
+    each is parametrized over the malformed shapes rather than copied per shape.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('existing', 'found_type'),
+        [
+            ('clobbered-by-hand', 'str'),
+            ({}, 'dict'),
+            (None, 'NoneType'),
+        ],
+        ids=['str', 'dict', 'none'],
+    )
+    async def test_non_list_citation_repairs_is_refused(
+        self, tmp_path, existing, found_type
+    ):
+        """Parametrized over three types so the gate is an ``isinstance(..., list)``
+        check and not a string special-case.
+
+        The ``None`` case is what makes this a PRESENCE check rather than an
+        ``is not None`` one. ``dict.setdefault`` only inserts when the key is
+        MISSING, so a finding carrying an explicit ``{'citation_repairs': None}``
+        — a hand-edit, or a JSON ``null`` from another writer, exactly the
+        provenance the gate's own hint names — gets ``None`` back from
+        ``setdefault`` and the ``.append`` raises. A ``found_type`` of
+        ``'NoneType'`` can only be produced by a gate keyed on presence.
+
+        ``memory.calls == []`` pins the ORDERING on the same three shapes: a
+        no-I/O gate belongs with the other resolution gates, ahead of the two
+        Mem0 point reads, per the module's stated cheapest-refusals-first
+        ordering. Asserted here rather than in a method of its own — a second
+        body differing by one assertion is one more thing to keep in lockstep
+        for one gate (SPOT).
+        """
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[
+                _finding('f-1', [_citation(DANGLING)], citation_repairs=existing)
+            ],
+        )
+        try:
+            before = _dump(await journal.get_run(RUN_ID))
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+            )
+
+            assert outcome['error'] == 'malformed_citation_repairs'
+            assert outcome['error_type'] == 'ReconCitationMalformedRepairs'
+            assert 'status' not in outcome
+            assert outcome['finding_id'] == 'f-1'
+            assert outcome['found_type'] == found_type
+            assert memory.calls == []
+            assert _dump(await journal.get_run(RUN_ID)) == before
+        finally:
+            await journal.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('existing', 'found_type'),
+        [('clobbered', 'str'), (None, 'NoneType')],
+        ids=['str', 'none'],
+    )
+    async def test_dry_run_also_reports_malformed_citation_repairs(
+        self, tmp_path, existing, found_type
+    ):
+        """The load-bearing half: a dry-run exists to tell the operator whether
+        the gates hold BEFORE anything is written, so it must not report a clean
+        ``dry_run`` for a blob whose apply is guaranteed to raise.
+
+        The ``None`` shape fails DIFFERENTLY here than on the apply path, which
+        is why the dry run carries its own parametrization rather than trusting
+        the one above: an ``is not None`` gate lets ``None`` through, and the dry
+        run — which never reaches the append — would answer a clean
+        ``{'status': 'dry_run', ...}`` for a blob whose apply is guaranteed to
+        raise ``AttributeError``. Patching only the append site would leave
+        exactly that asymmetry, so ``found_type`` is asserted on both shapes.
+        """
+        journal = await build_journal_with_closed_run(
+            tmp_path,
+            run_id=RUN_ID,
+            findings=[
+                _finding('f-1', [_citation(DANGLING)], citation_repairs=existing)
+            ],
+        )
+        try:
+            memory = FakeMemoryLookup({DANGLING: None, SUCCESSOR: SUCCESSOR_RECORD})
+
+            outcome = await citation_repair.repair_memory_citation(
+                journal,
+                memory,
+                target_run_id=RUN_ID,
+                finding_id='f-1',
+                memory_id=DANGLING,
+                store='mem0',
+                replacement_memory_id=SUCCESSOR,
+                repaired_by='run:caller-1',
+                apply=False,
+            )
+
+            assert outcome['error'] == 'malformed_citation_repairs'
+            assert outcome['found_type'] == found_type
+            assert 'status' not in outcome
         finally:
             await journal.close()

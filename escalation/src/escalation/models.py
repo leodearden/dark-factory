@@ -57,6 +57,17 @@ Over-fold evidence (default-empty; task 3998):
               log-scrape.
   SOLE WRITER: `queue.add_members_to_l2` (also the sole trimmer).
 
+Dedupe-provenance bound (default-0; task 4885):
+  dedupe_children_truncated:
+              count of oldest NON-HEAD child ids shed to the
+              `queue._MAX_DEDUPE_CHILDREN` cap.  The TRUE provenance total is
+              `len(dedupe_children) + dedupe_children_truncated`, so the loss
+              stays assertable from the record rather than only by log-scrape.
+              `dedupe_count` is the load-bearing RECURRENCE SIGNAL and is NOT
+              capped — `dedupe_children` is provenance only, and the cap
+              deliberately separates the two.
+  SOLE WRITER: `queue.attach_dedupe_child` (also the sole trimmer).
+
 Filing-identity field (default-None; task 3533, populated by task 3550):
   filing_claimant_run_id:
               the FILING incarnation's claimant id in
@@ -72,6 +83,40 @@ Filing-identity field (default-None; task 3533, populated by task 3550):
               once on `escalation.pins.classify_pins` (normative source:
               spec docs/task-escalation-state-spec.md S6) — do not restate
               them here.
+
+Declared-dependency marker (default-empty; task 4377):
+  pin_declared_by:
+              WHAT outside the escalation store relies on this record
+              staying OPEN — a deviation notice, an operator gate
+              (e.g. 'task-3546-second-deviation-notice') — NOT who stamped
+              it.  A non-empty list is the marker.
+  pin_declared_reason:
+              free-text WHY.  Not itself a marker: a reason with no
+              declarer blocks nothing.
+
+  WHY THIS EXISTS.  An OPEN escalation record is a PRESERVATION MECHANISM
+  for its subject task: `orchestrator/task_ground_truth.py::_RECOVERY` has
+  no row for the pinned shape (IN_PROGRESS, no live claimant, exists
+  off-main, has_open_escalation=True), so it falls through to
+  `RecoveryAction.LEAVE` and the row survives.  CLOSING the record flips
+  that boolean and the same shape recovers to REVERT_TO_PENDING — so a
+  close is a state-changing act on the subject task even under
+  `action='close_only'`, and even a `resume`/`restart`/`abandon` spends
+  the preservation just as completely.  Before this marker nothing at
+  resolve time could tell that a record was deliberately relied upon: on
+  2026-08-08 an L2 cascade close of the homogeneous 11-member cluster
+  esc-3237-5 dismissed esc-3371-2, the only pin preserving mu-gate
+  validation specimen task 3371, and the specimen is permanently gone.
+
+  NOT `escalation.pins.classify_pins`.  That module answers "does this
+  ALREADY-OPEN record veto recovery?" from an automatic severity/level
+  policy — classification AT RECOVERY TIME, and it protects nothing from
+  being CLOSED.  This marker is protection AT RESOLUTION TIME, driven by
+  an explicit declaration; the two are deliberately separate seams.
+
+  SOLE WRITER: `queue.declare_pin`.  Enforcement:
+  `escalation/declared_pins.py::blocking_pin_declarations` consulted by
+  `escalation/server.py::resolve_issue`.
 """
 
 from __future__ import annotations
@@ -185,6 +230,102 @@ class Amendment(TypedDict):
     summary: str          # incoming one-line hypothesis
     detail: str           # incoming `evidence` argument (see docstring on the name)
     options: list[str]    # incoming proposed resolution options
+
+
+class LateResolution(TypedDict):
+    """A substantive resolution that arrived AFTER an automated sweep had already
+    dismissed the record — captured rather than dropped on the floor (task 4495).
+
+    THE RACE.  The W9-δ steward auto-dismiss (`orchestrator.steward` ->
+    `_dismiss_capped_l0`) closes a capped L0 with `resolved_by='auto-dismissed'`.
+    A `resolve_issue` call already in flight from the killed agent session can
+    land microseconds later, on a record that is now terminal.  `queue.resolve()`
+    correctly refuses to re-close it (its status check is an atomic check-and-set
+    inside `escalation_id_lock`) — but it used to also DISCARD the incoming text,
+    so the steward's actual finding was destroyed and the record kept the
+    `resolution_class='benign'` the automated dismissal derived (esc-3902-1).
+
+    Each such late arrival now appends one of these instead.  The record's OWN
+    terminal state — `status` / `resolution` / `resolved_at` / `resolved_by` — is
+    NEVER overwritten: by the time the late call arrives, downstream waiters have
+    already consumed that state and the workflow has resumed, so flipping it
+    would rewrite history that was already acted on.  Append-only preservation
+    mirrors the `Amendment` precedent above exactly.
+
+    `timestamp` is stamped by the queue at write time, never author-supplied —
+    the write chokepoint owns its clock (mirroring `Amendment` / `stamp_triage`)
+    so a caller cannot backdate a capture.
+
+    `prior_resolution_class` records the stamp this capture SUPERSEDED (the
+    derived `'benign'`), so the correction `queue.resolve()` may apply destroys
+    nothing and the original derivation stays auditable.  None when no
+    correction was made.
+
+    `resolution` is stored ELIDED to the queue's per-entry cap with an in-band
+    marker naming what was dropped (`queue._build_late_resolution`); a field
+    ending in that marker is the HEAD of what was submitted, not all of it, and
+    the record-level `late_resolutions_chars_elided` holds the running total.
+
+    `dismiss` is the only fact recorded about what the late caller WANTED, and
+    deliberately so: the finer C1 action (`resume` / `restart` / `park` / ...)
+    is not a `queue.resolve()` argument at all — `server.resolve_issue` stamps
+    it onto the record BEFORE calling, a path an already-terminal record never
+    takes — so a key for it could only ever hold None.  A field that structurally
+    cannot be populated states a fact the entry does not hold; the coarse
+    dismiss/resolve intent that `resolve()` genuinely receives is kept instead.
+
+    Shape mirrors the Amendment / EvidenceEntry / TrainState TypedDicts.
+    TypedDict at runtime is a plain dict; existing from_dict / to_dict /
+    asdict() paths are unaffected — round-trip fidelity is unchanged.  Stored
+    verbatim with no shape validation, so a partial entry is accepted rather
+    than rejected.
+    """
+
+    timestamp: str                        # ISO, stamped by queue.resolve() at write time
+    resolution: str                       # the incoming free text that would have been lost
+    resolved_by: str | None               # the incoming resolver attribution
+    dismiss: bool                         # whether the incoming call asked to dismiss
+    prior_resolution_class: str | None    # the stamp this capture superseded, or None
+
+
+# The instruction `escalate_blocker` appends to its response, telling the FILER
+# what to do next.  NO CODE READS IT — the only consumer is the agent reading
+# the tool result — so the string itself is the whole contract: it is quoted
+# verbatim, as plain prose, by `orchestrator.agents.roles.ESCALATION_LADDER_CORE`
+# (role prompts cannot be f-strings) and by `escalate_blocker`'s tool docstring.
+# A rename would therefore silently decouple the instruction from the response
+# it describes, raising no import error anywhere; these names exist so the
+# prompt's copy can be pinned against the emission site from across the package
+# boundary (orchestrator/tests/test_roles_escalation_ladder.py).
+#
+# NOT `escalation.server.RESOLVE_ACTIONS`, the handler-side `resolve_issue`
+# disposition (resume/restart/park/abandon/close_only).  That is an orthogonal
+# vocabulary which merely shares a key name; the two must not be merged.
+ACTION_TERMINATE_CLEANLY: str = 'terminate_cleanly'   # persistence was observed
+ACTION_KEEP_DRIVING: str = 'keep_driving'             # persistence is unconfirmed
+FILER_ACTIONS: tuple[str, ...] = (ACTION_TERMINATE_CLEANLY, ACTION_KEEP_DRIVING)
+
+
+# The `status` a filing carries when the write was ACCEPTED but a post-write
+# re-read could not confirm it landed, and the `persist_check` verdict that
+# says why.  Emitted by `escalation.queue.observed_submit_response`.
+#
+# Unlike FILER_ACTIONS above, CODE reads this status, and across a module
+# boundary: `escalate_blocker` compares it to choose which action to append.
+# So a rename at the emission site would leave the comparison matching nothing
+# and hand an agent `terminate_cleanly` on a filing that never landed — the
+# exact defect the status exists to prevent — while raising no import error
+# anywhere.  Naming it is what makes the emit and the compare the same object.
+STATUS_ACCEPTED_UNPERSISTED: str = 'accepted_unpersisted'
+
+# `absent`: nothing for that id is on disk at all.  `unreadable`: a read was
+# attempted and failed, or a file IS on disk that yields no record (a torn or
+# corrupt write) — either way the record's state is unknown rather than known
+# to be missing.  The distinction is for the operator debugging the outage; it
+# never changes what the filer should do.
+PERSIST_CHECK_ABSENT: str = 'absent'
+PERSIST_CHECK_UNREADABLE: str = 'unreadable'
+PERSIST_CHECKS: tuple[str, ...] = (PERSIST_CHECK_ABSENT, PERSIST_CHECK_UNREADABLE)
 
 
 # Severities that cause an escalation to be created directly at L2,
@@ -305,6 +446,30 @@ class Escalation:
     dedupe_count: int = 0  # number of duplicate submissions folded into this parent
     dedupe_children: list[str] = field(default_factory=list)  # ids of folded duplicates
     dedupe_fingerprint: str | None = None  # content fingerprint for A7a/A7b recon dedup
+    # Count of oldest NON-HEAD child ids shed to the `queue._MAX_DEDUPE_CHILDREN`
+    # cap.  The TRUE provenance total is `len(dedupe_children) +
+    # dedupe_children_truncated`, so the loss stays assertable FROM THE RECORD
+    # and is never log-only (INV-8), exactly as for amendments_truncated and
+    # root_cause_variants_truncated below.
+    #
+    # `dedupe_count` is NOT affected by the cap and must never be: it is the
+    # load-bearing recurrence signal (a recon-watcher drain sorts the
+    # longest-rotting gates by it, and `sweep._pick_richer` ranks on it), while
+    # `dedupe_children` is provenance only.  The cap separates the two on
+    # purpose — the SIGNAL is uncapped, the PROVENANCE is bounded.
+    #
+    # Retention is HEAD-PRESERVING rather than the pure oldest-shed used above:
+    # unlike `amendments`, this list has no external anchor for the fold's
+    # origin, so the first `queue._MAX_DEDUPE_CHILDREN_HEAD` ids are kept and
+    # the oldest NON-head ones are shed.
+    #
+    # SOLE WRITER / sole trimmer: `queue.attach_dedupe_child`.  Zero migration by
+    # the same from_dict __dataclass_fields__ filter as every field below:
+    # legacy JSON without the key deserialises to 0, to_dict's asdict()
+    # serialises it for free, and queue.submit / submit_resolved /
+    # _atomic_write / resolve / park / stamp_triage need NO change (they are
+    # field-agnostic passthroughs or RMW-on-hydrated-record).
+    dedupe_children_truncated: int = 0
     # L2 cluster fields — empty defaults keep L0/L1 escalations bit-identical on disk.
     # Old JSON files (pre-L2) deserialise correctly via from_dict's __dataclass_fields__
     # filter: absent keys map to the dataclass defaults without any migration required.
@@ -341,6 +506,15 @@ class Escalation:
     # queue.submit_resolved() — never author-supplied at filing time.  None means
     # unstamped — readers fall back to the effective_benign() proxy (see
     # escalation.classify).
+    #
+    # queue.resolve() may also CORRECT an already-written stamp, in exactly one
+    # case: when it captures a late resolution (see `late_resolutions` below) on
+    # a record whose stamp is the DERIVED `'benign'` an automated dismissal
+    # produced, it re-stamps `'actionable'` (or the incoming explicit class) and
+    # preserves the superseded value in the entry's `prior_resolution_class`.
+    # An `'actionable'` or `'moot-terminal-subject'` stamp is never overwritten.
+    # The "written only at a terminal-write chokepoint" invariant still holds —
+    # the correction happens INSIDE resolve(), under the same per-id lock.
     resolution_class: str | None = None
     # Triage-ack annotation (NOT a resolution) — lets escalation-watcher-auto
     # rotations skip re-deriving the disposition of a still-pending L1/L2 item
@@ -394,6 +568,29 @@ class Escalation:
     # per-field caps that make the list's size (not merely its length) bounded.
     # Same zero-migration story as the two fields above.
     amendments_chars_elided: int = 0
+    # Preserved LATE resolution text (task 4495, esc-3902-1).  APPEND-ONLY: a
+    # capture NEVER overwrites this record's own `status` / `resolution` /
+    # `resolved_at` / `resolved_by` — the terminal state downstream waiters have
+    # already consumed is immutable, and every substantive resolution that
+    # arrived after an automated sweep closed the record is kept alongside it.
+    # See the `LateResolution` TypedDict above for the race this closes.
+    # `queue.resolve()`'s already-terminal branch is the SOLE writer and also
+    # the sole trimmer (it sheds the OLDEST past `queue._MAX_LATE_RESOLUTIONS`,
+    # counting each drop in late_resolutions_truncated).  Zero migration, same
+    # pattern as members / evidence / train_state / the triage quad /
+    # granted_files / filing_claimant_run_id / amendments above: legacy JSON
+    # without these keys deserialises to the defaults via the from_dict
+    # __dataclass_fields__ filter below, to_dict's asdict() serialises them
+    # automatically, and queue.submit / submit_resolved / _atomic_write /
+    # resolve / park / stamp_triage need NO change (they are field-agnostic
+    # passthroughs or RMW-on-hydrated-record).
+    late_resolutions: list[LateResolution] = field(default_factory=list)
+    late_resolutions_truncated: int = 0
+    # BYTE-side counterpart of late_resolutions_truncated: characters dropped by
+    # the per-entry cap that makes the list's SIZE (not merely its length)
+    # bounded.  Exactly mirrors the amendments_truncated / amendments_chars_elided
+    # pair above, and has the same zero-migration story as the two fields above.
+    late_resolutions_chars_elided: int = 0
     # The DISTINCT PRE-CANONICAL root_cause spellings that have folded into this
     # L2 (task 3998), the record's own spelling seeded first.  Canonicalising the
     # root-cause match makes MORE promotes fold BY DESIGN, so its failure mode is
@@ -453,6 +650,35 @@ class Escalation:
     # machine-internal filing bookkeeping, not triage-facing.
     citation_sha: str | None = None
     refiles_suppressed: int = 0
+    # DECLARED-DEPENDENCY MARKER (task 4377) — what makes a load-bearing record
+    # refusable at resolve time.  See the module docstring's field summary for
+    # the load-bearing semantics; the enforcement seam is
+    # `escalation/declared_pins.py::blocking_pin_declarations`, consulted by
+    # `escalation/server.py::resolve_issue` as a pre-flight over the target AND
+    # every cascade member.
+    #
+    # `pin_declared_by` names WHAT outside the escalation store relies on this
+    # record staying OPEN — a deviation notice, an operator gate
+    # (`'task-3546-second-deviation-notice'`, `'esc-3914-1'`) — NOT who stamped
+    # it.  That asymmetry is deliberate and is why the `declare_pin` MCP tool
+    # does not overwrite this from `X-Escalation-Identity` the way
+    # `resolved_by` / `triaged_by` are overwritten: those are WHO-acted
+    # attributions, this is what a closer must go read before spending the pin.
+    # A non-empty list is the marker; `pin_declared_reason` is the free-text
+    # why and is NOT itself a marker (a reason without a declarer blocks
+    # nothing).
+    #
+    # SOLE WRITER: `queue.declare_pin` (append-order, de-duplicating, blanks
+    # dropped).  Zero migration, same pattern as members / evidence /
+    # train_state / the triage quad / granted_files / filing_claimant_run_id /
+    # amendments / root_cause_variants above: legacy JSON without these keys
+    # deserialises to []/'' via the from_dict __dataclass_fields__ filter
+    # below, the empty defaults keep every existing record bit-identical on
+    # disk, to_dict's asdict() serialises them for free, and queue.submit /
+    # submit_resolved / _atomic_write / resolve / park / stamp_triage need NO
+    # change (they are field-agnostic passthroughs or RMW-on-hydrated-record).
+    pin_declared_by: list[str] = field(default_factory=list)
+    pin_declared_reason: str = ''
 
     def to_dict(self) -> dict:
         return asdict(self)

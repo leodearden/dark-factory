@@ -84,6 +84,54 @@ class TestCrossLayerIdentityLockstep:
             f'Real watcher identity {identity!r} must remain in PROMOTE_ALLOWED'
         )
 
+    def test_runner_curator_category_is_in_the_deny_list(self) -> None:
+        """The category the DeterministicRunner ACTUALLY files stays denied.
+
+        Same anti-drift shape as the ``_WATCHER_AUTO_IDENTITY`` pin above, for
+        the same documented reason: the string lives as a bare literal in
+        ``orchestrator.deterministic_runner`` and again in this package's
+        denylist, with nothing otherwise tying the two together — so a rename
+        on either side would silently re-open the auto-close hole while every
+        test stayed green.
+
+        The orchestrator import is FUNCTION-LOCAL, exactly as
+        ``test_watcher_wire_identity_is_mapped_and_promote_allowed`` does it:
+        escalation is the lower fleet-wide package and must not module-level
+        import orchestrator (see authority.py's module docstring).
+        """
+        from orchestrator.deterministic_runner import (
+            CURATOR_ADJUDICATION_MISSING_CATEGORY,
+        )
+
+        assert CURATOR_ADJUDICATION_MISSING_CATEGORY in L2_AUTO_CLOSE_DENY_CATEGORIES, (
+            f'The category the DeterministicRunner actually files '
+            f'({CURATOR_ADJUDICATION_MISSING_CATEGORY!r}) must be denied auto-close'
+        )
+
+    def test_runner_milestone_categories_are_in_the_deny_list(self) -> None:
+        """The runner's OTHER two born-at-L2 categories stay denied too.
+
+        Reviewer amendment: 'milestone_gate' and 'milestone_check_failed' sit in
+        the same denylist with the same exposure as the curator category above,
+        so pinning only the curator one would leave the identical silent-rename
+        hole open on its siblings — and leave a reader of authority.py with an
+        unexplained asymmetry between members of one frozenset.
+
+        Asserted in a SEPARATE test from the curator pin (not appended to it) so
+        a milestone rename and a curator rename identify themselves distinctly
+        in the failure report.
+        """
+        from orchestrator.deterministic_runner import (
+            MILESTONE_CHECK_FAILED_CATEGORY,
+            MILESTONE_GATE_CATEGORY,
+        )
+
+        for category in (MILESTONE_GATE_CATEGORY, MILESTONE_CHECK_FAILED_CATEGORY):
+            assert category in L2_AUTO_CLOSE_DENY_CATEGORIES, (
+                f'The category the DeterministicRunner actually files '
+                f'({category!r}) must be denied auto-close'
+            )
+
 
 class TestL2AutoCloseClass:
     """``l2_auto_close_class`` — the narrow above-ceiling ``close_only`` carve-out.
@@ -450,6 +498,31 @@ class TestL2AutoCloseClass:
             f'Expected denylist to block milestone_check_failed, got: {result!r}'
         )
 
+    def test_curator_adjudication_missing_denied_even_for_non_deterministic_role(self) -> None:
+        """'curator_adjudication_missing' is blocked by CATEGORY — the
+        highest-stakes member of the denylist.
+
+        It is the re-ask ``orchestrator.deterministic_runner`` files when a
+        ``human_curator_gate`` task resumes with no
+        ``human_curator_adjudicated_at`` stamp, so auto-closing it re-opens
+        the task-3181 phantom-done hazard the category exists to stop
+        (esc-3181-1 was auto-resolved by the watcher whose own resolution text
+        said the curator work was "deliberately NOT executed"). Class (c)
+        ``stale_task_scoped`` is both category- AND role-agnostic and accepts
+        a bare ``status=done`` marker, so without this denylist entry a filing
+        under any role other than ``orchestrator-deterministic`` sails
+        straight through — defense-in-depth, exactly as for
+        'milestone_check_failed' above."""
+        resolution = 'Subject task status=done per get_task; escalation moot.'
+        result = l2_auto_close_class(
+            identity=self.WATCHER, level=2, action='close_only',
+            category='curator_adjudication_missing', agent_role='some-other-role',
+            resolution=resolution,
+        )
+        assert result is None, (
+            f'Expected denylist to block curator_adjudication_missing, got: {result!r}'
+        )
+
     def test_orchestrator_deterministic_role_denied_even_for_infra_issue(self) -> None:
         resolution = 'live probe: curator paused=false — transient infra self-cleared.'
         result = l2_auto_close_class(
@@ -471,6 +544,7 @@ class TestL2AutoCloseClass:
         assert 'design_concern' in L2_AUTO_CLOSE_DENY_CATEGORIES
         assert 'milestone_gate' in L2_AUTO_CLOSE_DENY_CATEGORIES
         assert 'milestone_check_failed' in L2_AUTO_CLOSE_DENY_CATEGORIES
+        assert 'curator_adjudication_missing' in L2_AUTO_CLOSE_DENY_CATEGORIES
 
     def test_deny_roles_are_frozenset_containing_expected_members(self) -> None:
         assert isinstance(L2_AUTO_CLOSE_DENY_ROLES, frozenset)

@@ -10,6 +10,303 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+#### `_markup_rejections` — plan.json says how many of its own calls were refused (task 4597)
+
+A plan-tools call carrying leaked tool-call envelope markup is REFUSED before the
+tool body runs, which is the right disposition and leaves no trace at the one
+artifact every later reader opens. `design_decisions: []` was therefore genuinely
+ambiguous between "the architect never called" and "the architect called six times
+and was refused six times" — in task 4528 a reviewer could tell only because the
+architect happened to hand-file an info note.
+
+The guard's fact channel now has a SECOND consumer alongside task 4744's journal.
+`plan_tools._markup_fact_sink` fans each fact out to both, isolating them in
+separate try/except arms — load-bearing rather than defensive, because
+`MarkupGuardMiddleware._call_sink` wraps the whole sink in ONE try/except, so a
+composed sink that let the journal's exception propagate would silently skip the
+stamp. The journal runs first and keeps ownership of the return value.
+
+The block lands under a top-level `_markup_rejections`, joining the document's
+existing machine-written envelope (`_schema_version`, `_finalized_at`,
+`_revalidated_at`). It carries `count`, a `by_tool` aggregate, the `first_at` /
+`last_at` window bounds, up to 20 `{ts, tool, param, outcome}` events, an
+`events_truncated` disclosure whose PRESENCE means something was cut, and one
+static `note` so a reader who has never seen the key does not have to infer it.
+`confirm_plan` additionally folds a compact `{count, by_tool}` summary into EVERY
+response it can return — the success branch and all three error branches —
+because that tool result is the architect's last, and the only surface where the
+architect itself, still mid-session, can see that calls it believed it made were
+refused. The ERROR branches are where that matters most: refused `add_plan_step`
+calls are what leaves a plan stepless, and a refused `create_plan` is what leaves
+it absent, so a leaking architect lands on an error exit rather than the success
+one. The `No plan exists.` branch is served from the PENDING BUFFER, via
+`plan_markup_stamp.session_summary` — "what this session refused" rather than
+`summary`'s "what this plan records" — since a refused `create_plan` leaves no
+document to carry a block at all.
+
+- **It deliberately does not hold the matched pattern, the mis-close tag, or the
+  raw payload.** Three independent measured reasons. (1) The pattern and mis-close
+  ARE envelope markup, and plan.json is embedded verbatim into four
+  architect-facing prompts and edited by agents — a literal there reproduces the
+  exact over-consumption defect at the artifact a reader is told to open, which is
+  why `markup_journal` escapes its own bytes and the specimen corpus escapes every
+  literal. (2) `scripts/sweep_toolcall_markup.py` walks dead-lane plan.json
+  RECURSIVELY, so a stored literal would be classified as fresh corruption and
+  inflate the census the sweep exists to report. (3) The raw payload already has
+  exactly one owner, the residue escalation, which is by contract the only
+  surviving copy; a second weaker copy is the duplication the containment PRD rules
+  against. `build_event` is an ALLOWLIST copy rather than a filtered one, so a fact
+  that grows a field tomorrow cannot land in the plan by default.
+- **A contract narrows, deliberately and loudly.** Tasks 4457/4744 pinned that a
+  refused call leaves plan.json BYTE-identical. It now leaves every AUTHORED field
+  identical, the block being the only difference. The byte pin was a proxy for a
+  property about VALUES — `create_server`'s comment ("forwarding a repair would
+  write a guessed-at document that every later reader inherits") and the middleware
+  header ("no middleware-repaired value can ever reach plan.json") — and that
+  property is preserved intact: `tool` and `param` come from the invoked tool's own
+  registration and schema, `outcome` from the guard's closed vocabulary, `ts` from
+  the clock. Four pins were amended in the same commit as the wiring that falsifies
+  them, one renamed to say a rejection writes no CALLER CONTENT, and esc-4597-1
+  records the narrowing.
+- **A refused `create_plan` has no document to stamp**, so it is buffered in
+  process-global state (the shape `plan_tools._REPORTED_REFUSALS` already
+  establishes; one stdio subprocess is one agent session) and drained by
+  `_create_plan`, which also carries any existing block FORWARD because it
+  overwrites plan.json wholesale. Both are wrapped so bookkeeping can never fail a
+  call — the counter is a legibility aid, the plan is the work.
+- **A STORED block is re-projected on the way in, not merely shape-checked.** The
+  allowlist and the per-field cap would otherwise hold only for the events this
+  process builds: every merge re-emits what it read, so a hand-edited event
+  carrying an envelope literal under an unfamiliar key — or a megabyte string under
+  a familiar one — would survive indefinitely and be re-emitted by the very channel
+  whose justification is that it holds neither. Stored events are projected through
+  `STAMP_EVENT_KEYS` and capped; `by_tool` keys are capped too, and counts SUMMED
+  when two overlong keys collapse onto one prefix. `_create_plan`'s carry-forward
+  runs through the same algebra rather than copying the on-disk value raw, and an
+  unrecoverable block is DROPPED rather than laundered into a present-and-zero key.
+  For the same reason `summary` returns nothing for a present-but-empty block:
+  `{count: 0, by_tool: {}}` on a confirm_plan response would announce a loss that
+  did not happen, contradicting the contract that the key's PRESENCE is the signal.
+- **The stamp is serialised against ITSELF, and the residue is pinned.** plan-tools
+  registers sync tools, so FastMCP dispatches them on a thread pool and the emitter
+  adds an `asyncio.to_thread` hop of its own; two batched refusals could read
+  plan.json before either wrote, and the second write would land a block that never
+  saw the first — an undercount in the one artifact whose purpose is to say how
+  much was lost. A reentrant `_STAMP_LOCK` covers the sink's read-merge-write and
+  every mutation of the pending buffer. It does NOT close stamp-against-an-accepted
+  -tool-write: plan.json has no cross-writer lock anywhere, the ten plan-tools
+  mutators already race each other the same way, and closing that needs the lock to
+  live with `artifacts.write_plan` and be taken by every mutator — out of scope
+  here, filed as follow-up. `TestTheCrossWriterWindowIsKnown` pins the window so
+  the day it closes, the test that has to change says so.
+- **`PLAN_SCHEMA_VERSION` is deliberately NOT bumped.**
+  `workflow._can_skip_revalidation` is the only production branch on it, and a bump
+  would decline the revalidation skip for every plan already on disk across the
+  fleet — a real fleet-wide cost in exchange for nothing, since the key is purely
+  additive and absent by default on the clean path.
+
+#### Task-node families now collapse regardless of arriving spelling, and the residue is counted (task 5264)
+
+**The write-path normalizer was keyed on the spelling that ARRIVED, not on the
+family it belongs to, and had two structural blind spots because of it.**
+`MemoryService._normalize_task_node_names` walked the nodes one episode's
+extraction happened to mint, canonicalized each name, and then probed
+`find_duplicate_entity_nodes` for exactly two exact names: the arriving variant
+and the canonical form. Blind spot (1): `if canonical is None or canonical ==
+name: continue` — when extraction happened to mint the already-canonical
+spelling, the pass returned without a single backend call, so an episode that
+DID touch a fragmented task could not heal it. Blind spot (2): even on the
+bad-name path only those two exact names were ever looked at, so a third
+spelling in the same family (`tasks 605`, `task #605`, `Task: 132`) was never
+seen and a three-way split collapsed to two at best, then re-split on the next
+differently-spelled extraction.
+
+**(1) was the decisive one.** (2) makes the repair incomplete; (1) makes it
+unreachable. A task whose canonical node already exists is exactly the task an
+active episode is most likely to mention, so the arrival most likely to be able
+to heal a family was the one guaranteed to do nothing. The old test suite pinned
+that as intended behaviour — `test_already_canonical_name_is_noop` asserted
+`find_duplicate_entity_nodes.assert_not_awaited()` — so the bug was encoded in
+the tests, and fixing it required inverting that assertion rather than adding
+one.
+
+**The pass is now keyed on the FAMILY.** Every touched node name is mapped
+through the new `task_naming.task_node_referent(name) -> Referent | None` and
+de-duplicated on the frozen `Referent`, so an episode carrying both `Task 605`
+and `task 605` probes once. Each family is probed by its VERBATIM DIGITS via the
+new `GraphitiBackend.find_entity_nodes_by_name_substring`, and the candidates
+that query returns are filtered back down to one family by
+`task_naming.group_task_node_families`. Digits are naturally case-free and
+highly selective, which is why no case-insensitive Cypher is needed; precision
+stays at the one normative site, so `Task 6051`, `Task 1605` and the
+cross-project `reify:605` are all rejected by the Python-side filter rather than
+by the query. The outcome no longer depends on which spelling extraction
+produced: the three-arrival test asserts the resulting rename/merge calls are
+IDENTICAL for `Task 605`, `task 605` and the pluralized-container `tasks 605`.
+
+**Survivor selection changed, and it changes which uuid survives.** The old
+policy had a special case — a canonically-named node wins regardless of edge
+count — whose only purpose was to avoid recreating the exact-name duplicate
+`_dedup_episode_nodes` resolves. What rules that hazard out now is the ORDER of
+the two writes, not family-keying: every other member is merged into the
+survivor FIRST and the survivor is renamed onto `Task N` LAST. Renaming first
+would leave the just-renamed survivor and the family's pre-existing canonical
+member both carrying that name between the two awaits, and the pass is
+best-effort by design — so a merge failing there would leave the exact-name pair
+behind. `_dedup_episode_nodes` has already run by then, earlier in
+`_reconcile_episode_identity`, and nothing later in the chain collapses it, so
+the pair would survive until some future episode mentions that task again —
+which for the fragmented families this repair exists for is exactly what may
+never happen. Merging first cannot mint a same-name twin, and a failed rename
+merely leaves one fully-collapsed node under a non-canonical name, which the
+next episode touching that task renames. With the hazard handled by ordering,
+one uniform rule replaces the two branches: the survivor is `family[0]` under
+the backend's existing survivor-first ordering (most valid edges, then oldest,
+then uuid), renamed onto the canonical name only if it is not already canonical,
+with every other member merged into it. It degenerates to the old behaviour
+whenever the canonical node genuinely is the best member. Where the two diverge
+is the low-edge-canonical/high-edge-variant pair: the old rule made the low-edge
+canonical node the survivor and dragged the variant's edges across, the new rule
+keeps the high-edge node and moves fewer edges, then renames it. Fewer edges moved is less write amplification on a best-effort post-commit
+pass. This is recorded explicitly because it is a change of surviving uuid, not
+an implementation detail — and it is the mechanism doing its job, not an
+adjudication of any specific family by hand.
+
+**The residue that fix can never reach is now countable, and was counted: 296
+fragmented families over 624 nodes.** No amount of correct write-path behaviour
+collapses a family belonging to a task no future episode will mention again,
+because nothing will ever trigger the write path for it — so
+`fused_memory/maintenance/task_family_census.py` goes and looks. Measured
+2026-09-19 against the live FalkorDB store with
+`python -m fused_memory.maintenance.task_family_census --json`: every one of 154
+graphs enumerated in full (`complete: true`, no per-graph failures, no
+unconfirmed families, exit 0, 8.2s). Only 5 graphs hold any residue at all —
+**reify 199** families over 421 nodes, **dark_factory 64** over 137,
+**know_live 25** over 50, **solar_challenge 5** over 10, **autopilot_video 3**
+over 6; the other 149 (test and probe leftovers) report 0. Of the 296, **235 are
+split across more than one spelling** — the shape the write-path fix addresses
+when such a task is next mentioned — and 61 are exact-name duplicate pairs only.
+268 families hold 2 nodes, 27 hold 3, and one (reify `Task 2923`) holds 7 across
+three spellings. **145 of the 296 have a survivor whose spelling is not the
+canonical one**, which is the population where the survivor-selection change
+above decides a different uuid than the old policy would have.
+
+The store is live, so these are a measurement rather than a constant: an
+earlier run the same day reported 297 over 626, and the difference is one
+`solar_challenge` family that collapsed in between.
+
+**The census is read-only by construction, and that is asserted rather than
+promised.** It calls only `enumerate_entity_nodes`,
+`find_entity_nodes_by_name_substring` and `list_graphs`, all `ro_query`-backed;
+its tests assert every mutating backend method is never awaited AND that a run
+through a real `GraphitiBackend` never touches the driver's writable `query`
+channel, and they enumerate the argparse surface to prove no flag could mutate
+anything. There is deliberately no `--dry-run`: `verify_zombie_edges.py` needs
+one because it can delete, whereas every census run is already a dry run and
+offering the flag would imply an unsafe mode exists. Completeness is carried
+rather than smoothed over — a truncated or failed graph forces
+`complete: false` and a non-zero exit, so a lower bound can never be mistaken
+for a total by a script reading the exit status.
+
+**The count is also guarded against its own two reads disagreeing.**
+Membership comes from `enumerate_entity_nodes`, whose `MATCH (n:Entity)` carries
+no `group_id` property predicate, while the per-family edge-count probe does —
+that predicate is what keeps task-2115's cross-graph leak out of a collapse. A
+leaked node therefore counts toward the "more than one node" threshold and then
+vanishes from the probe, and the store being live means a concurrent write-path
+collapse produces the same shortfall. A family that thins below two spellings in
+between is recorded as an `UnconfirmedFamily` — canonical name plus both
+membership counts — and excluded from the total, rather than reported as a
+fragmented family holding one node or none. It does not move `complete` or the
+exit code: the graph was read in full, and the count is honest precisely because
+that family was left out of it. The measured sweep above reported zero.
+
+Wiring the census into `_scan_duplicate_entity_names` and running an unattended
+collapse sweep were both explicitly out of scope, and no family — including the
+`Task 605` pair the task record names, present in `dark_factory` as `task 605`
+(1 edge) and `Task 605` (0 edges) — was adjudicated by hand.
+
+#### `merge_request` gained a `lane` parameter, and `merge_lane` is blessed into Tier-A (task 4888)
+
+**`metadata.merge_lane` was inert for every MCP-submitted merge.** Exactly one
+`MergeRequest(...)` construction in the repo passed `lane=` — the orchestrator's own
+submit path, `workflow.py::TaskWorkflow::_submit_to_merge_queue`. The one in
+`escalation/src/escalation/server.py::merge_request` omitted it and took the dataclass
+default `'normal'`, so a main-health fix task carrying `merge_lane='high'` was silently
+enqueued behind every routine merge whenever its merge came through the MCP tool.
+`merge_request` now honours the key, and gained an explicit `lane` parameter to set one
+directly. Precedence is **`lane` > `metadata.merge_lane` > `'normal'`**, and the argument
+wins even when it EQUALS the default — `lane='normal'` deliberately holds a `'high'` task
+back to the normal lane, the case a truthiness-based implementation gets wrong.
+
+**The parameter is `lane`; the metadata key stays `merge_lane`.** Two namespaces, two
+right answers. At the merge-queue boundary every existing name for this concept is the
+bare word — `MergeRequest.lane`, `MERGE_LANES`, the `lane` field `get_merge_queue` emits
+per queue item — so a submitter correlating its request against the queue would otherwise
+have to translate. Task metadata is one flat global dict shared by every subsystem, and
+this repo has at least three other things called lanes (warm, offline, merge-worktree); a
+bare `lane` there would be ambiguous on sight. Renaming the metadata key to match was
+rejected — it is machine-written at three live sites and buys nothing but a migration.
+
+**An invalid CALLER-supplied lane is rejected loudly; an invalid INHERITED one still
+normalises silently.** `lane='higgh'` returns `{error, code='invalid_lane', hint}` and
+enqueues nothing; the same spelling in `metadata.merge_lane` still becomes `'normal'`.
+The asymmetry is the point: an inherited value was written by another actor at another
+time and a lane resolution must never be able to FAIL a merge submission, whereas the
+argument is live operator intent and silently downgrading a main-health hotfix is exactly
+the defect the parameter exists to remove. The caller-supplied check is deliberately NOT
+routed through `_normalize_lane`, whose defining behaviour — map anything unrecognised to
+`'normal'` — would reproduce that defect one level up; both halves still key on the same
+`MERGE_LANES` tuple, so there is one vocabulary and no second normaliser. (This entry is a
+dated release note and states the reasoning in full for a reader who has only the release
+notes; the LIVE copy every in-tree surface cites is the module docstring of
+`escalation/src/escalation/merge_lane_resolution.py`.)
+
+**The parameter is not separately access-gated, because the tool carrying it already is.**
+Measured, not assumed: `mcp__escalation__merge_request` appears in exactly ONE agent
+role's `allowed_tools` — `roles.py::STEWARD` — which the SDK enforces as a ceiling, so no
+rank-and-file agent role can reach the parameter to self-declare urgency. Task 1689's
+anti-starvation reservation of `'high'` for the rare, gated hotfix/main-health class is
+carried by that existing restriction plus attribution: the resolved lane and the source
+that won it are echoed back as `lane`/`lane_source` on both the queued and the attached
+submit response, and `get_merge_queue` already shows the lane per queue item. A third key,
+`lane_applied`, makes the queued/attached difference machine-branchable: it is `True` on
+the queued arm, where the lane rode the enqueued request, and `False` on the attached arm,
+where the submission coalesced onto an in-flight entry that keeps its own lane — so a
+`lane='high'` hotfix that coalesced cannot read as confirmed high-lane. That echo is
+what closes the loop for a caller who passed no argument — without it there was no way to
+learn whether the task's own `merge_lane` had been honoured, which is half of why the key
+could sit inert unnoticed. It lands on the RESPONSE rather than on the `merge_queued`
+event because `merge_queue.py` is frozen by the merge-lane quality PRD's ratchet
+(`orchestrator/tests/test_merge_lane_ratchet.py`) against a line/prose/cognitive baseline
+that one added line — or one added comment — would break.
+
+Cost is bounded: the submit path's degeneracy probe and the new lane fallback share ONE
+memoized task-metadata read, so the count per `merge_request` call is 0 or 1 and 2 is
+unreachable; an explicit `lane=` skips it entirely, and a rejected typo pays nothing
+because validation is pure and runs before any git or metadata work. The remaining single
+read on a no-explicit-lane submission is accepted rather than engineered away — it is
+unavoidable if the precedence rule exists at all, and it can degrade a lane to `'normal'`
+but never fail a submission. The rule itself lives in a new pure module,
+`escalation/src/escalation/merge_lane_resolution.py`, so it is testable without building a
+server, a queue, a registry and a fake worker.
+
+**`merge_lane` is now a Tier-A blessed metadata key**, so `parse_metadata` no longer emits
+`code=unknown_key` on every carrier, and `docs/task-authoring.md` §8 states what the key
+means and why `'high'` stays reserved. Blessed rather than promoted to a typed
+`Literal['normal', 'high']`, despite the vocabulary being closed and tiny — which is the
+fork `execution_class` (task 3780) is already recorded in that same §8 as the worked
+example for. A `Literal` raises on
+every metadata write to an out-of-vocabulary carrier under `direction='write',
+enforce=True`, permanently, since terminal tasks are unrepairable under the
+`done_provenance` write-authority floor; this task deliberately GROWS the carrier
+population via the new parameter, so the form that cannot strand a future carrier is the
+conservative one, and blessing can be tightened later where a raising `Literal` cannot be
+loosened. The typo the stronger form would have caught is caller intent — and that path is
+now guarded where it actually lives. The carrier census at blessing time (four tasks,
+measured 2026-08-20) is recorded once, in the frozenset annotation itself, which also
+records why the blessing ground here is LOAD-BEARING plus STABLE rather than corpus volume.
+
 #### `consolidate_memories` — one transactional op for folding a duplicate cluster (task 3133)
 
 Replaces the hand-rolled write-then-delete choreography that made consolidation a
@@ -136,13 +433,335 @@ retained peers tagged, then per supersede read → re-home children → corrobor
   is NOT tombstoned, and it makes the op `partial` — unlike a tombstone shortfall, an
   unprovable closure means the deliverable itself is missing.
 
-Explicitly NOT claimed here: topic-cluster auto-seed (task 3135), the Stage-1 rewire and
-`recon-stage-*` guard-exemption retirement (task 3134), `update_memory`'s
+Explicitly NOT claimed here: topic-cluster auto-seed (task 3135), `update_memory`'s
 `_apply_memory_metadata_validation` bypass (task 3523 — this op validates the slug at
 entry, bounding but not closing it), and `x_memory_citation_tombstones` on citing tasks
-(task 3893 — a different object in a different store).
+(task 3893 — a different object in a different store). The Stage-1 rewire and the
+`recon-stage-*` guard-exemption retirement, listed here as unclaimed when this op
+landed, have since landed under task 3134 (below).
 
 ### Changed
+
+#### The referent write path is finished: registry wiring, `.ambiguous` on the wire, and a pure verification layer (task 5262)
+
+**The wire blob gained a third key, `'ambiguous'`, and `_decode_referents` now returns
+three values.** Strictly additive, exactly as adding `'referents'` was: no
+`payload_version`, no unknown-operation guard, no migration. An old consumer draining a
+new row ignores one more unknown key; a new consumer draining an old two-key row finds
+`'ambiguous'` absent, which decodes to `None` — the load-bearing sentinel meaning "the
+producer did not tell us", distinct from `()` meaning "the producer told us: nothing was
+ambiguous". `.conflicts` remains dropped, and that is a decision rather than an omission:
+a conflict is a property of what the CALLER declared versus what the prose says, and the
+verifier asks a different question. All-or-nothing degradation extends to the new key —
+any unreadable element in either list degrades the whole blob, never a good `refs` beside
+a dropped `ambiguous`.
+
+**The verifier now reads the producer's ambiguity set OFF THE WIRE instead of re-deriving
+it.** That re-derivation was a SECOND SCAN SITE — the INV-5 lockstep duplication
+`canonical_labels` exists to prevent — and it was sound only while both scans were
+parameterized identically. Producer narrowing (below) ends that: the producer scans at
+ENQUEUE, the verifier runs at DEQUEUE on the far side of a durable SQLite queue, and a
+restart with a changed `DASHBOARD_KNOWN_PROJECT_ROOTS` between them would desynchronize
+the two sets silently — handing an AMBIGUOUS endpoint to the repair path as an
+instruction, which is destructive edge surgery onto the wrong node. Threading the RESULT
+rather than the INPUT makes the two sets incapable of disagreeing at all, which is
+strictly stronger than narrowing both in lockstep. The fallback re-derivation survives for
+legacy rows only, and is PERMISSIVE on purpose: a payload with no `'ambiguous'` key was
+enqueued by pre-change code whose producer scanned permissively, so only a permissive
+re-derivation reproduces it.
+
+**`resolve_referents` gained `known_project_ids`, wired from
+`MemoryService._known_projects` at all three producer call sites** (`add_episode`,
+`add_memory`, `replay_from_store`), so junk qualifiers — `localhost:6379`, `INFO:1234`,
+`redis:6379` — no longer mint referents. Measured over 3,229 real episode bodies (task
+5262's corpus study): 91.14% unchanged, 6.81% narrowed, and the 2.01% that narrowing
+would have PROMOTED are now held back, with all 26 genuine in-registry foreign refs
+preserved. That last 2.01% is why narrowing is now STRICTLY SUBTRACTIVE in `scan_content`:
+the allowlist `continue` fired inside the qualified-ref loop, so a dropped junk qualifier
+never reached the candidate set and the ambiguity contest it created vanished with it —
+promoting the bare number it had been suppressing out of `.ambiguous` and into `.refs`.
+The contest is now decided against the PERMISSIVE candidate set while the emitted refs
+stay narrowed, so the dropped candidate leaves the output entirely and only its contest
+survives. Narrowing can therefore only ever remove a referent, never add one — an episode
+that produces no referent set today, which every consumer no-ops on, can no longer become
+one a repair path acts on. `set_known_projects` now logs one structured INFO line naming
+the project count and whether narrowing is consequently `active` or `permissive`; the
+permissive arm is logged too, because `MemoryService` is constructed before
+`build_known_projects_map` runs and that window is otherwise invisible.
+
+**The per-edge cited-fact scan stays PERMISSIVE — now a deliberate asymmetry rather than a
+shared default.** It asks whether an edge's FACT names the node the edge landed on, and a
+citation is evidence whether or not the factory knows that project; narrowing it would
+drop the citation and turn a true negative into a false pairing finding. The
+`server/entities_gate.py` call also stays permissive: the gate holds no registry, and it
+rejects on CONFLICT and never on absence, so narrowing there could only subtract
+rejections it currently makes.
+
+**The pure verification policy/record layer moved to `utils/referent_verification.py` with
+zero behaviour change** — `REFERENT_CHECKS`, `REFERENT_FINDING_AXES`, `ReferentFinding`,
+`ReferentStats`, `_candidate_pool`, `_candidate_targets` and their siblings, re-imported by
+`memory_service` so the check vocabulary `MemoryService.__init__` seeds its counters from
+still lives at exactly one site. `_verify_episode_referents` — the behaviour — deliberately
+stays in `memory_service.py`.
+
+**Workstream D of this task required no work.** Deferring the per-edge fact scan until an
+endpoint parses as a task label had already landed as commit `d266471409` under task
+4506's A3 — the two were separate filings of the same esc-3671-1 suggestion. Noted so a
+reader diffing the task description against the change set does not read it as an omission.
+
+#### Both of `merge_gates.py`'s `--no-renames` diff gates are now rename-aware (task 5342)
+
+**Behaviour change, two sites plus a message.** Both gates built a path-string set
+operation on top of `--no-renames` diffs, which split a rename into two unrelated
+strings. Each therefore read a *relocation* as a *disappearance* and blocked a merge
+that had dropped nothing. The two sites need rename resolution on OPPOSITE ranges — the
+branch side and the merge side — so both now go through one shared `_rename_pairs`
+primitive (a single `git diff -M --name-status`, parsed with the tab-split idiom
+`_rename_pair_for` already used), leaving the module with exactly one way to ask git
+what was renamed between two trees.
+
+- **Post-merge equivalence gate** — before: a branch-touched path was compared unless
+  main touched *that exact path*. After: a path whose rename **source** main touched
+  becomes a *candidate* for exclusion, and is excluded only once the branch's own delta
+  is verified present in the merged blob. So relocating a file main concurrently edited
+  at the old path no longer produces a false `Conflict resolution likely dropped or
+  rewrote work` (measured: reify task 5694, merge `d1d857f43545`, esc-5694-5).
+- **Plan-target drop-guard** — before: every apparently-dropped path the branch had
+  changed was flagged. After: a path that is a rename **source** between task HEAD and
+  the merge commit becomes a *candidate*, excluded only once the same content check
+  confirms the branch's work is at the new name. So a sibling relocating a file the
+  branch *modified* no longer produces a false `Merge commit is missing plan target
+  files` (measured: reify esc-6436-4).
+
+The content check is one shared primitive used by both gates, gathering evidence in
+three ascending steps. First the merged path must **resolve to a blob** at all. Then, if
+the merged blob is **byte-identical** to the one the branch produced (`git diff --quiet`
+between the two blob revisions — it prints nothing, so it answers even for a payload
+that cannot be decoded), the branch's content landed verbatim and nothing need be read. Only otherwise — main edited the same content on top —
+is the branch's delta diffed blob-to-blob (`git diff <base>:<old> <after_rev>:<after_path>`)
+and reverse-applied against the merged blob with `git apply --check -R`.
+
+The existence step is load-bearing and comes first for a reason a later step cannot
+cover: a **pure relocation**'s delta is *empty*, and an empty patch reverse-applies
+against anything — including a resolution that deleted the file outright. On the
+equivalence gate both halves of such a rename are otherwise invisible (the source is
+discarded by the `main_touched` arm, the target by the suppression arm), so without it
+the compare set is empty and the gate passes a merge that destroyed the branch's work.
+Existence is the whole of a pure relocation's claim, so it is the whole of what is
+checked there.
+
+**A rename pair is not, by itself, evidence the work survived.** Git pairs renames at
+~50% similarity, so a resolution that relocates a file and *discards* the branch's edit
+still pairs (measured `R095`) — suppressing on the bare pair would turn both gates into
+silent work-loss holes, and neither gate backstops the other on this case. Hence the
+content check, and hence two deliberately *different* error directions: an unreadable
+**rename map** fails **open** (uniform with each gate's four existing `rc != 0` arms —
+the gate cannot tell a rename from a drop at all, so it degrades), while an unverifiable
+**content probe** declines to suppress, falling back to pre-change flagging, which by
+construction cannot introduce a false block relative to main. The probe is conservative
+in the same direction throughout: `git apply` matches context with no fuzz, so a
+main-side edit inside the branch hunk's context lines flags rather than silently passes.
+
+**A binary payload must not take either gate out of that error model.** `git_ops._run`
+decodes stdout as strict UTF-8, so reading a merged blob that is binary — or text in a
+legacy encoding — raises `UnicodeDecodeError`, and neither gate catches it:
+`classify_and_merge` re-raises after cleaning up the merge worktree, so the merge would
+die with a traceback instead of failing open OR keeping the flag. The OID step settles
+the common case without reading anything (a binary file only the branch touched
+suppresses on identity), and the read that remains is guarded and flags. An earlier
+draft of this entry claimed binary files "produce a patch `git apply` will not take" —
+that was wrong: control never reached `git apply`.
+
+`-C` is deliberately not passed, since a copy leaves its source in place. All five
+pre-existing diffs are byte-identical; `--no-renames` on the equivalence gate's
+main-touched diff is in fact load-bearing in the new design, because main's own rename
+must stay decomposed for its source to appear in the set the branch's rename sources are
+looked up in.
+
+When a suppression fires, each gate logs one INFO naming the pairs and recording that the
+content was verified at the new name, so a gate that passes says *why*. The complementary case — a block that survives rename
+resolution — now names its triage command **and its direction**
+(`git diff <tip12> <advanced12> -- <path>`, branch tip first) plus the `git log --follow`
+a relocated path requires; reading that diff backwards, and a `--follow`-less history
+that looked empty, are what steered the esc-5694-5 RCA to the opposite of the truth.
+
+The merge-lane ratchet baseline is regenerated accordingly. `merge_gates.py`'s
+`cognitive`/`lines`/`prose_lines` rise — the earned cost of the new behaviour, the content
+probe and their docstrings. Extracting the adapters rather than inlining them actually
+*lowered* both host functions (`_check_post_merge_equivalence` 25→24,
+`_check_plan_targets_in_tree` 16→15), and the four new keys land at 5/8/11/11 against the
+cognitive-15 new-key ceiling. The existence and byte-identity steps then take
+`_branch_delta_survives` 5→10 — still inside that ceiling, and the smallest shape that
+closes both holes: identity is asked with `git diff --quiet` rather than a pair of
+`rev-parse` reads precisely so it costs one branch instead of two.
+
+#### Stage 1 folds through `consolidate_memories`, and the `recon-stage-*` write exemption is retired (task 3134)
+
+**Behaviour change, two sites.** Task 3133 shipped the op; this is the leaf that makes
+the consolidator actually USE it and removes the write-path exemption that existed only
+because it did not.
+
+**The Stage-1 (`memory_consolidator`) prompt now advertises the op and directs folds
+through it.** `mcp__fused-memory__consolidate_memories` is listed in `## Available
+Tools` — the stage always HELD it (`STAGE1_DISALLOWED` never folds
+`DISALLOW_MEMORY_WRITES`), but `--disallowed-tools` omits a denied tool from the agent's
+listing rather than rejecting the call, so a held-but-unadvertised op is
+indistinguishable from inside the stage from one it does not have. A new `## Executing a
+Cluster Fold` section carries what a caller cannot succeed without: the two id arms
+(`supersedes` deletes, `retain` tags in place), the REQUIRED `topic` — a positional
+parameter, so a fold cannot mint an unstamped canonical and the vocabulary stamping stops
+being a step a prompt can forget — the ordering (validate → authorize → `scan_only`
+citation pre-flight → WRITE THE CANONICAL → tag peers → delete each supersede, with the
+byte-identical guarantee stated honestly as covering only the first four steps),
+`survivors` / `survivor_check_failed` as the corroborated closure signal, the no-resume
+rule (`'partial'` is not a retry signal — a second call for the same (project, topic)
+writes a SECOND canonical, which is the ratchet the op exists to end), and `run_id` as
+the DELETING run rather than the victims' own. The TARGET END STATE brief from task
+3112's `## Consolidation Gate` is CROSS-REFERENCED, never restated — a second normative
+copy inside one assembled prompt is resolved arbitrarily by the reader. The shared
+`STALE_KNOWLEDGE_ANNOTATION_NORM` (which renders verbatim into BOTH stage prompts) had
+clause (d) rewritten for the same reason: it prescribed the hand-rolled amend-then-delete
+choreography for a multi-record cluster, and now names the op, while KEEPING that
+sequence for the two cases it is still right for — superseding a SINGLE record (where
+`update_memory` preserves the survivor's id) and hand-finishing a `partial`.
+
+**The `recon-stage-*` exemption is retired at BOTH write sites.** Previously a
+`recon-stage-*` `agent_id` skipped the `add_memory` near-duplicate guards (cosine
+near-duplicate, known-topic-cluster and sufficient-phrase) AND was force-stored by
+`write_triage` without a retrieval round-trip. Both are gone: a recon-stage caller is now
+soft-blocked exactly like anyone else where the guards are live
+(`ProceduralKnowledgeNearDuplicateWriteRejected` /
+`ProceduralKnowledgeKnownTopicClusterWriteRejected`), and ROUTED by band exactly like
+anyone else where `write_triage.enabled` is on. The exemption's stated premise — a merged
+canonical necessarily resembles the duplicates it replaces, with no ordering guarantee
+that those duplicates are deleted first — is precisely what `consolidate_memories`
+supplies, so it no longer holds. **The sanctioned path is unaffected**: the op writes its
+canonical through `memory_service.add_memory`, the SERVICE method, not the guarded MCP
+`add_memory` tool where the guard block lives, so it never meets that guard at all. The
+retirement redirects Stage 1 onto the op rather than blocking it there too, and that
+property is regression-pinned. The prompt states the consequence for the stage in the
+same change: a soft-block is a SIGNAL that the cluster already exists — fold it, or amend
+the incumbent in place — and NOT an occasion for a reflexive
+`metadata={'allow_near_duplicate': True}`, which is how the cluster grew.
+
+**Stage 1's delete discipline now teaches the post-3624 citation gate.** The gate is a
+property of the RECORD, not of who is deleting, so it binds every caller — the prompt
+said nothing about it, leaving a Stage-1 agent facing a plain drop with no stated way
+forward. `metadata={'allow_dangling_citations': True}` is named as the ONE sanctioned
+bypass, with the rules the server actually enforces: only the literal boolean `True`
+counts (a truthy `'yes'`/`1`/`'true'` is IGNORED and the refusal stands), it is scoped to
+a PLAIN DROP where nothing replaces the entry and `replacement_memory_id` cannot express
+that, it is recorded at WARNING with every stranded citer named, and it is an
+individually-reasoned decision per delete rather than a loop default. It is explicitly
+WRONG for a consolidation, which has a survivor by definition and must name it —
+`consolidate_memories` exposes no such escape at all, because its canonical IS the
+repoint target by construction.
+
+#### `related_tasks` blessed into Tier-A, and every Tier-B canonical key is now machine-checked (task 4303)
+
+`related_tasks` was the **largest single `unknown_key` contributor in the
+corpus** — and, unusually, the *canonical* Tier-B spelling that
+`docs/task-authoring.md` §8 tells authors to migrate **toward**. So an author
+who followed the documentation exactly still minted a census line, and the
+drift signal could not distinguish "used a deprecated alias" from "used the
+canonical spelling". It was the sole violation of an invariant the Tier-B
+table already depended on: measured on the base tree, `prd_path`,
+`prd_task_label`, `invariants` and `source_finding_id` — every other key in
+the table's Canonical column — were already blessed.
+
+**The reader trace came back NEGATIVE, and the key is blessed anyway. This is
+the fact most likely to be misread later, so it is stated plainly.** There is
+no code reader, no code writer, and `git log -S` across `orchestrator/src`,
+`fused-memory/src`, `escalation/src`, `shared/src`, `dashboard`, `scripts`,
+`hooks`, `skills` and `.claude` shows the key has **never existed in code** in
+this repo's history. Unlike `related_memory_ids`, no live prompt instructs it
+either — the empirical writer is an LLM prose convention. The blessing rests on
+the **`esc-3796-1` corpus-dominance precedent**, under which the
+finding-provenance family is Tier-A with no reader and no writer because *the
+corpus is the usage*; `source_finding_id` was blessed at 120 tasks, this key at
+469. A future reader who greps for a writer, finds none, and prunes the entry
+as dead would be wrong.
+
+**Retirement was measured, not assumed, to be impossible today.** 326 of the
+469 carriers (69.5%) hold `done_provenance` and are unwritable under the
+presence-only write-authority floor until task 3777 lands. Sweeping only the
+writable ~30% is exactly the "fifth of the benefit" vocabulary fork §8 already
+rules out for task 4302 — so retiring would have converted this task into a
+block on 3777 while leaving live authoring guidance inverted for four spellings
+in the meantime. Typing was ruled out on the same grounds that decided
+`execution_class`: the corpus values are heterogeneous (432 list, 37 bare str),
+so a `list[str]` field would raise on every metadata write to those 37 under
+`direction='write', enforce=True`, permanently.
+
+**A new structural guard closes the class of bug, not just this instance.**
+`tests/scripts/test_task_authoring_tier_b_canonical_keys.py` pins the general
+invariant *every key in the Tier-B Canonical column is Tier-A blessed*, so a
+future table row whose canonical is unblessed fails the suite instead of
+silently recreating this defect. It is a new file rather than an extension of
+`test_task_authoring_blessed_keys_drift.py`, whose docstring explicitly forbids
+extending that guard to the surrounding prose. Non-vacuity was measured by
+hand, since its own RED was scaffolding-shaped: removing `'related_tasks'` from
+the frozenset makes it fail naming the key.
+
+**Two coverage holes in that guard were then closed, both falsified by hand.**
+(1) The row filter keeps any row with a backtick *anywhere* in it, but names are
+read out of the first cell only — so a row whose Canonical cell was written as
+bare prose passed the filter, contributed zero names and was **silently
+unpinned**. Measured on the live document: rewriting the real ``| `invariants` |
+`inv` |`` row as `| the invariants key | `inv` |` left the guard reporting
+**11 passed**; with the new per-row assertion the same edit fails **3 tests**
+naming the offending row. That is the identical silent-narrowing shape as the
+`` ` + ` ``-joined cell the file already guards against — one loses a key, this
+lost a whole row. (2) The parser suite exercised only `direction='read'` with a
+list value, so the **bless-not-type** ruling — which rests entirely on 37 corpus
+carriers holding a bare `str` — was defended by prose alone. A parametrized
+write leg now pins both shapes under `direction='write', enforce=True`, asserting
+neither raises *and* neither is coerced. Falsified by adding
+`related_tasks: list[str]` to `TaskMetadata`: exactly one case failed,
+`[bare_str_value]`, with `Input should be a valid list [input_value='task-1']`,
+while `[list_value]` stayed green. Neither mutation was committed.
+
+**Deliberately deferred:** the marker-span extraction (`begin`/`end` counting,
+inversion check, slice) is now duplicated between this guard and
+`tests/scripts/test_task_authoring_blessed_keys_drift.py`. Extracting it to a
+shared helper is only worth doing if *both* callers migrate, and the task-3780
+guard is outside this task's lock set, so it is filed as follow-up rather than
+half-done here.
+
+The frozenset header comment's `related_task*` **wildcard** is narrowed to the
+three literal aliases. It went false the moment the key was blessed, and was
+independently hazardous: the glob sweeps in `related_task_ids`, a different key
+— memory metadata, not task metadata — with a live reader in
+`fused-memory/scripts/audit_duplicate_memories.py`.
+
+**This does NOT empty the census, and should not be read as if it had.**
+Measured before and after against the live store (4748 dict-metadata tasks,
+2026-08-31): **1516 tasks → 1215** carrying at least one unknown key, **3130 →
+2661** warning lines, **1028 → 1027** distinct spellings. The blessing removes
+469 warning *lines* but clears only **301 tasks entirely**, because most
+carriers also hold other unknown keys. `related_tasks` is now absent from the
+census; the new #1 contributor is `merge_first_enqueued_at` at 209. The
+remaining tail is deliberately left warning as a drift signal.
+
+**`delivered_checks` (313 in a raw census) was investigated and is a
+non-finding** — a measurement artifact, not a leak, and no code changed. It is
+a registered submodel (`shared/src/shared/capability_manifest.py`) whose
+registration is an **import-order side effect**, so a standalone script that
+never imported `shared.capability_manifest` counts it as unknown. The live
+write path does reach the registration, so no real write emits the warning.
+Recorded in §8 with the operational corollary: import the submodel
+registrations before running a task-metadata census, or you will measure
+phantom leaks.
+
+**Operator note:**
+`fused-memory/scripts/migrate_task_metadata_to_x_namespace.py` now **refuses**
+`related_tasks` as a Tier-A blessed key (`--force` overrides) — verified by
+hand. That closes the retirement path in code, not merely in prose.
+
+The historical task-4372 entry below, which reads "The largest single
+contributor is `related_tasks` at 445 tasks — which is the *canonical* Tier-B
+spelling, not drift", is left as written: it was true when written and is the
+record of how this task was found. This entry supersedes it.
 
 #### `execution_class` blessed into Tier-A, and the Tier-A listing is now machine-checked (task 3780)
 
@@ -535,6 +1154,36 @@ table in `docs/task-authoring.md` §8, owned by
 `tkt_0RS4XDWJQ9PR8MFXY5DKW950WS`: `execution_class` is read by two live guards
 but is neither blessed nor typed (272 tasks), and the `x_` sweep has not been
 run corpus-wide.
+
+#### Plan-decision cross-pairing: a re-runnable scanner, and where it's documented (task 3967)
+
+A `design_decisions` entry whose `decision` and `rationale` are each well-formed
+prose but wrongly **paired** — a different damage class from the envelope
+leakage above, and invisible to that detector by construction, not by
+oversight (`shared.toolcall_markup.detect` cannot see a mis-pairing) — though
+the two classes do co-occur on individual plans, which is why the scanner
+reports an `envelope_leak` column rather than deferring to a second sweep.
+The full account — the shape, why repair is impossible, why no deterministic
+write-time predicate can contain it, and the containment measurement — lives
+in [`docs/plan-decision-cross-pairing.md`](docs/plan-decision-cross-pairing.md).
+Treat every prevalence figure there as a dated, strict lower bound, not a
+number to trust — the corpus keeps growing — and re-run the scanner instead of
+citing it.
+
+**Added `scripts/scan_plan_decision_pairing.py`**, a read-only, re-runnable CLI
+(`--root`, `--json`, `--fail-on-hit`, `--require-scanned`; no `--apply`, ever).
+The invocation safe for an unattended gate (CI job, timer):
+
+```bash
+python scripts/scan_plan_decision_pairing.py --fail-on-hit --require-scanned 1
+```
+
+`--require-scanned` must accompany `--fail-on-hit`: alone, `--fail-on-hit` keys
+only on hits, so a `--root` that is mistyped, not yet created, or unlistable
+yields zero hits over zero scanned files and exits 0 — indistinguishable from a
+clean corpus. `--require-scanned N` states the coverage floor instead and exits
+**3** when fewer than `N` plan files were actually read, which outranks
+`--fail-on-hit`'s exit 1.
 
 ### Changed (BREAKING)
 

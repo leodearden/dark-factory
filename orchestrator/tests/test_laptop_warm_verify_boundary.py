@@ -63,6 +63,7 @@ import signal
 import socket
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 import warnings
@@ -933,13 +934,16 @@ def worktree_base_for(repo: Path) -> Path:
 # ---------------------------------------------------------------------------
 # Task 4025 (de-flake beta) -- pinned SS9 Row 1/2/3 watchdog window.
 #
-# ROW_WATCHDOG_ENV carries the SAME numbers as today's production constants
-# -- verify_cancel.WATCHDOG_HEARTBEAT_TIMEOUT_SECS (10.0) and
-# WATCHDOG_KILL_GRACE_SECS (5.0) -- but as PINNED LITERALS, deliberately NOT
-# imported from verify_cancel: task 4195 will retune those constants
-# (deriving the timeout from SSH_SERVER_ALIVE_INTERVAL *
-# SSH_SERVER_ALIVE_COUNT_MAX, toward ~60s+), and tracking them here would
-# silently multiply this module's runtime (Row 3 from ~17s to ~70s).  The
+# ROW_WATCHDOG_ENV carries PINNED LITERALS, deliberately NOT imported from
+# verify_cancel.  They used to equal production; task 4195 has since landed and
+# derived WATCHDOG_HEARTBEAT_TIMEOUT_SECS from the ssh transport's own
+# dead-peer verdict (WATCHDOG_TRANSPORT_HEADROOM 1.5 x SSH_SERVER_ALIVE_INTERVAL
+# 15 x SSH_SERVER_ALIVE_COUNT_MAX 4 = 90.0; the 5.0 kill grace is unchanged),
+# so the pin and production now deliberately DIFFER.  Tracking production here
+# would silently multiply this module's runtime -- Row 3 from ~17s to ~95s and
+# ROW_PER_TEST_TIMEOUT_SECS from 390 to ~650 -- for no coverage, because the
+# rows already drive the real production code path through ROW_WATCHDOG_ENV ->
+# cli.py::_env_float.  The
 # pin is now STRUCTURAL, not just asserted: the literals live on
 # ROW_WATCHDOG_HEARTBEAT_TIMEOUT_SECS / ROW_WATCHDOG_KILL_GRACE_SECS below,
 # and ROW_TREE_KILL_CEILING_SECS / ROW_PER_TEST_TIMEOUT_SECS are computed
@@ -967,6 +971,13 @@ def worktree_base_for(repo: Path) -> Path:
 # window, not N.
 ROW_WATCHDOG_HEARTBEAT_TIMEOUT_SECS: float = 10.0
 ROW_WATCHDOG_KILL_GRACE_SECS: float = 5.0
+
+#: What production read when the divergence above was last DECIDED, not a value
+#: the rows spend.  Its only consumer is
+#: :func:`test_row_watchdog_window_tracks_the_baselined_production_window`,
+#: which fails the day production moves again so the next author re-decides
+#: whether the rows' fast window is still representative.
+BASELINED_PRODUCTION_WATCHDOG_WINDOW: tuple[float, float] = (90.0, 5.0)
 
 #: Worst-case time to fire and finish killing the tree.  Row 3 takes
 #: run_stdin_watchdog's select-TIMEOUT branch and pays the full sum; Rows
@@ -1155,18 +1166,18 @@ ROW5_WAITER_COMPLETION_CEILING_SECS: float = 60.0
 ROW5_HOLDER_TEARDOWN_CEILING_SECS: float = 5.0
 
 #: Worst-case FIXED (non-load-scaled) work in Row 5: the marker wait, the
-#: waiter subprocess's completion ceiling, and the finally block's holder
-#: teardown.  The marker term is counted TWICE because
-#: :func:`wait_for_marker_stable` spends its timeout on the existence gate and
-#: then a FRESH deadline on the settle loop -- worst case 40s, not 20s, a term
-#: the literal mark this replaced hid entirely.  (Deliberately excludes
-#: _setup_verify_repo's real git work and the in-process consumer half -- both
-#: small next to the headroom below, exactly as for Rows 1-4.)
+#: waiter subprocess's completion ceiling, and the finally block's TWO
+#: holder teardowns (waiter then holder).  The marker term is counted TWICE
+#: because :func:`wait_for_marker_stable` spends its timeout on the existence
+#: gate and then a FRESH deadline on the settle loop -- worst case 40s, not
+#: 20s, a term the literal mark this replaced hid entirely.  (Deliberately
+#: excludes _setup_verify_repo's real git work and the in-process consumer
+#: half -- both small next to the headroom below, exactly as for Rows 1-4.)
 _ROW5_WORST_CASE_FIXED_SECS: float = (
     2 * ROW_MARKER_CEILING_SECS
     + ROW5_WAITER_COMPLETION_CEILING_SECS
-    + ROW5_HOLDER_TEARDOWN_CEILING_SECS
-)  # 105.0
+    + 2 * ROW5_HOLDER_TEARDOWN_CEILING_SECS
+)  # 110.0
 
 #: Row 5's per-test opt-out from the inherited `timeout = 60`, in the same
 #: shape as ROW_PER_TEST_TIMEOUT_SECS above: 2x the FIXED terms (they do not
@@ -1177,7 +1188,7 @@ _ROW5_WORST_CASE_FIXED_SECS: float = (
 #: them as well would double-count the same elasticity.
 ROW5_PER_TEST_TIMEOUT_SECS: int = int(
     2 * _ROW5_WORST_CASE_FIXED_SECS + 2 * ROW_DISCOVERY_CEILING_MAX_SECS
-)  # 450
+)  # 460
 # ---------------------------------------------------------------------------
 
 
@@ -1193,38 +1204,43 @@ ROW5_PER_TEST_TIMEOUT_SECS: int = int(
 # ---------------------------------------------------------------------------
 
 
-def test_row_watchdog_window_still_matches_production_constants():
-    """Fails the day ROW_WATCHDOG_* stops matching verify_cancel's WATCHDOG_*.
+def test_row_watchdog_window_tracks_the_baselined_production_window():
+    """Fails the day verify_cancel's WATCHDOG_* moves off its baselined value.
 
     task 4025 pinned ROW_WATCHDOG_HEARTBEAT_TIMEOUT_SECS /
     ROW_WATCHDOG_KILL_GRACE_SECS as literals specifically so Rows 1/2/3's
     runtime does NOT track verify_cancel.WATCHDOG_HEARTBEAT_TIMEOUT_SECS /
-    WATCHDOG_KILL_GRACE_SECS -- task 4195 is expected to retune those toward
-    ~60s+.  Today the pinned literals happen to equal production, so this
-    passes; it exists to catch the moment that stops being true.
+    WATCHDOG_KILL_GRACE_SECS.  Those two once happened to be equal; task 4195
+    has since derived the production timeout from the ssh transport (90.0s),
+    so the pin and production now deliberately DIFFER and equality is no
+    longer the thing to assert.
 
-    If this fails: production changed (task 4195 landing is the expected
-    trigger).  Do NOT "fix" it by importing the pinned literals from
-    verify_cancel -- that reintroduces the silent-runtime-multiplication
-    this task exists to prevent.  Instead update the three Row 1/2/3
-    docstrings' "pinned production-equivalent window" wording (it will no
-    longer be accurate), decide afresh whether
-    ROW_WATCHDOG_HEARTBEAT_TIMEOUT_SECS / ROW_WATCHDOG_KILL_GRACE_SECS
-    should move, and re-baseline this assert against the new production
-    values.
+    What survives is this test's actual job: tell the next author that
+    production moved AGAIN, so they re-decide whether the rows' fast window is
+    still representative of the behaviour they exercise.
+
+    If this fails: production changed.  Do NOT "fix" it by importing the
+    pinned literals from verify_cancel -- that reintroduces the
+    silent-runtime-multiplication task 4025 built the pin to prevent, and buys
+    no coverage, because the rows already drive the real production code path
+    through ROW_WATCHDOG_ENV -> cli.py::_env_float.  Instead update the three
+    Row 1/2/3 docstrings' window wording, decide afresh whether
+    ROW_WATCHDOG_HEARTBEAT_TIMEOUT_SECS / ROW_WATCHDOG_KILL_GRACE_SECS should
+    move, and re-baseline BASELINED_PRODUCTION_WATCHDOG_WINDOW.
     """
     from orchestrator import verify_cancel
 
-    pinned = (ROW_WATCHDOG_HEARTBEAT_TIMEOUT_SECS, ROW_WATCHDOG_KILL_GRACE_SECS)
     production = (
         verify_cancel.WATCHDOG_HEARTBEAT_TIMEOUT_SECS,
         verify_cancel.WATCHDOG_KILL_GRACE_SECS,
     )
-    assert pinned == production, (
-        f'pinned ROW_WATCHDOG_* {pinned} no longer match production '
-        f'verify_cancel.WATCHDOG_* {production} -- the pin intentionally '
-        f'does not track production; update the docstrings\' '
-        f'"production-equivalent" wording and re-baseline this assert.'
+    assert production == BASELINED_PRODUCTION_WATCHDOG_WINDOW, (
+        f'production verify_cancel.WATCHDOG_* {production} no longer matches the '
+        f'baselined {BASELINED_PRODUCTION_WATCHDOG_WINDOW} this module was last '
+        f'reconciled against. The pinned ROW_WATCHDOG_* '
+        f'{(ROW_WATCHDOG_HEARTBEAT_TIMEOUT_SECS, ROW_WATCHDOG_KILL_GRACE_SECS)} '
+        f'intentionally do not track production; re-decide whether they should '
+        f'move, then re-baseline BASELINED_PRODUCTION_WATCHDOG_WINDOW.'
     )
 
 
@@ -1574,7 +1590,8 @@ def test_row5_per_test_timeout_covers_its_own_bounded_work():
     ``wait_subtree_gone`` kill confirmation -- so it cannot share their
     constant.  Its bounded terms are: two discovery waits (both on the
     load-scaled ceiling), the marker wait, the waiter subprocess's completion
-    ceiling, and the ``finally`` block's holder teardown.
+    ceiling, and the ``finally`` block's TWO holder teardowns (waiter then
+    holder).
 
     The marker term is counted TWICE on purpose:
     :func:`wait_for_marker_stable` spends its ``timeout`` on the
@@ -1590,13 +1607,13 @@ def test_row5_per_test_timeout_covers_its_own_bounded_work():
         2 * ROW_DISCOVERY_CEILING_MAX_SECS
         + 2 * ROW_MARKER_CEILING_SECS
         + ROW5_WAITER_COMPLETION_CEILING_SECS
-        + ROW5_HOLDER_TEARDOWN_CEILING_SECS
+        + 2 * ROW5_HOLDER_TEARDOWN_CEILING_SECS
     )
     assert required <= ROW5_PER_TEST_TIMEOUT_SECS, (
         f'ROW5_PER_TEST_TIMEOUT_SECS ({ROW5_PER_TEST_TIMEOUT_SECS}) does not cover '
         f"Row 5's bounded worst case ({required}) -- both discovery waits at the "
         f'MAX ceiling, the marker existence gate AND its settle loop, the waiter '
-        f"subprocess's completion ceiling, and the holder teardown"
+        f"subprocess's completion ceiling, and both holder teardowns"
     )
 
     applied = [
@@ -1775,20 +1792,80 @@ def _bare_kill_offenders(func_node, holder_names: set[str]) -> list[str]:
     return offenders
 
 
+def _untorn_down_holders(func_node, holder_names: set[str]) -> list[str]:
+    """``"func:holder"`` for every swept holder never passed to a
+    ``kill_holder_tree(...)`` call in a ``try`` handler/finalbody anywhere
+    in *func_node*.
+
+    Scoped to the WHOLE FUNCTION, across ALL of its ``try`` statements --
+    deliberately unlike :func:`_bare_kill_offenders`, which only excuses a
+    raw kill found in the SAME body of the SAME ``try`` -- because the
+    failure this catches is the ABSENCE of any teardown, which no per-``try``
+    rule can see: a holder torn down in a completely different ``try`` from
+    where it was bound is still torn down.
+
+    Only a call inside a ``finally``/``except`` body counts as teardown: a
+    ``kill_holder_tree(holder)`` reachable only along the happy path -- as
+    the last statement of a ``try`` BODY, or a bare statement outside any
+    ``try`` -- would not run if an earlier statement raises, which is
+    exactly the failure this check exists to catch, so it must not be
+    credited.  Only a DIRECT ``ast.Name`` argument of the call (positional
+    or keyword value) counts as teardown; the argument subtree is
+    deliberately not walked, so an indirection such as
+    ``kill_holder_tree(procs[0])`` is reported as a finding rather than
+    silently excused.  Keyword values are included because
+    ``kill_holder_tree``'s first parameter is named ``proc``, making
+    ``kill_holder_tree(proc=holder)`` a legal spelling.
+    """
+    torn_down: set[str] = set()
+    for try_node in ast.walk(func_node):
+        if not isinstance(try_node, ast.Try):
+            continue
+        bodies = [try_node.finalbody] + [handler.body for handler in try_node.handlers]
+        for body in bodies:
+            for stmt in body:
+                for node in ast.walk(stmt):
+                    if not (
+                        isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Name)
+                        and node.func.id == 'kill_holder_tree'
+                    ):
+                        continue
+                    for arg in node.args:
+                        if isinstance(arg, ast.Name):
+                            torn_down.add(arg.id)
+                    for keyword in node.keywords:
+                        if isinstance(keyword.value, ast.Name):
+                            torn_down.add(keyword.value.id)
+    return sorted(f'{func_node.name}:{name}' for name in holder_names - torn_down)
+
+
 def test_every_real_subprocess_holder_teardown_uses_the_tree_killer():
     """Every spawn_verify_merge-bound holder's teardown goes through kill_holder_tree.
 
     Enumeration-free sweep of this module's own AST (see the banner above
     :func:`test_every_scaled_discovery_wait_is_covered_by_its_test_timeout_mark`).
     For every ``test_*`` function, collects the local names bound from a
-    bare ``X = spawn_verify_merge(...)`` call, then asserts that no ``try``
-    handler/finalbody in that function calls ``<holder>.kill()``,
-    ``<holder>.terminate()``, or ``os.kill``/``os.killpg`` (with a swept
-    holder name anywhere in the argument subtree) directly unless the SAME
-    body also calls ``kill_holder_tree`` -- any of those raw-kill spellings
-    SIGKILLs/terminates only the leader, orphaning any session-escaped
-    descendant (e.g. one of verify.py's ``start_new_session`` build
-    commands) for the rest of its natural life (task 4092).
+    bare ``X = spawn_verify_merge(...)`` call, then makes TWO independent
+    claims about every such holder:
+
+    (i) no ``try`` handler/finalbody in that function calls
+    ``<holder>.kill()``, ``<holder>.terminate()``, or ``os.kill``/
+    ``os.killpg`` (with a swept holder name anywhere in the argument
+    subtree) directly unless the SAME body also calls ``kill_holder_tree``
+    -- any of those raw-kill spellings SIGKILLs/terminates only the leader,
+    orphaning any session-escaped descendant (e.g. one of verify.py's
+    ``start_new_session`` build commands) for the rest of its natural life
+    (task 4092); and
+
+    (ii) every swept holder is passed to a ``kill_holder_tree(...)`` call
+    inside a ``try``'s ``finally``/``except`` body SOMEWHERE in that function
+    (:func:`_untorn_down_holders`) -- (i) only judges the quality of a
+    teardown that exists, so a holder with no exception-safe teardown
+    anywhere satisfies (i) vacuously; (ii) closes that silent-pass hole
+    (task 4946), including the narrower case of a ``kill_holder_tree`` call
+    that is textually present but reachable only along the happy path (e.g.
+    the last statement of a ``try`` body, never its ``finally``/``except``).
 
     Carries the sibling sweep's anti-vacuity discipline: a matcher that
     silently stops matching is a guard reporting PASS while guarding
@@ -1799,6 +1876,7 @@ def test_every_real_subprocess_holder_teardown_uses_the_tree_killer():
     tree = ast.parse(Path(__file__).read_text(encoding='utf-8'))
     swept: dict[str, set[str]] = {}
     offenders: list[str] = []
+    untorn: list[str] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
             continue
@@ -1809,6 +1887,7 @@ def test_every_real_subprocess_holder_teardown_uses_the_tree_killer():
             continue
         swept[node.name] = holder_names
         offenders.extend(_bare_kill_offenders(node, holder_names))
+        untorn.extend(_untorn_down_holders(node, holder_names))
 
     missing = sorted(_KNOWN_HOLDER_TEARDOWN_ROWS - set(swept))
     assert not missing, (
@@ -1823,6 +1902,190 @@ def test_every_real_subprocess_holder_teardown_uses_the_tree_killer():
         'so a session-escaped descendant (e.g. a verify.py '
         "start_new_session build command) survives the leader's own death "
         'as an orphan:\n  ' + '\n  '.join(offenders)
+    )
+
+    assert not untorn, (
+        'these spawn_verify_merge-bound holders are never passed to '
+        "kill_holder_tree from inside their test's try finally/except "
+        'bodies, so a raised communicate()/wait() timeout -- or any '
+        'failing assertion before the teardown -- leaks the leader AND '
+        'every session-escaped descendant verify.py started under it; a '
+        'holder with no exception-safe teardown must be a finding, not a '
+        'silent pass (the raw-kill sweep above only sees teardowns that '
+        'exist):\n  ' + '\n  '.join(untorn)
+    )
+
+
+def test_untorn_down_holders_flags_only_holders_never_passed_to_kill_holder_tree():
+    """_untorn_down_holders flags a swept holder iff it never reaches
+    kill_holder_tree from inside a try's finally/except body.
+
+    Deterministic AST-only cases (``ast.parse`` over a ``textwrap.dedent(...)``
+    source, zero subprocesses, zero timing).  ``holder_names`` is supplied
+    directly to each case, so this test pins ONLY the new helper, not
+    :func:`_spawn_verify_merge_bound_names`.
+
+    Case (d) is load-bearing: a matcher that merely asks "does this function
+    call kill_holder_tree anywhere?" would pass cases (a)-(c) AND vacuously
+    green Row 5 (which already calls ``kill_holder_tree(holder, ...)``) while
+    catching nothing -- (d) is the only case that kills that implementation,
+    because ``other``'s teardown must not excuse ``holder``'s absence.
+
+    Case (f) is equally load-bearing, for the finally/except requirement:
+    a matcher that credits a ``kill_holder_tree`` call reachable anywhere in
+    the function -- including the happy path, e.g. the last statement of a
+    ``try`` BODY -- would pass every other case here while still leaving a
+    holder unprotected against an earlier statement in that same body
+    raising before the call is reached.
+
+    Cases (g) and (h) pin two properties this helper's own docstring already
+    claims but that no case previously exercised: (g) that an indirect
+    argument (not a direct ``ast.Name``) is reported as a finding rather
+    than silently excused, and (h) that the whole-function scope credits a
+    teardown living in a completely different ``try`` from where the holder
+    was bound.
+    """
+
+    def parse_func(source: str) -> ast.FunctionDef:
+        tree = ast.parse(textwrap.dedent(source))
+        (func,) = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
+        return func
+
+    # (a) holder bound, no kill_holder_tree call at all.
+    func_a = parse_func("""
+        def f():
+            holder = spawn_verify_merge()
+    """)
+    assert _untorn_down_holders(func_a, {'holder'}) == ['f:holder'], (
+        'a holder with NO kill_holder_tree call anywhere in its function '
+        'must be flagged'
+    )
+
+    # (b) holder passed positionally in a finally:.
+    func_b = parse_func("""
+        def f():
+            holder = spawn_verify_merge()
+            try:
+                do_work()
+            finally:
+                kill_holder_tree(holder, timeout=5)
+    """)
+    assert _untorn_down_holders(func_b, {'holder'}) == [], (
+        'a holder passed positionally to kill_holder_tree in a finally: '
+        'must not be flagged'
+    )
+
+    # (c) holder passed inside a nested `if holder is not None:` guard
+    # within the finally: -- pins that the helper walks nested bodies; this
+    # is the exact shape step-5 uses for Row 5's `waiter`.
+    func_c = parse_func("""
+        def f():
+            holder = None
+            try:
+                holder = spawn_verify_merge()
+                do_work()
+            finally:
+                if holder is not None:
+                    kill_holder_tree(holder, timeout=5)
+    """)
+    assert _untorn_down_holders(func_c, {'holder'}) == [], (
+        'a holder passed to kill_holder_tree inside a nested if-guard '
+        'within the finally: must not be flagged -- the helper must walk '
+        'nested bodies'
+    )
+
+    # (d) ANTI-VACUITY (load-bearing, do not drop): two holders, only
+    # `other` passed to kill_holder_tree -- `holder` must still be flagged.
+    func_d = parse_func("""
+        def f():
+            holder = spawn_verify_merge()
+            other = spawn_verify_merge()
+            try:
+                do_work()
+            finally:
+                kill_holder_tree(other, timeout=5)
+    """)
+    assert _untorn_down_holders(func_d, {'holder', 'other'}) == ['f:holder'], (
+        "kill_holder_tree(other) must not excuse holder's absence -- a "
+        'matcher that merely checks "is kill_holder_tree called anywhere?" '
+        'would wrongly return [] here'
+    )
+
+    # (e) keyword spelling: kill_holder_tree's first parameter is named `proc`.
+    func_e = parse_func("""
+        def f():
+            holder = spawn_verify_merge()
+            try:
+                do_work()
+            finally:
+                kill_holder_tree(proc=holder, timeout=5)
+    """)
+    assert _untorn_down_holders(func_e, {'holder'}) == [], (
+        'a holder passed as the proc= keyword must not be flagged -- '
+        "kill_holder_tree's first parameter is named proc"
+    )
+
+    # (f) LOAD-BEARING for the finally/except requirement: kill_holder_tree
+    # is called with `holder`, but only as the last statement of the try
+    # BODY itself -- never inside a finally/except.  An earlier statement in
+    # that same try body raising would skip this call entirely, which is
+    # exactly the failure this whole check exists to catch, so it must
+    # still be flagged even though a kill_holder_tree(holder) call is
+    # textually present in the function.
+    func_f = parse_func("""
+        def f():
+            holder = spawn_verify_merge()
+            try:
+                do_work()
+                kill_holder_tree(holder, timeout=5)
+            except RuntimeError:
+                pass
+    """)
+    assert _untorn_down_holders(func_f, {'holder'}) == ['f:holder'], (
+        'a kill_holder_tree call reachable only along the happy path (the '
+        'last statement of a try BODY, not its finally/except) must still '
+        'be flagged -- an earlier statement in the same try body raising '
+        'would skip it entirely'
+    )
+
+    # (g) indirection defeats the matcher: kill_holder_tree(procs[0]) does
+    # not count as tearing down `holder`, even though `procs` holds it at
+    # runtime -- only a DIRECT ast.Name argument counts, so an indirection
+    # is reported as a finding rather than silently excused.
+    func_g = parse_func("""
+        def f():
+            holder = spawn_verify_merge()
+            procs = [holder]
+            try:
+                do_work()
+            finally:
+                kill_holder_tree(procs[0], timeout=5)
+    """)
+    assert _untorn_down_holders(func_g, {'holder'}) == ['f:holder'], (
+        'kill_holder_tree(procs[0]) is an indirection, not a direct '
+        'ast.Name argument -- it must not excuse holder, even though procs '
+        'holds it at runtime'
+    )
+
+    # (h) whole-function scope: holder is bound before one try and torn down
+    # in a COMPLETELY DIFFERENT, later try's finally -- unlike
+    # _bare_kill_offenders (which is per-try), this check must not flag it.
+    func_h = parse_func("""
+        def f():
+            holder = spawn_verify_merge()
+            try:
+                do_work()
+            except RuntimeError:
+                pass
+            try:
+                do_more_work()
+            finally:
+                kill_holder_tree(holder, timeout=5)
+    """)
+    assert _untorn_down_holders(func_h, {'holder'}) == [], (
+        'a holder torn down in a completely different try from where it '
+        'was bound is still torn down -- this check is scoped to the '
+        'whole function, not per-try'
     )
 
 
@@ -1890,14 +2153,22 @@ def test_wait_for_marker_stable_raises_when_never_settles(tmp_path):
 # Task 4014 -- deterministic unit coverage for wait_subtree_live's descendant
 # discovery poll (the "no descendant appeared within 20.0s" flake).  Every
 # test here injects the two private seams (_probe_children / _ppid_map) and
-# runs with interval=0, so there is ZERO real timing and ZERO real
-# subprocess -- the same task-2819 precedent as the wait_for_marker_stable
-# tests above.  Fixing a flake with a flake is the failure mode to avoid, and
-# the 3689 steward failed to reproduce this one in 19 of 19 attempts
-# (including synthetic pressure at load 100 / ~8000 processes), so a
-# load-based test would be non-deterministic in BOTH directions.  The
-# efficiency property that actually prevents sampling-rate collapse is
-# therefore pinned STRUCTURALLY, by call count, which is exact at any load.
+# runs with interval=0, so the POLL LOOP itself has ZERO real timing -- the
+# same task-2819 precedent as the wait_for_marker_stable tests above.
+# Fixing a flake with a flake is the failure mode to avoid, and the 3689
+# steward failed to reproduce this one in 19 of 19 attempts (including
+# synthetic pressure at load 100 / ~8000 processes), so a load-based test
+# would be non-deterministic in BOTH directions.  The efficiency property
+# that actually prevents sampling-rate collapse is therefore pinned
+# STRUCTURALLY, by call count, which is exact at any load.
+#
+# Deliberate, narrow exceptions to "zero real subprocess" (task 4312,
+# joining test_read_direct_children_sees_a_real_fork_including_off_main_thread
+# below): the two timeout-diagnostic tests spawn a real `proc` because the
+# diagnostic message's CONTENT -- the leader's actual returncode and, where
+# applicable, its stderr tail -- is exactly what is under test.  The poll
+# loop each one drives still runs zero ticks (timeout=0, interval=0), so
+# timing stays zero even there.
 # ---------------------------------------------------------------------------
 
 
@@ -2038,6 +2309,128 @@ def test_wait_subtree_live_falls_back_to_the_full_walk_when_children_unreadable(
         'a pid that does not exist must probe as None (cannot probe), not raise -- '
         'a leader exiting mid-poll must not turn the timeout path into an OSError'
     )
+
+
+def test_wait_subtree_live_timeout_reports_leader_returncode_and_stderr_tail():
+    """The timeout diagnostic names the LEADER's real rc and stderr tail (291a75a919).
+
+    291a75a919 ("De-flake alpha: make wait_subtree_live's timeout path
+    self-diagnosing") added the ``proc``/``proc_label`` reporting in the
+    timeout branch above (:func:`wait_subtree_live`, ~:582-603) so a
+    watchdog self-kill (rc == 1, no ``Error:`` line), an exception exit
+    (rc == 1 WITH an ``Error:`` line), and a merely slow leader (rc is
+    None) are distinguishable from the failure message alone -- exactly the
+    signal an incident needs. It shipped with no test (task 4312).
+
+    Deterministic per the task-4014 precedent above: ``_probe_children``
+    always reports no children and ``timeout=0`` so the poll body never
+    executes a single tick -- the timeout branch fires immediately, with
+    zero real timing.  What IS real is *proc*: an actually-spawned,
+    already-``wait()``-ed subprocess with a KNOWN returncode (3) and a
+    KNOWN stderr payload (``SENTINEL-XYZ``), so this pins the diagnostic's
+    CONTENT rather than merely the presence of the words "rc"/"stderr" --
+    the vacuous-guard trap this repo has hit before: a message reporting
+    nothing (e.g. ``rc=None; stderr tail:\n``) would also contain those
+    labels.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, '-c', 'import sys; sys.stderr.write("SENTINEL-XYZ\\n"); sys.exit(3)'],
+        stderr=subprocess.PIPE,
+    )
+    try:
+        proc.wait()
+        assert proc.returncode == 3  # sanity: the known rc actually landed
+
+        with pytest.raises(AssertionError) as exc_info:
+            wait_subtree_live(
+                1234,
+                proc=proc,
+                proc_label='leader',
+                timeout=0,
+                interval=0,
+                _probe_children=lambda _pid: set(),
+                _ppid_map=lambda: {},
+            )
+
+        message = str(exc_info.value)
+        assert 'leader rc=3' in message, (
+            f'expected the leader\'s actual returncode (3), reported under its '
+            f'proc_label, in the timeout message; got: {message!r}'
+        )
+        assert 'SENTINEL-XYZ' in message, (
+            f'expected the leader\'s actual stderr tail content in the timeout '
+            f'message; got: {message!r}'
+        )
+    finally:
+        if proc.stderr is not None:
+            with contextlib.suppress(OSError):
+                proc.stderr.close()
+
+
+def test_wait_subtree_live_timeout_reports_rc_none_and_omits_stderr_for_a_live_leader():
+    """The rc=None ("merely slow leader") taxonomy branch and its anti-hang guard (291a75a919).
+
+    Sibling of
+    :func:`test_wait_subtree_live_timeout_reports_leader_returncode_and_stderr_tail`
+    above, covering the two properties that rc=3 case cannot reach (task 4312
+    review):
+
+    * the ``rc is None`` taxonomy branch itself -- a leader that is merely
+      slow (still running when the poll gives up) is the case an incident is
+      most likely to actually hit, and it was entirely unpinned.
+    * the load-bearing guard :func:`wait_subtree_live`'s docstring calls out:
+      stderr is read ONLY when ``proc.poll()`` is not ``None``, precisely
+      because a LIVE leader's pipe write end can still be held open by an
+      inherited-fd helper it spawned, and a buffered read on that pipe would
+      block until EOF -- hanging this helper, and the rest of the suite,
+      rather than raising.  A regression that swapped the guarded
+      ``select()``-bounded raw read for an unconditional ``proc.stderr.read()``
+      would still pass every other test in this module while reintroducing
+      exactly that hang.
+
+    *proc* here is a real, still-running subprocess (``time.sleep(300)``, well
+    outside this test's own runtime) so ``proc.poll()`` is genuinely ``None``
+    -- checking that costs one non-blocking ``waitpid(WNOHANG)`` syscall, so
+    this stays zero real TIMING even though *proc* itself is real, same as
+    its rc=3 sibling.  ``stderr=PIPE`` is set (mirroring real call sites) so a
+    guard regression would hang on the open write end rather than raise
+    ``AttributeError`` on a ``None`` pipe, which would make this test pass for
+    the wrong reason.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, '-c', 'import time; time.sleep(300)'],
+        stderr=subprocess.PIPE,
+    )
+    try:
+        with pytest.raises(AssertionError) as exc_info:
+            wait_subtree_live(
+                1234,
+                proc=proc,
+                proc_label='leader',
+                timeout=0,
+                interval=0,
+                _probe_children=lambda _pid: set(),
+                _ppid_map=lambda: {},
+            )
+
+        message = str(exc_info.value)
+        assert 'leader rc=None' in message, (
+            f'expected the merely-slow-leader taxonomy branch (rc=None, '
+            f'reported under its proc_label) in the timeout message; got: '
+            f'{message!r}'
+        )
+        assert 'stderr tail' not in message, (
+            f'stderr must be read ONLY when proc.poll() is not None -- seeing '
+            f'"stderr tail" here means the anti-hang poll()-gate regressed to '
+            f'an unconditional read, which would hang on a live leader whose '
+            f'pipe write end is still open; got: {message!r}'
+        )
+    finally:
+        proc.kill()
+        proc.wait()
+        if proc.stderr is not None:
+            with contextlib.suppress(OSError):
+                proc.stderr.close()
 
 
 #: A child that stays alive but is never waited on -- killed by the test that
@@ -2698,6 +3091,14 @@ def test_kill_holder_tree_is_safe_when_the_leader_already_exited():
 #: Marker token the instrumented bootstrap prints, one line per gate acquire.
 FLOCK_GATE_MARKER = '__FLOCK_GATE__'
 
+#: printf-style line format shared between the bootstrap's child-side print
+#: (embedded below via f-string substitution) and the parser self-test's
+#: synthetic ``emitted`` fixture, mirroring WATCHDOG_GATE_LINE_FMT (amendment
+#: pass) so a field rename is a rename in both places rather than two
+#: hand-written copies that can silently drift apart -- see
+#: test_flock_gate_timing_bootstrap_parses_its_own_marker_lines.
+FLOCK_GATE_LINE_FMT = f'{FLOCK_GATE_MARKER} lock=%s timeout=%r waited=%.4f acquired=%r'
+
 FLOCK_GATE_TIMING_BOOTSTRAP = f"""
 import sys, time
 import orchestrator.cli as _cli
@@ -2708,7 +3109,7 @@ def _timed_acquire(path, timeout_secs, **kwargs):
     _t0 = time.monotonic()
     fd = _real_acquire(path, timeout_secs, **kwargs)
     print(
-        '{FLOCK_GATE_MARKER} lock=%s timeout=%r waited=%.4f acquired=%r'
+        '{FLOCK_GATE_LINE_FMT}'
         % (path.name, timeout_secs, time.monotonic() - _t0, fd is not None),
         file=sys.stderr,
     )
@@ -2729,24 +3130,83 @@ class FlockGateWait(NamedTuple):
     acquired: bool
 
 
+#: Task 5019 (amendment): ``waited`` is bounded to the exact shape its
+#: ``%.4f`` format specifier always produces -- a run of digits, a dot, and
+#: exactly 4 fraction digits, with no exponent notation possible regardless
+#: of magnitude -- mirroring the fix to _WATCHDOG_GATE_RE.  ``timeout``
+#: stays ``\S+``: it is emitted via ``%r`` of a float, whose repr switches
+#: to exponent notation outside [1e-4, 1e16) and can render ``inf``/``nan``,
+#: none of which a digit-shaped group would accept -- and unlike a TRAILING
+#: field, ``timeout`` is an INTERIOR field already delimited by the literal
+#: ``' waited='`` that follows it, so (like ``lock``, delimited by
+#: ``' timeout='``) it was never reachable by the trailing-abutment defect
+#: this task fixes; tightening it would only add a false-negative risk with
+#: no corresponding safety gain.  ``acquired`` stays anchored to the literal
+#: ``True|False`` alternation.
 _FLOCK_GATE_RE = re.compile(
     re.escape(FLOCK_GATE_MARKER)
     + r' lock=(?P<lock>\S+) timeout=(?P<timeout>\S+) '
-    r'waited=(?P<waited>\S+) acquired=(?P<acquired>True|False)'
+    r'waited=(?P<waited>-?\d+\.\d{4}) acquired=(?P<acquired>True|False)'
+)
+
+
+#: Task 5019 (amendment; tempered per step-4): matches just the marker plus
+#: the rest of its line, tempered -- via the negative lookahead below -- to
+#: stop at the next marker occurrence instead of running unbounded to
+#: end-of-line, so :func:`parse_flock_gate_waits` can tell apart THREE cases
+#: rather than two: (1) "marker present but its fields don't conform" (a
+#: genuine corruption -- must fail loudly); (2) "marker's fields matched,
+#: followed by an abutting co-writer's text" (tolerated: _FLOCK_GATE_RE's
+#: bounded groups plus ``.match()`` not requiring end-of-line already handle
+#: it); and (3) "marker's fields matched, followed immediately by a SECOND
+#: marker record with no separating newline" (also tolerated, but only
+#: because tempering stops the region before it can swallow the second
+#: marker's text). An earlier, unbounded ``[^\n]*`` version of this regex
+#: handled (1) and (2) but silently mishandled (3): it swallowed both
+#: abutted records into a single finditer hit, so only the first record's
+#: fields were ever offered to _FLOCK_GATE_RE and the second vanished
+#: without a trace instead of being scanned on its own -- see
+#: test_parse_flock_gate_waits_recovers_both_abutted_marker_records.
+_FLOCK_GATE_LINE_RE = re.compile(
+    re.escape(FLOCK_GATE_MARKER) + r'(?:(?!' + re.escape(FLOCK_GATE_MARKER) + r')[^\n])*'
 )
 
 
 def parse_flock_gate_waits(stderr: str) -> list[FlockGateWait]:
-    """Parse the :data:`FLOCK_GATE_TIMING_BOOTSTRAP` lines out of a child's stderr."""
-    return [
-        FlockGateWait(
-            lock=m.group('lock'),
-            timeout_secs=float(m.group('timeout')),
-            waited_secs=float(m.group('waited')),
-            acquired=m.group('acquired') == 'True',
+    """Parse the :data:`FLOCK_GATE_TIMING_BOOTSTRAP` lines out of a child's stderr.
+
+    Every marker occurrence must have its fields conform to
+    :data:`_FLOCK_GATE_RE` -- a marker line whose fields don't parse raises
+    ``ValueError`` instead of being silently dropped, so a partial
+    corruption can't quietly lower the ``max()`` the ceiling assertions in
+    this module are computed over (task 5019 amendment; mirrors
+    :func:`parse_watchdog_gate_fire_delays`). That guarantee depends on
+    :data:`_FLOCK_GATE_LINE_RE` tempering its line region to stop at the
+    next marker occurrence (task 5019 step-4): an earlier, unbounded version
+    of that regex made the claim true only for non-marker trailing
+    corruption -- a SECOND marker record abutting the first with no
+    separating newline was swallowed into the first's line region and its
+    fields were never even offered to :data:`_FLOCK_GATE_RE`, so it vanished
+    silently instead of raising.
+    """
+    waits = []
+    for line_match in _FLOCK_GATE_LINE_RE.finditer(stderr):
+        line = line_match.group(0)
+        m = _FLOCK_GATE_RE.match(line)
+        if m is None:
+            raise ValueError(
+                'flock gate marker line does not match the expected '
+                f'lock=/timeout=/waited=/acquired= field shape: {line!r}'
+            )
+        waits.append(
+            FlockGateWait(
+                lock=m.group('lock'),
+                timeout_secs=float(m.group('timeout')),
+                waited_secs=float(m.group('waited')),
+                acquired=m.group('acquired') == 'True',
+            )
         )
-        for m in _FLOCK_GATE_RE.finditer(stderr)
-    ]
+    return waits
 
 
 def test_flock_gate_timing_bootstrap_parses_its_own_marker_lines():
@@ -2758,13 +3218,18 @@ def test_flock_gate_timing_bootstrap_parses_its_own_marker_lines():
     test_flock_wait_env_override_speeds_up_contention_result vacuous rather
     than red.  The emit format and this parser are therefore pinned together
     here, with no subprocess involved.
+
+    ``emitted`` is built from FLOCK_GATE_LINE_FMT (amendment-pass fix,
+    mirroring test_watchdog_gate_timing_bootstrap_parses_its_own_marker_lines)
+    -- the SAME format string the bootstrap embeds into the child -- rather
+    than a hand-copied literal, so a field rename in the bootstrap breaks
+    this round-trip by construction instead of relying on two copies staying
+    in sync by discipline.
     """
     emitted = (
-        f'{FLOCK_GATE_MARKER} lock=_merge-verify.lock timeout=0.5 '
-        'waited=0.0001 acquired=True\n'
+        f'{FLOCK_GATE_LINE_FMT % ("_merge-verify.lock", 0.5, 0.0001, True)}\n'
         'some unrelated stderr chatter\n'
-        f'{FLOCK_GATE_MARKER} lock=.merge_verify.lock timeout=0.5 '
-        'waited=0.5083 acquired=False\n'
+        f'{FLOCK_GATE_LINE_FMT % (".merge_verify.lock", 0.5, 0.5083, False)}\n'
     )
 
     waits = parse_flock_gate_waits(emitted)
@@ -2785,6 +3250,80 @@ def test_parse_flock_gate_waits_returns_empty_for_uninstrumented_stderr():
     an empty list would pass by default.
     """
     assert parse_flock_gate_waits('Traceback (most recent call last):\nboom\n') == []
+
+
+def test_parse_flock_gate_waits_survives_abutting_log_line():
+    """An unrelated co-writer's stderr line landing with no separator must
+    not corrupt the parse.
+
+    Task 5019 amendment -- symmetric coverage for the flock twin of
+    test_parse_watchdog_gate_fire_delays_survives_abutting_log_line.  Unlike
+    the watchdog twin, the flock line's true last field (``acquired``) is
+    already anchored to the ``True|False`` literal alternation, so an
+    abutting line was never able to corrupt it via the exact mechanism
+    observed in production for the watchdog twin (see the _FLOCK_GATE_RE
+    docstring above) -- this test pins that already-correct behaviour so a
+    future regex change can't silently break it.
+    """
+    corrupted = (
+        f'{FLOCK_GATE_MARKER} lock=_merge-verify.lock timeout=0.5 '
+        'waited=0.5083 acquired=True'
+        '2026-09-01T00:00:00Z some unrelated interleaved log line\n'
+    )
+
+    assert parse_flock_gate_waits(corrupted) == [
+        FlockGateWait('_merge-verify.lock', 0.5, 0.5083, True),
+    ]
+
+
+def test_parse_flock_gate_waits_raises_loudly_on_malformed_marker_line():
+    """A marker line whose fields don't conform must raise, not vanish.
+
+    Task 5019 amendment -- symmetric coverage for the flock twin of
+    test_parse_watchdog_gate_fire_delays_raises_loudly_on_malformed_marker_line.
+    Silently dropping a genuinely-malformed marker line would quietly lower
+    the max() the ceiling assertion in
+    test_flock_wait_env_override_speeds_up_contention_result is computed
+    over instead of surfacing the corruption.
+    """
+    malformed = (
+        f'{FLOCK_GATE_MARKER} lock=_merge-verify.lock timeout=0.5 '
+        'waited=NOT_A_NUMBER acquired=True\n'
+    )
+
+    with pytest.raises(ValueError, match=re.escape(FLOCK_GATE_MARKER)):
+        parse_flock_gate_waits(malformed)
+
+
+def test_parse_flock_gate_waits_recovers_both_abutted_marker_records():
+    """Two marker records landing back-to-back with no separator must both
+    survive the parse.
+
+    Task 5019 step-3 -- the marker-to-marker analogue of
+    test_parse_flock_gate_waits_survives_abutting_log_line's marker-to-log
+    abutment: the same shared stderr fd that lets an unrelated co-writer's
+    text land immediately after a marker's trailing field can just as well
+    let a SECOND marker record land there instead, with no intervening
+    newline. _FLOCK_GATE_LINE_RE's unbounded ``[^\n]*`` line region greedily
+    swallows the whole physical line -- including the second marker's text
+    -- as one hit, so ``_FLOCK_GATE_RE.match()`` only ever sees (and
+    returns) the FIRST record, and the second is silently dropped because
+    finditer never revisits text its first match already consumed. Built
+    from FLOCK_GATE_LINE_FMT (not hand-copied literals) so a field rename
+    breaks this round-trip by construction.
+    """
+    abutted = (
+        f'{FLOCK_GATE_LINE_FMT % ("a", 0.5, 0.0001, True)}'
+        f'{FLOCK_GATE_LINE_FMT % ("b", 0.5, 9.9999, False)}\n'
+    )
+
+    waits = parse_flock_gate_waits(abutted)
+
+    assert len(waits) == 2
+    # The larger wait sits on the SECOND (currently-dropped) record -- if it
+    # silently vanishes, the ceiling assertions this parser feeds would be
+    # computed over a falsely-low max() instead of surfacing the corruption.
+    assert max(w.waited_secs for w in waits) == 9.9999
 
 
 # ---------------------------------------------------------------------------
@@ -2962,21 +3501,75 @@ class WatchdogGateFire(NamedTuple):
     grace_secs: float
 
 
+#: Task 5019: the fraction groups are bounded to exactly 4 digits (rather
+#: than an unbounded ``\S+``) because WATCHDOG_GATE_LINE_FMT's ``%.4f``
+#: always renders exactly 4 fraction digits, and the child's stderr fd is
+#: shared with unrelated writers -- an interleaved log line landing with no
+#: separator right after the trailing field (observed in production,
+#: mr-ccc80440: 'grace=0.2023' + '2026-09-01...' collapsing into
+#: '0.20232026-09-01') must not be absorbed into the match.
 _WATCHDOG_GATE_RE = re.compile(
     re.escape(WATCHDOG_GATE_MARKER)
-    + r' fire_delay=(?P<fire_delay>\S+) grace=(?P<grace>\S+)'
+    + r' fire_delay=(?P<fire_delay>-?\d+\.\d{4}) grace=(?P<grace>-?\d+\.\d{4})'
+)
+
+#: Task 5019 (amendment; tempered per step-4): matches just the marker plus
+#: the rest of its line, tempered -- via the negative lookahead below -- to
+#: stop at the next marker occurrence instead of running unbounded to
+#: end-of-line, so :func:`parse_watchdog_gate_fire_delays` can tell apart
+#: THREE cases rather than two: (1) "marker present but its fields don't
+#: conform" (a genuine corruption -- must fail loudly); (2) "marker's
+#: fields matched, followed by an abutting co-writer's text" (the exact
+#: production defect this task fixes, tolerated because ``.match()``
+#: doesn't require end-of-line -- see
+#: test_parse_watchdog_gate_fire_delays_survives_abutting_log_line); and
+#: (3) "marker's fields matched, followed immediately by a SECOND marker
+#: record with no separating newline" (also tolerated, but only because
+#: tempering stops the region before it can swallow the second marker's
+#: text). An earlier, unbounded ``[^\n]*`` version of this regex handled
+#: (1) and (2) but silently mishandled (3): it swallowed both abutted
+#: records into a single finditer hit, so only the first record's fields
+#: were ever offered to _WATCHDOG_GATE_RE and the second vanished without a
+#: trace instead of being scanned on its own -- see
+#: test_parse_watchdog_gate_fire_delays_recovers_both_abutted_marker_records.
+_WATCHDOG_GATE_LINE_RE = re.compile(
+    re.escape(WATCHDOG_GATE_MARKER) + r'(?:(?!' + re.escape(WATCHDOG_GATE_MARKER) + r')[^\n])*'
 )
 
 
 def parse_watchdog_gate_fire_delays(stderr: str) -> list[WatchdogGateFire]:
-    """Parse the :data:`WATCHDOG_GATE_TIMING_BOOTSTRAP` lines out of a child's stderr."""
-    return [
-        WatchdogGateFire(
-            fire_delay_secs=float(m.group('fire_delay')),
-            grace_secs=float(m.group('grace')),
+    """Parse the :data:`WATCHDOG_GATE_TIMING_BOOTSTRAP` lines out of a child's stderr.
+
+    Every marker occurrence must have its fields conform to
+    :data:`_WATCHDOG_GATE_RE` -- a marker line whose fields don't parse
+    raises ``ValueError`` instead of being silently dropped, so a partial
+    corruption can't quietly lower the ``max()`` the ceiling assertions in
+    this module are computed over (task 5019 amendment; mirrors
+    :func:`parse_flock_gate_waits`). That guarantee depends on
+    :data:`_WATCHDOG_GATE_LINE_RE` tempering its line region to stop at the
+    next marker occurrence (task 5019 step-4): an earlier, unbounded version
+    of that regex made the claim true only for non-marker trailing
+    corruption -- a SECOND marker record abutting the first with no
+    separating newline was swallowed into the first's line region and its
+    fields were never even offered to :data:`_WATCHDOG_GATE_RE`, so it
+    vanished silently instead of raising.
+    """
+    fires = []
+    for line_match in _WATCHDOG_GATE_LINE_RE.finditer(stderr):
+        line = line_match.group(0)
+        m = _WATCHDOG_GATE_RE.match(line)
+        if m is None:
+            raise ValueError(
+                'watchdog gate marker line does not match the expected '
+                f'fire_delay=/grace= field shape: {line!r}'
+            )
+        fires.append(
+            WatchdogGateFire(
+                fire_delay_secs=float(m.group('fire_delay')),
+                grace_secs=float(m.group('grace')),
+            )
         )
-        for m in _WATCHDOG_GATE_RE.finditer(stderr)
-    ]
+    return fires
 
 
 def test_watchdog_gate_timing_bootstrap_parses_its_own_marker_lines():
@@ -3017,6 +3610,85 @@ def test_parse_watchdog_gate_fire_delays_returns_empty_for_uninstrumented_stderr
     an empty list would pass by default.
     """
     assert parse_watchdog_gate_fire_delays('Traceback (most recent call last):\nboom\n') == []
+
+
+def test_parse_watchdog_gate_fire_delays_survives_abutting_log_line():
+    """An unrelated co-writer's stderr line landing with no separator must
+    not corrupt the parse.
+
+    Task 5019 -- observed in production (mr-ccc80440, task 4537's post-merge
+    verify): the child's stderr fd is shared with anything else that writes
+    to it, and under merge-verify load a timestamped log line landed
+    immediately after the marker line's trailing ``grace=`` field with no
+    intervening whitespace or newline, collapsing the real value (0.2023)
+    and a '2026-09-01...' timestamp into one unbroken token,
+    '0.20232026-09-01'. The old ``\\S+`` field regex swallowed that whole
+    token and ``float()`` raised inside the parser, which the merge worker
+    then mis-dispositioned as "branch_bug" against a branch that never
+    touched this test.
+
+    The fix bounds the numeric groups to the exact shape
+    WATCHDOG_GATE_LINE_FMT's ``%.4f`` can produce -- a run of digits, a dot,
+    and exactly 4 fraction digits -- so an abutting line's digits cannot be
+    absorbed into the match. This test reproduces the exact corrupted shape
+    and must fail against the unbounded ``\\S+`` regex (raises ValueError)
+    and pass once the fraction groups are bounded.
+    """
+    corrupted = (
+        f'{WATCHDOG_GATE_MARKER} fire_delay=0.6931 grace=0.2023'
+        '2026-09-01T00:00:00Z some unrelated interleaved log line\n'
+    )
+
+    assert parse_watchdog_gate_fire_delays(corrupted) == [
+        WatchdogGateFire(fire_delay_secs=0.6931, grace_secs=0.2023),
+    ]
+
+
+def test_parse_watchdog_gate_fire_delays_raises_loudly_on_malformed_marker_line():
+    """A marker line whose fields don't conform must raise, not vanish.
+
+    Task 5019 amendment: bounding the field groups (to reject anything that
+    doesn't match WATCHDOG_GATE_LINE_FMT's exact shape) means a
+    genuinely-malformed marker line -- as opposed to one merely followed by
+    abutting unrelated text, which the abutment test above proves is still
+    tolerated -- no longer matches _WATCHDOG_GATE_RE at all. Silently
+    dropping such a line from the returned list would quietly lower the
+    max() the ceiling assertion in
+    test_watchdog_timeout_env_override_fires_fast_without_heartbeat is
+    computed over instead of surfacing the corruption, cutting against the
+    repo's no-silent-fail-soft / structured-facts-at-failure invariant.
+    """
+    malformed = f'{WATCHDOG_GATE_MARKER} fire_delay=NOT_A_NUMBER grace=0.2023\n'
+
+    with pytest.raises(ValueError, match=re.escape(WATCHDOG_GATE_MARKER)):
+        parse_watchdog_gate_fire_delays(malformed)
+
+
+def test_parse_watchdog_gate_fire_delays_recovers_both_abutted_marker_records():
+    """Two marker records landing back-to-back with no separator must both
+    survive the parse.
+
+    Task 5019 step-3 -- twin of
+    test_parse_flock_gate_waits_recovers_both_abutted_marker_records; see
+    that test's docstring for the mechanism
+    (_WATCHDOG_GATE_LINE_RE's unbounded ``[^\n]*`` swallows the second
+    marker's text into the first's line region, so finditer never revisits
+    it and the second record is silently dropped). Built from
+    WATCHDOG_GATE_LINE_FMT (not hand-copied literals) so a field rename
+    breaks this round-trip by construction.
+    """
+    abutted = (
+        f'{WATCHDOG_GATE_LINE_FMT % (0.6931, 0.2003)}'
+        f'{WATCHDOG_GATE_LINE_FMT % (14.9807, 5.0012)}\n'
+    )
+
+    fires = parse_watchdog_gate_fire_delays(abutted)
+
+    assert len(fires) == 2
+    # The larger fire_delay sits on the SECOND (currently-dropped) record --
+    # if it silently vanishes, the ceiling assertion this parser feeds would
+    # be computed over a falsely-low max() instead of surfacing corruption.
+    assert max(f.fire_delay_secs for f in fires) == 14.9807
 
 
 # ---------------------------------------------------------------------------
@@ -3096,7 +3768,17 @@ def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
         # subprocess completion past a short deadline; the discriminating
         # invariant is the FLOCK_WAIT_CEILING_SECS assertion below (task
         # 3369), never this ceiling, which only bounds a wedged child.
-        stdout, stderr = proc.communicate(timeout=60)
+        try:
+            stdout, stderr = proc.communicate(timeout=60)
+        finally:
+            # task 4092/4946: kill_holder_tree so a communicate() timeout
+            # here does not leak the child leader -- and any
+            # start_new_session build command verify.py spawned under it --
+            # while we still hold the flock; a child killed before the
+            # unlock below can never win the lock and proceed.  Free on the
+            # success path: communicate() has already reaped the child, so
+            # the ALREADY-REAPED SHORT CIRCUIT returns at once.
+            kill_holder_tree(proc, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
     finally:
         with contextlib.suppress(OSError):
             fcntl.flock(held_fd, fcntl.LOCK_UN)
@@ -3147,8 +3829,10 @@ def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
 #: catch either override being wired while the OTHER silently regresses to
 #: its production default, e.g. only ORCH_WATCHDOG_KILL_GRACE_SECS stops
 #: being threaded through (0.5s override + 5.0s production grace = ~5.5s) or
-#: only ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS does (10.0s production timeout
-#: + 0.2s override = ~10.2s). 4.0s sits comfortably under the nearer of
+#: only ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS does (90.0s production timeout
+#: + 0.2s override = ~90.2s; it was ~10.2s before task 4195 derived that
+#: constant from the ssh transport, so this axis has only got easier to
+#: discriminate). 4.0s sits comfortably under the nearer of
 #: those two partial-regression cases (5.5s) with room to spare above the
 #: fully-wired case (~0.7s: 0.5s heartbeat timeout + 0.2s kill grace) even
 #: under load, so it discriminates all three broken shapes from the
@@ -3185,7 +3869,8 @@ def test_watchdog_timeout_env_override_fires_fast_without_heartbeat(tmp_path):
     pgid-file wait would leave the remaining wait purely watchdog-bound.
     Task 4248's verify attempt-1 falsified that: under a full-suite xdist
     storm the outer fire_delay came in at 19.75s -- past even the 15.0s
-    production un-wired-override window -- while an isolated rerun at the
+    un-wired-override window production had at the time (90.0s+5.0s since
+    task 4195) -- while an isolated rerun at the
     same HEAD passed in 6.51s. The outer measurement was never purely the
     watchdog's own window: it also carries scheduler latency between the
     watchdog thread actually firing and this PARENT process observing
@@ -3199,9 +3884,10 @@ def test_watchdog_timeout_env_override_fires_fast_without_heartbeat(tmp_path):
     real env, a real watchdog thread racing a real select() on fd 0, real
     SIGTERM/SIGKILL signaling. The bootstrap only wraps the production
     ``start_stdin_watchdog``/``fire_watchdog_kill`` callables in a stopwatch,
-    so an un-wired override still shows up as a ~15s delay (10.0s heartbeat
-    timeout + 5.0s kill grace) -- see WATCHDOG_FIRE_DELAY_CEILING_SECS for
-    the exact discriminant, including the two partial-regression shapes.
+    so an un-wired override still shows up as a ~95s delay (90.0s heartbeat
+    timeout + 5.0s kill grace; it was ~15s before task 4195 derived the
+    timeout from the ssh transport) -- see WATCHDOG_FIRE_DELAY_CEILING_SECS
+    for the exact discriminant, including the two partial-regression shapes.
     Its two failure modes are both closed by non-vacuity assertions below:
     the CLI reaching the watchdog/kill by some path other than the patched
     module-level names (leaving zero observations and a vacuously-true
@@ -3342,7 +4028,7 @@ def test_watchdog_timeout_env_override_fires_fast_without_heartbeat(tmp_path):
     assert longest < WATCHDOG_FIRE_DELAY_CEILING_SECS, (
         f'expected the CLI-measured watchdog delay (heartbeat wait + kill '
         f'grace, excluding fire_watchdog_kill\'s /proc walks) to be well '
-        f'under the 15s production window (10s heartbeat timeout + 5s kill '
+        f'under the 95s production window (90s heartbeat timeout + 5s kill '
         f'grace) given the '
         f'{WATCHDOG_HEARTBEAT_OVERRIDE_SECS}s+{WATCHDOG_KILL_GRACE_OVERRIDE_SECS}s '
         f'env overrides -- longest={longest:.2f}s over {len(fires)} fire(s): '
@@ -3533,7 +4219,7 @@ def test_cancel_verify_tree_kills_under_live_watchdog(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.timeout(ROW_PER_TEST_TIMEOUT_SECS)  # task 4025: production 10s+5s watchdog window + real subprocesses under full-suite load
+@pytest.mark.timeout(ROW_PER_TEST_TIMEOUT_SECS)  # task 4025: pinned 10s+5s fast window (production is 90s+5s) + real subprocesses under full-suite load
 def test_orchestrator_killed_mid_build_tree_killed_via_eof(tmp_path):
     """SS9 Row 1: dispatcher process killed -> child sees stdin EOF -> tree-killed.
 
@@ -3547,9 +4233,9 @@ def test_orchestrator_killed_mid_build_tree_killed_via_eof(tmp_path):
 
     ROW_WATCHDOG_ENV is threaded through the dispatcher's own environment
     (:func:`spawn_ssh_heartbeat_dispatcher`'s *extra_env*, ambiently inherited
-    by the grandchild verify-merge) -- the pinned 10s+5s production-equivalent
-    window, not a fast one; see ROW_WATCHDOG_ENV's comment above for the pin
-    rationale.  Per ``run_stdin_watchdog``, EOF fires on the very next
+    by the grandchild verify-merge) -- the pinned 10s+5s window, deliberately
+    NOT production's own (90s+5s since task 4195); see ROW_WATCHDOG_ENV's
+    comment above for the pin rationale.  Per ``run_stdin_watchdog``, EOF fires on the very next
     ``select`` readiness check regardless of *heartbeat_timeout* -- only
     ``grace_secs`` (the SIGTERM->SIGKILL pause in ``fire_watchdog_kill``)
     materially bounds this row's timing (~5s, measured ~7.3s end-to-end).
@@ -3607,7 +4293,7 @@ def test_orchestrator_killed_mid_build_tree_killed_via_eof(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.timeout(ROW_PER_TEST_TIMEOUT_SECS)  # task 4025: production 10s+5s watchdog window + real subprocesses under full-suite load
+@pytest.mark.timeout(ROW_PER_TEST_TIMEOUT_SECS)  # task 4025: pinned 10s+5s fast window (production is 90s+5s) + real subprocesses under full-suite load
 def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
     """SS9 Row 2: ssh channel closes but the dispatcher stays alive -> EOF tree-kill.
 
@@ -3622,11 +4308,11 @@ def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
 
     Uses ROW_WATCHDOG_ENV directly on the spawned verify-merge (already an
     in-process dispatcher, so no extra remove is needed, unlike Row 1's
-    separate-process case) -- the pinned 10s+5s production-equivalent
-    window.  Row 2 is an EOF row like Row 1, not a timeout row:
-    ``close_stdin()`` closes the write end, so only ``grace_secs`` bounds it
-    (~5s, measured ~6.7s end-to-end), NOT the ~15s a reader might assume
-    from the heartbeat timeout.
+    separate-process case) -- the pinned 10s+5s window, deliberately NOT
+    production's own (90s+5s since task 4195).  Row 2 is an EOF row like Row
+    1, not a timeout row: ``close_stdin()`` closes the write end, so only
+    ``grace_secs`` bounds it (~5s, measured ~6.7s end-to-end), NOT the ~15s a
+    reader might assume from the pinned heartbeat timeout.
 
     Asserts within a bounded T: the full descendant subtree AND the pgid
     leader are gone, and the verify-merge process itself self-exits non-zero
@@ -3691,7 +4377,7 @@ def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.timeout(ROW_PER_TEST_TIMEOUT_SECS)  # task 4025: production 10s+5s watchdog window + real subprocesses under full-suite load
+@pytest.mark.timeout(ROW_PER_TEST_TIMEOUT_SECS)  # task 4025: pinned 10s+5s fast window (production is 90s+5s) + real subprocesses under full-suite load
 def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
     """SS9 Row 3: heartbeat starved, stdin stays OPEN -> select-timeout tree-kill.
 
@@ -3704,11 +4390,11 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
     ready set) rather than seeing EOF, taking the branch that calls
     ``on_fire`` directly without ever attempting a read.
 
-    Uses ROW_WATCHDOG_ENV -- the pinned production-equivalent window
-    (10.0s heartbeat timeout + 5.0s kill grace) -- directly on the spawned
-    verify-merge, so the assertion window here is ~15s, not fast; see
-    ROW_WATCHDOG_ENV's comment above for the pin rationale and the honest
-    cliff-moved caveat.
+    Uses ROW_WATCHDOG_ENV -- the pinned fast window (10.0s heartbeat timeout
+    + 5.0s kill grace; production is 90.0s+5.0s since task 4195, injected down
+    to this) -- directly on the spawned verify-merge, so the assertion window
+    here is ~15s rather than production's ~95s; see ROW_WATCHDOG_ENV's comment
+    above for the pin rationale and the honest cliff-moved caveat.
 
     Asserts the leader self-exits non-zero and, after reaping it (same
     zombie-avoidance ordering as Row 2 -- ``child`` is again a direct child
@@ -3821,12 +4507,19 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
     # task 3318: --request-id arms the holder's stdin watchdog (see
     # spawn_verify_merge docstring), but unlike Row 3 this holder was never
     # given a live HeartbeatWriter -- it self-killed at
-    # ~(WATCHDOG_HEARTBEAT_TIMEOUT_SECS + WATCHDOG_KILL_GRACE_SECS) = ~15-17s
+    # ~(WATCHDOG_HEARTBEAT_TIMEOUT_SECS + WATCHDOG_KILL_GRACE_SECS), measured
+    # ~15-17s back when those summed to 15.0 (task 4195 has since derived the
+    # timeout from the ssh transport, so an unpaired holder would now last
+    # ~95s -- this holder gets no ROW_WATCHDOG_ENV)
     # instead of surviving the full 300s sleeper_spec, well inside the
     # waiter's own budget under full-suite xdist load (Python import alone
     # ~9s). Pair it with a live heartbeat, mirroring Row 3, so it survives
     # for the whole span the test needs it.
     heartbeat_holder = HeartbeatWriter(holder, interval=0.2).start()
+    # task 4946: bound before the try so the finally below can tear it down
+    # even if wait_for_pgid_file/wait_subtree_live/wait_for_marker_stable
+    # raises before the waiter is ever spawned.
+    waiter = None
     try:
         holder_pgid_val = wait_for_pgid_file(pgf_holder)
         wait_subtree_live(holder_pgid_val, proc=holder)
@@ -3892,6 +4585,14 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
         )
     finally:
         heartbeat_holder.stop_heartbeats()
+        # task 4946: a TimeoutExpired from waiter.communicate() above, or
+        # any of the six assertions before this finally failing, previously
+        # left the waiter leader -- and its session-escaped descendants --
+        # alive.  Tear the waiter down BEFORE the holder: it is the process
+        # contending for the lock the holder owns.  Free on the success
+        # path via kill_holder_tree's already-reaped short circuit.
+        if waiter is not None:
+            kill_holder_tree(waiter, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
         kill_holder_tree(holder, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
 
     # --- Consumer side: feed #2's real discriminant through the real beta

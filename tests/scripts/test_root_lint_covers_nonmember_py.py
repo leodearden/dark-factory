@@ -210,7 +210,10 @@ def _ruff_targets(cmd: str) -> list[str]:
 
     Returns whole path TOKENS. Callers must compare against them by exact
     element and never substring-match the raw command — the documented contract
-    on ``_lint_leg_targets`` in ``test_fallback_verify_config.py``.
+    on ``tests/scripts/verify_command_invariants.py::positional_targets``, which
+    since task 3883 is the canonical home for it. (It was previously cited here
+    as ``_lint_leg_targets`` in ``test_fallback_verify_config.py``; that helper
+    now delegates to the shared parser rather than implementing the rule.)
 
     MEASURED at base ``1f83dbed15``, so the rule is not hypothetical:
     ``'shared' in cmd`` is ALREADY TRUE via the ``check_bare_magicmock_config.py``

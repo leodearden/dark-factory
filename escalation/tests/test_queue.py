@@ -17,6 +17,7 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+from _scan_race_helpers import relocating_read_text, unreadable_read_text
 
 from escalation.classify import effective_benign
 from escalation.models import Escalation
@@ -25,9 +26,12 @@ from escalation.queue import (
     _MAX_AMENDMENT_LINE_CHARS,
     _MAX_AMENDMENT_OPTIONS,
     _MAX_AMENDMENTS,
+    _MAX_LATE_RESOLUTION_CHARS,
+    _MAX_LATE_RESOLUTIONS,
     _MAX_ROOT_CAUSE_VARIANTS,
     AmendmentOutcome,
     EscalationQueue,
+    ResolveOutcome,
     iter_all_escalation_paths,
 )
 
@@ -638,6 +642,82 @@ class TestGetWithDuplicateArchiveCandidates:
         )
         assert any('esc-1-1' in r.message for r in warning_records), (
             f'Expected a WARNING mentioning esc-1-1; got: {[r.message for r in warning_records]}'
+        )
+
+
+class TestGetByTaskFindsRecordsWhoseStemDoesNotEncodeTaskId:
+    """get_by_task must find a record whose FILENAME does not encode its task_id.
+
+    WHY THIS EXISTS — do not "optimise" it away.  ``make_id``'s argument is an
+    id-NAMESPACE key, not a task_id: it names the durable counter ``esc-{key}.seq``
+    and the id stem ``esc-{key}-{n}``, and nothing more.  Five production sites
+    diverge deliberately — ``curator_escalator.py`` x3 (``make_id('curator')``
+    with ``task_id='task-curator'``) and ``ticket_janitor.py`` x2
+    (``make_id('ticket-janitor')``, same task_id) — so ``'task-curator'`` alone
+    carries three stem families in the live corpus (``esc-curator-*`` 31,
+    ``esc-ticket-janitor-*`` 6, ``esc-task-curator-*`` 13).
+
+    The false identity "for every record file, ``stem.startswith(
+    f'esc-{record.task_id}-')``" is therefore FALSE (42 of 2,972 corpus records
+    violate it), and believing it cost TWO design cycles: task 3999's 2026-08-11
+    amendment and ``plans/resume-charter-loss-remediation-prd.md``, both
+    withdrawn 2026-08-20 under ruling esc-3999-2.  ``get_by_task`` is correct
+    precisely BECAUSE it globs the unscoped ``esc-*.json`` and filters on the
+    STORED ``task_id`` FIELD.
+
+    THE BOUNDARY THIS TEST DRAWS: it forbids scoping ``get_by_task``'s glob to
+    ``f'esc-{task_id}-*.json'``.  That change was already rejected on its own
+    merits in esc-3999-2 — a measured 15x on a path costing 20-90 CPU-seconds/day
+    over a corpus the 30-day pruner already bounds, weighed against a
+    silent-record-loss failure mode and the erosion of contract D11
+    (``index_drift_detector.py``, task 3709, which put an opaque dedup key in the
+    task_id slot precisely BECAUSE get_by_task filters on the stored field).
+
+    This test is GREEN on arrival — it characterises existing correct behaviour —
+    so its honest RED is a MUTATION check: swap both globs to the scoped form and
+    it must go red.  That check was run and recorded in this commit.
+    """
+
+    def _esc(self, esc_id: str, task_id: str) -> Escalation:
+        return Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='curator',
+            severity='info',
+            category='cleanup_needed',
+            summary='curator surfaced a ticket',
+        )
+
+    def test_pending_divergent_stem_is_found_by_stored_task_id(self, tmp_path: Path):
+        """Both live stem families for one task_id come back from get_by_task."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        # The divergent specimen: stem says 'curator', the record says 'task-curator'.
+        queue.submit(self._esc('esc-curator-1', 'task-curator'))
+        # The SAME task_id under the other live stem family, for contrast.
+        queue.submit(self._esc('esc-task-curator-1', 'task-curator'))
+
+        results = queue.get_by_task('task-curator')
+
+        assert {e.id for e in results} == {'esc-curator-1', 'esc-task-curator-1'}, (
+            'get_by_task filters on the STORED task_id field, not on the '
+            f'filename: got {sorted(e.id for e in results)}'
+        )
+
+    def test_archived_divergent_stem_is_still_found(self, tmp_path: Path):
+        """The archive tier must not lose the divergent record either."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(self._esc('esc-curator-1', 'task-curator'))
+        queue.submit(self._esc('esc-task-curator-1', 'task-curator'))
+        queue.resolve('esc-curator-1', 'handled')
+
+        # It has moved out of the queue root and into archive/YYYY-MM-DD/.
+        assert not (queue.queue_dir / 'esc-curator-1.json').exists()
+
+        results = queue.get_by_task('task-curator')
+
+        assert 'esc-curator-1' in {e.id for e in results}, (
+            'an ARCHIVED divergent-stem record must still be found by its stored '
+            f'task_id: got {sorted(e.id for e in results)}'
         )
 
 
@@ -1703,6 +1783,464 @@ class TestGetPendingParseFailure:
         )
 
 
+class TestScanSurvivesRecordArchivedMidScan:
+    """An unlocked glob-then-read scan must survive a record relocated by a
+    concurrent archive sweep between the directory listing and the read.
+
+    The glob snapshots the queue root; the reads happen afterwards, one file
+    at a time, holding no lock.  A concurrent ``resolve()`` or startup sweep
+    can ``os.replace`` any of those files into ``archive/<date>/`` in that
+    window, so the read raises ``FileNotFoundError`` — an ``OSError``, which
+    none of the scan sites' ``except (json.JSONDecodeError, KeyError,
+    TypeError)`` tuples cover.  The blast radius is the WHOLE listing, and it
+    crosses tasks: every root file is read before the ``task_id`` filter runs,
+    so archiving an unrelated task's record kills a caller's query.
+    """
+
+    def test_get_by_task_survives_unrelated_record_archived_mid_scan(
+        self, tmp_path: Path, caplog,
+    ):
+        """A task-4176 query must survive the archival of a task-3517 record.
+
+        RED on main: ``FileNotFoundError: [Errno 2] No such file or directory:
+        '.../queue/esc-3517-5.json'`` escapes ``get_by_task`` entirely.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-4176-1', task_id='4176'))
+        queue.submit(_make_escalation('esc-3517-5', task_id='3517'))
+
+        doomed = queue.queue_dir / 'esc-3517-5.json'
+        archive_dir = queue.queue_dir / 'archive' / '2026-09-04'
+        flaky = relocating_read_text(doomed, archive_dir)
+
+        with (
+            caplog.at_level(logging.DEBUG, logger='escalation.queue'),
+            patch.object(Path, 'read_text', flaky),
+        ):
+            results = queue.get_by_task('4176', status='pending')
+
+        # (a) The unrelated archival must not void the caller's listing.
+        assert [e.id for e in results] == ['esc-4176-1'], (
+            f'Expected only the surviving task-4176 record, got '
+            f'{[e.id for e in results]}'
+        )
+
+        # (b) Loud enough to audit: the vanished path is named at DEBUG.
+        debug_records = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno == logging.DEBUG
+        ]
+        assert any(str(doomed) in r.getMessage() for r in debug_records), (
+            f'Expected a DEBUG naming {doomed}; got: '
+            f'{[r.getMessage() for r in debug_records]}'
+        )
+
+        # (c) ...but NOT loud enough to cry wolf.  A record archived mid-scan
+        # is expected concurrency, not corruption — and for status='pending'
+        # it would have been filtered out anyway, an archived record being by
+        # definition no longer pending.
+        loud = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.WARNING
+        ]
+        assert not loud, (
+            f'Expected no WARNING-or-above for a benign mid-scan archival; '
+            f'got: {[(r.levelname, r.getMessage()) for r in loud]}'
+        )
+
+
+    def test_get_by_task_keeps_an_unreadable_file_loud_and_distinguishable(
+        self, tmp_path: Path, caplog,
+    ):
+        """A present-but-unreadable file must not void the listing OR go quiet.
+
+        This is the guard against the fix degrading into a silent fail-soft.
+        A ``PermissionError`` (or EIO, or fd exhaustion) means the file IS
+        there and something is genuinely wrong — operator-actionable, unlike
+        the benign archived-mid-scan case, and it must reach the channel
+        operators actually watch.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-4176-1', task_id='4176'))
+        queue.submit(_make_escalation('esc-4176-2', task_id='4176'))
+
+        doomed = queue.queue_dir / 'esc-4176-2.json'
+        flaky = unreadable_read_text(doomed)
+
+        with (
+            caplog.at_level(logging.DEBUG, logger='escalation.queue'),
+            patch.object(Path, 'read_text', flaky),
+        ):
+            results = queue.get_by_task('4176', status='pending')
+
+        # (a) One unreadable file must not void the whole listing either.
+        assert [e.id for e in results] == ['esc-4176-1'], (
+            f'Expected the readable record to survive, got '
+            f'{[e.id for e in results]}'
+        )
+
+        loud = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.WARNING
+        ]
+        # (b) A permissions/EIO fault is operator-actionable: stay loud.
+        assert any(str(doomed) in r.getMessage() for r in loud), (
+            f'Expected a WARNING-or-above naming {doomed}; got: '
+            f'{[(r.levelname, r.getMessage()) for r in loud]}'
+        )
+        # (c) ...on the right channel.  An I/O fault is not a parse fault, and
+        # conflating them sends an operator hunting for corrupt JSON.
+        assert not any('Failed to parse' in r.getMessage() for r in loud), (
+            f"An I/O fault must not be reported as a parse failure; got: "
+            f'{[r.getMessage() for r in loud]}'
+        )
+
+
+    def test_get_pending_survives_a_record_archived_mid_scan(
+        self, tmp_path: Path,
+    ):
+        """get_pending() carries the identical gap and is pinned independently.
+
+        This scan also backs ``dismiss_all_pending``, so the startup L0 sweep
+        inherits the fix.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-4176-1', task_id='4176'))
+        queue.submit(_make_escalation('esc-3517-5', task_id='3517'))
+
+        doomed = queue.queue_dir / 'esc-3517-5.json'
+        archive_dir = queue.queue_dir / 'archive' / '2026-09-04'
+        flaky = relocating_read_text(doomed, archive_dir)
+
+        with patch.object(Path, 'read_text', flaky):
+            results = queue.get_pending()
+
+        assert [e.id for e in results] == ['esc-4176-1'], (
+            f'Expected only the surviving record, got {[e.id for e in results]}'
+        )
+
+    def test_find_terminal_by_citation_survives_a_record_archived_mid_scan(
+        self, tmp_path: Path,
+    ):
+        """The targeted ``esc-{task_id}-*.json`` glob has the same shape.
+
+        Both records are terminal and both match the glob, so both are read —
+        and the one the caller is NOT looking for is the one relocated, again
+        pinning that the blast radius is the whole listing rather than the
+        record that moved.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        citation = 'b' * 40
+        category = 'provenance_unattributed'
+
+        # Written directly rather than submit+resolve()'d: resolve() archives
+        # the record, and this test needs BOTH terminal records sitting in the
+        # queue root where the concurrent sweep would find them.
+        for esc_id, sha in (('esc-4176-1', citation), ('esc-4176-2', 'c' * 40)):
+            esc = _make_escalation(esc_id, task_id='4176', status='resolved', level=1)
+            esc.category = category
+            esc.citation_sha = sha
+            esc.resolved_at = datetime.now(UTC).isoformat()
+            (queue.queue_dir / f'{esc_id}.json').write_text(esc.to_json())
+
+        doomed = queue.queue_dir / 'esc-4176-2.json'
+        archive_dir = queue.queue_dir / 'archive' / '2026-09-04'
+        flaky = relocating_read_text(doomed, archive_dir)
+
+        with patch.object(Path, 'read_text', flaky):
+            found = queue.find_terminal_by_citation('4176', category, citation)
+
+        assert found is not None, (
+            'the surviving terminal record must still be found when an '
+            'unrelated sibling is archived mid-scan'
+        )
+        assert found.id == 'esc-4176-1', f'wrong record returned: {found.id!r}'
+
+
+class TestGetRetriesRelocationBetweenLocateAndRead:
+    """Task 5118, workstream A: ``get()`` must retry, not raise or return
+    ``None``, when the archive sweep relocates the record between
+    ``_locate_path`` and ``read_text``.
+
+    Unlike the glob-then-read scans above (``get_by_task``, ``get_pending``,
+    ``find_terminal_by_citation``), ``get()`` is ``_locate_path``-then-read:
+    its blast radius is the single record the caller asked about, and the
+    correct repair is re-locate-and-retry rather than "skip and continue" —
+    the record MOVED, it did not vanish.
+    """
+
+    def test_get_recovers_a_record_relocated_between_locate_and_read(
+        self, tmp_path: Path, caplog,
+    ):
+        """RED on main: ``FileNotFoundError`` escapes ``get()`` entirely
+        once ``_locate_path`` has already returned the (about to be stale)
+        root path.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1', task_id='1'))
+
+        doomed = queue.queue_dir / 'esc-1-1.json'
+        archive_dir = queue.queue_dir / 'archive' / '2026-09-04'
+        flaky = relocating_read_text(doomed, archive_dir)
+
+        with (
+            caplog.at_level(logging.DEBUG, logger='escalation.queue'),
+            patch.object(Path, 'read_text', flaky),
+        ):
+            result = queue.get('esc-1-1')
+
+        # (a) The record is recovered, not lost — the retry's fresh
+        # _locate_path call finds it at its new archive location.
+        assert result is not None, 'expected the relocated record to be recovered'
+        assert result.id == 'esc-1-1'
+
+        # (b) Loud enough to audit: the retry is named at DEBUG.
+        debug_records = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno == logging.DEBUG
+        ]
+        assert any('esc-1-1' in r.getMessage() for r in debug_records), (
+            f'Expected a DEBUG mentioning esc-1-1; got: '
+            f'{[r.getMessage() for r in debug_records]}'
+        )
+
+        # (c) ...but not loud enough to cry wolf — a mid-read relocation is
+        # expected concurrency, not corruption.
+        loud = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.WARNING
+        ]
+        assert not loud, (
+            f'Expected no WARNING-or-above for a benign relocation; got: '
+            f'{[(r.levelname, r.getMessage()) for r in loud]}'
+        )
+
+    def test_get_returns_none_for_a_record_genuinely_deleted_mid_read(
+        self, tmp_path: Path,
+    ):
+        """A record deleted (not relocated) mid-read must still resolve to
+        ``None`` after the retry — no raise, no infinite loop.
+
+        Distinguishes real relocation (recoverable via re-locate) from real
+        deletion (genuinely gone): the interposition here unlinks the file
+        outright instead of moving it into the archive tree, so the retry's
+        fresh ``_locate_path`` call finds nothing anywhere and must fall back
+        to ``None`` cleanly.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1', task_id='1'))
+
+        doomed = queue.queue_dir / 'esc-1-1.json'
+        original_read_text = Path.read_text
+
+        def deleting_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+            if self == doomed and doomed.exists():
+                doomed.unlink()
+            return original_read_text(self, *args, **kwargs)
+
+        with patch.object(Path, 'read_text', deleting_read_text):
+            result = queue.get('esc-1-1')
+
+        assert result is None
+
+    def test_get_propagates_a_present_but_unreadable_record(
+        self, tmp_path: Path,
+    ):
+        """A present-but-unreadable record must still raise — boundary pin
+        against the fix over-catching.
+
+        GREEN on main already (the un-fixed ``get()`` never caught
+        ``OSError`` either). Proves the retry loop's handler catches
+        ``FileNotFoundError`` only, never bare ``OSError``: a genuine
+        EACCES/EIO fault must not be degraded into the treatment a routine
+        archival gets (silently retried and then swallowed to ``None``).
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1', task_id='1'))
+
+        doomed = queue.queue_dir / 'esc-1-1.json'
+        flaky = unreadable_read_text(doomed)
+
+        with (
+            patch.object(Path, 'read_text', flaky),
+            pytest.raises(PermissionError),
+        ):
+            queue.get('esc-1-1')
+
+    def test_get_returns_none_for_a_genuinely_nonexistent_id(self, tmp_path: Path):
+        """An id that never existed still resolves to ``None`` (no retry
+        machinery regression on the ordinary not-found path)."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1', task_id='1'))
+
+        assert queue.get('esc-1-999') is None
+
+
+class TestGetByTaskRecoversRecordRelocatedMidScan:
+    """Task 5118, workstream B (follow-up to task 5111's amendment 8):
+    ``get_by_task`` must recover — not silently drop — a record relocated
+    root -> archive inside the scan window, for an archive-including scan.
+
+    ``get_by_task`` globs the archive tier BEFORE the root read loop, so a
+    record moved out of the root during that loop is in neither the
+    archive-tier snapshot (taken too early) nor the root copy (gone by read
+    time).  Before this fix that produced a silently SHORT listing; the fix
+    re-locates the id and retries the read once.
+    """
+
+    def test_get_by_task_recovers_relocated_record_into_a_complete_listing(
+        self, tmp_path: Path, caplog,
+    ):
+        """RED on main: the relocated record is silently missing from
+        ``results`` instead of being recovered via re-glob.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-4176-1', task_id='4176'))
+        queue.submit(_make_escalation('esc-4176-2', task_id='4176', status='resolved'))
+
+        doomed = queue.queue_dir / 'esc-4176-2.json'
+        archive_dir = queue.queue_dir / 'archive' / '2026-09-04'
+        flaky = relocating_read_text(doomed, archive_dir)
+
+        with (
+            caplog.at_level(logging.DEBUG, logger='escalation.queue'),
+            patch.object(Path, 'read_text', flaky),
+        ):
+            results = queue.get_by_task('4176', status=None)
+
+        # (a) The listing is complete — the relocated record is recovered,
+        # not silently dropped.
+        assert {e.id for e in results} == {'esc-4176-1', 'esc-4176-2'}, (
+            f'Expected both records via re-glob recovery, got '
+            f'{[e.id for e in results]}'
+        )
+
+        # (b) The recovery ITSELF is named at DEBUG for auditability — not
+        # just the (also-DEBUG) 'vanished mid-scan' line read_escalation_for_scan
+        # already logs before the recovery even runs, which also mentions the
+        # path and would satisfy a substring-only check on its own. Assert on
+        # the recovery line's distinguishing wording so weakening or removing
+        # it (while the earlier 'vanished' line stays) still fails this test.
+        debug_records = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno == logging.DEBUG
+        ]
+        assert any(
+            'recovered' in r.getMessage() and 'esc-4176-2' in r.getMessage()
+            for r in debug_records
+        ), (
+            f'Expected a DEBUG naming the recovery of esc-4176-2; got: '
+            f'{[r.getMessage() for r in debug_records]}'
+        )
+
+    def test_get_by_task_pending_scan_does_not_recover_a_relocated_record(
+        self, tmp_path: Path,
+    ):
+        """A ``status='pending'`` scan does not attempt recovery: the archive
+        is skipped there by design, and a record relocated out of the root
+        is by definition no longer pending — it would be filtered out on
+        status even if recovered, so recovering it would only add archive
+        I/O to the fast path for no behavioural difference.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-4176-1', task_id='4176'))
+        queue.submit(_make_escalation('esc-4176-2', task_id='4176'))
+
+        doomed = queue.queue_dir / 'esc-4176-2.json'
+        archive_dir = queue.queue_dir / 'archive' / '2026-09-04'
+        flaky = relocating_read_text(doomed, archive_dir)
+
+        with patch.object(Path, 'read_text', flaky):
+            results = queue.get_by_task('4176', status='pending')
+
+        assert [e.id for e in results] == ['esc-4176-1'], (
+            f'Expected only the surviving pending record, got '
+            f'{[e.id for e in results]}'
+        )
+
+    def test_get_by_task_drops_a_record_genuinely_deleted_mid_scan(
+        self, tmp_path: Path,
+    ):
+        """The ``relocated is None`` branch: a record DELETED (not
+        relocated) mid-scan on an archive-including scan cannot be
+        recovered — the fresh ``_locate_path`` re-probe finds it nowhere —
+        so the listing must come back one short WITHOUT raising, exactly
+        like the pre-recovery behaviour for a genuine deletion.
+
+        Distinguishes recoverable relocation from real deletion the same
+        way ``TestGetRetriesRelocationBetweenLocateAndRead``'s deletion test
+        does for ``get()``: the interposition unlinks the file outright
+        instead of moving it into the archive tree.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-4176-1', task_id='4176'))
+        queue.submit(_make_escalation('esc-4176-2', task_id='4176', status='resolved'))
+
+        doomed = queue.queue_dir / 'esc-4176-2.json'
+        original_read_text = Path.read_text
+
+        def deleting_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+            if self == doomed and doomed.exists():
+                doomed.unlink()
+            return original_read_text(self, *args, **kwargs)
+
+        with patch.object(Path, 'read_text', deleting_read_text):
+            results = queue.get_by_task('4176', status=None)
+
+        assert [e.id for e in results] == ['esc-4176-1'], (
+            f'Expected only the surviving record after a genuine mid-scan '
+            f'deletion (no recovery possible, no raise), got '
+            f'{[e.id for e in results]}'
+        )
+
+    def test_get_by_task_recovery_reread_failure_logs_reglob_context(
+        self, tmp_path: Path, caplog,
+    ):
+        """The recovery's OWN re-read can itself fail differently from the
+        first vanish — e.g. an EACCES fault at the newly-located archive
+        path.  That failure must be logged through the recovery's distinct
+        ``'queue.get_by_task (re-glob after vanish)'`` context, not silently
+        conflated with the ordinary scan's WARNING wording, and the record
+        must still be dropped (not raise) exactly like any other unreadable
+        file.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-4176-1', task_id='4176'))
+        queue.submit(_make_escalation('esc-4176-2', task_id='4176', status='resolved'))
+
+        doomed = queue.queue_dir / 'esc-4176-2.json'
+        archive_dir = queue.queue_dir / 'archive' / '2026-09-04'
+        relocated_path = archive_dir / 'esc-4176-2.json'
+        original_read_text = Path.read_text
+
+        def flaky(self: Path, *args: Any, **kwargs: Any) -> str:
+            if self == doomed and doomed.exists():
+                archive_dir.mkdir(parents=True, exist_ok=True)
+                os.replace(str(doomed), str(relocated_path))
+            if self == relocated_path:
+                raise PermissionError(13, 'Permission denied', str(relocated_path))
+            return original_read_text(self, *args, **kwargs)
+
+        with (
+            caplog.at_level(logging.WARNING, logger='escalation.queue'),
+            patch.object(Path, 'read_text', flaky),
+        ):
+            results = queue.get_by_task('4176', status=None)
+
+        assert [e.id for e in results] == ['esc-4176-1'], (
+            f'Expected the recovery to give up (not raise) after its own '
+            f're-read also fails, got {[e.id for e in results]}'
+        )
+        warnings = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno == logging.WARNING
+        ]
+        assert any('re-glob after vanish' in r.getMessage() for r in warnings), (
+            f'Expected a WARNING naming the re-glob-after-vanish context; got: '
+            f'{[r.getMessage() for r in warnings]}'
+        )
+
+
 class TestMakeIdCounter:
     """make_id() is backed by a single durable per-task_id counter file —
     NOT a directory/archive scan (PRD task-status-authority-prd.md contract
@@ -2742,6 +3280,252 @@ class TestAttachDedupeChild:
         assert result is not None
         assert result.severity == 'blocking'
         assert queue.get('esc-1-1').severity == 'blocking'  # type: ignore[union-attr]
+
+
+class TestAttachDedupeChildGrowthBound:
+    """dedupe_children is BOUNDED, and the bound is loud.
+
+    Why a bound is needed: ``DedupeConfig.for_gate_backlog()`` sets
+    ``infra_dedupe_window_secs=float('inf')`` by design (a 300h-old gate MUST
+    still fold), so nothing ever ages a gate-backlog parent out — it gains one
+    child id per Stage-1 cycle for as long as a human has not decided, and that
+    whole record is read and parsed by ``get_pending()`` on every subsequent
+    dedupe scan.
+
+    Retention is HEAD-PRESERVING (first ``_MAX_DEDUPE_CHILDREN_HEAD`` + most
+    recent), not the pure oldest-shed used for ``amendments``: this list has no
+    external anchor for the fold's ORIGIN, so shedding purely oldest-first would
+    erase where the parent came from and leave only-recent ids — the least useful
+    provenance possible on a record whose whole problem is that it is old.
+
+    Every expected value below is DERIVED from the module constants, never
+    transcribed as a literal: a hand-copied literal encodes the constant's VALUE
+    instead of its NAME and silently drifts when the cap is retuned (test_server's
+    ``_COMPACT_KEYS`` comment records that this drift already happened once here).
+    """
+
+    #: How far past the cap these tests push.  Small on purpose — the shed is
+    #: per-attach in steady state, so K attaches past the cap shed exactly K.
+    K = 5
+
+    #: How far OVER the cap a record is seeded straight onto disk (bypassing
+    #: attach_dedupe_child) in the bulk-shed case.  Must be > 1: that is the
+    #: whole point — it forces `shed > 1`, the multi-element `del` slice that
+    #: the steady-state cases can never reach.
+    OVER_CAP_SEED = 30
+
+    def _make_infra_esc(self, esc_id: str, task_id: str = '1', severity: str = 'blocking') -> Escalation:
+        return Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='implementer',
+            severity=severity,
+            category='infra_issue',
+            summary='fused-memory connection timeout on port 8002',
+        )
+
+    def _attach_n(self, queue: EscalationQueue, parent_id: str, n: int) -> list[str]:
+        """Attach *n* children with predictable ids; returns the attach ORDER."""
+        order = [f'esc-child-{i}' for i in range(n)]
+        for child_id in order:
+            queue.attach_dedupe_child(parent_id, child_id)
+        return order
+
+    def test_at_the_cap_nothing_is_shed(self, tmp_path: Path):
+        """(a) Exactly at the cap: every id is still present, in order, nothing counted.
+
+        Named for what it ASSERTS (``_MAX_DEDUPE_CHILDREN`` attaches — the
+        boundary itself), not for the strictly-below case it does not exercise:
+        the cap fires on ``>``, so the last non-shedding attach IS the one at
+        the cap, and that is the edge worth pinning.
+        """
+        from escalation.queue import _MAX_DEDUPE_CHILDREN
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(self._make_infra_esc('esc-1-1'))
+
+        order = self._attach_n(queue, 'esc-1-1', _MAX_DEDUPE_CHILDREN)
+
+        from_disk = queue.get('esc-1-1')
+        assert from_disk is not None
+        assert len(from_disk.dedupe_children) == _MAX_DEDUPE_CHILDREN
+        assert from_disk.dedupe_children == order, 'At the cap nothing may be shed or reordered'
+        assert from_disk.dedupe_children_truncated == 0
+
+    def test_past_the_cap_sheds_the_oldest_non_head_ids_and_counts_them(self, tmp_path: Path):
+        """(b) Past the cap: the list is bounded, the HEAD and the TAIL both survive,
+        and exactly the oldest NON-head ids are shed and counted."""
+        from escalation.queue import _MAX_DEDUPE_CHILDREN, _MAX_DEDUPE_CHILDREN_HEAD
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(self._make_infra_esc('esc-1-1'))
+
+        order = self._attach_n(queue, 'esc-1-1', _MAX_DEDUPE_CHILDREN + self.K)
+
+        from_disk = queue.get('esc-1-1')
+        assert from_disk is not None
+        kept = from_disk.dedupe_children
+
+        assert len(kept) == _MAX_DEDUPE_CHILDREN, (
+            f'dedupe_children must be BOUNDED at _MAX_DEDUPE_CHILDREN='
+            f'{_MAX_DEDUPE_CHILDREN}, got {len(kept)}'
+        )
+        assert from_disk.dedupe_children_truncated == self.K
+
+        # Head retention — the ids that ESTABLISHED the fold survive.
+        assert kept[:_MAX_DEDUPE_CHILDREN_HEAD] == order[:_MAX_DEDUPE_CHILDREN_HEAD], (
+            'The first _MAX_DEDUPE_CHILDREN_HEAD ids must be retained: on a '
+            "weeks-old parent they are the only record of the fold's origin"
+        )
+        # Tail retention — current activity survives.
+        tail_len = _MAX_DEDUPE_CHILDREN - _MAX_DEDUPE_CHILDREN_HEAD
+        assert kept[_MAX_DEDUPE_CHILDREN_HEAD:] == order[-tail_len:], (
+            'The most recent ids must be retained'
+        )
+
+        # Exactly the oldest NON-head ids were shed.
+        shed = order[_MAX_DEDUPE_CHILDREN_HEAD:_MAX_DEDUPE_CHILDREN_HEAD + self.K]
+        assert set(shed).isdisjoint(kept), f'Expected {shed} to have been shed, found some kept'
+
+        # The true-provenance-total identity: the loss is assertable FROM THE
+        # RECORD, never log-only (INV-8).
+        assert len(kept) + from_disk.dedupe_children_truncated == _MAX_DEDUPE_CHILDREN + self.K
+
+    def test_an_over_cap_record_seeded_on_disk_sheds_the_whole_excess_in_one_fold(
+        self, tmp_path: Path,
+    ):
+        """(b2) A record that arrives ALREADY over the cap sheds the entire
+        excess on its first fold — `shed > 1`, the multi-element `del` slice.
+
+        The steady-state cases above can only ever produce ``shed == 1``,
+        because they grow the list one attach at a time.  That branch is NOT
+        the only reachable one: ``attach_dedupe_child`` is not the sole writer
+        of ``dedupe_children``.  `fused-memory/scripts/backfill_recon_escalations.py`
+        assigns ``canonical.dedupe_children = list(collapse.child_ids)``
+        wholesale and persists it with ``queue.submit()``, which writes the
+        record verbatim and enforces no cap — so an arbitrarily long list can
+        legitimately exist on disk, and the FIRST subsequent fold must shed
+        ``len - cap + 1`` ids in one `del`, crediting every one of them to
+        ``dedupe_children_truncated``.
+
+        Seeded through ``submit`` rather than ``_rewrite`` precisely because
+        ``submit`` is the production path that creates this shape.
+        """
+        from escalation.queue import _MAX_DEDUPE_CHILDREN, _MAX_DEDUPE_CHILDREN_HEAD
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        seeded_total = _MAX_DEDUPE_CHILDREN + self.OVER_CAP_SEED
+        seeded = [f'esc-seed-{i}' for i in range(seeded_total)]
+
+        esc = self._make_infra_esc('esc-1-1')
+        esc.dedupe_children = list(seeded)
+        esc.dedupe_count = seeded_total
+        queue.submit(esc)
+
+        # Precondition: submit really does persist an over-cap list untouched.
+        pre = queue.get('esc-1-1')
+        assert pre is not None
+        assert len(pre.dedupe_children) == seeded_total, (
+            'submit must write dedupe_children verbatim — if it ever starts '
+            'capping, this test is no longer exercising the bulk-shed path'
+        )
+        assert pre.dedupe_children_truncated == 0
+
+        queue.attach_dedupe_child('esc-1-1', 'esc-late-1')
+
+        from_disk = queue.get('esc-1-1')
+        assert from_disk is not None
+        kept = from_disk.dedupe_children
+
+        # One fold, many ids shed: the excess plus the id just appended.
+        expected_shed = self.OVER_CAP_SEED + 1
+        assert expected_shed > 1, 'OVER_CAP_SEED must force the multi-element del slice'
+        assert len(kept) == _MAX_DEDUPE_CHILDREN
+        assert from_disk.dedupe_children_truncated == expected_shed, (
+            f'A single fold on an over-cap record must credit ALL {expected_shed} '
+            f'dropped ids, got {from_disk.dedupe_children_truncated}'
+        )
+
+        # Head retention survives a bulk shed exactly as it does a single one.
+        assert kept[:_MAX_DEDUPE_CHILDREN_HEAD] == seeded[:_MAX_DEDUPE_CHILDREN_HEAD]
+
+        # Tail: the most recent ids, ending with the id just attached.
+        tail_len = _MAX_DEDUPE_CHILDREN - _MAX_DEDUPE_CHILDREN_HEAD
+        expected_tail = (seeded + ['esc-late-1'])[-tail_len:]
+        assert kept[_MAX_DEDUPE_CHILDREN_HEAD:] == expected_tail
+        assert kept[-1] == 'esc-late-1', 'the id just folded in must survive'
+
+        # Exactly the oldest NON-head ids were shed — contiguously, in one slice.
+        shed = seeded[_MAX_DEDUPE_CHILDREN_HEAD:_MAX_DEDUPE_CHILDREN_HEAD + expected_shed]
+        assert len(shed) == expected_shed
+        assert set(shed).isdisjoint(kept)
+
+        # The true-provenance-total identity holds across a bulk shed too.
+        assert len(kept) + from_disk.dedupe_children_truncated == seeded_total + 1
+        # And the recurrence signal is untouched by a bulk shed.
+        assert from_disk.dedupe_count == seeded_total + 1
+
+    def test_the_cap_never_touches_dedupe_count_or_severity(self, tmp_path: Path):
+        """(c) The cap bounds PROVENANCE only.
+
+        dedupe_count is the load-bearing recurrence signal (task 3522) — a
+        recon-watcher drain sorts the longest-rotting gates by it and
+        sweep._pick_richer ranks on it — so it must keep climbing past the cap.
+        Severity promotion is likewise unaffected, and is never demoted.
+        """
+        from escalation.queue import _MAX_DEDUPE_CHILDREN
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(self._make_infra_esc('esc-1-1', severity='info'))
+
+        total = _MAX_DEDUPE_CHILDREN + self.K
+        self._attach_n(queue, 'esc-1-1', total)
+
+        from_disk = queue.get('esc-1-1')
+        assert from_disk is not None
+        assert from_disk.dedupe_count == total, (
+            f'dedupe_count is the recurrence SIGNAL and is never capped: expected '
+            f'{total}, got {from_disk.dedupe_count}'
+        )
+        assert from_disk.severity == 'info', 'info children must not promote an info parent'
+
+        # A promotion AFTER the cap is crossed still takes effect.
+        promoted = queue.attach_dedupe_child('esc-1-1', 'esc-late-1', child_severity='blocking')
+        assert promoted is not None
+        assert promoted.severity == 'blocking', (
+            'max_severity promotion must still work once the list is at the cap'
+        )
+        assert promoted.dedupe_count == total + 1
+
+    def test_shedding_logs_a_warning_naming_the_running_total(self, tmp_path: Path, caplog):
+        """(d) The loss is LOUD: a WARNING names the parent and the running total.
+
+        no-silent-fail-soft — a bound that drops ids quietly is exactly the
+        silent degradation this repo forbids.
+        """
+        from escalation.queue import _MAX_DEDUPE_CHILDREN
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(self._make_infra_esc('esc-1-1'))
+
+        # Fill to the cap OUTSIDE the caplog window, so only shed warnings land.
+        self._attach_n(queue, 'esc-1-1', _MAX_DEDUPE_CHILDREN)
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            queue.attach_dedupe_child('esc-1-1', 'esc-over-1')
+
+        shed_records = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue'
+            and r.levelno >= logging.WARNING
+            and 'esc-1-1' in r.getMessage()
+            and 'truncated=1' in r.getMessage()
+        ]
+        assert shed_records, (
+            'Expected a WARNING from escalation.queue naming the parent id and the '
+            f'running dedupe_children_truncated total, got: '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
 
 
 class TestFindPendingL2ByRootCause:
@@ -3940,8 +4724,10 @@ class TestStampTriage:
 
 class TestUpdatedAtStamp:
     """updated_at is a last-substantive-change marker: bumped by add_members_to_l2's real
-    append path, left untouched by its no-op path, and never touched by stamp_triage
-    (an annotation must not masquerade as a content change)."""
+    append path, left untouched by its no-op path, never touched by stamp_triage
+    (an annotation must not masquerade as a content change), and bumped by
+    attach_dedupe_child (a fold IS a content change — recurrence count up, possible
+    severity promotion)."""
 
     def _make_l2(self, queue: EscalationQueue, task_id: str = 'task-1') -> Escalation:
         esc = Escalation(
@@ -3992,6 +4778,311 @@ class TestUpdatedAtStamp:
         assert result.updated_at is None, (
             f'Expected updated_at to stay None after stamp_triage, got {result.updated_at!r}'
         )
+
+    def _make_pending_parent(self, queue: EscalationQueue, task_id: str = 'task-1') -> Escalation:
+        """Seed a PENDING dedupe parent.
+
+        attach_dedupe_child loads from the queue ROOT only and returns None for
+        archived parents, so this record must stay pending — hence a plain
+        submit and no resolve.  Seeded at ``info`` so the fold below also
+        exercises the max_severity promotion that makes the staleness bump
+        load-bearing.
+        """
+        esc = Escalation(
+            id=queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='implementer',
+            severity='info',
+            category='infra_issue',
+            summary='fused-memory connection timeout on port 8002',
+        )
+        queue.submit(esc)
+        return esc
+
+    def test_attach_dedupe_child_sets_updated_at_on_a_triaged_parent(self, tmp_path: Path):
+        """(d) A dedupe fold IS a substantive change, so it must bump updated_at.
+
+        The contract this defends: a triaged pending parent that then folds in
+        duplicates gains recurrence count (``dedupe_count``) and can be promoted
+        info->blocking by ``max_severity``, yet used to read ``updated_at is
+        None``.  An L1/L2 rotation applying the "updated_at is not None and is
+        newer than triaged_at" re-verify rule (the triage quad in models.py;
+        skills/escalation-watcher/SKILL.md) would therefore trust the now-stale
+        triage note and skip re-assessing a record that has materially changed.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        parent = self._make_pending_parent(queue)
+        assert parent.updated_at is None
+        assert parent.triaged_at is None
+
+        stamped = queue.stamp_triage(
+            parent.id,
+            triaged_by='escalation-watcher-auto',
+            triage_note='verified predicate + probe',
+        )
+        assert stamped is not None
+
+        # Re-pin the existing stamp_triage contract as THIS test's precondition:
+        # an annotation stamps triaged_at and leaves updated_at alone, so the
+        # bump asserted below can only have come from the fold.
+        after_triage = queue.get(parent.id)
+        assert after_triage is not None
+        assert after_triage.triaged_at is not None
+        assert after_triage.updated_at is None, (
+            'Precondition: stamp_triage must not bump updated_at, got '
+            f'{after_triage.updated_at!r}'
+        )
+
+        result = queue.attach_dedupe_child(parent.id, 'esc-2-1', child_severity='blocking')
+
+        assert result is not None
+        assert result.updated_at is not None, (
+            'Expected attach_dedupe_child to stamp updated_at: a fold raises '
+            'dedupe_count and can promote severity, so a parent reading '
+            'updated_at=None after folding makes an L1/L2 rotation trust a '
+            'stale triage note and skip re-assessing it'
+        )
+        assert result.triaged_at is not None
+        assert result.updated_at > result.triaged_at, (
+            "The watcher's stamp-then-skip protocol keys off STRICTLY newer, so "
+            f'updated_at ({result.updated_at!r}) must exceed triaged_at '
+            f'({result.triaged_at!r})'
+        )
+
+        # The same two properties must hold on the PERSISTED record, not only on
+        # the returned object.
+        from_disk = queue.get(parent.id)
+        assert from_disk is not None
+        assert from_disk.updated_at is not None, (
+            'Expected the bump to be durable, not only on the returned object'
+        )
+        assert from_disk.triaged_at is not None
+        assert from_disk.updated_at > from_disk.triaged_at
+
+
+class TestDeclarePin:
+    """EscalationQueue.declare_pin() stamps the declared-dependency marker (task 4377).
+
+    ``stamp_triage``'s structural twin — an annotation writer on a PENDING
+    record — but with a different consequence: the marker changes what a
+    resolver may do to the record (``escalation/server.py::resolve_issue``
+    refuses every non-``park`` action on a marked record), so a silent no-op
+    stamp would leave the declarer believing a record is protected when it is
+    not.
+    """
+
+    DECLARER = 'task-3546-second-deviation-notice'
+    REASON = 'mu-gate validation specimen — the evidence base'
+
+    def _make_pending(
+        self, queue: EscalationQueue, task_id: str = 'task-3371', level: int = 1,
+    ) -> Escalation:
+        esc = Escalation(
+            id=queue.make_id(task_id),
+            task_id=task_id,
+            agent_role='steward',
+            severity='blocking',
+            category='risk_identified',
+            summary='pending record for the declared-pin marker',
+            level=level,
+        )
+        queue.submit(esc)
+        return esc
+
+    # --- (a) stamps a pending record and persists to disk ---
+
+    def test_stamps_pending_record_and_returns_it(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+
+        result = queue.declare_pin(esc.id, declared_by=[self.DECLARER], reason=self.REASON)
+
+        assert result is not None
+        assert result.pin_declared_by == [self.DECLARER]
+        assert result.pin_declared_reason == self.REASON
+
+    def test_stamp_is_persisted_to_disk(self, tmp_path: Path):
+        """It went through _rewrite, not just an in-memory mutation."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+
+        queue.declare_pin(esc.id, declared_by=[self.DECLARER], reason=self.REASON)
+
+        reread = queue.get(esc.id)
+        assert reread is not None
+        assert reread.pin_declared_by == [self.DECLARER]
+        assert reread.pin_declared_reason == self.REASON
+
+    def test_stamp_does_not_archive(self, tmp_path: Path):
+        """The file stays in the queue root — a declaration is not a resolution."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+
+        queue.declare_pin(esc.id, declared_by=[self.DECLARER])
+
+        assert (queue.queue_dir / f'{esc.id}.json').exists()
+
+    # --- (b)/(c) append semantics ---
+
+    def test_second_distinct_declarer_appends_in_declaration_order(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+
+        queue.declare_pin(esc.id, declared_by=['first-gate'])
+        result = queue.declare_pin(esc.id, declared_by=['second-gate'])
+
+        assert result is not None
+        assert result.pin_declared_by == ['first-gate', 'second-gate']
+
+    def test_redeclaring_an_existing_declarer_is_idempotent(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+        queue.declare_pin(esc.id, declared_by=[self.DECLARER])
+
+        result = queue.declare_pin(esc.id, declared_by=[self.DECLARER])
+
+        assert result is None, (
+            'a wholly-redundant re-declaration adds nothing and must not report success'
+        )
+        reread = queue.get(esc.id)
+        assert reread is not None
+        assert reread.pin_declared_by == [self.DECLARER], 'no duplicate entry'
+
+    def test_partially_redundant_declaration_appends_only_the_new_entry(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+        queue.declare_pin(esc.id, declared_by=['first-gate'])
+
+        result = queue.declare_pin(esc.id, declared_by=['first-gate', 'second-gate'])
+
+        assert result is not None
+        assert result.pin_declared_by == ['first-gate', 'second-gate']
+
+    def test_duplicates_within_one_call_are_collapsed(self, tmp_path: Path):
+        """The shared normalisation (declared_pins.normalise_declarers) de-dups
+        within the incoming list too, not just against what is already there —
+        so the write side and the read-side predicate agree on what the field
+        holds."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+
+        result = queue.declare_pin(
+            esc.id, declared_by=['gate-a', '  gate-a  ', 'gate-b', 'gate-a'],
+        )
+
+        assert result is not None
+        assert result.pin_declared_by == ['gate-a', 'gate-b']
+
+    # --- (d) asymmetric reason overwrite ---
+
+    def test_reason_is_overwritten_only_when_non_empty(self, tmp_path: Path):
+        """The asymmetric-overwrite contract stamp_triage establishes for triage_note."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+        queue.declare_pin(esc.id, declared_by=['first-gate'], reason=self.REASON)
+
+        result = queue.declare_pin(esc.id, declared_by=['second-gate'], reason='')
+
+        assert result is not None
+        assert result.pin_declared_reason == self.REASON, (
+            'an empty reason must not silently wipe a previously-recorded one'
+        )
+
+    def test_a_non_empty_reason_replaces_the_previous_one(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+        queue.declare_pin(esc.id, declared_by=['first-gate'], reason='old reason')
+
+        result = queue.declare_pin(esc.id, declared_by=['second-gate'], reason='new reason')
+
+        assert result is not None
+        assert result.pin_declared_reason == 'new reason'
+
+    # --- (e) blank normalisation; a no-op stamp must not report success ---
+
+    def test_blank_entries_are_dropped_from_declared_by(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+
+        result = queue.declare_pin(esc.id, declared_by=['', '  real-gate  ', '\t'])
+
+        assert result is not None
+        assert result.pin_declared_by == ['real-gate']
+
+    def test_empty_declared_by_returns_none_and_writes_nothing(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+        path = queue.queue_dir / f'{esc.id}.json'
+        before = path.read_bytes()
+
+        result = queue.declare_pin(esc.id, declared_by=[])
+
+        assert result is None, 'loud over silent: a no-op stamp must not report success'
+        assert path.read_bytes() == before, 'the record must be byte-identical on disk'
+
+    def test_all_blank_declared_by_returns_none_and_writes_nothing(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+        path = queue.queue_dir / f'{esc.id}.json'
+        before = path.read_bytes()
+
+        result = queue.declare_pin(esc.id, declared_by=['', '   ', '\t\n'], reason='r')
+
+        assert result is None
+        assert path.read_bytes() == before
+
+    # --- (f)/(g) unknown and archived ids ---
+
+    def test_unknown_id_returns_none(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+
+        assert queue.declare_pin('esc-does-not-exist', declared_by=[self.DECLARER]) is None
+
+    def test_resolved_record_returns_none_and_is_not_resurrected(self, tmp_path: Path):
+        """Root-only load: the Defect-2 class of bug stamp_triage's contract prevents.
+
+        ``self.get()`` falls back to the archive, and ``_rewrite`` always targets
+        the queue root — so loading via ``get()`` here would write an archived
+        record back into the pending pile.
+        """
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+        queue.resolve(esc.id, 'done')
+        assert not (queue.queue_dir / f'{esc.id}.json').exists(), 'precondition: archived'
+
+        result = queue.declare_pin(esc.id, declared_by=[self.DECLARER])
+
+        assert result is None
+        assert not (queue.queue_dir / f'{esc.id}.json').exists(), (
+            'declare_pin must not resurrect an archived record into the queue root'
+        )
+
+    def test_dismissed_record_returns_none(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue)
+        queue.resolve(esc.id, 'not a real problem', dismiss=True)
+
+        assert queue.declare_pin(esc.id, declared_by=[self.DECLARER]) is None
+
+    # --- (h) neighbouring fields are untouched ---
+
+    def test_does_not_bump_updated_at_or_touch_status_level_triage(self, tmp_path: Path):
+        """add_members_to_l2 stays the sole updated_at writer (see the design decision)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = self._make_pending(queue, level=2)
+        queue.stamp_triage(esc.id, triaged_by='watcher', triage_note='note')
+        triaged_at_before = queue.get(esc.id).triaged_at  # type: ignore[union-attr]
+
+        result = queue.declare_pin(esc.id, declared_by=[self.DECLARER], reason=self.REASON)
+
+        assert result is not None
+        assert result.updated_at is None, (
+            f'declare_pin must not bump updated_at, got {result.updated_at!r}'
+        )
+        assert result.status == 'pending'
+        assert result.level == 2
+        assert result.triaged_at == triaged_at_before
+        assert result.triaged_by == 'watcher'
 
 
 class TestResolveCascade:
@@ -4128,6 +5219,150 @@ class TestResolveCascade:
         assert result is not None
         assert result.status == 'resolved'
         assert result.resolution == 'Fixed; no members'
+
+
+class TestResolveWarnsOnDeclaredPin:
+    """resolve() WARNS when it closes a record carrying a declared pin (task 4377).
+
+    This is the NAMED RESIDUAL for the ~20 orchestrator-internal
+    ``queue.resolve()`` callers the server-side gate deliberately does not cover
+    (harness self-clearing sentinels, workflow.py / steward.py L0 teardown,
+    dismiss_all_pending).  An audit line, NOT a veto: refusal lives at the
+    ``escalation/server.py::resolve_issue`` chokepoint, because resolve()
+    archives an L2 head BEFORE cascading and most in-repo callers wrap it in a
+    best-effort try/except.
+    """
+
+    DECLARER = 'task-3546-second-deviation-notice'
+    REASON = 'mu-gate validation specimen — the evidence base'
+
+    def _declared_pending(
+        self, queue: EscalationQueue, esc_id: str, task_id: str = 'task-3371', level: int = 1,
+    ) -> Escalation:
+        esc = Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='steward',
+            severity='blocking',
+            category='risk_identified',
+            summary='a load-bearing pending record',
+            level=level,
+        )
+        queue.submit(esc)
+        queue.declare_pin(esc_id, declared_by=[self.DECLARER], reason=self.REASON)
+        return esc
+
+    @staticmethod
+    def _pin_warnings(caplog) -> list[str]:
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno >= logging.WARNING and 'DECLARED PIN' in r.getMessage()
+        ]
+
+    # --- (a) the warning names the id, every declarer, and the reason ---
+
+    @pytest.mark.parametrize('dismiss', [False, True])
+    def test_warns_naming_id_declarers_and_reason(self, tmp_path: Path, caplog, dismiss: bool):
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._declared_pending(queue, 'esc-pin-1')
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            queue.resolve('esc-pin-1', 'closing it', dismiss=dismiss)
+
+        warnings = self._pin_warnings(caplog)
+        assert len(warnings) == 1, f'Expected exactly one declared-pin warning, got {warnings}'
+        assert 'esc-pin-1' in warnings[0]
+        assert self.DECLARER in warnings[0]
+        assert self.REASON in warnings[0]
+
+    def test_warning_names_every_declarer(self, tmp_path: Path, caplog):
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._declared_pending(queue, 'esc-pin-1')
+        queue.declare_pin('esc-pin-1', declared_by=['esc-3914-1'])
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            queue.resolve('esc-pin-1', 'closing it')
+
+        (warning,) = self._pin_warnings(caplog)
+        assert self.DECLARER in warning
+        assert 'esc-3914-1' in warning
+
+    # --- (b) it still CLOSES — an audit line, not a veto ---
+
+    @pytest.mark.parametrize(
+        ('dismiss', 'expected_status'), [(False, 'resolved'), (True, 'dismissed')],
+    )
+    def test_record_is_still_closed_and_archived(
+        self, tmp_path: Path, dismiss: bool, expected_status: str,
+    ):
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._declared_pending(queue, 'esc-pin-1')
+
+        result = queue.resolve('esc-pin-1', 'closing it', dismiss=dismiss)
+
+        assert result is not None
+        assert result.status == expected_status
+        assert not (queue.queue_dir / 'esc-pin-1.json').exists(), 'expected it to be archived'
+
+    def test_declaration_survives_into_the_archive(self, tmp_path: Path):
+        """The archived JSON still carries pin_declared_by — the audit trail persists."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._declared_pending(queue, 'esc-pin-1')
+
+        queue.resolve('esc-pin-1', 'closing it')
+
+        (archived,) = list((queue.queue_dir / 'archive').rglob('esc-pin-1.json'))
+        payload = json.loads(archived.read_text())
+        assert payload['pin_declared_by'] == [self.DECLARER]
+        assert payload['pin_declared_reason'] == self.REASON
+
+    # --- (c) cascade members are covered by the same line, via self-recursion ---
+
+    def test_cascade_member_pin_is_warned_about(self, tmp_path: Path, caplog):
+        """The path that actually spent the specimen: a marked MEMBER of an L2."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        self._declared_pending(queue, 'esc-member-pin', level=1)
+        l2 = Escalation(
+            id='esc-l2-head',
+            task_id='task-cluster',
+            agent_role='escalation-watcher-auto',
+            severity='blocking',
+            category='design_concern',
+            summary='L2 cluster head, itself unmarked',
+            level=2,
+            members=['esc-member-pin'],
+        )
+        queue.submit(l2)
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            queue.resolve('esc-l2-head', 'bulk close', dismiss=True)
+
+        (warning,) = self._pin_warnings(caplog)
+        assert 'esc-member-pin' in warning, (
+            'the cascade must warn about the MEMBER that carried the marker'
+        )
+        assert self.DECLARER in warning
+
+    # --- (d) ordinary closes stay silent ---
+
+    def test_unmarked_record_emits_no_declared_pin_warning(self, tmp_path: Path, caplog):
+        queue = EscalationQueue(tmp_path / 'esc')
+        esc = Escalation(
+            id='esc-plain-1',
+            task_id='task-1',
+            agent_role='steward',
+            severity='blocking',
+            category='design_concern',
+            summary='an ordinary record',
+            level=1,
+        )
+        queue.submit(esc)
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            queue.resolve('esc-plain-1', 'closing it')
+
+        assert self._pin_warnings(caplog) == []
 
 
 class TestResolveResolutionClassExplicit:
@@ -4780,6 +6015,97 @@ class TestConcurrentResolveExactlyOneArchive:
 # Step-7: Deterministic spy test proving submit/submit_resolved/resolve adopt lock (RED)
 # ---------------------------------------------------------------------------
 
+class TestSubmitLogsIdTaskIdDivergence:
+    """submit() makes an id/task_id divergence OBSERVABLE — and never rejects it.
+
+    ``make_id``'s argument is an id-NAMESPACE key, not a task_id, so a record's
+    filename stem need not encode its stored ``task_id``.  Five production sites
+    diverge deliberately (curator_escalator.py x3 via ``make_id('curator')``
+    with ``task_id='task-curator'``; ticket_janitor.py x2 via
+    ``make_id('ticket-janitor')``).  Believing the false identity
+    ``stem.startswith(f'esc-{record.task_id}-')`` has already cost two design
+    cycles (task 3999's 2026-08-11 amendment and
+    plans/resume-charter-loss-remediation-prd.md, both withdrawn 2026-08-20 as
+    ruling esc-3999-2), so the divergence is logged where it is CREATED rather
+    than being rediscovered by the next failed design.
+    """
+
+    #: The stable fragment of the guard's message.  Asserting on this plus the
+    #: two interpolated values, rather than on the full sentence, keeps the
+    #: tests from pinning prose.
+    MARKER = 'does not encode its task_id'
+
+    def _esc(self, esc_id: str, task_id: str) -> Escalation:
+        return Escalation(
+            id=esc_id,
+            task_id=task_id,
+            agent_role='curator',
+            severity='info',
+            category='cleanup_needed',
+            summary='curator surfaced a ticket',
+        )
+
+    def test_divergent_stem_is_logged_with_both_values(self, tmp_path: Path, caplog):
+        """(a) The LIVE specimen is logged, showing BOTH halves of the divergence.
+
+        A reader who hits this line must be able to see the divergence itself,
+        not be told one half of it — so the id and the task_id are both on it.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        with caplog.at_level(logging.INFO, logger='escalation.queue'):
+            queue.submit(self._esc('esc-curator-1', 'task-curator'))
+
+        matching = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue'
+            and r.levelno >= logging.INFO
+            and 'esc-curator-1' in r.getMessage()
+            and 'task-curator' in r.getMessage()
+            and self.MARKER in r.getMessage()
+        ]
+        assert len(matching) == 1, (
+            'Expected exactly one escalation.queue record naming both the id and '
+            f'the task_id; got: {[r.getMessage() for r in caplog.records]}'
+        )
+
+    def test_conforming_stem_logs_no_divergence_line(self, tmp_path: Path, caplog):
+        """(b) Silent on the conforming majority — 97 of 102 construction sites.
+
+        A guard that fired on every submit would be noise nobody reads.  Filters
+        on the marker rather than counting records, since submit already emits an
+        unconditional 'Escalation submitted: ...' INFO of its own.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        with caplog.at_level(logging.INFO, logger='escalation.queue'):
+            queue.submit(self._esc('esc-42-1', '42'))
+
+        divergence = [r for r in caplog.records if self.MARKER in r.getMessage()]
+        assert not divergence, (
+            'A conforming id must not log a divergence line; got: '
+            f'{[r.getMessage() for r in divergence]}'
+        )
+
+    def test_divergent_submit_is_still_written_and_retrievable(self, tmp_path: Path):
+        """(c) OBSERVABILITY ONLY — the guard must never reject and never raise.
+
+        The five divergent production sites are legitimate by design.  Turning
+        this into enforcement would break them, which is why the record must
+        still land and still be findable BY ITS STORED task_id.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+
+        queue.submit(self._esc('esc-curator-1', 'task-curator'))
+
+        assert queue.get('esc-curator-1') is not None, (
+            'the divergent record must still be written'
+        )
+        assert 'esc-curator-1' in {e.id for e in queue.get_by_task('task-curator')}, (
+            'the divergent record must still be retrievable by its STORED task_id'
+        )
+
+
 class TestSubmitResolveAdoptLock:
     """Spy test: submit, submit_resolved, and resolve must call escalation_id_lock with correct id."""
 
@@ -4863,6 +6189,158 @@ class TestSubmitResolveAdoptLock:
         assert any(eid == 'esc-3-1' for _, eid in acquired), (
             f'Expected lock acquisition for esc-3-1; got {acquired}'
         )
+
+
+class TestPatchResolutionMetadataLock:
+    """patch_resolution_metadata must serialize its read-modify-write per id.
+
+    It is the LONE mutator in this module that did not take
+    ``escalation_id_lock`` — submit, resolve, park, submit_resolved,
+    add_members_to_l2, stamp_triage, attach_dedupe_child and
+    note_suppressed_refile all do.  Its read-modify-write is on the FULL record,
+    so an unlocked interleave with any of them drops the loser's change
+    wholesale: not just the two patched fields, but every field the loser's
+    in-memory copy carried.
+    """
+
+    def _resolved(self, queue: EscalationQueue, esc_id: str = 'esc-1-1') -> Escalation:
+        """Seed an ARCHIVED, resolved record.
+
+        patch_resolution_metadata returns None for anything still pending, so a
+        pending record would make these tests vacuous.
+        """
+        esc = _make_escalation(esc_id, level=1)
+        esc.category = 'provenance_unattributed'
+        esc.citation_sha = 'b' * 40
+        _submit_escalation(queue, esc)
+        resolved = queue.resolve(esc_id, 'confirmed benign', resolved_by='escalation-watcher-auto')
+        assert resolved is not None
+        return resolved
+
+    def test_patch_resolution_metadata_acquires_lock_for_escalation_id(self, tmp_path: Path):
+        """(a) The cheap direct assertion: a lock is acquired for the right id.
+
+        Paired with (b) on purpose — on its own this would pass even if the lock
+        wrapped nothing at all.
+        """
+        import escalation.queue as queue_mod
+        from escalation.queue import escalation_id_lock as real_lock
+
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._resolved(queue)  # seed WITHOUT the spy
+
+        acquired: list[tuple[Path, str]] = []
+
+        @contextlib.contextmanager
+        def recording_lock(queue_dir: Path, escalation_id: str):
+            acquired.append((queue_dir, escalation_id))
+            with real_lock(queue_dir, escalation_id):
+                yield
+
+        with patch.object(queue_mod, 'escalation_id_lock', recording_lock):
+            queue.patch_resolution_metadata(
+                'esc-1-1', resolved_by='steward-patch', resolution_turns=5,
+            )
+
+        assert any(eid == 'esc-1-1' for _, eid in acquired), (
+            f'Expected lock acquisition for esc-1-1; got {acquired}'
+        )
+
+    @pytest.mark.timeout(30)
+    def test_patch_holds_the_lock_across_its_whole_read_modify_write(self, tmp_path: Path, monkeypatch):
+        """(b) The SEMANTIC test — the lock must span read..write, not just exist.
+
+        Deliberately NOT the probabilistic two-process shape used by
+        TestAttachDedupeChildConcurrency, for a reason specific to this method:
+        both fields it patches are idempotent last-write-wins SETs, so a
+        patch-vs-patch race produces the correct final value either way and a
+        lost update is INVISIBLE.  The defect is observable only against a
+        mutator whose loss shows, so this races the patch against
+        note_suppressed_refile's ``refiles_suppressed`` INCREMENT.
+
+        Timing is then made deterministic by interposing on the instance's
+        _atomic_write_path, which launches the child BETWEEN the patch's read
+        and its write:
+
+        - WITHOUT the lock: the child finds the sidecar free, bumps 0->1 and
+          writes; the patch's real write then lands its stale in-memory copy and
+          the increment is LOST.  refiles_suppressed reads 0 EVERY time.
+        - WITH the lock: the child BLOCKS on the flock, the 3s wait times out,
+          the patch completes and releases, and the child then bumps on top of
+          the patched record.  refiles_suppressed reads 1 and resolved_by reads
+          'steward-patch' EVERY time.
+
+        The ~3s wait is paid only on the green path.  This shape is what
+        _suppressed_refile_child.py's own docstring records as the fix for a
+        MEASURED failure mode: two processes that never actually overlap make a
+        concurrency test pass even with the lock deleted.
+        """
+        queue_dir = tmp_path / 'queue'
+        queue = EscalationQueue(queue_dir)
+        self._resolved(queue)
+
+        env = os.environ.copy()
+        src_path = str(Path(__file__).parent.parent / 'src')
+        existing = env.get('PYTHONPATH', '')
+        env['PYTHONPATH'] = f'{src_path}:{existing}' if existing else src_path
+
+        # Pre-create the go-file: the child is barrier-aware, and here we want it
+        # to run IMMEDIATELY on launch rather than park.  The ready-file path is
+        # required by its CLI but nothing waits on it.
+        go = tmp_path / 'go'
+        go.write_text('go')
+        ready = tmp_path / 'ready-child'
+
+        real_write = queue._atomic_write_path
+        launched: list[subprocess.Popen] = []
+
+        def interposing_write(path: Path, json_text: str, *, durable: bool = False) -> None:
+            # Fire once, on the patch's own write — between its read and its write.
+            if not launched:
+                proc = subprocess.Popen(
+                    [
+                        sys.executable, str(_SUPPRESSED_REFILE_CHILD), str(queue_dir),
+                        'esc-1-1', '1', str(ready), str(go),
+                    ],
+                    env=env,
+                )
+                launched.append(proc)
+                # Returns fast when the sidecar is FREE (the unlocked bug);
+                # times out when the patch is correctly holding it.  Either way
+                # the real write below runs — the timeout IS the green path.
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=3)
+            real_write(path, json_text, durable=durable)
+
+        monkeypatch.setattr(queue, '_atomic_write_path', interposing_write)
+
+        try:
+            queue.patch_resolution_metadata('esc-1-1', resolved_by='steward-patch')
+            assert launched, 'the interposing write never fired — the test is vacuous'
+            rc = launched[0].wait(timeout=15)
+        finally:
+            for proc in launched:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+        assert rc == 0, f'child exited rc={rc} (rc=3 means the barrier wedged)'
+
+        record = queue.get('esc-1-1')
+        assert record is not None
+        assert record.refiles_suppressed == 1, (
+            'the concurrent locked INCREMENT was clobbered by the unlocked patch: '
+            f'expected refiles_suppressed=1, got {record.refiles_suppressed}'
+        )
+        assert record.resolved_by == 'steward-patch', (
+            f"the patch's own write was lost: resolved_by={record.resolved_by!r}"
+        )
+
+        # No resurrection: the record stays where it lives, in exactly one place.
+        assert not (queue.queue_dir / 'esc-1-1.json').exists(), (
+            'patching an archived record must not resurrect it into the queue root'
+        )
+        archived = list(queue.queue_dir.glob('archive/*/esc-1-1.json'))
+        assert len(archived) == 1, f'expected exactly one archive copy, found {archived}'
 
 
 class TestArchiveListingMemoisation:
@@ -6345,4 +7823,1042 @@ class TestNoteSuppressedRefile:
         )
         assert record.status == 'resolved', (
             f'the concurrent bumps disturbed the adjudication: {record.status!r}'
+        )
+
+
+class TestResolveOutcomeOutParam:
+    """`resolve(..., outcome=...)` reports what the call DID, on every return path.
+
+    An OUT-PARAM for the same reason `AmendmentOutcome` is one (see its
+    docstring): the `Escalation` is `resolve()`'s primary return value and every
+    existing call site reads it directly, and the facts a caller wants —
+    "did my text actually apply?" — are only exact when computed INSIDE
+    `escalation_id_lock`.  Re-deriving them in `server.resolve_issue` from a
+    pre-call `queue.get` would be a real TOCTOU: this queue is built for
+    cross-process mutators, so a concurrent auto-dismiss landing between the
+    pre-read and the call makes the reported flag wrong.
+    """
+
+    @staticmethod
+    def _poisoned() -> ResolveOutcome:
+        """A pre-seeded outcome whose every key is WRONG.
+
+        Seeding the opposite of the expected value is what makes "the key was
+        left stale on this return path" distinguishable from "the key happens
+        to already hold the right value".
+        """
+        return {
+            'applied': True,
+            'prior_status': 'poison',
+            'prior_resolved_by': 'poison',
+            'late_resolution_captured': True,
+            'resolution_class_corrected': 'poison',
+        }
+
+    def test_unknown_id_reports_not_applied_with_no_prior_state(self, tmp_path: Path):
+        """(a) The not-found early return still resets every key."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        out = self._poisoned()
+
+        assert queue.resolve('esc-nope-1', 'never lands', outcome=out) is None
+
+        assert out['applied'] is False, f'nothing was applied: {out}'
+        assert out['prior_status'] is None, f'there was no prior record: {out}'
+        assert out['prior_resolved_by'] is None, f'there was no prior record: {out}'
+        assert out['late_resolution_captured'] is False, f'nothing was captured: {out}'
+        assert out['resolution_class_corrected'] is None, f'nothing was corrected: {out}'
+
+    def test_pending_record_reports_applied(self, tmp_path: Path):
+        """(b) The ordinary path: the resolution took effect."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1'))
+        out = self._poisoned()
+
+        result = queue.resolve('esc-1-1', 'Fixed', resolved_by='interactive', outcome=out)
+
+        assert result is not None and result.status == 'resolved'
+        assert out['applied'] is True, f'a pending record accepts the resolve: {out}'
+        assert out['prior_status'] == 'pending', f'prior status must be exact: {out}'
+        assert out['prior_resolved_by'] is None, (
+            f'an unresolved record has no prior resolver: {out}'
+        )
+        assert out['late_resolution_captured'] is False, (
+            f'nothing was captured — the text APPLIED: {out}'
+        )
+        assert out['resolution_class_corrected'] is None, f'nothing was corrected: {out}'
+
+    def test_already_terminal_record_reports_not_applied_and_echoes_prior_state(
+        self, tmp_path: Path,
+    ):
+        """(c) The already-terminal branch reports the state that WON the race."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1'))
+        queue.resolve('esc-1-1', 'Fixed once', resolved_by='interactive')
+
+        out = self._poisoned()
+        result = queue.resolve('esc-1-1', 'Fixed again', resolved_by='interactive', outcome=out)
+
+        # The stored record is still what comes back — the contract
+        # `TestResolveIdempotent` pins is unchanged.
+        assert result is not None
+        assert result.resolution == 'Fixed once'
+        assert out['applied'] is False, (
+            f'the second resolve is a no-op and must say so: {out}'
+        )
+        assert out['prior_status'] == 'resolved', (
+            f'prior_status names the state that won: {out}'
+        )
+        assert out['prior_resolved_by'] == 'interactive', (
+            f'prior_resolved_by names WHO won: {out}'
+        )
+
+    def test_existing_call_sites_stay_byte_compatible(self, tmp_path: Path):
+        """(d) The out-param changed nothing for the callers that ignore it.
+
+        `resolve()` has callers that pass positionally (`resolve(id, text,
+        dismiss)`), plus its own member cascade and `dismiss_all_pending` — none
+        of which want the out-param.  Keyword-only with a None default is what
+        keeps them untouched, asserted the way those callers experience it: a
+        third POSITIONAL argument still means `dismiss` (it would have meant
+        `outcome` had the new parameter been added positionally), and a call
+        that passes no out-param at all still resolves exactly as before.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1'))
+        queue.submit(_make_escalation('esc-1-2'))
+
+        positional = queue.resolve('esc-1-1', 'Fixed', True)
+        assert positional is not None and positional.status == 'dismissed', (
+            'the third positional argument must still bind to dismiss: '
+            f'{positional and positional.status!r}'
+        )
+
+        omitted = queue.resolve('esc-1-2', 'Fixed')
+        assert omitted is not None and omitted.status == 'resolved', (
+            'a call with no out-param must behave exactly as before: '
+            f'{omitted and omitted.status!r}'
+        )
+
+
+class TestResolveCapturesLateResolution:
+    """The esc-3902-1 shape at the queue level: a late resolve is CAPTURED, not dropped.
+
+    THE RACE.  The W9-δ steward auto-dismiss closes a capped L0 with
+    `resolved_by='auto-dismissed'`.  A `resolve_issue` already in flight from
+    the killed agent session lands microseconds later.  `resolve()` correctly
+    refuses to re-close the record — its status check is an atomic check-and-set
+    inside `escalation_id_lock` — but it also used to DISCARD the incoming text,
+    so the steward's actual finding was destroyed and the record kept the
+    `resolution_class='benign'` the automated dismissal derived.
+    """
+
+    LATE_TEXT = "the steward's real finding: the verify command was never run"
+    LATE_RESOLVER = 'claude-task-3902-steward'
+
+    def _auto_dismissed(self, tmp_path: Path) -> EscalationQueue:
+        """A queue holding one L0 an automated sweep has already dismissed."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-3902-1', task_id='3902'))
+        queue.resolve(
+            'esc-3902-1',
+            'Auto-dismissed: steward interrupted (attempt cap)',
+            dismiss=True,
+            resolved_by='auto-dismissed',
+        )
+        return queue
+
+    def test_late_substantive_resolve_is_captured(self, tmp_path: Path, caplog):
+        """(a)(b)(c)(e) The text survives, the terminal state does not move, and it is loud."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-3902-1', task_id='3902'))
+        queue.resolve(
+            'esc-3902-1',
+            'Auto-dismissed: steward interrupted (attempt cap)',
+            dismiss=True,
+            resolved_by='auto-dismissed',
+        )
+        dismissed = queue.get('esc-3902-1')
+        assert dismissed is not None
+        stored_resolved_at = dismissed.resolved_at
+        assert stored_resolved_at is not None, 'setup: the dismissal must be stamped'
+
+        out: ResolveOutcome = {
+            'applied': True, 'prior_status': None, 'prior_resolved_by': None,
+            'late_resolution_captured': False, 'resolution_class_corrected': None,
+        }
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            returned = queue.resolve(
+                'esc-3902-1', self.LATE_TEXT,
+                resolved_by=self.LATE_RESOLVER, outcome=out,
+            )
+
+        record = queue.get('esc-3902-1')
+        assert record is not None
+
+        # --- (a) exactly ONE entry, carrying the incoming facts.
+        assert len(record.late_resolutions) == 1, (
+            f'expected exactly one captured late resolution: {record.late_resolutions!r}'
+        )
+        entry = record.late_resolutions[0]
+        assert entry['resolution'] == self.LATE_TEXT, (
+            f"the steward's finding was lost or mangled: {entry!r}"
+        )
+        assert entry['resolved_by'] == self.LATE_RESOLVER, f'wrong attribution: {entry!r}'
+        assert entry['dismiss'] is False, f'the late call did not ask to dismiss: {entry!r}'
+        # The timestamp is stamped by the QUEUE at write time — a caller cannot
+        # backdate a capture, the same contract Amendment/stamp_triage carry.
+        stamped = datetime.fromisoformat(entry['timestamp'])
+        assert stamped.tzinfo is not None, f'timestamp must be tz-aware: {entry!r}'
+        assert stamped >= datetime.fromisoformat(stored_resolved_at), (
+            f'the capture cannot predate the dismissal it followed: {entry!r}'
+        )
+
+        # --- (b) the record's OWN terminal state is untouched.  Downstream
+        # waiters (_resolve_callback -> harness -> the workflow resume) already
+        # consumed it; flipping it now would rewrite history already acted on.
+        assert record.status == 'dismissed', f'status must not move: {record.status!r}'
+        assert record.resolution == 'Auto-dismissed: steward interrupted (attempt cap)', (
+            f'the stored resolution must not be overwritten: {record.resolution!r}'
+        )
+        assert record.resolved_at == stored_resolved_at, (
+            f'resolved_at must not move: {record.resolved_at!r}'
+        )
+        assert record.resolved_by == 'auto-dismissed', (
+            f'resolved_by must not move: {record.resolved_by!r}'
+        )
+
+        # --- (c) the return value is still the stored record; the outcome tells
+        # the caller its text did NOT apply but WAS preserved.
+        assert returned is not None
+        assert returned.status == 'dismissed'
+        assert out['applied'] is False, f'the late text did not apply: {out}'
+        assert out['late_resolution_captured'] is True, (
+            f'the caller must learn its text was captured late: {out}'
+        )
+        assert out['prior_resolved_by'] == 'auto-dismissed', (
+            f'the outcome names the automated dismisser that won: {out}'
+        )
+
+        # --- (e) the capture is LOUD as well as durable.
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            'esc-3902-1' in m and 'auto-dismissed' in m and self.LATE_RESOLVER in m
+            for m in warnings
+        ), (
+            'expected a WARNING naming the escalation id, the stored '
+            f'auto-dismisser and the late resolver; got: {warnings}'
+        )
+
+    def test_capture_writes_in_place_with_no_resurrected_root_copy(self, tmp_path: Path):
+        """(d) The write lands at the ARCHIVE path, never back in the queue root.
+
+        `_atomic_write` is hard-wired to `queue_dir/{id}.json`, so using it here
+        would write a SECOND copy beside the archived one — resurrecting a
+        closed record into the pending-scan surface and creating exactly the
+        orphan state `TestResolveIdempotent` exists to prevent.
+        """
+        queue = self._auto_dismissed(tmp_path)
+
+        archived_before = list((queue.queue_dir / 'archive').rglob('esc-3902-1.json'))
+        assert len(archived_before) == 1, f'setup: {archived_before}'
+
+        queue.resolve('esc-3902-1', self.LATE_TEXT, resolved_by=self.LATE_RESOLVER)
+
+        archived_after = list((queue.queue_dir / 'archive').rglob('esc-3902-1.json'))
+        assert len(archived_after) == 1, (
+            f'expected exactly one archive copy after the capture (no orphan), '
+            f'got {[str(p) for p in archived_after]}'
+        )
+        assert archived_after[0] == archived_before[0], (
+            f'archive path moved: {archived_before[0]} -> {archived_after[0]}'
+        )
+        assert not (queue.queue_dir / 'esc-3902-1.json').exists(), (
+            'the capture resurrected a root copy of an archived record — it '
+            'would reappear on the pending scan surface'
+        )
+
+        # And the capture is genuinely ON DISK, not merely on the in-memory
+        # object the call returned.
+        on_disk = Escalation.from_json(archived_after[0].read_text())
+        assert len(on_disk.late_resolutions) == 1, (
+            f'the capture did not reach disk: {on_disk.late_resolutions!r}'
+        )
+        assert on_disk.late_resolutions[0]['resolution'] == self.LATE_TEXT
+
+
+class TestLateResolutionCaptureFailsClosed:
+    """The capture WRITE did not land — so nothing may be reported as captured.
+
+    `_write_late_resolution` is fail-closed by contract: a missing
+    `_locate_path` or a raising write returns False, and the capture then rolls
+    back FOUR pieces of in-memory state (the entry list, the truncation
+    counter, the elision counter and the corrected stamp) so the record the
+    caller gets back is what is actually on disk.  Nothing else pins that, and
+    every way it can break is silent: a reported capture that never reached
+    disk, a returned record disagreeing with disk on one un-rolled-back field,
+    or the exception escaping and killing the `resolve()` it rode in on — the
+    call whose real business (reporting the record's terminal state) is already
+    done.
+    """
+
+    #: Long enough to be ELIDED, so the elision counter's rollback is
+    #: observable, and prefixed so the fail-closed WARNING can be identified.
+    LATE_TEXT = 'UNPERSISTABLE FINDING: ' + 'detail. ' * 300
+
+    def _break_the_write(self, monkeypatch, mode: str) -> None:
+        """Install one of the two ways `_write_late_resolution` returns False.
+
+        `missing_path` lets the FIRST `_locate_path` call through — the one
+        `resolve()`'s in-lock `get()` makes to read the record — and loses the
+        file for every call after it, which is exactly the window the
+        fail-closed branch defends: another process moved or removed the
+        archived file between that read and the capture's write.  A blanket
+        None would instead make `get()` itself miss, and `resolve()` would
+        return None long before reaching the code under test.
+        """
+        if mode == 'write_raises':
+            def _boom(self, path: Path, content: str) -> None:
+                raise OSError(28, 'No space left on device')
+            monkeypatch.setattr(EscalationQueue, '_atomic_write_path', _boom)
+            return
+
+        real_locate = EscalationQueue._locate_path
+        seen: list[str] = []
+
+        def _vanishing(self, escalation_id: str) -> Path | None:
+            seen.append(escalation_id)
+            return real_locate(self, escalation_id) if len(seen) == 1 else None
+
+        monkeypatch.setattr(EscalationQueue, '_locate_path', _vanishing)
+
+    def _at_the_cap(self, tmp_path: Path) -> EscalationQueue:
+        """A dismissed record already holding a FULL `late_resolutions` list.
+
+        At the cap the next capture would BOTH trim (moving
+        `late_resolutions_truncated`) and correct the stamp, so a rollback that
+        forgot either is observable rather than merely theoretical.  The
+        fillers pass `resolution_class='benign'` explicitly — a candidate equal
+        to the stored stamp is not a correction, so the record keeps the
+        DERIVED 'benign' the sweep left and the failing capture below is still
+        one the correction would fire on.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-3902-1', task_id='3902'))
+        queue.resolve(
+            'esc-3902-1', 'Auto-dismissed: steward interrupted (attempt cap)',
+            dismiss=True, resolved_by='auto-dismissed',
+        )
+        for i in range(_MAX_LATE_RESOLUTIONS):
+            queue.resolve(
+                'esc-3902-1', f'earlier finding {i}',
+                resolved_by='claude-task-3902-steward', resolution_class='benign',
+            )
+        return queue
+
+    @pytest.mark.parametrize('mode', ['write_raises', 'missing_path'])
+    def test_a_capture_that_never_reached_disk_is_not_reported_as_one(
+        self, tmp_path: Path, caplog, monkeypatch, mode: str,
+    ):
+        queue = self._at_the_cap(tmp_path)
+        before = queue.get('esc-3902-1')
+        assert before is not None
+        assert len(before.late_resolutions) == _MAX_LATE_RESOLUTIONS, 'setup: at the cap'
+        assert before.resolution_class == 'benign', f'setup: {before.resolution_class!r}'
+        self._break_the_write(monkeypatch, mode)
+
+        out: ResolveOutcome = {
+            'applied': True, 'prior_status': None, 'prior_resolved_by': None,
+            'late_resolution_captured': True, 'resolution_class_corrected': 'poison',
+        }
+        # The eight setup captures each logged a (correct) capture WARNING; this
+        # test asserts on what the FAILING one logs, so they are dropped first.
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            returned = queue.resolve(
+                'esc-3902-1', self.LATE_TEXT,
+                resolved_by='claude-task-3902-steward', outcome=out,
+            )
+        # The failure is armed for the capture ONLY — every assertion below
+        # reads the record back through the real code.
+        monkeypatch.undo()
+
+        # --- the resolve itself survives: a capture failure must not crash the
+        # call it rode in on, whose real business is already done.
+        assert returned is not None, 'the capture failure killed the resolve'
+        assert returned.status == 'dismissed'
+        assert returned.resolution == 'Auto-dismissed: steward interrupted (attempt cap)'
+
+        # --- nothing is reported as captured or corrected.
+        assert out['late_resolution_captured'] is False, (
+            f'the write did not land, so nothing was captured: {out}'
+        )
+        assert out['resolution_class_corrected'] is None, (
+            f'a rolled-back stamp was never corrected: {out}'
+        )
+        assert out['applied'] is False, f'the text still did not apply: {out}'
+        assert out['prior_resolved_by'] == 'auto-dismissed', (
+            f'the prior state is still reported exactly: {out}'
+        )
+
+        # --- all FOUR rolled-back fields, on the returned object AND on disk:
+        # a record that disagrees with disk is the silent half of this defect.
+        on_disk = queue.get('esc-3902-1')
+        assert on_disk is not None
+        for label, record in (('returned', returned), ('on-disk', on_disk)):
+            assert record.late_resolutions == before.late_resolutions, (
+                f'{label}: the unpersisted entry survived in memory: '
+                f'{record.late_resolutions!r}'
+            )
+            assert record.late_resolutions_truncated == 0, (
+                f'{label}: a trim that never reached disk was counted: '
+                f'{record.late_resolutions_truncated!r}'
+            )
+            assert record.late_resolutions_chars_elided == (
+                before.late_resolutions_chars_elided
+            ), (
+                f'{label}: an elision that never reached disk was counted: '
+                f'{record.late_resolutions_chars_elided!r}'
+            )
+            assert record.resolution_class == 'benign', (
+                f'{label}: the stamp was corrected for a capture that never '
+                f'landed: {record.resolution_class!r}'
+            )
+
+        # --- degraded to log-only, never silently lost.
+        warnings = [
+            r.getMessage() for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.WARNING
+        ]
+        assert any(
+            'esc-3902-1' in m and 'UNPERSISTABLE FINDING' in m for m in warnings
+        ), (
+            'the text that could not be persisted must survive in the log line '
+            f'that reports the failure; got: {warnings}'
+        )
+        assert not any('CAPTURED in late_resolutions' in m for m in warnings), (
+            f'nothing was captured, so no capture may be announced: {warnings}'
+        )
+
+
+class TestLateResolutionCapturePredicate:
+    """The NEGATIVES: the capture stays narrow, so it cannot become noise.
+
+    A high-signal forensic field is only high-signal while it stays rare.  Each
+    case below is a shape that ALREADY happens routinely in this system; if any
+    of them captured, `late_resolutions` would fill with entries nobody filed a
+    race about, and the one entry that matters would be indistinguishable.
+
+    Every case also re-asserts `TestResolveIdempotent`'s no-orphan-archive
+    guarantee: a suppressed capture must write NOTHING, not write a no-change
+    record to a fresh path.
+    """
+
+    LATE_TEXT = "the steward's real finding"
+
+    def _archive_state(self, queue: EscalationQueue, esc_id: str) -> tuple[list[Path], list[str]]:
+        """(archive paths, their bytes) — the on-disk footprint of *esc_id*."""
+        paths = sorted((queue.queue_dir / 'archive').rglob(f'{esc_id}.json'))
+        return paths, [p.read_text() for p in paths]
+
+    def _assert_nothing_written(
+        self, queue: EscalationQueue, esc_id: str,
+        before: tuple[list[Path], list[str]],
+    ) -> None:
+        """No entry appended, no orphan copy, and the on-disk BYTES unchanged."""
+        record = queue.get(esc_id)
+        assert record is not None
+        assert record.late_resolutions == [], (
+            f'capture must be suppressed for this shape: {record.late_resolutions!r}'
+        )
+        after = self._archive_state(queue, esc_id)
+        assert after[0] == before[0], (
+            f'archive layout changed: {before[0]} -> {after[0]}'
+        )
+        assert after[1] == before[1], 'on-disk bytes changed despite a suppressed capture'
+        assert not (queue.queue_dir / f'{esc_id}.json').exists(), (
+            'a suppressed capture resurrected a queue-root copy of an archived record'
+        )
+
+    def _seeded(
+        self, tmp_path: Path, *, dismiss: bool, resolved_by: str, resolution: str,
+    ) -> EscalationQueue:
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-3902-1', task_id='3902'))
+        queue.resolve('esc-3902-1', resolution, dismiss=dismiss, resolved_by=resolved_by)
+        return queue
+
+    def test_stored_human_resolver_does_not_capture(self, tmp_path: Path):
+        """(a) A HUMAN closed it, so a second resolve is an ordinary double-close.
+
+        `resolved_by='interactive'` classifies as tier 'human', not
+        'reaper-sweep'.  Without this conjunct every idempotent re-resolve of a
+        human-closed record would append an entry.
+        """
+        queue = self._seeded(
+            tmp_path, dismiss=True, resolved_by='interactive', resolution='closed by hand',
+        )
+        before = self._archive_state(queue, 'esc-3902-1')
+
+        queue.resolve('esc-3902-1', self.LATE_TEXT, resolved_by='claude-task-3902-steward')
+
+        self._assert_nothing_written(queue, 'esc-3902-1', before)
+
+    def test_stored_resolved_status_does_not_capture(self, tmp_path: Path):
+        """(b) Only a DISMISSAL loses information — a resolve already carries a finding."""
+        queue = self._seeded(
+            tmp_path, dismiss=False, resolved_by='auto-dismissed', resolution='closed',
+        )
+        before = self._archive_state(queue, 'esc-3902-1')
+
+        queue.resolve('esc-3902-1', self.LATE_TEXT, resolved_by='claude-task-3902-steward')
+
+        self._assert_nothing_written(queue, 'esc-3902-1', before)
+
+    def test_incoming_automated_dismissal_does_not_capture(self, tmp_path: Path):
+        """(c) An auto-dismisser re-closing an auto-dismissed record is routine.
+
+        THIS is the conjunct that keeps workflow.py's five idempotent
+        auto-dismiss backstops and test_workflow_escalated_steward_stall.py's
+        deliberate re-dismissals silent.  Without it they would each append an
+        entry every time they re-closed an already-closed record.
+        """
+        queue = self._seeded(
+            tmp_path, dismiss=True, resolved_by='auto-dismissed',
+            resolution='Auto-dismissed: steward interrupted',
+        )
+        before = self._archive_state(queue, 'esc-3902-1')
+
+        queue.resolve(
+            'esc-3902-1', 'Auto-dismissed: workflow backstop',
+            dismiss=True, resolved_by='auto-dismissed',
+        )
+
+        self._assert_nothing_written(queue, 'esc-3902-1', before)
+
+    def test_other_reaper_sweep_resolvers_are_also_excluded_incoming(self, tmp_path: Path):
+        """(c cont.) The exclusion is the TIER, not the literal 'auto-dismissed'.
+
+        Both sides derive from `classify.classify_resolver_tier`, so a future
+        member added to `_REAPER_SWEEP_RESOLVERS` is covered automatically
+        rather than silently starting to generate noise (INV-5).
+        """
+        queue = self._seeded(
+            tmp_path, dismiss=True, resolved_by='harness-orphan-reaper',
+            resolution='swept: orphaned',
+        )
+        before = self._archive_state(queue, 'esc-3902-1')
+
+        queue.resolve(
+            'esc-3902-1', 'swept again: orphaned',
+            dismiss=True, resolved_by='harness-escalation-revalidation-sweep',
+        )
+
+        self._assert_nothing_written(queue, 'esc-3902-1', before)
+
+    def test_empty_incoming_resolution_does_not_capture(self, tmp_path: Path):
+        """(d) There is nothing to preserve."""
+        queue = self._seeded(
+            tmp_path, dismiss=True, resolved_by='auto-dismissed',
+            resolution='Auto-dismissed: steward interrupted',
+        )
+        before = self._archive_state(queue, 'esc-3902-1')
+
+        queue.resolve('esc-3902-1', '', resolved_by='claude-task-3902-steward')
+
+        self._assert_nothing_written(queue, 'esc-3902-1', before)
+
+    def test_identical_incoming_resolution_does_not_capture(self, tmp_path: Path):
+        """(d cont.) A byte-identical retry preserves nothing the record lacks."""
+        stored = 'Auto-dismissed: steward interrupted (attempt cap)'
+        queue = self._seeded(
+            tmp_path, dismiss=True, resolved_by='auto-dismissed', resolution=stored,
+        )
+        before = self._archive_state(queue, 'esc-3902-1')
+
+        queue.resolve('esc-3902-1', stored, resolved_by='claude-task-3902-steward')
+
+        self._assert_nothing_written(queue, 'esc-3902-1', before)
+
+
+class TestCascadeForwardIsCapturedButNotReportedAsARace:
+    """An L2 member cascade is an ORDINARY close path — capture it, don't cry race.
+
+    `resolve()`'s cascade re-resolves every member of an L2 under
+    `l2-cascade:<id>`, so a member an automated sweep had already dismissed
+    passes the capture predicate.  That is deliberate: the text being forwarded
+    is the L2's own resolution, which can be a human's substantive finding about
+    the whole cluster — the same loss the capture exists to prevent, arriving
+    through a different door.  What must NOT happen is describing it as a late
+    arrival that beat a dismissal, at the WARNING level the genuine race owns:
+    the field's signal is defended in the LOG, not by dropping the finding.
+    """
+
+    MEMBER = 'esc-3902-member'
+    L2 = 'esc-3902-l2'
+
+    def _capture_lines(self, caplog) -> list[tuple[int, str]]:
+        """(level, message) for every queue log line reporting a capture."""
+        return [
+            (r.levelno, r.getMessage()) for r in caplog.records
+            if r.name == 'escalation.queue' and 'CAPTURED in late_resolutions' in r.getMessage()
+        ]
+
+    def _l2_over_an_auto_dismissed_member(self, tmp_path: Path) -> EscalationQueue:
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation(self.MEMBER, task_id='3902', level=1))
+        l2 = _make_escalation(self.L2, task_id='3902', level=2)
+        l2.members = [self.MEMBER]
+        queue.submit(l2)
+        queue.resolve(
+            self.MEMBER, 'Auto-dismissed: steward interrupted (attempt cap)',
+            dismiss=True, resolved_by='auto-dismissed',
+        )
+        return queue
+
+    def test_cascade_forward_is_captured_and_logged_at_info(self, tmp_path: Path, caplog):
+        """(a) The human's cluster finding reaches the member — at INFO, as a forward."""
+        queue = self._l2_over_an_auto_dismissed_member(tmp_path)
+
+        with caplog.at_level(logging.INFO, logger='escalation.queue'):
+            queue.resolve(
+                self.L2, 'root cause was a stale lockfile across the whole cluster',
+                resolved_by='interactive',
+            )
+
+        record = queue.get(self.MEMBER)
+        assert record is not None
+        # The finding is NOT dropped — that is what the cascade is carrying.
+        assert len(record.late_resolutions) == 1, (
+            f"the L2's resolution must reach the already-closed member: "
+            f'{record.late_resolutions!r}'
+        )
+        entry = record.late_resolutions[0]
+        assert entry['resolution'] == 'root cause was a stale lockfile across the whole cluster'
+        assert entry['resolved_by'] == f'l2-cascade:{self.L2}'
+        assert entry['prior_resolution_class'] == 'benign'
+        assert record.resolution_class == 'actionable', (
+            f'a human resolve cascading onto a swept member corrects the derived '
+            f'stamp like any other capture: {record.resolution_class!r}'
+        )
+
+        # …but it is reported as the routine forward it is.
+        lines = self._capture_lines(caplog)
+        assert len(lines) == 1, f'expected exactly one capture line: {lines}'
+        level, message = lines[0]
+        assert level == logging.INFO, (
+            f'a cascade forward is not a race and must not claim the WARNING the '
+            f'genuine race owns: {logging.getLevelName(level)} — {message}'
+        )
+        assert 'CASCADE forward' in message, (
+            f'the line must name what actually happened: {message}'
+        )
+        assert 'arriving after that automated dismissal' not in message, (
+            f'no dismissal was beaten here — nothing raced: {message}'
+        )
+        assert self.MEMBER in message and f'l2-cascade:{self.L2}' in message, (
+            f'the line must name the member and the cascade it came from: {message}'
+        )
+
+    def test_a_genuine_late_arrival_still_warns(self, tmp_path: Path, caplog):
+        """(b) The race the field exists for keeps its WARNING, unchanged.
+
+        The INFO demotion is scoped to the cascade tier by
+        `classify_resolver_tier`; a direct resolve from an agent session is the
+        esc-3902-1 shape and must stay loud.
+        """
+        queue = self._l2_over_an_auto_dismissed_member(tmp_path)
+
+        with caplog.at_level(logging.INFO, logger='escalation.queue'):
+            queue.resolve(
+                self.MEMBER, "the steward's real finding",
+                resolved_by='claude-task-3902-steward',
+            )
+
+        lines = self._capture_lines(caplog)
+        assert len(lines) == 1, f'expected exactly one capture line: {lines}'
+        level, message = lines[0]
+        assert level == logging.WARNING, (
+            f'a late arrival that beat nothing but the sweep is the reported harm '
+            f'and stays loud: {logging.getLevelName(level)} — {message}'
+        )
+        assert 'arriving after that automated dismissal' in message, (
+            f'the line must name the race it is reporting: {message}'
+        )
+        assert 'CASCADE' not in message, f'nothing cascaded here: {message}'
+
+
+class TestLateResolutionCorrectsResolutionClass:
+    """The reported harm: "recorded as resolution_class=benign instead of carrying
+    the steward's actual finding".
+
+    `resolved_by='auto-dismissed'` classifies as tier 'reaper-sweep', which
+    `default_resolution_class_for_resolver` maps to 'benign' — so the sweep's
+    own stamp says "nothing actionable happened here" about a record whose
+    actual resolution was a real finding.  Capturing the text without correcting
+    the stamp would leave the dashboard aggregation still reading the lie.
+    """
+
+    LATE_TEXT = "the steward's real finding: verify never ran"
+    LATE_RESOLVER = 'claude-task-3902-steward'
+
+    def _auto_dismissed(
+        self, tmp_path: Path, *, stored_class: str | None = None,
+    ) -> EscalationQueue:
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-3902-1', task_id='3902'))
+        queue.resolve(
+            'esc-3902-1', 'Auto-dismissed: steward interrupted (attempt cap)',
+            dismiss=True, resolved_by='auto-dismissed', resolution_class=stored_class,
+        )
+        return queue
+
+    @staticmethod
+    def _outcome() -> ResolveOutcome:
+        return {
+            'applied': True, 'prior_status': None, 'prior_resolved_by': None,
+            'late_resolution_captured': False, 'resolution_class_corrected': 'poison',
+        }
+
+    def test_derived_benign_is_corrected_to_actionable(self, tmp_path: Path):
+        """(a)(d)(e) The derived stamp is re-stamped, the prior one preserved."""
+        queue = self._auto_dismissed(tmp_path)
+        seeded = queue.get('esc-3902-1')
+        assert seeded is not None
+        assert seeded.resolution_class == 'benign', (
+            f'setup: the auto-dismiss must derive benign, got {seeded.resolution_class!r}'
+        )
+
+        out = self._outcome()
+        queue.resolve(
+            'esc-3902-1', self.LATE_TEXT, resolved_by=self.LATE_RESOLVER, outcome=out,
+        )
+
+        record = queue.get('esc-3902-1')
+        assert record is not None
+        assert record.resolution_class == 'actionable', (
+            f'the derived benign stamp must be corrected: {record.resolution_class!r}'
+        )
+        assert out['resolution_class_corrected'] == 'actionable', (
+            f'the caller must learn the stamp was re-derived: {out}'
+        )
+        # (d) the correction DESTROYS nothing — the superseded stamp is on the entry.
+        assert record.late_resolutions[0]['prior_resolution_class'] == 'benign', (
+            f'the superseded stamp must be preserved: {record.late_resolutions[0]!r}'
+        )
+        # (e) the dashboard aggregation now reads the truth rather than the lie.
+        assert effective_benign(record) == ('actionable', 'stamped'), (
+            f'effective_benign must report the corrected stamp: {effective_benign(record)}'
+        )
+
+    def test_explicit_incoming_class_wins_over_the_actionable_default(self, tmp_path: Path):
+        """(b) 'actionable' is the DEFAULT, not an override of the caller."""
+        queue = self._auto_dismissed(tmp_path)
+
+        out = self._outcome()
+        queue.resolve(
+            'esc-3902-1', self.LATE_TEXT, resolved_by=self.LATE_RESOLVER,
+            resolution_class='stale-strand', outcome=out,
+        )
+
+        record = queue.get('esc-3902-1')
+        assert record is not None
+        assert record.resolution_class == 'stale-strand', (
+            f'an explicit incoming class must win: {record.resolution_class!r}'
+        )
+        assert out['resolution_class_corrected'] == 'stale-strand', f'{out}'
+        assert record.late_resolutions[0]['prior_resolution_class'] == 'benign'
+
+    @pytest.mark.parametrize('stored_class', ['actionable', 'moot-terminal-subject'])
+    def test_a_non_benign_stamp_is_never_overwritten(self, tmp_path: Path, stored_class: str):
+        """(c) Only the DERIVED benign is corrected.
+
+        'moot-terminal-subject' is task 2724's deliberately-distinct sweep stamp:
+        it says something specific about WHY the record was closed, and silently
+        flattening it to 'actionable' would destroy that distinction.  An
+        'actionable' stamp is already the truth this correction aims at.
+        """
+        queue = self._auto_dismissed(tmp_path, stored_class=stored_class)
+
+        out = self._outcome()
+        queue.resolve(
+            'esc-3902-1', self.LATE_TEXT, resolved_by=self.LATE_RESOLVER, outcome=out,
+        )
+
+        record = queue.get('esc-3902-1')
+        assert record is not None
+        assert record.resolution_class == stored_class, (
+            f'a non-benign stamp must survive: {record.resolution_class!r}'
+        )
+        assert out['resolution_class_corrected'] is None, (
+            f'nothing was corrected, so nothing must be reported: {out}'
+        )
+        # The TEXT is still captured — the capture and the correction are
+        # independent; only the correction is conditional on the stamp.
+        assert len(record.late_resolutions) == 1, (
+            f'the text must still be preserved: {record.late_resolutions!r}'
+        )
+        assert record.late_resolutions[0]['prior_resolution_class'] is None, (
+            f'no stamp was superseded, so none is recorded: {record.late_resolutions[0]!r}'
+        )
+
+    def test_a_candidate_equal_to_the_stored_stamp_is_not_a_correction(
+        self, tmp_path: Path, caplog,
+    ):
+        """(a)(b)(c) Re-deriving the SAME stamp is not a correction, and is not reported as one.
+
+        `resolution_class='benign'` on a record already stamped the derived
+        'benign' passes the capture predicate — the TEXT is a genuine late
+        finding — but nothing about the stamp changed.  Reporting a correction
+        here would contradict both documented contracts: `ResolveOutcome`'s
+        'the stamp this call re-derived, or None' (queue.py:301) and the
+        entry's `prior_resolution_class`, which names the stamp this capture
+        SUPERSEDED.  Nothing was superseded.
+        """
+        queue = self._auto_dismissed(tmp_path)
+
+        out = self._outcome()
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            queue.resolve(
+                'esc-3902-1', self.LATE_TEXT, resolved_by=self.LATE_RESOLVER,
+                resolution_class='benign', outcome=out,
+            )
+
+        record = queue.get('esc-3902-1')
+        assert record is not None
+        # (a) nothing was re-derived, so nothing is reported as re-derived.
+        assert out['resolution_class_corrected'] is None, (
+            f'a candidate equal to the stored stamp is not a correction: {out}'
+        )
+        assert record.late_resolutions[0]['prior_resolution_class'] is None, (
+            f'no stamp was superseded, so none is recorded: {record.late_resolutions[0]!r}'
+        )
+        # (b) capture and correction stay independent — the TEXT still lands.
+        assert out['late_resolution_captured'] is True, (
+            f'the text is still a genuine late finding: {out}'
+        )
+        assert len(record.late_resolutions) == 1, (
+            f'exactly one entry must be captured: {record.late_resolutions!r}'
+        )
+        assert record.late_resolutions[0]['resolution'] == self.LATE_TEXT
+        assert record.resolution_class == 'benign', (
+            f'the stamp is unchanged, not re-written: {record.resolution_class!r}'
+        )
+        # (c) a log reader is not told about a change that did not happen.
+        messages = [
+            r.getMessage() for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.WARNING
+        ]
+        assert any('CAPTURED in late_resolutions' in m for m in messages), (
+            f'setup: the capture WARNING must have fired: {messages}'
+        )
+        assert not any('resolution_class corrected' in m for m in messages), (
+            f'no correction happened, so none may be logged: {messages}'
+        )
+
+    def test_the_l2_member_cascade_reaches_the_no_op_correction_for_real(
+        self, tmp_path: Path, caplog,
+    ):
+        """(d) The same shape, driven end-to-end rather than via an explicit kwarg.
+
+        Resolving a reaper-sweep L2 forwards its OWN derived 'benign' stamp to
+        each member (queue.py:1476) under `resolved_by='l2-cascade:<id>'`, whose
+        tier is 'cascade' — so the incoming side of the capture predicate passes
+        and a member already auto-dismissed 'benign' gets a candidate identical
+        to its stored stamp.  This is how the no-op arises in production, with
+        no caller ever typing `resolution_class='benign'`.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        member = _make_escalation('esc-3902-member', task_id='3902', level=1)
+        queue.submit(member)
+        l2 = _make_escalation('esc-3902-l2', task_id='3902', level=2)
+        l2.members = ['esc-3902-member']
+        queue.submit(l2)
+        queue.resolve(
+            'esc-3902-member', 'Auto-dismissed: steward interrupted (attempt cap)',
+            dismiss=True, resolved_by='auto-dismissed',
+        )
+        seeded = queue.get('esc-3902-member')
+        assert seeded is not None
+        assert seeded.resolution_class == 'benign', f'setup: {seeded.resolution_class!r}'
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            queue.resolve(
+                'esc-3902-l2', 'aged out', dismiss=True, resolved_by='auto-dismissed',
+            )
+
+        parent = queue.get('esc-3902-l2')
+        assert parent is not None
+        assert parent.resolution_class == 'benign', f'setup: {parent.resolution_class!r}'
+        record = queue.get('esc-3902-member')
+        assert record is not None
+        assert len(record.late_resolutions) == 1, (
+            f'the cascade text is still captured: {record.late_resolutions!r}'
+        )
+        assert record.resolution_class == 'benign', (
+            f'the member stamp must be untouched: {record.resolution_class!r}'
+        )
+        assert record.late_resolutions[0]['prior_resolution_class'] is None, (
+            f'no stamp was superseded: {record.late_resolutions[0]!r}'
+        )
+        messages = [
+            r.getMessage() for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.WARNING
+        ]
+        assert not any('resolution_class corrected' in m for m in messages), (
+            f'no correction happened on the cascade path either: {messages}'
+        )
+
+    def test_patch_resolution_metadata_preserves_the_capture_and_correction(
+        self, tmp_path: Path,
+    ):
+        """(f) The new field rides along through that method's full-record RMW.
+
+        `patch_resolution_metadata` is a `from_json` -> mutate -> `to_json`
+        rewrite of the WHOLE record (serialised under the same per-id lock since
+        commit 226c1ad696), and the steward calls it on records in exactly this
+        family.  A field it did not know about must survive it.
+        """
+        queue = self._auto_dismissed(tmp_path)
+        queue.resolve('esc-3902-1', self.LATE_TEXT, resolved_by=self.LATE_RESOLVER)
+
+        patched = queue.patch_resolution_metadata(
+            'esc-3902-1', resolved_by='claude-task-3902-steward-repatched',
+        )
+
+        assert patched is not None
+        assert patched.resolved_by == 'claude-task-3902-steward-repatched', 'setup: patch applied'
+        assert len(patched.late_resolutions) == 1, (
+            f'the RMW clobbered the capture: {patched.late_resolutions!r}'
+        )
+        assert patched.late_resolutions[0]['resolution'] == self.LATE_TEXT
+        assert patched.resolution_class == 'actionable', (
+            f'the RMW clobbered the correction: {patched.resolution_class!r}'
+        )
+
+        # And on disk, not merely on the returned object.
+        record = queue.get('esc-3902-1')
+        assert record is not None
+        assert len(record.late_resolutions) == 1
+        assert record.resolution_class == 'actionable'
+
+
+class TestLateResolutionBounds:
+    """`late_resolutions` is SIZE-bounded, and every loss is a durable fact.
+
+    The same no-silent-cap policy `_MAX_AMENDMENTS` already models: the oldest
+    entries are shed, each drop is counted ON THE RECORD (not merely logged), an
+    over-long entry is elided with an in-band marker naming what was dropped, and
+    the dropped character total is likewise durable — so `len(list) + truncated`
+    never plateaus and INV-8 (loss is assertable from the record) holds.
+    """
+
+    def _auto_dismissed(self, tmp_path: Path) -> EscalationQueue:
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-3902-1', task_id='3902'))
+        queue.resolve(
+            'esc-3902-1', 'Auto-dismissed: steward interrupted (attempt cap)',
+            dismiss=True, resolved_by='auto-dismissed',
+        )
+        return queue
+
+    def test_oldest_entries_are_shed_at_the_cap_and_counted(self, tmp_path: Path, caplog):
+        """(a)(c) Past the cap the OLDEST go, each drop counted, and it is loud.
+
+        The list is read from DISK after every single call, so an
+        over-cap list that existed durably even momentarily — a trim in a
+        second write rather than the same one as the append — would be caught.
+        """
+        queue = self._auto_dismissed(tmp_path)
+        overshoot = 3
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            for i in range(_MAX_LATE_RESOLUTIONS + overshoot):
+                queue.resolve(
+                    'esc-3902-1', f'finding number {i}',
+                    resolved_by='claude-task-3902-steward',
+                )
+                on_disk = queue.get('esc-3902-1')
+                assert on_disk is not None
+                assert len(on_disk.late_resolutions) <= _MAX_LATE_RESOLUTIONS, (
+                    f'an over-cap list existed on disk after call {i}: '
+                    f'{len(on_disk.late_resolutions)} > {_MAX_LATE_RESOLUTIONS} — '
+                    'the trim must share the append\'s single write'
+                )
+
+        record = queue.get('esc-3902-1')
+        assert record is not None
+        assert len(record.late_resolutions) == _MAX_LATE_RESOLUTIONS
+        assert record.late_resolutions_truncated == overshoot, (
+            f'every drop must be counted on the record: '
+            f'{record.late_resolutions_truncated!r} != {overshoot}'
+        )
+        # OLDEST-shed: the survivors are the most recent window, and the true
+        # total (kept + truncated) never plateaus.
+        kept = [e['resolution'] for e in record.late_resolutions]
+        assert kept == [
+            f'finding number {i}'
+            for i in range(overshoot, _MAX_LATE_RESOLUTIONS + overshoot)
+        ], f'expected the most-recent window, got {kept}'
+        assert len(record.late_resolutions) + record.late_resolutions_truncated == (
+            _MAX_LATE_RESOLUTIONS + overshoot
+        ), 'the TRUE total must keep climbing past the cap'
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('shed' in m and 'esc-3902-1' in m for m in warnings), (
+            f'the shed must be LOUD as well as counted; got: {warnings}'
+        )
+
+    def test_over_long_resolution_is_elided_in_band_and_the_loss_is_durable(
+        self, tmp_path: Path, caplog,
+    ):
+        """(b)(c) Elision is MARKED, and the dropped characters land on the record.
+
+        A silently truncated finding is worse than a dropped one: a reader
+        cannot tell "this is all of it" from "this is the head of it".
+        """
+        queue = self._auto_dismissed(tmp_path)
+        overshoot = 250
+        long_text = 'x' * (_MAX_LATE_RESOLUTION_CHARS + overshoot)
+
+        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+            queue.resolve(
+                'esc-3902-1', long_text, resolved_by='claude-task-3902-steward',
+            )
+
+        record = queue.get('esc-3902-1')
+        assert record is not None
+        stored = record.late_resolutions[0]['resolution']
+        assert stored != long_text, 'an over-long resolution must be elided'
+        assert stored.startswith('x' * _MAX_LATE_RESOLUTION_CHARS), (
+            'the HEAD of the finding must be what is kept'
+        )
+        assert 'elided' in stored, (
+            f'elision must be MARKED IN-BAND, not silent: {stored[-120:]!r}'
+        )
+        # INV-8: the loss is assertable FROM THE RECORD, never log-only.
+        assert record.late_resolutions_chars_elided == overshoot, (
+            f'dropped characters must be counted on the record: '
+            f'{record.late_resolutions_chars_elided!r} != {overshoot}'
+        )
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('elid' in m and 'esc-3902-1' in m for m in warnings), (
+            f'the elision must be LOUD as well as counted; got: {warnings}'
+        )
+
+    def test_chars_elided_accumulates_across_captures(self, tmp_path: Path):
+        """(b cont.) The counter is a RUNNING total, not the last call's loss."""
+        queue = self._auto_dismissed(tmp_path)
+        overshoot = 100
+
+        for i in range(3):
+            queue.resolve(
+                'esc-3902-1', f'{i}' + 'y' * (_MAX_LATE_RESOLUTION_CHARS + overshoot - 1),
+                resolved_by='claude-task-3902-steward',
+            )
+
+        record = queue.get('esc-3902-1')
+        assert record is not None
+        assert record.late_resolutions_chars_elided == 3 * overshoot, (
+            f'expected a running total: {record.late_resolutions_chars_elided!r}'
         )

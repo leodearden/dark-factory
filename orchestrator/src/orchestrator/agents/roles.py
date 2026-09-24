@@ -138,15 +138,39 @@ _ESCALATION_TOOLS = [
 # concatenation, like every other splice in this file -- these prompts are
 # deliberately not f-strings (see the MANDATED_STAGING_COMMAND note above).
 # Regression-guarded by orchestrator/tests/test_roles_escalation_ladder.py.
+#
+# The two `action` values quoted verbatim in the escalate_blocker bullet --
+# `terminate_cleanly` and `keep_driving` -- are WIRE TOKENS defined in
+# `escalation.models.FILER_ACTIONS` and emitted by `escalate_blocker`. NO CODE
+# READS THEM: this prose is the only thing that tells an agent what the key it
+# receives means, so a rename at the emission site would silently decouple the
+# instruction from the response. Exactly like MANDATED_STAGING_COMMAND, that
+# constant is a *test anchor*, not a shared template -- this prompt is not an
+# f-string, so the copy below must be updated with it, and
+# test_roles_escalation_ladder.py catches the drift after the fact rather than
+# preventing it structurally (task 5368).
 ESCALATION_LADDER_CORE = """
 ## Escalation
 
 If you encounter a problem you cannot solve at your scope, you can escalate:
 
 - **`escalate_info(...)`** — Non-blocking observation. Report it and continue working.
-- **`escalate_blocker(...)`** — Blocking problem. Report it, then commit any in-progress
-  work, log your iteration, and STOP. Do NOT retry — the handler will resolve the issue
-  and you will be re-invoked.
+- **`escalate_blocker(...)`** — Blocking problem. Report it, then read the `action` key
+  of the response and do what it says.
+  - `terminate_cleanly` (every normal branch) — commit any in-progress work, log your
+    iteration, and STOP. Do NOT retry — the handler will resolve the issue and you will
+    be re-invoked.
+  - `keep_driving` — accompanies `status: accepted_unpersisted`. Your filing was accepted
+    but a post-write re-read could not confirm it landed, so there may be no record on
+    disk for any handler to drain. Stopping here would remove your task from every
+    recovery path in exchange for an escalation nobody will ever see. So do NOT stop:
+    keep driving the blocked task as best you can, and re-file ONCE on your next
+    iteration — then terminate cleanly regardless of what that second filing returns.
+    Re-file exactly ONCE because the repeat is NOT generally folded: the dedupe gate
+    covers only `category='infra_issue'` inside a short (600s) window, and a
+    `critical`/`urgent` filing bypasses dedupe entirely — so on every other path each
+    repeat mints a NEW record, and on that one a NEW page to the human. One retry
+    buys a second chance at durability; a retry every iteration is a storm.
 
 Categories: scope_violation, design_concern, cleanup_needed, dependency_discovered,
 risk_identified, infra_issue.
@@ -308,6 +332,14 @@ Use when you need context not in your briefing:
 - Before making assumptions about conventions or patterns
 - When encountering unfamiliar code or entities
 - When you need context about prior decisions
+
+Parameters:
+- `caller_agent_id`: Use the agent_id from your Agent Identity section
+- `caller_task_id`: Use your task id from the Agent Identity section
+
+These two record WHO IS ASKING so a read can be attributed. They are NOT the
+`agent_id` parameter, which is a FILTER restricting results to one authoring
+agent — passing your own id there would hide everyone else's memories from you.
 """
 
 # The canonical staging command that every role's "## CRITICAL: Git Staging
@@ -370,9 +402,11 @@ half-done tree that is falsely recorded as a completed, successful run.
   below, past which you must background it and poll instead. A foreground
   command that legitimately runs that long is fine; an abandoned background one
   never is.
-- If you genuinely must use `run_in_background=true`, you MUST poll it to
-  completion with `BashOutput` (or terminate it with `KillShell`) BEFORE ending
-  your turn. Never end the turn with a background command still pending.
+- If you genuinely must use `run_in_background=true`, you MUST see it through
+  BEFORE ending your turn. The launch hands you an output FILE PATH; `Read` on
+  that path is how you collect the result, so read it until the command has
+  actually finished — or terminate the task outright. Never end the turn with a
+  background command still pending.
 """
 
 
@@ -398,19 +432,46 @@ half-done tree that is falsely recorded as a completed, successful run.
 #       prohibition without the pattern breeds busy-loops, the pattern without
 #       the prohibition breeds abandoned background work.
 #
-# TOOL AVAILABILITY -- measured 2026-08-05, do NOT re-derive.  The tools named
-# below (`BashOutput`, `Monitor`, `ToolSearch`, `ScheduleWakeup`) are absent
-# from every role's `allowed_tools`, and that is CORRECT, not a bug: the
-# `--allowed-tools` flag cli_invoke passes (cli_invoke.py:1830) is a PERMISSION
-# allowlist -- what may run without a prompt -- not a tool-registry filter.
-# Built-in harness tools remain present and callable regardless.  Verified from
-# inside a dispatched implementer session whose cmdline was exactly
-# `--allowed-tools Read Edit Write Bash Glob Grep mcp__...`: `ToolSearch` and
-# `ScheduleWakeup` were live in that session's tool list, and
-# `ToolSearch("select:Monitor,TaskOutput")` returned both schemas.  The same
-# holds for the `BashOutput`/`KillShell` that BACKGROUND_TASK_WARNING has named
-# since task 2761.  So do NOT "fix" this block by trimming those tools out of
-# it on the theory that the roles cannot reach them -- they can.
+# TOOL AVAILABILITY -- read what this block does and does not establish.  It
+# records that built-ins are REACHABLE.  It is NOT, and cannot be, an inventory
+# of WHICH built-ins exist -- see the retraction below, which this block has
+# now earned twice.  For that, re-derive with `ToolSearch`.
+#
+# REACHABILITY -- measured 2026-08-05, do NOT re-derive.  The tools named below
+# (`Monitor`, `ToolSearch`, `ScheduleWakeup`) are absent from every role's
+# `allowed_tools`, and that is CORRECT, not a bug: the `--allowed-tools` flag
+# cli_invoke passes (cli_invoke.py:1830) is a PERMISSION allowlist -- what may
+# run without a prompt -- not a tool-registry filter.  Built-in harness tools
+# remain present and callable regardless.  Verified from inside a dispatched
+# implementer session whose cmdline was exactly `--allowed-tools Read Edit
+# Write Bash Glob Grep mcp__...`: `ToolSearch` and `ScheduleWakeup` were live
+# in that session's tool list, and a `ToolSearch` select query for deferred
+# tools returned their schemas.  So do NOT "fix" this block by trimming those
+# tools out of it on the theory that the roles cannot reach them -- they can.
+#
+# RETRACTED 2026-09-20 (task 5332), in place rather than deleted, so the next
+# editor can tell which of this block's claims rest on what.  The block used to
+# continue: "The same holds for the `BashOutput`/`KillShell` that
+# BACKGROUND_TASK_WARNING has named since task 2761."  That sentence was never
+# measured -- it inherited the authority of the genuine measurement above it
+# through the words "The same holds for", and later edits then cited the whole
+# block as settled.  It is false: neither name has ever resolved from the
+# registry, and no transcript in the fleet census ever shows one being called.
+# THE MEASUREMENT AND ITS DATES ARE NOT RESTATED HERE -- they live once, at
+# tests/test_roles_harness_tool_inventory.py::MEASURED_ABSENT_TOOLS, for the
+# same reason the size figures below live at exactly one site.
+#
+# The retraction GENERALISES, and that is the part worth carrying forward: this
+# block has now aged wrong TWICE in the same way.  Its own worked example above
+# used to cite a `ToolSearch` select query returning a `TaskOutput` schema --
+# and ten days later that name no longer resolved at all (both measurements at
+# the citation above).  Reachability is durable; the roster is not.  So the
+# guidance below is deliberately built on the things that do not churn --
+# `Bash`'s own `run_in_background` parameter, `Read` on the output file path it
+# returns, and `ToolSearch` as the way to DISCOVER the current termination tool
+# -- and names a concrete tool only where unavoidable, stamped with its
+# measurement date.  tests/test_roles_harness_tool_inventory.py now holds the
+# "a named built-in must be a real built-in" invariant mechanically.
 #
 # THE ~25-MINUTE BACKGROUND THRESHOLD is deliberate and is NOT the harness Bash
 # cap; do not "simplify" it back to 3900000.  But the watchdog mechanism differs
@@ -424,7 +485,8 @@ half-done tree that is falsely recorded as a completed, successful run.
 #     so extension_engaged latches True and the watchdog measures IDLE time: it
 #     kills only after no NEW transcript turn for
 #     max(working_idle_secs, timeout_seconds).  Polling a backgrounded command
-#     genuinely resets that clock, since each `BashOutput` poll is a new turn.
+#     genuinely resets that clock, since each read of the background task's
+#     output file is a new turn.
 #     Covers architect (2400s), implementer/debugger (1800s), merger (1800s),
 #     simple_task (7200s) -- each being max(working_idle_secs=1800, role).
 #   * steward.py:806 passes `timeout_seconds=timeouts.steward` and NEITHER
@@ -473,20 +535,40 @@ SANCTIONED
   - architect, implementer, debugger, merger, simple_task are watched on IDLE
     time — the kill fires only after no new transcript turn for
     max(working_idle_secs, your role timeout), stock 1800s = 30 minutes. Here
-    polling genuinely helps: every `BashOutput` poll IS a new turn and resets
-    that clock, which is what makes a long backgrounded run survivable.
+    polling genuinely helps: any tool call that engages the background task —
+    a `Read` of its output file — IS a new turn and resets that clock, which is
+    what makes a long backgrounded run survivable.
   - As STEWARD your ceiling is FLAT wall clock — 1800s = 30 minutes from
     session start — and NOTHING resets it. Polling does not extend it. Work
     that cannot finish inside that window must be sized down or handed off; no
     wait strategy rescues it, so do not start a 40-minute job and plan to poll.
   - As deep_reviewer no watchdog ceiling fires at all; only the harness Bash
     cap binds you. The don't-end-your-turn rule above still applies in full.
-  So: `Bash` with `run_in_background=true`, then poll it to completion with
-  `BashOutput` and READ the result BEFORE ending your turn. Launching it
-  detached with `setsid` and polling its log file is the same sanctioned shape;
-  so is backgrounding a wait command that EXITS on its own when the condition
-  holds. Polling something you launched is NOT the ad-hoc wait prohibited
-  below: you have a real completion signal, and you stay until you have it.
+  So: `Bash` with `run_in_background=true`. The launch returns a task ID AND
+  an output FILE PATH, and says it will notify you. `Read` that path — it is
+  the entire collection mechanism, and there is NO poll tool in this build to
+  go hunting for. While the command runs the file holds the output so far;
+  once it finishes the file holds the full output plus an "[exited with code
+  N]" trailer carrying the real exit status, so a single Read gives you both
+  the result and whether it passed (measured 2026-09-20 on a probe that exited
+  7). Keep reading until you have that trailer, BEFORE ending your turn. To
+  terminate instead, find the build's termination tool with `ToolSearch`
+  first — it is DEFERRED, so calling it cold is the `InputValidationError`
+  described below; today that tool is `TaskStop` (measured 2026-09-20), and if
+  `ToolSearch` stops returning that name it has been renamed, so discover the
+  current one rather than improvising. If a tool you reach for is absent, do
+  NOT fall back to a `ps`/`pgrep` liveness loop — that improvisation is the
+  failure this guidance exists to prevent; read the output file instead.
+  Launching it detached with `setsid` and reading its log file is the same
+  sanctioned shape; so is backgrounding a wait command that EXITS on its own
+  when the condition holds. A pid-based foreground wait
+  (`timeout N tail --pid=<pid> -f /dev/null`) is a LAST resort, and only if you
+  captured the pid AT LAUNCH: `run_in_background` hands you a task ID and a
+  path, never a pid, and a pid guessed with `pgrep -f` matched a wrapper
+  process in measurement, so the wait blocked its full timeout and exited 124
+  though the job had finished long before. Reading something you launched is
+  NOT the ad-hoc wait prohibited below: you have a real completion signal, and
+  you stay until you have it.
 - `Monitor` streams ONE notification per matching output line, so it fits a
   recurring event feed, not a single "tell me when this finishes" — for that,
   background a command that exits when done. If you do reach for it, load its
@@ -525,11 +607,11 @@ BACKGROUND_WAIT_GUIDANCE = BACKGROUND_TASK_WARNING + WAIT_PATTERN_GUIDANCE
 # system prompt, just spread across the system/turn pair where that test cannot
 # see it.  The point of the at-the-failure-site injection was always ADJACENCY
 # (put the rule next to the action item that trips it), and the pointer buys
-# that for ~15% of the block's bytes.
+# that for ~11% of the block's bytes.
 #
 # THE ONLY SIZE FIGURES IN THIS FEATURE LIVE HERE.  Measured on this revision:
-# BACKGROUND_WAIT_GUIDANCE 4480 B (= BACKGROUND_TASK_WARNING 1071 +
-# WAIT_PATTERN_GUIDANCE 3409), WAIT_PATTERN_REMINDER 662 B -> 662/4480 = 14.8%.
+# BACKGROUND_WAIT_GUIDANCE 6710 B (= BACKGROUND_TASK_WARNING 1193 +
+# WAIT_PATTERN_GUIDANCE 5517), WAIT_PATTERN_REMINDER 766 B -> 766/6710 = 11.4%.
 # Re-derive rather than trust these after any edit to the strings:
 #   python -c "from orchestrator.agents.roles import *; \
 #              print(len(BACKGROUND_WAIT_GUIDANCE), len(WAIT_PATTERN_REMINDER))"
@@ -537,9 +619,11 @@ BACKGROUND_WAIT_GUIDANCE = BACKGROUND_TASK_WARNING + WAIT_PATTERN_GUIDANCE
 # test_roles_wait_pattern.py is deliberately QUALITATIVE ("the full block").
 # An earlier revision hand-copied the figure to 8 sites (2 here, 6 in the test
 # file) and every one was wrong: 5 said "~3.2 kB" and 2 said "~2.6 kB" against
-# a real 4.4 kB, and 1 said the pointer costs "~2% of the tokens" against a
-# real ~15% -- a 7x error (task 3607 review).  Prose copies do not move when
-# the string they describe does.  Do not reintroduce a number anywhere else --
+# a real 4.4 kB, and 1 said the pointer costs "~2% of the tokens" against the
+# then-real ~15% -- a 7x error (task 3607 review).  Those are the figures as
+# that review found them; both constants have grown since, which is exactly
+# why the live numbers above are re-derived rather than carried forward.
+# Prose copies do not move when the string they describe does.  Do not reintroduce a number anywhere else --
 # cite this comment instead.
 #
 # Use this ONLY where the receiving role is statically known to carry
@@ -558,7 +642,7 @@ BACKGROUND_WAIT_GUIDANCE = BACKGROUND_TASK_WARNING + WAIT_PATTERN_GUIDANCE
 #
 # Keep it SUBSTANTIVE when editing: a pointer still has to STATE the operative
 # rules at the failure site -- foreground with an explicit `timeout`, or else
-# background it and poll `BashOutput` to completion before ending the turn --
+# background it and read its output file to completion before ending the turn --
 # because that adjacency is the whole reason for the injection.  Do not let it
 # decay into a bare "see the rule above" cross-reference; a reader who follows
 # no cross-reference gets nothing.  This is an editorial expectation, so it
@@ -568,12 +652,13 @@ WAIT_PATTERN_REMINDER = """
 Reminder — verification is exactly where the wait rules above bite. If it will
 finish inside ~25 minutes, run it in the FOREGROUND with an explicit Bash
 `timeout` (milliseconds; 120000 default). If it will run longer than that
-WITHOUT emitting a new assistant turn, background it and poll `BashOutput` to
-completion before you end your turn — the deciding limit is the working-regime
-watchdog, which kills this SESSION after ~30 minutes with no new turn, well
-short of the 3900000 harness ceiling, and each poll resets that clock. Never
-end this turn with verification still pending: this session is one-shot, and
-abandoned work is recorded as a successful run."""
+WITHOUT emitting a new assistant turn, background it and collect the result by
+reading the output file path the launch returns, until that file shows the
+command has exited, before you end your turn — the deciding limit is the
+working-regime watchdog, which kills this SESSION after ~30 minutes with no new
+turn, well short of the 3900000 harness ceiling, and each read is a new turn
+that resets that clock. Never end this turn with verification still pending:
+this session is one-shot, and abandoned work is recorded as a successful run."""
 
 
 # Census-2026-08-16 §1.1 companion to WAIT_PATTERN_GUIDANCE's `Monitor` bullet
@@ -648,12 +733,12 @@ abandoned work is recorded as a successful run."""
 # sighting every census cycle, and a number baked into a role prompt goes
 # stale silently while "catalogued sightings all show the same shape" stays
 # true.
-TOOL_CALL_REJECTION_GUIDANCE = """
+_TOOL_CALL_REJECTION_KNOWN_SHAPES = """
 ## Reading a tool-call rejection before you retry
 
 `InputValidationError` reports a defect in the CALL you just made, and it
 echoes back the exact bytes you sent — read that echo before retrying. It
-reports two different shapes, and they need OPPOSITE fixes:
+reports several distinct shapes, and they do not share a fix:
 
 - "could not be parsed as JSON" means the call's SYNTAX is broken and no
   parameter VALUE is implicated. Re-emit the entire call from scratch; never
@@ -667,6 +752,372 @@ reports two different shapes, and they need OPPOSITE fixes:
   tool called before `ToolSearch` loaded its schema. Consult the schema; do
   not re-emit blindly.
 """
+
+
+# Census-2026-08-21 §1.1 companion to _TOOL_CALL_REJECTION_KNOWN_SHAPES above
+# (task 4578; plans/confusion-census-2026-08-21.md). A dispatched session
+# called the `Agent` tool supplying only a `prompt` field; the schema also
+# requires `description`, and the omission was rejected by
+# `InputValidationError: The required parameter 'description' is missing`
+# before any sub-agent launched.
+#
+# WHAT IS AND IS NOT ADDRESSED. The CAUSE is upstream of this repository --
+# harness-side tool-call construction for a Claude Code builtin -- and no
+# in-repo code path produces or can intercept it, so this constant does not
+# attempt to detect or repair the malformed call. Only the RECOVERY facet is
+# in scope, the same carve-out the constant above already takes for the
+# stray-comma sighting: a dispatched agent's response to the rejection is
+# this repo's to fix, through the role system prompts.
+#
+# DISCRIMINATION, NOT DUPLICATION. This is a THIRD `InputValidationError`
+# shape, not a rewording of either bullet above -- do not fold it into, or
+# delete, either existing bullet as redundant. The raw error string ("The
+# required parameter `X` is missing") is IDENTICAL to the deferred-tool
+# shape's founding evidence above, so the string alone does not discriminate
+# between the two mechanisms; read the echo instead. The deferred-tool case
+# carries a trailer stating the tool's schema was not sent to the API, and
+# names a parameter the schema does not have -- an INVENTED name. This case
+# carries neither: the named parameter is real and accepted, and only a
+# required sibling is missing.
+#
+# HARD CONSTRAINTS, same as the block above. No `mcp__<family>__<name>`
+# example -- the ancestry-check test that guards role/tool-grant consistency
+# is parametrized over every role and would fail for whichever of the 8
+# roles lacks the grant; `Agent`, `ToolSearch` and `InputValidationError` are
+# all builtins and do not match that test's regex, so naming them is safe,
+# and `Agent` is genuinely reachable by a dispatched role regardless of
+# whether it appears in that role's allowed_tools -- the same fact the
+# comment above already records for `ToolSearch`. No literal `{`/`}` braces
+# -- role prompts reach this only by plain `+` concatenation. No sighting
+# COUNT -- the codebook accrues a new sighting every census cycle, and a
+# number baked into a role prompt goes stale silently.
+MISSING_REQUIRED_PARAMETER_REJECTION = """\
+- A rejection naming a REQUIRED parameter that is MISSING is a third shape,
+  distinct from both above: the call parsed fine and the parameter it
+  names IS a real, accepted field — a required sibling was left out. No
+  schema-not-sent trailer, and the named parameter is real rather than
+  invented, means a required sibling is missing rather than the
+  deferred-tool problem above — re-emit the whole call with every required
+  field supplied; do not edit or drop the field that was already accepted,
+  and do not reach for `ToolSearch`. Catalogued sighting: an `Agent` call
+  that supplied `prompt` and omitted the required `description`, rejected
+  before any sub-agent launched.
+"""
+
+
+# The single splice unit.  SYSTEM prompts embed THIS, never either half on its
+# own -- test_roles_tool_call_rejection.py asserts the composition so the
+# three shapes cannot drift apart.
+TOOL_CALL_REJECTION_GUIDANCE = _TOOL_CALL_REJECTION_KNOWN_SHAPES + MISSING_REQUIRED_PARAMETER_REJECTION
+
+
+# Census-2026-08-31 §1.1 finding (task 4964; plans/confusion-census-2026-08-31.md),
+# codebook entry entry-cand-20260827-23, founding session
+# 7dae04c6-f0a5-400d-b199-8932d65a8790. An `Edit` call landed
+# `<tool_use_error>Found 3 matches of the string to replace, but replace_all
+# is false...`, and the very next turn called a bare `replace_all({})` --
+# rejected with `Error: No such tool available: replace_all`, one turn lost.
+# The agent read the rejection's remedy clause ("set replace_all to true")
+# and bound the bare identifier `replace_all` to the wrong syntactic
+# category: a callable tool rather than a parameter on a re-issued `Edit`
+# call.
+#
+# WHAT IS AND IS NOT ADDRESSED. `Edit`'s multi-match error text is emitted
+# by the harness and is upstream of this repository; no in-repo code path
+# produces or can intercept it, so this constant does not attempt to
+# change, wrap or detect that message. Only the RESPONSE facet is in
+# scope -- an agent that reads the remedy clause correctly does not spend a
+# turn on a phantom tool call. This is the same carve-out tasks 4273 and
+# 4578 documented for the two `InputValidationError` findings above, and it
+# is why a harness-rooted census finding still lands in this file.
+#
+# DISCRIMINATION, NOT DUPLICATION -- now against THREE neighbouring shapes,
+# not two. `TOOL_CALL_REJECTION_GUIDANCE` above covers `InputValidationError`:
+# a defect in the CALL you just made, with the echoed bytes to read, in
+# three shapes (unparseable JSON / invented parameter name / missing
+# required sibling). This constant covers a DIFFERENT error class: a
+# well-formed call that succeeded in parsing, failed on CONTENT, and
+# printed a remedy -- where the failure is in parsing the remedy, not the
+# call. The census recorded "No such tool available" as spanning at least
+# five catalogued mechanisms, so neither block may be collapsed into the
+# other and neither may be deleted as redundant with the other.
+#
+# ACCURACY CAVEAT the text below must honour: the census explicitly does
+# NOT establish that `replace_all: true` was the semantically correct fix
+# for that particular edit. The guidance presents both remedies as chosen
+# on intent -- it must never assert that setting the parameter is always
+# right.
+#
+# HARD CONSTRAINTS, same as both neighbours above. No `mcp__<family>__<name>`
+# example -- this constant is spliced into 8 roles with differing
+# allowlists, and
+# test_roles_ancestry_check.py::test_role_holds_every_mcp_tool_its_prompt_names
+# asserts any fully-qualified MCP tool a prompt names is in THAT role's
+# allowed_tools; `Edit` and `ToolSearch` are both builtins and do not
+# match that regex. No literal `{`/`}` braces -- role prompts reach this
+# only by plain `+` concatenation. No sighting COUNT in the prose -- the
+# codebook accrues a new sighting every census cycle, and a number baked
+# into a role prompt goes stale silently.
+ERROR_REMEDY_HINT_GUIDANCE = """
+## A tool error's remedy hint may name a parameter — check your tool list first
+
+When a tool result rejects your call and its remedy clause names a bare
+identifier ("set X to true", "pass Y"), the discriminator is whether that
+identifier is in your own tool list. If it is NOT, it is a PARAMETER of
+the tool that just errored — not a tool you can call. Re-issue THAT SAME
+tool call with the parameter set, carrying over every argument from the
+failed call; the remedy names the one field to change, not a standalone
+action. If it IS in your tool list — e.g. a deferred tool's rejection
+naming `ToolSearch` — call it for real: that is a genuine "call this tool
+first," already covered by the section above, not this one.
+
+Catalogued sighting of the parameter case: `Edit` failed with "Found 3
+matches of the string to replace, but replace_all is false", and the next
+turn called a bare `replace_all` with an empty argument object — rejected
+with "No such tool available: replace_all", one turn lost. `replace_all`
+never appears in any tool list; the empty argument object is the other
+tell: read as a tool, the name carries nothing from the failed edit, so
+there is nothing for it to act on.
+
+For that `Edit` case both remedies are legitimate and you choose on
+INTENT: re-issue `Edit` with `replace_all: true` only if you really do
+mean every occurrence; otherwise lengthen `old_string` until it matches
+uniquely. The hint reports why the edit was refused; it is not a claim
+that replacing all of them is what you wanted.
+"""
+
+
+# Census finding, task 5331 (`metadata.source: legibility_census`),
+# reproduced first-hand in the founding session and again on revalidation
+# 2026-09-17:
+#
+#     Grep(pattern='config\.(?!git|project_root|verify_env)[a-z_]+', ...)
+#     -> error: look-around, including look-ahead and look-behind, is not
+#        supported
+#        Consider enabling PCRE2 with the --pcre2 flag
+#
+# The search never runs. Two facts make that a legibility defect rather than
+# a plain capability limit. The `Grep` tool's own description advertises
+# "Full regex syntax" and warns only about literal braces, so the agent
+# learns the limit by failure. And the printed remedy is UNREACHABLE through
+# the tool that printed it: `Grep`'s schema exposes pattern/path/glob/type/
+# output_mode/-i/-n/-A/-B/-C/-o/multiline/head_limit/offset and nothing that
+# can carry `--pcre2`.
+#
+# WHAT IS AND IS NOT ADDRESSED. `Grep` is a Claude Code builtin: no in-repo
+# code path produces, wraps or can intercept its pattern rejection, so
+# nothing here can add a `--pcre2` option or change that message. Only the
+# told-upfront/recovery facet is in scope -- an agent told the limit BEFORE
+# it writes the pattern does not spend a turn discovering it, and one that
+# reads the remedy correctly does not spend a second turn trying to pass
+# `--pcre2` to a tool with no such parameter. Same carve-out tasks 4273,
+# 4578 and 4964 documented for the three findings above, and the reason a
+# harness-rooted census finding still lands in this file.
+#
+# DISCRIMINATION, NOT DUPLICATION -- a FOURTH shape, against three
+# neighbours. `TOOL_CALL_REJECTION_GUIDANCE` covers `InputValidationError`:
+# a defect in the CALL you just made, in three shapes (unparseable JSON /
+# invented parameter name / missing required sibling), every one of them
+# fixed by re-emitting the call correctly. `ERROR_REMEDY_HINT_GUIDANCE`
+# covers a well-formed call that failed on CONTENT and printed a remedy
+# naming a real PARAMETER of the erroring tool -- fixed by re-issuing with
+# it set. This is neither: the call was well-formed, it failed on content,
+# and the remedy names a flag of the WRAPPED BINARY that the tool exposes no
+# parameter for, so NO re-issue can ever succeed and the correct response is
+# to restructure the pattern or switch tools. Folding this into either
+# neighbour would collapse the discrimination it exists to draw; neither
+# block may be deleted as redundant with the other.
+#
+# THE PROSE DEPENDS ON THE PLACEMENT PIN. _GREP_ENGINE_LIMITS draws its
+# discrimination by pointing at "the section just above", which is true only
+# because every splice site abuts ERROR_REMEDY_HINT_GUIDANCE. That abutment is
+# machine-checked by
+# orchestrator/tests/test_roles_grep_lookaround.py::test_variant_placement_is_structural;
+# moving this block elsewhere in a prompt silently turns that pointer into a
+# reference to whatever now precedes it, so reword the sentence if the pin ever
+# has to change.
+#
+# TWO VARIANTS, because two orthogonal capability dimensions decide who
+# needs what. All 9 roles hold `Grep`, so every role can hit the rejection
+# and needs the LIMITATION; but the `grep -P` escape hatch is gated on the
+# `Bash` grant, and `judge` holds only `Bash(git:*)`, so prescribing it
+# there would walk that role into a permission denial -- the same "agent
+# follows its own instructions into a denial" defect that
+# orchestrator/tests/test_roles_ancestry_check.py::test_role_holds_every_mcp_tool_its_prompt_names
+# guards against for MCP tools, and which does NOT cover builtins. Composed
+# the way _SCOPE_BOUNDARY_FACTS + _SCOPE_BOUNDARY_RECOURSE compose
+# SCOPE_BOUNDARY_GUIDANCE below: the shared facts stated once so the two
+# variants cannot drift, each half self-contained with its own
+# leading/trailing blank line, plain `+` concatenation, and only the
+# composed units ever spliced into a prompt.
+#
+# THE SHELL MEASUREMENTS BEHIND THE ESCAPE HATCH, with the commands that
+# produced them, taken in a dispatched agent session in a task worktree
+# (2026-09-17):
+#     type -a rg               -> "rg is a function": a shell function the
+#                                 harness snapshot installs, re-execing the
+#                                 Claude Code bundle via CLAUDE_CODE_EXECPATH
+#     which rg                 -> empty
+#     bash -c 'command -v rg'  -> not found
+#     type -a grep             -> /usr/bin/grep, /bin/grep; no function shadow
+#     grep --version           -> GNU grep 3.11; no ugrep installed here
+#     command grep -rPoh --include='*.py' <the look-ahead pattern above> \
+#         orchestrator/src/orchestrator/verify.py
+#                              -> exit 0, the intended matches returned
+#
+# TWO MEASUREMENTS ADDED ON THE AMENDMENT PASS (2026-09-19), each correcting a
+# sentence that had generalized past what the 09-17 run above actually showed.
+#
+# (1) WHERE the `rg` shell function survives. `bash -c 'command -v rg'` tests
+# one thing only -- a nested shell PROCESS -- and an earlier revision of
+# _GREP_PCRE_BASH_RECOURSE read that as "never put `rg` in a script, a subshell
+# or any nested shell", which is false for a subshell. Re-measured directly on
+# `rg` rather than on a stand-in function:
+#     rg --pcre2 -o <the look-ahead pattern above> \
+#         orchestrator/src/orchestrator/verify.py | head -3
+#                                       -> matches returned; pipeline is fine
+#     echo "subst: $(rg --version)"     -> ripgrep 14.1.1
+#     ( rg --version )                  -> ripgrep 14.1.1
+#     bash -c 'rg --version'            -> rg: command not found
+#     bash <standalone script file>     -> rg: command not found
+# A pipeline, a command substitution and an explicit ( ... ) subshell all stay
+# inside the shell that defines the function; only a new shell PROCESS loses
+# it. The prose now draws the boundary there.
+#
+# (2) The IGNORE-FILE asymmetry the escape hatch silently dropped. `Grep`
+# (ripgrep) reads ignore files; GNU grep reads none, so `--include=` alone does
+# not reproduce `Grep`'s filtering:
+#     rg -l -g '*.py' 'config\.[a-z_]+' .                    -> 711 files
+#     command grep -rlP --include='*.py' 'config\.[a-z_]+' .  -> 1101 files
+# The 385-file difference is entirely under `.venv`, and `rg --no-ignore` is
+# what unlocks it -- the mechanism is `.venv/.gitignore`, a catch-all the
+# virtualenv writes inside ITSELF, which is why `git check-ignore .venv` exits
+# 1 (the directory is not ignored; its contents are) and why naming .gitignore
+# at the repo root alone would have mis-stated the cause. Hence the
+# `--exclude-dir=` flags and the scope-the-path sentence in the prose: without
+# them the prescribed recovery returns a wall of third-party matches, which is
+# the same wasted turn this constant exists to prevent.
+#
+# Those are the claims that were measured; nothing broader is asserted about
+# the environment. In particular the shadowed SET is NOT stable across time
+# or host: a 2026-08-11 project memory records `grep` ITSELF shadowed by a
+# ugrep-wrapping shell function that honoured .gitignore and silently
+# skipped a whole ignored tree, returning a fast, confident, wrong zero --
+# which does not hold here. That instability is precisely why the guidance
+# prescribes the `command` prefix (it resolves the real /usr/bin/grep
+# whichever way a given snapshot falls) rather than depending on which
+# commands happen to be shadowed, and why `rg --pcre2` is mentioned only
+# with its caveat instead of being led with despite the error message
+# suggesting it. Leading with `rg` would repeat the defect census
+# 2026-09-10 sec 1.1 caught: role wait-guidance naming `BashOutput`, a tool
+# absent from every CLI build in the corpus, sending the agent after
+# something that is not there.
+#
+# HARD CONSTRAINTS, four, every one machine-checked:
+#   - No literal `{`/`}` in the constants. Role prompts reach them by plain
+#     `+` concatenation, but they are held brace-free defensively so a
+#     future interpolating splice site stays safe -- CODE_QUALITY_GUIDANCE
+#     below is the live example, brace-free BY CONTRACT because it reaches
+#     _REVIEWER_HEURISTICS_TEMPLATE's str.format().
+#   - No `mcp__<family>__<name>` name in the prompt text: the ancestry check
+#     cited above is parametrized over every role, and these constants land
+#     in 8 roles with differing allowlists. `Grep`, `Bash` and `Read` are
+#     builtins and do not match its regex.
+#   - No `Test` + CamelCase class citation that does not resolve to a real
+#     class. orchestrator/tests/test_cited_test_class_drift.py statically
+#     requires every such identifier in a comment or string token of any
+#     member's src tree to resolve to a real test class, so every test cited
+#     from here is named `path/to/test_module.py::lowercase_function`, which
+#     is out of scope by shape.
+#   - No sighting COUNT and no byte-size figure in the prose. The codebook
+#     accrues a sighting every census cycle, and the BACKGROUND_WAIT_GUIDANCE
+#     comment above records what byte-size figures cost: an earlier revision
+#     hand-copied one to 8 sites and every one was wrong, one by 7x, because
+#     a prose copy does not move when the string it describes does.
+_GREP_ENGINE_LIMITS = """
+## The `Grep` tool's regex engine rejects look-around outright
+
+`Grep` runs ripgrep's default engine: no look-ahead, no look-behind, no
+backreferences. A pattern using any of them is REJECTED before the search
+runs — `error: look-around, including look-ahead and look-behind, is not
+supported`, and you get no results at all rather than a partial or degraded
+match. Know this before you write the pattern. `multiline: true` does not
+change it: same engine either way.
+
+The rejection prints "Consider enabling PCRE2 with the --pcre2 flag". That
+remedy is addressed to ripgrep's command line, NOT to the `Grep` tool, which
+exposes no such parameter under any spelling — not `--pcre2`, not `pcre2`,
+and not a flag smuggled into `pattern`. Do not retry the call. This is the
+discriminator against the section just above: THERE the remedy named a real
+parameter of the erroring tool and re-issuing with it set is the fix; HERE it
+names a flag of the WRAPPED BINARY that the tool does not expose, so no
+re-issue of `Grep` can ever succeed and you must change approach instead.
+
+FIRST-LINE RECOVERY, needing no other tool: express the intent without
+look-around — match broadly, then exclude from the results. A rejected
+`config\\.(?!git|project_root|verify_env)[a-z_]+` means "every `config.<key>`
+except those three names"; the working form is `Grep` for `config\\.[a-z_]+`
+with `-o`, then drop the three from what comes back. "Not followed by", "not
+preceded by" and "the same capture twice" are all this one shape: the engine
+cannot express them, and a second pass over the matches can.
+"""
+
+
+# Recourse for the roles holding unqualified `Bash`. Concatenated onto
+# _GREP_ENGINE_LIMITS below -- never used alone.
+_GREP_PCRE_BASH_RECOURSE = """
+When look-around or a backreference is genuinely required, the escape hatch
+is `Bash`:
+
+    command grep -rP --include='*.py' --exclude-dir=.venv --exclude-dir=node_modules --exclude-dir=.git '<pattern>' <path>
+
+`-P` is real PCRE, so the rejected pattern runs unchanged, and `--include=`
+is the glob filter `Grep` would have applied.
+
+The `--exclude-dir=` flags are not boilerplate: they stand in for a SECOND
+filter `Grep` applied for you and real grep does not. `Grep` reads ignore
+files — `.gitignore` at each level, including the catch-all one a virtualenv
+writes inside itself — while GNU grep reads none of them and walks straight
+into a vendored tree. Measured in this worktree, `--include='*.py'` ALONE
+still matched hundreds of third-party site-packages files under `.venv` for a
+pattern as ordinary as `config\\.[a-z_]+`, not one of which `Grep` would have
+returned. So point `<path>` at a source directory rather than the repo root,
+and if the rejected `Grep` call omitted `path`, do not simply substitute `.`.
+
+The `command` prefix is load-bearing, not decoration. The harness shell
+snapshot shadows some search commands with shell functions, and WHICH ones is
+not stable across sessions or hosts: one measured shadow wrapped `grep` in a
+.gitignore-respecting tool that silently skipped an ignored tree and returned
+a fast, confident, empty result. `command` reaches the real `/usr/bin/grep`
+either way.
+
+`rg --pcre2` also works, and needs none of those exclusions — `rg` IS the
+engine `Grep` wraps, so it honours the same ignore files. Its one limit is
+where it survives. `rg` here is currently a shell FUNCTION that re-execs the
+Claude Code bundle, not a binary on `PATH`, so it is lost in a nested shell
+PROCESS: a `bash -c` or `sh -c`, or a standalone script file you write and
+then run. It DOES survive a pipeline, a `$(...)` substitution and an explicit
+`( ... )` subshell in the top-level `Bash` call — those stay in the shell that
+defines it. `which rg` finds nothing either way, so do not use that to decide.
+Reach for `command grep -rP` when a nested shell process is involved.
+"""
+
+
+# JUDGE's recourse. Its `Bash` grant is `Bash(git:*)`, so the escape hatch
+# above would land it a permission denial rather than a result -- naming a
+# command the role cannot run is the failure this variant exists to avoid.
+# Concatenated onto _GREP_ENGINE_LIMITS below -- never used alone.
+_GREP_PCRE_READ_ONLY_RECOURSE = """
+Shelling out is NOT available to you here: your `Bash` grant is restricted to
+git commands, so a `grep -P` call would land a permission denial rather than
+a result. The restructure above IS your recovery — match broadly with `Grep`
+and exclude afterwards. Where the candidate region is small enough, `Read` it
+and judge the text directly instead of searching it.
+"""
+
+
+GREP_LOOKAROUND_GUIDANCE = _GREP_ENGINE_LIMITS + _GREP_PCRE_BASH_RECOURSE
+GREP_LOOKAROUND_GUIDANCE_READ_ONLY = _GREP_ENGINE_LIMITS + _GREP_PCRE_READ_ONLY_RECOURSE
 
 
 # Canonical rc=0/1/128 check for `git merge-base --is-ancestor`, spliced into
@@ -859,11 +1310,135 @@ SCOPE_BOUNDARY_GUIDANCE = _SCOPE_BOUNDARY_FACTS + _SCOPE_BOUNDARY_RECOURSE
 SCOPE_BOUNDARY_GUIDANCE_SIMPLE = _SCOPE_BOUNDARY_FACTS + _SCOPE_BOUNDARY_RECOURSE_SIMPLE
 
 
+# Inlined from docs/code-quality.md, which remains the single normative copy
+# (INV-9). The inline copy exists at all because a dispatched agent's system
+# prompt cannot follow a cross-reference, the same reason this module already
+# carries its own copy of the refs/stash prohibition.
+#
+# CARRIED HERE, and nothing else: the fourteen headline TOKENS; both stances;
+# and the do-not-steer-by list. The Tests stance deliberately FOLDS IN the three
+# measurable symptoms the doc lists under heuristic 13's reading (reach-back
+# imports, cycle-breaking function-local imports, re-export shims), because a
+# reviewer meets all five symptoms as one test-shaped finding rather than as two
+# separate lookups. NOT carried: the agreed reading of every other headline.
+#
+# orchestrator/tests/test_code_quality_guidance_parity.py is the drift guard: it
+# parses BOTH the doc and the production-RENDERED prompt with one parser, and
+# compares the headline tokens and both bullet lists' LABELS as ordered
+# equalities, so those are provably derived rather than a second source. The
+# folded symptom list is NOT guarded -- labels are compared, bullet bodies are
+# not -- so it is the one place where an edit to heuristic 13's reading in the
+# doc must be mirrored here by hand. Cited by FILE PATH, not by test class name,
+# because test_cited_test_class_drift.py requires every cited Test<CamelCase>
+# identifier in src prose to resolve to a real class.
+#
+# Interpolation-safe by contract: this reaches _REVIEWER_HEURISTICS_TEMPLATE's
+# str.format() call, so it must carry no literal brace.
+CODE_QUALITY_GUIDANCE = """
+## Code quality — judge against this definition
+
+Code quality is the expected cost and risk of the next change. In a
+factory-operated codebase the next change is made by an agent working from a
+partial view of the code, reviewed by an agent, and verified by machine. So
+quality means two things: how cheaply and safely an agent can make a correct
+change, and how likely a wrong change is to be caught before it lands.
+
+The mechanical gates — pytest, ruff, pyright — are the FLOOR. This definition
+is the BAR. A change can pass every gate and still be correctly rejected
+against it.
+
+## The fourteen heuristics
+
+1. **Informative names.**
+2. **Simple control flows.**
+3. **Carefully factored orthogonal dimensions of variability.**
+4. **Small function scopes.**
+5. **Minimum data access scopes and lifetimes.**
+6. **Well-defined purpose for each entity.**
+7. **Prefer stateless interactions between modules.**
+8. **Prefer immutable data.**
+9. **Deep modules with appropriate nesting and coherent narrow interfaces.**
+10. **Clear invariants, informatively, redundantly, uniformly enforced.**
+11. **SPOT — single point of truth.**
+12. **Structured data instead of meaningful strings.**
+13. **Files make internal sense in isolation.**
+14. **No file too large.**
+
+The agreed reading of each headline lives in `docs/code-quality.md` when the
+repository under review carries that file — read it there rather than guessing
+at a headline's intent. The readings are deliberately not restated here so that
+doc stays the one normative copy.
+
+Name the heuristic you are applying — say "heuristic 13, files make internal
+sense in isolation" — whenever a finding or a design decision turns on it. An
+unnamed appeal to "quality" is neither reviewable nor actionable.
+
+## Two stances
+
+- **Comments.** Aim for code that is clear with no or low comments. Needing
+  abundant and escalating amounts of commenting is a symptom of poor clarity,
+  and comments drift away from the code they describe. Rationale that must
+  persist belongs in a tracked file the next agent can read — the PRD, docs/,
+  or a test — with a pointer from the code. A pointer into memory or an
+  escalation record does not count: no dispatched role but the steward can read
+  an escalation, and a memory record is reached by search, not by a path the
+  code can name. Prose written to answer a reviewer — a measurement, a rejected
+  alternative, a defence of a decision — belongs in the commit message, or in
+  the task record where the agent holds a task write, not in the file. This
+  does not license deleting existing rationale during unrelated work.
+- **Tests.** Test access to a module's internals is an interface design smell:
+  such a test pins implementation rather than behaviour, and the seam it reaches
+  through is usually the real defect. Five symptoms, each reportable as an
+  interface-design finding rather than a style nit: monkeypatching a private
+  name by dotted path; reading a private attribute from a test; a
+  reach-back import into a parent module; a function-local import placed to
+  break an import cycle; and a re-export shim that exists only to keep an old
+  path resolving.
+
+## Do not steer by
+
+- **Raw line count.** Comments and docstrings can be most of a file; one large
+  module in this factory's own code measured 55% prose. That is a caution about
+  the metric, not a tolerance for prose: heuristic 14's thresholds are alarms
+  that trigger a measurement, never a number to get under by deleting prose or
+  by a cheating split.
+- **Average complexity.** A file can average a good grade while eight of its
+  functions score the worst one.
+- **Line coverage under autouse stubs.** A suite that stubs the thing under test
+  into passing reports coverage of paths it cannot fail.
+- **Test count or test-to-code ratio.** Tests that pin implementation are a
+  liability carrying a green tick.
+"""
+
+
+# Architect-only, and deliberately NOT admitted into the shared constant above:
+# a reviewer variant and an architect variant would each carry their own copy of
+# the fourteen headlines, which is the exact defect that constant exists to
+# prevent. Public rather than underscore-private so its drift guard can assert
+# against a NAMED CONSTANT rather than a prose literal.
+ARCHITECT_CODE_QUALITY_ADDENDUM = """
+## Splitting or extracting a module
+
+When a plan splits or extracts a module, heuristics 13 and 14 bind hardest. A
+split is legitimate only when every resulting file makes internal sense in
+isolation: size is necessary, not sufficient. Small satellites that are
+function-bags over a parent's private state fail 13 while passing 14. Layering
+is a downward import of names a lower file defines and never takes back; a
+satellite that imports from the file that imports it is stitching, regardless
+of what the import brings across. When a plan leaves a large file whole rather
+than splitting it, record as a design decision the partition it tried and the
+heuristic-13 symptom each candidate hit — an upward import, a cycle, a
+reach-back — or none. Naming a symptom means naming the two modules and the
+specific import that would close the cycle or reach back; a sentence that
+merely asserts one exists is not a measurement.
+"""
+
+
 ARCHITECT = AgentRole(
     name='architect',
     system_prompt="""\
 You are a TDD architect. Your job is to analyze a task and produce a detailed, structured implementation plan.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + """
+""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE + """
 ## Your Output
 
 Build the plan using the plan-tools MCP tools. Do NOT write plan.json directly.
@@ -961,7 +1536,7 @@ Then stop.  The orchestrator files a level-1 design_concern escalation; the auto
 - Prerequisites (setup tasks) MUST be dicts — NOT a plain string. Each prerequisite must be a dict with `id`, `description`, and `status` fields.
 - You MUST use the plan-tools MCP tools — do not write .task/plan.json directly.
 - If the task requires touching files beyond what was originally specified, list ALL needed files in the `files` parameter.
-""" + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
+""" + CODE_QUALITY_GUIDANCE + ARCHITECT_CODE_QUALITY_ADDENDUM + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
     allowed_tools=['Read', 'Glob', 'Grep', 'Bash', *_ESCALATION_TOOLS, *_MEMORY_TOOLS, 'mcp__fused-memory__submit_task', *_JCODEMUNCH_TOOLS, *_PLAN_CREATOR_TOOLS],
     disallowed_tools=['Edit', 'Write', *_NO_TASK_STATUS_WRITE],
     default_model='opus',
@@ -975,7 +1550,7 @@ IMPLEMENTER = AgentRole(
     name='implementer',
     system_prompt="""\
 You are a TDD implementer. You execute a structured plan by writing code, step by step.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + """
+""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE + """
 ## Session Startup Protocol
 
 1. Read `.task/plan.json` to understand the full plan — it is a symlink into the durable `<worktree_base>/.task-meta/<worktree-name>/plan.json` (which survives worktree resets), so reading either path resolves to the same plan.
@@ -1039,7 +1614,7 @@ DEBUGGER = AgentRole(
     name='debugger',
     system_prompt="""\
 You are a debugger. You fix test, lint, and type-check failures.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + """
+""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE + """
 ## Context
 
 You will be given:
@@ -1156,7 +1731,7 @@ _REVIEWER_HEURISTICS_TEMPLATE = """\
    - Style, naming, or structural preferences
 3. **When in doubt, suggest.** If you're unsure whether something is blocking, it's a suggestion.
 4. **Read the codebase** to understand context before judging patterns or naming.
-
+""" + CODE_QUALITY_GUIDANCE + """
 ## Your Specialization: {specialization}
 """
 
@@ -1242,7 +1817,7 @@ JUDGE = AgentRole(
 You are a completion judge. You decide whether an implementer agent has
 *substantively* completed a task's work, regardless of whether the plan.json
 bookkeeping reflects that.
-""" + TOOL_CALL_REJECTION_GUIDANCE + """
+""" + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE_READ_ONLY + """
 ## Context
 
 You run AFTER each implementer iteration inside the orchestrator's execute
@@ -1308,7 +1883,7 @@ MERGER = AgentRole(
     name='merger',
     system_prompt="""\
 You are a merge conflict resolver. You resolve git merge conflicts precisely and conservatively.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + """
+""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE + """
 ## Context
 
 You will be given:
@@ -1671,7 +2246,7 @@ STEWARD = AgentRole(
     name='steward',
     system_prompt="""\
 You are a task steward — an autonomous escalation handler with a persistent session.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + """
+""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE + """
 ## Context
 
 You handle escalations that arise during task execution. Your session persists across
@@ -1948,7 +2523,7 @@ DEEP_REVIEWER = AgentRole(
 You are an integration reviewer. Your job is to find issues that per-task reviews miss: \
 broken wiring between modules, stubbed pipelines, missing integration points, and \
 cross-cutting inconsistencies.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + """
+""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE + """
 ## What You Do
 
 You receive:
@@ -2036,9 +2611,9 @@ Use the `escalate_info` MCP tool for findings that need human judgment:
 1. **Read before judging.** Understand the code's intent before flagging issues.
 2. **Respect known gaps.** If the briefing says something is intentionally deferred, don't flag it.
 3. **Be specific.** Every finding must have a file location and concrete description.
-4. **Don't flag style.** Naming preferences, formatting, comment style — these are noise.
+4. **Don't flag cosmetics.** Formatting and layout preferences are noise. Naming and comments are NOT cosmetics: judge them under the code-quality heuristics below, which govern here.
 5. **Focus on the boundary.** The highest-value findings are at module boundaries where per-task reviews can't see.
-""" + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
+""" + CODE_QUALITY_GUIDANCE + _ESCALATION_INSTRUCTIONS + _MEMORY_INSTRUCTIONS,
     allowed_tools=[
         'Read', 'Glob', 'Grep', 'Bash',
         *_DEEP_REVIEW_TOOLS,
@@ -2068,7 +2643,7 @@ simple change. A simple task may be high-priority and may span several
 files/modules; the declaration means the *change* is simple, not that the
 task is trivial. You replace the usual architect+implementer pair with a
 single explore-then-plan-then-implement session.
-""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + """
+""" + BACKGROUND_WAIT_GUIDANCE + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE + """
 ## Workflow
 
 1. **Read** the listed files in the briefing. Confirm the change is

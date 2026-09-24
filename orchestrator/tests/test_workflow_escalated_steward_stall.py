@@ -997,10 +997,27 @@ class TestHealthyStewardIsNotForceDismissed:
         self, config, git_ops, task_assignment, tmp_path,
     ):
         """Silent past the completion timeout, inside the invocation ceiling."""
-        # 0.3s completion timeout + 1.0s per-invocation ceiling.  The steward
+        # 0.3s completion timeout + 5.0s per-invocation ceiling.  The steward
         # gives up at 0.6s: past the OLD bound (0.3s) — so this fails today —
-        # and inside the derived window (1.0 + 0.3 = 1.3s).
-        local_config = _short_window_config(config, completion=0.3, invocation=1.0)
+        # and inside the derived window (5.0 + 0.3 = 5.3s).
+        #
+        # `invocation` is widened from 1.0 to 5.0 (window 1.3s -> 5.3s, slack
+        # 0.7s -> 4.7s, ~9x the fake steward's 0.6s delay) to de-flake under
+        # full-suite xdist load: this fake exposes no `metrics` attribute, so
+        # `_steward_progress_counter()` returns None and the wait degrades to
+        # a plain fixed deadline the progress-refresh path (fix D1/D2) cannot
+        # rescue — leaving only ABSOLUTE slack between anchoring the deadline
+        # and the fake's single sleep landing. Under scheduler starvation
+        # that slack can be consumed before the sleep completes, tripping the
+        # give-up backstop on a deliberately-healthy steward. `completion`
+        # stays at 0.3 deliberately, so the post-completion drain grace and
+        # the "silent past the OLD bound" property both keep their current
+        # values — starvation only ever makes OBSERVED silence longer than
+        # 0.6s, never shorter, so widening `invocation` cannot make the test
+        # vacuous. Same xdist-starvation mechanism as the direct sibling
+        # de-flake in task 3912 (commit b69da5f051), for
+        # TestObservableProgressRefreshesTheWait in this same file.
+        local_config = _short_window_config(config, completion=0.3, invocation=5.0)
         wt = await _make_advanced_worktree(git_ops, task_assignment.task_id)
         queue = EscalationQueue(tmp_path / 'queue')
         esc = _submit_l0(queue, task_assignment.task_id)
@@ -1020,7 +1037,11 @@ class TestHealthyStewardIsNotForceDismissed:
         invoke_mock = _make_marking_invoke(markers)
         workflow._invoke = invoke_mock  # type: ignore[method-assign]
 
-        await asyncio.wait_for(workflow.run(), 10)
+        # 30s (not 10s): the derived window above is now 5.3s, so the outer
+        # guard must stay well clear of it — a genuine regression should
+        # surface as the precise assertion below, not an opaque outer
+        # TimeoutError. A healthy run still returns in ~0.6s.
+        await asyncio.wait_for(workflow.run(), 30)
 
         archived = queue.get(esc.id)
         assert archived is not None, 'the record must still be readable'

@@ -42,10 +42,12 @@ with its rationale lives above :func:`_classify_record`):
                                               (``DEAD_L0`` only when the filer
                                               is PROVABLY dead)
 
-This task delivers the types + classifier + tests ONLY.  Rewiring the veto
-sites (``task_ground_truth._shape``, the harness reconcile sweeps, the
-scheduler's stranded-blocked sweep) is task eta (3541); the structured
-``escalation_store_unavailable`` emission is task beta (3535).
+Task 3533 delivered the types + classifier + tests; task 3541 (eta) rewired
+every veto site onto them — ``task_ground_truth._shape`` and its report-shaped
+adapters, the harness reconcile sweeps, the scheduler's stranded-blocked
+redispatch, the deterministic-recon dedup and the orphan-L0 reaper, the
+orchestrator half composed in ``orchestrator/recovery_pins.py``.  The
+structured ``escalation_store_unavailable`` emission is task beta (3535).
 """
 
 from __future__ import annotations
@@ -204,9 +206,12 @@ def _norm_id(value: str | None) -> str | None:
       ``None`` (unknown) otherwise, and its in-memory source yields ``None``.
       Its plan.lock leg reads the ``.task-meta`` root the lock's writer
       targets (task 4028), so a real orchestrator run CAN reach it and emit a
-      composed identity from that source — though no production caller passes
-      a live identity into this module yet at all (task 3541).
-      This guard nonetheless stays load-bearing DEFENCE IN DEPTH — legacy
+      composed identity from that source.  Since task 3541 a production
+      caller DOES pass a live identity: the orphan-L0 reaper compares a
+      record's filing identity against the live task row's DB
+      ``claimant_run_id`` stamp, so this guard is on a hot path rather than
+      latent.
+      It stays load-bearing DEFENCE IN DEPTH beyond that — legacy
       plan.lock files already on disk, harness-less workflows (whose DB stamp
       is itself partial), and any future producer can still hand this module a
       non-composed identity.  A format mismatch is not PROOF that the filer is
@@ -234,7 +239,13 @@ def _classify_record(
     # JSON on disk can carry a null `severity` despite the `str` annotation.
     sev = str(record.severity or '').strip().lower()
 
-    # Link 1 — spec S6: an info record is an ANNOTATION, not a handoff.
+    # Link 1 — spec S6: an info record is an ANNOTATION, not a handoff.  Since
+    # task 3976, `escalation.server.promote_to_l2`'s inherited
+    # max(member severities) default can MINT a fresh L2 at severity='info'
+    # (previously the only info-severity L2s were ones `EscalationQueue.park()`
+    # promoted from an already-open L0/L1, never freshly filed ones), so this
+    # link now also decides an inherited-info L2 as NON_PINNING — see
+    # TestInfoAtL2Coupling in escalation/tests/test_pins.py (task 4402).
     if sev == 'info':
         return PinClass.NON_PINNING
 

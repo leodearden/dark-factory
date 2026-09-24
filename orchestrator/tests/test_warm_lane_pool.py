@@ -793,6 +793,94 @@ class TestSeedRcToUnavailable:
         from orchestrator.git_ops import _seed_rc_to_unavailable
         assert _seed_rc_to_unavailable(127) is WarmLaneUnavailable.FAULT
 
+    def test_124_is_lane_lock_timeout(self):
+        """Task 4930: rc=124 is flock's --conflict-exit-code for the bounded
+        ``<lane_dir>.lock`` wait — a TRANSIENT contention signal (a concurrent
+        GC reseed / thin / another seed still holds the lock), not a per-task
+        fault.  Before 4930 it fell through to FAULT, which is the one
+        warm-lane discriminant that is not a WarmLaneRequeue, so a lost lock
+        race hard-BLOCKed the task with agent_invocations=0.
+
+        Pinned via the module constant, not a bare 124 literal, so a retune of
+        the sentinel moves the test with it.
+        """
+        from orchestrator.git_ops import (
+            _SEED_WARM_LANE_LOCK_TIMEOUT_RC,
+            _seed_rc_to_unavailable,
+        )
+        assert _SEED_WARM_LANE_LOCK_TIMEOUT_RC == 124, (
+            'the flock --conflict-exit-code sentinel is expected to stay at '
+            "timeout(1)'s well-known 124 convention"
+        )
+        assert (
+            _seed_rc_to_unavailable(_SEED_WARM_LANE_LOCK_TIMEOUT_RC)
+            is WarmLaneUnavailable.LANE_LOCK_TIMEOUT
+        )
+
+    def test_existing_rc_mappings_unchanged(self):
+        """The new 124 branch must not swallow a neighbouring rc.
+
+        Re-asserts every other documented row in one place so a future edit to
+        the discriminant cannot quietly widen the lock-timeout branch (e.g. a
+        ``rc >= 124`` comparison) past its single cell.
+        """
+        from orchestrator.git_ops import _seed_rc_to_unavailable
+        assert _seed_rc_to_unavailable(75) is WarmLaneUnavailable.DISK_PRESSURE
+        assert _seed_rc_to_unavailable(76) is WarmLaneUnavailable.BASE_ABSENT
+        assert (
+            _seed_rc_to_unavailable(77)
+            is WarmLaneUnavailable.LANE_LOCK_CONTENDED
+        )
+        assert _seed_rc_to_unavailable(1) is WarmLaneUnavailable.FAULT
+        assert _seed_rc_to_unavailable(127) is WarmLaneUnavailable.FAULT
+    # ── task 4211: rc 77 → LANE_LOCK_CONTENDED ────────────────────────────
+    #
+    # reify's seed-warm-lane.sh emits 75 at exactly two sites, BOTH lane-lock
+    # refusal arms (flock -n immediate refusal; flock -w queue timeout) — seed
+    # has no disk-pressure exit-75 path at all.  So every lane-lock refusal was
+    # unconditionally rendered as "disk pressure", which is the operator-facing
+    # string that ran throughout reify esc-5556-1.  reify task 5568 added the
+    # OPT-IN ``--distinct-lock-refusal-rc`` flag under which those two arms exit
+    # 77 instead; these tests pin DF's half of that seam.
+
+    def test_77_is_lane_lock_contended(self):
+        """77 is reify's opt-in distinct lane-lock refusal code (reify 5568)."""
+        from orchestrator.git_ops import _seed_rc_to_unavailable
+        assert (
+            _seed_rc_to_unavailable(77)
+            is WarmLaneUnavailable.LANE_LOCK_CONTENDED
+        )
+
+    def test_lane_lock_contended_enum_member_value(self):
+        """The enum member exists and carries the documented wire value."""
+        assert WarmLaneUnavailable.LANE_LOCK_CONTENDED.value == 'lane_lock_contended'
+
+    def test_77_arm_is_additive_and_does_not_narrow_75(self):
+        """Regression fence — the rc 77 arm is purely ADDITIVE.
+
+        75 must KEEP meaning DISK_PRESSURE *alongside* 77 meaning
+        LANE_LOCK_CONTENDED: a lane whose checked-out seed script predates
+        reify 5568 still emits 75 for a lock refusal (the capability probe
+        fails CLOSED for such lanes, so the flag is omitted and the old code
+        is what arrives), and DF has its own genuine exit-75 producer that is
+        NOT seed — the ε pre-acquire disk-guard path, where 75 really does
+        mean disk pressure.  Narrowing 75 would break both.  Disambiguation
+        comes ONLY from the opt-in 77.
+
+        Deliberately asserts ONLY the 75/77 coexistence, not the whole
+        taxonomy: 76 -> BASE_ABSENT and 1/127 -> FAULT are already pinned by
+        test_76_is_base_absent / test_1_is_fault / test_127_is_fault directly
+        above, and re-asserting them here would make one future taxonomy
+        change fail in two places for a single reason (amendment,
+        reviewer_comprehensive test-coverage).
+        """
+        from orchestrator.git_ops import _seed_rc_to_unavailable
+        assert _seed_rc_to_unavailable(75) is WarmLaneUnavailable.DISK_PRESSURE
+        assert (
+            _seed_rc_to_unavailable(77)
+            is WarmLaneUnavailable.LANE_LOCK_CONTENDED
+        )
+
 
 class TestWarmLaneBaseResolvable:
     """GitOps._warm_lane_base_resolvable() — tri-state warm-base health probe.
@@ -4013,6 +4101,72 @@ class TestCreateWorktreeWarmLaneRouting:
 
         with pytest.raises(WarmLaneDiskPressure):
             await git_ops.create_worktree('task-dp')
+
+    # ── task 4211: LANE_LOCK_CONTENDED → WarmLaneLockContention ───────────
+
+    async def test_warm_lane_lock_contention_is_a_warm_lane_requeue(self):
+        """It inherits the requeue routing, not the blocked+L1 RuntimeError one.
+
+        A lane-lock refusal means another live consumer holds
+        ``<lane_dir>.lock`` — a transient shared-resource condition and no
+        fault of this task, so it must requeue via the shared
+        :class:`WarmLaneRequeue` handler in workflow.run().
+        """
+        from orchestrator.git_ops import WarmLaneLockContention, WarmLaneRequeue
+
+        assert issubclass(WarmLaneLockContention, WarmLaneRequeue)
+
+    async def test_create_worktree_lane_lock_contended_raises_lock_contention(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig, monkeypatch,
+    ):
+        """The discriminant LANE_LOCK_CONTENDED routes to its own raise arm.
+
+        Isolates the create_worktree routing from the seed subprocess by
+        pinning acquire_warm_lane's return value directly: before task 4211
+        this discriminant had no arm and fell through to the generic
+        FAULT/DISABLED ``RuntimeError`` (blocked + L1), which is the wrong
+        routing for transient contention.
+        """
+        from orchestrator.git_ops import WarmLaneLockContention
+
+        await self._setup_repo_with_seed(wl_git_repo, seed_exit=0)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        async def _contended(*_args, **_kwargs):
+            return WarmLaneUnavailable.LANE_LOCK_CONTENDED
+
+        monkeypatch.setattr(git_ops, 'acquire_warm_lane', _contended)
+
+        with pytest.raises(WarmLaneLockContention) as excinfo:
+            await git_ops.create_worktree('task-contended')
+
+        message = str(excinfo.value)
+        assert 'lock contention' in message.lower(), message
+        assert 'task-contended' in message, message
+        # The whole point of task 4211: the operator-facing string must no
+        # longer say "disk pressure" for what is a lane-lock refusal.
+        assert 'disk pressure' not in message.lower(), message
+
+    async def test_create_worktree_seed_exit_77_raises_lock_contention(
+        self, wl_git_repo: Path, wl_git_config_on: GitConfig,
+    ):
+        """End-to-end sibling of the seed-exit-75 DISK_PRESSURE test above.
+
+        Drives the REAL seam — seed subprocess rc 77 → _seed_rc_to_unavailable
+        → discriminant → create_worktree raise arm — rather than pinning the
+        discriminant, so the two halves cannot drift apart.
+        """
+        from orchestrator.git_ops import WarmLaneDiskPressure, WarmLaneLockContention
+
+        await self._setup_repo_with_seed(wl_git_repo, seed_exit=77)
+        git_ops = GitOps(wl_git_config_on, wl_git_repo, warm_lane_pool_size=1)
+
+        with pytest.raises(WarmLaneLockContention) as excinfo:
+            await git_ops.create_worktree('task-lock')
+
+        assert not isinstance(excinfo.value, WarmLaneDiskPressure), (
+            'rc 77 must NOT be rendered as disk pressure (task 4211)'
+        )
 
     async def test_create_worktree_success_returns_worktree_info_on_lane(
         self, wl_git_repo: Path, wl_git_config_on: GitConfig,

@@ -33,8 +33,10 @@ except ImportError:
 import shared.deploy_state  # noqa: F401  # populate W3 metadata registry with the deploy_state sub-model (DS shared-visible registration; §5.2)
 from shared.task_metadata import DoneProvenance, SchemaWarning, parse_metadata
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
+from shared.task_statuses import TaskStatus
 from shared.task_transitions import derive_actor_class, is_legal_transition
 
+from fused_memory.backends.sqlite_task_backend import task_timestamp_now
 from fused_memory.backends.task_backend_errors import (
     DoneProvenanceWriteAuthorityError,
     DuplicateCandidateKeyError,
@@ -93,6 +95,8 @@ from fused_memory.models.scope import resolve_project_id
 from fused_memory.reconciliation.consolidation_gate import (
     GATE_METADATA_KEY,
     evaluate_closure,
+    handrolled_member_enumeration,
+    resolve_unstamped_live_ids,
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
 
@@ -525,6 +529,11 @@ class TaskInterceptor:
         # through. Wired by set_consolidation_scroll (see its docstring).
         self._consolidation_scroll: Any | None = None
         self._consolidation_count: Any | None = None
+        # Task 4808: the per-candidate existence probe that makes
+        # `unstamped_cluster_member` reachable. DORMANT on the same terms as
+        # the scroll above — unwired, the derivation returns () and the gate
+        # behaves exactly as it did before.
+        self._consolidation_exists: Any | None = None
 
     def set_write_journal(self, journal: 'WriteJournal') -> None:
         """Wire the write journal for durable auditing of task writes.
@@ -590,7 +599,9 @@ class TaskInterceptor:
         """
         self._lifecycle_reset_filer = filer
 
-    def set_consolidation_scroll(self, scroll: Any, count: Any = None) -> None:
+    def set_consolidation_scroll(
+        self, scroll: Any, count: Any = None, exists: Any = None
+    ) -> None:
         """Wire the consolidation-gate closure scroll (task 3112).
 
         *scroll* is an async ``(filters, *, limit, project_id) -> list[payload]``
@@ -606,6 +617,24 @@ class TaskInterceptor:
         ``TaskInterceptor`` construction site, where ``memory_service`` is
         already in scope.
 
+        *exists* (task 4808) is an async ``(memory_id, *, project_id) -> bool``
+        — in production a wrapper over ``MemoryService.get_memory_by_id``,
+        built by ``consolidation_gate.py::closure_exists_probe`` (the shared
+        factory ``server/main.py::_wire_closure_collaborators`` and
+        ``scripts/check_consolidation_closure.py`` both bind). It is what lets
+        the seam derive ``unstamped_live_ids`` from the gate block's inert
+        provenance, and it is scoped for the same non-optional reason the
+        scroll is. Like *count* it falls back to ``scroll.exists`` when
+        omitted, so one bound collaborator object still carries all three.
+        When it is not wired the unstamped-member derivation is DORMANT and
+        the gate behaves exactly as it did before: without a probe an observed
+        id missing from the scroll cannot be told apart from one that was
+        absorbed and deleted, and guessing would make every correctly executed
+        delete-arm consolidation permanently uncloseable.
+
+        *scroll* stays positional and *count* keeps its position, so existing
+        positional callers are untouched.
+
         Before the call — and in every test that does not configure one — the
         consolidation-closure gate is DORMANT and status transitions proceed
         exactly as before: zero behaviour change, mirroring
@@ -613,6 +642,9 @@ class TaskInterceptor:
         """
         self._consolidation_scroll = scroll
         self._consolidation_count = count if count is not None else getattr(scroll, 'count', None)
+        self._consolidation_exists = (
+            exists if exists is not None else getattr(scroll, 'exists', None)
+        )
 
     #: Per-check cap on the consolidation-closure scroll. Mirrors the
     #: `consolidate_memories` topic-members listing: a single Qdrant scroll,
@@ -637,6 +669,17 @@ class TaskInterceptor:
         COST ORDERING copies the landed op: count first, scroll only on a
         non-zero count, and disclose truncation — so the common path is cheap
         and a capped scroll never reads as complete.
+
+        UNSTAMPED MEMBERS (task 4808). The seam also derives
+        ``unstamped_live_ids`` from the gate block's inert provenance, via
+        ``consolidation_gate.py::resolve_unstamped_live_ids``. This is the ONE
+        thing provenance may contribute, and it can only ever ADD a refusal —
+        never grant a pass — which is the design statement
+        ``consolidation_gate.py::build_consolidation_gate_task`` already makes
+        about the enumeration it writes. The derivation sits INSIDE the
+        fail-closed ``try`` below on purpose: a probe timeout then becomes the
+        same refusal an unreadable scroll already produces, with no new policy
+        and no second decision to keep in sync.
         """
         scroll = self._consolidation_scroll
         if scroll is None:
@@ -646,6 +689,29 @@ class TaskInterceptor:
             return None
         block = meta.get(GATE_METADATA_KEY)
         if not isinstance(block, dict):
+            # Task 4808, the SECOND gap. `operational_mode == 'gate'` is a
+            # GENERIC human-gate marker, so a block-less gate cannot be
+            # refused — that would brick the 123 measured gates that
+            # legitimately carry no block. But a gate that hand-rolled its own
+            # member list under `memory_ids`/`related_memory_ids` is very
+            # likely a consolidation gate the seam simply cannot see, so it is
+            # FLAGGED rather than silently skipped. See
+            # `consolidation_gate.py::handrolled_member_enumeration` for the
+            # measured basis and the flag-don't-refuse decision.
+            handrolled = handrolled_member_enumeration(meta)
+            if handrolled is not None:
+                key, ids = handrolled
+                logger.warning(
+                    'task=%s enumerates cluster members under `metadata.%s` '
+                    '(%s) but carries no `%s` block, so the consolidation '
+                    'gate is DORMANT for it and this `done` transition '
+                    'closes it unchecked. File it through '
+                    '`build_consolidation_gate_task` to arm the gate.',
+                    task_id,
+                    key,
+                    ', '.join(str(i) for i in ids),
+                    GATE_METADATA_KEY,
+                )
             return None
         topic = block.get('topic')
         if not isinstance(topic, str) or not topic:
@@ -668,6 +734,12 @@ class TaskInterceptor:
 
         filters = {'topic': topic}
         limit = self._CONSOLIDATION_SCROLL_LIMIT
+        # Initialised BEFORE the try so the except path cannot raise
+        # UnboundLocalError — a handler that itself raises would convert a
+        # fail-closed refusal into a 500. That path forces available=False
+        # anyway, which makes evaluate_closure return `scroll_unavailable`
+        # and ignore everything else.
+        unstamped: tuple[str, ...] = ()
         try:
             total: int | None = None
             if self._consolidation_count is not None:
@@ -683,10 +755,16 @@ class TaskInterceptor:
             )
             if total is None:
                 total = len(members)
+            unstamped = await resolve_unstamped_live_ids(
+                block,
+                members=members,
+                exists=self._consolidation_exists,
+                project_id=project_id,
+            )
         except Exception as exc:  # noqa: BLE001 — every failure is a refusal
             logger.warning(
-                'consolidation closure scroll failed for task=%s topic=%s: %s; '
-                'REFUSING the done transition (fail-closed)',
+                'consolidation closure scroll or probe failed for task=%s '
+                'topic=%s: %s; REFUSING the done transition (fail-closed)',
                 task_id,
                 topic,
                 exc,
@@ -699,6 +777,7 @@ class TaskInterceptor:
             scroll_total=total,
             scroll_truncated=truncated,
             scroll_available=available,
+            unstamped_live_ids=unstamped,
         )
         if verdict.closed:
             return None
@@ -974,6 +1053,20 @@ class TaskInterceptor:
         if ',' in task_id:
             ids = [t.strip() for t in task_id.split(',') if t.strip()]
             results: list[dict] = []
+            # One `metadata.pending_since` clock for the whole batch (task
+            # 3816, PRD §C1 invariants / rule 5). A CSV flip -- what
+            # `commit_planning` issues -- is ONE atomic release, so it must
+            # read as one instant: per-id clock reads drift by tens of ms
+            # across a batch of gated transactions, and under the scheduler's
+            # age term that spread is a real score delta, enough to order the
+            # batch by commit sequence when intra-batch order is required to
+            # fall through to CPM and then numeric id. `task_timestamp_now` is
+            # the store's PUBLIC clock and its docstring carries the format
+            # contract; this module's own `datetime.now(UTC).isoformat()`
+            # helper is deliberately NOT interchangeable with it.
+            batch_pending_since = (
+                task_timestamp_now() if status == TaskStatus.PENDING else None
+            )
             for tid in ids:
                 per_result = await self._apply_status_transition(
                     task_id=tid,
@@ -985,6 +1078,7 @@ class TaskInterceptor:
                     claimant_run_id=claimant_run_id,
                     heartbeat_at=heartbeat_at,
                     agent_id=agent_id,
+                    pending_since_now=batch_pending_since,
                 )
                 results.append({'task_id': tid, 'result': per_result})
             all_ok = all(
@@ -1021,12 +1115,19 @@ class TaskInterceptor:
         claimant_run_id: str | None = _UNSET,  # type: ignore[assignment]
         heartbeat_at: str | None = _UNSET,  # type: ignore[assignment]
         agent_id: str | None = None,
+        pending_since_now: str | None = None,
     ) -> dict:
         """Single-id status transition with all gates + event emission.
 
         Extracted so the public ``set_task_status`` can loop over CSV ids
         and apply the gates per-id. Holds the write lock across
         read→check→write, emits the event outside the lock.
+
+        ``pending_since_now`` is a pure pass-through to the backend's wait-
+        anchor stamp (task 3816): the CSV branch above supplies one value for
+        a whole batch, and the single-id branch leaves it ``None`` so the
+        backend computes its own clock, exactly as before. No gate logic,
+        event payload, or reconciliation behaviour keys on it.
         """
         tm = await self._ensure_taskmaster()
         project_id = resolve_project_id(project_root)
@@ -1399,6 +1500,12 @@ class TaskInterceptor:
             # the default call stays byte-identical to every existing caller.
             claimant_kwargs: dict[str, Any] = _maybe_kwargs(
                 _UNSET, claimant_run_id=claimant_run_id, heartbeat_at=heartbeat_at,
+            )
+            # Same tri-state forwarding shape, one more kwarg: omitted unless
+            # a batch clock was supplied, so the single-id call stays
+            # byte-identical to a pre-3816 one (task 3816).
+            claimant_kwargs.update(
+                _maybe_kwargs(None, pending_since_now=pending_since_now),
             )
 
             async def _do_set_task_status_write() -> Any:

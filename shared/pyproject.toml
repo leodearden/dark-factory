@@ -57,6 +57,15 @@ dev = [
     "pytest-asyncio>=0.23",
     "pytest-cov>=7.1.0",
     "pytest-timeout>=2.4.0",
+    # For the `scripts` verify leg, NOT for this member's own suite: that leg is
+    # `uv run --project shared pytest tests/scripts/ scripts/tests/ ... -n auto`
+    # (scripts/orchestrator.yaml), so shared is the environment uv resolves the
+    # plugin from. This member's own addopts stays SERIAL deliberately — measured
+    # faster serial, and tests/test_proc_group.py, tests/test_concurrency.py and
+    # tests/test_cli_invoke.py need @pytest.mark.xdist_group pins first (task
+    # 5408; pinned by tests/scripts/test_merge_gate_parallelism_config.py::
+    # RULED_SERIAL_MEMBERS).
+    "pytest-xdist>=3.5.0",
     "ruff>=0.4",
     "aiohttp>=3.9",
 ]
@@ -65,13 +74,51 @@ dev = [
 markers = ["integration: live CLI tests requiring OAuth accounts (deselect: -m 'not integration')"]
 addopts = "-m 'not integration'"
 asyncio_mode = "auto"
-# Default per-test timeout. Catches accidental asyncio-sleep hangs (e.g. a
-# misconfigured UsageGate mock whose slot.detect_cap_hit returns a truthy
-# MagicMock, sending invoke_with_cap_retry through 19 real exponential-
-# backoff sleeps). Slow tests can opt out with @pytest.mark.timeout(N).
-# signal method is load-bearing: thread method prints a stack trace but
+# Default per-test timeout. THE CANONICAL RATIONALE for this setting across
+# the workspace — orchestrator/, fused-memory/, escalation/ and dashboard/
+# pyproject.toml cite this block rather than restating it.
+#
+# WHAT IT CATCHES: accidental asyncio-sleep hangs (e.g. a misconfigured
+# UsageGate mock whose slot.detect_cap_hit returns a truthy MagicMock, sending
+# invoke_with_cap_retry through 19 real exponential-backoff sleeps), and
+# deadlocked lock implementations. Slow tests can opt out with
+# @pytest.mark.timeout(N).
+#
+# WHY A LARGE VALUE AND NOT THE ORIGINAL 60 (2026-09-12). The cap is
+# WALL-CLOCK, not CPU time. On this 32-core host under sustained load (~180 at
+# the time of that change) a perfectly healthy test can exceed 60s from CPU
+# STARVATION alone, without being hung at all. The cost of that is not one
+# honest red: under timeout_method = "thread" pytest-timeout answers a breach by
+# os._exit()ing the xdist worker, and --max-worker-restart=0 degrades that into
+# a clean per-test FAILURE whose victim is whatever test happened to be on the
+# dead worker — NOT the starved one. That is the "shifting victim" false-red
+# mechanism from the CPU-contention RCA (memory:
+# project_cpu_contention_test_flakiness_rootcause_2026_07_18).
+#
+# So the value attacks the TRIGGER and deliberately leaves both safety
+# mechanisms intact: timeout_method and --max-worker-restart=0 are UNCHANGED,
+# each having been chosen against a measured worse failure (task 1907).
+#
+# 540 IS DERIVED FROM MEASUREMENT (task 5442, 2026-09-17), which is what this
+# paragraph used to say nobody had done. The worst per-test wall clock of an
+# UNMARKED test, across every suite and both inifile-resolution modes under real
+# fleet load, measured 61.52s; times the 8x headroom factor whose rationale is
+# orchestrator/tests/test_whole_tree_scan_timeout_guard.py
+# ::_REQUIRED_HEADROOM_FACTOR, rounded up to a whole minute, floored at the
+# independently-measured 300. The full corpus, the run-to-run spread and the
+# arithmetic are in
+# plans/pytest-per-test-timeout-measurement-2026-09-17.md — read that before
+# moving this number, and re-measure rather than re-judging it.
+#
+# THE MEASUREMENT RAISED THE VALUE RATHER THAN CONFIRMING IT: 300 was only 4.9x
+# the measured worst case, against the 8x this repo's own worker-death evidence
+# demands. The cost is unchanged in kind and stated plainly — a genuinely hung
+# test now takes 9 minutes to surface, not 5. @pytest.mark.timeout(N) remains
+# the escape hatch for any test that wants to surface faster.
+#
+# signal method is load-bearing HERE: thread method prints a stack trace but
 # can't actually interrupt a blocking asyncio.sleep in the main thread.
-timeout = 60
+timeout = 540
 timeout_method = "signal"
 
 [tool.pyright]

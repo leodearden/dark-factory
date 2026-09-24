@@ -4,11 +4,11 @@ const { ProjectGroup: PG_T, Segmented: SEG_T } = window.DF_SHELL;
 const { PALETTE: CP_T } = window.DF_CHARTS;
 const DF_T = window.DF_DATA;
 const { useState: uS_T, useEffect: uE_T, useRef: uR_T, useLayoutEffect: uLE_T, useMemo: uM_T } = React;
-const { computeTiers, partitionComponents, orderRows, computeNeighborhood, focusSubset } = window.DF_GRAPH_LAYOUT;
+const { computeTiers, partitionComponents, orderRows, computeNeighborhood, focusGroupView } = window.DF_GRAPH_LAYOUT;
 const { prdTitle, aggregatePrdStatus, summarizePrdMembers, groupTasksByPrd, orderPrdGroups } = window.DF_PRD_GROUPING;
 const { projectStatusCounts, activityPips } = window.DF_TASK_STATUS_COUNTS;
 const { strandBadgeState, agentCellState } = window.DF_TASK_ROW_CELLS;
-const { rtCell, rtAge } = window.DF_RUNTIME_FMT;
+const { rtCell, rtAge, rtProbe, rtProbeSummary } = window.DF_RUNTIME_FMT;
 const { tasksBannerNotices } = window.DF_TASKS_OFFLINE_BANNER;
 
 // Dot colour per activity pip. activityPips is pure and owns ORDER and
@@ -19,6 +19,15 @@ const PIP_DOT_COLOR_T = {
   running: CP_T.accent,
   blocked: CP_T.bad,
   'merge-deferred': 'var(--merge-deferred)',
+};
+
+// CSS accent per probe-status tone (runtime_format.js owns which tone each
+// status gets; this only translates a tone into a colour for the banner's
+// left rule). 'muted' means "expected, not a fault" — no accent at all.
+const PROBE_TONE_ACCENT_T = {
+  muted: 'var(--line)',
+  warn: 'var(--warn)',
+  bad: 'var(--bad)',
 };
 
 // Persisted-state hook (same shape as elsewhere)
@@ -148,8 +157,9 @@ function TaskGraphEdges({ containerRef, nodeRefs, tasks, selectedId, neighborhoo
 // registers its nodes into it instead of a private one, and renderEdges=false
 // skips this instance's own TaskGraphEdges overlay entirely — used when a
 // single hoisted overlay (spanning multiple TaskGraph instances) draws edges
-// instead. Neither prop is passed by the ungrouped call site (ProjectTaskGraph),
-// so that path's behavior is unchanged: its own private nodeRefs, own overlay.
+// instead. Neither prop is passed by the ungrouped per-project call site in
+// TasksTab's projects.map() below, so that path's behavior is unchanged: its
+// own private nodeRefs, own overlay.
 function TaskGraph({ tasks, selectedId, onSelect, onEnterFocus, nodeRefs: externalNodeRefs, renderEdges = true }) {
   const containerRef = uR_T(null);
   const ownNodeRefs = uR_T({});
@@ -231,37 +241,18 @@ function TaskGraph({ tasks, selectedId, onSelect, onEnterFocus, nodeRefs: extern
   );
 }
 
-// Per-project wrapper around TaskGraph: memoizes the focus-mode subset so
-// it isn't recomputed (rebuilding focusSubset's Map + re-walking
-// computeNeighborhood) on every TasksTab render that doesn't actually
-// change this project's filtered tasks, selection, or focus state — e.g.
-// re-renders driven by unrelated live-data ticks elsewhere on the page.
-// This has to be a real component (not an inline computation inside the
-// projects.map() callback below) so the useMemo call follows the Rules of
-// Hooks: one consistent hook per mounted project instance, not a
-// variable-count hook call inside a loop.
-//
-// Guarding on selectedId != null (not just focusMode) keeps the existing
-// immediate-passthrough behavior when a node is deselected by clicking it
-// again — that only clears selectedId, and without this guard the subset
-// would still reflect the stale focusAnchorId for one render until the
-// effect above catches focusMode up to it.
-function ProjectTaskGraph({ filtered, selectedId, focusMode, focusAnchorId, onSelect, onEnterFocus }) {
-  const graphTasks = uM_T(
-    () => (focusMode && selectedId != null ? focusSubset(filtered, focusAnchorId) : filtered),
-    [filtered, focusMode, selectedId, focusAnchorId]
-  );
-  return <TaskGraph tasks={graphTasks} selectedId={selectedId} onSelect={onSelect} onEnterFocus={onEnterFocus} />;
-}
-
 // Per-project "group by PRD" render: buckets the project's filtered tasks
 // into PRD boxes (groupTasksByPrd), orders the boxes via orderPrdGroups (a
 // PRD consuming another PRD's tasks renders below it; "no PRD" trails), and
 // lays out each box's induced subgraph via the existing per-box TaskGraph
 // machinery (which itself calls computeTiers/partitionComponents/orderRows).
 // Kept as its own component (not an inline computation inside the
-// projects.map() callback below) for the same Rules-of-Hooks reason as
-// ProjectTaskGraph above — one consistent useMemo per mounted project instance.
+// projects.map() callback below) because the refs and memos it holds are
+// hooks, and the Rules of Hooks forbid calling one from inside a map
+// callback — a mounted component per project gives each its own consistent
+// ref/memo identity.
+// The flat view needs no such wrapper: it renders TaskGraph directly, having
+// nothing left to memoize once the narrowing moved to the call site.
 //
 // Cross-box dependency edges: a SINGLE TaskGraphEdges overlay is hoisted here
 // (spanning every box) instead of each TaskGraph instance rendering its own —
@@ -273,19 +264,18 @@ function ProjectTaskGraph({ filtered, selectedId, focusMode, focusAnchorId, onSe
 // renderEdges={false} (skip its own overlay) and handed the SAME shared
 // nodeRefs map (via the nodeRefs prop) so its nodes register into the map
 // the hoisted overlay reads from.
-function ProjectPrdGroups({ filtered, allProjectTasks, selectedId, focusMode, focusAnchorId, onSelect, onEnterFocus }) {
+function ProjectPrdGroups({ graphTasks, allProjectTasks, selectedId, onSelect, onEnterFocus }) {
   const containerRef = uR_T(null);
   const nodeRefs = uR_T({});
 
-  // Mirrors ProjectTaskGraph's focus-subset narrowing above: onEnterFocus is
-  // wired into every rendered node's double-click below exactly like the
-  // list view, so without this the "focus" affordance would silently do
-  // nothing while grouped — the boxes would keep showing every group's full
-  // filtered membership instead of narrowing to the anchor's neighborhood.
-  const graphTasks = uM_T(
-    () => (focusMode && selectedId != null ? focusSubset(filtered, focusAnchorId) : filtered),
-    [filtered, focusMode, selectedId, focusAnchorId]
-  );
+  // `graphTasks` arrives ALREADY focus-narrowed as a prop, from the single
+  // focusGroupView call in the projects.map() callback below (shared with the
+  // flat view's TaskGraph and with the header's shown count). It is still the
+  // focus-narrowed set and not the project's full membership: onEnterFocus is
+  // wired into every rendered node's double-click below exactly like the list
+  // view, so were it not narrowed the "focus" affordance would silently do
+  // nothing while grouped. `allProjectTasks` below is deliberately NOT
+  // narrowed — see fullMembersByPrd.
 
   // Content signatures so the pricier work below (bucketing + PRD-level
   // mini-DAG tiering, and the full-member summaries) only reruns when
@@ -524,6 +514,12 @@ function TaskDetail({ task, allTasks }) {
   }
   const deps = task.deps || [];
   const dependents = allTasks.filter(t => (t.deps || []).some(d => d.id === task.id));
+  // Why the runtime cells below are dashed. Three separable cases the operator
+  // must not confuse: the orchestrator is unreachable, OUR probe deadline fired
+  // (a starved dashboard event loop looks exactly like this), or no runtime
+  // endpoint is configured at all. Produced by task_runtime._probe_one ->
+  // active_tasks._probe_status. null on the healthy path — nothing renders.
+  const probe = rtProbe(task.runtime_status);
   return (
     <div className="task-detail">
       <h4>{task.title}</h4>
@@ -536,12 +532,21 @@ function TaskDetail({ task, allTasks }) {
               columns; deliberately INDEPENDENT of `agent` below, which is only
               worktree presence and stays truthy after the agent dies. */}
           {(() => { const sb = strandBadgeState(task); return sb && <span className={sb.cls} style={{ marginLeft: sb.marginLeft }} title={sb.title}>{sb.label}</span>; })()}</span>
-        <span className="k">agent</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{(() => { const ac = agentCellState(task); return ac.muted ? <span style={{ color: 'var(--fg-3)' }}>{ac.text}</span> : ac.text; })()}</span>
+        <span className="k">agent</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{(() => { const ac = agentCellState(task); return ac.color ? <span style={{ color: ac.color }}>{ac.text}</span> : ac.text; })()}</span>
         <span className="k">loops</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.loops)}</span>
         <span className="k">attempts</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.attempts)}</span>
         <span className="k">lane</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.lane)}</span>
         <span className="k">phase</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.phase)}</span>
         <span className="k">state</span><span style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{rtCell(task.lane_state)}</span>
+        {probe && (
+          <React.Fragment>
+            <span className="k">runtime</span>
+            <span data-testid="task-runtime-probe" title={probe.hint}>
+              <span className={`badge ${probe.tone}`}>{probe.label}</span>
+              <span style={{ color: 'var(--fg-3)', fontSize: 10, marginLeft: 6 }}>{probe.hint}</span>
+            </span>
+          </React.Fragment>
+        )}
       </div>
 
       <div className="section-lbl">Description</div>
@@ -695,6 +700,46 @@ function TasksTab({ projectFilter, search }) {
     'count-unknown': 'tasks-count-unknown-banner',
   };
 
+  // Runtime-probe health, derived frontend-side from the ACTIVE_TASKS rows
+  // (deliberately not a new top-level payload key — the per-project fact is
+  // already fully recoverable from `runtime_status`, so a new key would carry
+  // zero extra information). `runtime_status` is produced by
+  // task_runtime._probe_one (which names the fault domain) and mapped to the
+  // row vocabulary by active_tasks._probe_status — grep either end to find
+  // the other.
+  //
+  // A SIBLING of bannerNotices above, not a fifth kind inside it. The two
+  // answer different questions: tasksBannerNotices reports whether TASK DATA
+  // is available, a distinction decided server-side in app.api_tasks, while
+  // rtProbeSummary is a client-side derivation over the ACTIVE_TASKS rows
+  // reporting whether we could reach the ORCHESTRATORS. Those are independent
+  // — fused-memory being down says nothing about orchestrator reachability —
+  // so both banners can show at once, and neither gates the other.
+  //
+  // Folding this into tasksBannerNotices would not merely blur that: it would
+  // SUPPRESS the probe verdict. That function short-circuits
+  // (tasks_offline_banner.js:112-115) — when `offline` is true it returns a
+  // single global notice and never evaluates the other kinds — so a probe
+  // notice routed through it would vanish during precisely the fused-memory
+  // outage we must not gate on, which is when an operator is already
+  // mid-triage and least able to afford a missing signal. Pinned by
+  // test_tab_tasks_runtime.py::test_probe_banner_is_not_a_tasksbannernotices_kind.
+  //
+  // Computed over the UNFILTERED rows, and deliberately NOT narrowable.
+  // `selfInflicted` is an assertion about the DASHBOARD's own health — that it
+  // finished none of the probes it started — so its denominator must be every
+  // probed project. This was previously scoped to the projectFilter-visible
+  // rows, which let an operator narrowed to two timed-out projects manufacture
+  // an all-at-once verdict and blame the dashboard for what was actually a
+  // per-project outage: the precise misdiagnosis this banner exists to prevent.
+  // The banner is therefore a global fact.
+  //
+  // Accepted tradeoff, so a future reader does not "fix" this back: an
+  // operator filtered down to one healthy project may still see a banner about
+  // a project they cannot see. That is strictly less harmful than a false "the
+  // orchestrators may be healthy — check the dashboard first" shown mid-triage.
+  const probeSummary = rtProbeSummary(allTasks);
+
   function statusMatches(s) {
     if (filters.active    && (s === 'in-progress' || s === 'blocked' || s === 'merge-deferred')) return true;
     if (filters.pending   && s === 'pending')    return true;
@@ -730,6 +775,25 @@ function TasksTab({ projectFilter, search }) {
           {notice.text}
         </div>
       ))}
+      {probeSummary && (
+        <div className="col-span-12" data-testid="tasks-runtime-probe-banner"
+             style={{
+               padding: '8px 12px',
+               border: '1px solid var(--line)',
+               // Accent by the WORST tone present, not by selfInflicted: a
+               // lone timed-out project is a 'warn' (quite possibly our own
+               // starved loop) and must not wear the same alarm colour as a
+               // confirmed orchestrator outage. rtProbe owns the mapping.
+               borderLeft: `3px solid ${PROBE_TONE_ACCENT_T[probeSummary.tone] || 'var(--warn)'}`,
+               borderRadius: 4,
+               background: 'var(--bg-2)',
+               color: 'var(--fg-2)',
+               fontFamily: 'var(--mono)',
+               fontSize: 11,
+             }}>
+          {probeSummary.text}
+        </div>
+      )}
       {/* Filter bar */}
       <div className="col-span-12" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
         <span className="lbl" style={{ color: 'var(--fg-3)', fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase' }}>show</span>
@@ -792,6 +856,35 @@ function TasksTab({ projectFilter, search }) {
                     ? '—'
                     : (_fallbackDone >= 50 ? '50+' : _fallbackDone)),
             };
+            // The ONE focus-narrowing site. Both the header count below and
+            // the group body read this single result, so they cannot be fed
+            // different arrays — which is exactly what went wrong before
+            // (task 4137): focus state is global, narrowing was applied per
+            // group, and the header counted the PRE-focus `filtered`, so every
+            // non-anchor project rendered an empty graph under "N/N shown".
+            // A plain call, not a hook, so it is legal here inside map().
+            //
+            // This replaces a useMemo that sat in each of the two per-project
+            // render paths (a ProjectTaskGraph wrapper, since deleted, and
+            // ProjectPrdGroups). For an OPEN group dropping them costs no
+            // measured work: both were reference-keyed on `filtered`, which
+            // projTasks.filter(...) above rebuilds as a fresh array on every
+            // TasksTab render — including the app-wide 1s clock tick — so both
+            // already recomputed every render. That is the same hazard
+            // ProjectPrdGroups documents for its own signature-keyed memos.
+            //
+            // For a COLLAPSED group it IS new work, deliberately. shell.jsx's
+            // ProjectGroup renders `summary` unconditionally but `children`
+            // only when open, so neither per-project component ever mounted
+            // and the narrowing never ran — yet the header still has to show
+            // the narrowed count, which is the whole defect. So this runs for
+            // every project on every render, closed ones included. The bound
+            // is computeNeighborhood's O(|neighborhood| x |tasks|) descendants
+            // scan over ONE project's filtered list (hundreds at most today),
+            // and it is free in the two common cases: focus off is a
+            // passthrough, and an already-empty `filtered` gives the walk
+            // nothing to scan.
+            const groupView = focusGroupView(filtered, { focusMode, selectedId, focusAnchorId });
             const isOpen = openMap[p.id] !== false; // default-open
             const groupByPrd = groupByPrdMap[p.id] === 'prd';
             const summary = (
@@ -804,7 +897,9 @@ function TasksTab({ projectFilter, search }) {
                 ))}
                 <span className="pip"><span className="pip-dot" style={{ background: CP_T.warn }}></span>{counts.pending} pending</span>
                 <span className="pip"><span className="pip-dot" style={{ background: CP_T.ok }}></span>{counts.complete} done</span>
-                <span className="mono" style={{ color: 'var(--fg-3)', fontSize: 10 }}>{filtered.length}/{counts.total} shown</span>
+                <span className="mono" style={{ color: 'var(--fg-3)', fontSize: 10 }}>
+                  {groupView.shownCount}/{counts.total} shown{groupView.emptiedByFocus ? ' — none in focus' : ''}
+                </span>
               </>
             );
             const summaryRight = (
@@ -818,12 +913,13 @@ function TasksTab({ projectFilter, search }) {
             return (
               <PG_T key={p.id} id={p.id} label={p.id} open={isOpen} onToggle={() => toggle(p.id)}
                     summary={summary} summaryRight={summaryRight}>
-                {groupByPrd
-                  ? <ProjectPrdGroups filtered={filtered} allProjectTasks={projTasks} selectedId={selectedId}
-                                      focusMode={focusMode} focusAnchorId={focusAnchorId}
-                                      onSelect={setSelectedId} onEnterFocus={enterFocus} />
-                  : <ProjectTaskGraph filtered={filtered} selectedId={selectedId} focusMode={focusMode}
-                                      focusAnchorId={focusAnchorId} onSelect={setSelectedId} onEnterFocus={enterFocus} />}
+                {groupView.emptiedByFocus
+                  ? <div className="empty">no tasks in the focused neighborhood — Esc to exit focus</div>
+                  : groupByPrd
+                    ? <ProjectPrdGroups graphTasks={groupView.shown} allProjectTasks={projTasks} selectedId={selectedId}
+                                        onSelect={setSelectedId} onEnterFocus={enterFocus} />
+                    : <TaskGraph tasks={groupView.shown} selectedId={selectedId}
+                                 onSelect={setSelectedId} onEnterFocus={enterFocus} />}
               </PG_T>
             );
           })}

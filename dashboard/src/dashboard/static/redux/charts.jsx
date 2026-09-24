@@ -2,6 +2,12 @@
 
 const { useRef, useEffect, useState, useMemo } = React;
 
+// The Datum render decision. Module scope, no fallback, bound under datum.js's
+// own name — a text/babel tag joins no classic-script scope, so there is
+// nothing to collide with. See the CANONICAL note in datum.js's header; the
+// spark_path.js destructure below follows the same rule.
+const { datumView } = window.DF_DATUM;
+
 // The scale+path math for every chart primitive here lives in the plain-JS
 // sibling /static/redux/spark_path.js, where it is behaviourally testable under
 // `node --test` (dashboard/tests/js/spark_path.test.mjs) — this file is JSX
@@ -23,6 +29,7 @@ const {
   stepPaths: sparkStepPaths,
   plottableMax,
   axisY,
+  formatCountTick,
   axisPaths,
   barFractions,
   stackedAreaPaths,
@@ -105,11 +112,24 @@ function StepSpark({ values, width = 100, height = 28, color = PALETTE.bad, stro
 }
 
 // NOTE — this formatY default deliberately does NOT round, while
-// StackedAreaChart's below does; both hand formatY the RAW tick, only the
-// defaults differ. So an integer-count series renders `1.75` / `3.5` here but
-// `2` / `4` there. Aligning them means auditing every LineChart caller
-// (tabs.jsx:538, tabs.jsx:1109, tab_overview.jsx:231, the analytics tab) — out
-// of scope for task 4059, which only fixed the pre-rounding defect below.
+// StackedAreaChart's below does. Both hand formatY the RAW tick; only the
+// DEFAULTS differ, and that asymmetry is now a decision on the record rather
+// than an accident.
+//
+// Task 4232 ran the caller audit task 4059 deferred. Eight call sites; four
+// pass no formatY and rely on this default. THREE of those are integer counts
+// (memory reads/writes per hour, merge attempts per 15-minute bucket,
+// escalation re-filings per day) — but the FOURTH,
+// tab_escalation_analytics.jsx's escalations-per-done chart, plots
+// `filings / done` (escalation_analytics.py::_esc_per_done), a genuine
+// fraction. Rounding by default would collapse that ratio axis exactly the way
+// pre-4059 pre-rounding collapsed WorkflowPanel's 100%-normalized stack — i.e.
+// it would re-file its own predecessor's defect one primitive over.
+//
+// So the default stays `(v) => String(v)`, and the three count callers opt in
+// explicitly with `formatY={formatCountTick}` (spark_path.js, where its
+// blank-don't-round rule is behaviourally tested). Do not "align" these two
+// defaults without redoing that audit.
 function LineChart({ series, labels, height = 220, yLabel, formatY = (v) => String(v), formatX = (v) => v }) {
   const ref = useRef(null);
   const [w, setW] = useState(600);
@@ -464,16 +484,61 @@ function Donut({ data, size = 120, thickness = 18, centerLabel, centerValue }) {
   );
 }
 
-function StatTile({ label, value, unit, delta, deltaDir, spark, sparkColor, hint }) {
+// How an age badge renders, in one place. An INLINE style rather than a new
+// `.datum-age` CSS rule: styles.css belongs to no leaf of this PRD, and the
+// repo already styles one-off annotations inline throughout these files. It
+// borrows the delta's own typography (mono, 10px, dim tertiary) because the two
+// sit side by side in the same row and are both secondary annotations on the
+// value above them — an age that shouted would read as the measurement.
+//
+// Exported on DF_CHARTS so shell.jsx::Pip states an age in the SAME shape
+// rather than hand-copying three literals, the drift MUTED_COLOR was extracted
+// to end in task_row_cells.js.
+const DATUM_AGE_STYLE = Object.freeze({ fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--fg-3)' });
+
+// ── One KPI tile ──
+// `datum` is REQUIRED and must be a Datum: datumView asserts it, so a call site
+// that was missed during the migration throws by name in dev instead of
+// rendering an unprovenanced number that looks exactly like a measured one.
+// Wrap a value the server does not yet serve as a Datum with
+// plainDatum(value, endpointKey).
+//
+// THE TILE MAKES NO HOLE DECISION AND NO AGE DECISION. Both come back from the
+// one datumView call: `text` is the value cell with `format` and the lower-bound
+// prefix already applied, `title` is the producer's reason as a tooltip, and
+// `age` is the humanised displayed age — non-null only when there is something
+// to say about freshness. Before this, 43 call sites hand-rolled 14 different
+// `x == null ? '—' : f(x)` guards and the tile rendered whatever it was handed.
+//
+// `format` REPLACES those guards rather than joining them: datumView never
+// invokes it on a hole, which is what lets a call site delete its sentinel
+// instead of keeping two hole decisions per tile. charts.jsx::HBarChart records
+// why that, and not the placeholder, is the load-bearing half — its live call
+// sites pass formatters that throw on a missing value.
+//
+// `history` IS THE OLD `spark`, renamed. The series feeding the sparkline is a
+// history of measurements, not the datum-backed value beside it, and one prop
+// named `spark` next to a `sparkColor` read as though they were a pair. Its
+// falsy gate, and the `unit &&` / `delta &&` / `hint &&` gates, are unchanged —
+// a call site passing `unit=""` deliberately still suppresses the span.
+//
+// The age badge sits beside the delta, in the same row: both are secondary
+// annotations on the value above them, and putting the age there costs the
+// value cell no width when there is nothing to badge.
+function StatTile({ label, datum, history, format, unit, delta, deltaDir, sparkColor, hint }) {
+  const view = datumView(datum, { now: Date.now(), format });
   return (
     <div className="kpi">
       <div className="lbl">{label}{hint && <span style={{ color: 'var(--fg-3)', textTransform: 'none', letterSpacing: 0, fontSize: 10 }}> · {hint}</span>}</div>
-      <div className="val">{value}{unit && <span className="unit">{unit}</span>}</div>
+      <div className="val" title={view.title || undefined}>{view.text}{unit && <span className="unit">{unit}</span>}</div>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', alignItems: 'center', gap: 6 }}>
         <div className="spark" style={{ height: 22 }}>
-          {spark && <Sparkline values={spark} color={sparkColor || PALETTE.accent} />}
+          {history && <Sparkline values={history} color={sparkColor || PALETTE.accent} />}
         </div>
-        {delta && <span className={`delta ${deltaDir || 'flat'}`}>{deltaDir === 'up' ? '▲' : deltaDir === 'down' ? '▼' : '·'} {delta}</span>}
+        <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          {view.age && <span style={DATUM_AGE_STYLE} title={view.title || undefined}>{view.age}</span>}
+          {delta && <span className={`delta ${deltaDir || 'flat'}`}>{deltaDir === 'up' ? '▲' : deltaDir === 'down' ? '▼' : '·'} {delta}</span>}
+        </span>
       </div>
     </div>
   );
@@ -570,4 +635,4 @@ function deriveVelocitySeries(series, labels, smoothingWindowSeconds) {
   return result;
 }
 
-window.DF_CHARTS = { PALETTE, Sparkline, StepSpark, LineChart, StackedAreaChart, BarChart, HBarChart, Donut, StatTile, Heatmap, HistBar, SMOOTHING_OPTIONS, smoothingLabelToSeconds, defaultSmoothingForWindow, deriveVelocitySeries };
+window.DF_CHARTS = { PALETTE, DATUM_AGE_STYLE, Sparkline, StepSpark, LineChart, StackedAreaChart, BarChart, HBarChart, Donut, StatTile, Heatmap, HistBar, SMOOTHING_OPTIONS, smoothingLabelToSeconds, defaultSmoothingForWindow, deriveVelocitySeries, formatCountTick };

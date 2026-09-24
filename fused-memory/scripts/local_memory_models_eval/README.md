@@ -51,7 +51,7 @@ Exit codes are per failure class, because each has a different remedy:
 | 3 | `hash_drift` | the selection is right, but episode bytes changed |
 | 4 | `missing_episodes` | an id the manifest names is gone from the store |
 | 5 | `bad_manifest` | the artifact is structurally unusable |
-| 1 | — | the run never reached a verdict (store unreachable, unsatisfiable `--n`, or stdout unwritable — a reader closed the pipe early as in `\| head`, or a `>` redirect hit a full disk) |
+| 1 | — | the run never reached a verdict (store unreachable, unsatisfiable `--n`, stdout unwritable — a reader closed the pipe early as in `\| head`, or a `>` redirect hit a full disk — the manifest unwritable at `--out`, or a store defect blocking the check under `--verify`: a duplicated episode uuid or an unparseable `created_at` on a live row) |
 
 Exit `1` is always accompanied by one `error: ...` line on stderr, never a
 traceback. Read it: a pipe that broke on the trailing `manifest: ...` line

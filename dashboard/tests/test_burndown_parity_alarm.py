@@ -365,12 +365,53 @@ class TestComputeParityAlarm:
         assert result['parity_peak'] is None
         assert result['parity_breach_count'] == 0
 
-    def test_ragged_lists_do_not_raise(self):
-        """Defensive: a short cap list must degrade, not explode a route."""
+    def test_a_short_cap_list_truncates_rather_than_padding(self):
+        """A short cap list TRUNCATES to the shortest input — it does not pad.
+
+        The policy is ``zip(in_progress, caps, strict=False)``: an index with no
+        cap is not comparable, so it is dropped rather than judged against a
+        forward-filled or last-seen cap.  A cap that was never recorded is
+        UNKNOWN, and inventing one would let this surface alarm on a comparison
+        that was never made.
+
+        The fixture is built so the policy is OBSERVABLE.  ``30`` sits at index
+        1 — past the end of the single-entry cap list — and is far ABOVE that
+        cap, so any padding or forward-fill policy would compare ``(30, 24)``
+        and report alarm True / breach_count 1 / peak 30.  (The previous
+        fixture, ``[1, 2, 3]`` against ``[24]``, had every count below the cap,
+        so truncation, padding and forward-fill were indistinguishable — it
+        pinned "does not raise", not the policy its name claimed.)
+
+        ``parity_peak == 1`` is the load-bearing assertion: it proves index 1
+        was never considered at all, which ``breach_count == 0`` alone cannot.
+        With only ``(1, 24)`` comparable and no breach, the published pair falls
+        back to ``highest``, which is that single pair.
+        """
         result = compute_parity_alarm({
             'labels': ['a', 'b', 'c'],
-            'in_progress': [1, 2, 3],
+            'in_progress': [1, 30, 3],
             'concurrency_cap': [24],
+        })
+
+        assert result['parity_alarm'] is False
+        assert result['parity_breach_count'] == 0
+        assert result['parity_peak'] == 1, (
+            'the uncapped index 1 (count 30) must not be compared at all; a '
+            f"peak of {result['parity_peak']} means a cap was invented for it"
+        )
+        assert result['parity_cap'] == 24, 'the matched half of the same pair'
+
+    def test_ragged_lists_do_not_raise(self):
+        """Defensive: a ragged series must degrade, not explode a route.
+
+        Kept separate from the truncation-policy test above: this one is about
+        not raising at all (a longer cap list than count list, the other
+        direction), and it must stay true whatever the comparison policy is.
+        """
+        result = compute_parity_alarm({
+            'labels': ['a'],
+            'in_progress': [1],
+            'concurrency_cap': [24, 24, 24],
         })
 
         assert result['parity_alarm'] is False

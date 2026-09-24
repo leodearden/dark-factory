@@ -303,6 +303,129 @@ def test_evaluate_budget_raises_on_an_incoherent_reading(
 
 
 # ---------------------------------------------------------------------------
+# (c2) unstarted_budget — the budget answer when NOTHING was started
+# ---------------------------------------------------------------------------
+#
+# `run_healthcheck` can legitimately be handed a run in which no arm is
+# measurable: every arm is a TBD placeholder, which `lms_ctl.preflight` refuses
+# before the card is ever touched, so none of them can HAVE a baseline.  There
+# is no `used - baseline` subtraction to perform in that run, and `evaluate_budget`
+# is the wrong tool for it twice over -- it validates preconditions on a
+# subtraction nobody asked for, and its `reason` prose asserts an arm "took"
+# something when no arm was ever loaded.  This is that case stated in its own
+# words.
+
+_UNSTARTED_READING = lms_vram.GpuReading(
+    total_mib=24576, used_mib=7362, free_mib=16761,
+)
+
+
+def test_an_unstarted_run_charges_no_footprint_at_all():
+    """Nothing was loaded, so the footprint is 0 -- a theorem, not a default."""
+    verdict = lms_vram.unstarted_budget(_UNSTARTED_READING)
+
+    assert verdict.arm_footprint_mib == 0
+    assert verdict.arm_footprint_gib == pytest.approx(0.0)
+
+
+def test_the_unstarted_baseline_is_the_card_as_it_stands():
+    """With nothing started, the live card IS the pre-start card.
+
+    There is no earlier reading to fetch: the moment before the run and the
+    moment of the run hold the same memory, because the run allocated none.
+    """
+    verdict = lms_vram.unstarted_budget(_UNSTARTED_READING)
+
+    assert verdict.baseline_mib == _UNSTARTED_READING.used_mib
+    assert verdict.used_mib == _UNSTARTED_READING.used_mib
+    assert verdict.budget_mib == _UNSTARTED_READING.free_mib
+    assert verdict.total_mib == _UNSTARTED_READING.total_mib
+
+
+def test_an_unstarted_run_passes_with_the_whole_free_reading_as_headroom():
+    """No allocation was made, so no budget was ever at risk."""
+    verdict = lms_vram.unstarted_budget(_UNSTARTED_READING)
+
+    assert verdict.verdict == 'PASS'
+    assert verdict.headroom_gib == pytest.approx(
+        _UNSTARTED_READING.free_mib / lms_vram.MIB_PER_GIB, abs=0.01
+    )
+
+
+def test_the_unstarted_reason_says_no_arm_was_started():
+    """An operator reads `reason` verbatim, so it must not describe a measurement.
+
+    `evaluate_budget` with the snapshot as its own baseline produces the same
+    arithmetic (footprint 0, PASS) but emits "the arm took 0.00 GiB (7362 -
+    7362 MiB), within the 16.37 GiB budget free before it started" -- prose
+    claiming a measurement of an arm that was never started.
+    """
+    reason = lms_vram.unstarted_budget(_UNSTARTED_READING).reason.lower()
+
+    assert 'no arm' in reason
+    assert 'started' in reason
+    assert 'took' not in reason
+
+
+def test_an_unstarted_budget_accepts_a_reading_evaluate_budget_refuses():
+    """A card reading 0 used is a real card, not a dead probe, when nothing ran.
+
+    `evaluate_budget` raises on `baseline_mib <= 0` because a zero baseline
+    there means the pre-start probe never ran and the desktop's memory would be
+    credited to the arm.  No subtraction happens here, so that precondition
+    does not apply and imposing it would turn a placeholder report into a
+    spurious probe error.
+    """
+    empty_card = lms_vram.GpuReading(total_mib=24576, used_mib=0, free_mib=24576)
+
+    with pytest.raises(lms_vram.VramProbeError):
+        lms_vram.evaluate_budget(
+            used_mib=0, total_mib=24576, baseline_mib=0, baseline_free_mib=24576,
+        )
+
+    verdict = lms_vram.unstarted_budget(empty_card)
+
+    assert verdict.baseline_mib == 0
+    assert verdict.arm_footprint_mib == 0
+    assert verdict.verdict == 'PASS'
+
+
+@pytest.mark.parametrize(
+    ('used_mib', 'total_mib'),
+    [
+        (7362, 0),       # no card
+        (-1, 24576),     # negative usage
+        (30000, 24576),  # used beyond the card
+    ],
+)
+def test_an_unstarted_budget_still_refuses_an_incoherent_reading(used_mib, total_mib):
+    """Dropping the SUBTRACTION preconditions does not drop the READING's own.
+
+    The two `evaluate_budget` preconditions this path deliberately sheds are
+    both about `used - baseline`; these three are about whether the reading
+    describes a card that could exist, and no subtraction is needed to ask
+    that.  `GpuReading` validates none of its three fields, and
+    `parse_nvidia_smi_csv` -- which enforces them upstream -- is only ONE of the
+    ways one gets built.  Without this, a test double or a future `--from-file`
+    mode turns nonsense into a PASS verdict carrying nonsense figures.
+    """
+    with pytest.raises(lms_vram.VramProbeError):
+        lms_vram.unstarted_budget(
+            lms_vram.GpuReading(total_mib=total_mib, used_mib=used_mib, free_mib=0)
+        )
+
+
+def test_an_unstarted_verdict_still_carries_both_reference_figures():
+    """Same contract as `evaluate_budget`: the deviation stays legible either way."""
+    verdict = lms_vram.unstarted_budget(_UNSTARTED_READING)
+
+    assert verdict.nominal_ceiling_gib == pytest.approx(19.5)
+    assert verdict.operating_budget_gib == pytest.approx(
+        lms_vram.MEASURED_OPERATING_BUDGET_GIB
+    )
+
+
+# ---------------------------------------------------------------------------
 # (d) arm_fits — the measured deviation from PRD D10, as behaviour
 # ---------------------------------------------------------------------------
 
