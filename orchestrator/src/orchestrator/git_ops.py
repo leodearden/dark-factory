@@ -2526,70 +2526,25 @@ async def _run(
     worktree (recoverable race) from other ``FileNotFoundError``\\ s (e.g.
     missing binary on ``PATH``).
 
-    THIS FUNCTION IS A THIN ADAPTER (task 3778).  The spawn primitive itself —
-    ``create_subprocess_exec``, the forced C locale, stdin feeding, and the
-    cancellation kill+reap — grew here but now lives once in
-    :func:`shared.git_async.run_git`, because fused-memory's live-workflow
-    probes needed the identical primitive and cloning it would have created a
-    lockstep duplicate (INV-5).  What stays HERE is everything orchestrator-
-    specific: the :class:`WorktreeMissing` taxonomy (both the pre-flight and
-    the vanished-between-check-and-spawn race) and the ``(rc, stdout, stderr)``
-    3-tuple return shape this module's call sites destructure.  ``run_git`` is
-    imported by BARE NAME so ``git_ops.run_git`` is the single patchable spawn
-    seam.
+    A thin adapter over :func:`shared.git_async.run_git` (task 3778), which
+    owns the spawn mechanism and its rationale: the ``LC_ALL=C`` locale pin
+    :func:`_git_clean_failure_is_benign` depends on, stdin feeding, and the
+    task-2608 cancellation kill+reap.  What stays here is orchestrator-
+    specific: the :class:`WorktreeMissing` taxonomy and the 3-tuple return.
+    ``run_git`` is imported by bare name so ``git_ops.run_git`` is the single
+    patchable spawn seam.
 
-    Stdin feeding (``input_text``): when provided, the child is spawned with
-    ``stdin=PIPE`` and ``input_text.encode()`` is written to it via
-    ``communicate(input=...)``.  This is what lets callers pipe a diff into a
-    stdin-only filter such as ``git patch-id`` (see
-    :meth:`GitOps.find_equivalent_commit`).  When ``None`` (the default) the
-    behaviour is exactly as before — stdin is not piped and the child inherits
-    the parent's — so no existing caller is affected.  The capability is inert
-    unless ``input_text`` is passed.  Mechanism: ``shared.git_async``.
+    ``input_text``, when given, is piped to the child's stdin, e.g. a diff
+    into ``git patch-id`` (see :meth:`GitOps.find_equivalent_commit`).
 
-    Locale: ``LC_ALL=C`` and ``LANG=C`` are forced in the child environment so
-    that git (and other tools) always emit English-locale diagnostics.  This is
-    required for :func:`_git_clean_failure_is_benign`, which substring-matches
-    English warning text; a non-C locale would produce translated output that
-    the matcher cannot recognise, silently defeating the R3 ENOENT-tolerance
-    fix for the 4892-class warm-lane FAULT.  Mechanism: ``shared.git_async``,
-    whose module docstring carries this rationale forward — the pin is
-    load-bearing for THIS module, so do not let it be "simplified" away there.
+    No ``timeout`` is passed: callers that want one wrap this call in their
+    own ``asyncio.wait_for``, whose cancellation the kill+reap covers.
 
-    Cancellation safety (task 2608): if the underlying ``communicate()`` await
-    is cancelled — e.g. by a caller wrapping ``_run`` in
-    ``asyncio.wait_for(..., timeout=...)``, as delivered_checks.py's
-    ``_run_script_check`` does for script-kind delivered checks — the spawned
-    child would otherwise keep running as an orphan with its stdout/stderr
-    pipes open. For a persistently-hung script this recurred every scheduler
-    sweep, leaking a process and file descriptors. The child is best-effort
-    killed and reaped before the triggering exception (including
-    ``asyncio.CancelledError``) is re-raised.  Mechanism: ``shared.git_async``.
-
-    Note that ``_run`` passes no ``timeout``: callers that want one wrap this
-    call in their own ``asyncio.wait_for``, and that cancellation path is
-    exactly what the kill+reap above covers.
-
-    CONCURRENCY: UNBOUNDED, deliberately (``bounded=False``).  ``run_git``
-    offers a per-loop spawn bound sized for fused-memory's live-workflow
-    fan-out — short-lived git probes, hundreds of them.  ``_run`` is not that
-    caller and must not share that queue.  It is the orchestrator's general
-    subprocess runner: ``delivered_checks.run_script_check`` puts
-    operator-supplied SCRIPT checks through it and gathers them CONCURRENTLY,
-    ``merge_skew_tripwire`` runs its config-driven oracle command through it,
-    and ``verify`` runs ``scripts/verify-pipeline-guard.sh``.  Two things break
-    if those share an 8-slot queue with every merge-lane and scheduler git
-    call.  (1) The semaphore is acquired INSIDE ``run_git``, so queue time
-    lands inside each caller's own ``asyncio.wait_for`` window: a delivered
-    check that would pass gets reported ERRORED, and the tripwire oracle fails
-    open — contention rendered as a verdict.  (2) ``merge_skew_tripwire``
-    deliberately ABANDONS a timed-out oracle task because its kill+reap "can
-    vastly outlast timeout_secs"; an abandoned task would hold a global slot
-    for that whole period, so a few hung oracles could head-of-line block the
-    merge lane — against that module's own I6 ("never block/delay the
-    advance").  The orchestrator never had such a bound and does not acquire
-    one here; ``test_a_long_running_script_cannot_delay_a_concurrent_git_call``
-    pins that.
+    Deliberately UNBOUNDED (``bounded=False``): this runs operator scripts
+    and oracle commands as well as git, and a caller-side ``wait_for`` would
+    otherwise count queue time as a verdict.  The shared module's "WHO SHOULD
+    OPT OUT OF THE BOUND" section is the full argument;
+    ``test_a_long_running_script_cannot_delay_a_concurrent_git_call`` pins it.
     """
     # Pre-flight: a missing cwd surfaces as a generic FileNotFoundError from
     # posix_spawn whose .filename is not reliably set.  Check explicitly so we
