@@ -475,6 +475,18 @@
           "current": 31587
         }
       ]
+    },
+    {
+      "task_id": "4023",
+      "reason": "Net-additive regression coverage for a silent-data-loss fix, not a failed refactor. test_mcp_post_transport.py is a NEW file that drives the five raw MCP POSTs (a /mcp/ 307 redirect silently discarded every write) through a real httpx client and asserts where each tools/call actually landed -- the payload-shaped mocks that missed the bug could not. It imports merge_queue/git_ops only to build the merge-worker mirror of _post_submit_tasks, so every private read in the file is counted: 10 are the TaskWorkflow memory writers under test (workflow.py is outside the cluster) and 3 are SpeculativeMergeWorker._post_submit_tasks, none of which has a public seam. Trimmed first: the three worker._mcp reaches now go through the constructor's mcp= argument (16 -> 13).",
+      "measures": [
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6628,
+          "current": 6641
+        }
+      ]
     }
   ]
 }

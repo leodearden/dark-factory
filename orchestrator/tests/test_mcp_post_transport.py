@@ -31,8 +31,15 @@ from _mcp_transport_harness import (
     RecordingMcpServer,
 )
 from _mcp_url_scan import find_trailing_slash_mcp_urls
+from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from orchestrator.workflow import TaskWorkflow
+
+# The repo-wide sweep guard below ast.parses every swept *.py, so this module
+# is a member of the whole-tree-scanner family whose ceiling
+# test_whole_tree_scan_timeout_guard.py enforces (see
+# WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py).
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 @pytest.fixture
@@ -303,6 +310,7 @@ async def test_suggestions_write_client_follows_redirects_and_accepts_json(
 
 
 def _make_merge_worker(tmp_path, mcp_url='http://memory.test:8002'):
+    """A bare merge worker whose MCP handle points at *mcp_url* (None: no handle)."""
     import asyncio
 
     from orchestrator.git_ops import GitOps
@@ -314,10 +322,11 @@ def _make_merge_worker(tmp_path, mcp_url='http://memory.test:8002'):
     git_ops = MagicMock(spec=GitOps)
     git_ops.project_root = tmp_path
 
-    worker = SpeculativeMergeWorker(git_ops=git_ops, queue=asyncio.Queue())
-    worker._mcp = MagicMock()
-    worker._mcp.url = mcp_url
-    return worker
+    mcp = None
+    if mcp_url is not None:
+        mcp = MagicMock()
+        mcp.url = mcp_url
+    return SpeculativeMergeWorker(git_ops=git_ops, queue=asyncio.Queue(), mcp=mcp)
 
 
 FIX_TASK_ARGS = {
@@ -360,8 +369,7 @@ async def test_merge_worker_client_follows_redirects_and_accepts_json(
 @pytest.mark.asyncio
 async def test_merge_worker_submit_is_still_none_safe(tmp_path, server, client_factory):
     """The documented ``self._mcp is None`` guard must survive the fix."""
-    worker = _make_merge_worker(tmp_path)
-    worker._mcp = None
+    worker = _make_merge_worker(tmp_path, mcp_url=None)
 
     with patch('httpx.AsyncClient', client_factory):
         await worker._post_submit_tasks([FIX_TASK_ARGS])
@@ -434,29 +442,18 @@ SWEEP_EXCLUSIONS = {
 }
 
 
-#: Co-location tag + timeout budget for the two tests that call ``_sweep_hits``.
+#: Co-location tag for the two tests that call ``_sweep_hits``.
 #:
-#: MEASURED, and the reason both are needed.  The walk reads and ``ast.parse``s
-#: 553 files: ~13s of pure work, 20.5s wall on a machine already running the
-#: fleet.  The suite's default per-test timeout is 60s
-#: (``orchestrator/pyproject.toml``) with ``timeout_method = "thread"``, which
-#: ``os._exit()``s the xdist worker on expiry, and ``--max-worker-restart=0``
-#: turns that into a hard suite failure — observed exactly once here as
-#: ``worker 'gw29' crashed``, on the full ``-n auto`` run and never when this
-#: file runs alone.
+#: MEASURED.  The walk reads and ``ast.parse``s 553 files: ~13s of pure work,
+#: 20.5s wall on a machine already running the fleet.  Its timeout budget is
+#: the module-level ``pytestmark`` above; this tag is the other half.
 #:
 #: ``xdist_group`` is what makes the ``lru_cache`` actually pay: ``--dist
 #: loadgroup`` spreads UNGROUPED tests across workers, so without the tag the
 #: two callers land in different processes and each pays a full walk — a
 #: per-process cache cannot help.  Tagged, they share one worker and the second
 #: call is free (measured 0.000004s).
-#:
-#: The timeout bump is the other half: even one walk can exceed 60s under
-#: 32-way contention.  Deliberately generous rather than tight — this is a
-#: static scan of the tree, so a slow run is contention, not a hang, and the
-#: only thing a tight bound buys is a flaky suite.
 SWEEP_GROUP = 'mcp_url_sweep'
-SWEEP_TIMEOUT_SECONDS = 300
 
 
 @functools.lru_cache(maxsize=1)
@@ -470,8 +467,8 @@ def _sweep_hits() -> dict[str, tuple[tuple[int, str], ...]]:
     CACHED, and returning tuples so the cached value cannot be mutated by
     either caller.  The walk parses 553 files (measured); it ran twice for a
     byte-identical result, and each run is the dominant cost of this whole
-    file — against a 60s per-test timeout (``orchestrator/pyproject.toml``)
-    that only gets tighter under ``-n auto`` contention.  Nothing in the tree
+    file — against a per-test timeout that only gets tighter under
+    ``-n auto`` contention.  Nothing in the tree
     changes between the two calls within a session, so the second is pure
     waste: measured at 0.000004s from cache.
     """
@@ -488,7 +485,6 @@ def _sweep_hits() -> dict[str, tuple[tuple[int, str], ...]]:
 
 
 @pytest.mark.xdist_group(SWEEP_GROUP)
-@pytest.mark.timeout(SWEEP_TIMEOUT_SECONDS)
 def test_no_raw_post_builds_a_trailing_slash_mcp_url():
     """No source file may build an MCP URL with a trailing slash.
 
@@ -547,7 +543,6 @@ def test_no_raw_post_builds_a_trailing_slash_mcp_url():
 
 
 @pytest.mark.xdist_group(SWEEP_GROUP)
-@pytest.mark.timeout(SWEEP_TIMEOUT_SECONDS)
 def test_every_sweep_exclusion_still_earns_its_place():
     """An exclusion that outlives its offending line must fail, not lurk.
 
