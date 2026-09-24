@@ -54,11 +54,15 @@ each. Whether a check is satisfied on main is the δ gate's question and
 THE LABEL-BINDING DIRECTION (task 4907). The drift walk is keyed on each
 sidecar's STAMPED task_id, so it cannot see a task whose ``prd_task_label``
 matches no sidecar entry at all. ``commit_planning``'s stamper binds nothing
-for such a task and copies it no ``delivered_checks``, and says nothing. This
-direction walks from every task the stamper would admit to the sidecar it would
-open, and reports each label that tracked sidecar does not declare as an
-UNBOUND LABEL, in its own list. It came out of the task-4590 stamp-coverage
-audit and task 4907's adjudication of the rows that audit left.
+for such a task and copies it no ``delivered_checks``. It does name the label,
+in the ``missing_labels`` of the ``manifest_stamping`` report that
+``commit_planning`` returns (manifest_stamping.py step 4b), but only once, at
+planning time, for that batch only, and nothing re-surfaces it afterwards. This
+direction is the retrospective sweep over the whole store: it walks from every
+task the stamper would admit to the sidecar it would open, and reports each
+label that tracked sidecar does not declare as an UNBOUND LABEL, in its own
+list. It came out of the task-4590 stamp-coverage audit and task 4907's
+adjudication of the rows that audit left.
 
 AN UNBOUND LABEL IS NOT BY ITSELF A DEFECT. A sidecar is scoped, not a per-task
 registry (plans/capability-delivered-checks-prd.md §"Sketch of approach",
@@ -66,8 +70,8 @@ registry (plans/capability-delivered-checks-prd.md §"Sketch of approach",
 cases are recorded in the ``.capability-manifest.md`` twins, each under
 "Unbound task labels (task 4907 adjudication)". Only a LIVE row, whose task is
 not yet done or cancelled, makes a run dirty. Fixing one is a separate,
-reviewed edit, made on the task side unless the PRD's own decomposition plan
-declares the label, in which case the sidecar is completed instead.
+reviewed edit; which edit is stated once, in ``_UNBOUND_CAVEAT``, which the
+report and the JSON both carry.
 """
 from __future__ import annotations
 
@@ -205,9 +209,10 @@ class ManifestBinding(NamedTuple):
     """A task the stamper would try to bind to a sidecar label.
 
     ``label`` is the task's ``prd_task_label``, verbatim. ``manifest`` is the
-    sidecar relpath DERIVED from its ``prd_path`` (see
-    :func:`_manifest_binding`) — the file a re-stamp would open, not a path
-    read from anywhere.
+    sidecar path exactly as the stamper's step 1 DERIVES it from ``prd_path``
+    (see :func:`_manifest_binding`): never read from anywhere, and not yet
+    resolved against a project root, which is step 2
+    (:func:`_contained_sidecar_relpath`).
     """
 
     task_id: int
@@ -275,6 +280,10 @@ def _manifest_binding(task_id: int, status: str, metadata: dict) -> ManifestBind
     non-string ``prd_path`` or never match a non-string label against the
     sidecar's string labels — so such a row can be neither bound nor usefully
     reported. No live row has that shape.
+
+    Step 2 resolves the derived path against the project root, which this
+    function does not know; that is :func:`_contained_sidecar_relpath`, applied
+    by the sweep.
     """
     prd_path = metadata.get("prd_path")
     label = metadata.get("prd_task_label")
@@ -288,6 +297,33 @@ def _manifest_binding(task_id: int, status: str, metadata: dict) -> ManifestBind
         label=label,
         manifest=re.sub(r"\.md$", "", prd_path) + _MANIFEST_SUFFIX,
     )
+
+
+def _contained_sidecar_relpath(project_root: str, derived: str) -> str | None:
+    """The stamper's step 2 for one derived sidecar path: the root-relative
+    POSIX path it resolves to, or ``None`` when the stamper would open nothing
+    there.
+
+    Resolved and containment-checked as
+    fused-memory/src/fused_memory/server/manifest_stamping.py::_stamp_capability_manifests_impl
+    does it, so a ``./``-prefixed, ``..``-bearing or absolute in-root
+    ``prd_path`` reaches the sidecar the stamper would open, and one that
+    resolves outside the root is refused, as the stamper refuses it. The stamper
+    then checks that the file exists; the sweep instead looks the relpath up
+    among the TRACKED sidecars (see :func:`_tracked_manifest_paths`).
+
+    A path that cannot be resolved at all (an embedded NUL raises
+    ``ValueError``) is ``None`` too, never an abort: the stamper opens nothing
+    for it either, and one corrupt row must not end a sweep over thousands.
+    """
+    root = Path(project_root).resolve()
+    try:
+        resolved = (root / derived).resolve()
+    except ValueError:
+        return None
+    if not resolved.is_relative_to(root):
+        return None
+    return resolved.relative_to(root).as_posix()
 
 
 def load_task_store_scan(tasks_db_path: str) -> TaskStoreScan:
@@ -463,11 +499,12 @@ class AuditCoverage(NamedTuple):
                                   + tasks_without_a_tracked_sidecar
                                   + tasks_on_an_unparseable_sidecar
 
-    A sidecar that is absent or untracked and one that is tracked but will not
-    parse are separate terms, because only the second IS tracked. Both classes
-    are COUNTED and never itemized in ``uncomparable_details``. The first is a
-    stamper no-op that numbers in the hundreds live, and would bury the rows
-    the report exists to show. The second's sidecar is already named in
+    A sidecar that is not in the tracked corpus at all (absent, untracked,
+    outside the project root, or unresolvable) and one that is tracked but will
+    not parse are separate terms, because only the second IS tracked. Both
+    classes are COUNTED and never itemized in ``uncomparable_details``. The
+    first is a stamper no-op that numbers in the hundreds live, and would bury
+    the rows the report exists to show. The second's sidecar is already named in
     ``manifest_parse_failure_details``.
     """
 
@@ -584,6 +621,7 @@ class LabelBindingSweep(NamedTuple):
 
 def _sweep_label_bindings(
     bindings: tuple[ManifestBinding, ...],
+    project_root: str,
     declared_by_manifest: dict[str, tuple[str, ...]],
     unparseable_manifests: set[str],
 ) -> LabelBindingSweep:
@@ -592,36 +630,27 @@ def _sweep_label_bindings(
 
     Mirrors the stamper's own matching in
     fused-memory/src/fused_memory/server/manifest_stamping.py::_stamp_capability_manifests_impl.
-    Step 2 opens only a sidecar that exists, so a task whose derived sidecar is
-    not among the tracked ones is promised nothing and is never a row. Step 4
-    matches on LABEL, by exact string equality, so a declared label is bound
-    whatever its entry's ``task_id`` says. A task on a sidecar that failed to
-    parse is never a row either: that sidecar declares nothing KNOWN, which is
-    not the same as declaring nothing, and the parse failure is already named in
-    the coverage details.
+    Step 2 opens only a sidecar that resolves inside *project_root* and exists
+    (:func:`_contained_sidecar_relpath`), so a task whose sidecar is not among
+    the tracked ones is promised nothing and is never a row. Step 4 matches on
+    LABEL, by exact string equality, so a declared label is bound whatever its
+    entry's ``task_id`` says. A task on a sidecar that failed to parse is never
+    a row either: that sidecar declares nothing KNOWN, which is not the same as
+    declaring nothing, and the parse failure is already named in the coverage
+    details.
 
-    A ROW IS NOT BY ITSELF A DEFECT. A sidecar may deliberately omit a label;
-    the four "Unbound task labels (task 4907 adjudication)" sections in the
-    ``.capability-manifest.md`` twins record the 21 adjudicated cases. Fixing a
-    row is a separate, reviewed edit, and it is one of three:
-
-    - realign a misspelled or transliterated label to the declared entry, on the
-      task side (task 4590's precedent);
-    - clear ``prd_task_label``, keeping ``prd_path``, on a task filed against
-      the PRD from outside its decomposition plan;
-    - complete the sidecar, for a label the PRD's own decomposition plan
-      declares but the sidecar omits.
-
-    Never invent a sidecar entry for a label the plan does not declare.
+    A row is not by itself a defect. What a row does and does not mean, and the
+    reviewed edits that fix one, are stated once, in ``_UNBOUND_CAVEAT``.
     """
     rows: list[UnboundLabel] = []
     bound = without_tracked_sidecar = on_unparseable_sidecar = 0
     for binding in bindings:
-        if binding.manifest in unparseable_manifests:
+        manifest = _contained_sidecar_relpath(project_root, binding.manifest)
+        if manifest in unparseable_manifests:
             on_unparseable_sidecar += 1
             continue
-        declared = declared_by_manifest.get(binding.manifest)
-        if declared is None:
+        declared = None if manifest is None else declared_by_manifest.get(manifest)
+        if manifest is None or declared is None:
             without_tracked_sidecar += 1
         elif binding.label in declared:
             bound += 1
@@ -630,7 +659,7 @@ def _sweep_label_bindings(
                 task_id=binding.task_id,
                 label=binding.label,
                 status=binding.status,
-                manifest=binding.manifest,
+                manifest=manifest,
                 declared_labels=declared,
             ))
     rows.sort(key=_unbound_sort_key)
@@ -814,7 +843,7 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
 
     findings.sort(key=_drift_sort_key)
     label_bindings = _sweep_label_bindings(
-        scan.manifest_bindings, declared_by_manifest, unparseable_manifests)
+        scan.manifest_bindings, root, declared_by_manifest, unparseable_manifests)
     return ProjectAudit(
         project_root=root,
         manifest_root=manifests_root,
