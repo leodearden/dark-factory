@@ -1628,25 +1628,64 @@ class TestAbsoluteTmpProjectRootLiteralsAreCensused:
 
         assert _absolute_tmp_project_root_literals(tree) == []
 
-    def test_the_detector_ignores_the_call_keyword_shape(self) -> None:
-        """Negative, and this one is a DECISION rather than a limitation — pinned
-        here so it reads as deliberate to whoever finds the excluded sites.
+    @pytest.mark.parametrize(
+        ('source', 'literal'),
+        [
+            ("reconcile_landed_row(row, project_root='/tmp/proj')\n", '/tmp/proj'),
+            (
+                "OrchestratorConfig(project_root=Path('/tmp/xcheck-fake'))\n",
+                '/tmp/xcheck-fake',
+            ),
+            ("Foo(review_project_root=pathlib.Path('/tmp/r'))\n", '/tmp/r'),
+        ],
+        ids=['bare-str', 'path-wrapped', 'suffix-name-pathlib-attribute'],
+    )
+    def test_the_detector_matches_a_call_keyword(self, source, literal) -> None:
+        """A call keyword binds a real parameter, so it can carry a real escape.
 
-        The tree also holds ~16 ``project_root=<literal>`` CALL-KEYWORD sites
-        (test_merge_queue_landed_reconciler.py x13,
-        test_merge_queue_landed_dispatch_gate.py, test_multihost_verify_integration.py).
-        Those bind a real constructor/dataclass PARAMETER rather than an
-        attribute on a ``spec_set`` MagicMock: a structurally different
-        population that nobody has adjudicated, and not the one task 3551's
-        sweep found or task 4389 was filed to rule on.
-
-        Widening the detector to cover them would force this guard to either fix
-        16 out-of-scope sites or pre-approve them wholesale in the allowlist —
-        and a wholesale sanction is precisely the silent appearance this guard
-        family exists to stop (see ``_Sanctioned.__doc__`` on why ``sites`` is a
-        COUNT rather than a flag).  So the boundary is drawn structurally, at
-        ``ast.keyword``, and a follow-up ticket carries the kwarg population.
+        Task 5011 measured one — ``_xcheck_config``'s keyword wrote
+        ``data/orchestrator/runs.db`` outside the sandbox — so the keyword shape
+        is inside the census, under the same name rule as the other shapes.
         """
-        tree = ast.parse("reconciler = LandedReconciler(project_root='/tmp/proj')\n")
+        tree = ast.parse(source)
+
+        sites = _absolute_tmp_project_root_literals(tree)
+
+        assert len(sites) == 1, sites
+        assert literal in sites[0], sites
+
+    def test_the_detector_ignores_a_sandboxed_call_keyword(self) -> None:
+        """Negative: the fix for a keyword site must not trip the guard."""
+        tree = ast.parse("Foo(project_root=tmp_path / 'proj')\n")
+
+        assert _absolute_tmp_project_root_literals(tree) == []
+
+    def test_the_detector_ignores_a_double_star_keyword(self) -> None:
+        """Negative: ``**kwargs`` is an ``ast.keyword`` whose ``arg`` is ``None``,
+        and the keyword arm must skip it rather than crash on it.
+        """
+        tree = ast.parse('Foo(**kwargs)\n')
+
+        assert _absolute_tmp_project_root_literals(tree) == []
+
+    @pytest.mark.parametrize(
+        'source',
+        [
+            "GitOps(git_config, Path('/tmp/repo'))\n",
+            "OrchestratorConfig.model_validate({'project_root': '/tmp/x'})\n",
+        ],
+        ids=['positional-argument', 'string-dict-key'],
+    )
+    def test_the_detector_ignores_a_binding_with_no_project_root_identifier(
+        self, source,
+    ) -> None:
+        """The detector's recorded EDGE: it sees a binding only where
+        ``project_root`` is spelled as an identifier at the site.
+
+        A positional argument binds by position to a callee signature a
+        single-module AST walk cannot resolve, and a dict key is a string, not a
+        binding.  Task 5011 measured both shapes at 0 sites in the tree.
+        """
+        tree = ast.parse(source)
 
         assert _absolute_tmp_project_root_literals(tree) == []
