@@ -19,6 +19,7 @@ booleans and on flips. ``k`` appears only as a metric parameterisation.
 """
 from __future__ import annotations
 
+import errno
 import functools
 import json
 import types
@@ -3448,6 +3449,89 @@ class TestRunStampOverride:
         monkeypatch.setenv('MEMORY_EVAL_RUN_STAMP', '20260101T010101Z')
 
         assert run_stamp() == '20260101T010101Z'
+
+
+class _UnopenableStoreDouble(_ServiceDouble):
+    """A store whose open fails the way ``MemoryService.initialize`` measurably
+    does when it cannot create ``config.queue.data_dir``."""
+
+    async def initialize(self):
+        raise PermissionError(errno.EACCES, 'Permission denied', '/unwritable/queue-data')
+
+
+def _error_lines(stderr: str) -> list[str]:
+    """Only the ``error:`` lines: logging may or may not reach stderr under
+    pytest's root handlers, so the whole stream is not a stable count."""
+    return [line for line in stderr.splitlines() if line.startswith('error: ')]
+
+
+class TestNonStdoutOSErrorsAreAttributedAtTheirSeam:
+    """Every non-stdout ``OSError`` ends in ONE attributed line and a documented code.
+
+    The process boundary (``shared.cli_boundary.run_cli``) reports any
+    ``OSError`` escaping ``main()`` as "cannot write to stdout", so each seam
+    that knows what its failure means converts it first: the store open, the
+    artifact write, and ``--derive-registry``'s source read.
+    """
+
+    STAMP = '20260730T090000Z'
+
+    def _argv(self, monkeypatch, tmp_path, out_root: Path) -> list[str]:
+        registry_path = tmp_path / 'registry.json'
+        registry_path.write_text(json.dumps(_as_payload(_probe_registry())), encoding='utf-8')
+        monkeypatch.setenv('MEMORY_EVAL_RUN_STAMP', self.STAMP)
+        return [
+            '--registry', str(registry_path),
+            '--out-root', str(out_root),
+            '--project-id', 'dark_factory',
+        ]
+
+    def test_a_store_that_cannot_be_opened(self, monkeypatch, tmp_path, capsys):
+        m = _mod()
+        _install_double(monkeypatch, _UnopenableStoreDouble())
+        out_root = tmp_path / 'out'
+
+        code = m.main(self._argv(monkeypatch, tmp_path, out_root))
+
+        assert code == m.EXIT_RUN_FAILED == 1
+        errors = _error_lines(capsys.readouterr().err)
+        assert len(errors) == 1
+        assert 'store' in errors[0]
+        assert '/unwritable/queue-data' in errors[0]
+        assert 'stdout' not in errors[0]
+        assert not list(out_root.rglob('metrics-*.json'))
+
+    def test_an_out_root_that_cannot_be_written(self, monkeypatch, tmp_path, capsys):
+        m = _mod()
+        registry = _probe_registry()
+        double = _ServiceDouble(by_query=_canned_hits(registry))
+        _install_double(monkeypatch, double)
+        blocker = tmp_path / 'not-a-dir'
+        blocker.write_text('x')
+        out_root = blocker / 'out'
+
+        code = m.main(self._argv(monkeypatch, tmp_path, out_root))
+
+        assert code == m.EXIT_RUN_FAILED
+        errors = _error_lines(capsys.readouterr().err)
+        assert len(errors) == 1
+        assert str(out_root) in errors[0]
+        assert 'stdout' not in errors[0]
+        assert double.closed
+
+    def test_a_derivation_source_that_cannot_be_read(self, monkeypatch, tmp_path, capsys):
+        m = _mod()
+        monkeypatch.setattr(m, 'DEFAULT_CALIBRATION_PATH', tmp_path / 'absent.jsonl')
+
+        code = m.main(['--derive-registry'])
+
+        assert code == m.EXIT_RUN_FAILED
+        captured = capsys.readouterr()
+        errors = _error_lines(captured.err)
+        assert len(errors) == 1
+        assert 'absent.jsonl' in errors[0]
+        assert 'stdout' not in errors[0]
+        assert captured.out == ''
 
 
 # ---------------------------------------------------------------------------
