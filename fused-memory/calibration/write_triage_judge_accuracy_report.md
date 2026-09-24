@@ -72,7 +72,7 @@
 - `case_count`: `84`
 - `candidate_count`: `5`
 - `candidate_count_min`: `5`
-- `distractor_count`: `4`
+- `distractor_count`: `None`
 - `distractor_count_requested`: `None`
 - `judge_candidate_count`: `5`
 - `judge_enabled`: `True`

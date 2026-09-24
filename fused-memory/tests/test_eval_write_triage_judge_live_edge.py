@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _fm_helpers import load_script_module
+from _write_triage_store_fake import FakeMemoryService
 
 from fused_memory.models.enums import SourceStore
 from fused_memory.models.memory import MemoryResult
@@ -291,3 +292,55 @@ class TestTheLimitedCli:
         with pytest.raises(ValueError, match='a-dup-1'):
             _mod().main()
         assert [path.name for path in tmp_path.iterdir()] == ['corpus.jsonl']
+
+
+class TestTheRetrievedCli:
+    """`main()` on a retrieved `--dry-run` over a stub store: what the plan is built under, and from.
+
+    A retrieved plan builds a `MemoryService`, whose stores construct SDK
+    clients of their own, so it must be built outside `usage_recording_openai`,
+    which swaps `openai.AsyncOpenAI` for a plain factory.
+    """
+
+    @staticmethod
+    def _main(tmp_path: Path, monkeypatch, *extra: str, rows=()) -> list:
+        """Every search answers *rows*. Returns the SDK class each store was built under."""
+        import openai  # noqa: PLC0415
+
+        built_under: list = []
+
+        class _LiveStore(FakeMemoryService):
+            def __init__(self, config) -> None:
+                super().__init__(rows)
+                built_under.append(openai.AsyncOpenAI)
+
+            async def initialize(self) -> None:
+                return None
+
+            async def close(self) -> None:
+                return None
+
+        monkeypatch.setattr('fused_memory.services.memory_service.MemoryService', _LiveStore)
+        monkeypatch.setattr(
+            sys, 'argv', TestTheLimitedCli._argv(tmp_path, '--slate-mode', 'retrieved', *extra),
+        )
+        assert _mod().main() == 0
+        return built_under
+
+    def test_the_store_is_built_under_the_sdks_own_client_class(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        import openai  # noqa: PLC0415
+
+        assert self._main(tmp_path, monkeypatch) == [openai.AsyncOpenAI]
+
+    def test_a_limited_run_describes_its_targets_from_the_whole_fixture(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """`--limit 1` measures a-dup-1 alone; its target b-dup-1 is still a fixture record."""
+        self._main(tmp_path, monkeypatch, '--limit', '1', rows=[_hit('b-dup-1', 0.7)])
+        [row] = [json.loads(line) for line in (tmp_path / 'cases.jsonl').read_text().splitlines()]
+        assert row['attach_target_id'] == 'b-dup-1', 'precondition: the shipped bands attached it'
+        assert (row['attach_target_cluster_id'], row['attach_target_label']) == (
+            'b-canon', 'duplicate',
+        )

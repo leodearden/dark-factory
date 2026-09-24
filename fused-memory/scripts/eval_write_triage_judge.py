@@ -493,6 +493,9 @@ class EvalPlan:
     selector re-sorts every slate by, so a borrowed row would hand one case
     another query's order.
 
+    ``fixture_by_id`` is the curator fixture by memory id: the ground truth an
+    attach target's cluster and label are read from, wherever it was retrieved.
+
     ``provenance`` is the plan's OWN disclosure — the fields that describe how
     the slates were obtained. It is merged UNDER the caller's, so nothing here
     can overwrite what the operator asked for.
@@ -504,6 +507,7 @@ class EvalPlan:
 
     cases: tuple[dict[str, Any], ...]
     candidate_records: tuple[tuple[Mapping[str, Any], ...], ...]
+    fixture_by_id: Mapping[str, Mapping[str, Any]]
     record_count: int
     provenance: Mapping[str, Any]
 
@@ -552,6 +556,7 @@ def seeded_plan(
         candidate_records=tuple(
             tuple(fixture[cid] for cid in case['candidates']) for case in cases
         ),
+        fixture_by_id=fixture,
         record_count=len(records),
         provenance={
             'slate_mode': SLATE_SEEDED,
@@ -566,12 +571,18 @@ def plan_from_slates(
     *,
     provenance: Mapping[str, Any],
     aliases: Mapping[str, str] = _NO_ALIASES,
+    fixture: Sequence[Mapping[str, Any]] | None = None,
 ) -> EvalPlan:
     """Pair production-shaped slates with the curator labels they answer for.
 
     One case per NON-canonical record, positional against *slates*. No control
     class is constructed: a retrieved slate that carries no correct attach
-    target is the ordinary case here rather than something to build.
+    target is the ordinary case here rather than something to build, and
+    ``distractor_count`` is ``None``.
+
+    Attach targets are described from *fixture*, the whole curator corpus
+    (default: *records*), so a ``--limit`` run describes a target exactly as
+    the full run does.
 
     The expected class stays the fixture's label. The slate, the attach target
     and the band come from the retrieval — including for a record whose
@@ -601,8 +612,9 @@ def plan_from_slates(
     return EvalPlan(
         cases=tuple(cases),
         candidate_records=tuple(tuple(slate.candidates) for slate in slates),
+        fixture_by_id={str(r['memory_id']): r for r in (records if fixture is None else fixture)},
         record_count=len(records),
-        provenance={'slate_mode': SLATE_RETRIEVED, **dict(provenance)},
+        provenance={'slate_mode': SLATE_RETRIEVED, 'distractor_count': None, **dict(provenance)},
     )
 
 
@@ -901,18 +913,23 @@ def case_row(
     case: Mapping[str, Any],
     answer: JudgeAnswer,
     candidate_records: Sequence[Mapping[str, Any]],
+    fixture_by_id: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, Any]:
     """Everything about one case that the aggregate numbers cannot be reread from.
 
-    A function of this case alone: *candidate_records* are the rows ITS judge
-    was shown, and the attach target is described only when it was one of them.
+    A function of this case and the curator fixture alone: *candidate_records*
+    are the rows ITS judge was shown. The attach target is described from its
+    fixture record, so a null cluster or label means it is not one, and
+    otherwise from its row on this slate.
 
     JSON-serializable verbatim: this is the line appended to the cases file as
     each case completes, so a run interrupted partway keeps what it paid for.
     """
     target_id = case['attach_target_id']
     shown = {str(record['memory_id']): record for record in candidate_records}
-    target = shown.get(str(target_id)) if target_id else None
+    target = (
+        (fixture_by_id.get(str(target_id)) or shown.get(str(target_id))) if target_id else None
+    )
     cluster_id = case['cluster_id']
     alias_id = case['canonical_alias_id']
     canonical_ids = {str(cluster_id), *([str(alias_id)] if alias_id else [])}
@@ -1320,7 +1337,7 @@ def run_judge_eval(
         paired = zip(cases, plan.candidate_records, strict=True)
         for index, (case, records) in enumerate(paired, 1):
             answer = _as_answer(judge_fn(case, list(records)))
-            row = case_row(index, case, answer, records)
+            row = case_row(index, case, answer, records, plan.fixture_by_id)
             emit(row)
             rows.append(row)
             if index % 10 == 0:
@@ -1532,6 +1549,11 @@ def usage_recording_openai() -> Iterator[list[Any]]:
     3169 flip is deciding about a per-write cost. The client is wrapped rather
     than the production call changed: the wrapper adds one append and returns
     the provider's own response untouched.
+
+    It swaps ``openai.AsyncOpenAI`` for a plain factory process-wide, so enter
+    it around the judge calls alone: a client anything else built inside it,
+    as the retrieved plan's ``MemoryService`` stores do, would not be the SDK's
+    class.
 
     Yields the sink. It stays EMPTY on the anthropic arm and for an injected
     stub judge, which is why the spend block reports ``None`` rather than 0.
@@ -1781,6 +1803,7 @@ def _retrieved_plan(
     config: Any,
     records: Sequence[Mapping[str, Any]],
     *,
+    fixture: Sequence[Mapping[str, Any]],
     judge_candidate_count: int,
     aliases: Mapping[str, str],
 ) -> EvalPlan:
@@ -1830,7 +1853,7 @@ def _retrieved_plan(
         'canonical_absent': sum(1 for s in slates if not s.canonical_present),
         'degraded_retrievals': sum(1 for s in slates if s.degraded),
         'self_retrieved': sum(1 for s in slates if s.self_retrieved),
-    }, aliases=aliases)
+    }, aliases=aliases, fixture=fixture)
 
 
 def _run(args: Any) -> int:
@@ -1886,23 +1909,22 @@ def _run(args: Any) -> int:
     judge_candidate_count = resolve_judge_candidate_count(service)
     judge_enabled = resolve_judge_enabled(service)
 
-    records = load_fixture(args.fixture)
-    logger.info('Loaded %d labeled record(s) from %s', len(records), args.fixture)
-    if args.limit is not None:
-        records = _limited(records, args.limit)
+    fixture = load_fixture(args.fixture)
+    logger.info('Loaded %d labeled record(s) from %s', len(fixture), args.fixture)
+    records = fixture if args.limit is None else _limited(fixture, args.limit)
+
+    if args.slate_mode == SLATE_RETRIEVED:
+        plan = _retrieved_plan(
+            args, config, records, fixture=fixture,
+            judge_candidate_count=judge_candidate_count, aliases=aliases,
+        )
+    else:
+        plan = seeded_plan(records, distractors=args.distractors, aliases=aliases)
 
     with (
         field_chars_override(args.field_chars) as field_chars,
         usage_recording_openai() as recorded,
     ):
-        if args.slate_mode == SLATE_RETRIEVED:
-            plan = _retrieved_plan(
-                args, config, records,
-                judge_candidate_count=judge_candidate_count, aliases=aliases,
-            )
-        else:
-            plan = seeded_plan(records, distractors=args.distractors, aliases=aliases)
-
         if args.dry_run:
             judge_fn = _dry_run_judge_fn()
             provider, model = 'dry-run', f'fixed:{_DRY_RUN_VERDICT}'

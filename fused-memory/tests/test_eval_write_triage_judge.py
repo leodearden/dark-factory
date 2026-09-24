@@ -1333,9 +1333,9 @@ class TestRunJudgeEval:
     ) -> None:
         """Measuring must not CHANGE the numbers when the pool is adequate.
 
-        The committed artifact reports candidate_count 5 / distractor_count 4;
-        measurement has to agree with that on a corpus that can supply it,
-        or this fix would silently restate the operator's own input.
+        A seeded run whose pool can supply `--distractors` publishes exactly
+        the width asked for, or measuring would silently restate the
+        operator's own input.
         """
         report = _run(tmp_path, distractors=2)
         provenance = report['provenance']
@@ -2143,6 +2143,24 @@ class TestCommittedJudgeAccuracyReportIsTraceable:
         assert report is not None
         assert report['provenance']['degraded_retrievals'] == 0
 
+    def test_the_arbiter_publishes_no_distractor_count(self) -> None:
+        """A retrieved slate draws no distractors, so it must not report a count."""
+        _block, report, _resolved = self._committed()
+        assert report is not None
+        assert report['provenance']['distractor_count'] is None
+
+    def test_a_null_attach_target_cluster_means_not_a_fixture_record(self, records) -> None:
+        """Every dumped target that IS a fixture record names its cluster and label."""
+        _block, report, _resolved = self._committed()
+        assert report is not None
+        fixture = {record['memory_id']: record for record in records}
+        cases = Path(__file__).parent.parent / report['provenance']['cases_path']
+        for row in (json.loads(line) for line in cases.read_text().splitlines()):
+            target = fixture.get(row['attach_target_id'])
+            assert (row['attach_target_cluster_id'], row['attach_target_label']) == (
+                (target['cluster_id'], target['label']) if target else (None, None)
+            ), row['memory_id']
+
 
 # ---------------------------------------------------------------------------
 # Option C: the per-case dump, the field-width override, the retrieved slate
@@ -2199,7 +2217,7 @@ def _aliased_row(candidates, attach_target_id) -> dict:
     return _mod().case_row(
         0, plan.cases[0],
         _mod().JudgeAnswer(outcome=OUTCOME_AMENDED, verdict=OUTCOME_AMENDED),
-        plan.candidate_records[0],
+        plan.candidate_records[0], plan.fixture_by_id,
     )
 
 
@@ -2326,7 +2344,7 @@ class TestTheCasesDump:
         row = _mod().case_row(
             3, plan.cases[0],
             _mod().JudgeAnswer(outcome=OUTCOME_AMENDED, verdict=OUTCOME_AMENDED),
-            plan.candidate_records[0],
+            plan.candidate_records[0], plan.fixture_by_id,
         )
         assert row == {
             'index': 3,
@@ -2337,9 +2355,9 @@ class TestTheCasesDump:
             'acceptable_outcomes': sorted([OUTCOME_AMENDED, OUTCOME_RESTATED]),
             'candidates': ['c1-canon', 'zz'],
             'attach_target_id': 'c1-canon',
-            'attach_target_cluster_id': None,
+            'attach_target_cluster_id': 'c1-canon',
             'attach_target_category': 'procedural_knowledge',
-            'attach_target_label': None,
+            'attach_target_label': 'canonical',
             'attach_target_is_canonical': True,
             'canonical_in_slate': True,
             'canonical_present': True,
@@ -2353,6 +2371,63 @@ class TestTheCasesDump:
             'usage': None,
             'canonical_alias_id': None,
         }
+
+
+class TestTheAttachTargetIsDescribedFromTheFixture:
+    """A null cluster or label means the target is not a fixture record.
+
+    A retrieved row carries only what the store holds, so a target described
+    from the slate alone published both as null in the arbiter's own mode,
+    fixture record or not.
+    """
+
+    RECORDS = (
+        _rec('canon', 'canon', 'canonical', category='preferences_and_norms'),
+        _rec('dup-a', 'canon', 'duplicate'),
+        _rec('dup-b', 'canon', 'duplicate', category='observations_and_summaries'),
+    )
+
+    @classmethod
+    def _dup_a_target(cls, candidates, attach_target_id, *, records=None, **kwargs) -> dict:
+        """How dup-a's dump row describes its attach target."""
+        population = list(cls.RECORDS if records is None else records)
+        slates = [
+            _slate(r['memory_id'], candidates=candidates,
+                   attach_target_id=attach_target_id, band=OUTCOME_JUDGE)
+            for r in population if r['label'] != 'canonical'
+        ]
+        plan = _mod().plan_from_slates(population, slates, provenance={}, **kwargs)
+        row = _mod().case_row(
+            1, plan.cases[0], _mod().JudgeAnswer(outcome=OUTCOME_AMENDED),
+            plan.candidate_records[0], plan.fixture_by_id,
+        )
+        return {key: row[f'attach_target_{key}'] for key in ('cluster_id', 'label', 'category')}
+
+    def test_a_wrong_attach_to_a_fixture_sibling_names_its_cluster_and_label(self) -> None:
+        shown = [_live('dup-b', category='observations_and_summaries')]
+        assert self._dup_a_target(shown, 'dup-b') == {
+            'cluster_id': 'canon', 'label': 'duplicate', 'category': 'observations_and_summaries',
+        }
+
+    def test_a_hoisted_parent_off_the_slate_is_described_from_the_fixture(self) -> None:
+        shown = [_live('child', canonical_id='canon')]
+        assert self._dup_a_target(shown, 'canon') == {
+            'cluster_id': 'canon', 'label': 'canonical', 'category': 'preferences_and_norms',
+        }
+
+    def test_a_target_outside_the_fixture_is_described_by_its_row_alone(self) -> None:
+        shown = [_live('zz', category='observations_and_summaries')]
+        assert self._dup_a_target(shown, 'zz') == {
+            'cluster_id': None, 'label': None, 'category': 'observations_and_summaries',
+        }
+
+    def test_a_limited_run_describes_a_target_as_the_full_run_does(self) -> None:
+        """`--limit` narrows the population, not the fixture a target is read from."""
+        limited = [r for r in self.RECORDS if r['memory_id'] != 'dup-b']
+        shown = [_live('dup-b', category='observations_and_summaries')]
+        assert self._dup_a_target(
+            shown, 'dup-b', records=limited, fixture=self.RECORDS,
+        ) == self._dup_a_target(shown, 'dup-b')
 
 
 class TestScoreAttachments:
@@ -2501,6 +2576,15 @@ class TestPlanFromSlates:
         with pytest.raises(ValueError, match='positional'):
             _mod().plan_from_slates(self._records(), [], provenance={})
 
+    def test_a_retrieved_run_publishes_no_distractor_count(self, tmp_path: Path) -> None:
+        """Distractors are the seeded construction's; a retrieved slate draws none."""
+        report = _mod().run_judge_eval(
+            plan=self._plan(), judge_fn=_fake_judge(),
+            report_path=tmp_path / 'report.json', provenance={},
+        )
+        provenance = report['provenance']
+        assert (provenance['candidate_count'], provenance['distractor_count']) == (2, None)
+
     def test_a_hoisted_child_counts_as_the_canonical_on_the_slate(self) -> None:
         """`_canonical_id_of` hoists a sighting to its parent, so a slate
         holding only the CHILD still shows the model the match."""
@@ -2513,7 +2597,7 @@ class TestPlanFromSlates:
         plan = _mod().plan_from_slates(self._records(), slates, provenance={})
         row = _mod().case_row(
             1, plan.cases[0], _mod().JudgeAnswer(outcome=OUTCOME_AMENDED),
-            plan.candidate_records[0],
+            plan.candidate_records[0], plan.fixture_by_id,
         )
         assert row['canonical_in_slate'] is True
 
@@ -2603,6 +2687,7 @@ class TestEachCaseIsShownItsOwnRetrieval:
         def rebuilt(candidate_records):
             return _mod().EvalPlan(
                 cases=plan.cases, candidate_records=candidate_records,
+                fixture_by_id=plan.fixture_by_id,
                 record_count=plan.record_count, provenance=plan.provenance,
             )
 
