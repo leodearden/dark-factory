@@ -24,6 +24,7 @@ inifile enforces on every possible invocation.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import gc
 import json
@@ -2410,6 +2411,168 @@ class TestOpenDebtClosesAFinishedCycle:
         assert row is not None and row.opened_at == self.LATER.isoformat()
         naive = [r.getMessage() for r in caplog.records if 'naive' in r.getMessage()]
         assert len(naive) == 1 and 'open_debt' in naive[0], naive
+
+
+@pytest.mark.asyncio
+class TestOpenDebtRegressionHook:
+    """``open_debt`` reports a re-entry — a test flaking again after its fix landed —
+    EXACTLY ONCE, through ``on_regressed_after_resolution`` (task η).  ASYNC-ONLY CLASS.
+
+    The hook fires right after the upsert commits and BEFORE ζ's owner filing awaits
+    anything, so a filing that is cancelled or hangs (the recorder's wall-clock budget)
+    cannot take the regression signal down with it.
+    """
+
+    NOW = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    LATER = datetime(2026, 8, 6, 13, 0, tzinfo=UTC)
+    LATEST = datetime(2026, 8, 6, 14, 0, tzinfo=UTC)
+    TEST_ID = 'tests/test_a.py::test_one'
+    COMMIT = 'c0ffee' + '0' * 34
+
+    async def _resolved(self, db_path: Path) -> None:
+        """Cycle 1, owned by task-901 and closed at LATER."""
+        await _open_owned_debt(db_path, self.TEST_ID, now=self.NOW)
+        assert await _resolve_as_done(db_path, self.TEST_ID, commit=self.COMMIT, now=self.LATER)
+
+    async def test_a_re_entry_over_a_resolved_row_reports_once(self, tmp_path: Path) -> None:
+        """(a) The row handed over carries the regression's evidence."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await self._resolved(db_path)
+        seen: list = []
+
+        await open_debt(
+            db_path, 'dark_factory', self.TEST_ID,
+            now=self.LATEST, on_regressed_after_resolution=seen.append,
+        )
+
+        assert len(seen) == 1, seen
+        assert seen[0].open_count == 2
+        assert seen[0].prior_resolving_commit == self.COMMIT
+        assert seen[0].prior_resolved_at == self.LATER.isoformat()
+
+    async def test_a_re_entry_through_the_lazy_close_reports_once(self, tmp_path: Path) -> None:
+        """(b) The production shape: the owner is found done by this very call."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await _open_owned_debt(db_path, self.TEST_ID, now=self.NOW)
+        client = _FakeTaskClient(
+            tasks={'task-901': _done_task('task-901', self.COMMIT)}, submit_returns='task-902'
+        )
+        seen: list = []
+
+        await open_debt(
+            db_path, 'dark_factory', self.TEST_ID,
+            task_client=client, now=self.LATER, on_regressed_after_resolution=seen.append,
+        )
+
+        assert [row.open_count for row in seen] == [2]
+        assert seen[0].prior_resolving_commit == self.COMMIT
+
+    async def test_a_fresh_open_or_a_repeat_reports_nothing(self, tmp_path: Path) -> None:
+        """(c) Only a RE-ENTRY is a regression: not the first suppression, and not a
+        repeat inside the re-entered cycle."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        seen: list = []
+        await open_debt(
+            db_path, 'dark_factory', 'tests/test_b.py::test_fresh',
+            now=self.NOW, on_regressed_after_resolution=seen.append,
+        )
+        assert seen == []
+
+        await self._resolved(db_path)
+        await open_debt(
+            db_path, 'dark_factory', self.TEST_ID,
+            now=self.LATEST, on_regressed_after_resolution=seen.append,
+        )
+        assert len(seen) == 1
+        await open_debt(
+            db_path, 'dark_factory', self.TEST_ID,
+            now=self.LATEST + timedelta(hours=1), on_regressed_after_resolution=seen.append,
+        )
+        assert len(seen) == 1, 'a repeat inside the re-entered cycle is not a second regression'
+
+    async def test_the_report_precedes_the_owner_filing(self, tmp_path: Path) -> None:
+        """(d) The hook sees the re-entered row before ζ gives it an owner, and it has
+        fired even when the filing hangs and the call is cancelled from outside."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await self._resolved(db_path)
+        never = asyncio.Event()
+
+        class _HangingFiling(_FakeTaskClient):
+            async def submit_task(self, arguments: dict) -> str:
+                await never.wait()
+                return 'unreachable'
+
+        seen: list = []
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(
+                open_debt(
+                    db_path, 'dark_factory', self.TEST_ID,
+                    task_client=_HangingFiling(), now=self.LATEST,
+                    on_regressed_after_resolution=seen.append,
+                ),
+                timeout=0.2,
+            )
+
+        assert len(seen) == 1, 'a cancelled filing must not cost the regression report'
+        assert seen[0].owner_task_id is None
+
+    async def test_a_raising_hook_costs_only_the_report(self, tmp_path: Path, caplog) -> None:
+        """(e) The re-entered row is still returned and still gets its owner; the
+        failure is loud and names the test."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await self._resolved(db_path)
+        client = _FakeTaskClient(submit_returns='task-902')
+
+        def _boom(_row) -> None:
+            raise RuntimeError('escalation queue unavailable')
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            row = await open_debt(
+                db_path, 'dark_factory', self.TEST_ID,
+                task_client=client, now=self.LATEST, on_regressed_after_resolution=_boom,
+            )
+
+        assert row is not None and row.open_count == 2
+        assert row.owner_task_id == 'task-902'
+        assert len(client.submit_calls) == 1
+        raised = [r for r in caplog.records if r.exc_info and self.TEST_ID in r.getMessage()]
+        assert len(raised) == 1, caplog.text
+
+    async def test_an_unhooked_re_entry_is_loud(self, tmp_path: Path, caplog) -> None:
+        """(f) No hook is a legitimate configuration, but the regression is never
+        silent: one WARNING names the test and the flag."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await self._resolved(db_path)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            await open_debt(db_path, 'dark_factory', self.TEST_ID, now=self.LATEST)
+
+        flagged = [r.getMessage() for r in caplog.records if 'regressed_after_resolution' in r.getMessage()]
+        assert len(flagged) == 1, caplog.text
+        assert self.TEST_ID in flagged[0]
+
+    async def test_no_re_entry_logs_no_warning(self, tmp_path: Path, caplog) -> None:
+        """(g) The negative control for (f): a fresh open and a repeat stay quiet."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            await open_debt(db_path, 'dark_factory', self.TEST_ID, now=self.NOW)
+            await open_debt(db_path, 'dark_factory', self.TEST_ID, now=self.LATER)
+
+        assert [r for r in caplog.records if r.name == 'orchestrator.flake_ledger'] == []
 
 
 @pytest.mark.asyncio
