@@ -1,11 +1,49 @@
 """Certifier: every documented ``entities=`` example is one the live gate accepts.
 
-Task 3675 (PRD ``plans/memory-referent-fidelity-prd.md`` leaf kappa).
+Task 3675 (PRD ``plans/memory-referent-fidelity-prd.md`` leaf kappa). Several
+sites teach agents to declare a write's referents: the markdown guides, the
+review-checkpoint reflection template and the recon prompt fragment. Each one
+carries a hand-transcribed ``entities=`` example that must agree with the live
+``add_memory`` signature and gate. That is the INV-5 lockstep shape, and this
+repo has already seen hand-transcribed prompt text drift twice in one file. So
+the agreement is checked by a machine, here, once for every site.
+
+EXECUTE, NOT COMPARE. Each extracted literal is run through the live
+``fused_memory.server.entities_gate::entities_gate`` together with the content
+of its own call. This is the ``tests/scripts/test_package_source_lookup_convention.py``
+doctrine: certify that the recipe works, not that it is still spelled the same.
+Rewording the prose around an example never fails here. A renamed key, a label
+used as an id, or an id the example's own content contradicts does fail. The
+scan keyword is pinned to the live tool signatures as well, so renaming the
+parameter fails here too.
+
+WHY THIS SUITE. ``fused-memory/pyproject.toml`` sets
+``pythonpath = ["src", "../orchestrator/src"]``, so both the gate and the
+orchestrator template are declared imports here. ``tests/scripts/`` runs under
+``uv run --project shared``, and that project's declared closure has no
+fused_memory: it raises ModuleNotFoundError under ``--isolated``. It is present
+only incidentally, in a venv provisioned with ``--all-packages``.
+``tests/scripts/test_check_fused_memory_unit_parity.py`` records the same
+finding.
+
+KNOWN LIMITATION. A task-role diff that touches only ``.md`` files does not run
+this file, because ``orchestrator/src/orchestrator/verify.py::_has_source_files``
+counts only ``.py``/``.rs`` files. Merge-role full-breadth verify and review
+checkpoints still run it.
+
+Sibling guards on the same contract: ``test_referent_guidance_prompt_drift.py``
+checks that the rendered fragment reaches every recon prompt that writes, and
+``orchestrator/tests/test_review_checkpoint_reflection_splice.py`` checks that
+the reflection template reaches the review prompt.
 """
 
 from __future__ import annotations
 
+import ast
 import inspect
+import re
+from dataclasses import dataclass
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -16,6 +54,117 @@ from fused_memory.server.tools import create_mcp_server
 #: signature of both write tools, so a parameter rename goes red here instead
 #: of leaving every documented example "valid" under a dead name.
 _DECLARATION_KEYWORD = 'entities'
+
+_DECLARATION_RE = re.compile(rf'(?<!\w){_DECLARATION_KEYWORD}[ \t]*=(?!=)[ \t]*')
+_CONTENT_RE = re.compile(r'(?<!\w)content[ \t]*=(?!=)[ \t]*')
+_WRITE_CALL_RE = re.compile(r'add_(?:memory|episode)[ \t]*\(')
+_STRING_RE = re.compile(r"""'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*\"""")
+
+
+@dataclass(frozen=True)
+class DeclaredExample:
+    """One documented declaration, and the content of the write call it sits in."""
+
+    literal: list[Any]
+    content: str | None
+    where: str
+
+
+def _declared_examples(text: str, *, origin: str) -> list[DeclaredExample]:
+    """Every ``entities=<list literal>`` in *text*, in document order.
+
+    Fails loudly, naming *origin*, rather than returning ``[]``. An extractor
+    that silently finds nothing would make every assertion downstream pass
+    while certifying nothing.
+    """
+    examples = [_declared_example(text, m, origin=origin) for m in _DECLARATION_RE.finditer(text)]
+    assert examples, (
+        f'{origin}: no `{_DECLARATION_KEYWORD}=` example found. A guarded site '
+        'that shows no declaration teaches nothing about it. Add a worked call, '
+        'or drop the site from _GUARDED_SITES if it no longer teaches writes.'
+    )
+    return examples
+
+
+def _declared_example(text: str, match: re.Match[str], *, origin: str) -> DeclaredExample:
+    where = f'{origin}:{text.count(chr(10), 0, match.start()) + 1}'
+    return DeclaredExample(
+        literal=_list_literal(text, match.end(), where=where),
+        content=_call_content(text, match.start(), where=where),
+        where=where,
+    )
+
+
+def _list_literal(text: str, start: int, *, where: str) -> list[Any]:
+    assert text.startswith('[', start), (
+        f'{where}: `{_DECLARATION_KEYWORD}=` is not followed by a list literal. '
+        'Every example must be executable: write a concrete list ([] or '
+        "[{'kind': 'task', 'id': 3127}]), never a placeholder, and phrase "
+        f'omission as "omit `{_DECLARATION_KEYWORD}`", without the "=".'
+    )
+    end = _balanced_end(text, start, '[', ']')
+    assert end is not None, f'{where}: the `{_DECLARATION_KEYWORD}=[` list never closes.'
+    span = text[start:end]
+    try:
+        value = ast.literal_eval(span)
+    except (ValueError, SyntaxError, TypeError) as exc:
+        raise AssertionError(
+            f'{where}: `{_DECLARATION_KEYWORD}={span}` is not a Python literal ({exc}). '
+            'Write concrete values; a placeholder cannot be checked against the gate.'
+        ) from exc
+    assert isinstance(value, list), f'{where}: `{_DECLARATION_KEYWORD}={span}` is not a list.'
+    return value
+
+
+def _call_content(text: str, offset: int, *, where: str) -> str | None:
+    """The ``content=`` string of the write call enclosing *offset*, if any."""
+    call = _enclosing_write_call(text, offset)
+    if call is None:
+        return None
+    match = _CONTENT_RE.search(text, *call)
+    if match is None:
+        return None
+    string = _STRING_RE.match(text, match.end())
+    assert string is not None, (
+        f'{where}: the enclosing call passes `content=` something other than a '
+        'quoted string, so the declaration cannot be checked against it.'
+    )
+    return ast.literal_eval(string.group())
+
+
+def _enclosing_write_call(text: str, offset: int) -> tuple[int, int] | None:
+    """``(open, close)`` of the nearest ``add_memory(``/``add_episode(`` spanning *offset*."""
+    starts = list(_WRITE_CALL_RE.finditer(text, 0, offset))
+    if not starts:
+        return None
+    open_paren = starts[-1].end() - 1
+    close = _balanced_end(text, open_paren, '(', ')')
+    if close is None or close <= offset:
+        return None
+    return open_paren, close
+
+
+def _balanced_end(text: str, start: int, opener: str, closer: str) -> int | None:
+    """Offset just past the *closer* balancing the *opener* at *start*.
+
+    Quoted strings are skipped whole, so a bracket or comma inside one never
+    ends the walk. Returns None if the text runs out first.
+    """
+    depth = 0
+    pos = start
+    while pos < len(text):
+        string = _STRING_RE.match(text, pos)
+        if string is not None:
+            pos = string.end()
+            continue
+        if text[pos] == opener:
+            depth += 1
+        elif text[pos] == closer:
+            depth -= 1
+        pos += 1
+        if depth == 0:
+            return pos
+    return None
 
 
 # ── The scan keyword is a live parameter ─────────────────────────────────────
