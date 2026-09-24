@@ -563,8 +563,8 @@ def simulate_candidate(name: str, facts: Iterable[str]) -> CandidateResult:
 #
 # The measured figures behind these values (FalkorDB's server-wide cap of
 # 10000, and what an unpaginated whole-graph read cost on the live corpus)
-# live in the RESULT-SET CAP AUDIT block of backends/graphiti_client.py,
-# which is the one place they are recorded.
+# live in plans/falkordb-resultset-cap-audit.md, which is the one place
+# they are recorded.
 DEFAULT_PAGE_SIZE = _DEFAULT_READ_PAGE_SIZE
 RESULTSET_SIZE = _RESULTSET_SIZE
 MAX_ENUM_PAGES = _MAX_READ_PAGES
@@ -1907,8 +1907,7 @@ def render_markdown(report: Report) -> str:
         '',
         '`get_all_valid_edges` is **PAGINATED as of task 4340** and that '
         'truncation is GONE. The measured counts behind both statements live '
-        'in the `RESULT-SET CAP AUDIT` block of '
-        '`fused-memory/src/fused_memory/backends/graphiti_client.py`, which is '
+        'in `plans/falkordb-resultset-cap-audit.md`, which is '
         'the one place they are recorded. It is NOT working around a live bug, '
         'and nothing in `graphiti_client.py` is owed a fix on this account.',
         '',

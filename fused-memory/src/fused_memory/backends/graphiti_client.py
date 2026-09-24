@@ -490,8 +490,12 @@ class IncompleteEnumerationError(Exception):
 
 
 # ---------------------------------------------------------------------------
-# Paginated whole-graph reads (task 4340)
+# Paginated whole-graph reads (tasks 4340, 4869)
 # ---------------------------------------------------------------------------
+# plans/falkordb-resultset-cap-audit.md is the one place for the dated row
+# counts, the measured paging cost, the per-read classification of every read
+# in this file, the open residual, and the ticket cross-references.  Update it
+# there, not here.
 
 _RESULTSET_SIZE = 10000
 """FalkorDB's server-wide result-set ceiling: every query returns at most this
@@ -571,155 +575,6 @@ graph being written to mid-read.
 Callers should branch on membership in this set rather than on a specific
 kind, so a future fifth structural path is covered by construction.
 """
-
-# --------------------------------------------------------------------------- #
-# RESULT-SET CAP AUDIT — every read in this file, re-checked 2026-08-17
-# (task 4340).  Recorded so the next person does not have to redo it, and
-# stated as claims with reasons so it can be FALSIFIED rather than trusted.
-#
-# THIS BLOCK IS THE ONE PLACE the measured figures, the open residual, and the
-# ticket cross-references are written down.  Everything else that used to
-# restate them — the two shim docstrings, _paged_ro_query's residual
-# paragraph, the pagination test module's docstring, and the task-4340
-# amendment in reconciliation/stale_status_snapshot_edge_sweep.py — now points
-# HERE, so a re-measurement is a one-block edit.  Keep it that way.  Moving
-# the block out of source entirely, into a reference doc, is tracked as ticket
-# tkt_0RSKFG5RX196H9CJ0RXGJCZF4F; the counts below are date-stamped precisely
-# because they rot (Entity nodes on dark_factory read 16038, then 16083, then
-# 16262 over roughly 24 hours of task 4340).
-#
-# Measured live against localhost:6379, RESULTSET_SIZE=10000:
-#
-#     graph          Entity nodes   valid-edge rows   an unpaginated read saw
-#     dark_factory       16083            25040                10000
-#     reify              23616            31659                10000
-#
-# FIXED HERE — both were measurably truncated, and they COMPOUND:
-# ``detect_stale_with_edges`` calls them on consecutive lines and the two
-# truncations were INDEPENDENT, so an entity surviving the node cut could
-# still lose every edge to the edge cut, yielding a bogus "stale, zero valid
-# facts" verdict that ``rebuild_entity_from_edges`` then WROTE BACK into
-# ``n.summary``.  Corrupting, not merely under-reporting.
-#   - get_all_valid_edges  -> enumerate_all_valid_edges
-#   - list_entity_nodes    -> enumerate_entity_nodes
-# The old names survive as thin shims with UNCHANGED signatures applying a
-# SPLIT incompleteness policy: they RAISE IncompleteEnumerationError on a
-# STRUCTURAL incompleteness (a read that was never validly performed — its
-# emptiness or prefix is fabricated, and returning it is what let '' be
-# written back over real summaries) and WARN-and-return on an EMPIRICAL one
-# (a census disagreement, transient on a continuously-written graph).  The
-# completeness signal itself is a first-class return value on the enumerate_*
-# methods, which never raise.  No consumer ACTS on it yet — the two
-# reconciliation sweeps and cleanup_count_snapshots still call the shims, so
-# they cannot yet distinguish "swept a complete corpus" from "swept what we
-# could fetch".  Filed as ticket tkt_0RSJP8CH1M9GAAJTABV8FZB4AH.
-#
-# A THIRD CONSUMER, outside this file: scripts/measure_plural_enum_guard_recall.py
-# (task 4576) pages through _paged_ro_query and composes both its Cypher
-# strings from _ALL_VALID_EDGES_MATCH, so the read-only recall probe measures
-# the same population this module enumerates.  It supplies its OWN projection
-# and its own count(DISTINCT e.uuid) census — it decides completeness in
-# distinct EDGES, not in rows — and so re-derives its own verdict rather than
-# reading paged.complete.  Comment only; nothing here changes on its account.
-#
-# MEASURED COST of paging, and the keyset rewrite it rules out.  Measured
-# 2026-08-18 against localhost:6379, warm, 3 repeats, median reported; the
-# whole enumeration (census + every page), page_size 5000:
-#
-#     graph          read          UNPAGINATED     PAGED       rows
-#     dark_factory   entity nodes     860 ms      862 ms      16262
-#     dark_factory   valid edges      771 ms     3301 ms      25382
-#     reify          entity nodes    3326 ms     1498 ms      23671
-#     reify          valid edges     3126 ms     3685 ms      31783
-#
-# The UNPAGINATED column is the OLD behaviour and returned 10000 truncated
-# rows for its money, so it is a cost floor, not a comparable answer.  One
-# full detect_stale_with_edges (both reads) costs ~4.2 s on dark_factory —
-# about +2.6 s per reconciliation cycle — and ~5.2 s on reify, which is
-# FASTER than the ~6.5 s the two truncated reads used to cost there.  Paging
-# a large result set in 5000-row chunks beats transferring one 10000-row set.
-#
-# KEYSET/SEEK PAGINATION WAS TRIED AND DECLINED, on measurement rather than
-# on taste.  The concern it answers is real in principle: ORDER BY ... SKIP k
-# LIMIT n re-scans and re-sorts the whole matched population per page, so an
-# enumeration is O(P * N log N) where a seek would be O(N log N).  For the
-# node read the seek form is available — `WHERE n.uuid > $last ORDER BY
-# n.uuid LIMIT k` over the RANGE index ensure_indices creates on
-# Entity(uuid).  Measured head to head, running SEEK FIRST each round so any
-# warm-cache advantage favoured it:
-#
-#     graph          node SEEK (keyset)        node SKIP (offset)
-#     dark_factory   [781, 904, 862] ms        [796, 862, 1610] ms
-#     reify          [1414, 1310, 1577] ms     [1814, 1498, 1214] ms
-#
-# Indistinguishable — identical medians on dark_factory, ~6% on reify, well
-# inside the run-to-run spread.  The asymptotic argument does not bite at
-# this N: 4-5 pages over ~16-24k rows, where the sort is not the bottleneck.
-# So a second paging mode in _paged_ro_query would buy no measured latency
-# and cost a second code path to keep correct.  Re-open only WITH a
-# measurement showing the sort dominating — and note the edge read, which is
-# the expensive one, cannot use it anyway: its ORDER BY is the composite
-# (e.uuid, n.uuid) needed for a total order over ROWS.
-#
-# DOWNSTREAM FAN-OUT, the other cost this fix moved.  detect_stale_dry_run
-# issues one get_valid_edges_for_node per non-empty-summary entity, and now
-# runs over the COMPLETE node set instead of a truncated 10000.  Measured
-# 0.70 ms/entity amortised at max_concurrency=10 on dark_factory (0.39 ms on
-# reify), so the full fan-out is ~9.0 s against ~7.0 s before (dark_factory)
-# and ~8.8 s against ~3.9 s (reify).  Seconds, bounded, and it is the price
-# of the answer being right; it is not a liveness risk at these sizes.
-#
-# RESIDUAL LEFT OPEN DELIBERATELY, and not an oversight: a materially-short
-# INCOMPLETE_SHORT_READ still returns a partial collection that the
-# force=True path (memory_service.py:5826-5834, MemoryService.rebuild_entity_summaries)
-# will write back, blanking the summary of any entity whose edges fell in the
-# missing remainder.  That path never consults staleness, so it writes to
-# every entity the node read returned.  Do NOT close it by tightening the shims — guard 4 fires on any
-# shortfall at all, including a single concurrently-invalidated edge, so
-# raising there would take down the live rebuild for exactly the transient
-# the warn-not-raise decision rejected.  The fix belongs at the consumer, as
-# a policy on how short is too short applied where the destructive write is
-# decided, which is the same code the ticket above must touch.
-#
-# STILL UNPAGINATED and assessed AT RISK.  Left out of 4340 only because they
-# are separable — different call chains, no shared verdict, no write-back —
-# and folding them in would have doubled the diff.  Follow-up filed as ticket
-# tkt_0RSJP82N82SNKT2BHRT3HWK3DA (a TICKET id, not a task id — the curator
-# resolves it to a task asynchronously).
-#   - query_stale_node_embeddings: ~16083 rows on dark_factory.  A truncated
-#     read makes an embedding-dimension migration look COMPLETE when it is
-#     not — the worst shape of this bug, because the operator's evidence of
-#     success is the very thing being truncated.
-#   - query_stale_edge_embeddings: ~15242/22392 rows.  No ``invalid_at``
-#     filter, so it includes superseded edges and its row count runs ahead of
-#     the valid-edge census above.
-#   - query_edges_by_time_range: bounded only by the caller's window width;
-#     any window wide enough to span >10000 edges truncates.
-#   - retrieve_episodes: reaches the same server through graphiti-core's
-#     ``get_by_group_ids(limit=None)`` rather than ``ro_query``, so it is not
-#     fixable with ``_paged_ro_query`` as-is.  Its existing comment reasons
-#     about transfer COST and about ``last_n`` being capped in tools.py;
-#     neither protects against server-side truncation.  Truncation is worse
-#     than slowness here: the Python-side ``sorted(...)[:last_n]`` would be
-#     selecting the most-recent of a truncated 10000, i.e. silently returning
-#     the wrong episodes rather than merely fewer of them.
-#
-# ASSESSED SAFE, with the reason (a bare list would not be checkable):
-#   - every uuid-keyed lookup: the key is unique, so the result is 0 or 1 rows.
-#   - every exact-name lookup: bounded by the duplicate-name count, which
-#     ``find_duplicate_entity_nodes`` reports in single digits.
-#   - every single-row aggregate: one row by construction.
-#   - server-side grouped/filtered aggregates that SCAN the whole graph but
-#     whose RESULT set is small — the cap applies to rows RETURNED, not rows
-#     scanned, so a ``count``/``collect`` folding 20k rows into a handful is
-#     safe.
-#   - ``CALL db.indexes()``: one row per index, single digits.
-#   - every per-node neighbourhood read.  ``get_valid_edges_for_node`` is
-#     called out by name because task 4340 asked about it specifically: its
-#     row count is ONE node's valid degree, and a single node would have to
-#     hold >10000 of the graph's ~12506 valid edges to reach the cap.  It is
-#     left unpaginated deliberately, not by oversight.
-# --------------------------------------------------------------------------- #
 
 
 # Page/census pairs for the paginated whole-graph reads. Each pair shares an
@@ -968,7 +823,7 @@ async def _paged_ro_query(
     is the WRONG fix — it fires on a single concurrently-invalidated edge, so
     it would take down the live rebuild for exactly the transient described
     above.  Full statement, the affected call site, and the ticket that closes
-    it are in the RESULT-SET CAP AUDIT block at the top of this module.
+    it are in plans/falkordb-resultset-cap-audit.md.
 
     Args:
         graph: FalkorDB graph handle exposing ``async ro_query(cypher, params)``.
@@ -1103,7 +958,7 @@ async def _read_all_group_episodes(
     and keyset pages never shift under concurrent insert.  Only an EMPTY page
     ends the read, never a short one, so a server cap below ``page_size``
     cannot truncate it — which is why neither ``_paged_ro_query``'s refusal
-    guard nor a census is needed.  See the RESULT-SET CAP AUDIT block above.
+    guard nor a census is needed.  See plans/falkordb-resultset-cap-audit.md.
 
     Raises:
         IncompleteEnumerationError: ``max_pages`` ran out on a non-empty page.
@@ -1145,9 +1000,9 @@ def _apply_incompleteness_policy(
     per-method opinion: copies drift, and the drift would be silent in exactly
     the direction that matters — a caller that forgot to raise returns a
     fabricated empty and the write-back path blanks summaries with it.  It is
-    also the single seam the follow-up ticket
-    (tkt_0RSJP8CH1M9GAAJTABV8FZB4AH, wire the completeness signal through to
-    consumers) has to move when the policy migrates to the consumer.
+    also the single seam the follow-up that wires the completeness signal
+    through to consumers has to move when the policy migrates to the consumer
+    (see the TICKETS section of plans/falkordb-resultset-cap-audit.md).
 
       STRUCTURAL (``INCOMPLETE_STRUCTURAL_KINDS``) -> raise
       ``IncompleteEnumerationError``.  Deterministic, non-transient, and
@@ -2313,8 +2168,8 @@ class GraphitiBackend:
 
         PAGINATED (task 4869) through ``_paged_ro_query``, because the embedded
         population exceeds the server's result-set cap; incompleteness follows
-        the shared ``_apply_incompleteness_policy``.  Measured counts are in the
-        RESULT-SET CAP AUDIT block at the top of this module.
+        the shared ``_apply_incompleteness_policy``.  Measured counts are in
+        plans/falkordb-resultset-cap-audit.md.
 
         Raises:
             IncompleteEnumerationError: The read was structurally incomplete.
@@ -2390,8 +2245,8 @@ class GraphitiBackend:
         PAGINATED (task 4869) through ``_paged_ro_query``, because a window
         spanning more edges than the server's result-set cap was silently
         truncated; incompleteness follows the shared
-        ``_apply_incompleteness_policy``.  See the RESULT-SET CAP AUDIT block
-        at the top of this module.
+        ``_apply_incompleteness_policy``.  See
+        plans/falkordb-resultset-cap-audit.md.
 
         Args:
             start: ISO 8601 string for the lower bound (inclusive).
@@ -2709,10 +2564,10 @@ class GraphitiBackend:
         — about HALF the valid-edge population was invisible to every caller,
         with no error and no marker.  Do not "simplify" it back to one query.
         The measured row counts, the paging cost, and the per-query audit that
-        found this live in the RESULT-SET CAP AUDIT block at the top of this
-        module (the single place they are recorded, so a re-measurement is a
-        one-block edit); the ORDER BY and completeness rules that make paging
-        safe are in _paged_ro_query.
+        found this live in plans/falkordb-resultset-cap-audit.md (the single
+        place they are recorded, so a re-measurement is a one-file edit); the
+        ORDER BY and completeness rules that make paging safe are in
+        _paged_ro_query.
 
         Incompleteness is handled by the shared _apply_incompleteness_policy:
         STRUCTURAL kinds raise IncompleteEnumerationError, EMPIRICAL ones warn
@@ -4524,8 +4379,8 @@ class GraphitiBackend:
         no writes are performed.
 
         PAGINATED (task 4340).  This read was truncated at the same server-wide
-        RESULTSET_SIZE ceiling as get_all_valid_edges — measured counts in the
-        RESULT-SET CAP AUDIT block at the top of this module.
+        RESULTSET_SIZE ceiling as get_all_valid_edges — measured counts in
+        plans/falkordb-resultset-cap-audit.md.
 
         THE COMPOUNDING HAZARD, and the reason this method is in scope for a
         task nominally about edges: ``detect_stale_with_edges`` calls this

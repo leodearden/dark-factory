@@ -1,16 +1,19 @@
-"""Tests for paginated whole-graph reads in GraphitiBackend (task 4340).
+"""Tests for paginated whole-graph reads in GraphitiBackend (tasks 4340, 4869).
 
 FalkorDB truncates every result set at a server-wide ``RESULTSET_SIZE``
-ceiling, silently, and two whole-graph reads exceeded it on the live corpus —
-so both were returning a short collection with no error and no marker.  The
-measured corpus figures, the cap, and the per-query audit live in ONE place:
-the RESULT-SET CAP AUDIT block at the top of
-``fused_memory/backends/graphiti_client.py``.  The ``_LIVE_*`` constants below
-are this module's local copy, used to size the fixture corpora so the tests
-exercise the real shape rather than a toy; re-measure them together.
+ceiling, silently, and several whole-graph reads exceeded it on the live
+corpus — so each was returning a short collection with no error and no
+marker.  The measured corpus figures, the cap, and the per-query audit live in
+ONE place: ``plans/falkordb-resultset-cap-audit.md``.  The ``_LIVE_*``
+constants below are this module's local copy, used to size the fixture
+corpora so the tests exercise the real shape rather than a toy; re-measure
+them together.
 
 This module pins the paginated read primitive (``_paged_ro_query``), its four
-fail-closed completeness paths, and the two methods routed through it.
+fail-closed completeness paths, the two task-4340 methods routed through it,
+the three task-4869 reads routed through it (the two stale-embedding reads and
+``query_edges_by_time_range``), and ``retrieve_episodes``' keyset reader
+(``_read_all_group_episodes``).
 
 ``FakeCappedGraph`` is a purpose-built double rather than a ``make_graph_mock``
 variant because it needs stateful multi-page behaviour and a query log.  It
@@ -43,7 +46,7 @@ _LOGGER_NAME = 'fused_memory.backends.graphiti_client'
 # sizes. Deliberately FROZEN at the measurement that motivated the fix rather
 # than tracked against the live graph: the corpus grows every reconciliation
 # cycle, and a test whose expectations chase it proves nothing about the cap.
-# The authoritative figures are in graphiti_client.py's audit block.
+# The authoritative figures are in plans/falkordb-resultset-cap-audit.md.
 _LIVE_EDGE_ROWS = 24938
 _LIVE_DISTINCT_EDGES = 12506
 _LIVE_ENTITY_NODES = 16038
