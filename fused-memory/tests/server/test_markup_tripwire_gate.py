@@ -1495,9 +1495,9 @@ class TestMarkupStormAtTheBoundary:
 # above is assembled from shared.toolcall_markup's constants, and prose
 # spells the bracket with the ``\x3c`` escape.
 #
-# Modelled on tests/server/test_markup_tripwire.py's guard (task 4228). Its
-# needle set and scanner are COPIED here rather than imported: a guard whose
-# needles another module can edit is not a per-file guard.
+# Modelled on tests/server/test_markup_tripwire.py's guard (task 4228), whose
+# needle set and scanner it repeats; whether such per-file copies give way to
+# one shared scanner is task 5209's design call.
 # ---------------------------------------------------------------------------
 
 #: Every ENVELOPE_LITERALS member plus the two structural prefixes a

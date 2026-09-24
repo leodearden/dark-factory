@@ -1364,9 +1364,9 @@ class TestUnrepairableResidueIsPreserved:
 # ---------------------------------------------------------------------------
 # Source-hygiene guards (task 4948): the AUTHORING RULE in this module's
 # docstring, enforced mechanically rather than by convention alone. Modelled
-# on tests/server/test_markup_tripwire.py's block (task 4228). Its needle set
-# and scanner are COPIED here rather than imported: a guard whose needles
-# another module can edit is not a per-file guard.
+# on tests/server/test_markup_tripwire.py's block (task 4228), whose needle
+# set and scanner it repeats; whether such per-file copies give way to one
+# shared scanner is task 5209's design call.
 # ---------------------------------------------------------------------------
 
 #: Every ENVELOPE_LITERALS member plus the two structural prefixes a
