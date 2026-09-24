@@ -23,7 +23,9 @@ from __future__ import annotations
 import contextlib
 import logging
 import re
-from unittest.mock import MagicMock
+import types
+from datetime import UTC, datetime, timedelta
+from unittest.mock import MagicMock, patch
 
 import pytest
 import pytest_asyncio
@@ -69,7 +71,9 @@ class _FakeResult:
 class FakeCappedGraph:
     """A graph double that reproduces FalkorDB's silent server-side row cap.
 
-    This is the ONLY double in the suite that reproduces the server cap.
+    This is the ONLY ro_query-level double in the suite that reproduces the
+    server cap; ``FakeCappedEpisodeStore`` is its graphiti-core-API
+    counterpart and shares ``_LIVE_RESULTSET_CAP``.
     ``conftest.make_graph_mock`` deliberately does not, so the two cannot
     drift; it shares this module's census pattern exactly (``_CENSUS_RE``).
 
@@ -221,8 +225,8 @@ class TestFakeCappedGraphCensusDispatch:
     """The double's census detection must match conftest.make_graph_mock's.
 
     Two doubles standing in for the same server are two chances to be wrong
-    about it, so this suite keeps only ONE that reproduces the cap and pins
-    the shared behaviour here. The mirror of this test lives in
+    about it, so this suite keeps only ONE ro_query-level double that
+    reproduces the cap and pins the shared behaviour here. The mirror of this test lives in
     test_conftest_fixtures.py (``test_a_count_column_among_others_is_not_a_census``);
     if either double loosens its pattern, one of the two goes red.
     """
@@ -2104,3 +2108,166 @@ class TestQueryEdgesByTimeRangePagination:
             'valid_at': '2026-03-22T17:51:00',
             'invalid_at': '2026-03-22T18:00:00',
         }]
+
+
+# ---------------------------------------------------------------------------
+# task 4869: retrieve_episodes, keyset-paged through graphiti-core
+# ---------------------------------------------------------------------------
+#
+# This read reaches the server through EpisodicNode.get_by_group_ids, not
+# ro_query, so the cap bites one layer further from this module. It is the
+# worst-shaped truncation of all: graphiti-core orders by uuid DESC, so a capped
+# read drops the LOWEST uuids, and the created_at sort then picks the
+# most-recent of the SURVIVORS. The caller gets the wrong episodes, not fewer.
+
+
+class FakeCappedEpisodeStore:
+    """graphiti-core-API counterpart of FakeCappedGraph, for episode reads.
+
+    ``get_by_group_ids`` models graphiti-core's contract exactly: uuid DESC,
+    ``uuid < uuid_cursor`` when a cursor is given, ``limit`` when not None —
+    then SILENT truncation to ``resultset_cap``, as the server does. Each call's
+    ``(limit, uuid_cursor)`` is logged in ``calls`` and the uuids it returned
+    in ``pages``.
+    """
+
+    def __init__(self, episodes, *, resultset_cap: int | None = _LIVE_RESULTSET_CAP):
+        self.episodes = list(episodes)
+        self.resultset_cap = resultset_cap
+        self.calls: list[tuple[int | None, str | None]] = []
+        self.pages: list[list[str]] = []
+
+    async def get_by_group_ids(self, driver, group_ids, limit=None, uuid_cursor=None):
+        self.calls.append((limit, uuid_cursor))
+        page = sorted(self.episodes, key=lambda ep: ep.uuid, reverse=True)
+        if uuid_cursor:
+            page = [ep for ep in page if ep.uuid < uuid_cursor]
+        if limit is not None:
+            page = page[:limit]
+        if self.resultset_cap is not None:
+            page = page[: self.resultset_cap]
+        self.pages.append([ep.uuid for ep in page])
+        return page
+
+
+_EPISODE_BASE_TIME = datetime(2026, 9, 24, 12, 0, tzinfo=UTC)
+
+
+def make_episode_corpus(count: int) -> list[types.SimpleNamespace]:
+    """Episodes whose NEWEST members have the LOWEST uuids.
+
+    That is exactly the tail a uuid-DESC truncation drops, so a capped read
+    selects the wrong most-recent episodes rather than merely fewer.
+    """
+    return [
+        types.SimpleNamespace(
+            uuid=f'ep-{i:07d}',
+            created_at=_EPISODE_BASE_TIME - timedelta(minutes=i),
+            name=f'episode-{i}',
+            content=f'content-{i}',
+            source='message',
+            group_id='dark_factory',
+        )
+        for i in range(count)
+    ]
+
+
+def _patch_episode_store(store: FakeCappedEpisodeStore):
+    return patch(
+        'fused_memory.backends.graphiti_client.EpisodicNode.get_by_group_ids',
+        store.get_by_group_ids,
+    )
+
+
+class TestRetrieveEpisodesKeysetPagination:
+    """Every episode is read, so the created_at sort sees the whole group."""
+
+    CORPUS_SIZE = 12000  # comfortably above the 10000 cap
+
+    @pytest.mark.asyncio
+    async def test_control_an_unbounded_read_drops_the_newest_episodes(self):
+        """CONTROL: the double reproduces the defect it stands in for."""
+        store = FakeCappedEpisodeStore(make_episode_corpus(self.CORPUS_SIZE))
+        episodes = await store.get_by_group_ids(MagicMock(), ['g'], limit=None)
+        assert len(episodes) == _LIVE_RESULTSET_CAP
+        returned = {ep.uuid for ep in episodes}
+        assert not returned & {f'ep-{i:07d}' for i in range(2000)}
+
+    @pytest.mark.asyncio
+    async def test_the_most_recent_episodes_are_selected(self, mock_config, make_backend):
+        """HEADLINE: the newest five, not the newest five of the survivors."""
+        backend = make_backend(mock_config)
+        store = FakeCappedEpisodeStore(make_episode_corpus(self.CORPUS_SIZE))
+        with _patch_episode_store(store):
+            result = await backend.retrieve_episodes(group_ids=['dark_factory'], last_n=5)
+        assert [ep.uuid for ep in result] == [f'ep-{i:07d}' for i in range(5)]
+
+    @pytest.mark.asyncio
+    async def test_every_episode_is_reachable(self, mock_config, make_backend):
+        backend = make_backend(mock_config)
+        store = FakeCappedEpisodeStore(make_episode_corpus(self.CORPUS_SIZE))
+        with _patch_episode_store(store):
+            result = await backend.retrieve_episodes(
+                group_ids=['dark_factory'], last_n=self.CORPUS_SIZE
+            )
+        assert len({ep.uuid for ep in result}) == self.CORPUS_SIZE
+
+    @pytest.mark.asyncio
+    async def test_every_call_is_bounded_and_the_cursor_advances(
+        self, mock_config, make_backend
+    ):
+        backend = make_backend(mock_config)
+        store = FakeCappedEpisodeStore(make_episode_corpus(self.CORPUS_SIZE))
+        with _patch_episode_store(store):
+            await backend.retrieve_episodes(group_ids=['dark_factory'], last_n=5)
+        assert len(store.calls) > 1
+        assert all(limit is not None for limit, _ in store.calls)
+        assert store.calls[0][1] is None
+        for previous_page, (_, cursor) in zip(
+            store.pages[:-1], store.calls[1:], strict=True
+        ):
+            assert cursor == min(previous_page)
+
+    @pytest.mark.asyncio
+    async def test_a_server_cap_below_page_size_cannot_truncate_the_read(self):
+        """Only an EMPTY page ends the read, so a short page is never mistaken
+        for end-of-data. That is what makes a census unnecessary here."""
+        from fused_memory.backends.graphiti_client import _read_all_group_episodes
+
+        store = FakeCappedEpisodeStore(make_episode_corpus(10), resultset_cap=3)
+        with _patch_episode_store(store):
+            episodes = await _read_all_group_episodes(MagicMock(), ['g'], page_size=5)
+        assert {ep.uuid for ep in episodes} == {f'ep-{i:07d}' for i in range(10)}
+
+    @pytest.mark.asyncio
+    async def test_page_cap_exhaustion_raises_instead_of_returning_a_prefix(self):
+        from fused_memory.backends.graphiti_client import (
+            INCOMPLETE_PAGE_CAP,
+            IncompleteEnumerationError,
+            _read_all_group_episodes,
+        )
+
+        store = FakeCappedEpisodeStore(make_episode_corpus(10))
+        with (
+            _patch_episode_store(store),
+            pytest.raises(IncompleteEnumerationError) as exc,
+        ):
+            await _read_all_group_episodes(
+                MagicMock(), ['g'], page_size=2, max_pages=3
+            )
+        message = str(exc.value)
+        assert INCOMPLETE_PAGE_CAP in message
+        assert 'max_pages=3' in message
+        assert 'page_size=2' in message
+        assert 'episodes_seen=6' in message
+
+    @pytest.mark.asyncio
+    async def test_an_empty_group_returns_empty_after_one_call(
+        self, mock_config, make_backend
+    ):
+        backend = make_backend(mock_config)
+        store = FakeCappedEpisodeStore([])
+        with _patch_episode_store(store):
+            result = await backend.retrieve_episodes(group_ids=['dark_factory'], last_n=5)
+        assert result == []
+        assert len(store.calls) == 1
