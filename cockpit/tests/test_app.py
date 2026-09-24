@@ -4464,6 +4464,123 @@ class TestStaleScanSequenceGuard:
             assert recorded_seqs == [issued]
 
 
+class TestInFlightScanCannotUndoAKeypressWrite:
+    """Task 5839: TestBoostReordersAndPersists's merge-gate red, replayed
+    deterministically.
+
+    _apply_boost and action_drop write a decision and then re-read
+    decisions, but a poll scan issued BEFORE that write, whose registry read
+    predates it, can land AFTER it. As in TestStaleScanSequenceGuard, the
+    poll pipeline's two halves are driven by hand, because racing the real
+    timer is what made the original test flaky: _next_scan_seq() plus
+    _scan_registry() stand in for _poll_registry issuing a seq and its worker
+    reading the registry, and _apply_scan(records, decisions, seq) stands in
+    for the late call_from_thread hand-off. poll_interval=60 keeps a real
+    tick from landing mid-test.
+    """
+
+    @pytest.mark.timeout(10)
+    async def test_a_boost_survives_a_scan_issued_before_it(self, tmp_path):
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+        from cockpit.priority import Priorities
+
+        older = sr.DecisionRecord(
+            id='dec-a',
+            project='df',
+            text='A?',
+            filed_at='2026-06-01T00:00:00+00:00',
+            manual_boost=0,
+        )
+        newer = sr.DecisionRecord(
+            id='dec-b',
+            project='df',
+            text='B?',
+            filed_at='2026-07-07T00:00:00+00:00',
+            manual_boost=0,
+        )
+        for d in (older, newer):
+            assert sr.write_decision(d, root=tmp_path)
+
+        fixed_now = datetime.fromisoformat('2026-07-07T00:00:00+00:00')
+        app = CockpitApp(
+            fleet_root=tmp_path,
+            backend=FakeBackend(),
+            poll_interval=60,
+            now_fn=lambda: fixed_now,
+            priorities=Priorities.default(),
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            queue.move_cursor(row=queue.get_row_index('decision:dec-b'))
+            await pilot.pause()
+
+            in_flight_seq = app._next_scan_seq()
+            records, decisions = app._scan_registry()
+            assert {d.id: d.manual_boost for d in decisions}['dec-b'] == 0
+
+            await pilot.press('b')
+            await pilot.pause()
+            assert queue.get_row_index('decision:dec-b') < queue.get_row_index('decision:dec-a')
+
+            app._apply_scan(records, decisions, in_flight_seq)
+            await pilot.pause()
+            assert queue.get_row_index('decision:dec-b') < queue.get_row_index('decision:dec-a'), (
+                "the late scan reverted the keypress's persisted boost in the view"
+            )
+
+            for _ in range(2):
+                await pilot.press('b')
+                await pilot.pause()
+            persisted = {d.id: d for d in sr.list_decisions(root=tmp_path)}
+            assert persisted['dec-b'].manual_boost == 3, (
+                'a press built on the reverted boost and was lost'
+            )
+
+    @pytest.mark.timeout(10)
+    async def test_a_drop_survives_a_scan_issued_before_it(self, tmp_path):
+        from textual.widgets.data_table import RowDoesNotExist
+
+        from cockpit.app import CockpitApp
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        first = sr.DecisionRecord(
+            id='dec-1', project='df', text='First?', filed_at='2026-07-07T00:00:00+00:00'
+        )
+        second = sr.DecisionRecord(
+            id='dec-2', project='df', text='Second?', filed_at='2026-07-07T00:00:00+00:00'
+        )
+        for d in (first, second):
+            assert sr.write_decision(d, root=tmp_path)
+
+        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=60)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            queue.move_cursor(row=queue.get_row_index('decision:dec-1'))
+            await pilot.pause()
+
+            in_flight_seq = app._next_scan_seq()
+            records, decisions = app._scan_registry()
+            assert {d.id: d.state for d in decisions} == {
+                'dec-1': sr.DecisionState.OPEN,
+                'dec-2': sr.DecisionState.OPEN,
+            }
+
+            await pilot.press('x')
+            await pilot.pause()
+            assert queue.row_count == 1
+
+            app._apply_scan(records, decisions, in_flight_seq)
+            await pilot.pause()
+            assert queue.row_count == 1, 'the late scan resurrected the dropped decision'
+            with pytest.raises(RowDoesNotExist):
+                queue.get_row_index('decision:dec-1')
+
+
 class TestDecisionQueueDetail:
     @pytest.mark.timeout(10)
     async def test_highlighting_a_decision_row_renders_its_full_question(self, tmp_path):
