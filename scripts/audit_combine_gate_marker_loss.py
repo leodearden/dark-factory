@@ -97,7 +97,10 @@ _SHARED_SRC = Path(__file__).resolve().parent.parent / "shared" / "src"
 if str(_SHARED_SRC) not in sys.path:
     sys.path.insert(0, str(_SHARED_SRC))
 
-from shared.capability_manifest import load_capability_manifest  # noqa: E402
+from shared.capability_manifest import (  # noqa: E402
+    MECHANICAL_CHECK_KINDS,
+    load_capability_manifest,
+)
 
 # The curator verdict this audit is about. The sibling verdict is 'create',
 # which files a NEW task and wipes nothing.
@@ -289,17 +292,6 @@ _MANIFEST_GLOBS = (
     ("docs/prds", "*.capability-manifest.yaml"),
 )
 
-# The delivered_check kinds that commit_planning actually copies into
-# metadata.delivered_checks. THE REAL RULE, read off the stamping site:
-# fused-memory/src/fused_memory/server/manifest_stamping.py:311 is
-# `if check is None or check.kind not in ('grep', 'script'): continue`, i.e.
-# BOTH mechanical kinds are copied and only 'manual' is dropped (corroborated
-# by DeliveredCheckMeta.kind: Literal['grep', 'script']). A grep-only filter
-# here would under-count the expected entries and produce FALSE NEGATIVES on
-# the one severity class that removes a mark-done gate.
-MECHANICAL_CHECK_KINDS = ("grep", "script")
-
-
 class ManifestExpectation(NamedTuple):
     """What a capability manifest says a task's metadata should carry.
 
@@ -376,6 +368,11 @@ def build_manifest_index(
                 cap.name
                 for cap in task.capabilities
                 if cap.delivered_check is not None
+                # MECHANICAL_CHECK_KINDS is DERIVED from
+                # DeliveredCheckMeta's own kind Literal, so this sweep and
+                # commit_planning's copy filter cannot disagree about what
+                # "mechanical" means. Undercounting here would produce FALSE
+                # NEGATIVES on the one severity class this script detects.
                 and cap.delivered_check.kind in MECHANICAL_CHECK_KINDS
             )
             existing = index.get(key)
