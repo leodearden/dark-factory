@@ -5,14 +5,14 @@ state (via the orchestrator's escalation MCP, ``get_task_runtime_state``),
 and optional burst state from reconciliation — into the ``ACTIVE_TASKS``
 shape consumed by the React dashboard's tasks tab.
 
-Output shape (per task) matches ``data.js`` mock fixtures:
+Output shape (per task) matches ``data.js`` mock fixtures. A task's
+description/details are NOT on it: the Task Detail pane fetches them for the
+selected task from ``dashboard/src/dashboard/api/task_prose.py::api_task_prose``.
 
     {
         'id': 'dark_factory/T-19',
         'project': 'dark_factory',
         'title': '...',
-        'description': '...',
-        'details': '...',         # may be empty; many tasks have none
         'status': 'in-progress',
         'agent': 'claude-task-19',  # TaskRuntimeEntry.has_worktree; None if no worktree.
                                     # WORKTREE PRESENCE, NOT LIVENESS — see 'stranded'.
@@ -542,8 +542,6 @@ def _build_task_row(
         'id': uid,
         'project': project,
         'title': task.get('title') or '',
-        'description': task.get('description') or '',
-        'details': task.get('details') or '',
         'status': task.get('status'),
         'agent': rt.get('agent'),
         'loops': rt.get('loops'),

@@ -399,8 +399,6 @@ class TestBuildTaskRowStrandProjection:
         """
         task = _task(
             title='a distinctive title',
-            description='a distinctive description',
-            details='some distinctive details',
             status='blocked',
             metadata={
                 'files': ['a.py', 'b.py'],
@@ -418,15 +416,13 @@ class TestBuildTaskRowStrandProjection:
         row = _build_task_row('proj-x', task, 42, rt, 'p/T-42', now=_NOW)
 
         assert set(row) >= {
-            'id', 'project', 'title', 'description', 'details', 'status',
+            'id', 'project', 'title', 'status',
             'agent', 'loops', 'attempts', 'lane', 'phase', 'lane_state',
             'runtime_offline', 'meta_files', 'train', 'external_deps', 'prd',
         }
         assert row['id'] == 'p/T-42'   # the row's id IS the uid
         assert row['project'] == 'proj-x'
         assert row['title'] == 'a distinctive title'
-        assert row['description'] == 'a distinctive description'
-        assert row['details'] == 'some distinctive details'
         assert row['status'] == 'blocked'
         assert row['agent'] == 'claude-task-42'
         assert row['loops'] == 5
