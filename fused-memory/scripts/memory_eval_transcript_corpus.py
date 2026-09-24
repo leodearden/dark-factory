@@ -181,6 +181,13 @@ run can end without a status, and it too has a code rather than a traceback:
 corpus was produced and no coverage could be, so calling it ``total_failure``
 would claim an archive was read when none was opened.
 
+Exit 1 (:data:`EXIT_RUN_FAILED`) means the run could not complete: the
+artifacts could not be written under ``--out-root``, or stdout could not take
+the report. It is outside the status table for the same reason as a bad
+stamp. An artifact failure is reported as one ``error:`` line naming the
+out-root. A stdout failure after the artifacts landed names the report that
+IS on disk, so an operator can still find it.
+
 Usage::
 
     # whole archive (default root = the MAIN checkout's archive)
@@ -855,6 +862,18 @@ argument that makes a corrupt transcript land inside the status table makes a
 bad stamp land inside the exit-code table.
 """
 
+EXIT_RUN_FAILED = 1
+"""The run could not complete: artifacts unwritable, or stdout unwritable.
+
+Deliberately OUTSIDE :data:`EXIT_CODES` and :data:`EXIT_BAD_STAMP`: a wrapper
+reading only the exit code must be able to tell "the artifacts do not exist"
+apart from every coverage status and from a run that never started.
+
+It is also the status ``shared.cli_boundary.EXIT_STDOUT_FAILED`` reports for a
+stdout failure. That agreement is pinned by a real child process's exit status
+(``tests/test_scripts_cli_boundary_wiring.py``), not by comparing the names.
+"""
+
 
 def coverage_status(coverage: Mapping[str, Any]) -> str:
     """Resolve a coverage mapping to one of :data:`EXIT_CODES`' statuses.
@@ -1155,6 +1174,15 @@ def main(argv: list[str] | None = None) -> int:
         # discarded either way, since the stamp names all three artifacts.
         print(f'error: {exc}', file=sys.stderr)
         return EXIT_BAD_STAMP
+    except OSError as exc:
+        # Converted at this seam because an OSError escaping main() reads as a
+        # stdout failure at the process boundary. The report prints stay
+        # outside this try so a BrokenPipeError is never blamed on artifacts.
+        print(
+            f'error: cannot write the corpus artifacts under {args.out_root}: {exc}',
+            file=sys.stderr,
+        )
+        return EXIT_RUN_FAILED
     report = render_report(coverage)
     print(report, end='')
     print(f'report: {report_path}')
