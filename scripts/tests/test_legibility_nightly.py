@@ -18,6 +18,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -1270,6 +1271,111 @@ def test_default_census_launcher_inherits_the_parent_env_by_default(monkeypatch)
     nightly._default_census_launcher()
 
     assert seen.get('env') is None
+
+
+# ---------------------------------------------------------------------------
+# task 3269 (re-landed by task 5782): the census launch names its target
+#
+# The launcher used to run a bare `python census.py`, so census.py fell back
+# to its `--project-root "."` default and resolved against the launcher's cwd
+# -- which legibility-trickle@.service pins to /home/leo/src/dark-factory for
+# EVERY %i instance. Every fired census therefore censused dark_factory,
+# whichever project the trickle instance was for. No test inspected the argv.
+# ---------------------------------------------------------------------------
+
+def _adjacent_pair(argv: list[str], flag: str) -> list[str] | None:
+    """Return ``[flag, value]`` for the first occurrence of *flag* in *argv*.
+
+    Asserting on the ADJACENT pair (rather than mere membership of both
+    strings) is what makes "flag present but paired with the wrong value"
+    fail -- the exact failure mode under test.
+    """
+    for index, token in enumerate(argv):
+        if token == flag and index + 1 < len(argv):
+            return argv[index:index + 2]
+    return None
+
+
+def _fire_decide(project_root, *, now=None, status_fetcher=None):
+    return census_trigger.Decision(fire=True, reasons=['max-interval: 11.0d -> FIRE'])
+
+
+def test_default_census_launcher_argv_names_the_target_project(monkeypatch):
+    seen = _spy_subprocess_run(monkeypatch)
+
+    nightly._default_census_launcher('/some/other/project')
+
+    argv = seen['args']
+    assert argv[0] == sys.executable
+    assert argv[1].endswith('census.py'), f'argv[1] must be the census entrypoint, got {argv[1]!r}'
+    assert _adjacent_pair(argv, '--project-root') == ['--project-root', '/some/other/project']
+    assert '.' not in argv, "the census must never be launched with a relative '.' root"
+    assert os.getcwd() not in argv, (
+        "the census target must come from the argument, not from the launcher's cwd"
+    )
+    assert '--config' not in argv, (
+        'a caller holding only a project root must not synthesize a config path'
+    )
+
+
+def test_default_census_launcher_composes_project_root_with_the_pool_env(monkeypatch):
+    """Task 3269's argv fix and task 5488's env overlay ride the SAME launch."""
+    seen = _spy_subprocess_run(monkeypatch)
+    env = {'CLAUDE_CODE_OAUTH_TOKEN': 'tok'}
+
+    nightly._default_census_launcher('/p', env=env)
+
+    assert seen['env'] is env
+    assert seen['check'] is False
+    assert _adjacent_pair(seen['args'], '--project-root') == ['--project-root', '/p']
+
+
+def test_default_census_launcher_refuses_a_relative_project_root(monkeypatch):
+    """A relative target would resolve against the trickle's cwd -- the unit
+    file's WorkingDirectory -- which is task 3269's defect all over again."""
+    seen = _spy_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError) as excinfo:
+        nightly._default_census_launcher('relative-proj')
+
+    assert 'relative-proj' in str(excinfo.value)
+    assert seen == {}, 'a refused target must never reach subprocess.run'
+
+
+def test_evaluate_census_step_launches_against_the_configs_project_root(tmp_path):
+    cfg = load_config(_write_config(tmp_path / 'proj_a', project_id='proj_a'))
+    calls = []
+
+    def rec(project_root, *, config_path=None):
+        calls.append((project_root, config_path))
+
+    _line, fire = nightly.evaluate_census_step(
+        cfg, now=None, status_fetcher=None, decide=_fire_decide,
+        entrypoint_exists=lambda: True, launcher=rec,
+    )
+
+    assert fire is True
+    # The config's own root -- a tmp dir, definitively NOT the pytest cwd.
+    assert calls == [(str(tmp_path / 'proj_a'), None)]
+
+
+def test_evaluate_census_step_two_project_configs_produce_two_distinct_launches(tmp_path):
+    """The production defect's own shape: a legibility-trickle@reify run and a
+    legibility-trickle@dark_factory run launched an IDENTICAL census."""
+    cfg_a = load_config(_write_config(tmp_path / 'proj_a', project_id='proj_a'))
+    cfg_b = load_config(_write_config(tmp_path / 'proj_b', project_id='proj_b'))
+    calls = []
+
+    def rec(project_root, *, config_path=None):
+        calls.append(project_root)
+
+    for cfg in (cfg_a, cfg_b):
+        nightly.evaluate_census_step(
+            cfg, now=None, status_fetcher=None, decide=_fire_decide,
+            entrypoint_exists=lambda: True, launcher=rec,
+        )
+
+    assert calls == [str(tmp_path / 'proj_a'), str(tmp_path / 'proj_b')]
 
 
 class TestRunNightlyBindsTheCensusLauncherToThePool:
