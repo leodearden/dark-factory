@@ -4023,8 +4023,19 @@ def _write_legibility_yaml(config_path, *, project_id="dark_factory", project_ro
     independent of the module under test's own YAML writer.
 
     When *agent_transcript_roots* is given, an ``agent_transcript_roots:``
-    block is appended so the loaded cfg opts into archive-root enumeration."""
-    project_root = project_root if project_root is not None else config_path.parent
+    block is appended so the loaded cfg opts into archive-root enumeration.
+
+    The default *project_root* is the one IMPLIED by the canonical layout
+    (``<root>/docs/legibility/legibility.yaml`` -> ``<root>``), so a fixture
+    config names the same tree its caller passes as ``--project-root``:
+    main() refuses a mixed-project run (task 3269)."""
+    if project_root is None:
+        parent = config_path.parent
+        project_root = (
+            parent.parents[1]
+            if parent.name == "legibility" and parent.parent.name == "docs"
+            else parent
+        )
     cwd_prefixes = cwd_prefixes if cwd_prefixes is not None else [str(project_root)]
     config_path.parent.mkdir(parents=True, exist_ok=True)
     lines = [
@@ -4238,6 +4249,83 @@ def test_main_cost_control_flags_thread_into_run_census(tmp_path, monkeypatch):
     assert str(kwargs["report_path"]) == str(
         tmp_path / "plans" / "confusion-census-2026-07-30.md"
     )
+
+
+def test_main_requires_project_root(tmp_path, monkeypatch, capsys, install_fake_httpx):
+    """The census must REFUSE to guess its target from the process cwd.
+
+    An implicit-cwd default on a money-spending entrypoint is the root enabler
+    of task 3269: the nightly launcher passed no --project-root, so every
+    trickle instance censused whatever project legibility-trickle@.service's
+    WorkingDirectory named. Reinstating ``default="."`` fails here: argparse
+    would not raise at all.
+    """
+    # An EMPTY cwd: were the flag silently defaulted, "." must not resolve to
+    # a tree holding a real legibility.yaml (the worktree root does).
+    monkeypatch.chdir(tmp_path)
+    install_fake_httpx(lambda *a, **k: pytest.fail("no network on this path"))
+    monkeypatch.setattr(mod, "run_census", _poison("run_census"))
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+
+    with pytest.raises(SystemExit) as exc:
+        mod.main(["--force"])
+
+    assert exc.value.code == 2, "argparse signals a usage error with exit 2"
+    assert "--project-root" in capsys.readouterr().err
+
+
+def test_main_rejects_a_project_root_that_disagrees_with_the_config(
+    tmp_path, monkeypatch, capsys, install_fake_httpx,
+):
+    """Two sources for "which project is this?" must agree, or the run stops.
+
+    ``--project-root A --config B/...`` would mine B's census window (the
+    window comes from ``cfg.project_root``), stamp A's outputs with B's
+    project_id, and advance A's census-state past a window it never mined --
+    a quieter instance of task 3269's mixed-project failure. Bad argument,
+    never a deferral.
+    """
+    project_a = tmp_path / "project_a"
+    project_b = tmp_path / "project_b"
+    project_a.mkdir()
+    config_b = _write_legibility_yaml(
+        _default_config_path(project_b), project_id="project_b", project_root=project_b,
+    )
+    install_fake_httpx(lambda *a, **k: pytest.fail("no network on this path"))
+    fake_run_census = _make_fake_main_run_census()
+    monkeypatch.setattr(mod, "run_census", fake_run_census)
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+
+    exit_code = mod.main([
+        "--project-root", str(project_a), "--config", str(config_b), "--force",
+    ])
+
+    assert exit_code == 1
+    assert fake_run_census.calls == [], "a mixed-project run must stop before any billable work"
+    err = capsys.readouterr().err
+    # BOTH sides must be named, or the operator cannot tell which one is wrong.
+    assert str(project_a) in err
+    assert str(project_b) in err
+    assert str(config_b) in err
+
+
+def test_main_accepts_a_project_root_that_matches_the_config_via_a_relative_spelling(
+    tmp_path, monkeypatch,
+):
+    """The cross-check compares RESOLVED roots, so a relative-but-equivalent
+    ``--project-root`` is not mistaken for a mixed-project run."""
+    project = tmp_path / "project_a"
+    project.mkdir()
+    _write_legibility_yaml(_default_config_path(project), project_root=project)
+    fake_run_census = _make_fake_main_run_census()
+    monkeypatch.setattr(mod, "run_census", fake_run_census)
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+    monkeypatch.chdir(tmp_path)
+
+    exit_code = mod.main(["--project-root", "project_a", "--force"])
+
+    assert exit_code == 0
+    assert fake_run_census.calls[0]["project_root"] == str(project.resolve())
 
 
 def test_main_without_cost_control_flags_passes_defaults(tmp_path, monkeypatch):
