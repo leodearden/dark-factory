@@ -18,6 +18,8 @@ import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 SCRIPT = Path(__file__).parent.parent / "check_memory_metadata_census_reporting.py"
 UNIT = "memory-metadata-coverage-census.service"
 HISTORY_RELPATH = Path("plans") / "memory-metadata-coverage-history.json"
@@ -316,3 +318,53 @@ def test_unit_state_is_read_with_timestamps_pinned_to_utc(tmp_path):
     )
 
     assert _systemctl_state(tmp_path)["call_tz"] == ["UTC"]
+
+
+def test_stale_history_row_behind_healthy_unit_fails(tmp_path):
+    result = _run(
+        tmp_path, "48",
+        fields=_healthy_fields(),
+        history=_history_with_newest_stamp(_hours_ago(25 * 24)),
+    )
+
+    _assert_named_failure(result, "600.0h", "48h", str(tmp_path / HISTORY_RELPATH))
+
+
+@pytest.mark.parametrize(
+    ("history", "fragment"),
+    [
+        (None, "does not exist"),
+        ("{not json", "not valid JSON"),
+        ({"schema_version": 1}, "no 'runs' list"),
+        ({"schema_version": 1, "runs": {}}, "no 'runs' list"),
+        ({"schema_version": 1, "runs": []}, "'runs' is empty"),
+        ({"schema_version": 1, "runs": [{"census": 1}]}, "no 'stamp'"),
+        ({"schema_version": 1, "runs": [{"stamp": "garbage"}]}, "'garbage'"),
+        ({"schema_version": 1, "runs": [{"stamp": 123}]}, "123"),
+        (
+            {"schema_version": 1, "runs": [{"stamp": "2026-09-24T05:00:00"}]},
+            "no UTC offset",
+        ),
+    ],
+    ids=[
+        "absent", "invalid-json", "runs-missing", "runs-not-a-list",
+        "runs-empty", "stamp-missing", "stamp-unparsable", "stamp-not-a-string",
+        "stamp-naive",
+    ],
+)
+def test_unreadable_history_fails_loud_naming_path(tmp_path, history, fragment):
+    result = _run(tmp_path, "48", fields=_healthy_fields(), history=history)
+
+    _assert_named_failure(result, fragment, str(tmp_path / HISTORY_RELPATH))
+
+
+def test_not_installed_outranks_a_stale_history_row(tmp_path):
+    result = _run(
+        tmp_path, "48",
+        fields=_healthy_fields(LoadState="not-found"),
+        history=_history_with_newest_stamp(_hours_ago(25 * 24)),
+    )
+
+    _assert_named_failure(result, INSTALLER)
+    assert "not installed" in result.stderr.lower(), result.stderr
+    assert HISTORY_RELPATH.name not in result.stderr, result.stderr
