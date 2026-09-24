@@ -26,7 +26,7 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import pydantic_spec
+from _orch_helpers import pydantic_spec, wait_responsive
 from escalation.pins import PinReport, _norm_id, classify_pins
 from shared.task_claimant import compose_claimant_run_id
 
@@ -154,6 +154,29 @@ async def test_dispatch_stamp_embeds_run_id_session_id_and_pid(tmp_path: Path):
 # step-15/16: heartbeat loop
 # ---------------------------------------------------------------------------
 
+# Loop-responsive seconds (green ~15 ms); its 10 s wall cap is far under the 540 s thread timeout.
+_HEARTBEAT_REFRESH_BUDGET_SECS = 5
+
+
+async def _await_heartbeat_refreshes(wf: TaskWorkflow, count: int = 1) -> None:
+    """Wait for the loop's *count*-th refresh itself, not for a wall-clock window.
+
+    Give-up is ``wait_responsive``'s labelled ``pytest.fail``, whose message tells a
+    starved worker apart from a real hang.
+    """
+    refreshes = cast(AsyncMock, wf.scheduler.set_task_claimant)
+
+    async def _poll() -> None:
+        while refreshes.await_count < count:
+            await asyncio.sleep(0.005)
+
+    await wait_responsive(
+        _poll(),
+        timeout=_HEARTBEAT_REFRESH_BUDGET_SECS,
+        label=f'task {wf.task_id} heartbeat loop reaching {count} refresh(es)',
+    )
+
+
 # A fixed 50 ms wait survives a stall of at most 50 - 10 = 40 ms (35 ms: 1 refresh, 45 ms: 0).
 _DISPATCH_STALL_SECS = 0.06
 
@@ -192,8 +215,7 @@ async def test_heartbeat_loop_refreshes_heartbeat_only(tmp_path: Path):
     wf = _make_workflow(project_root=tmp_path, task_id='303', claimant_heartbeat_interval_secs=0.01)
 
     await _setup(wf)
-    # Let the loop tick at least once (interval=0.01s).
-    await asyncio.sleep(0.05)
+    await _await_heartbeat_refreshes(wf)
     await wf._stop_claimant_heartbeat()
 
     assert wf.scheduler.set_task_claimant.await_count >= 1  # type: ignore[attr-defined]
@@ -211,7 +233,7 @@ async def test_heartbeat_loop_still_refreshes_after_a_loop_stall_at_dispatch(tmp
     _stall_loop_at_dispatch(wf, _DISPATCH_STALL_SECS)
 
     await _setup(wf)
-    await asyncio.sleep(0.05)
+    await _await_heartbeat_refreshes(wf)
     await wf._stop_claimant_heartbeat()
 
     assert cast(AsyncMock, wf.scheduler.set_task_claimant).await_count >= 1
@@ -223,9 +245,10 @@ async def test_stop_claimant_heartbeat_halts_further_refreshes(tmp_path: Path):
     wf = _make_workflow(project_root=tmp_path, claimant_heartbeat_interval_secs=0.01)
 
     await _setup(wf)
-    await asyncio.sleep(0.05)
+    await _await_heartbeat_refreshes(wf)
     await wf._stop_claimant_heartbeat()
     count_after_stop = wf.scheduler.set_task_claimant.await_count  # type: ignore[attr-defined]
+    assert count_after_stop >= 1
 
     # Give the (now-cancelled) loop plenty of time to have ticked again if it
     # were still alive.
