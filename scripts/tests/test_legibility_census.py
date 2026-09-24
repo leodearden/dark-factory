@@ -1236,8 +1236,8 @@ flags introduce must be gated on a non-None flag value, so a run that
 passes none of them renders exactly this. Do NOT regenerate this constant
 to make a failing run pass -- a diff here means a cost-control rendering
 leaked into the unflagged path (and therefore into the nightly trickle,
-which launches census.py with no extra argv). A deliberate change to the
-flagless report may move this lock, in a commit whose message says why;
+which launches census.py with no cost-control flags). A deliberate change to
+the flagless report may move this lock, in a commit whose message says why;
 that record is what distinguishes it from a leak."""
 
 
@@ -2880,7 +2880,7 @@ def test_main_done_line_names_unresolved_verdicts_only_when_non_zero(
     """The CLI clause appears exactly when it carries information, so a normal
     run's summary line stays BYTE-unchanged -- same gating reasoning as
     render_report's coverage-shortfall clause."""
-    _write_legibility_yaml(_default_config_path(tmp_path))
+    _write_legibility_yaml(tmp_path)
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
 
     def _run_main(unresolved):
@@ -2908,12 +2908,11 @@ def test_main_done_line_names_unresolved_verdicts_only_when_non_zero(
 # task 3291: run_census() must never persist a FABRICATED done-count baseline.
 #
 # This is the test that would have caught the 2026-07-24 regression on the day
-# it happened. census.py's CLI defaults --project-root to "." and
-# nightly._default_census_launcher launches it with no arguments, so the
-# get_statuses call went out with a relative path; fused-memory rejected it
-# with a {"error", "error_type"} envelope on an isError:false response; and
-# the old `(status.get("statuses") or {})` idiom silently read that as a
-# done-count of 0 and persisted it as a real baseline.
+# it happened. The get_statuses call went out with a relative path (the
+# pre-task-3269 --project-root default); fused-memory rejected it with a
+# {"error", "error_type"} envelope on an isError:false response; and the old
+# `(status.get("statuses") or {})` idiom silently read that as a done-count
+# of 0 and persisted it as a real baseline.
 # ---------------------------------------------------------------------------
 
 def _make_error_envelope_status_fetcher():
@@ -4012,19 +4011,26 @@ def test_run_census_all_three_cost_control_flags_interact_end_to_end(tmp_path, c
 # step-21: RED — main(argv) CLI
 # ---------------------------------------------------------------------------
 
-def _write_legibility_yaml(config_path, *, project_id="dark_factory", project_root=None,
+def _default_config_path(project_root):
+    return project_root / "docs" / "legibility" / "legibility.yaml"
+
+
+def _write_legibility_yaml(project_root, *, config_path=None, project_id="dark_factory",
                             escalation_port=8103, cwd_prefixes=None,
                             agent_transcript_roots=None):
-    """Write a minimal valid legibility.yaml to *config_path* (any path —
-    the caller decides whether it lives at the default
-    <project-root>/docs/legibility/legibility.yaml location or elsewhere,
-    to exercise --config's override). Plain-text lines, not a yaml.safe_dump
-    round trip — mirrors test_legibility_nightly.py's _write_config, kept
-    independent of the module under test's own YAML writer.
+    """Write a minimal valid legibility.yaml naming *project_root* as its
+    ``project_root`` -- the same root the caller passes as ``--project-root``,
+    since main() refuses a mixed-project run (task 3269). Returns the path.
+
+    The file lands at *config_path* when given (to exercise --config's
+    override), else at the canonical ``_default_config_path(project_root)``.
+    Plain-text lines, not a yaml.safe_dump round trip -- mirrors
+    test_legibility_nightly.py's _write_config, kept independent of the
+    module under test's own YAML writer.
 
     When *agent_transcript_roots* is given, an ``agent_transcript_roots:``
     block is appended so the loaded cfg opts into archive-root enumeration."""
-    project_root = project_root if project_root is not None else config_path.parent
+    config_path = config_path if config_path is not None else _default_config_path(project_root)
     cwd_prefixes = cwd_prefixes if cwd_prefixes is not None else [str(project_root)]
     config_path.parent.mkdir(parents=True, exist_ok=True)
     lines = [
@@ -4039,10 +4045,6 @@ def _write_legibility_yaml(config_path, *, project_id="dark_factory", project_ro
         lines += [f"  - {r}" for r in agent_transcript_roots]
     config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return config_path
-
-
-def _default_config_path(project_root):
-    return project_root / "docs" / "legibility" / "legibility.yaml"
 
 
 def _make_fake_main_run_census(outcome=None):
@@ -4064,7 +4066,7 @@ def _make_fake_main_run_census(outcome=None):
 
 
 def test_main_force_bypasses_gate_and_calls_run_census(tmp_path, monkeypatch):
-    _write_legibility_yaml(_default_config_path(tmp_path))
+    _write_legibility_yaml(tmp_path)
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
     # proves --force never even reaches the gate
@@ -4078,7 +4080,7 @@ def test_main_force_bypasses_gate_and_calls_run_census(tmp_path, monkeypatch):
 
 
 def test_main_without_force_no_fire_noops_with_exit_zero(tmp_path, monkeypatch, capsys):
-    _write_legibility_yaml(_default_config_path(tmp_path))
+    _write_legibility_yaml(tmp_path)
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
 
@@ -4148,7 +4150,7 @@ def test_main_configures_logging_so_info_lines_reach_the_journal(tmp_path, monke
     # debugging the trickle (or a host whose unit env is sourced) exporting
     # LEGIBILITY_LOG_LEVEL=WARNING would otherwise turn a working fix red.
     monkeypatch.delenv("LEGIBILITY_LOG_LEVEL", raising=False)
-    _write_legibility_yaml(_default_config_path(tmp_path))
+    _write_legibility_yaml(tmp_path)
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
 
@@ -4174,7 +4176,7 @@ def test_main_configures_logging_so_info_lines_reach_the_journal(tmp_path, monke
 
 
 def test_main_without_force_fire_decision_runs_pipeline(tmp_path, monkeypatch):
-    _write_legibility_yaml(_default_config_path(tmp_path))
+    _write_legibility_yaml(tmp_path)
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
 
@@ -4193,7 +4195,7 @@ def test_main_without_force_fire_decision_runs_pipeline(tmp_path, monkeypatch):
 def test_main_config_flag_overrides_default_path_and_date_flag_threads_through(tmp_path, monkeypatch):
     # deliberately NOT at the default <project-root>/docs/legibility/legibility.yaml
     # location, so this only passes if --config is actually honored.
-    alt_config = _write_legibility_yaml(tmp_path / "alt-legibility.yaml", project_root=tmp_path)
+    alt_config = _write_legibility_yaml(tmp_path, config_path=tmp_path / "alt-legibility.yaml")
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
@@ -4213,7 +4215,7 @@ def test_main_config_flag_overrides_default_path_and_date_flag_threads_through(t
 
 
 def test_main_cost_control_flags_thread_into_run_census(tmp_path, monkeypatch):
-    _write_legibility_yaml(_default_config_path(tmp_path))
+    _write_legibility_yaml(tmp_path)
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
@@ -4240,10 +4242,86 @@ def test_main_cost_control_flags_thread_into_run_census(tmp_path, monkeypatch):
     )
 
 
+def test_main_requires_project_root(tmp_path, monkeypatch, capsys, install_fake_httpx):
+    """The census must REFUSE to guess its target from the process cwd.
+
+    An implicit-cwd default on a money-spending entrypoint is the root enabler
+    of task 3269: the nightly launcher passed no --project-root, so every
+    trickle instance censused whatever project legibility-trickle@.service's
+    WorkingDirectory named. Reinstating ``default="."`` fails here: argparse
+    would not raise at all.
+    """
+    # An EMPTY cwd: were the flag silently defaulted, "." must not resolve to
+    # a tree holding a real legibility.yaml (the worktree root does).
+    monkeypatch.chdir(tmp_path)
+    install_fake_httpx(lambda *a, **k: pytest.fail("no network on this path"))
+    monkeypatch.setattr(mod, "run_census", _poison("run_census"))
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+
+    with pytest.raises(SystemExit) as exc:
+        mod.main(["--force"])
+
+    assert exc.value.code == 2, "argparse signals a usage error with exit 2"
+    assert "--project-root" in capsys.readouterr().err
+
+
+def test_main_rejects_a_project_root_that_disagrees_with_the_config(
+    tmp_path, monkeypatch, capsys, install_fake_httpx,
+):
+    """Two sources for "which project is this?" must agree, or the run stops.
+
+    ``--project-root A --config B/...`` would mine B's census window (the
+    window comes from ``cfg.project_root``), stamp A's outputs with B's
+    project_id, and advance A's census-state past a window it never mined --
+    a quieter instance of task 3269's mixed-project failure. Bad argument,
+    never a deferral.
+    """
+    project_a = tmp_path / "project_a"
+    project_b = tmp_path / "project_b"
+    project_a.mkdir()
+    config_b = _write_legibility_yaml(project_b, project_id="project_b")
+    install_fake_httpx(lambda *a, **k: pytest.fail("no network on this path"))
+    fake_run_census = _make_fake_main_run_census()
+    monkeypatch.setattr(mod, "run_census", fake_run_census)
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+
+    exit_code = mod.main([
+        "--project-root", str(project_a), "--config", str(config_b), "--force",
+    ])
+
+    assert exit_code == 1
+    assert fake_run_census.calls == [], "a mixed-project run must stop before any billable work"
+    err = capsys.readouterr().err
+    # BOTH sides must be named, or the operator cannot tell which one is wrong.
+    assert str(project_a) in err
+    assert str(project_b) in err
+    assert str(config_b) in err
+
+
+def test_main_accepts_a_project_root_that_matches_the_config_via_a_relative_spelling(
+    tmp_path, monkeypatch,
+):
+    """The cross-check compares RESOLVED roots, so a relative-but-equivalent
+    ``--project-root`` is not mistaken for a mixed-project run."""
+    project = tmp_path / "project_a"
+    project.mkdir()
+    _write_legibility_yaml(project)
+    fake_run_census = _make_fake_main_run_census()
+    monkeypatch.setattr(mod, "run_census", fake_run_census)
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+    monkeypatch.chdir(tmp_path)
+
+    exit_code = mod.main(["--project-root", "project_a", "--force"])
+
+    assert exit_code == 0
+    assert fake_run_census.calls[0]["project_root"] == str(project.resolve())
+
+
 def test_main_without_cost_control_flags_passes_defaults(tmp_path, monkeypatch):
-    # The nightly launcher (nightly.py) runs census.py with NO extra argv, so
-    # this is the shape that must stay behaviorally byte-identical.
-    _write_legibility_yaml(_default_config_path(tmp_path))
+    # The nightly launcher (nightly.py) passes only --project-root/--config and
+    # no cost-control flags, so this is the shape that must stay behaviorally
+    # byte-identical.
+    _write_legibility_yaml(tmp_path)
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
@@ -4272,7 +4350,7 @@ def test_main_rejects_a_nonpositive_cost_cap_at_the_cli_boundary(
     # A nonsense cap on a flag whose entire purpose is to be an explicit,
     # legible bound must exit non-zero with a message, not degenerate into a
     # half-applied cap. argparse raises SystemExit(2) for a type= rejection.
-    _write_legibility_yaml(_default_config_path(tmp_path))
+    _write_legibility_yaml(tmp_path)
     monkeypatch.setattr(mod, "run_census", _poison("run_census"))
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
 
@@ -4287,7 +4365,7 @@ def test_main_rejects_a_nonpositive_cost_cap_at_the_cli_boundary(
 
 def test_main_accepts_a_cap_of_one(tmp_path, monkeypatch):
     # The boundary itself is valid: 1 is the smallest cap that can be honored.
-    _write_legibility_yaml(_default_config_path(tmp_path))
+    _write_legibility_yaml(tmp_path)
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
@@ -4303,7 +4381,7 @@ def test_main_accepts_a_cap_of_one(tmp_path, monkeypatch):
 
 
 def test_main_dry_run_summary_line_names_payload_file(tmp_path, monkeypatch, capsys):
-    _write_legibility_yaml(_default_config_path(tmp_path))
+    _write_legibility_yaml(tmp_path)
     payloads_path = "/p/plans/confusion-census-2026-07-30-payloads.json"
     fake_run_census = _make_fake_main_run_census(
         outcome=mod.CensusOutcome(
@@ -4339,7 +4417,7 @@ def test_main_done_summary_line_counts_filed_tickets_not_tasks(tmp_path, monkeyp
     # The operator reads this line to learn what the run produced. Filing
     # yields tickets, not tasks (census.py::_ticket_id_from_submit_result),
     # so "filed_tasks=N" would overclaim N tasks that may not exist.
-    _write_legibility_yaml(_default_config_path(tmp_path))
+    _write_legibility_yaml(tmp_path)
     fake_run_census = _make_fake_main_run_census(
         outcome=mod.CensusOutcome(
             status="done",
@@ -4374,7 +4452,7 @@ def test_main_missing_config_returns_nonzero(tmp_path, monkeypatch):
 
 
 def test_main_returns_nonzero_on_fail_loud_error(tmp_path, monkeypatch):
-    _write_legibility_yaml(_default_config_path(tmp_path))
+    _write_legibility_yaml(tmp_path)
 
     def raising_run_census(**kwargs):
         raise RuntimeError("codebook merge produced an invalid codebook")
@@ -4396,7 +4474,7 @@ def test_main_failure_files_escalation(tmp_path, monkeypatch):
     escalate_fn closure (PRD decision 8: degradation never silent) -- a hard
     census failure exits non-zero AND leaves an operator signal, rather than
     dying with only a stderr line (the silent-census incident this fixes)."""
-    _write_legibility_yaml(_default_config_path(tmp_path))
+    _write_legibility_yaml(tmp_path)
 
     def raising_run_census(**kwargs):
         raise RuntimeError("codebook merge produced an invalid codebook")
@@ -4428,7 +4506,7 @@ def test_main_failure_escalation_is_best_effort_when_poster_raises(tmp_path, mon
     """The failure escalation is best-effort: if the escalation POST itself
     raises, the closure swallows it (logging a WARNING) and main() STILL
     returns 1 -- the escalation never masks the authoritative exit code."""
-    _write_legibility_yaml(_default_config_path(tmp_path))
+    _write_legibility_yaml(tmp_path)
 
     def raising_run_census(**kwargs):
         raise RuntimeError("codebook merge produced an invalid codebook")
@@ -4461,8 +4539,7 @@ def test_main_failure_escalation_is_best_effort_when_poster_raises(tmp_path, mon
 
 def test_default_batch_source_passes_resolved_archive_roots_to_enumerate(tmp_path, monkeypatch):
     config_path = _write_legibility_yaml(
-        _default_config_path(tmp_path), project_root=tmp_path,
-        agent_transcript_roots=["data/orchestrator/agent-transcripts"],
+        tmp_path, agent_transcript_roots=["data/orchestrator/agent-transcripts"],
     )
     cfg = config_mod.load_config(config_path)
 
@@ -4627,7 +4704,7 @@ def test_main_hard_failure_under_pytest_reaches_no_real_mcp_endpoint(tmp_path, m
 
     The exit contract is asserted alongside: refusing the POST must not
     change `main()`'s authoritative signal (tasks 2951/2952/3644)."""
-    _write_legibility_yaml(_default_config_path(tmp_path))
+    _write_legibility_yaml(tmp_path)
 
     def raising_run_census(**kwargs):
         raise RuntimeError("codebook merge produced an invalid codebook")
@@ -4792,7 +4869,7 @@ def test_main_wires_per_stage_timeouts_into_run_census(tmp_path, monkeypatch):
     # DEFAULT config — NO timeouts block — so cfg.timeouts falls back to the
     # schema defaults (120/900/1800). This is exactly the shape of a
     # pre-existing legibility.yaml.
-    _write_legibility_yaml(_default_config_path(tmp_path))
+    _write_legibility_yaml(tmp_path)
 
     recorded = []
 
@@ -6461,7 +6538,7 @@ def test_run_census_clean_run_emits_no_run_summary_line(tmp_path, caplog):
 def test_main_done_line_names_unresolved_verdicts_when_nonzero(
     tmp_path, monkeypatch, capsys,
 ):
-    _write_legibility_yaml(_default_config_path(tmp_path))
+    _write_legibility_yaml(tmp_path)
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
 
     def _run_main(unresolved):
