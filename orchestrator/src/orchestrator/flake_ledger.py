@@ -67,7 +67,7 @@ import contextlib
 import json
 import logging
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -1370,6 +1370,42 @@ def read_debt_many(db_path: Path, test_ids: Iterable[str]) -> dict[str, DebtRow]
         return {}
 
 
+def _this_call_reentered(row: DebtRow, *, stamp: str) -> bool:
+    """Whether the upsert that read back *row* RE-ENTERED a resolved cycle at *stamp*.
+
+    The upsert's re-entry branch is the only writer that moves ``opened_at`` on an
+    existing row, and it writes THIS call's *stamp*; ``open_count > 1`` excludes the
+    fresh insert, which writes the stamp too.  Two calls sharing one canonical stamp —
+    only an injected clock does that — would both read as re-entries.
+    """
+    return row.open_count > 1 and row.opened_at == stamp
+
+
+def _report_regression(row: DebtRow, hook: Callable[[DebtRow], None] | None) -> None:
+    """Hand the re-entered *row* to *hook* (``open_debt``'s
+    ``on_regressed_after_resolution``), or log the regression LOUDLY when none is wired.
+    Never raises: a failing hook costs only the report."""
+    if hook is None:
+        logger.warning(
+            'flake_ledger: test_id=%s re-entered debt after a resolution '
+            '(regressed_after_resolution, cycle %d, prior resolving commit %s) but no hook '
+            'is wired, so it is visible only in `orchestrator flake-ledger`',
+            row.test_id,
+            row.open_count,
+            row.prior_resolving_commit or '(none recorded)',
+        )
+        return
+    try:
+        hook(row)
+    except Exception:
+        logger.warning(
+            'flake_ledger: reporting regressed_after_resolution for test_id=%s raised — '
+            'the re-entered debt row IS written and its owner is still enforced',
+            row.test_id,
+            exc_info=True,
+        )
+
+
 async def open_debt(
     db_path: Path,
     project_id: str,
@@ -1377,6 +1413,7 @@ async def open_debt(
     *,
     task_client: FlakeLedgerTaskClient | None = None,
     now: datetime | None = None,
+    on_regressed_after_resolution: Callable[[DebtRow], None] | None = None,
 ) -> DebtRow | None:
     """Open (or advance) the single ``flake_debt`` row for *test_id* (PRD §8.3).
 
@@ -1399,6 +1436,16 @@ async def open_debt(
     detection race-free with no sweep at all: ``owner_task_id`` changes only inside this
     function, so the done owner is still on the row when the next suppression arrives,
     whether or not an eager sweep has run.  The eager sweep is task θ's.
+
+    REGRESSION REPORT (task η).  A RE-ENTRY means the test flaked again after its fix
+    landed, and *on_regressed_after_resolution* receives the re-entered row EXACTLY ONCE
+    per re-entry: never for a first suppression, never for a repeat inside a cycle.  It
+    is called synchronously right after the upsert commits, with no await in between and
+    BEFORE ζ's owner filing awaits anything, so a filing that hangs, or that the caller's
+    budget cancels (task 4974), cannot lose the report; that is also why the row it
+    receives has no owner yet.  A raising hook costs only the report, never the row or
+    its owner.  Unwired, the re-entry is logged as a WARNING instead: a legitimate
+    configuration, never a silent one.
 
     COUPLING RULE, binding: the ledger READS task status but never WRITES it, except
     for the initial filing (``submit_task`` plus the ``commit_planning`` that completes
@@ -1499,6 +1546,9 @@ async def open_debt(
             exc_info=True,
         )
         return None
+
+    if _this_call_reentered(debt_row, stamp=stamp):
+        _report_regression(debt_row, on_regressed_after_resolution)
 
     # ENSURING THE OWNER IS OUTSIDE THE TRY ABOVE, AND THE BOUNDARY IS THE COMMIT.
     # `None` is a contract -- it means "the ledger was unavailable, the measurement is
