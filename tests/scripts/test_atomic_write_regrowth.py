@@ -410,7 +410,7 @@ _ALLOWED_RENAMERS = {
         'than decorative: the _rewrites_on_gate_polls watcher thread calls '
         'this WHILE the spawned script polls the same file, and '
         'drain_check._read_heartbeat turns the ValueError from a partially '
-        'written file into "absent" — a verdict no timeline scheduled, i.e. a '
+        'written file into "absent" — a verdict no rewrite asked for, i.e. a '
         'flake. Stated plainly: there is NO semantic here beyond '
         'atomic_write_text\'s reach, so this is a migration candidate, held '
         'back only because whether the fixture should keep mirroring the shell '

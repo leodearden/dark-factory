@@ -1186,7 +1186,7 @@ _HB_STALE = {"merge_idle": True, "ts_epoch": time.time() - 99999}
 # from it (_polls_outlasting) move together with it instead of each test
 # repeating a bare "1" string for ORCH_DRAIN_POLL_INTERVAL_SECS
 # (reviewer_comprehensive #1).
-_TIMELINE_POLL_INTERVAL_SECS = 1
+_DRAIN_POLL_INTERVAL_SECS = 1
 # ONE binding feeding both the grace and the timeout -- see
 # test_defer_withholds_restart_while_busy. Here the grace is a
 # MUST-NEVER-BE-REACHED bound rather than a wait-proving one: if the
@@ -1308,7 +1308,7 @@ def _run_busy_unit_through(tmp_path, rewrites, *, spawn_timeout, **knobs):
 
     `knobs` are merged into `_run_script`'s env over
     {"RESTART_VERIFY_TIMEOUT": "5", "ORCH_DRAIN_POLL_INTERVAL_SECS":
-    str(_TIMELINE_POLL_INTERVAL_SECS)}. `state` is the fake systemctl's
+    str(_DRAIN_POLL_INTERVAL_SECS)}. `state` is the fake systemctl's
     recorded state and `polls` the gate's finished poll ledger, as read by
     `_read_poll_trace`.
     """
@@ -1326,7 +1326,7 @@ def _run_busy_unit_through(tmp_path, rewrites, *, spawn_timeout, **knobs):
 
     env = {
         "RESTART_VERIFY_TIMEOUT": "5",
-        "ORCH_DRAIN_POLL_INTERVAL_SECS": str(_TIMELINE_POLL_INTERVAL_SECS),
+        "ORCH_DRAIN_POLL_INTERVAL_SECS": str(_DRAIN_POLL_INTERVAL_SECS),
         "ORCH_DRAIN_POLL_TRACE_FILE": str(trace_path),
     }
     env.update(knobs)
@@ -1356,7 +1356,7 @@ def _polls_outlasting(secs: int) -> int:
     therefore more than the busy loop alone can make before a `secs`
     deadline, and put the script at least `secs` past its defer anchor.
     """
-    return math.ceil(secs / _TIMELINE_POLL_INTERVAL_SECS) + 1
+    return math.ceil(secs / _DRAIN_POLL_INTERVAL_SECS) + 1
 
 
 def _assert_resumed_from_the_busy_loop(result, state, polls):
