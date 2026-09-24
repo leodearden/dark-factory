@@ -160,6 +160,22 @@ class _FakeLedgerTaskClient:
         self.commit_calls.append(list(task_ids))
 
 
+class _ReportsEveryTaskDone(_FakeLedgerTaskClient):
+    """Every task reads back live ``done``, its fix merged as *commit* — the owner state
+    in which η's ``resolve_debt`` closes a cycle (it reads the commit, never takes it)."""
+
+    def __init__(self, commit: str) -> None:
+        super().__init__()
+        self._commit = commit
+
+    async def get_task(self, task_id: str) -> tuple[dict | None, Exception | None]:
+        return {
+            'id': task_id,
+            'status': 'done',
+            'metadata': {'done_provenance': {'kind': 'merged', 'commit': self._commit}},
+        }, None
+
+
 @pytest.fixture(autouse=True)
 def _reset_streak():
     """The streak is a MODULE-GLOBAL, so a test that bumps it and does not reset
@@ -616,7 +632,9 @@ class TestRecordOpensDebt:
         client = _FakeLedgerTaskClient()
         db = ledger_db_path(tmp_path)
         await _record(_result(_suppression(test_ids=(ids[0],))), tmp_path, task_client=client)
-        await resolve_debt(db, _PROJECT_ID, ids[0], resolving_commit='f' * 40)
+        assert await resolve_debt(
+            db, _PROJECT_ID, ids[0], task_client=_ReportsEveryTaskDone('f' * 40),
+        )
         seeded = read_debt(db, ids[0])
         assert seeded is not None and seeded.resolved_at and seeded.owner_task_id
 
