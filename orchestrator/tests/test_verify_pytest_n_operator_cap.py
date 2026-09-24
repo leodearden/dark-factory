@@ -29,9 +29,9 @@ NO-OP contract (no ``-n`` injected at all) whenever that value is the
 ``''``/``'auto'`` sentinel, so both regimes stay covered and stay green.
 
 Harness provenance: ``_leg_for_cmd``/``_module_config`` are cross-imported from
-``test_verify_admission_pytest_n`` so the leg-labelling contract has exactly
-ONE definition — the ``'pytest'``-and-``'tests/'`` two-substring form, which
-the joined ``'pytest tests/'`` form silently breaks the moment a ``-n`` is
+``_orch_helpers`` (task 4586) so the leg-labelling contract has exactly ONE
+definition — the ``'pytest'``-and-``'tests/'`` two-substring form, which the
+joined ``'pytest tests/'`` form silently breaks the moment a ``-n`` is
 spliced between them (the very rewrite under test here). ``_load_committed_
 config`` stays module-local instead: the ``test_warm_lane_bash_bucket_
 placement`` copy takes no constructor overrides, and this module needs one
@@ -46,7 +46,7 @@ from typing import Any, Literal
 from unittest.mock import patch
 
 import pytest
-from test_verify_admission_pytest_n import _leg_for_cmd, _module_config
+from _orch_helpers import _leg_for_cmd, _module_config
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.verify import run_verification

@@ -37,12 +37,6 @@ the autouse ``_neutralize_verify_admission`` conftest fixture
 other test in the suite (task 2390 pre-1) — this gate must exercise the REAL
 seam.
 
-Helpers are kept MODULE-LOCAL (never conftest.py) — a conftest.py edit trips
-``verify.py``'s ``has_conftest`` heuristic and forces merge-time scoped
-verify to fall back to running the full owning-package suite instead of a
-scoped subset (mirrors ``test_verify_admission_wiring.py``'s stated
-rationale).
-
 TEST-ONLY integration gate: every scenario drives already-shipped T1/T2/T3
 seams (patch ``orchestrator.verify._run_cmd``, instrument
 ``orchestrator.verify.acquire_task_slot``, inject
@@ -70,61 +64,10 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+from _orch_helpers import _TEST_CMD, _leg_for_cmd, _module_config
 
-from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.config import OrchestratorConfig
 from orchestrator.verify import run_full_verification, run_verification
-
-# ---------------------------------------------------------------------------
-# Shared sentinels + labelling (adapted from test_verify_admission_wiring.py)
-# ---------------------------------------------------------------------------
-
-# module_config commands are chosen to be uniquely identifiable by substring,
-# so a spy `_run_cmd` can label which leg is running without needing `label`
-# (which is a `_run_or_skip_timed`-local closure variable, never passed down
-# to `_run_cmd`).
-_TEST_CMD = 'pytest tests/'
-_LINT_CMD = 'ruff'
-_TYPE_CMD = 'pyright'
-
-
-def _leg_for_cmd(cmd: str) -> str:
-    """Label which leg *cmd* belongs to by substring, not exact match — an
-    active admission gate nice-wraps the test leg (``<nice argv> /bin/bash -c
-    <shlex.quote(cmd)>``), so its captured cmd still CONTAINS ``_TEST_CMD``
-    but is no longer equal to it. lint/type are never wrapped either way.
-
-    Checks ``'pytest'``/``'tests/'`` as two SEPARATE substrings rather than the
-    joined ``_TEST_CMD``: a ``verify_admission_pytest_n`` cap splices new flags
-    BETWEEN them (``pytest tests/`` -> ``pytest -n 8 tests/``), breaking
-    containment of the joined string. That is worse here than a failed
-    assertion: ``_RunCmdSpy`` keys its gates on ``(leg, occurrence)``, so a
-    mislabelled test leg means the gate never fires, the holder never holds the
-    slot, and ``max_seen``/``len(calls)`` silently go wrong too
-    (task 4456; same rationale as test_verify_admission_pytest_n.py:56-66).
-    """
-    if 'pytest' in cmd and 'tests/' in cmd:
-        return 'test'
-    if _LINT_CMD in cmd:
-        return 'lint'
-    if _TYPE_CMD in cmd:
-        return 'type'
-    return cmd
-
-
-def _module_config(**overrides: Any) -> ModuleConfig:
-    kwargs: dict[str, Any] = dict(
-        prefix='pkg',
-        test_command=_TEST_CMD,
-        lint_command=_LINT_CMD,
-        type_check_command=_TYPE_CMD,
-        # Sequential so the three legs run strictly test -> lint -> type,
-        # making ordering/labelling assertions deterministic (no gather
-        # interleaving between legs themselves).
-        concurrent_verify=False,
-    )
-    kwargs.update(overrides)
-    return ModuleConfig(**kwargs)
-
 
 # ---------------------------------------------------------------------------
 # Configurable spy for orchestrator.verify._run_cmd
