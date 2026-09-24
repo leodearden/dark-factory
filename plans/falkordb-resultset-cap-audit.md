@@ -12,7 +12,7 @@ FalkorDB returns at most `RESULTSET_SIZE` rows per query and truncates silently:
 
 - Measured 2026-08-17 against localhost:6379: `GRAPH.CONFIG GET RESULTSET_SIZE -> 10000`.
 - Re-measured 2026-09-24 (task 4869 architect), same command, same answer: `10000`.
-- Corroborated end to end on 2026-09-24 by the task-4869 live test (`TestStaleNodeEmbeddingsLiveFalkorDB` in `fused-memory/tests/test_graph_read_pagination.py`). On a throwaway graph of 12000 embedded Entity nodes, the old unpaginated `query_stale_node_embeddings` returned 10000; the paginated one returns 12000.
+- Corroborated end to end on 2026-09-24 by the task-4869 live test (`TestStaleEmbeddingsLiveFalkorDB` in `fused-memory/tests/test_graph_read_pagination.py`). On a throwaway graph of 12000 embedded Entity nodes, the old unpaginated `query_stale_node_embeddings` returned 10000; the paginated one returns 12000. The same day the test was extended to a throwaway graph of 12000 embedded RELATES_TO edges. An unpaginated read of it returned 10000, and `query_stale_edge_embeddings` returned all 12000.
 
 `_RESULTSET_SIZE` in `graphiti_client.py` encodes this value as an ASSUMPTION. That is why `_paged_ro_query` cross-checks every read against a server-side census instead of trusting it.
 
@@ -95,7 +95,7 @@ Task 4869 pages `retrieve_episodes` with a keyset cursor. That does NOT reverse 
 
 `query_stale_node_embeddings`, `query_stale_edge_embeddings`, `query_edges_by_time_range` and `retrieve_episodes` have no measured paging cost. All four are maintenance or cold paths (reindex, stale-edge cleanup, episode listing). The architect tried a single-page timing probe against production `dark_factory` on 2026-09-24 (SKIP/LIMIT over `name_embedding`). It produced no output within 300 s and was killed (exit 124), and FalkorDB answered a trivial count in 4 ms right afterwards. The cause is unknown. Hypothesis: contention around a fused-memory service restart at 09:22:44 that day. Treat the cost as unknown until someone measures it. Do not estimate it from the 4340 tables.
 
-The two vector reads cut each page in `WITH ... ORDER BY ... SKIP ... LIMIT` BEFORE `RETURN` projects the embedding. The intent is that each page's sort carries node or edge refs and materialises only `page_size` vectors, not every matched vector. This is REASONED, NOT MEASURED. The throwaway-graph live test confirms only that FalkorDB accepts the template and pages correctly through it.
+The two vector reads cut each page in `WITH ... ORDER BY ... SKIP ... LIMIT` BEFORE `RETURN` projects the embedding. The intent is that each page's sort carries node or edge refs and materialises only `page_size` vectors, not every matched vector. This is REASONED, NOT MEASURED. The throwaway-graph live test confirms only that FalkorDB accepts both templates and pages correctly through them.
 
 ## Per-read classification (post-4869, re-audited 2026-09-24)
 

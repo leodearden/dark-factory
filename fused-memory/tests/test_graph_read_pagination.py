@@ -1575,37 +1575,60 @@ class TestListEntityNodesLiveFalkorDB:
         assert paged.expected_rows == self.LIVE_NODE_COUNT
 
 
+_LIVE_EMBEDDED_COUNT = 12000  # comfortably above the 10000 cap
+_LIVE_UUID_AND_NAME_PROPS = "uuid: 'u' + toString(i), name: 'n' + toString(i)"
+
+
 @falkor_skipif()
 @pytest.mark.timeout(60)
 @pytest.mark.integration
-class TestStaleNodeEmbeddingsLiveFalkorDB:
+@pytest.mark.parametrize(
+    'method, seed_cypher, unpaginated_cypher',
+    [
+        pytest.param(
+            'query_stale_node_embeddings',
+            f'UNWIND range(0, {_LIVE_EMBEDDED_COUNT - 1}) AS i '
+            f'CREATE (:Entity {{{_LIVE_UUID_AND_NAME_PROPS}, '
+            'name_embedding: vecf32([0.1, 0.2, 0.3])})',
+            'MATCH (n:Entity) RETURN n.uuid',
+            id='nodes',
+        ),
+        pytest.param(
+            'query_stale_edge_embeddings',
+            f'UNWIND range(0, {_LIVE_EMBEDDED_COUNT - 1}) AS i '
+            "CREATE (:Entity {uuid: 'a' + toString(i)})"
+            f'-[:RELATES_TO {{{_LIVE_UUID_AND_NAME_PROPS}, '
+            'fact_embedding: vecf32([0.1, 0.2, 0.3])}]->'
+            "(:Entity {uuid: 'b' + toString(i)})",
+            'MATCH ()-[e:RELATES_TO]->() RETURN e.uuid',
+            id='edges',
+        ),
+    ],
+)
+class TestStaleEmbeddingsLiveFalkorDB:
     """Task 4869: the real cap, and the WITH-before-RETURN page syntax.
 
-    The fake cannot check that FalkorDB accepts the page template, nor that
-    a real ``vecf32`` survives the dimension parse, so this runs the vector
-    read end to end on a THROWAWAY graph. Never point it at a production one.
+    The fake cannot check that FalkorDB accepts either page template, nor that
+    a real ``vecf32`` survives the dimension parse, so this runs both vector
+    reads end to end on a THROWAWAY graph. Never point it at a production one.
     """
-
-    LIVE_NODE_COUNT = 12000  # comfortably above the 10000 cap
 
     @pytest.mark.asyncio
     async def test_every_stale_embedding_is_found_past_the_server_cap(
-        self, mock_config, make_backend, pagination_live_graph
+        self, method, seed_cypher, unpaginated_cypher,
+        mock_config, make_backend, pagination_live_graph,
     ):
         _, graph = pagination_live_graph
-        await graph.query(
-            f'UNWIND range(0, {self.LIVE_NODE_COUNT - 1}) AS i '
-            "CREATE (:Entity {uuid: 'u' + toString(i), name: 'n' + toString(i), "
-            'name_embedding: vecf32([0.1, 0.2, 0.3])})'
-        )
+        await graph.query(seed_cypher)
+
+        raw = await graph.ro_query(unpaginated_cypher)
+        assert len(raw.result_set) == _LIVE_RESULTSET_CAP
 
         backend = make_backend(mock_config)
         backend._driver._get_graph = MagicMock(return_value=graph)
-        stale = await backend.query_stale_node_embeddings(
-            expected_dim=1536, group_id='test'
-        )
-        assert len(stale) == self.LIVE_NODE_COUNT
-        assert {s[0] for s in stale} == {f'u{i}' for i in range(self.LIVE_NODE_COUNT)}
+        stale = await getattr(backend, method)(expected_dim=1536, group_id='test')
+        assert len(stale) == _LIVE_EMBEDDED_COUNT
+        assert {s[0] for s in stale} == {f'u{i}' for i in range(_LIVE_EMBEDDED_COUNT)}
         assert {s[2] for s in stale} == {3}
 
 
@@ -1816,23 +1839,23 @@ _STALE_EMBEDDING_READS = [
 ]
 
 
+@pytest.mark.asyncio
+async def test_control_an_unpaginated_embedded_read_is_truncated_by_the_cap():
+    """CONTROL: keeps the stale-embedding headline below from being a tautology."""
+    graph = FakeCappedGraph(make_embedded_row_corpus(_LIVE_ENTITY_NODES, 3))
+    result = await graph.ro_query(
+        'MATCH (n:Entity) WHERE n.name_embedding IS NOT NULL '
+        'RETURN n.uuid, n.name, n.name_embedding'
+    )
+    assert result.result_set is not None
+    assert len(result.result_set) == _LIVE_RESULTSET_CAP
+
+
 @pytest.mark.parametrize(
     'method, where_fragment, order_key, vector_prop', _STALE_EMBEDDING_READS
 )
 class TestStaleEmbeddingReadsPagination:
     """Both vector reads return every stale row past the server cap."""
-
-    @pytest.mark.asyncio
-    async def test_control_unpaginated_read_is_truncated_by_the_cap(
-        self, method, where_fragment, order_key, vector_prop
-    ):
-        """CONTROL: keeps the headline below from being a tautology."""
-        graph = FakeCappedGraph(make_embedded_row_corpus(_LIVE_ENTITY_NODES, 3))
-        result = await graph.ro_query(
-            f'MATCH (n) WHERE {where_fragment} RETURN {order_key}, {vector_prop}'
-        )
-        assert result.result_set is not None
-        assert len(result.result_set) == _LIVE_RESULTSET_CAP
 
     @pytest.mark.asyncio
     async def test_every_stale_row_is_returned(
@@ -1895,18 +1918,25 @@ class TestStaleEmbeddingReadsPagination:
 
     @pytest.mark.asyncio
     async def test_a_uuid_re_emitted_across_pages_is_reported_once(
-        self, method, where_fragment, order_key, vector_prop, mock_config, make_backend
+        self, method, where_fragment, order_key, vector_prop,
+        mock_config, make_backend, monkeypatch,
     ):
-        """SKIP re-emission under concurrent insert must not double a re-embed."""
+        """SKIP re-emission under concurrent insert must not double a re-embed.
+
+        Pages of two put the repeated ``u1`` on page 2, so the dedup under
+        test is the cross-page one, not a within-page one.
+        """
         backend = make_backend(mock_config)
         corpus = [
             ['u1', 'n1', _vector_text(3)],
             ['u2', 'n2', _vector_text(3)],
-            ['u1', 'n1', _vector_text(3)],   # the boundary row, re-emitted
+            ['u1', 'n1', _vector_text(3)],   # page 2 — the boundary row, re-emitted
             ['u3', 'n3', _vector_text(3)],
         ]
-        _wire(backend, FakeCappedGraph(corpus, resultset_cap=None))
+        graph = _wire(backend, FakeCappedGraph(corpus))
+        _force_paged_kwargs(monkeypatch, page_size=2)
         stale = await getattr(backend, method)(expected_dim=1536, group_id='test')
+        assert len(graph.page_queries) > 1
         assert [s[0] for s in stale] == ['u1', 'u2', 'u3']
 
     @pytest.mark.asyncio
@@ -2045,18 +2075,24 @@ class TestQueryEdgesByTimeRangePagination:
 
     @pytest.mark.asyncio
     async def test_a_uuid_re_emitted_across_pages_is_returned_once(
-        self, mock_config, make_backend
+        self, mock_config, make_backend, monkeypatch
     ):
-        """bulk_remove_edges must not be handed the same uuid twice."""
+        """bulk_remove_edges must not be handed the same uuid twice.
+
+        Pages of two put the repeated ``e1`` on page 2, so the dedup under
+        test is the cross-page one, not a within-page one.
+        """
         backend = make_backend(mock_config)
         corpus = [
             ['e1', 'first fact', 'n1', '2026-03-22T18:00:00', None],
             ['e2', 'fact two', 'n2', '2026-03-22T18:00:00', None],
-            ['e1', 'later fact', 'n1', '2026-03-22T18:00:00', None],
+            ['e1', 'later fact', 'n1', '2026-03-22T18:00:00', None],   # page 2
             ['e3', 'fact three', 'n3', '2026-03-22T18:00:00', None],
         ]
-        _wire(backend, FakeCappedGraph(corpus, resultset_cap=None))
+        graph = _wire(backend, FakeCappedGraph(corpus))
+        _force_paged_kwargs(monkeypatch, page_size=2)
         edges = await _edges_in_window(backend)
+        assert len(graph.page_queries) > 1
         assert [e['uuid'] for e in edges] == ['e1', 'e2', 'e3']
         assert edges[0]['fact'] == 'first fact'
 
