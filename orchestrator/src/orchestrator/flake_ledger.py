@@ -948,12 +948,13 @@ class FlakeLedgerTaskClient(Protocol):
 
 
 def _owner_liveness(status: str | None) -> str:
-    """Three-way verdict on a stored owner's LIVE status: ``open`` | ``deferred`` | ``closed``.
+    """Four-way verdict on a stored owner's LIVE status:
+    ``open`` | ``deferred`` | ``done`` | ``closed``.
 
     Mirrors ``orchestrator/src/orchestrator/chronic_flake.py::_is_open_status``'s
     ``status not in TERMINAL and status != 'deferred'`` predicate against the same source
-    of truth (``shared.task_statuses.TERMINAL``), REFINED from a boolean to three values
-    so ``deferred`` stays distinguishable.
+    of truth (``shared.task_statuses.TERMINAL``), REFINED from a boolean to four values
+    so ``deferred`` and ``done`` stay distinguishable.
 
     Why that refinement is load-bearing and not a nicety: ``planning_mode=True`` creates
     the task ``deferred``, so between ``submit_task`` and ``commit_planning`` there is a
@@ -962,6 +963,16 @@ def _owner_liveness(status: str | None) -> str:
     every subsequent suppression of the same test would file another orphan — a
     duplicate-generating loop that gets worse the more the test flakes.  The
     ``deferred`` branch finishes the half-done filing instead.
+
+    ``done`` is split out of ``closed`` (task η) for the same reason: its correct action
+    differs.  With a ``task_client`` wired, :func:`open_debt`'s lazy close resolves a
+    done owner's cycle and the re-entry upsert discharges that owner, so a done owner on
+    an OPEN row can only mean that resolution did not land: ``get_task`` failed, raised
+    or is missing, or the owner went done between η's read and this one.  Replacing it
+    would overwrite the only pointer to the fix that did not hold, so the cycle would
+    never close, ``prior_resolving_commit`` would never be written, and no
+    ``regressed_after_resolution`` L2 would fire.  ``closed`` therefore means only a
+    non-done terminal status (``cancelled``) or an absent owner.
 
     Empty/absent is ``closed``: ``get_statuses`` silently OMITS ids it does not know, so
     a missing entry from a SUCCESSFUL read is a corroborated absence (the task was
@@ -980,6 +991,8 @@ def _owner_liveness(status: str | None) -> str:
         return 'closed'
     if status == 'deferred':
         return 'deferred'
+    if status == 'done':
+        return 'done'
     return 'closed' if status in TERMINAL else 'open'
 
 
@@ -1075,7 +1088,9 @@ async def _ensure_owner_task(
     task behind it may have gone terminal, been cancelled, or been deleted since it was
     written, so it is re-read against LIVE status every time and NEVER assumed
     still-open.  Short-circuiting on a non-NULL ``owner_task_id`` would satisfy the
-    invariant's letter while pointing stale rows at done tasks forever.
+    invariant's letter while pointing stale rows at done tasks forever.  Only a cancelled
+    or absent owner is REPLACED: a done one is kept, because on an open row it means the
+    lazy close did not land and the next suppression retries it (:func:`_owner_liveness`).
 
     COUPLING RULE, binding (§5.9): the ledger READS task status but never WRITES it,
     except the initial filing.  It never marks a task done, never blocks one, never
@@ -1167,9 +1182,23 @@ async def _ensure_owner_task(
                     exc_info=True,
                 )
             return row
+        if liveness == 'done':
+            # The resolution did not land this call (see `_owner_liveness`).  Keep the
+            # pointer and file nothing, the unreadable-status branch's fail-safe
+            # direction: the next lazy resolve_debt closes the cycle through it, where a
+            # replacement would erase it for good.
+            logger.warning(
+                'flake_ledger: owner %s of test_id=%s is done but its debt cycle could not '
+                'be closed — KEEPING the owner rather than replacing it; '
+                'regressed_after_resolution detection is DEFERRED to the next suppression '
+                "(or θ's sweep)",
+                row.owner_task_id,
+                row.test_id,
+            )
+            return row
         logger.info(
-            'flake_ledger: de-flake task %s owning test_id=%s is no longer live '
-            '(status=%r) — filing a replacement',
+            'flake_ledger: de-flake task %s owning test_id=%s was cancelled or no longer '
+            'exists (status=%r) — filing a replacement',
             row.owner_task_id,
             row.test_id,
             statuses.get(row.owner_task_id),
@@ -1424,7 +1453,8 @@ async def open_debt(
 
     ``task_client`` is where §5.9's invariant is ENFORCED (see
     :func:`_ensure_owner_task`): after the upsert, ``owner_task_id`` is re-corroborated
-    against live task status and a de-flake task is filed if none is non-terminal.  Pass
+    against live task status and a de-flake task is filed if there is no owner, or it was
+    cancelled or deleted.  Pass
     ``None`` — the CLI and storeless callers do — and the row is written exactly as α
     wrote it, with no owner; that is a legitimate degrade, logged, and rendered by ι as
     an invariant breach rather than hidden.
