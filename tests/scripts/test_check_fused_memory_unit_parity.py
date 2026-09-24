@@ -686,7 +686,7 @@ def test_fm_checker_reuses_the_shared_find_dropins():
     behavioural test above while reproducing — inside the tooling built to
     report silent duplication — exactly the duplication it exists to report.
     """
-    import systemd_unit_parity  # pyright: ignore[reportMissingImports]
+    import systemd_unit_parity
 
     mod = _load_checker()
 
@@ -1437,7 +1437,7 @@ _FM_UV_PATH = "/home/leo/.local/bin/uv"
 
 def _render_fused_unit(repo_root: str = _FM_REPO_ROOT) -> str:
     """The committed template rendered — through the REAL renderer's substitution."""
-    import render_systemd_unit  # pyright: ignore[reportMissingImports]
+    import render_systemd_unit
 
     return render_systemd_unit.render_template(
         TEMPLATE_PATH.read_text(encoding="utf-8"),
@@ -1517,7 +1517,7 @@ def test_preserved_names_are_disjoint_from_required_service_directives():
     docstring — a cross-module import would ImportError under the section-8
     tmp-repo tests that replace one of them with a stub).
     """
-    import render_systemd_unit  # pyright: ignore[reportMissingImports]
+    import render_systemd_unit
 
     mod = _load_checker()
 
@@ -1704,7 +1704,7 @@ def test_scope_known_project_roots_env_is_actually_preserved_by_the_renderer():
     would be empty for the wrong reason, and the hazard would be reopened under
     a passing test. That state is precisely what goes red here.
     """
-    import render_systemd_unit  # pyright: ignore[reportMissingImports]
+    import render_systemd_unit
 
     name = _scope_known_project_roots_env()
     assert isinstance(name, str) and name

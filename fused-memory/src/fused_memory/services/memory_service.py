@@ -2423,7 +2423,7 @@ class MemoryService:
                     success=True,
                 )
             return result
-        except Exception as e:
+        except (Exception, asyncio.CancelledError) as e:
             if self._write_journal:
                 await self._write_journal.log_backend_op(
                     write_op_id=write_op_id,
@@ -2432,7 +2432,7 @@ class MemoryService:
                     operation=operation,
                     payload=payload,
                     success=False,
-                    error=str(e),
+                    error=f'{type(e).__name__}: {e}',
                 )
             raise
 
@@ -5729,6 +5729,10 @@ class MemoryService:
 
         result = None
         error_msg = None
+        # Set only once the backend await returns, never inferred from a None
+        # error_msg: a BaseException the handler below does not name must not
+        # journal as a success either.
+        succeeded = False
         try:
             result = await self._journaled_backend_call(
                 write_op_id=write_op_id,
@@ -5740,8 +5744,9 @@ class MemoryService:
                     content=payload['content'], scope=scope, metadata=metadata
                 ),
             )
+            succeeded = True
             return result
-        except Exception as e:
+        except (Exception, asyncio.CancelledError) as e:
             error_msg = f'{type(e).__name__}: {e}'
             raise
         finally:
@@ -5766,7 +5771,7 @@ class MemoryService:
                         'category': metadata.get('category', ''),
                     },
                     result_summary=str(result)[:500] if result else None,
-                    success=error_msg is None,
+                    success=succeeded,
                     error=error_msg,
                 )
 
@@ -6072,7 +6077,9 @@ class MemoryService:
             known_project_ids=self._known_projects,
         )
 
-        success = True
+        # Set only once enqueue() commits: `success` on a write_ops row means
+        # "the enqueue was ACCEPTED" (_execute_mem0_write has the same shape).
+        success = False
         error_msg = None
         try:
             # NO 'uuid' KEY — deliberately (task 3561). graphiti_core
@@ -6119,9 +6126,9 @@ class MemoryService:
                 },
                 callback_type='dual_write_episode',
             )
-        except Exception as e:
-            success = False
-            error_msg = str(e)
+            success = True
+        except (Exception, asyncio.CancelledError) as e:
+            error_msg = f'{type(e).__name__}: {e}'
             raise
         finally:
             if self._write_journal:

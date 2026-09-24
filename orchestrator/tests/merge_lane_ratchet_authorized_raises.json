@@ -61,6 +61,90 @@
           "current": 31400
         }
       ]
+    },
+    {
+      "task_id": "3790",
+      "reason": "Flake ledger \u03b6 (PRD \u00a75.9): thread the de-flake task client through the three merge-verify recorder sites so a suppressed red opens an OWNED flake_debt row at write time; net-additive safety work restoring an invariant that was unenforced (6 suppressions, 0 debt rows since 2026-09-21). Reviewer-answering prose was trimmed first (stale-pin docstring paragraph and a 17-line comment removed; recorder bound once via functools.partial); the residual is the wiring and its tests' reads of the private post-merge-verify seam. Hand-carried 2026-09-23 on Leo's ruling (2A) to land \u03b6 ahead of task 5036; re-recorded once against the post-5795 baseline after a queue conflict.",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 2132,
+          "current": 2134
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_queue.py::SpeculativeMergeWorker::__init__",
+          "baseline": 8,
+          "current": 10
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 21572,
+          "current": 21614
+        },
+        {
+          "measure": "patch_targets",
+          "key": "orchestrator/tests/test_merge_queue_flake_recorder.py",
+          "baseline": 0,
+          "current": 1
+        },
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_merge_queue_flake_recorder.py",
+          "baseline": 11,
+          "current": 26
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 12288,
+          "current": 12327
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4722,
+          "current": 4724
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 56000,
+          "current": 56042
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6513,
+          "current": 6528
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31400,
+          "current": 31439
+        }
+      ]
+    },
+    {
+      "task_id": "5082",
+      "reason": "Task 5082 facet 1 adds five required regression tests of verify._is_bare_xdist_worker_crash's new crash-attribution clause (crash-attributed FAILED line accepted; plus unrelated FAILED, plus INTERNALERROR, already-failed-then-crashed, and no-crash-notice all rejected). Net-additive guard coverage against the same private helper the file already tests 14 times; no refactor regressed.",
+      "measures": [
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_verify_env_transient.py",
+          "baseline": 31,
+          "current": 36
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6528,
+          "current": 6533
+        }
+      ]
     }
   ]
 }

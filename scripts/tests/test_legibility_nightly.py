@@ -42,7 +42,7 @@ from legibility.config import load_config
 
 @pytest.fixture(autouse=True)
 def _isolate_trickle_state(tmp_path, monkeypatch):
-    """Point XDG_STATE_HOME at tmp_path for EVERY test in this module.
+    """Point the legibility state root at tmp_path for EVERY test here.
 
     ``run_nightly`` records run state through ``trickle_state.record_run``
     on every exit path (task 3340), so without this an ordinary test run
@@ -53,8 +53,12 @@ def _isolate_trickle_state(tmp_path, monkeypatch):
     reaches the recorder — including the ones that assert on this module's
     WARNING records, which a failed real-home write would otherwise
     pollute.
+
+    The lever was ``XDG_STATE_HOME`` until task 4514 made
+    ``trickle_state.trickle_state_path`` environment-independent; this is
+    now the only variable it reads.
     """
-    monkeypatch.setenv('XDG_STATE_HOME', str(tmp_path / 'xdg-state'))
+    monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path / 'legibility-state'))
 
 
 def _write_config(
@@ -3342,6 +3346,7 @@ class TestRunNightlyRecordsTrickleState:
 
         assert result.exit_code == 1
         doc = _one_recorded(calls)
+        assert doc['outcome'] == trickle_state.OUTCOME_FAILED
         assert doc['exit_code'] == 1
         assert doc['counters']['selected_count'] == 1
 
@@ -3354,6 +3359,7 @@ class TestRunNightlyRecordsTrickleState:
         assert result.exit_code == 1
         assert result.coder_status == 'failure'
         doc = _one_recorded(calls)
+        assert doc['outcome'] == trickle_state.OUTCOME_FAILED
         assert doc['exit_code'] == 1
         assert doc['counters']['selected_count'] == 1
 
@@ -3365,6 +3371,7 @@ class TestRunNightlyRecordsTrickleState:
 
         assert result.exit_code == 1
         doc = _one_recorded(calls)
+        assert doc['outcome'] == trickle_state.OUTCOME_FAILED
         assert doc['exit_code'] == 1
         assert doc['commit_made'] is False
 
@@ -3376,6 +3383,7 @@ class TestRunNightlyRecordsTrickleState:
 
         assert result.exit_code == 1
         doc = _one_recorded(calls)
+        assert doc['outcome'] == trickle_state.OUTCOME_FAILED
         assert doc['exit_code'] == 1
         assert doc['commit_made'] is False
 
@@ -3393,6 +3401,7 @@ class TestRunNightlyRecordsTrickleState:
             _run_e2e_nightly(tmp_path, recorder=recorder)
 
         doc = _one_recorded(calls)
+        assert doc['outcome'] == trickle_state.OUTCOME_FAILED
         assert doc['exit_code'] != 0, (
             'a crashed night must record its crash honestly'
         )
@@ -3400,6 +3409,54 @@ class TestRunNightlyRecordsTrickleState:
             'the sample was computed before the crash, so its real counters '
             'are still recordable'
         )
+
+    def test_a_crash_after_selecting_digests_records_failed_not_productive(
+        self, tmp_path
+    ):
+        """The 2026-08-18 reify shape: signal DID reach the digest stage,
+        and the pipeline broke downstream of it. Before task 4514 this
+        recorded ``productive``, streak 0, and a FRESH
+        ``last_productive_at`` — every night, for as long as the coder
+        stayed broken."""
+        recorder, calls = _recorder_spy()
+        result, _repo = _run_e2e_nightly(
+            tmp_path, branch='storm', recorder=recorder,
+        )
+
+        assert result.exit_code == 1
+        doc = _one_recorded(calls)
+        assert doc['outcome'] == trickle_state.OUTCOME_FAILED
+        assert doc['exit_code'] == 1
+        assert doc['counters']['selected_count'] >= 1, (
+            'signal reached the digest stage; the counters must still say so'
+        )
+        assert doc['consecutive_failed_runs'] == 1
+        assert doc['consecutive_barren_runs'] == 0
+        assert doc['last_productive_at'] is None
+
+    def test_result_exit_code_is_not_mutated_by_recording(self, tmp_path):
+        """Nothing in the recorder may write back onto
+        ``NightlyResult.exit_code`` — the refusal
+        ``scripts/legibility/nightly.py::_escalate_barren_streak``
+        records, because doing so would flip the unit to ``Result=failed``
+        and invert ``check_trickle_liveness.sh`` into a permanent false
+        alarm."""
+        recorder, calls = _recorder_spy()
+        clean, _repo = _run_e2e_nightly(tmp_path, recorder=recorder)
+        assert clean.exit_code == 0
+        assert _one_recorded(calls)['outcome'] == trickle_state.OUTCOME_PRODUCTIVE
+
+        storm_dir = tmp_path / 'storm'
+        storm_dir.mkdir()
+        recorder, calls = _recorder_spy()
+        stormed, _repo2 = _run_e2e_nightly(
+            storm_dir, branch='storm', recorder=recorder,
+        )
+        assert stormed.exit_code == 1, (
+            'the fail-loud branch owns the exit code; recording must not '
+            'move it in either direction'
+        )
+        assert _one_recorded(calls)['outcome'] == trickle_state.OUTCOME_FAILED
 
     def test_a_raising_recorder_never_breaks_the_run(self, tmp_path, caplog):
         """Observability must never become a new failure mode — mirroring
@@ -3463,15 +3520,16 @@ class _NightRunner:
 
     def night(self, day, kind):
         """Run one night. *kind* is 'barren' (real signal, squeezed budget),
-        'productive' (real signal, stock budget) or 'quiet' (no sessions at
-        all for this date)."""
+        'productive' (real signal, stock budget), 'quiet' (no sessions at
+        all for this date) or 'storm' (real signal, every digest's coding
+        output unparseable, so the night exits 1 and records ``failed``)."""
         target = date(2026, 7, day)
         _write_config(
             self.repo, project_id='testproj', escalation_port=8199,
             cwd_prefixes=[self.work_cwd],
             max_daily_digest_bytes=10 if kind == 'barren' else None,
         )
-        if kind in ('barren', 'productive'):
+        if kind in ('barren', 'productive', 'storm'):
             _write_transcript(
                 self.projects_root / _encode_cwd(self.work_cwd)
                 / f'session-{day}.jsonl',
@@ -3484,10 +3542,22 @@ class _NightRunner:
             projects_root=self.projects_root,
             target_date=target,
             now=datetime(2026, 7, day + 1, 3, 0, 0, tzinfo=UTC),
-            invoke=_fake_invoke_known_cause,
+            invoke=(
+                _fake_invoke_unparseable if kind == 'storm'
+                else _fake_invoke_known_cause
+            ),
             status_fetcher=None,
             poster=lambda url, env: self.escalations.append((url, env)),
         )
+
+    def recorded(self):
+        """The state document the REAL recorder just wrote for this run."""
+        status, doc = trickle_state.load_state(
+            trickle_state.trickle_state_path('testproj')
+        )
+        assert (status, doc) != ('missing', None), 'no run recorded yet'
+        assert doc is not None
+        return doc
 
 
 class TestBarrenStreakEscalation:
@@ -3500,6 +3570,74 @@ class TestBarrenStreakEscalation:
     than re-opening it, and avoids the one-shot latch's worse failure mode
     that 3270 explicitly rejected.
     """
+
+    def test_repeated_crashes_never_restamp_last_productive_at(self, tmp_path):
+        """THE "forever green" scenario, end to end through the real
+        pipeline: one productive night, then three storming ones. An
+        operator reading ``last_productive_at`` must see night one, not a
+        stamp refreshed by every crash."""
+        runner = _NightRunner(tmp_path)
+
+        runner.night(13, 'productive')
+        first = runner.recorded()
+        assert first['outcome'] == trickle_state.OUTCOME_PRODUCTIVE
+        stamp = first['last_productive_at']
+        assert stamp is not None
+
+        for night, expected_streak in ((14, 1), (15, 2), (16, 3)):
+            result = runner.night(night, 'storm')
+            assert result.exit_code == 1
+            doc = runner.recorded()
+            assert doc['outcome'] == trickle_state.OUTCOME_FAILED
+            assert doc['consecutive_failed_runs'] == expected_streak
+            assert doc['last_productive_at'] == stamp, (
+                'a night that crashed did nothing productive; restamping '
+                'here is the lie that makes a broken pipeline read healthy'
+            )
+
+    def test_a_failed_night_does_not_fire_the_barren_streak_escalation(
+        self, tmp_path
+    ):
+        """``_escalate_barren_streak`` returns early unless the outcome is
+        ``barren``, so a crashed night cannot fire it — the crash is
+        already owned by that run's own fail-loud escalation."""
+        runner = _NightRunner(tmp_path)
+        runner.night(13, 'barren')
+        runner.night(14, 'barren')
+
+        stormed = runner.night(15, 'storm')
+
+        assert stormed.exit_code == 1
+        assert stormed.barren_escalated is False
+        assert _streak_escalations(runner.escalations) == []
+
+    def test_a_failed_night_carries_the_barren_streak_forward(self, tmp_path):
+        """barren, barren, FAILED, barren — the FOURTH night is the one
+        that reaches the threshold. Asserting exactly one streak
+        escalation across all four proves the carry-forward cannot
+        double-fire the exact-equality edge trigger."""
+        runner = _NightRunner(tmp_path)
+
+        runner.night(13, 'barren')
+        runner.night(14, 'barren')
+        assert runner.recorded()['consecutive_barren_runs'] == 2
+
+        runner.night(15, 'storm')
+        carried = runner.recorded()
+        assert carried['outcome'] == trickle_state.OUTCOME_FAILED
+        assert carried['consecutive_barren_runs'] == 2, (
+            'a crashed run is evidence about the RUN, not about whether '
+            'signal is flowing'
+        )
+
+        fourth = runner.night(16, 'barren')
+
+        assert runner.recorded()['consecutive_barren_runs'] == 3
+        assert fourth.barren_escalated is True
+        assert len(_streak_escalations(runner.escalations)) == 1, (
+            'the streak passes through the threshold value at most once, so '
+            'the carry-forward cannot produce a second edge trigger'
+        )
 
     def test_threshold_default_is_three(self):
         """One barren night can be an ordinary bad day; three consecutive

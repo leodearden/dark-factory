@@ -1,5 +1,6 @@
 """Integration tests verifying causation_id flows through all paths."""
 
+import asyncio
 import json
 import uuid
 from unittest.mock import AsyncMock, MagicMock
@@ -300,6 +301,149 @@ async def test_execute_mem0_write_still_journals_on_success(service, write_journ
     assert row['success'] == 1
     assert row['error'] is None
     assert row['result_summary'] is not None
+
+
+@pytest.mark.asyncio
+async def test_execute_mem0_write_journals_cancellation_as_failure(
+    service, write_journal
+):
+    """A CANCELLED queued mem0 write must never journal as a success.
+
+    The durable queue cancels a write in two ordinary ways: the
+    ``asyncio.wait_for(..., self._write_timeout_seconds)`` around every
+    execute (durable_queue.py), and ``close()`` cancelling its worker tasks.
+    Either way the write provably never executed — so the Layer-1 row must
+    say so. ``success`` was derived from the ABSENCE of a recorded error, and
+    ``asyncio.CancelledError`` is a BaseException that sails past
+    ``except Exception``, so the ``finally`` journalled ``success=True`` for a
+    write that never reached mem0 at all.
+
+    Task 3582's property is preserved, not traded away: the row must still
+    EXIST on the cancellation path. Only its content changes.
+    """
+    op_id = str(uuid.uuid4())
+
+    # A plain hanging coroutine function, deliberately NOT an AsyncMock
+    # side_effect: the await must be a real suspension point so wait_for can
+    # actually cancel it mid-flight.
+    async def _hang(*_args, **_kwargs):
+        await asyncio.sleep(30)
+
+    service.mem0.add = _hang
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            service._execute_mem0_write(
+                {
+                    'content': 'a fact cancelled mid-flight',
+                    'project_id': 'test',
+                    '_write_op_id': op_id,
+                    'metadata': {'category': 'preferences_and_norms'},
+                }
+            ),
+            0.2,
+        )
+
+    row = await write_journal.get_write_op(op_id)
+    assert row is not None, 'a cancelled queued mem0 write must still be journaled'
+    assert row['operation'] == 'add_memory'
+    assert row['success'] == 0, 'a cancelled write never landed — it is not a success'
+    assert 'CancelledError' in (row['error'] or '')
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_backend_call_still_leaves_a_layer_2_row(
+    service, write_journal
+):
+    """A cancelled backend call must leave a Layer-2 row, not vanish.
+
+    Every backend write routes through one shared Layer-2 helper, and its
+    handler was ``except Exception``. On a cancellation NEITHER branch ran,
+    so no backend_ops row was written at all — the cancelled call simply
+    disappeared from Layer 2. That is the row an operator is sent to when
+    deciding whether a write landed (DurableWriteQueue.get_dead_items), so a
+    missing one leaves the question unanswerable exactly when it is asked.
+
+    Driven through the public ``add_memory``, whose Mem0 leg is a direct
+    journaled call, and cancelled once that call is in flight — the way a
+    request timeout or a client disconnect cancels it.
+    """
+    cid = str(uuid.uuid4())
+    in_flight = asyncio.Event()
+
+    async def _hang(*_args, **_kwargs):
+        in_flight.set()
+        await asyncio.sleep(30)
+
+    service.mem0.add = _hang
+
+    call = asyncio.create_task(
+        service.add_memory(
+            content='a fact cancelled mid-flight',
+            category='preferences_and_norms',
+            project_id='test',
+            causation_id=cid,
+        )
+    )
+    try:
+        await asyncio.wait_for(in_flight.wait(), 10)
+    finally:
+        call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+
+    ops = await write_journal.get_ops_by_causation(cid)
+    mem0_adds = [
+        o for o in ops
+        if o['layer'] == 'backend_op' and o['backend'] == 'mem0' and o['operation'] == 'add'
+    ]
+    assert len(mem0_adds) == 1, 'a cancelled backend call must still be journaled'
+    assert mem0_adds[0]['success'] == 0
+    assert 'CancelledError' in (mem0_adds[0]['error'] or '')
+
+
+@pytest.mark.asyncio
+async def test_add_episode_journals_cancellation_as_failure(service, write_journal):
+    """A cancelled add_episode enqueue must never journal as a success.
+
+    Per the write_ops schema, a row's ``success`` means "the enqueue was
+    ACCEPTED" — it is stamped the instant durable_queue.enqueue() commits.
+    An enqueue cancelled mid-commit was therefore never accepted, and is by
+    definition not a success.
+
+    This is the same defect as ``_execute_mem0_write``'s (optimistic
+    ``success = True`` initialiser + ``except Exception`` + a ``finally``
+    that journals it) on the far higher-traffic producer: the ``mem0_add``
+    queue operation has no live producer at all, while ``add_episode`` is
+    the hot Layer-1 path. The two are a documented pair — each file's
+    comment already names the other as its mirror — so they are fixed
+    together.
+    """
+    cid = str(uuid.uuid4())
+
+    async def _hang(*_args, **_kwargs):
+        await asyncio.sleep(30)
+
+    service.durable_queue.enqueue = _hang
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            service.add_episode(
+                content='never enqueued',
+                project_id='test',
+                causation_id=cid,
+            ),
+            0.2,
+        )
+
+    # add_episode mints its write_op_id internally and never returns it, so
+    # causation_id is the only join key available here.
+    ops = await write_journal.get_ops_by_causation(cid)
+    write_ops = [o for o in ops if o['layer'] == 'write_op']
+    assert len(write_ops) == 1, 'a cancelled add_episode must still be journaled'
+    assert write_ops[0]['operation'] == 'add_episode'
+    assert write_ops[0]['success'] == 0, 'an enqueue that never committed is not accepted'
+    assert 'CancelledError' in (write_ops[0]['error'] or '')
 
 
 # ── task 3212: the SECOND copy of the search-telemetry shape ──────────

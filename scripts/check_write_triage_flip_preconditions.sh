@@ -13,7 +13,8 @@
 # invariant now holds".
 #
 # The invariant: three review findings from task 3128's cycle-2 review must be on
-# main BEFORE the judge goes live. They are numbered here by the RECOVERED
+# main BEFORE the judge goes live, plus item 5 below, which closes a gap in the
+# first of them rather than being a fourth finding. They are numbered here by the RECOVERED
 # PAYLOAD's numbering (task 4762's own enumeration), NOT by the cycle-2 artifact's
 # issue numbers -- payload 1/2/4 map to artifact issues #3/#6/#8, so a reader who
 # follows these numbers into reviews-cycle-2/ reads an entirely different set.
@@ -44,6 +45,33 @@
 #   item 4  report_path.with_suffix('.md') means `--report-path foo.md` writes the
 #           JSON and then OVERWRITES it with the markdown, losing the JSON.
 #
+#   item 5  item 1's CONSUMPTION half, and not one of the three recovered
+#           findings: it closes a gap in item 1 itself (task 4949). Item 1 stops
+#           at the judge path -- it proves a verdict CAN be bound to a
+#           determinate candidate, and never executes the attach. So a change
+#           that only widened the parse contract opened item 1 while the write
+#           still landed on the band's top-1, which is the harm item 1
+#           describes, still live.
+#
+#           Checked by EXECUTING the ref's triage_write with an injected fake
+#           judge AND by reading the ref's judge module, via
+#           scripts/check_write_triage_attach_consumption.py. TWO branches
+#           satisfy it, and the verdict below names the one that did -- they
+#           rest on different evidence:
+#             - judge-side designation swap (option a): the judge names its
+#               candidate back and the attach tracks it across two different
+#               designations. MEASURED, by running the write twice.
+#             - judge-module attach target (option b, task 4762): judge_write
+#               feeds build_judge_prompt the decision.canonical_id it already
+#               holds, and triage_write is unchanged. Consumption holds BY
+#               CONSTRUCTION -- announced target and attach target are the same
+#               expression -- not by a measured swap.
+#
+#           WHAT IT DOES NOT ASSERT is listed on the probe's own PASS report
+#           (its _pass_scope_note, per branch): chiefly that it stops at
+#           BandDecision.canonical_id and never executes add_memory's stamp.
+#           Confirm those separately before flipping.
+#
 # Items 2 and 4 corrupt or churn the very artifact step 1 of the gate tells the
 # operator to read. Item 1 was re-raised as `correctness` in task 3128's fifth and
 # final review verdict.
@@ -53,7 +81,7 @@
 # in task 4762 (description + details) and in esc-3169-1's triage note.
 #
 # CONTRACT
-#   exit 0  -- all three fixes are on main; the flip may proceed
+#   exit 0  -- every item below holds on main; the flip may proceed
 #   exit 1  -- at least one is missing. DeterministicRunner files a born-at-L2
 #              milestone_check_failed escalation carrying this script's stdout,
 #              re-stamps gate_escalated_at, and blocks task 3169 again.
@@ -72,6 +100,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REF="${WRITE_TRIAGE_GATE_REF:-main}"
 
 JUDGE='fused-memory/src/fused_memory/server/write_triage_judge.py'
+TRIAGE='fused-memory/src/fused_memory/server/write_triage.py'
 EVAL='fused-memory/scripts/eval_write_triage_judge.py'
 CONF='fused-memory/config/config.yaml'
 
@@ -116,11 +145,50 @@ else
   PROBE_PY_CMD=(uv run --frozen --project "$REPO/fused-memory" python)
 fi
 
-# Bounded well inside the before_done predicate's own 120s budget. A host
-# without coreutils' `timeout` runs the probe unbounded rather than failing
-# every run on a missing binary.
+# Item 5's probe: the CONSUMPTION half. Its env seam mirrors item 1's exactly,
+# including the ARRAY (see the command-word-list note above) -- a $REPO
+# containing a space must not tear the resolved interpreter path apart.
+PROBE5="$REPO/scripts/check_write_triage_attach_consumption.py"
+
+# Item 5's PASS line, matched literally (grep -F). BOTH of its PASS branches
+# emit this prefix (see the item 5 block above), and no FAIL or
+# UNVERIFIABLE path does. Pinned by the hermetic tests in
+# scripts/tests/test_check_write_triage_flip_preconditions.py so the two cannot
+# drift apart silently.
+PROBE5_PASS_MARKER='PASS  the judge-bound candidate is CONSUMED by the attach'
+
+# The probe's one machine-readable line naming WHICH of those two branches
+# held, quoted into the verdict below. `PASS item 5` alone cannot tell an
+# operator whether a swap was MEASURED or whether option (b) held BY
+# CONSTRUCTION, and those authorise the production flag flip on different
+# evidence. Pinned from both ends by the hermetic tests, like the marker above.
+PROBE5_BRANCH_MARKER='ITEM5-BRANCH  '
+# How much of the branch name is quoted back. The probe keeps that line ASCII
+# for this bound: a cut inside a multi-byte character would emit a broken one.
+PROBE5_BRANCH_CHARS=120
+
+if [ -n "${CHECK_WRITE_TRIAGE_ATTACH_CONSUMPTION_PY:-}" ]; then
+  read -r -a PROBE5_PY_CMD <<< "$CHECK_WRITE_TRIAGE_ATTACH_CONSUMPTION_PY"
+elif [ -x "$REPO/.venv/bin/python3" ]; then
+  PROBE5_PY_CMD=("$REPO/.venv/bin/python3")
+else
+  PROBE5_PY_CMD=(uv run --frozen --project "$REPO/fused-memory" python)
+fi
+
+#: Wall-clock bound for EACH probe; both build their `timeout` from it.
+#
+# The two probes run in series inside one before_done check allowed 120s
+# (fused-memory/tests/server/test_write_triage_flip_gate_invariants.py::FLIP_GATE_DELIVERED_CHECK),
+# so 2 * PROBE_TIMEOUT_SECS plus a few seconds for the archive and items 2/4
+# must fit under it. An overrun ERRORS the check rather than failing it: a
+# silent, indefinite hold (docs/task-authoring.md 3.3). Retune against that
+# sum, never by widening the descriptor. Pinned by
+# scripts/tests/test_check_write_triage_flip_preconditions.py::TestBothProbesShareOneBudget.
+PROBE_TIMEOUT_SECS=45
+# A host without coreutils' `timeout` runs the probes unbounded rather than
+# failing every run on a missing binary.
 if command -v timeout >/dev/null 2>&1; then
-  PROBE_TIMEOUT_CMD=(timeout 90)
+  PROBE_TIMEOUT_CMD=(timeout "$PROBE_TIMEOUT_SECS")
 else
   PROBE_TIMEOUT_CMD=()
 fi
@@ -161,9 +229,8 @@ record_fail() { fail=1; failed_items="${failed_items}${1} "; }
 # *" 2 "* and *" 4 "*.
 item_failed() { case " $failed_items" in *" $1 "*) return 0 ;; esac; return 1; }
 
-# item 1 extracts the ref's package tree to a temp dir. `git archive` is
-# read-only and touches no .git state, unlike `git worktree add` -- which
-# matters in this repo, where refs are shared across every worktree.
+# Removed on exit however the script leaves. Filled by the single extraction
+# below, which both probe items read.
 PROBE_TMP=''
 cleanup() {
   if [ -n "${PROBE_TMP:-}" ]; then
@@ -194,6 +261,48 @@ read_ref_file() {
 note "write_triage flip preconditions — checked against ref '$REF' in $REPO"
 note ""
 
+# --- the ref's source tree, extracted ONCE for both probe items ---------------
+#
+# `git archive` is read-only and touches no .git state, unlike `git worktree
+# add` -- which matters in this repo, where refs are shared across every
+# worktree. write_triage.py and write_triage_judge.py are siblings in one tree,
+# so items 1 and 5 read the same extraction: a second archive of the same
+# pathspec buys nothing and costs wall clock the 120s delivered-check budget
+# cannot spare (see PROBE_TIMEOUT_CMD above).
+#
+# EXTRACTED is read by both items, and on failure BOTH fail closed -- each at
+# its own check site below, so `FAILING ITEMS` stays in ascending order and each
+# item's verdict sits with its own report. EXTRACT_ERROR carries the one
+# diagnosis both sites quote, so it is stated in one place. Every record_fail
+# runs in THIS shell -- never inside a `$(...)`, whose assignment a subshell
+# discards; that is how an unreadable ref once skipped a whole check block and
+# the gate exited 0 on unverifiable input.
+EXTRACTED=0
+EXTRACT_ERROR=''
+PROBE_TMP="$(mktemp -d 2>/dev/null)"
+if [ -z "$PROBE_TMP" ] || [ ! -d "$PROBE_TMP" ]; then
+  EXTRACT_ERROR="cannot create a temp dir to extract '$REF'"
+elif ! git -C "$REPO" archive "$REF" fused-memory/src 2>/dev/null \
+     | tar -x -C "$PROBE_TMP" 2>/dev/null; then
+  EXTRACT_ERROR="cannot extract fused-memory/src from ref '$REF'"
+else
+  EXTRACTED=1
+fi
+# BEST-EFFORT, and deliberately non-fatal. The real write_triage.py imports
+# shared.storm_counter, a different workspace member that no fused-memory/src
+# pathspec reaches. Extracting it too means item 5 measures the REF's copy
+# rather than whatever is installed. But a repo whose layout carries no
+# shared/src -- every hermetic fixture repo here, and any project laid out
+# differently -- must still get ordinary verdicts: a second archive that could
+# fail an item would be a new way for the gate to report UNVERIFIABLE against a
+# tree that is perfectly readable. So a failure here only drops the flag.
+PROBE5_EXTRA_ARGS=()
+if [ "$EXTRACTED" -eq 1 ] \
+   && git -C "$REPO" archive "$REF" shared/src 2>/dev/null \
+      | tar -x -C "$PROBE_TMP" 2>/dev/null; then
+  PROBE5_EXTRA_ARGS=(--extra-path "$PROBE_TMP/shared/src")
+fi
+
 # --- item 1: the judge path must bind a verdict to a determinate candidate ----
 #
 # EVERY unverifiable outcome here calls record_fail: a missing probe, a temp dir that
@@ -204,17 +313,8 @@ note ""
 if [ ! -f "$PROBE" ]; then
   note "FAIL  item 1  UNVERIFIABLE: probe missing at $PROBE. Failing closed."
   record_fail 1
-else
-  PROBE_TMP="$(mktemp -d 2>/dev/null)"
-  if [ -z "$PROBE_TMP" ] || [ ! -d "$PROBE_TMP" ]; then
-    note "FAIL  item 1  UNVERIFIABLE: cannot create a temp dir to extract '$REF'. Failing closed."
-    record_fail 1
-  elif ! git -C "$REPO" archive "$REF" fused-memory/src 2>/dev/null \
-       | tar -x -C "$PROBE_TMP" 2>/dev/null; then
-    note "FAIL  item 1  UNVERIFIABLE: cannot extract fused-memory/src from ref '$REF'."
-    note "              Failing closed."
-    record_fail 1
-  else
+elif [ "$EXTRACTED" -eq 1 ]; then
+  {
     # STDERR IS CAPTURED SEPARATELY, not folded in with 2>&1. The probe imports
     # the REF's tree, so anything that tree (or a transitive dependency) writes
     # at import time lands here -- measured on this checkout: a multi-line
@@ -298,7 +398,10 @@ else
       note "$(tail -n "$PROBE_STDERR_LINES" "$probe_err" 2>/dev/null \
         | sed 's/^/              /')"
     fi
-  fi
+  }
+else
+  note "FAIL  item 1  UNVERIFIABLE: $EXTRACT_ERROR. Failing closed."
+  record_fail 1
 fi
 
 # --- item 2: the committed accuracy artifact must be reproducible -------------
@@ -354,6 +457,81 @@ else
   record_fail '2 4'
 fi
 
+# --- item 5: the bound candidate must be CONSUMED by the attach ---------------
+#
+# Placed after items 2 and 4 so `FAILING ITEMS` reads in ascending order; it is
+# item 1's other half and nothing here depends on the order.
+#
+# Same verdict ladder and the same fail-closed discipline as item 1: every
+# unverifiable outcome calls record_fail 5, and each call runs in THIS shell,
+# never inside a `$(...)` -- see the note above read_ref_file for why that
+# distinction once made the gate PASS on unverifiable input.
+if [ ! -f "$PROBE5" ]; then
+  note "FAIL  item 5  UNVERIFIABLE: probe missing at $PROBE5. Failing closed."
+  record_fail 5
+elif [ "$EXTRACTED" -eq 1 ]; then
+  {
+    # Stderr captured separately, for item 1's reason: the probe EXECUTES the
+    # ref's own triage module, so that tree's import-time chatter lands here and
+    # would otherwise spend the 2000-char operator window on noise this gate
+    # does not control. The probe carries its own WARNs on stdout, and last.
+    probe5_err="$PROBE_TMP/probe5.stderr"
+    probe5_out="$(${PROBE_TIMEOUT_CMD[@]+"${PROBE_TIMEOUT_CMD[@]}"} \
+      "${PROBE5_PY_CMD[@]}" "$PROBE5" \
+      --src-root "$PROBE_TMP/fused-memory/src" \
+      ${PROBE5_EXTRA_ARGS[@]+"${PROBE5_EXTRA_ARGS[@]}"} 2>"$probe5_err")"
+    probe5_rc=$?
+    show_probe5_stderr=0
+    # BELT AND BRACES, and a HERE-STRING rather than a pipe: both for item 1's
+    # measured reasons. rc 0 alone is not a PASS because the probe executes the
+    # ref's own code and a SystemExit out of it exits 0 having printed nothing;
+    # and `printf | grep -q` races on SIGPIPE under `set -o pipefail`, which
+    # reported ~0.5% spurious failures per call. Do not "tidy" this into a pipe.
+    if [ "$probe5_rc" -eq 0 ] && grep -qF "$PROBE5_PASS_MARKER" <<<"$probe5_out"; then
+      note "PASS  item 5  the judge-bound candidate is consumed by the attach"
+      # HERE-STRING and `grep -m1`, never a pipe and never `| head -1`: the
+      # measured SIGPIPE race under `set -o pipefail` documented on item 1,
+      # and a second process in the pipeline is a second thing to lose it to.
+      # An absent or reformatted line leaves this empty and the verdict above
+      # stands exactly as it reads -- a drift in the probe's report format may
+      # not turn a PASS into a failure.
+      probe5_branch="$(grep -m1 -F "$PROBE5_BRANCH_MARKER" <<<"$probe5_out")"
+      probe5_branch="${probe5_branch#*"$PROBE5_BRANCH_MARKER"}"
+      if [ -n "$probe5_branch" ]; then
+        note "              via ${probe5_branch:0:$PROBE5_BRANCH_CHARS}"
+      fi
+    elif [ "$probe5_rc" -eq 0 ]; then
+      note "FAIL  item 5  UNVERIFIABLE: the probe exited 0 without reporting a PASS."
+      note "              Its report claims no verdict, so nothing was asserted about"
+      note "              the invariant. Failing closed."
+      record_fail 5
+      show_probe5_stderr=1
+    elif [ "$probe5_rc" -eq 1 ]; then
+      # Terse, for item 1's reason: the harm, both accepted remedies and the
+      # measured slate are all in the probe's own report printed directly below.
+      note "FAIL  item 5  the judge-bound candidate is NOT consumed by the attach"
+      note "              Subject: $TRIAGE at ref '$REF'."
+      note "              What was measured, and every branch the probe evaluated, are"
+      note "              in its own report below."
+      record_fail 5
+    else
+      note "FAIL  item 5  UNVERIFIABLE: the probe could not be run (exit $probe5_rc)."
+      note "              Interpreter: ${PROBE5_PY_CMD[*]}. Failing closed."
+      record_fail 5
+      show_probe5_stderr=1
+    fi
+    note "$(printf '%s\n' "$probe5_out" | sed 's/^/              /')"
+    if [ "$show_probe5_stderr" -ne 0 ] && [ -s "$probe5_err" ]; then
+      note "              --- probe stderr, last $PROBE_STDERR_LINES lines ---"
+      note "$(tail -n "$PROBE_STDERR_LINES" "$probe5_err" 2>/dev/null \
+        | sed 's/^/              /')"
+    fi
+  }
+else
+  note "FAIL  item 5  UNVERIFIABLE: $EXTRACT_ERROR. Failing closed."
+  record_fail 5
+fi
+
 # --- premature-flip detection -------------------------------------------------
 # Reported whether or not it changes the verdict: if the flag is already true on
 # main while any item is missing, the flip happened before its preconditions and
@@ -403,6 +581,17 @@ else
     note "        Item 1 is closed by EITHER attach-target remedy -- option (a) is task"
     note "        4798 item 7, option (b) is task 4762 -- so whichever lands first"
     note "        satisfies it. See its report above for what was measured."
+    clause_printed=1
+  fi
+  # Gated on its OWN item, like the two clauses above and for the same measured
+  # reason: this arm runs on ANY failure, so an ungated clause names an item the
+  # report declared PASS a few lines up, contradicting the authoritative
+  # FAILING ITEMS line.
+  if item_failed 5; then
+    note "        Item 5 is item 1's CONSUMPTION half: a verdict can be bound to a"
+    note "        determinate candidate and still not be the id the write attaches to,"
+    note "        so closing item 1 does not close this. Either branch listed in"
+    note "        this script's item 5 block satisfies it."
     clause_printed=1
   fi
   # Fallback so this block can never go guidance-free: unreachable today

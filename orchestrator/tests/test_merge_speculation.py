@@ -3052,8 +3052,8 @@ class TestTimeoutMarkCoverage:
 # lone `MagicMock(passed=True)` — recorded and pinned in
 # fused-memory/tests/test_check_bare_magicmock_config.py::
 # TestRuleBCoversMergeSpeculation, which also holds the two-sided proof that the
-# rule reaches this module. This module is deliberately absent from the rule's
-# _DATACLASS_DOUBLE_DEBT baseline, so a regression here fails the gate.
+# rule reaches this module. Rule B has no debt baseline at all (task 4354), so a
+# regression here fails the gate.
 #
 # The single deliberate bare double below keeps a per-site
 # `bare-dataclass-double` noqa pragma, which is now its SOLE suppression.
@@ -3153,15 +3153,15 @@ class TestDispositionDoubleFidelity:
         (fused-memory/scripts/check_bare_magicmock_config.py, task 4016).  The
         file-local scope exemption that used to pair with it was deleted in task
         4246 along with the duplicate guard it belonged to.  That single pragma
-        is not a licence to add another bare double here: every other one in this
-        module is still covered, because the module is deliberately OFF the
-        rule's _DATACLASS_DOUBLE_DEBT baseline.
+        is not a licence to add another bare double here: a pragma suppresses the
+        one site it sits above, and Rule B has no per-file baseline that could
+        cover the rest (task 4354).
         """
         for logger_name in _FAIL_OPEN_LOGGERS:
             caplog.set_level(logging.WARNING, logger=logger_name)
 
-        # This module is deliberately OFF _DATACLASS_DOUBLE_DEBT, so the pragma
-        # below is a per-SITE suppression and every other double here stays covered.
+        # The pragma below is a per-SITE suppression — Rule B has no per-file
+        # baseline — so every other double in this module stays covered.
         # noqa: bare-dataclass-double — permanent mutation leg: this bare double IS the test subject, proving the positive leg can actually fail
         bare = MagicMock(
             passed=False, summary='tests failed', test_output='FAIL',
