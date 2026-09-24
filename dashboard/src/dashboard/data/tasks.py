@@ -369,6 +369,11 @@ def _shape_task(task: dict) -> dict | None:
     ``updatedAt`` is preserved as ``updated_at`` — it is the recency key for
     ordering done tasks and the ``completed`` display timestamp.
 
+    ``description`` stays because ``redux_api.shape_escalations`` embeds this
+    whole dict as each escalation row's ``task`` and the Escalations drawer
+    renders it; ``details`` is dropped because only the Task Detail pane
+    renders it, and that pane reads it through :func:`fetch_task_prose`.
+
     ``claimant_run_id`` and ``heartbeat_at`` are carried through for the
     STRANDED projection (task 3543 / PRD ι): they are the two columns
     :func:`task_is_stranded` reads, and dropping them here is what previously
@@ -406,7 +411,6 @@ def _shape_task(task: dict) -> dict | None:
         'id': tid,
         'title': task.get('title') or '',
         'description': task.get('description') or '',
-        'details': task.get('details') or '',
         'status': task.get('status'),
         'priority': task.get('priority'),
         'dependencies': deps,
@@ -769,7 +773,7 @@ async def fetch_task_page(
     window passes ``offset=max(0, n_terminal - window)``, computed from a live
     task count that grows every time a task completes, so a fresh key is
     minted on every completion.  Each retired key held a 400-row list — rows
-    carrying description/details/metadata — plus an ``asyncio.Lock``, forever
+    carrying description/metadata — plus an ``asyncio.Lock``, forever
     (task 3857 review).  Quantizing the offset does NOT fix this and was
     rejected: ``n_terminal`` grows monotonically, so quantized offsets do too
     — that slows the leak by the quantum, it does not bound it.
@@ -1178,8 +1182,8 @@ async def fetch_task_prose(
     selected task only. Each outcome is its own type because the route answers
     each with a different status:
 
-    - :class:`TaskProse`: missing prose normalises to ``''``, as in
-      :func:`_shape_task`;
+    - :class:`TaskProse`: missing prose normalises to ``''``, as
+      :func:`_shape_task` does for ``description``;
     - :class:`TaskNotFound`: fused-memory's ``TaskNotFoundError``, matched on
       its structured ``error_type``. It is RETURNED from the per-URL call, not
       raised: ``first_success`` would treat a raised ``ValueError`` as a soft
