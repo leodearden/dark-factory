@@ -254,12 +254,12 @@ def _write_heartbeat(fleet_dir, unit, **overrides):
     mktemp + `mv -f` idiom -- rather than `Path.write_text`, which truncates
     the target file before writing its new content. That truncate-then-write
     window is a torn read for any concurrent reader: this function is also
-    called from a background `threading.Timer` thread by `_heartbeat_timeline`
-    (below) WHILE the spawned script polls this same file every
+    called from the `_rewrites_on_gate_polls` watcher thread (below) WHILE
+    the spawned script polls this same file every
     ORCH_DRAIN_POLL_INTERVAL_SECS, and a poll landing inside the window would
     see a zero-length file -- drain_check.py's `_read_heartbeat` turns a
     `ValueError` from the empty/partial JSON into "absent", a verdict no
-    timeline scheduled. `os.replace` is a same-filesystem rename, atomic on
+    rewrite asked for. `os.replace` is a same-filesystem rename, atomic on
     POSIX, so a concurrent reader always observes either the old content or
     the full new content, never a partial write (reviewer_comprehensive #2).
     """
@@ -972,7 +972,7 @@ def test_a_drain_check_that_cannot_run_is_traced_as_the_coerced_absent(tmp_path)
     surface: drain_check.py's main() prints one of four literals and returns
     0, and this harness deliberately does not shim `python3` (a fake first on
     bin_dir would also shadow the fake systemctl's own `#!/usr/bin/env
-    python3` shebang, see _heartbeat_timeline). It stays a defensive backstop
+    python3` shebang, see _rewrites_on_gate_polls). It stays a defensive backstop
     against a future drain_check.py change.
     """
     fleet_dir = tmp_path / "fleet"
@@ -1173,21 +1173,11 @@ _HB_IDLE = {"merge_idle": True}  # fresh + drained
 # can't carry a call-time value.
 _HB_STALE = {"merge_idle": True, "ts_epoch": time.time() - 99999}
 
-# Every timeline below polls at this cadence; named so the offsets DERIVED
-# from it (immediately below) move together with it instead of each test
+# Every test below polls at this cadence; named so the poll counts DERIVED
+# from it (_polls_outlasting) move together with it instead of each test
 # repeating a bare "1" string for ORCH_DRAIN_POLL_INTERVAL_SECS
 # (reviewer_comprehensive #1).
 _TIMELINE_POLL_INTERVAL_SECS = 1
-# The delay before a timeline's FIRST transition. It must clear both the
-# subprocess's own startup and drain_gate's first heartbeat read -- fast under
-# no load (~0.2s observed) but NOT bounded -- with margin to spare: if a
-# loaded box pushes that first read out past this point, the read observes
-# the ALREADY-flipped heartbeat instead of the pre-timeline value, and every
-# assertion that depends on the pre-flip behaviour (starting with the initial
-# "deferring" line every one of these tests asserts on) fails for a reason
-# unrelated to the drain_gate branch under test. Three poll intervals rather
-# than a bare `2.0`, so the margin scales if the poll interval ever does.
-_FIRST_TRANSITION_DELAY_SECS = 3 * _TIMELINE_POLL_INTERVAL_SECS
 # ONE binding feeding both the grace and the timeout -- see
 # test_defer_withholds_restart_while_busy. Here the grace is a
 # MUST-NEVER-BE-REACHED bound rather than a wait-proving one: if the
@@ -1195,212 +1185,14 @@ _FIRST_TRANSITION_DELAY_SECS = 3 * _TIMELINE_POLL_INTERVAL_SECS
 # instead of force-firing early and looking like a pass.
 _IN_LOOP_RESUME_SPAWN_TIMEOUT_SECS = 15
 # Longer than the worst spawn-to-first-poll latency measured under load (2.80s
-# at loadavg ~90 on 32 cores, task 5838) and than the 3s wall-clock offset
-# (_FIRST_TRANSITION_DELAY_SECS) at which the first rewrite currently fires.
+# at loadavg ~90 on 32 cores, task 5838) and than the 3s wall-clock offset the
+# old timer-driven rewrites fired at.
 _SLOW_START_SECS = 4
 # Small, so each counted run (see _polls_outlasting) is a handful of polls. At
 # least 2, so the watcher's FIRST rewrite, which reacts to the gate's first busy
 # poll, still lands before the busy loop's last pre-force poll: bash's
 # whole-second $SECONDS can shrink an F-second deadline to about F-1 seconds.
 _SHORT_FORCE_FIRE_SECS = 2
-
-
-@contextlib.contextmanager
-def _heartbeat_timeline(fleet_dir, unit, timeline):
-    """Rewrite <fleet_dir>/<unit>.json on a schedule while `_run_script` blocks.
-
-    `drain_check.py` classifies a verdict purely from the on-disk heartbeat
-    JSON (scripts/drain_check.py `classify`), so a single static file can
-    never exercise a mid-poll verdict CHANGE -- busy->idle, busy->stale->idle,
-    or a stale<->busy oscillation. This helper drives those transitions by
-    rewriting the file on a schedule while the spawned script polls it.
-
-    `timeline` is an ordered ``(label, delay_secs, overrides)`` sequence. Each
-    entry arms one ``threading.Timer(delay_secs, ...)``, all started together
-    at context entry so every delay is an offset from the SAME t0 -- callers'
-    timings are relative to script start, and `_run_script` must be invoked
-    INSIDE this block. ``overrides`` is forwarded to `_write_heartbeat` as
-    kwargs; ``overrides is None`` instead UNLINKS <fleet_dir>/<unit>.json
-    (missing_ok=True), driving the verdict to "absent".
-
-    Yields a `fired` list that each transition appends its label to on
-    success. READ THAT LIST FOR WHAT IT IS: a wall-clock observation of THIS
-    process, never a record of what the spawned script reached. Every timer is
-    armed here at context entry and cancelled only once the with-BODY returns,
-    so a label lands in `fired` iff the script's TOTAL wall clock outran that
-    label's delay -- whatever the script did or did not observe.
-
-    So only POSITIVE `<label> in fired` checks are legitimate, and what they
-    assert is non-vacuity: "the rewrite this test depends on did happen before
-    the script exited". A NEGATIVE `<label> not in fired` is FORBIDDEN in any
-    form (task 4890). It reads as "the correct code never reached that state"
-    and is in fact "this host was fast enough", so it fails on correct code
-    under load: one stood in
-    test_busy_stale_busy_oscillation_does_not_reset_the_force_fire_anchor and
-    failed 2/10 isolated reruns at loadavg 90 on 32 cores, where the same run's
-    wall clock was measured varying 11.3s-39.7s. Observe a counterfactual
-    "trap" transition through the SUBPROCESS'S STDOUT instead -- that records
-    what the script actually reached, and no amount of host load can perturb
-    it. `test_fired_records_elapsed_wall_clock_not_script_reachability` pins
-    this premise directly, and is the test to read before adding a timeline
-    test that wants to assert a negative.
-
-    Cancels and joins every timer on the way out, and asserts that no
-    transition raised -- collected into a list rather than left to escape
-    silently on a background thread, so a failed rewrite can never masquerade
-    as a passing test. If the with-BODY also raised (e.g. `_run_script`
-    raising `subprocess.TimeoutExpired` during a RED-proof mutant run), that
-    exception is the more diagnostic of the two and is left to propagate
-    as-is -- any collected transition errors are folded into it as a note
-    instead of being raised as a separate `AssertionError` that would bump
-    the body's own failure down to `__context__` (reviewer_comprehensive #3).
-
-    Rewriting real heartbeat JSON, rather than shimming a fake `python3` onto
-    PATH to script drain_check.py's own output, is deliberate: this module's
-    own docstring records that drain_check.py is NOT mocked here -- it runs
-    for real against heartbeat files the tests write -- and a scripted-verdict
-    shim would stop exercising classify()'s fresh-window arithmetic. It would
-    also collide with `_make_fake_systemctl`'s fake, whose shebang is
-    `#!/usr/bin/env python3`: bin_dir is already first on PATH, so a fake
-    `python3` placed there would shadow it too.
-    """
-    fired = []
-    errors = []
-
-    def _apply(label, overrides):
-        try:
-            if overrides is None:
-                (Path(fleet_dir) / f"{unit}.json").unlink(missing_ok=True)
-            else:
-                _write_heartbeat(fleet_dir, unit, **overrides)
-            fired.append(label)
-        except Exception as exc:  # collected, not raised -- see docstring
-            errors.append((label, exc))
-
-    timers = []
-    for label, delay_secs, overrides in timeline:
-        timer = threading.Timer(delay_secs, _apply, args=(label, overrides))
-        timer.daemon = True
-        timers.append(timer)
-    for timer in timers:
-        timer.start()
-
-    try:
-        yield fired
-    finally:
-        for timer in timers:
-            timer.cancel()
-        for timer in timers:
-            timer.join(timeout=5)
-        if errors:
-            in_flight = sys.exc_info()[1]
-            if in_flight is not None:
-                in_flight.add_note(
-                    f"ALSO: heartbeat timeline transition(s) raised: {errors!r}"
-                )
-            else:
-                raise AssertionError(
-                    f"heartbeat timeline transition(s) raised: {errors!r}"
-                )
-
-
-def test_fired_records_elapsed_wall_clock_not_script_reachability(tmp_path):
-    """`fired` is a WALL-CLOCK observation of the TEST process -- not a record
-    of what the spawned script actually reached.
-
-    `_heartbeat_timeline` arms one `threading.Timer` per transition IN THIS
-    process and cancels them only once the with-block exits, so a label
-    lands in `fired` iff the BODY was still inside the block when that
-    timer's delay elapsed -- whether or not anything ever read the heartbeat
-    the transition wrote. The body below proves the decoupling: it finishes
-    everything it cares about in its first statement (reading the
-    pre-transition heartbeat), then merely LINGERS past the transition's
-    delay, standing in for a subprocess still running under host load. The
-    label lands anyway.
-
-    That is why a NEGATIVE `assert <label> not in fired` cannot be a
-    behavioural assertion: it asserts only "the with-body returned in under
-    <delay> seconds", which on a contended host is a property of the LOAD,
-    not of the code under test (task 4890). The POSITIVE `<label> in fired`
-    non-vacuity checks elsewhere in this file are a different claim and are
-    unaffected -- they assert a transition a test depends on did land.
-
-    Load-independent in the direction that matters: it asserts a label IS
-    present after lingering PAST the delay, so extra host load can only make
-    it more true, never flaky. In-process and sub-second; spawns no
-    subprocess and shims no PATH.
-    """
-    fleet_dir = tmp_path / "fleet"
-    _write_heartbeat(fleet_dir, UNIT_R, **_HB_BUSY)
-    trap_delay_secs = 0.2
-
-    with _heartbeat_timeline(
-        fleet_dir, UNIT_R, [("trap", trap_delay_secs, _HB_IDLE)],
-    ) as fired:
-        # The body's OWN business, complete in one statement: it reads the
-        # heartbeat and gets the pre-transition value. Nothing below ever
-        # looks at the file again, so nothing here observes the trap.
-        observed = json.loads((fleet_dir / f"{UNIT_R}.json").read_text())
-        # From here the body only LINGERS -- the stand-in for `_run_script`
-        # still blocking on a child that host load has slowed down.
-        time.sleep(trap_delay_secs * 2)
-        # Bounded top-up wait: under heavy load the timer THREAD may not have
-        # been scheduled by the time that sleep returns. Waiting on the
-        # CONDITION rather than trusting one fixed sleep is what keeps this
-        # test's own assertion load-independent -- extra load makes it wait
-        # longer, never fail. The bound only caps a genuine hang.
-        deadline = time.monotonic() + 30
-        while not fired and time.monotonic() < deadline:
-            time.sleep(0.05)
-
-    assert "trap" in fired, (
-        f"the trap label must land purely because the BODY lingered past "
-        f"{trap_delay_secs}s, with nothing having read the heartbeat it "
-        f"wrote; got fired={fired!r} body_observed={observed!r}"
-    )
-
-
-def _busy_unit_drain_run(tmp_path, timeline, *, spawn_timeout, **knobs):
-    """Shared preamble + spawn for the busy-unit drain-gate timeline tests
-    below (reviewer_comprehensive #4).
-
-    Every one of them starts UNIT_R busy, drives one or more scheduled
-    heartbeat transitions across a run of restart-all-orchestrators.sh
-    --drain via `_heartbeat_timeline`, and inspects the result -- only the
-    timeline and a couple of env knobs actually differ between them. This
-    factors out the rest (fake systemctl setup, the initial busy heartbeat,
-    and the timeline-wrapped `_run_script` call) so a caller is left with
-    just its own timeline, knobs, and assertions.
-
-    `knobs` are merged into `_run_script`'s env on top of
-    {"RESTART_VERIFY_TIMEOUT": "5", "ORCH_DRAIN_POLL_INTERVAL_SECS":
-    str(_TIMELINE_POLL_INTERVAL_SECS)}, both of which every caller wants and
-    none of them varies.
-
-    Returns (result, state, fired) so a caller can assert directly on all
-    three without re-deriving any of them: `state` is
-    _load_state(state_path) (the fake systemctl's recorded calls) and
-    `fired` is the timeline's own non-vacuity list (see
-    _heartbeat_timeline's docstring).
-    """
-    fleet_dir = tmp_path / "fleet"
-    bin_dir, state_path = _make_fake_systemctl(
-        tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
-    )
-    _write_heartbeat(fleet_dir, UNIT_R, **_HB_BUSY)
-
-    env = {
-        "RESTART_VERIFY_TIMEOUT": "5",
-        "ORCH_DRAIN_POLL_INTERVAL_SECS": str(_TIMELINE_POLL_INTERVAL_SECS),
-    }
-    env.update(knobs)
-
-    with _heartbeat_timeline(fleet_dir, UNIT_R, timeline) as fired:
-        result = _run_script(
-            bin_dir, state_path, fleet_dir, "--drain", env=env, timeout=spawn_timeout,
-        )
-
-    return result, _load_state(state_path), fired
 
 
 @dataclasses.dataclass(frozen=True)
