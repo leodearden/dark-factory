@@ -6,7 +6,7 @@ Usage: check_memory_metadata_census_reporting.py <hours>
 
 It reads both the census service's systemd state and the newest row of the
 history artifact, because the census wrapper always exits 0 and a
-healthy-looking unit can still have stopped the trend. OPERATIONS.md §12
+healthy-looking unit can still be recording nothing. OPERATIONS.md §12
 "Nightly canonical/topic coverage census (05:00)" carries the full argument.
 """
 from __future__ import annotations
