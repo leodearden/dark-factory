@@ -27,6 +27,8 @@ from pathlib import Path
 
 import pytest
 from _fm_helpers import load_script_module
+from shared.cli_boundary import EXIT_STDOUT_FAILED, run_cli
+from shared.testing_streams import closed_pipe_stdout
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'memory_eval_retrieval_probe.py'
 REGISTRY_PATH = Path(__file__).parent / 'fixtures' / 'memory_eval_topic_registry.json'
@@ -3532,6 +3534,46 @@ class TestNonStdoutOSErrorsAreAttributedAtTheirSeam:
         assert 'absent.jsonl' in errors[0]
         assert 'stdout' not in errors[0]
         assert captured.out == ''
+
+
+class TestAStdoutFailureAfterEmissionNamesTheArtifacts:
+    """The metrics and report are on disk before the report is printed, so a
+    stdout failure there must say where they are: the exit status alone says
+    only that the run could not complete."""
+
+    STAMP = '20260730T090000Z'
+
+    @pytest.mark.parametrize('buffering', [None, 1], ids=['deferred', 'in-band'])
+    def test_the_error_line_names_both_artifacts(
+        self, monkeypatch, tmp_path, capsys, buffering,
+    ):
+        m = _mod()
+        registry = _probe_registry()
+        registry_path = tmp_path / 'registry.json'
+        registry_path.write_text(json.dumps(_as_payload(registry)), encoding='utf-8')
+        _install_double(monkeypatch, _ServiceDouble(by_query=_canned_hits(registry)))
+        monkeypatch.setenv('MEMORY_EVAL_RUN_STAMP', self.STAMP)
+        out_root = tmp_path / 'out'
+        argv = [
+            '--registry', str(registry_path),
+            '--out-root', str(out_root),
+            '--project-id', 'dark_factory',
+        ]
+
+        with closed_pipe_stdout(monkeypatch, buffering=buffering, quiet_close=True):
+            code = run_cli(lambda: m.main(argv))
+        monkeypatch.undo()
+
+        eval_dir = out_root / m.EVAL_ID
+        metrics_path = eval_dir / f'metrics-{self.STAMP}.json'
+        report_path = eval_dir / f'report-{self.STAMP}.txt'
+        assert code == EXIT_STDOUT_FAILED
+        errors = _error_lines(capsys.readouterr().err)
+        assert len(errors) == 1
+        assert str(metrics_path) in errors[0]
+        assert str(report_path) in errors[0]
+        assert metrics_path.exists()
+        assert report_path.exists()
 
 
 # ---------------------------------------------------------------------------

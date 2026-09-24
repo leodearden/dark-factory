@@ -6,7 +6,10 @@ file pins only that each script in :data:`_MIGRATED_SCRIPTS` is WIRED to it: its
 parser is a ``LoudArgumentParser`` and its ``__main__`` guard calls
 ``shared.cli_boundary.run_cli``. The exit status a closed stdout produces is
 decided at interpreter finalization, so every test runs the script in a real
-child process and observes only argv, exit status and streams.
+child process and observes only argv, exit status and streams. The one
+exception reads a script's own ``EXIT_RUN_FAILED``: that is the agreement pin
+``shared.cli_boundary.EXIT_STDOUT_FAILED``'s docstring asks each consumer with
+its own exit-code table for.
 
 Later migration batches append to :data:`_MIGRATED_SCRIPTS`, and to
 :data:`_STORE_FREE_RUNS` for an ordinary run that needs no store, rather than
@@ -20,6 +23,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from _fm_helpers import load_script_module
 from shared.cli_boundary import EXIT_STDOUT_FAILED
 
 _SCRIPTS_DIR = Path(__file__).parent.parent / 'scripts'
@@ -39,20 +43,28 @@ _MIGRATED = pytest.mark.parametrize(
     ids=[Path(script).stem for script, _ in _MIGRATED_SCRIPTS],
 )
 
+def _probe_derive_registry_argv(out_root: Path) -> list[str]:
+    """Prints ~67 KB of registry candidates and writes no artifact."""
+    return ['--derive-registry']
+
+
+def _corpus_fixture_run_argv(out_root: Path) -> list[str]:
+    """Writes three artifacts under *out_root*, then prints a short report."""
+    return [
+        '--archive-root', str(_CORPUS_FIXTURE_ARCHIVE),
+        '--out-root', str(out_root), '--stamp', _STAMP,
+    ]
+
+
 _STORE_FREE_RUNS = pytest.mark.parametrize(
     ('script', 'argv_for'),
     [
         pytest.param(
-            'memory_eval_retrieval_probe.py',
-            lambda out_root: ['--derive-registry'],
+            'memory_eval_retrieval_probe.py', _probe_derive_registry_argv,
             id='memory_eval_retrieval_probe',
         ),
         pytest.param(
-            'memory_eval_transcript_corpus.py',
-            lambda out_root: [
-                '--archive-root', str(_CORPUS_FIXTURE_ARCHIVE),
-                '--out-root', str(out_root), '--stamp', _STAMP,
-            ],
+            'memory_eval_transcript_corpus.py', _corpus_fixture_run_argv,
             id='memory_eval_transcript_corpus',
         ),
     ],
@@ -163,3 +175,39 @@ def test_an_ordinary_run_into_a_closed_pipe_is_one_clean_stdout_failure(
     )
 
     _assert_one_clean_stdout_failure(code, err)
+
+
+@_BUFFERING
+class TestTheStdoutFailureLineNamesOnlyWhatWasWritten:
+    """A stdout failure AFTER the artifacts landed names them; a run that
+    wrote nothing claims nothing."""
+
+    def test_the_corpus_names_its_report_and_agrees_on_the_exit_status(
+        self, unbuffered, tmp_path,
+    ):
+        corpus = load_script_module(
+            _SCRIPTS_DIR / 'memory_eval_transcript_corpus.py',
+            mod_name='memory_eval_transcript_corpus',
+        )
+        report_path = tmp_path / corpus.EVAL_ID / f'report-{_STAMP}.txt'
+
+        code, _, err = _spawn(
+            'memory_eval_transcript_corpus.py', *_corpus_fixture_run_argv(tmp_path),
+            closed_stdout=True, unbuffered=unbuffered,
+        )
+
+        assert code == corpus.EXIT_RUN_FAILED
+        error = _assert_one_clean_stdout_failure(code, err)
+        assert 'closed the output pipe' in error
+        assert error.endswith(f'(the report was written to {report_path})')
+        assert report_path.exists()
+
+    def test_the_probes_derive_registry_run_claims_no_artifact(self, unbuffered, tmp_path):
+        code, _, err = _spawn(
+            'memory_eval_retrieval_probe.py', *_probe_derive_registry_argv(tmp_path),
+            closed_stdout=True, unbuffered=unbuffered,
+        )
+
+        error = _assert_one_clean_stdout_failure(code, err)
+        assert '(' not in error
+        assert 'written to' not in error
