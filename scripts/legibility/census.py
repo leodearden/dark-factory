@@ -3240,6 +3240,27 @@ def _build_stage_invokes(cfg, *, project_root):
     )
 
 
+def _project_identity_mismatch(project_root: Path, cfg, config_path: Path) -> str | None:
+    """Return why *project_root* and *cfg* name different projects, or
+    ``None`` when they agree.
+
+    Two identity sources must agree: *project_root* (``--project-root``,
+    already resolved) drives the codebook, state, report and payload paths
+    and the stage cwd, while ``cfg.project_root`` drives the census window
+    and archive roots and ``cfg.project_id`` stamps every filing. Roots are
+    compared RESOLVED, so an equivalent relative spelling is no mismatch.
+    A mismatch is a bad argument, never a deferral (task 3269).
+    """
+    cfg_project_root = Path(cfg.project_root).resolve()
+    if cfg_project_root == project_root:
+        return None
+    return (
+        f"--project-root {project_root} disagrees with the project_root in "
+        f"{config_path} ({cfg.project_root!r} -> {cfg_project_root}); refusing "
+        f"to run a mixed-project census (project_id={cfg.project_id!r})"
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entrypoint.
 
@@ -3396,20 +3417,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"census: failed to load config at {config_path}: {exc}", file=sys.stderr)
         return 1
 
-    # Two identity sources must agree: --project-root drives the codebook,
-    # state, report and payload paths and the stage cwd, while cfg.project_root
-    # drives the census window and archive roots and cfg.project_id stamps
-    # every filing. A mismatch is a bad argument, never a deferral -- the same
-    # shape as the not-a-directory check above.
-    cfg_project_root = Path(cfg.project_root).resolve()
-    if cfg_project_root != project_root:
-        print(
-            f"census: --project-root {project_root} disagrees with the "
-            f"project_root in {config_path} ({cfg.project_root!r} -> "
-            f"{cfg_project_root}); refusing to run a mixed-project census "
-            f"(project_id={cfg.project_id!r})",
-            file=sys.stderr,
-        )
+    mismatch = _project_identity_mismatch(project_root, cfg, config_path)
+    if mismatch is not None:
+        print(f"census: {mismatch}", file=sys.stderr)
         return 1
 
     now = datetime.now(UTC)
