@@ -1547,13 +1547,15 @@ def test_main_manifest_root_that_is_not_a_checkout_is_loudly_non_zero(
 
 def test_main_run_is_strictly_read_only(tmp_path, make_tasks_db):
     """THE READ-ONLY CLAIM, CHECKED. The tasks.db AND every manifest YAML have
-    their (mtime, sha256) captured before and after a full run, and the whole
-    mapping must be unchanged."""
+    their (mtime, sha256) captured before and after a full run that reports
+    BOTH a drifted descriptor and an unbound label, and the whole mapping must
+    be unchanged."""
     import hashlib
 
     root = _make_project(
         tmp_path, make_tasks_db,
-        tasks=[_task(100, [_entry("gate", {**_GREP_CHECK, "pattern": "drifted"})])],
+        tasks=[_task(100, [_entry("gate", {**_GREP_CHECK, "pattern": "drifted"})]),
+               _labelled(200, prd_path="plans/a-prd.md", label="omega")],
         manifests=[
             ("plans/a-prd.capability-manifest.yaml", _manifest_doc(100)),
             ("docs/prds/b-prd.capability-manifest.yaml",
@@ -1573,9 +1575,105 @@ def test_main_run_is_strictly_read_only(tmp_path, make_tasks_db):
         }
 
     before = fingerprint()
-    assert _run_cli("--project-root", str(root)).returncode == 1
+    result = _run_cli("--project-root", str(root))
+    assert result.returncode == 1
+    # The run genuinely exercised the label-binding direction too.
+    assert "label=omega" in result.stdout
 
     assert fingerprint() == before
+
+
+# The label-binding direction's exit contract. A LIVE unbound label is dirty; a
+# historical one is reported but not dirty (see UnboundLabel.is_live). Labels
+# here are ASCII so no assertion depends on the child's stdout encoding.
+
+def test_main_exit_1_when_a_live_unbound_label_is_the_only_issue(
+        tmp_path, make_tasks_db):
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_labelled(7, status="pending", label="kappa-followup")],
+        manifests=[("plans/x-prd.capability-manifest.yaml", _declaring("kappa"))],
+    )
+
+    result = _run_cli("--project-root", str(root))
+
+    assert result.returncode == 1
+    assert _unbound_line(7, "kappa-followup", "pending", "LIVE") in result.stdout.splitlines()
+
+
+def test_main_exit_0_when_every_unbound_label_is_historical_but_names_them_all(
+        tmp_path, make_tasks_db):
+    """Clean, but never silent: a done or cancelled row cannot be touched by a
+    future planning batch, so it does not make the run dirty, and it is still
+    in the report."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_labelled(7, status="done", label="omega"),
+               _labelled(8, status="cancelled", label="psi")],
+        manifests=[("plans/x-prd.capability-manifest.yaml", _declaring("alpha"))],
+    )
+
+    result = _run_cli("--project-root", str(root))
+
+    assert result.returncode == 0, result.stdout
+    lines = result.stdout.splitlines()
+    assert _unbound_line(7, "omega", "done", "historical") in lines
+    assert _unbound_line(8, "psi", "cancelled", "historical") in lines
+
+
+def test_main_drift_plus_a_historical_unbound_label_still_exits_1(
+        tmp_path, make_tasks_db):
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_task(100, [_entry("gate", {**_GREP_CHECK, "pattern": "def bar"})]),
+               _labelled(7, status="done", prd_path="plans/a-prd.md", label="omega")],
+        manifests=[("plans/a-prd.capability-manifest.yaml",
+                    _manifest_doc(100, prd="plans/a-prd.md"))],
+    )
+
+    assert _run_cli("--project-root", str(root)).returncode == 1
+
+
+def test_main_exit_0_with_neither_drift_nor_an_unbound_label(tmp_path, make_tasks_db):
+    """A live task whose label its sidecar declares is BOUND, so nothing is
+    wrong."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_labelled(7, status="pending", label="alpha")],
+        manifests=[("plans/x-prd.capability-manifest.yaml", _declaring("alpha"))],
+    )
+
+    assert _run_cli("--project-root", str(root)).returncode == 0
+
+
+def test_main_discovery_failure_exits_1_whatever_the_unbound_list_holds(
+        tmp_path, make_tasks_db):
+    """Only historical labels here, which alone would be clean, but the corpus
+    was never enumerated, so no label was classified at all."""
+    root = _make_project(tmp_path, make_tasks_db,
+                         tasks=[_labelled(7, status="done", label="omega")])
+    not_a_checkout = tmp_path / "bare"
+    not_a_checkout.mkdir()
+
+    result = _run_cli("--project-root", str(root), "--manifest-root", str(not_a_checkout))
+
+    assert result.returncode == 1
+
+
+def test_main_json_carries_unbound_labels_with_their_liveness(tmp_path, make_tasks_db):
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_labelled(7, status="done", label="omega"),
+               _labelled(8, status="pending", label="psi")],
+        manifests=[("plans/x-prd.capability-manifest.yaml", _declaring("alpha"))],
+    )
+
+    result = _run_cli("--project-root", str(root), "--json")
+
+    assert result.returncode == 1
+    (project,) = json.loads(result.stdout)["projects"]
+    assert [(row["task_id"], row["label"], row["is_live"])
+            for row in project["unbound_labels"]] == [(7, "omega", False), (8, "psi", True)]
 
 
 def test_exit_constants_alias_the_shared_tier_3_codes():
