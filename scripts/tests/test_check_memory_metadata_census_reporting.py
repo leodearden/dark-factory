@@ -21,6 +21,7 @@ from pathlib import Path
 SCRIPT = Path(__file__).parent.parent / "check_memory_metadata_census_reporting.py"
 UNIT = "memory-metadata-coverage-census.service"
 HISTORY_RELPATH = Path("plans") / "memory-metadata-coverage-history.json"
+INSTALLER = "scripts/install-memory-metadata-coverage-census-timer.sh"
 
 
 _FAKE_SYSTEMCTL_SRC = '''#!/usr/bin/env python3
@@ -156,3 +157,66 @@ def test_healthy_census_exits_zero_and_names_unit_and_age(tmp_path):
     last = _last_line(result.stdout)
     assert UNIT in last, last
     assert re.search(r"\b2\.0h\b", last), last
+
+
+def _never_ran_fields():
+    fields = _healthy_fields()
+    del fields["ExecMainExitTimestamp"]
+    return fields
+
+
+def test_not_found_load_state_is_not_installed_and_names_installer(tmp_path):
+    result = _run(
+        tmp_path, "48",
+        fields=_healthy_fields(LoadState="not-found"),
+        history=_history_with_newest_stamp(_hours_ago(2)),
+    )
+
+    assert result.returncode != 0, result.stdout
+    assert "not installed" in result.stderr.lower(), result.stderr
+    assert "not-found" in result.stderr, result.stderr
+    assert INSTALLER in result.stderr, result.stderr
+
+
+def test_absent_load_state_is_not_installed(tmp_path):
+    fields = _healthy_fields()
+    del fields["LoadState"]
+    result = _run(
+        tmp_path, "48",
+        fields=fields,
+        history=_history_with_newest_stamp(_hours_ago(2)),
+    )
+
+    assert result.returncode != 0, result.stdout
+    assert "not installed" in result.stderr.lower(), result.stderr
+
+
+def test_not_installed_verdict_is_reached_without_reading_history(tmp_path):
+    result = _run(
+        tmp_path, "48",
+        fields=_healthy_fields(LoadState="not-found"),
+        history=None,
+    )
+
+    assert result.returncode != 0, result.stdout
+    assert "not installed" in result.stderr.lower(), result.stderr
+    assert HISTORY_RELPATH.name not in result.stderr, result.stderr
+
+
+def test_not_installed_and_never_ran_are_told_apart(tmp_path):
+    fresh_history = _history_with_newest_stamp(_hours_ago(2))
+    not_installed_dir = tmp_path / "not_installed"
+    never_ran_dir = tmp_path / "never_ran"
+    not_installed_dir.mkdir()
+    never_ran_dir.mkdir()
+
+    not_installed = _run(
+        not_installed_dir, "48",
+        fields=_healthy_fields(LoadState="not-found"), history=fresh_history,
+    )
+    never_ran = _run(
+        never_ran_dir, "48", fields=_never_ran_fields(), history=fresh_history,
+    )
+
+    assert "not installed" in not_installed.stderr.lower(), not_installed.stderr
+    assert not_installed.stderr != never_ran.stderr
