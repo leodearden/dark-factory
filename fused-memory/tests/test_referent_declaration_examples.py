@@ -49,6 +49,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from orchestrator.review_checkpoint import REFLECTION_INSTRUCTIONS
 
 from fused_memory.server.entities_gate import entities_gate
 from fused_memory.server.tools import create_mcp_server
@@ -207,11 +208,17 @@ def _read_repo_doc(relative: str) -> str:
     return path.read_text()
 
 
+def _review_reflection_instructions() -> str:
+    # Formatting is part of the check: a literal brace left unescaped raises here.
+    return REFLECTION_INSTRUCTIONS.format(project_id=_GROUP_ID, review_id='REV-TEST')
+
+
 _GUARDED_DOCS = ('CLAUDE.md', '.claude/commands/memory.md', 'skills/reflect/SKILL.md')
 
 _GUARDED_SITES = (
     ('recon-prompt-fragment', render_referent_declaration_guidance),
     *((doc, partial(_read_repo_doc, doc)) for doc in _GUARDED_DOCS),
+    ('review-checkpoint-reflection', _review_reflection_instructions),
 )
 
 
