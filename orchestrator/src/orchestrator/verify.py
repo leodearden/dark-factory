@@ -17,6 +17,7 @@ import sys
 import time
 import uuid
 import xml.etree.ElementTree as ET
+from collections import Counter
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field, is_dataclass, replace
 from datetime import UTC, datetime
@@ -679,65 +680,27 @@ _XDIST_WORKER_CRASH_RE = re.compile(
 )
 
 
-# pytest-xdist's BAILOUT marker (task 5082) — a signal RELATED TO, but
-# deliberately DISTINCT FROM, _XDIST_WORKER_CRASH_RE above. The crash
-# signature says "a worker died"; this says "and xdist therefore gave up",
-# which is a strictly stronger and much rarer claim.
+# pytest-xdist's BAILOUT marker (task 5082). Deliberately DISTINCT FROM
+# _XDIST_WORKER_CRASH_RE above: that says "a worker died", this says "and xdist
+# therefore gave up". `xdist/dsession.py::DSession.worker_errordown` prints one
+# of these literals only once the `--max-worker-restart` cap is exceeded, then
+# calls `triggershutdown()` and abandons every queued test — so the tally
+# printed afterwards is PARTIAL. Below the cap it prints ``replacing crashed
+# worker gwN`` instead and the run COMPLETES, so a crash signature alone must
+# never label a session aborted (verify.py serves projects whose cap may be
+# non-zero; see _KNOWN_LOAD_FLAKE_NODEID_RES below).
 #
-# Grounded in `xdist/dsession.py::DSession.worker_workerdown`: on every worker
-# death it increments `_failed_nodes_count`, then branches on whether the
-# configured `--max-worker-restart` cap has been exceeded.
-#   * EXCEEDED -> it sets `msg` to one of exactly two literals — ``f"worker
-#     {node.gateway.id} crashed and worker restarting disabled"`` when the cap
-#     is 0 (dark-factory's own setting, orchestrator/pyproject.toml's addopts),
-#     or ``f"maximum crashed workers reached: {N}"`` for a non-zero cap — and
-#     then calls `triggershutdown()`. Every test still queued on every worker
-#     is ABANDONED, so the tally pytest subsequently prints is PARTIAL.
-#   * NOT EXCEEDED -> it prints ``replacing crashed worker gwN``, clones the
-#     node, and the session runs to COMPLETION with a full, trustworthy tally.
-# The marker below is emitted on the first branch only, i.e. exactly at
-# `triggershutdown()`, which is why it means "truncated" and nothing else.
-# Keying truncation detection on the crash signature instead would relabel
-# every recovering (`--max-worker-restart > 0`) target's COMPLETE run as
-# aborted — and verify.py verifies multiple projects (see the multi-project
-# rationale on _KNOWN_LOAD_FLAKE_NODEID_RES below), so such a target is
-# reachable, not hypothetical.
+# Not line-anchored: xdist prints the message bare through `report_line` and
+# again as ``=== xdist: <msg> ===`` in its terminal summary.
 #
-# NOT line-anchored, unlike the _PYTEST_* patterns above, because xdist emits
-# the same message through two writers with different decoration: `report_line`
-# prints it bare, while `pytest_terminal_summary` re-emits it via
-# ``terminalreporter.write_sep("=", f"xdist: {msg}")`` — wrapped in ``=`` bars
-# with an ``xdist: `` prefix. Both must match.
-#
-# ACCEPTED, DOCUMENTED LIMITATION: both emission paths are gated on
-# ``config.option.verbose >= 0`` (dsession.py's `report_line` and
-# `pytest_terminal_summary`), so under ``-q`` the marker is absent and every
-# consumer below falls back to today's behaviour exactly. That is the fail-safe
-# direction — the abort label is only ever ADDED when certain, never asserted
-# on a run that may have completed. It cannot be repaired by keying on the
-# ABSENCE of ``replacing crashed worker``, because that line is suppressed
-# under ``-q`` too: the negative signal is unsound precisely in the case it
-# would be meant to cover.
-#
-# MEASURED (task 5082 debug pass, 2026-09-08) -- this limitation is NOT a corner
-# case for dark-factory, and an earlier revision of this note wrongly implied it
-# was. dark-factory's own *addopts* carry no ``-q``, but that is the wrong place
-# to look: all SEVEN module-scoped configs run
-# ``pytest tests/ --tb=short -q --timeout=300`` (shared/, escalation/,
-# orchestrator/, fused-memory/, dashboard/, sampler/, cockpit/
-# ``orchestrator.yaml``), and the module-scoped leg is exactly the path that
-# produced the specimen this note is written from: ``attempt-2.orchestrator.
-# test.log``, where a gw7 death truncated the suite at ``[ 32%]`` (6677 of 20717
-# collected) and the marker is absent. So on this project's own verify output
-# `_is_worker_death_truncated_session` is INERT today -- fail-safe, but silent.
-#
-# A ``-q``-robust discriminator DOES exist and was reproduced both ways: the
-# final progress line of a bailout run stays below ``[100%]`` while a recovering
-# (``--max-worker-restart > 0``) run still reaches ``[100%]``, so it separates
-# the two cases this detector cares about without either suppressed line.
-# Adopting it would change this detector's frozen detection signal -- which four
-# consumers key off -- so the debug pass filed it for the architect rather than
-# widening the design unilaterally.
+# ACCEPTED LIMITATION: both emissions are gated on ``verbose >= 0``, so under
+# ``-q`` the marker is absent and every consumer keeps its pre-task behaviour —
+# fail-safe, since the abort label is only ever added when certain (the absence
+# of ``replacing crashed worker`` is no substitute: ``-q`` suppresses it too).
+# The detector is therefore inert on dark-factory's module-scoped legs, which
+# all pass ``-q``, and live on the root whole-suite chain in
+# dark-factory-orchestrator.yaml, which does not. esc-5082-5 records the
+# measurement and a ``-q``-robust discriminator left to a follow-up.
 _XDIST_SESSION_ABORTED_RE = re.compile(
     r"worker gw\d+ crashed and worker restarting disabled"
     r"|maximum crashed workers reached: \d+",
@@ -812,6 +775,56 @@ def _crash_attributed_nodeids(output: str) -> set[str]:
     }
 
 
+def _failed_lines_not_crash_attributed(output: str) -> list[str]:
+    """Return *output*'s ``FAILED`` lines, minus the dead worker's artefacts.
+
+    A line is dropped only when its node-id is crash-attributed AND no other
+    ``FAILED`` line names that node-id. `handle_crashitem` synthesizes at most
+    one report per crashed node-id, so a second line for the same node-id is
+    a genuine verdict — the test failed, and THEN its worker died in teardown
+    — and both lines are kept. A line with no extractable node-id is kept
+    too: never guess.
+
+    Membership is EXACT, unlike the prefix-tolerant known-flake allow-list.
+    The FAILED line's node-id can differ from the crash notice's by an
+    invocation-dir prefix, but module-relative node-ids collide across this
+    repo's suites, so suffix matching could bind a crash to another test's
+    real failure (esc-5082-3). A miss only restores pre-task routing.
+    """
+    failed_lines = _PYTEST_FAILED_LINE_RE.findall(output)
+    matches = [_FAILED_LINE_NODEID_RE.match(line) for line in failed_lines]
+    nodeids = [m.group(1) if m else None for m in matches]
+    lines_per_nodeid = Counter(nodeids)
+    crash_attributed = _crash_attributed_nodeids(output)
+    return [
+        line
+        for line, nodeid in zip(failed_lines, nodeids, strict=True)
+        if nodeid not in crash_attributed or lines_per_nodeid[nodeid] > 1
+    ]
+
+
+def _first_surviving_failure_line(output: str) -> str | None:
+    """Return the first failure line in *output* that a dead worker did not fake.
+
+    Checks a ``FAILED`` line from ``_failed_lines_not_crash_attributed``
+    first, then the first ``INTERNALERROR>`` or ``ERROR`` short-summary line
+    (a fixture/setup error or a module that failed to collect) — xdist never
+    synthesizes either of those for a crash item. Returns ``None`` when no
+    failure line survives: there is none, or each is the crash's own artefact.
+    """
+    survivors = _failed_lines_not_crash_attributed(output)
+    if survivors:
+        return survivors[0].strip()
+    for line in output.splitlines():
+        if (
+            _PYTEST_INTERNALERROR_RE.match(line)
+            or _ERROR_LINE_NODEID_RE.match(line)
+            or _ERROR_LINE_FILE_RE.match(line)
+        ):
+            return line.strip()
+    return None
+
+
 # Small, ENUMERATED allow-list of known load-induced test flakes (esc-2496-3),
 # grounded in the same config.yaml task-2361 worker-kill-catalog reasoning as
 # _XDIST_WORKER_CRASH_RE above: under host CPU oversubscription, a bare
@@ -854,8 +867,8 @@ def _is_bare_xdist_worker_crash(output: str) -> bool:
     is present, every ``^FAILED `` line is inspected individually. If ANY
     names a test that is neither on the narrow, enumerated
     ``_KNOWN_LOAD_FLAKE_NODEID_RES`` allow-list NOR attributed to the crash
-    itself (see the next paragraph), or has no extractable node-id, this
-    returns ``False`` — never mask a real failure. A
+    itself (the THIRD ACCEPTANCE CLAUSE below), or has no extractable
+    node-id, this returns ``False`` — never mask a real failure. A
     co-occurring ``INTERNALERROR>`` line or ``ERROR`` short-summary line
     (a fixture/setup error or a whole-module collection failure) is
     likewise never attributable to a known FAILED-line flake, so either one
@@ -872,35 +885,6 @@ def _is_bare_xdist_worker_crash(output: str) -> bool:
     short-summary form (node-id or bare-file) — any one of which suppresses
     reclassification.
 
-    THIRD ACCEPTANCE CLAUSE (task 5082, esc-4292-3): a ``FAILED`` line whose
-    node-id is in ``_crash_attributed_nodeids(output)`` — the test the dead
-    worker itself had in flight — is likewise accepted. That line is not the
-    test's verdict: ``xdist/dsession.py::handle_crashitem`` SYNTHESIZED the
-    report after the worker died, with ``outcome="failed"``, ``when="???"``
-    and a longrepr that is the crash message rather than a traceback, and
-    pytest's terminal reporter then printed an ordinary-looking ``FAILED``
-    short-summary line for it and counted it in the tally. esc-4292-3
-    measured exactly this: the single test on a ``FAILED`` summary line was
-    THE SAME test the crashed worker was running, and it passes in isolation
-    — so the run was sent to the debugger to chase a failure that never
-    happened, instead of to the bounded infra retry.
-
-    This clause is stronger evidence than the ``_KNOWN_LOAD_FLAKE_NODEID_RES``
-    clause beside it, not weaker. The allow-list is a JUDGEMENT about which
-    tests are flaky; crash attribution is STRUCTURAL — ``when="???"`` is
-    xdist's own admission that no verdict was ever reached for that node-id.
-    Accepting it is the same "may never assert a property the gate did not
-    measure" contract ``_summarize_checks`` enforces. Attribution is read
-    from the UNTRIMMED crash notice in the FAILURES body, never from the
-    ``FAILED`` line's own `` - worker 'gwN' crashed...`` suffix — see
-    ``_crash_attributed_nodeids`` for why that suffix is unparseable in
-    general.
-
-    Every veto above is unaffected: an INTERNALERROR / ERROR-nodeid /
-    ERROR-file surface still forces ``False`` before this loop is reached,
-    and a co-occurring FAILED line for any OTHER test still forces ``False``
-    inside it.
-
     That last sentence used to name only the first two (task 4066): the two
     branches had drifted apart, since tasks 3514/3597 added the
     INTERNALERROR/ERROR veto to the FAILED-lines branch alone. verify-log
@@ -909,6 +893,21 @@ def _is_bare_xdist_worker_crash(output: str) -> bool:
     aborted the session before pytest could print its short-summary and
     decorated stats lines) zero ``^FAILED `` lines and zero ``^E   ``
     lines, which the old fallback reclassified as transient infra.
+
+    THIRD ACCEPTANCE CLAUSE (task 5082, esc-4292-3): a ``FAILED`` line that
+    ``_failed_lines_not_crash_attributed`` drops — the one
+    ``xdist/dsession.py::handle_crashitem`` SYNTHESIZED for the test the dead
+    worker had in flight — is likewise accepted. It is not that test's
+    verdict (``when="???"`` is xdist's own admission that none was reached),
+    and esc-4292-3 measured such a test passing in isolation after the run
+    had been sent to the debugger to chase it. This is stronger evidence than
+    the allow-list beside it, not weaker: the allow-list is a JUDGEMENT about
+    which tests are flaky, while crash attribution is STRUCTURAL — the same
+    "may never assert a property the gate did not measure" contract
+    ``_summarize_checks`` enforces. It stays strict: a SECOND ``FAILED`` line
+    for the same node-id (the test failed, then its worker died in teardown)
+    is a real verdict and still forces ``False``, as does a ``FAILED`` line
+    for any other test and every INTERNALERROR / ERROR veto above.
 
     Accepted fail-safe tradeoff: a genuine regression IN an allow-listed
     known-flake test, co-occurring with a crash, is discounted here and
@@ -961,60 +960,9 @@ def _is_bare_xdist_worker_crash(output: str) -> bool:
             # of its own, so the per-line allow-list check below would
             # never see it — veto here instead of silently masking it.
             return False
-        # THIRD ACCEPTED LIMITATION, beside the two on _XDIST_SESSION_ABORTED_RE
-        # (esc-5082-3). The `node_id in crash_attributed` membership below is
-        # EXACT while its sibling clause `_is_known_load_flake_nodeid` is
-        # prefix-TOLERANT (`(?:^|/)`). That asymmetry is deliberate, not an
-        # oversight, and the tempting repair is unsound -- read on before
-        # "fixing" it.
-        #
-        # THE SKEW. `_pytest/config/__init__.py::Config.cwd_relative_nodeid`
-        # rewrites a nodeid from rootdir-relative to invocation-dir-relative,
-        # but ONLY `if invocation_params.dir != rootpath`. The FAILED
-        # short-summary line goes through it (`terminal.py::
-        # _get_node_id_with_markup`); xdist's crash notice carries the raw
-        # rootdir-relative nodeid untouched. So the two forms diverge -- and
-        # this clause silently no-ops -- exactly when pytest is handed path
-        # arguments from a cwd ABOVE the inifile dir, e.g. `pytest
-        # orchestrator/tests` run from the repo root.
-        #
-        # NO SERVED TARGET IS AFFECTED TODAY (steward, 2026-09-10, measured
-        # across every registered config on this host, not inferred): the 7
-        # module-scoped test_commands all `uv run --directory <module>`, so
-        # cwd == rootdir; `scripts/orchestrator.yaml` is the one config that
-        # passes path args from the repo root under a bare `--project`, and it
-        # is safe only because tests/scripts/ carries no inifile of its own, so
-        # rootdir resolves back to the repo root (measured, not assumed -- that
-        # is a latent coupling: adding an inifile under tests/scripts/ would
-        # make this clause go silent there). Of the other projects verify.py
-        # serves, reify is Cargo (no pytest at all) and the rest invoke pytest
-        # from their own root. Failure direction is fail-safe regardless: a
-        # miss returns False, i.e. pre-task behaviour -- the run routes to the
-        # debugger instead of the bounded infra retry. A missed improvement,
-        # never a masked failure.
-        #
-        # WHY NOT JUST SUFFIX-ANCHOR IT, as esc-5082-3 proposed. Because
-        # module-relative nodeids are NOT unique across this repo's suites, so
-        # a suffix match can bind a crash notice to a DIFFERENT test's genuine
-        # FAILED line and return True -- masking a real failure, the one thing
-        # this predicate must never do. Measured: `tests/test_config.py::
-        # test_defaults` exists in more than one module suite, as do
-        # test_full_yaml_override, test_overrides_accepted,
-        # test_not_in_reloadable_fields, test_disabled_returns_empty, and 5+
-        # more in test_harness.py. Note the two conditions co-occur rather than
-        # exclude each other: the invocation shape that CREATES the skew (path
-        # args from a parent dir) is also the natural way to name several
-        # module suites in ONE session. Any real repair must NORMALIZE both
-        # sides onto a common root, not merely relax the comparison.
-        crash_attributed = _crash_attributed_nodeids(output)
-        for line in failed_lines:
+        for line in _failed_lines_not_crash_attributed(output):
             match = _FAILED_LINE_NODEID_RE.match(line)
-            if match is None:
-                return False
-            node_id = match.group(1)
-            if not (
-                _is_known_load_flake_nodeid(node_id) or node_id in crash_attributed
-            ):
+            if match is None or not _is_known_load_flake_nodeid(match.group(1)):
                 return False
         return True
     # Same three surfaces the FAILED-lines branch vetoes on above. They
@@ -1162,6 +1110,27 @@ def _extract_failing_test_ids_from_junit(path: Path) -> list[str] | None:
     return sorted(ids)
 
 
+def _worker_death_cause_hint(output: str) -> str:
+    """Rung 0 of ``_extract_cause_hint``: the hint for a truncated session.
+
+    Reports BOTH facts, never just one: the abort marker, then the first
+    failure that is not the dead worker's own artefact
+    (``_first_surviving_failure_line``). Suppressing every failure on
+    truncation would recreate task 4066's incident (8 real failures silently
+    hidden), while naming only the survivor would let the ladder quote a
+    partial tally as though it were complete. When nothing survives, the
+    bailout line itself is quoted, so the hint always says WHY there is no
+    verdict.
+    """
+    survivor = _first_surviving_failure_line(output)
+    if survivor is not None:
+        detail = f'first surviving failure: {survivor}'
+    else:
+        bailout = _XDIST_SESSION_ABORTED_RE.search(output)
+        detail = bailout.group(0) if bailout else ''
+    return f'{WORKER_DEATH_SUMMARY_MARKER}; {detail}'.strip()[:200]
+
+
 def _extract_cause_hint(output: str) -> str:
     """Extract a one-line failure hint from command output.
 
@@ -1179,9 +1148,10 @@ def _extract_cause_hint(output: str) -> str:
     10. fallback: last non-blank line of output, with pytest progress lines
         filtered. If only progress lines remain, returns an opaque-exit message.
 
-    RUNG 0 (task 5082) fires only when `_is_worker_death_truncated_session`
-    confirms xdist ABANDONED the rest of the suite, and it must precede two
-    specific rungs for two specific reasons:
+    RUNG 0 (task 5082, ``_worker_death_cause_hint``) fires only when
+    `_is_worker_death_truncated_session` confirms xdist ABANDONED the rest of
+    the suite, and it must precede two specific rungs for two specific
+    reasons:
 
     * Ahead of RUNG 1, because the ``FAILED`` line a truncated session carries
       is typically the one xdist FABRICATED for the test the dead worker had
@@ -1194,15 +1164,6 @@ def _extract_cause_hint(output: str) -> str:
       (esc-4176-6: ``1 failed, 728 passed`` truncated vs ``19622 passed`` on a
       clean re-run of the identical command).
 
-    Inside the gate BOTH facts are reported, never just one.  A ``FAILED``
-    line whose node-id is NOT crash-attributed is a genuine independent
-    failure and is named alongside the abort marker: suppressing every
-    ``FAILED`` line on truncation would recreate task 4066's incident (8 real
-    failures silently hidden), while returning only the surviving line would
-    let the ladder quote a partial tally as though it were complete.  When no
-    such line survives, the bailout line itself is quoted, so the hint always
-    says WHY there is no verdict.
-
     Every other rung is untouched, so output with no bailout marker takes a
     byte-identical path to today's.
 
@@ -1212,20 +1173,8 @@ def _extract_cause_hint(output: str) -> str:
     if not output or not output.strip():
         return ''
 
-    # Rung 0 — see the docstring above for why this pre-empts the ladder.
     if _is_worker_death_truncated_session(output):
-        crash_attributed = _crash_attributed_nodeids(output)
-        for line in _PYTEST_FAILED_LINE_RE.findall(output):
-            match = _FAILED_LINE_NODEID_RE.match(line)
-            if match is not None and match.group(1) in crash_attributed:
-                continue
-            return (
-                f'{WORKER_DEATH_SUMMARY_MARKER}; first surviving failure: '
-                f'{line.strip()}'
-            ).strip()[:200]
-        bailout = _XDIST_SESSION_ABORTED_RE.search(output)
-        detail = bailout.group(0).strip() if bailout else ''
-        return f'{WORKER_DEATH_SUMMARY_MARKER}; {detail}'.strip()[:200]
+        return _worker_death_cause_hint(output)
 
     _HINT_PATTERNS = [
         _PYTEST_FAILED_LINE_RE,
@@ -1908,23 +1857,24 @@ def _tool_for_cmd(cmd: str | None) -> ToolKind:
 # producer rather than letting the consumer degrade quietly.
 SIGNAL_KILL_SUMMARY_MARKER = 'killed by signal'
 
-# The SECOND cause of a verdict-less leg, and the second marker the
-# `_aggregate_results` carry-through below must know about (task 5082).
-#
-# An external kill (above) means the process was stopped before it could emit
-# a single diagnostic.  This one means something narrower but just as
+# The SECOND cause of a verdict-less leg (task 5082).  An external kill
+# (above) means the process was stopped before it could emit a single
+# diagnostic.  This one means something narrower but just as
 # verdict-destroying: a pytest-xdist worker died, the `--max-worker-restart`
 # cap was exceeded, and `xdist/dsession.py` called `triggershutdown()` — so
 # every test still queued on every worker was ABANDONED and the tally pytest
 # printed counts only what had already run.  Measured (esc-4176-6): a
 # truncated run reported ``1 failed, 728 passed, 1 skipped`` where a clean
-# re-run of the identical command reported ``19622 passed, 17 skipped`` —
-# ~97% of the suite never ran, yet the shape is structurally
-# indistinguishable from an ordinary complete red run.
+# re-run of the identical command reported ``19622 passed, 17 skipped``.
 #
 # Same CONSTRAINT ON PRODUCERS as above: a fragment bearing this marker must
 # not contain ', '.  See `_worker_death_leg_note`.
 WORKER_DEATH_SUMMARY_MARKER = 'session aborted after worker death'
+
+# Every marker that makes a summary fragment a no-verdict note.
+# `_aggregate_results` carries each such fragment through verbatim, so a new
+# no-verdict note needs only its marker added here.
+_NO_VERDICT_SUMMARY_MARKERS = (SIGNAL_KILL_SUMMARY_MARKER, WORKER_DEATH_SUMMARY_MARKER)
 
 
 def _killed_leg_note(label: str, rc: int, duration: float | None) -> str:
@@ -2035,9 +1985,12 @@ def _summarize_checks(
     rest (esc-4176-6 measured ``1 failed, 728 passed, 1 skipped`` where a
     clean re-run of the identical command reported ``19622 passed, 17
     skipped``).  ``'tests failed'`` asserts a complete measured verdict that
-    no such run produced.  Gated on the test leg alone because the bailout
-    marker is a pytest-xdist artefact: a lint or type leg carrying that text
-    is quoting it, not exhibiting it.
+    no such run produced — unless the truncated output still carries a
+    failure the dead worker did not fabricate
+    (``_first_surviving_failure_line``), in which case BOTH fragments are
+    reported, as ``_worker_death_cause_hint`` reports both facts.  Gated on
+    the test leg alone because the bailout marker is a pytest-xdist artefact:
+    a lint or type leg carrying that text is quoting it, not exhibiting it.
 
     CONTRACT (task 3173 review amendment): the returned ``category`` and
     ``failing_leg_categories`` answer DIFFERENT questions and neither
@@ -2099,6 +2052,8 @@ def _summarize_checks(
         if is_external_kill_rc(rc):
             parts.append(_killed_leg_note(label, rc, duration))
         elif label == 'test' and _is_worker_death_truncated_session(out):
+            if _first_surviving_failure_line(out) is not None:
+                parts.append(tool_verdict)
             parts.append(_worker_death_leg_note(label))
         else:
             parts.append(tool_verdict)
@@ -6515,6 +6470,12 @@ async def run_verification(
     # sees it, nothing is silently greened), not a fail-fast one, and is
     # judged acceptable against the status quo of burning debugger
     # iterations on non-reproducible overload flakes.
+    #
+    # The same tradeoff covers a regression that makes the in-flight test
+    # deterministically CRASH its worker (a segfault, an OOM kill): the FAILED
+    # line xdist synthesizes for that test is crash-attributed (task 5082), so
+    # it too takes the bounded infra retry and, recurring, infra_hold +
+    # escalate_to_human instead of the debugger.
     if (
         not is_merge_verify
         and attempt.test.rc != 0
@@ -6696,19 +6657,10 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         # Carry every distinct no-verdict note through verbatim, in child
         # order, de-duplicated (two subprojects killed identically must not
         # stutter the same sentence twice).
-        #
-        # THIS LOOP IS THE REQUIRED THIRD EDIT for any new no-verdict note
-        # (task 5082 added the second, WORKER_DEATH_SUMMARY_MARKER): a marker
-        # constant and a note producer alone leave the aggregate degrading
-        # exactly as above. Add the marker to the tuple below rather than
-        # rediscovering that bug. The `', '` split is also why every producer
-        # must keep its note free of `', '` — see the CONSTRAINT ON PRODUCERS
-        # on SIGNAL_KILL_SUMMARY_MARKER.
-        _no_verdict_markers = (SIGNAL_KILL_SUMMARY_MARKER, WORKER_DEATH_SUMMARY_MARKER)
         for r in results:
             for fragment in r.summary.removeprefix('Failures: ').split(', '):
                 if (
-                    any(marker in fragment for marker in _no_verdict_markers)
+                    any(marker in fragment for marker in _NO_VERDICT_SUMMARY_MARKERS)
                     and fragment not in parts
                 ):
                     parts.append(fragment)
