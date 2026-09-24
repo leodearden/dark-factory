@@ -11,6 +11,7 @@ write directly into a tmp fleet dir (ORCH_FLEET_DIR).
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 import os
 import re
@@ -1396,6 +1397,154 @@ def _busy_unit_drain_run(tmp_path, timeline, *, spawn_timeout, **knobs):
     return result, _load_state(state_path), fired
 
 
+@dataclasses.dataclass(frozen=True)
+class _Rewrite:
+    """Rewrite the heartbeat to `to` once the gate has polled `after` `polls`
+    times since the previous rewrite."""
+
+    after: str  # a drain verdict: "busy" | "idle" | "stale" | "absent"
+    to: dict | None  # `_write_heartbeat` kwargs; None unlinks, driving "absent"
+    polls: int = 1
+
+
+# How often the rewrite watcher re-reads the ledger. Responsiveness only: a
+# rewrite that lands late just adds polls of the state it replaces.
+_REWRITE_WATCH_INTERVAL_SECS = 0.02
+
+
+def _complete_poll_records(trace_path):
+    """The ledger's ``(verdict, unit)`` records so far, newline-terminated only.
+
+    The script appends while the watcher reads, so an unterminated tail is a
+    record still being written and must never count.
+    """
+    try:
+        text = Path(trace_path).read_text()
+    except FileNotFoundError:
+        return []
+    return [tuple(line.split("\t")) for line in text.split("\n")[:-1]]
+
+
+@contextlib.contextmanager
+def _rewrites_on_gate_polls(fleet_dir, unit, trace_path, rewrites):
+    """Apply `rewrites` to <fleet_dir>/<unit>.json in order, each once the
+    drain gate has polled the verdict it waits for, while `_run_script` blocks.
+
+    `drain_check.py` classifies a verdict purely from the on-disk heartbeat
+    JSON (scripts/drain_check.py::classify), so a single static file can
+    never exercise a mid-poll verdict CHANGE -- busy->idle, busy->stale->idle,
+    or a stale<->busy oscillation. One watcher thread drives those
+    transitions, triggered by the gate's own poll ledger at `trace_path`
+    (the script's ORCH_DRAIN_POLL_TRACE_FILE).
+
+    WHY THE LEDGER AND NOT A CLOCK. restart-all-orchestrators.sh::
+    drain_check_verdict appends a record only AFTER python3 has READ the
+    heartbeat, and records the verdict the gate then acts on. A record
+    therefore proves the gate has acted on the state that produced it, so a
+    rewrite it triggers can never land before the read it depends on,
+    however loaded the host. An offset from spawn can: nothing bounds when
+    the script's first poll lands (see _SLOW_START_SECS).
+
+    THE CALLER INVARIANT. Each rewrite counts the records appended since the
+    previous rewrite fired, and a poll already in flight when that rewrite
+    landed may still have read the state it replaced. So `after` must be a
+    verdict the PREVIOUS heartbeat state cannot produce: then every counted
+    record is a read of the state just written.
+
+    A rewrite whose trigger never arrives is not an error: a trap rewrite
+    must never fire on correct code, and the callers' ledger assertions
+    report everything else. An exception on the watcher thread is collected
+    and surfaced on exit, so a failed rewrite can never masquerade as a
+    passing test: as an AssertionError, or, if the with-body raised too (a
+    `subprocess.TimeoutExpired` from `_run_script`, say), as a note on that
+    exception, which is the more diagnostic of the two and stays primary.
+
+    Rewriting real heartbeat JSON, rather than shimming a fake `python3` onto
+    PATH to script drain_check.py's own output, is deliberate: this module's
+    own docstring records that drain_check.py is NOT mocked here -- it runs
+    for real against heartbeat files the tests write -- and a scripted-verdict
+    shim would stop exercising classify()'s fresh-window arithmetic. It would
+    also collide with `_make_fake_systemctl`'s fake, whose shebang is
+    `#!/usr/bin/env python3`: bin_dir is already first on PATH, so a fake
+    `python3` placed there would shadow it too.
+    """
+    stop = threading.Event()
+    errors = []
+
+    def _position_once_triggered(rewrite, since):
+        while True:
+            records = _complete_poll_records(trace_path)
+            if records[since:].count((rewrite.after, unit)) >= rewrite.polls:
+                return len(records)
+            if stop.wait(_REWRITE_WATCH_INTERVAL_SECS):
+                return None
+
+    def _watch():
+        try:
+            position = 0
+            for rewrite in rewrites:
+                position = _position_once_triggered(rewrite, position)
+                if position is None:
+                    return
+                if rewrite.to is None:
+                    (Path(fleet_dir) / f"{unit}.json").unlink(missing_ok=True)
+                else:
+                    _write_heartbeat(fleet_dir, unit, **rewrite.to)
+        except Exception as exc:  # collected, not raised -- see docstring
+            errors.append(exc)
+
+    watcher = threading.Thread(target=_watch, daemon=True)
+    watcher.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        watcher.join(timeout=5)
+        if errors:
+            in_flight = sys.exc_info()[1]
+            if in_flight is not None:
+                in_flight.add_note(f"ALSO: heartbeat rewrite(s) raised: {errors!r}")
+            else:
+                raise AssertionError(f"heartbeat rewrite(s) raised: {errors!r}")
+
+
+def _run_busy_unit_through(tmp_path, rewrites, *, spawn_timeout, **knobs):
+    """Run restart-all-orchestrators.sh --drain on a busy UNIT_R, applying
+    `rewrites` as the gate polls, and return (result, state, polls).
+
+    `knobs` are merged into `_run_script`'s env over
+    {"RESTART_VERIFY_TIMEOUT": "5", "ORCH_DRAIN_POLL_INTERVAL_SECS":
+    str(_TIMELINE_POLL_INTERVAL_SECS)}. `state` is the fake systemctl's
+    recorded state and `polls` the gate's finished poll ledger, as read by
+    `_read_poll_trace`.
+    """
+    assert "ORCH_DRAIN_POLL_TRACE_FILE" not in knobs, (
+        "_run_busy_unit_through OWNS ORCH_DRAIN_POLL_TRACE_FILE: its rewrite "
+        "watcher must read the very ledger the script writes. Assert on the "
+        "returned `polls` instead of passing the knob."
+    )
+    fleet_dir = tmp_path / "fleet"
+    trace_path = tmp_path / "drain-poll-trace.tsv"
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
+    )
+    _write_heartbeat(fleet_dir, UNIT_R, **_HB_BUSY)
+
+    env = {
+        "RESTART_VERIFY_TIMEOUT": "5",
+        "ORCH_DRAIN_POLL_INTERVAL_SECS": str(_TIMELINE_POLL_INTERVAL_SECS),
+        "ORCH_DRAIN_POLL_TRACE_FILE": str(trace_path),
+    }
+    env.update(knobs)
+
+    with _rewrites_on_gate_polls(fleet_dir, UNIT_R, trace_path, rewrites):
+        result = _run_script(
+            bin_dir, state_path, fleet_dir, "--drain", env=env, timeout=spawn_timeout,
+        )
+
+    return result, _load_state(state_path), _read_poll_trace(trace_path)
+
+
 def _assert_resumed_from_the_busy_loop(result, state, polls):
     """Assert drain_gate's IN-LOOP resume: defer on a busy read, then resume
     on an idle read taken straight from the busy poll loop.
@@ -1447,18 +1596,18 @@ def test_busy_unit_that_drains_mid_defer_resumes_and_restarts(tmp_path):
     the `verdict == "idle"` arm reached straight from its busy poll loop,
     before any stale/absent handoff). A unit that goes busy, then drains
     WHILE deferred, must resume the restart from inside the poll loop rather
-    than waiting out the full busy grace."""
-    trace_path = tmp_path / "drain-poll-trace.tsv"
+    than waiting out the full busy grace. The drain lands only after the
+    gate's first busy poll, so the defer-then-resume order does not depend on
+    how fast the script starts."""
     spawn_timeout = _IN_LOOP_RESUME_SPAWN_TIMEOUT_SECS
 
-    result, state, _ = _busy_unit_drain_run(
-        tmp_path, [("idle", _FIRST_TRANSITION_DELAY_SECS, _HB_IDLE)],
+    result, state, polls = _run_busy_unit_through(
+        tmp_path, [_Rewrite(after="busy", to=_HB_IDLE)],
         spawn_timeout=spawn_timeout,
         ORCH_RESTART_FORCE_FIRE_AFTER_SECS=str(wait_proof_grace_secs(spawn_timeout)),
-        ORCH_DRAIN_POLL_TRACE_FILE=str(trace_path),
     )
 
-    _assert_resumed_from_the_busy_loop(result, state, _read_poll_trace(trace_path))
+    _assert_resumed_from_the_busy_loop(result, state, polls)
 
 
 def test_a_slow_start_still_defers_before_the_drain_lands(tmp_path):
@@ -1474,18 +1623,16 @@ def test_a_slow_start_still_defers_before_the_drain_lands(tmp_path):
     """
     slow_start = tmp_path / "slow-start.sh"
     slow_start.write_text(f"sleep {_SLOW_START_SECS}\n")
-    trace_path = tmp_path / "drain-poll-trace.tsv"
     spawn_timeout = _IN_LOOP_RESUME_SPAWN_TIMEOUT_SECS + _SLOW_START_SECS
 
-    result, state, _ = _busy_unit_drain_run(
-        tmp_path, [("idle", _FIRST_TRANSITION_DELAY_SECS, _HB_IDLE)],
+    result, state, polls = _run_busy_unit_through(
+        tmp_path, [_Rewrite(after="busy", to=_HB_IDLE)],
         spawn_timeout=spawn_timeout,
         ORCH_RESTART_FORCE_FIRE_AFTER_SECS=str(wait_proof_grace_secs(spawn_timeout)),
-        ORCH_DRAIN_POLL_TRACE_FILE=str(trace_path),
         BASH_ENV=str(slow_start),
     )
 
-    _assert_resumed_from_the_busy_loop(result, state, _read_poll_trace(trace_path))
+    _assert_resumed_from_the_busy_loop(result, state, polls)
 
 
 @pytest.mark.parametrize(
