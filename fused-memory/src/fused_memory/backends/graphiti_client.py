@@ -780,6 +780,21 @@ _EMBEDDED_EDGES_PAGE_TEMPLATE = (
 )
 _EMBEDDED_EDGES_CENSUS = _EMBEDDED_EDGES_MATCH + 'RETURN count(*)'
 
+# Edges whose valid_at falls in a window (task 4869). `e.uuid` is total for the
+# directed-pattern reason given at _EMBEDDED_EDGES_MATCH. No vector here, so the
+# plain RETURN-then-ORDER shape suffices.
+_EDGES_IN_VALID_AT_WINDOW_MATCH = (
+    'MATCH ()-[e:RELATES_TO]->() '
+    'WHERE e.valid_at >= $start AND e.valid_at <= $end '
+)
+_EDGES_IN_VALID_AT_WINDOW_PAGE_TEMPLATE = (
+    _EDGES_IN_VALID_AT_WINDOW_MATCH
+    + 'RETURN e.uuid, e.fact, e.name, e.valid_at, e.invalid_at '
+    'ORDER BY e.uuid '
+    'SKIP {skip} LIMIT {limit}'
+)
+_EDGES_IN_VALID_AT_WINDOW_CENSUS = _EDGES_IN_VALID_AT_WINDOW_MATCH + 'RETURN count(*)'
+
 
 @dataclass(frozen=True)
 class PagedRead:
@@ -2337,6 +2352,12 @@ class GraphitiBackend:
 
         Uses ro_query since no writes are performed.
 
+        PAGINATED (task 4869) through ``_paged_ro_query``, because a window
+        spanning more edges than the server's result-set cap was silently
+        truncated; incompleteness follows the shared
+        ``_apply_incompleteness_policy``.  See the RESULT-SET CAP AUDIT block
+        at the top of this module.
+
         Args:
             start: ISO 8601 string for the lower bound (inclusive).
             end: ISO 8601 string for the upper bound (inclusive).
@@ -2344,15 +2365,19 @@ class GraphitiBackend:
 
         Returns:
             List of dicts with keys: uuid, fact, name, valid_at, invalid_at.
+
+        Raises:
+            IncompleteEnumerationError: The read was structurally incomplete.
         """
         graph = self._graph_for(group_id)
-        cypher = (
-            'MATCH ()-[e:RELATES_TO]->() '
-            'WHERE e.valid_at >= $start AND e.valid_at <= $end '
-            'RETURN e.uuid, e.fact, e.name, e.valid_at, e.invalid_at'
+        params = {'start': start, 'end': end}
+        paged = await _paged_ro_query(
+            graph,
+            _EDGES_IN_VALID_AT_WINDOW_PAGE_TEMPLATE,
+            _EDGES_IN_VALID_AT_WINDOW_CENSUS,
+            params=params,
         )
-        result = await graph.ro_query(cypher, {'start': start, 'end': end})
-        return [
+        edges = [
             {
                 'uuid': row[0],
                 'fact': row[1],
@@ -2360,8 +2385,17 @@ class GraphitiBackend:
                 'valid_at': row[3],
                 'invalid_at': row[4],
             }
-            for row in (result.result_set or [])
+            for row in _first_row_per_uuid(paged.rows)
         ]
+        _apply_incompleteness_policy(
+            paged,
+            method='query_edges_by_time_range',
+            group_id=group_id,
+            returned_count=len(edges),
+            noun='edges',
+            consequence=f'must not be treated as every edge in [{start}, {end}]',
+        )
+        return edges
 
     @_canonicalize_group_args
     async def get_valid_edges_for_node(self, node_uuid: str, *, group_id: str) -> list[EdgeDict]:
