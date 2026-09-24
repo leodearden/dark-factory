@@ -10,7 +10,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from _git_fixtures import README_SEED, RepoSeed, RepoTemplates, build_repo
+from _git_fixtures import README_SEED, RepoSeed, RepoTemplates, build_repo, seed_repo
 from _orch_helpers import git_env_with_ceiling
 
 
@@ -177,3 +177,20 @@ def test_a_copy_costs_at_most_one_git_spawn(
     templates.seed(tmp_path / 'measured', README_SEED)
 
     assert _spawns(log) <= 1
+
+
+def test_seed_repo_uses_the_session_templates(tmp_path: Path) -> None:
+    repo = seed_repo(tmp_path / 'repo')
+
+    assert repo == tmp_path / 'repo'
+    assert (repo / 'README.md').read_text() == '# Test\n'
+    assert _out(repo, 'symbolic-ref', 'HEAD') == 'refs/heads/main'
+    assert _out(repo, 'log', '-1', '--format=%s') == 'Initial commit'
+    assert _out(repo, 'config', 'user.email') == 'test@test.com'
+
+
+def test_session_templates_live_under_this_runs_basetemp(
+    pristine_repo_templates: RepoTemplates, tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    basetemp = tmp_path_factory.getbasetemp().resolve()
+    assert pristine_repo_templates.root.resolve().is_relative_to(basetemp)
