@@ -298,7 +298,11 @@ def _import_judge_if_present(src_root: Path) -> Any | None:
     """
     try:
         module = importlib.import_module(_JUDGE_MODULE_NAME)
-    except BaseException:  # noqa: BLE001 - see the docstring; never fatal
+    except BaseException as exc:  # noqa: BLE001 - see the docstring; never fatal
+        logger.warning(
+            '%s is not importable from %s, so the judge-target branch is '
+            'unsatisfied: %r', _JUDGE_MODULE_NAME, src_root, exc,
+        )
         return None
     origin = getattr(module, '__file__', None)
     if origin is None or not _is_inside(Path(origin), src_root):
