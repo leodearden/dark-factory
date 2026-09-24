@@ -317,7 +317,7 @@ def _load_state(state_path):
     return json.loads(state_path.read_text())
 
 
-def _read_poll_trace(path):
+def _read_poll_trace(path, *, complete_only=False):
     """Read the drain poll ledger, as one ``(verdict, unit)`` pair per poll.
 
     The ledger is written by restart-all-orchestrators.sh's
@@ -328,12 +328,21 @@ def _read_poll_trace(path):
     Returns the EMPTY LIST when the file does not exist, so a test whose
     ledger never appeared fails on its own assertion message rather than on a
     bare FileNotFoundError that says nothing about what was being proven.
+
+    ``complete_only`` is for a reader racing the script (the
+    `_rewrites_on_gate_polls` watcher): it drops the text after the last
+    newline, a record still being appended, which must never count. A
+    finished ledger is read whole, so a torn final record still fails the
+    field-count check below instead of vanishing.
     """
-    path = Path(path)
-    if not path.exists():
+    try:
+        text = Path(path).read_text()
+    except FileNotFoundError:
         return []
+    if complete_only:
+        text = text[: text.rfind("\n") + 1]
     records = []
-    for raw_line in path.read_text().splitlines():
+    for raw_line in text.splitlines():
         fields = raw_line.split("\t")
         assert len(fields) == 2, (
             f"poll-trace records are <verdict>\\t<unit>, exactly two fields; "
@@ -1210,19 +1219,6 @@ class _Rewrite:
 _REWRITE_WATCH_INTERVAL_SECS = 0.02
 
 
-def _complete_poll_records(trace_path):
-    """The ledger's ``(verdict, unit)`` records so far, newline-terminated only.
-
-    The script appends while the watcher reads, so an unterminated tail is a
-    record still being written and must never count.
-    """
-    try:
-        text = Path(trace_path).read_text()
-    except FileNotFoundError:
-        return []
-    return [tuple(line.split("\t")) for line in text.split("\n")[:-1]]
-
-
 @contextlib.contextmanager
 def _rewrites_on_gate_polls(fleet_dir, unit, trace_path, rewrites):
     """Apply `rewrites` to <fleet_dir>/<unit>.json in order, each once the
@@ -1271,7 +1267,7 @@ def _rewrites_on_gate_polls(fleet_dir, unit, trace_path, rewrites):
 
     def _position_once_triggered(rewrite, since):
         while True:
-            records = _complete_poll_records(trace_path)
+            records = _read_poll_trace(trace_path, complete_only=True)
             if records[since:].count((rewrite.after, unit)) >= rewrite.polls:
                 return len(records)
             if stop.wait(_REWRITE_WATCH_INTERVAL_SECS):
