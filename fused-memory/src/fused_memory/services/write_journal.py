@@ -81,11 +81,11 @@ CREATE TABLE IF NOT EXISTS write_ops (
     --               the write. That case is separable: the queue prefixes
     --               terminal_error with POST_EXECUTE_DEAD_PREFIX
     --               ('post-execute failure (the backend write LANDED; ...)')
-    --               when the failure happened after the backend call
-    --               succeeded. Absent that prefix, terminal_error is the
-    --               queue's own f'{type(exc).__name__}: {exc}' from a failed
-    --               execute. When in doubt, check backend_ops (joined on
-    --               write_op_id) before replaying.
+    --               when a backend write for the item had landed. Before
+    --               replaying, read the queue row's structured `executed`
+    --               rather than matching that prefix; its domain and the
+    --               replay rule are in
+    --               services/durable_queue.py::DurableWriteQueue.get_dead_items.
     --
     -- LAST-WRITE-WINS: replay_dead resets a dead item to pending, so a
     -- dead-letter that is later replayed and lands correctly re-stamps
