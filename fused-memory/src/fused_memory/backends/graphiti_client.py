@@ -753,6 +753,33 @@ _ENTITY_NODES_PAGE_TEMPLATE = (
 )
 _ENTITY_NODES_CENSUS = _ENTITY_NODES_MATCH + 'RETURN count(*)'
 
+# Embedded entity nodes, for the stale-embedding read (task 4869). `n.uuid` is
+# total for the reason above. The page cut happens in WITH, before RETURN
+# projects the vector, so each page sorts node refs and materialises only
+# page_size vectors rather than carrying every matched vector through the sort.
+_EMBEDDED_ENTITY_NODES_MATCH = 'MATCH (n:Entity) WHERE n.name_embedding IS NOT NULL '
+_EMBEDDED_ENTITY_NODES_PAGE_TEMPLATE = (
+    _EMBEDDED_ENTITY_NODES_MATCH
+    + 'WITH n ORDER BY n.uuid SKIP {skip} LIMIT {limit} '
+    'RETURN n.uuid, n.name, n.name_embedding'
+)
+_EMBEDDED_ENTITY_NODES_CENSUS = _EMBEDDED_ENTITY_NODES_MATCH + 'RETURN count(*)'
+
+# Embedded edges, for the stale-embedding read (task 4869), with the same late
+# vector projection. Here `e.uuid` alone IS total, unlike _ALL_VALID_EDGES: the
+# DIRECTED pattern yields exactly one row per edge, and RELATES_TO uuids are
+# unique graph-wide (tasks 2207/2210, the invariant get_all_valid_edges' dedup
+# rests on). No invalid_at filter: superseded edges still need re-embedding.
+_EMBEDDED_EDGES_MATCH = (
+    'MATCH (n)-[e:RELATES_TO]->(m) WHERE e.fact_embedding IS NOT NULL '
+)
+_EMBEDDED_EDGES_PAGE_TEMPLATE = (
+    _EMBEDDED_EDGES_MATCH
+    + 'WITH e ORDER BY e.uuid SKIP {skip} LIMIT {limit} '
+    'RETURN e.uuid, e.name, e.fact_embedding'
+)
+_EMBEDDED_EDGES_CENSUS = _EMBEDDED_EDGES_MATCH + 'RETURN count(*)'
+
 
 @dataclass(frozen=True)
 class PagedRead:
@@ -1055,12 +1082,13 @@ def _apply_incompleteness_policy(
     noun: str,
     consequence: str,
 ) -> None:
-    """Apply the SPLIT incompleteness policy to a shim's PagedRead.
+    """Apply the SPLIT incompleteness policy to a paged read's PagedRead.
 
-    ONE implementation, shared by every back-compat shim over
-    ``_paged_ro_query``, because the policy is a single decision and not a
+    ONE implementation, shared by every caller of ``_paged_ro_query`` that
+    returns a plain collection (the two task-4340 back-compat shims and the
+    task-4869 reads), because the policy is a single decision and not a
     per-method opinion: copies drift, and the drift would be silent in exactly
-    the direction that matters — a shim that forgot to raise returns a
+    the direction that matters — a caller that forgot to raise returns a
     fabricated empty and the write-back path blanks summaries with it.  It is
     also the single seam the follow-up ticket
     (tkt_0RSJP8CH1M9GAAJTABV8FZB4AH, wire the completeness signal through to
@@ -1077,9 +1105,9 @@ def _apply_incompleteness_policy(
 
     Args:
         paged: The PagedRead the enumeration returned.
-        method: Shim name, for the message an operator reads.
+        method: Calling method's name, for the message an operator reads.
         group_id: Graph the read targeted.
-        returned_count: Size of the collection the shim would return.
+        returned_count: Size of the collection the caller would return.
         noun: What ``returned_count`` counts, e.g. ``'entities'``/``'nodes'``.
         consequence: Method-specific clause naming what must NOT be done with
             a structurally incomplete result, appended to the raise message.
@@ -1102,6 +1130,34 @@ def _apply_incompleteness_policy(
             method, group_id, paged.rows_seen, returned_count, noun,
             paged.reason, paged.rows_seen, paged.expected_rows,
         )
+
+
+def _first_row_per_uuid(rows: list[list]) -> list[list]:
+    """Keep the first row for each column-0 uuid, in order.
+
+    Paging introduces duplicates a single query never could: an insert that
+    sorts before the current offset makes the next page's SKIP re-emit the
+    previous page's last row (the hazard enumerate_entity_nodes documents).
+    """
+    seen: set = set()
+    unique: list[list] = []
+    for row in rows:
+        if row[0] in seen:
+            continue
+        seen.add(row[0])
+        unique.append(row)
+    return unique
+
+
+def _embedding_dim(raw) -> int:
+    """Dimension of a raw vector property, parsed from its ``<v1, v2, ...>`` text.
+
+    FalkorDB's ``size()`` does not work on Vectorf32, so the dimension is
+    counted client-side.
+    """
+    if isinstance(raw, bytes):
+        raw = raw.decode('utf-8', errors='replace')
+    return len(str(raw).strip('<>').split(', '))
 
 
 def _as_sortable_utc(created_at: datetime | None) -> datetime:
@@ -2204,22 +2260,37 @@ class GraphitiBackend:
         FalkorDB's ``size()`` does not work on Vectorf32 properties, so we
         return all nodes with embeddings and filter client-side by parsing the
         raw vector text representation (``<v1, v2, ...>``).
+
+        PAGINATED (task 4869) through ``_paged_ro_query``, because the embedded
+        population exceeds the server's result-set cap; incompleteness follows
+        the shared ``_apply_incompleteness_policy``.  Measured counts are in the
+        RESULT-SET CAP AUDIT block at the top of this module.
+
+        Raises:
+            IncompleteEnumerationError: The read was structurally incomplete.
         """
         graph = self._graph_for(group_id)
-        cypher = (
-            'MATCH (n:Entity) '
-            'WHERE n.name_embedding IS NOT NULL '
-            'RETURN n.uuid, n.name, n.name_embedding'
+        paged = await _paged_ro_query(
+            graph,
+            _EMBEDDED_ENTITY_NODES_PAGE_TEMPLATE,
+            _EMBEDDED_ENTITY_NODES_CENSUS,
         )
-        result = await graph.ro_query(cypher)
-        stale: list[tuple[str, str, int]] = []
-        for row in result.result_set or []:
-            raw = row[2]
-            if isinstance(raw, bytes):
-                raw = raw.decode('utf-8', errors='replace')
-            dim = len(str(raw).strip('<>').split(', '))
-            if dim != expected_dim:
-                stale.append((row[0], row[1], dim))
+        stale = [
+            (row[0], row[1], dim)
+            for row in _first_row_per_uuid(paged.rows)
+            if (dim := _embedding_dim(row[2])) != expected_dim
+        ]
+        _apply_incompleteness_policy(
+            paged,
+            method='query_stale_node_embeddings',
+            group_id=group_id,
+            returned_count=len(stale),
+            noun='stale node embeddings',
+            consequence=(
+                'must not be taken as the full stale set, because a reindex '
+                'driven by it would look finished when it is not'
+            ),
+        )
         return stale
 
     @_canonicalize_group_args
@@ -2228,23 +2299,34 @@ class GraphitiBackend:
     ) -> list[tuple[str, str, int]]:
         """Return (uuid, name, dim) for RELATES_TO edges whose embedding dim != expected_dim.
 
-        See ``query_stale_node_embeddings`` for why client-side filtering is needed.
+        See ``query_stale_node_embeddings`` for why client-side filtering is
+        needed, and for the pagination (task 4869) this read shares.
+
+        Raises:
+            IncompleteEnumerationError: The read was structurally incomplete.
         """
         graph = self._graph_for(group_id)
-        cypher = (
-            'MATCH (n)-[e:RELATES_TO]->(m) '
-            'WHERE e.fact_embedding IS NOT NULL '
-            'RETURN e.uuid, e.name, e.fact_embedding'
+        paged = await _paged_ro_query(
+            graph,
+            _EMBEDDED_EDGES_PAGE_TEMPLATE,
+            _EMBEDDED_EDGES_CENSUS,
         )
-        result = await graph.ro_query(cypher)
-        stale: list[tuple[str, str, int]] = []
-        for row in result.result_set or []:
-            raw = row[2]
-            if isinstance(raw, bytes):
-                raw = raw.decode('utf-8', errors='replace')
-            dim = len(str(raw).strip('<>').split(', '))
-            if dim != expected_dim:
-                stale.append((row[0], row[1], dim))
+        stale = [
+            (row[0], row[1], dim)
+            for row in _first_row_per_uuid(paged.rows)
+            if (dim := _embedding_dim(row[2])) != expected_dim
+        ]
+        _apply_incompleteness_policy(
+            paged,
+            method='query_stale_edge_embeddings',
+            group_id=group_id,
+            returned_count=len(stale),
+            noun='stale edge embeddings',
+            consequence=(
+                'must not be taken as the full stale set, because a reindex '
+                'driven by it would look finished when it is not'
+            ),
+        )
         return stale
 
     @_canonicalize_group_args
