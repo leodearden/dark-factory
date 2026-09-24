@@ -22,6 +22,7 @@ UNIT = "memory-metadata-coverage-census.service"
 INSTALLER = "scripts/install-memory-metadata-coverage-census-timer.sh"
 UNIT_FIELDS = ("LoadState", "Result", "ExecMainStatus", "ExecMainExitTimestamp")
 SYSTEMD_UTC_TIMESTAMP = "%a %Y-%m-%d %H:%M:%S UTC"
+NEVER_RAN_TIMESTAMPS = frozenset({"", "n/a"})
 DEFAULT_REPO = "/home/leo/src/dark-factory"
 HISTORY_RELPATH = Path("plans") / "memory-metadata-coverage-history.json"
 
@@ -52,6 +53,32 @@ def require_installed(state: dict[str, str]) -> None:
         )
 
 
+def last_run_time(state: dict[str, str]) -> datetime:
+    raw = state.get("ExecMainExitTimestamp", "")
+    if raw in NEVER_RAN_TIMESTAMPS:
+        raise NotReporting(
+            f"NEVER RAN: {UNIT} is installed but has never run "
+            f"(ExecMainExitTimestamp={raw!r}); its first reading lands at the next 05:00"
+        )
+    try:
+        return datetime.strptime(raw, SYSTEMD_UTC_TIMESTAMP).replace(tzinfo=UTC)
+    except ValueError:
+        raise NotReporting(
+            f"UNREADABLE LAST RUN: {UNIT} reported ExecMainExitTimestamp={raw!r}, "
+            f"not a systemd UTC timestamp"
+        ) from None
+
+
+def last_run_age(state: dict[str, str], window_hours: float) -> float:
+    age = age_hours(last_run_time(state))
+    if age > window_hours:
+        raise NotReporting(
+            f"STALE LAST RUN: {UNIT} last ran {age:.1f}h ago, "
+            f"outside the {window_hours:g}h window"
+        )
+    return age
+
+
 def history_path() -> Path:
     return Path(os.environ.get("REPO") or DEFAULT_REPO) / HISTORY_RELPATH
 
@@ -66,22 +93,20 @@ def age_hours(then: datetime) -> float:
     return (datetime.now(UTC) - then).total_seconds() / 3600
 
 
-def assess() -> str:
+def assess(window_hours: float) -> str:
     state = read_unit_state()
     require_installed(state)
-    last_run = datetime.strptime(
-        state["ExecMainExitTimestamp"], SYSTEMD_UTC_TIMESTAMP
-    ).replace(tzinfo=UTC)
-    row = newest_stamp(history_path())
+    run_age = last_run_age(state, window_hours)
+    row_age = age_hours(newest_stamp(history_path()))
     return (
-        f"OK: {UNIT} last ran {age_hours(last_run):.1f}h ago; "
-        f"newest history row {age_hours(row):.1f}h ago"
+        f"OK: {UNIT} last ran {run_age:.1f}h ago; "
+        f"newest history row {row_age:.1f}h ago (window {window_hours:g}h)"
     )
 
 
 def main(argv: list[str]) -> int:
     try:
-        verdict = assess()
+        verdict = assess(float(argv[1]))
     except NotReporting as reason:
         print(reason, file=sys.stderr)
         return 1
