@@ -1689,3 +1689,34 @@ class TestAbsoluteTmpProjectRootLiteralsAreCensused:
         tree = ast.parse(source)
 
         assert _absolute_tmp_project_root_literals(tree) == []
+
+    @pytest.mark.parametrize(
+        ('source', 'literal'),
+        [
+            ("config.project_root = tmp_path or Path('/tmp/proj')\n", '/tmp/proj'),
+            ("config.project_root = Path('/tmp/a') if flag else tmp_path\n", '/tmp/a'),
+            ("config.project_root = tmp_path if flag else '/tmp/b'\n", '/tmp/b'),
+            ("Foo(project_root=root or '/tmp/c')\n", '/tmp/c'),
+        ],
+        ids=['boolop', 'ifexp-body', 'ifexp-orelse', 'compound-call-keyword'],
+    )
+    def test_the_detector_sees_through_a_compound_value(self, source, literal) -> None:
+        """A fallback literal escapes whenever a caller omits the sandboxed
+        argument, so it meets the same bar as any other literal: ONE site per
+        binding.  The keyword case shows value shape and binding shape are
+        orthogonal.
+        """
+        tree = ast.parse(source)
+
+        sites = _absolute_tmp_project_root_literals(tree)
+
+        assert len(sites) == 1, sites
+        assert literal in sites[0], sites
+
+    def test_the_detector_ignores_a_compound_value_with_no_tmp_literal(self) -> None:
+        """Negative: seeing through a compound must not flag one whose operands
+        are all references.
+        """
+        tree = ast.parse('config.project_root = tmp_path or other_root\n')
+
+        assert _absolute_tmp_project_root_literals(tree) == []
