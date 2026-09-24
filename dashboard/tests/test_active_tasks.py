@@ -13,6 +13,8 @@ from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 
 from dashboard.config import DashboardConfig
 from dashboard.data.active_tasks import (
+    _MAX_CANCELLED_PER_PROJECT,
+    _MAX_DONE_PER_PROJECT,
     _build_task_row,
     _minutes_since,
     collect_active_tasks,
@@ -408,7 +410,7 @@ async def test_collect_active_tasks_handles_missing_worktree_metadata(tmp_path, 
     active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
     assert active == [{
         'id': 'solo/T-1', 'project': 'solo', 'title': 'lonely',
-        'description': '', 'details': '', 'status': 'pending', 'agent': None,
+        'status': 'pending', 'agent': None,
         'started': 0, 'loops': 0, 'attempts': 0, 'deps': [],
         'meta_files': [], 'train': None, 'external_deps': [], 'prd': None,
         'lane': None, 'phase': None, 'lane_state': None, 'runtime_offline': False,
@@ -417,6 +419,48 @@ async def test_collect_active_tasks_handles_missing_worktree_metadata(tmp_path, 
         # is never stranded — the shared predicate gates on 'in-progress'.
         'claimant_run_id': None, 'heartbeat_at': None, 'stranded': False,
     }]
+
+
+@pytest.mark.asyncio
+async def test_no_active_tasks_row_carries_description_or_details(tmp_path, monkeypatch, dummy_client):
+    """ACCEPTANCE (task 5815): no row the list builds ships a task's prose.
+
+    The Task Detail pane fetches description/details for the ONE selected task
+    (dashboard/src/dashboard/api/task_prose.py::api_task_prose); shipping them
+    on every row was ~84% of the /tasks payload. Every raw row here carries
+    NON-EMPTY prose, so a missing key is a real omission, not an empty field.
+    """
+    root, shaped = _make_project(
+        tmp_path, project_dir='prose',
+        tasks=[
+            {'id': task_id, 'title': status, 'status': status, 'dependencies': [],
+             'description': f'why {task_id}', 'details': f'how {task_id}',
+             'updated_at': '2026-09-24T00:00:00+00:00'}
+            for task_id, status in enumerate(
+                ['in-progress', 'pending', 'blocked', 'done', 'cancelled'], start=1,
+            )
+        ],
+    )
+
+    async def _fake_fetch_tasks(client, config, project_root):
+        return list(shaped)
+
+    _register_fetch_tasks(monkeypatch, _fake_fetch_tasks)
+    _register_runtime(monkeypatch, {'prose': []})
+    cfg = DashboardConfig(project_root=root)
+
+    active, _offline, _counts, _degraded, _unknown = await collect_tasks_with_counts(
+        client=dummy_client, config=cfg,
+        max_done_per_project=_MAX_DONE_PER_PROJECT,
+        max_cancelled_per_project=_MAX_CANCELLED_PER_PROJECT,
+    )
+
+    # NON-VACUITY: both build paths through _build_task_row must have run.
+    statuses = {row['status'] for row in active}
+    assert statuses & {'in-progress', 'pending', 'blocked'}, f'no active-status row: {statuses}'
+    assert statuses & {'done', 'cancelled'}, f'no terminal row: {statuses}'
+    carrying = [row['id'] for row in active if 'description' in row or 'details' in row]
+    assert carrying == [], f'these ACTIVE_TASKS rows still ship prose: {carrying}'
 
 
 @pytest.mark.asyncio
