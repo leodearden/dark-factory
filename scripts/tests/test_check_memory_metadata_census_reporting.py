@@ -15,6 +15,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -368,3 +369,65 @@ def test_not_installed_outranks_a_stale_history_row(tmp_path):
     _assert_named_failure(result, INSTALLER)
     assert "not installed" in result.stderr.lower(), result.stderr
     assert HISTORY_RELPATH.name not in result.stderr, result.stderr
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [(), ("48", "12"), ("abc",), ("0",), ("-5",), ("inf",), ("nan",)],
+    ids=["none", "two", "non-numeric", "zero", "negative", "infinite", "nan"],
+)
+def test_bad_arguments_exit_nonzero_with_usage_before_probing(tmp_path, argv):
+    result = _run(
+        tmp_path, *argv,
+        fields=_healthy_fields(),
+        history=_history_with_newest_stamp(_hours_ago(2)),
+    )
+
+    _assert_named_failure(result, "usage:")
+    assert _systemctl_state(tmp_path)["calls"] == []
+
+
+def test_failed_result_fails_naming_it(tmp_path):
+    result = _run(
+        tmp_path, "48",
+        fields=_healthy_fields(Result="failed"),
+        history=_history_with_newest_stamp(_hours_ago(2)),
+    )
+
+    _assert_named_failure(result, "Result='failed'")
+
+
+def test_nonzero_exec_main_status_fails_naming_it(tmp_path):
+    result = _run(
+        tmp_path, "48",
+        fields=_healthy_fields(ExecMainStatus="1"),
+        history=_history_with_newest_stamp(_hours_ago(2)),
+    )
+
+    _assert_named_failure(result, "ExecMainStatus='1'")
+
+
+def test_systemctl_absent_from_path_is_unreadable_unit_state(tmp_path):
+    python_only = tmp_path / "python_only"
+    python_only.mkdir()
+    (python_only / "python3").symlink_to(sys.executable)
+
+    result = _run(
+        tmp_path, "48",
+        fields=_healthy_fields(),
+        history=_history_with_newest_stamp(_hours_ago(2)),
+        path_dirs=[python_only],
+    )
+
+    _assert_named_failure(result, "could not read unit state")
+
+
+def test_systemctl_exiting_nonzero_is_unreadable_unit_state(tmp_path):
+    result = _run(
+        tmp_path, "48",
+        fields=_healthy_fields(),
+        history=_history_with_newest_stamp(_hours_ago(2)),
+        exit_code=1,
+    )
+
+    _assert_named_failure(result, "could not read unit state")
