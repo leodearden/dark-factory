@@ -154,7 +154,9 @@ async def test_dispatch_stamp_embeds_run_id_session_id_and_pid(tmp_path: Path):
 # step-15/16: heartbeat loop
 # ---------------------------------------------------------------------------
 
-# Loop-responsive seconds (green ~15 ms); its 10 s wall cap is far under the 540 s thread timeout.
+# Loop-responsive seconds; bounds only a real hang. The wall cap that
+# _orch_helpers.py::wait_responsive derives from it must stay under
+# _orch_helpers.py::VERIFY_CLI_PER_TEST_TIMEOUT, the merge gate's per-test budget.
 _HEARTBEAT_REFRESH_BUDGET_SECS = 5
 
 
