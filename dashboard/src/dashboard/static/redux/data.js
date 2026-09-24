@@ -86,6 +86,12 @@ function endpointsFor(win) {
 // Note which half is encoded: the url must survive HTTP parsing, and the key
 // must be the name a caller can look up with the parameter it already holds.
 // No call site should have to know which is which.
+//
+// `retain`, where a row declares it, bounds what the row leaves behind: only
+// that many of its most recently requested params keep their value and
+// bookkeeping (see trimOnDemand). terminal declares none because its params are
+// the configured projects, a bounded set. taskProse's params are every task a
+// user clicks in a long-lived tab.
 const ON_DEMAND_KEYS = {
   terminal: {
     url: project => `/api/v2/dashboard/tasks?terminal=${encodeURIComponent(project)}`,
@@ -99,6 +105,7 @@ const ON_DEMAND_KEYS = {
     url: uid => '/api/v2/dashboard/task/' + uid.split('/').map(encodeURIComponent).join('/'),
     key: uid => `TASK_PROSE:${uid}`,
     spec: PLAIN,
+    retain: 8,
   },
 };
 
@@ -693,26 +700,90 @@ async function refreshDFData(win, opts) {
 // single user-triggered request has nothing to spread against, and delaying it
 // would only be latency the user sees.
 //
-// RETURNS refreshOne's outcome verbatim. A user action is the one caller that
-// cannot just wait for the next tick: without it, an awaited request resolves
-// identically whether the Datum landed, the server 503'd, or the key was still
-// inside its backoff window and nothing was even asked — so the UI could only
-// spin.
+// RETURNS the refreshOne outcome of the request serving this call. A user
+// action is the one caller that cannot just wait for the next tick: without
+// it, an awaited request resolves identically whether the Datum landed, the
+// server 503'd, or the key was still inside its backoff window and nothing was
+// even asked — so the UI could only spin.
+//
+// A CALL FOR A PARAM STILL IN FLIGHT JOINS THAT REQUEST and resolves with its
+// outcome. It is never handed skippedInFlight: that says a value is coming and
+// never says how the request ended, so a caller whose own earlier call was
+// abandoned (the Task Detail pane re-selecting a task) would wait forever on a
+// request that failed.
 async function requestOnDemand(name, param, opts) {
   const row = ON_DEMAND_KEYS[name];
   if (!row) {
     throw new Error(`DF_DATA: no on-demand key named '${name}' (declared: ${Object.keys(ON_DEMAND_KEYS).join(', ')})`);
   }
   const o = opts || {};
-  const url = row.url(param);
-  const deps = { ...DEFAULT_POLL_DEPS, ...o.deps, jitterMaxMs: 0 };
-  return refreshOne(
-    url,
+  const state = o.state || DF_POLL_STATE;
+  const ledger = onDemandLedger(state, name);
+  const request = ledger.get(param) || startOnDemand(name, param, state, o.deps, ledger);
+  // Re-inserted, so the ledger orders params by their latest request.
+  ledger.delete(param);
+  ledger.set(param, request);
+  trimOnDemand(name, ledger, row.retain ?? Infinity, state);
+  return request;
+}
+
+function startOnDemand(name, param, state, depsOverrides, ledger) {
+  const row = ON_DEMAND_KEYS[name];
+  const deps = { ...DEFAULT_POLL_DEPS, ...depsOverrides, jitterMaxMs: 0 };
+  const request = refreshOne(
+    row.url(param),
     { [row.key(param)]: row.spec },
-    o.state || DF_POLL_STATE,
+    state,
     deps,
-    `${pollKey(url)}#${name}:${param}`,
-  );
+    onDemandStateKey(name, param),
+  ).finally(() => {
+    if (ledger.get(param) === request) ledger.set(param, null);
+  });
+  return request;
+}
+
+function onDemandStateKey(name, param) {
+  return `${pollKey(ON_DEMAND_KEYS[name].url(param))}#${name}:${param}`;
+}
+
+// Per poll state, per row: every param requestOnDemand has asked for and not
+// yet forgotten, least recently requested first. Each maps to its request's
+// promise while that request is in flight, and to null once it settles. Keyed
+// by the state object, so an injected state has its own ledger, just as it
+// has its own flow-control entries.
+const ON_DEMAND_LEDGERS = new WeakMap();
+
+function onDemandLedger(state, name) {
+  if (!ON_DEMAND_LEDGERS.has(state)) ON_DEMAND_LEDGERS.set(state, new Map());
+  const rows = ON_DEMAND_LEDGERS.get(state);
+  if (!rows.has(name)) rows.set(name, new Map());
+  return rows.get(name);
+}
+
+// Forget the least recently requested params until at most `limit` remain.
+// A param still in flight is passed over: a caller may be joined to it, and
+// its landing would re-create what was forgotten. A later trim takes it once
+// it has settled.
+function trimOnDemand(name, ledger, limit, state) {
+  for (const [param, inFlight] of ledger) {
+    if (ledger.size <= limit) return;
+    if (inFlight) continue;
+    ledger.delete(param);
+    forgetOnDemand(name, param, state);
+  }
+}
+
+// Everything one settled request left behind: its value, its flow-control
+// entry and its __stale/__receipt records. The __loaded marker goes too, so it
+// never claims a value that is no longer there.
+function forgetOnDemand(name, param, state) {
+  const key = ON_DEMAND_KEYS[name].key(param);
+  const stateKey = onDemandStateKey(name, param);
+  state.delete(stateKey);
+  delete window.DF_DATA[key];
+  delete window.DF_DATA.__loaded[key];
+  delete window.DF_DATA.__stale[stateKey];
+  delete window.DF_DATA.__receipt[stateKey];
 }
 
 window.DF_REFRESH = refreshDFData;

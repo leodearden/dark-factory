@@ -2287,3 +2287,163 @@ test('onDemandView: with no value, a settled request that brought none is unavai
     }
   }
 });
+
+// ---------------------------------------------------------------------------
+// On-demand joining and retention
+//
+// JOINING. A caller that asks for a param whose request is still in flight
+// is joined to that request and gets its real outcome. It is never handed
+// skippedInFlight, which would tell it something is coming and then never
+// say how it ended. The Task Detail pane hits this whenever a user re-selects
+// a task whose first request belongs to an effect that was already torn down.
+//
+// RETENTION. A row that declares `retain` keeps the value and bookkeeping of
+// only that many of its most recently requested params. taskProse needs it:
+// its params are every task a user clicks in a long-lived tab, and each one
+// would otherwise leave its prose in DF_DATA for good.
+// ---------------------------------------------------------------------------
+
+function heldProse() {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const fetchUrls = [];
+  const fetchImpl = url => { fetchUrls.push(url); return gate.then(respond => respond(url)); };
+  return { fetchImpl, fetchUrls, release };
+}
+
+function proseStateKey(uid) {
+  return `/api/v2/dashboard/task/${uid}#taskProse:${uid}`;
+}
+
+test('on-demand joining: a re-request for a param in flight joins it and learns that it FAILED', async () => {
+  const { api } = loadDataJs();
+  const state = api.createPollState();
+  const held = heldProse();
+  const deps = { fetchImpl: held.fetchImpl, now: () => 5 };
+
+  const first = api.requestOnDemand('taskProse', PROSE_UID, { state, deps });
+  await drain();
+  const second = api.requestOnDemand('taskProse', PROSE_UID, { state, deps });
+  held.release(() => ({ ok: false, status: 503 }));
+
+  assert.equal(await first, api.REFRESH_OUTCOMES.failed);
+  assert.equal(
+    await second, api.REFRESH_OUTCOMES.failed,
+    'the joined caller must learn how the request ended, not be told it is still coming',
+  );
+  assert.equal(held.fetchUrls.length, 1, 'joining must not issue a second request');
+});
+
+test('on-demand joining: a joined caller of a request that LANDS gets applied and the value', async () => {
+  const { api, window: win } = loadDataJs();
+  const state = api.createPollState();
+  const held = heldProse();
+  const deps = { fetchImpl: held.fetchImpl, now: () => 5 };
+
+  const first = api.requestOnDemand('taskProse', PROSE_UID, { state, deps });
+  await drain();
+  const second = api.requestOnDemand('taskProse', PROSE_UID, { state, deps });
+  held.release(url => taskProseResponse()(url));
+
+  assert.deepEqual([await first, await second], [api.REFRESH_OUTCOMES.applied, api.REFRESH_OUTCOMES.applied]);
+  assert.equal(win.DF_DATA[PROSE_KEY], SERVED_PROSE);
+  assert.equal(held.fetchUrls.length, 1);
+});
+
+test('on-demand joining: once a request settles, the next one fetches afresh rather than replaying it', async () => {
+  const { api } = loadDataJs();
+  const state = api.createPollState();
+  const fetchUrls = [];
+  const inner = taskProseResponse();
+  const deps = { fetchImpl: url => { fetchUrls.push(url); return inner(url); }, now: () => 5 };
+
+  await api.requestOnDemand('taskProse', PROSE_UID, { state, deps });
+  await api.requestOnDemand('taskProse', PROSE_UID, { state, deps });
+
+  assert.equal(fetchUrls.length, 2);
+});
+
+test('on-demand retention: taskProse declares a positive whole-number retain', () => {
+  const { api } = loadDataJs();
+  const { retain } = api.ON_DEMAND_KEYS.taskProse;
+
+  assert.ok(Number.isInteger(retain) && retain >= 1, `taskProse.retain must be a positive integer, got ${retain}`);
+});
+
+test('on-demand retention: one param past the cap forgets the least recently requested one entirely', async () => {
+  const { api, window: win } = loadDataJs();
+  const state = api.createPollState();
+  const { retain } = api.ON_DEMAND_KEYS.taskProse;
+  const deps = { fetchImpl: taskProseResponse(), now: () => 9 };
+  const uids = Array.from({ length: retain + 1 }, (_, i) => `dark-factory/T-${i + 1}`);
+
+  for (const uid of uids) await api.requestOnDemand('taskProse', uid, { state, deps });
+
+  const [oldest, ...kept] = uids;
+  assert.equal(win.DF_DATA[`TASK_PROSE:${oldest}`], undefined, 'the oldest prose is still held');
+  assert.equal(win.DF_DATA.__loaded[`TASK_PROSE:${oldest}`], undefined, 'the oldest __loaded marker is still held');
+  assert.equal(state.get(proseStateKey(oldest)), undefined, 'the oldest flow-control entry is still held');
+  assert.equal(win.DF_DATA.__stale[proseStateKey(oldest)], undefined, 'the oldest __stale entry is still held');
+  assert.equal(win.DF_DATA.__receipt[proseStateKey(oldest)], undefined, 'the oldest __receipt entry is still held');
+  for (const uid of kept) {
+    assert.equal(win.DF_DATA[`TASK_PROSE:${uid}`], SERVED_PROSE, `${uid} was forgotten inside the cap`);
+  }
+  assert.equal(state.size, retain);
+  assert.equal(Object.keys(win.DF_DATA.__stale).length, retain);
+  assert.equal(Object.keys(win.DF_DATA.__receipt).length, retain);
+});
+
+test('on-demand retention: re-requesting a param makes it the most recent, so the next one goes instead', async () => {
+  const { api, window: win } = loadDataJs();
+  const state = api.createPollState();
+  const { retain } = api.ON_DEMAND_KEYS.taskProse;
+  const deps = { fetchImpl: taskProseResponse(), now: () => 9 };
+  const uids = Array.from({ length: retain }, (_, i) => `dark-factory/T-${i + 1}`);
+
+  for (const uid of uids) await api.requestOnDemand('taskProse', uid, { state, deps });
+  await api.requestOnDemand('taskProse', uids[0], { state, deps });
+  await api.requestOnDemand('taskProse', 'dark-factory/T-999', { state, deps });
+
+  assert.equal(win.DF_DATA[`TASK_PROSE:${uids[0]}`], SERVED_PROSE, 're-requested, so it is the most recent');
+  assert.equal(win.DF_DATA[`TASK_PROSE:${uids[1]}`], undefined, 'now the least recent, so it goes');
+});
+
+test('on-demand retention: a param in flight is never forgotten, and goes by a later trim once settled', async () => {
+  const { api, window: win } = loadDataJs();
+  const state = api.createPollState();
+  const { retain } = api.ON_DEMAND_KEYS.taskProse;
+  const held = heldProse();
+  const settled = { fetchImpl: taskProseResponse(), now: () => 9 };
+  const slowUid = 'dark-factory/T-1';
+
+  const slow = api.requestOnDemand('taskProse', slowUid, { state, deps: { fetchImpl: held.fetchImpl, now: () => 9 } });
+  await drain();
+  for (let i = 2; i <= retain + 2; i += 1) {
+    await api.requestOnDemand('taskProse', `dark-factory/T-${i}`, { state, deps: settled });
+  }
+  assert.equal(state.get(proseStateKey(slowUid)).inFlight, true, 'the in-flight request lost its flow-control entry');
+
+  held.release(url => taskProseResponse()(url));
+  assert.equal(await slow, api.REFRESH_OUTCOMES.applied);
+  assert.equal(win.DF_DATA[`TASK_PROSE:${slowUid}`], SERVED_PROSE);
+
+  await api.requestOnDemand('taskProse', 'dark-factory/T-999', { state, deps: settled });
+  assert.equal(win.DF_DATA[`TASK_PROSE:${slowUid}`], undefined, 'settled and past the cap, so it goes now');
+  assert.equal(state.get(proseStateKey(slowUid)), undefined);
+  assert.equal(state.size, retain);
+});
+
+test('on-demand retention: a row that declares no retain keeps every param', async () => {
+  const { api, window: win } = loadDataJs();
+  const state = api.createPollState();
+  const projects = Array.from({ length: 20 }, (_, i) => `project-${i}`);
+
+  assert.equal(api.ON_DEMAND_KEYS.terminal.retain, undefined, 'terminal params are the configured projects, a bounded set');
+  for (const project of projects) {
+    await api.requestOnDemand('terminal', project, { state, deps: { fetchImpl: terminalResponse(), now: () => 9 } });
+  }
+
+  for (const project of projects) {
+    assert.ok(win.DF_DATA[`TASKS_TERMINAL:${project}`], `${project} was forgotten`);
+  }
+});
