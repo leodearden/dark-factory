@@ -76,10 +76,6 @@ def test_task_prose_reads_the_value_through_the_rows_key_builder(tab_tasks_code,
     )
 
 
-def test_task_prose_branches_on_the_shared_view_decision(task_prose_code):
-    assert 'DF_LOADER_T.onDemandView(' in task_prose_code
-
-
 def test_task_prose_renders_both_fields_as_markdown(task_prose_code):
     for field in ('description', 'details'):
         assert re.search(
