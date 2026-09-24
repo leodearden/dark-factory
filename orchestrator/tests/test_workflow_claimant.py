@@ -19,8 +19,10 @@ import ast
 import asyncio
 import dataclasses
 import os
+import time
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -152,6 +154,23 @@ async def test_dispatch_stamp_embeds_run_id_session_id_and_pid(tmp_path: Path):
 # step-15/16: heartbeat loop
 # ---------------------------------------------------------------------------
 
+# A fixed 50 ms wait survives a stall of at most 50 - 10 = 40 ms (35 ms: 1 refresh, 45 ms: 0).
+_DISPATCH_STALL_SECS = 0.06
+
+
+def _stall_loop_at_dispatch(wf: TaskWorkflow, stall_secs: float) -> None:
+    """Freeze the loop thread for *stall_secs*, the way a descheduled xdist worker is frozen.
+
+    The dispatch write is the seam: the heartbeat task is created right after it, so the
+    stall runs AHEAD of the heartbeat's first step, once the test is already waiting.
+    """
+    dispatch_write = cast(AsyncMock, wf.scheduler.set_task_status)
+
+    def _queue_stall(*_args, **_kwargs) -> None:
+        asyncio.get_running_loop().call_soon(time.sleep, stall_secs)
+
+    dispatch_write.side_effect = _queue_stall
+
 
 @pytest.mark.asyncio
 async def test_heartbeat_loop_starts_after_dispatch_stamp(tmp_path: Path):
@@ -182,6 +201,20 @@ async def test_heartbeat_loop_refreshes_heartbeat_only(tmp_path: Path):
     assert args == ('303',)
     assert 'claimant_run_id' not in kwargs
     assert 'heartbeat_at' in kwargs
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_loop_still_refreshes_after_a_loop_stall_at_dispatch(tmp_path: Path):
+    """A loop stall between the dispatch write and the heartbeat's first step
+    delays, but must not lose, the first refresh."""
+    wf = _make_workflow(project_root=tmp_path, task_id='404', claimant_heartbeat_interval_secs=0.01)
+    _stall_loop_at_dispatch(wf, _DISPATCH_STALL_SECS)
+
+    await _setup(wf)
+    await asyncio.sleep(0.05)
+    await wf._stop_claimant_heartbeat()
+
+    assert cast(AsyncMock, wf.scheduler.set_task_claimant).await_count >= 1
 
 
 @pytest.mark.asyncio
