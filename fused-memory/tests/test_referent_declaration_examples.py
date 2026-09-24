@@ -48,7 +48,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from fused_memory.server.entities_gate import entities_gate
 from fused_memory.server.tools import create_mcp_server
+from fused_memory.utils.referent_resolution import render_referent_declaration_guidance
 
 #: The keyword the extractor scans documents for. Pinned below to the LIVE
 #: signature of both write tools, so a parameter rename goes red here instead
@@ -183,6 +185,52 @@ def test_declaration_keyword_is_a_live_write_tool_parameter(tool_name):
         'it exists. If it was renamed, rename _DECLARATION_KEYWORD and every '
         'documented example with it.'
     )
+
+
+# ── Every guarded site teaches declarations the live gate accepts ────────────
+
+_GROUP_ID = 'dark_factory'
+
+#: Content for an example whose call carries none. It names no task, so the
+#: gate's content scan is empty and can never conflict: such an example is
+#: certified for SHAPE only. Named here so that is a visible choice.
+_CONTENT_NAMING_NO_TASK = 'Fallback content for a contentless example; it names no task.'
+
+_GUARDED_SITES = (('recon-prompt-fragment', render_referent_declaration_guidance),)
+
+
+def _rejection(example: DeclaredExample) -> str | None:
+    block = entities_gate(
+        example.literal,
+        content=example.content if example.content is not None else _CONTENT_NAMING_NO_TASK,
+        group_id=_GROUP_ID,
+    )
+    if block is None:
+        return None
+    details = {k: block[k] for k in ('conflicts', 'content_referents') if k in block}
+    return (
+        f'{example.where}: {_DECLARATION_KEYWORD}={example.literal!r} -> '
+        f'{block["error_type"]} {details or ""}: {block.get("hint", block["error"])}'
+    )
+
+
+@pytest.mark.parametrize(('site_id', 'load'), _GUARDED_SITES, ids=[s for s, _ in _GUARDED_SITES])
+def test_every_guarded_example_is_accepted_by_the_live_gate(site_id, load):
+    examples = _declared_examples(load(), origin=site_id)
+
+    assert any(example.literal for example in examples), (
+        f'{site_id}: every example declares []. The gate accepts that, but it '
+        'teaches nothing about the entry shape. Show at least one non-empty '
+        'declaration whose content names what it declares.'
+    )
+    rejections = [r for r in map(_rejection, examples) if r is not None]
+    assert not rejections, (
+        f'{site_id} teaches declarations the live entities_gate rejects:\n' + '\n'.join(rejections)
+    )
+
+
+def test_rendered_fragment_names_the_declaration_keyword():
+    assert _DECLARATION_KEYWORD in render_referent_declaration_guidance()
 
 
 # ── The extractor, against hand-written fixtures only ────────────────────────
