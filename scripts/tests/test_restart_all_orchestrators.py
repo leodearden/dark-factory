@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import json
+import math
 import os
 import re
 import signal
@@ -1197,6 +1198,11 @@ _IN_LOOP_RESUME_SPAWN_TIMEOUT_SECS = 15
 # at loadavg ~90 on 32 cores, task 5838) and than the 3s wall-clock offset
 # (_FIRST_TRANSITION_DELAY_SECS) at which the first rewrite currently fires.
 _SLOW_START_SECS = 4
+# Small, so each counted run (see _polls_outlasting) is a handful of polls. At
+# least 2, so the watcher's FIRST rewrite, which reacts to the gate's first busy
+# poll, still lands before the busy loop's last pre-force poll: bash's
+# whole-second $SECONDS can shrink an F-second deadline to about F-1 seconds.
+_SHORT_FORCE_FIRE_SECS = 2
 
 
 @contextlib.contextmanager
@@ -1545,6 +1551,26 @@ def _run_busy_unit_through(tmp_path, rewrites, *, spawn_timeout, **knobs):
     return result, _load_state(state_path), _read_poll_trace(trace_path)
 
 
+def _polls_outlasting(secs: int) -> int:
+    """How many polls of a new verdict carry drain_gate past `secs` seconds
+    of its force-fire clock.
+
+    drain_gate's busy loop checks the force-fire deadline F at the TOP of
+    each iteration and sleeps one poll interval before every poll, so:
+      (i) the busy loop alone makes at most ceil(F/interval) polls before it
+          force-fires;
+      (ii) the k-th poll of a new verdict, counting from the busy loop's
+          first poll of it, lands at least k-1 intervals after the defer
+          anchor: the next poll, drain_await_fresh's opening read, needs no
+          sleep, and each later one has one.
+    Both bounds come from the script's own sleeps, so host load can only
+    strengthen them. The ceil(secs/interval)+1 polls returned here are
+    therefore more than the busy loop alone can make before a `secs`
+    deadline, and put the script at least `secs` past its defer anchor.
+    """
+    return math.ceil(secs / _TIMELINE_POLL_INTERVAL_SECS) + 1
+
+
 def _assert_resumed_from_the_busy_loop(result, state, polls):
     """Assert drain_gate's IN-LOOP resume: defer on a busy read, then resume
     on an idle read taken straight from the busy poll loop.
@@ -1788,27 +1814,30 @@ def test_unit_that_drains_during_the_unknown_grace_resumes_after_the_await(
     in-loop resume site's (drain_gate's `verdict == "idle"` arm reached
     straight from the busy poll loop, pinned by
     test_busy_unit_that_drains_mid_defer_resumes_and_restarts), so the two
-    can't be told apart by text. They're told apart by an ORDERING
-    INEQUALITY instead: ORCH_RESTART_FORCE_FIRE_AFTER_SECS=5 is deliberately
-    SMALLER than the scheduled idle flip at t=8, and drain_await_fresh never
-    consults the force-fire clock. A resume observed at ~t=8 is therefore
-    only reachable from INSIDE drain_await_fresh -- had control stayed in
-    the outer busy loop, it would have force-fired at t=5 instead. Do not
-    "simplify" the 5-vs-8 relationship; it is the assertion.
+    can't be told apart by text. They're told apart by a POLL COUNT instead,
+    in the script's own clock (see _polls_outlasting): drain_await_fresh
+    never consults the force-fire clock, and the idle rewrite waits for one
+    more stale/absent poll than the outer busy loop can make before its
+    _SHORT_FORCE_FIRE_SECS deadline. Had control stayed in that loop, it
+    would have force-fired before the idle was ever written, so a resume
+    line with no force line proves the idle was read INSIDE
+    drain_await_fresh. Do not "simplify" the idle rewrite's
+    `polls=_polls_outlasting(...)` count; it is the assertion.
     """
     # ORCH_DRAIN_UNKNOWN_GRACE_SECS is the must-never-elapse bound here (the
-    # unit resumes on its own at t=8, well inside it); ONE binding still
-    # feeds it from spawn_timeout, per test_defer_withholds_restart_while_busy.
+    # unit drains on its own a few polls into it); ONE binding still feeds it
+    # from spawn_timeout, per test_defer_withholds_restart_while_busy.
     spawn_timeout = 20
+    outlasting = _polls_outlasting(_SHORT_FORCE_FIRE_SECS)
 
-    result, state, fired = _busy_unit_drain_run(
+    result, state, polls = _run_busy_unit_through(
         tmp_path,
         [
-            (verdict_label, _FIRST_TRANSITION_DELAY_SECS, overrides),
-            ("idle", 8.0, _HB_IDLE),
+            _Rewrite(after="busy", to=overrides),
+            _Rewrite(after=verdict_label, to=_HB_IDLE, polls=outlasting),
         ],
         spawn_timeout=spawn_timeout,
-        ORCH_RESTART_FORCE_FIRE_AFTER_SECS="5",
+        ORCH_RESTART_FORCE_FIRE_AFTER_SECS=str(_SHORT_FORCE_FIRE_SECS),
         ORCH_DRAIN_UNKNOWN_GRACE_SECS=str(wait_proof_grace_secs(spawn_timeout)),
     )
 
@@ -1822,7 +1851,7 @@ def test_unit_that_drains_during_the_unknown_grace_resumes_after_the_await(
     assert f"resuming restart of {UNIT_R}: drained" in result.stdout, (
         f"expected the post-await idle resume line; got stdout={result.stdout!r}"
     )
-    # THE SITE-2 PROOF -- see the docstring's ordering-inequality argument.
+    # THE SITE-2 PROOF -- see the docstring's poll-count argument.
     assert "force-restarting" not in result.stdout.lower(), (
         f"expected the resume to come from inside drain_await_fresh, not a "
         f"force-fire; got stdout={result.stdout!r}"
@@ -1836,8 +1865,19 @@ def test_unit_that_drains_during_the_unknown_grace_resumes_after_the_await(
     assert ["--user", "restart", UNIT_R] in state["calls"], (
         f"expected a restart call for {UNIT_R}; got calls={state['calls']!r}"
     )
-    assert fired == [verdict_label, "idle"], (
-        f"expected both scheduled transitions to land in order; got fired={fired!r}"
+    busy, unfresh, idle = ("busy", UNIT_R), (verdict_label, UNIT_R), ("idle", UNIT_R)
+    assert busy in polls and polls == (
+        [busy] * polls.count(busy) + [unfresh] * polls.count(unfresh) + [idle]
+    ), (
+        f"expected one or more busy polls, then {verdict_label} polls, then "
+        f"exactly one idle poll; ledger={polls!r} stdout={result.stdout!r}"
+    )
+    assert polls.count(unfresh) >= outlasting, (
+        f"the ledger's shape is fine; its {verdict_label} run is not. The idle "
+        f"rewrite waits for {outlasting} {verdict_label} polls, so a shorter "
+        f"run means something other than that count released it, and the "
+        f"site-2 proof above no longer holds. ledger={polls!r} "
+        f"stdout={result.stdout!r}"
     )
 
 
