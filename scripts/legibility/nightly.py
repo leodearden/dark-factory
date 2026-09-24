@@ -54,6 +54,7 @@ from legibility import (  # noqa: E402
 )
 from legibility.config import (  # noqa: E402
     LegibilityConfig,
+    _require_absolute,
     configure_logging,
     load_config,
 )
@@ -595,16 +596,10 @@ def _default_entrypoint_exists() -> bool:
     return (Path(__file__).resolve().parent / _CENSUS_ENTRYPOINT_NAME).exists()
 
 
-def _require_absolute_launch_arg(value: str | Path, *, what: str) -> str:
-    """Return *value* as a census argv string; REFUSE a relative one rather
-    than resolve it against whatever cwd this process happens to have."""
-    if not Path(value).is_absolute():
-        raise ValueError(
-            f'census {what} must be absolute, got {value!r}: a relative one '
-            "would resolve against the trickle's cwd "
-            "(legibility-trickle@.service's WorkingDirectory), task 3269's defect"
-        )
-    return str(value)
+_RELATIVE_CENSUS_ARG_DETAIL = (
+    "A relative one would resolve against the trickle's cwd "
+    "(legibility-trickle@.service's WorkingDirectory) -- task 3269's defect."
+)
 
 
 def _default_census_launcher(
@@ -640,10 +635,16 @@ def _default_census_launcher(
     argv = [
         sys.executable,
         str(Path(__file__).resolve().parent / _CENSUS_ENTRYPOINT_NAME),
-        '--project-root', _require_absolute_launch_arg(project_root, what='project_root'),
+        '--project-root', _require_absolute(
+            str(project_root), field_name='census project_root',
+            detail=_RELATIVE_CENSUS_ARG_DETAIL,
+        ),
     ]
     if config_path is not None:
-        argv += ['--config', _require_absolute_launch_arg(config_path, what='config_path')]
+        argv += ['--config', _require_absolute(
+            str(config_path), field_name='census config_path',
+            detail=_RELATIVE_CENSUS_ARG_DETAIL,
+        )]
     result = subprocess.run(argv, check=False, env=env)
     if result.returncode != 0:
         logger.warning(

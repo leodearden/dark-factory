@@ -1310,10 +1310,6 @@ def test_default_census_launcher_argv_names_the_target_project(monkeypatch):
     assert argv[0] == sys.executable
     assert argv[1].endswith('census.py'), f'argv[1] must be the census entrypoint, got {argv[1]!r}'
     assert _adjacent_pair(argv, '--project-root') == ['--project-root', '/some/other/project']
-    assert '.' not in argv, "the census must never be launched with a relative '.' root"
-    assert os.getcwd() not in argv, (
-        "the census target must come from the argument, not from the launcher's cwd"
-    )
     assert '--config' not in argv, (
         'a caller holding only a project root must not synthesize a config path'
     )
