@@ -29,19 +29,20 @@ decision writes: its explicit-action keybindings (boost/drop) add
 action-only writes to a DECISION's manual_boost/state via C1's
 set_manual_boost/update_decision_state, each of which runs synchronously on
 the event-loop thread and is followed there by a full
-list_decisions(self.fleet_root) re-scan (CockpitApp._apply_boost,
-CockpitApp.action_drop) -- see test_app.py's
-TestWriteDiscipline (the C5a session/detail path) and
+list_decisions(self.fleet_root) re-scan (CockpitApp._reread_decisions,
+shared by CockpitApp._apply_boost and CockpitApp.action_drop) -- see
+test_app.py's TestWriteDiscipline (the C5a session/detail path) and
 TestRefreshWriteDiscipline (the C5b queue/attention path) for the
 end-to-end proof of the refresh-path half of this contract.
 
 Every decision READ goes through cockpit.registry_reader.scan_decisions --
 registry_reader's folding wrapper over C1's list_decisions, which
-canonicalizes DecisionRecord.project (task 3812) -- at all three of this
-module's read sites: _scan_registry, and the re-reads inside _apply_boost
-and action_drop. That does not weaken the discipline above: scan_decisions
-is itself read-only, so the canonicalized record exists in memory only and
-can never be written back (this module still never calls write_decision).
+canonicalizes DecisionRecord.project (task 3812) -- at both of this
+module's read sites: _scan_registry, and _reread_decisions (the post-write
+re-read _apply_boost and action_drop share). That does not weaken the
+discipline above: scan_decisions is itself read-only, so the canonicalized
+record exists in memory only and can never be written back (this module
+still never calls write_decision).
 """
 
 from __future__ import annotations
@@ -272,10 +273,11 @@ class CockpitApp(App):
         self._has_scanned = False
         # Monotonic scan-sequence guard (esc-2517-1, task 2606): _scan_seq is
         # the next-to-issue sequence number (see _next_scan_seq), bumped once
-        # per scan INITIATED -- by refresh_registry or _poll_registry, both
-        # always on the main thread. _applied_scan_seq is the high-water
-        # mark of the newest sequence _apply_scan has actually applied. A
-        # scan whose seq is older than that mark read the registry before a
+        # per scan INITIATED -- by refresh_registry, _poll_registry or
+        # _reread_decisions, all always on the main thread. _applied_scan_seq
+        # is the high-water mark of the newest sequence actually applied, by
+        # _apply_scan or by _reread_decisions' decisions-only read. A scan
+        # whose seq is older than that mark read the registry before a
         # fresher scan already landed, and _apply_scan drops it rather than
         # letting it regress the view. Like _scan_in_flight below, both are
         # only ever mutated on the main thread, so neither needs a lock.
@@ -376,12 +378,14 @@ class CockpitApp(App):
         """Issue the next monotonic scan sequence number. MAIN-THREAD-ONLY.
 
         self._scan_seq += 1 is a non-atomic read-modify-write; only
-        refresh_registry and _poll_registry call this, and both always run
-        on the main thread (mirrors the _scan_in_flight discipline -- see
-        __init__), so no lock is needed. The returned value must travel WITH
-        its scan as an explicit parameter through to _apply_scan, never via
-        a shared mutable attribute -- the whole point of the guard is that a
-        still in-flight, older scan carries its own older sequence.
+        refresh_registry, _poll_registry and _reread_decisions call this,
+        and all three always run on the main thread (mirrors the
+        _scan_in_flight discipline -- see __init__), so no lock is needed.
+        The returned value must travel WITH its scan as an explicit value --
+        a parameter through to _apply_scan, or _reread_decisions' own local
+        -- never via a shared mutable attribute: the whole point of the
+        guard is that a still in-flight, older scan carries its own older
+        sequence.
         """
         self._scan_seq += 1
         return self._scan_seq
@@ -458,16 +462,18 @@ class CockpitApp(App):
 
         Note: seq order tracks scan-*initiation* order, not measured
         read-completion order -- it is a proxy for freshness, not a direct
-        stamp of it. In principle a scan issued earlier (lower seq) could
-        finish its off-thread registry read later than one issued after it,
-        and this guard would drop that earlier-issued-but-actually-fresher
-        result. That window cannot open today: _scan_in_flight (see
-        _poll_registry) admits only one in-flight poll worker at a time, so
-        poll-issued scans can never race each other, and refresh_registry
-        only ever runs synchronously at on_mount, before the poll timer is
-        registered. The guard's correctness therefore rests on that
-        backpressure serialization keeping initiation order equal to
-        landing order, not on seq tracking true read recency.
+        stamp of it. So a scan issued earlier (lower seq) that finishes its
+        registry read later than one issued after it is dropped even though
+        it is actually fresher. _reread_decisions opens exactly that window:
+        it can take a seq while a poll scan is in flight, so that
+        earlier-issued scan is dropped whole even if its read finished
+        after the keypress's write. A drop never regresses the view,
+        though: the next tick's scan re-reads everything, so the only cost
+        is lag until that scan lands, sessions included. Poll scans still
+        never race each other or refresh_registry: _scan_in_flight (see
+        _poll_registry) admits only one in-flight poll worker at a time,
+        and refresh_registry only ever runs synchronously at on_mount,
+        before the poll timer is registered.
         """
         if not self.is_running:
             return
@@ -1036,6 +1042,26 @@ class CockpitApp(App):
             return
         self._backend_for(item.target.kind).focus(item.target)
 
+    def _reread_decisions(self) -> None:
+        """Adopt decisions as they now stand, after one of this app's own sanctioned writes.
+
+        Lets the queue re-score without waiting for a poll tick, and updates
+        the snapshot too, so that tick does not re-detect the write as an
+        external change. Reads through registry_reader.scan_decisions, so
+        the task-3812 project fold holds here as well.
+
+        A SEQUENCED read: it takes a seq from _next_scan_seq() and advances
+        _applied_scan_seq, so a poll scan issued before the write, whose
+        read may predate it, is dropped by _apply_scan's stale-scan guard
+        when it lands. Unsequenced, that late landing reverted the write in
+        the view, and the next 'b' built on the stale boost and persisted
+        it, losing a press (task 5839).
+        """
+        seq = self._next_scan_seq()
+        self._decisions = scan_decisions(self.fleet_root)
+        self._decisions_snapshot = _decisions_snapshot(self._decisions)
+        self._applied_scan_seq = seq
+
     def _decision_by_id(self, decision_id: str) -> DecisionRecord | None:
         return next((d for d in self._decisions if d.id == decision_id), None)
 
@@ -1045,12 +1071,8 @@ class CockpitApp(App):
         Exactly one of *delta* (additive -- b/B) or *absolute* (a direct
         set -- a digit key) is given. A DECISION-backed highlighted row
         persists its new manual_boost via C1's set_manual_boost -- the
-        cockpit's own sanctioned decision write -- then re-scans decisions
-        (registry_reader.scan_decisions, the folding wrapper over C1's
-        list_decisions, so the re-read cannot reintroduce a raw project
-        token the initial scan had already canonicalized -- task 3812) so
-        self._decisions (and its snapshot, so a later poll tick doesn't
-        redundantly re-detect this same change as external) reflect the
+        cockpit's own sanctioned decision write -- then re-reads decisions
+        through _reread_decisions, so self._decisions reflects the
         persisted value directly; no in-memory overlay is needed once a
         decision's boost is on disk. A SESSION-backed row has no
         persisted priority field at all (PRD §2 design decisions), so its
@@ -1084,8 +1106,7 @@ class CockpitApp(App):
                 assert delta is not None, 'exactly one of delta/absolute must be given'
                 new_boost = current_boost + delta
             set_manual_boost(item.decision_id, new_boost, root=self.fleet_root)
-            self._decisions = scan_decisions(self.fleet_root)
-            self._decisions_snapshot = _decisions_snapshot(self._decisions)
+            self._reread_decisions()
         else:
             current_boost = self._boosts.get(key, 0)
             if absolute is not None:
@@ -1122,13 +1143,10 @@ class CockpitApp(App):
         """'x' -- drop the highlighted row (PRD §9 C5b).
 
         A DECISION-backed row persists via C1's update_decision_state --
-        the cockpit's other sanctioned decision write -- then re-scans
-        decisions (registry_reader.scan_decisions, the same folding wrapper
-        _apply_boost re-reads through, so a drop cannot refragment a project
-        token either -- task 3812) so self._decisions (and its snapshot)
-        reflect the persisted state directly; order_queue's own
-        state=='open' filter then excludes it, exactly like _apply_boost's
-        re-scan. A
+        the cockpit's other sanctioned decision write -- then re-reads
+        decisions through _reread_decisions, so self._decisions reflects
+        the persisted state directly; order_queue's own state=='open'
+        filter then excludes it. A
         SESSION-backed row has no cockpit-writable state field at all
         (PRD §2 design decisions), so it is instead added to
         self._dropped, an in-memory overlay order_queue filters out by
@@ -1152,8 +1170,7 @@ class CockpitApp(App):
             return
         if item.kind == 'decision' and item.decision_id is not None:
             update_decision_state(item.decision_id, DecisionState.DROPPED, root=self.fleet_root)
-            self._decisions = scan_decisions(self.fleet_root)
-            self._decisions_snapshot = _decisions_snapshot(self._decisions)
+            self._reread_decisions()
         else:
             self._record_overlay(key)
             self._dropped.add(key)
