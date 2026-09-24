@@ -1568,6 +1568,40 @@ class TestListEntityNodesLiveFalkorDB:
         assert paged.expected_rows == self.LIVE_NODE_COUNT
 
 
+@falkor_skipif()
+@pytest.mark.timeout(60)
+@pytest.mark.integration
+class TestStaleNodeEmbeddingsLiveFalkorDB:
+    """Task 4869: the real cap, and the WITH-before-RETURN page syntax.
+
+    The fake cannot check that FalkorDB accepts the page template, nor that
+    a real ``vecf32`` survives the dimension parse, so this runs the vector
+    read end to end on a THROWAWAY graph. Never point it at a production one.
+    """
+
+    LIVE_NODE_COUNT = 12000  # comfortably above the 10000 cap
+
+    @pytest.mark.asyncio
+    async def test_every_stale_embedding_is_found_past_the_server_cap(
+        self, mock_config, make_backend, pagination_live_graph
+    ):
+        _, graph = pagination_live_graph
+        await graph.query(
+            f'UNWIND range(0, {self.LIVE_NODE_COUNT - 1}) AS i '
+            "CREATE (:Entity {uuid: 'u' + toString(i), name: 'n' + toString(i), "
+            'name_embedding: vecf32([0.1, 0.2, 0.3])})'
+        )
+
+        backend = make_backend(mock_config)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        stale = await backend.query_stale_node_embeddings(
+            expected_dim=1536, group_id='test'
+        )
+        assert len(stale) == self.LIVE_NODE_COUNT
+        assert {s[0] for s in stale} == {f'u{i}' for i in range(self.LIVE_NODE_COUNT)}
+        assert {s[2] for s in stale} == {3}
+
+
 # ---------------------------------------------------------------------------
 # step-20: the OUTCOME, not the mechanism
 # ---------------------------------------------------------------------------
@@ -1732,3 +1766,192 @@ class TestStructuralRefusalProducesNoStaleVerdicts:
             result = await backend.detect_stale_with_edges(group_id='test')
         # Nothing was returned, so nothing with a non-empty .stale was either.
         assert result is sentinel
+
+
+# ---------------------------------------------------------------------------
+# task 4869: the stale-embedding reads
+# ---------------------------------------------------------------------------
+#
+# query_stale_node_embeddings / query_stale_edge_embeddings decide staleness
+# CLIENT-side (FalkorDB's size() does not work on Vectorf32), so they read
+# every embedded node/edge and were therefore capped at 10000 like the 4340
+# reads. The truncated shape is the worst one: a dimension migration driven by
+# a short list looks FINISHED when it is not, because the operator's evidence
+# of success is the very read being truncated.
+
+
+def _vector_text(dim: int) -> str:
+    """The raw vector text shape the stale-embedding reads parse: ``<v1, v2, ...>``."""
+    return '<' + ', '.join(['0.1'] * dim) + '>'
+
+
+def make_embedded_row_corpus(rows: int, dim: int) -> list[list]:
+    """Build ``rows`` embedded rows in the methods' shape: (uuid, name, vector)."""
+    vector = _vector_text(dim)
+    return [[f'uuid-{i:07d}', f'name-{i}', vector] for i in range(rows)]
+
+
+_STALE_EMBEDDING_READS = [
+    pytest.param(
+        'query_stale_node_embeddings',
+        'n.name_embedding IS NOT NULL',
+        'n.uuid',
+        'n.name_embedding',
+        id='nodes',
+    ),
+    pytest.param(
+        'query_stale_edge_embeddings',
+        'e.fact_embedding IS NOT NULL',
+        'e.uuid',
+        'e.fact_embedding',
+        id='edges',
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    'method, where_fragment, order_key, vector_prop', _STALE_EMBEDDING_READS
+)
+class TestStaleEmbeddingReadsPagination:
+    """Both vector reads return every stale row past the server cap."""
+
+    @pytest.mark.asyncio
+    async def test_control_unpaginated_read_is_truncated_by_the_cap(
+        self, method, where_fragment, order_key, vector_prop
+    ):
+        """CONTROL: keeps the headline below from being a tautology."""
+        graph = FakeCappedGraph(make_embedded_row_corpus(_LIVE_ENTITY_NODES, 3))
+        result = await graph.ro_query(
+            f'MATCH (n) WHERE {where_fragment} RETURN {order_key}, {vector_prop}'
+        )
+        assert result.result_set is not None
+        assert len(result.result_set) == _LIVE_RESULTSET_CAP
+
+    @pytest.mark.asyncio
+    async def test_every_stale_row_is_returned(
+        self, method, where_fragment, order_key, vector_prop, mock_config, make_backend
+    ):
+        """HEADLINE: 16038 stale rows in, 16038 stale tuples out — not 10000."""
+        backend = make_backend(mock_config)
+        graph = _wire(
+            backend, FakeCappedGraph(make_embedded_row_corpus(_LIVE_ENTITY_NODES, 3))
+        )
+        stale = await getattr(backend, method)(expected_dim=1536, group_id='test')
+        assert len(stale) == _LIVE_ENTITY_NODES
+        assert {s[0] for s in stale} == {r[0] for r in graph.corpus}
+
+    @pytest.mark.asyncio
+    async def test_only_mismatched_dimensions_come_back(
+        self, method, where_fragment, order_key, vector_prop, mock_config, make_backend
+    ):
+        backend = make_backend(mock_config)
+        corpus = [
+            ['fresh-1', 'Fresh One', _vector_text(1536)],
+            ['stale-1', 'Stale One', _vector_text(3)],
+            ['fresh-2', 'Fresh Two', _vector_text(1536)],
+            ['stale-2', 'Stale Two', _vector_text(3)],
+        ]
+        _wire(backend, FakeCappedGraph(corpus))
+        stale = await getattr(backend, method)(expected_dim=1536, group_id='test')
+        assert stale == [('stale-1', 'Stale One', 3), ('stale-2', 'Stale Two', 3)]
+
+    @pytest.mark.asyncio
+    async def test_emitted_cypher_pages_a_total_order_and_projects_the_vector_late(
+        self, method, where_fragment, order_key, vector_prop, mock_config, make_backend
+    ):
+        """Pages are totally ordered, share the census population, and cut first.
+
+        The vector is projected AFTER ``SKIP/LIMIT``, so each page sorts node
+        or edge refs and materialises only ``page_size`` vectors rather than
+        carrying every matched vector through every page's sort.
+        """
+        backend = make_backend(mock_config)
+        graph = _wire(
+            backend, FakeCappedGraph(make_embedded_row_corpus(_LIVE_ENTITY_NODES, 3))
+        )
+        await getattr(backend, method)(expected_dim=1536, group_id='test')
+
+        assert len(graph.census_queries) == 1
+        assert graph.page_queries
+        assert len(graph.queries) == (
+            len(graph.census_queries) + len(graph.page_queries)
+        )
+        census = graph.census_queries[0]
+        assert where_fragment in census
+        assert 'SKIP' not in census.upper()
+        population = census.rsplit('RETURN count(*)', 1)[0]
+        for page in graph.page_queries:
+            assert page.startswith(population)
+            assert order_key in page.split('ORDER BY', 1)[1]
+            assert page.index('RETURN') > page.index('LIMIT')
+            assert vector_prop in page.split('RETURN', 1)[1]
+
+    @pytest.mark.asyncio
+    async def test_a_uuid_re_emitted_across_pages_is_reported_once(
+        self, method, where_fragment, order_key, vector_prop, mock_config, make_backend
+    ):
+        """SKIP re-emission under concurrent insert must not double a re-embed."""
+        backend = make_backend(mock_config)
+        corpus = [
+            ['u1', 'n1', _vector_text(3)],
+            ['u2', 'n2', _vector_text(3)],
+            ['u1', 'n1', _vector_text(3)],   # the boundary row, re-emitted
+            ['u3', 'n3', _vector_text(3)],
+        ]
+        _wire(backend, FakeCappedGraph(corpus, resultset_cap=None))
+        stale = await getattr(backend, method)(expected_dim=1536, group_id='test')
+        assert [s[0] for s in stale] == ['u1', 'u2', 'u3']
+
+    @pytest.mark.asyncio
+    async def test_empirical_incompleteness_warns_and_returns(
+        self, method, where_fragment, order_key, vector_prop,
+        mock_config, make_backend, caplog,
+    ):
+        backend = make_backend(mock_config)
+        corpus = make_embedded_row_corpus(_LIVE_ENTITY_NODES, 3)
+        _wire(
+            backend,
+            FakeCappedGraph(corpus, census_override=len(corpus) + 5000),
+        )
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            stale = await getattr(backend, method)(expected_dim=1536, group_id='test')
+        assert len(stale) == len(corpus)
+        assert any(method in m for m in _warnings(caplog))
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'force, kind_name',
+        [
+            pytest.param(_refusal, 'INCOMPLETE_STRUCTURAL_REFUSAL', id='refusal'),
+            pytest.param(_page_cap, 'INCOMPLETE_PAGE_CAP', id='page-cap'),
+        ],
+    )
+    async def test_structural_incompleteness_raises(
+        self, method, where_fragment, order_key, vector_prop, force, kind_name,
+        mock_config, make_backend, monkeypatch,
+    ):
+        """A prefix or a fabricated empty must not pass for the full stale set."""
+        from fused_memory.backends import graphiti_client
+
+        backend = make_backend(mock_config)
+        _wire(
+            backend, FakeCappedGraph(make_embedded_row_corpus(_LIVE_ENTITY_NODES, 3))
+        )
+        force(monkeypatch)
+        with pytest.raises(graphiti_client.IncompleteEnumerationError) as exc:
+            await getattr(backend, method)(expected_dim=1536, group_id='test')
+        message = str(exc.value)
+        assert "'test'" in message
+        assert getattr(graphiti_client, kind_name) in message
+
+    @pytest.mark.asyncio
+    async def test_a_genuinely_empty_graph_returns_empty_quietly(
+        self, method, where_fragment, order_key, vector_prop,
+        mock_config, make_backend, caplog,
+    ):
+        backend = make_backend(mock_config)
+        _wire(backend, FakeCappedGraph([]))
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            stale = await getattr(backend, method)(expected_dim=1536, group_id='test')
+        assert stale == []
+        assert _warnings(caplog) == []
