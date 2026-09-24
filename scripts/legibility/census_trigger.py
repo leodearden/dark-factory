@@ -1271,9 +1271,12 @@ def default_status_fetcher(project_root: str | Path):
     # an `isError: false` JSON-RPC response, so it used to sail through
     # `_extract_tool_result` and get counted as a done-count of 0.
     #
-    # In production this call ALWAYS carried a relative path: census.py's
-    # CLI defaults --project-root to "." and nightly._default_census_launcher
-    # (nightly.py:521) launches census.py with no arguments at all.
+    # In production this call ALWAYS carried a relative path: census.py's CLI
+    # DEFAULTED --project-root to "." and nightly._default_census_launcher
+    # launched census.py with no arguments at all. Both were fixed by task
+    # 3269 (re-landed by task 5782) -- the launcher passes
+    # --project-root/--config and --project-root is required -- so that is
+    # history. The resolve() below stays as defence in depth.
     #
     # Resolving HERE, at the wire boundary, rather than at each CLI
     # entrypoint, fixes every consumer at once -- census.py's main(), the

@@ -1236,8 +1236,8 @@ flags introduce must be gated on a non-None flag value, so a run that
 passes none of them renders exactly this. Do NOT regenerate this constant
 to make a failing run pass -- a diff here means a cost-control rendering
 leaked into the unflagged path (and therefore into the nightly trickle,
-which launches census.py with no extra argv). A deliberate change to the
-flagless report may move this lock, in a commit whose message says why;
+which launches census.py with no cost-control flags). A deliberate change to
+the flagless report may move this lock, in a commit whose message says why;
 that record is what distinguishes it from a leak."""
 
 
@@ -2908,10 +2908,11 @@ def test_main_done_line_names_unresolved_verdicts_only_when_non_zero(
 # task 3291: run_census() must never persist a FABRICATED done-count baseline.
 #
 # This is the test that would have caught the 2026-07-24 regression on the day
-# it happened. census.py's CLI defaults --project-root to "." and
-# nightly._default_census_launcher launches it with no arguments, so the
-# get_statuses call went out with a relative path; fused-memory rejected it
-# with a {"error", "error_type"} envelope on an isError:false response; and
+# it happened. census.py's CLI DEFAULTED --project-root to "." and
+# nightly._default_census_launcher launched it with no arguments (both fixed
+# by task 3269), so the get_statuses call went out with a relative path;
+# fused-memory rejected it with a {"error", "error_type"} envelope on an
+# isError:false response; and
 # the old `(status.get("statuses") or {})` idiom silently read that as a
 # done-count of 0 and persisted it as a real baseline.
 # ---------------------------------------------------------------------------
@@ -4329,8 +4330,9 @@ def test_main_accepts_a_project_root_that_matches_the_config_via_a_relative_spel
 
 
 def test_main_without_cost_control_flags_passes_defaults(tmp_path, monkeypatch):
-    # The nightly launcher (nightly.py) runs census.py with NO extra argv, so
-    # this is the shape that must stay behaviorally byte-identical.
+    # The nightly launcher (nightly.py) passes only --project-root/--config and
+    # no cost-control flags, so this is the shape that must stay behaviorally
+    # byte-identical.
     _write_legibility_yaml(_default_config_path(tmp_path))
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
