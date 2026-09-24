@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""Audit capability-manifest ``delivered_check`` descriptors against their
-producer task's ``metadata.delivered_checks`` entry.
+"""Audit capability-manifest sidecars against the task store, in two directions:
+``delivered_check`` descriptors that have drifted from their producer task's
+``metadata.delivered_checks`` entry (sidecar -> task), and task labels their
+sidecar does not declare (task -> sidecar).
 
-READ-ONLY / REPORT-ONLY: this module and its CLI never mutate a task record or
-a manifest file. Every database connection it opens is a read-only SQLite URI
-(``sqlite3.connect(f"file:{path}?mode=ro", uri=True)``), so the sweep is
-structurally incapable of writing to the live WAL database the running
-orchestrator holds open. Manifest YAML on disk is only ever read. There is no
-``--apply`` flag and no MCP client is ever constructed. RESYNCING A DRIFTED
-SIDECAR IS A SEPARATE, REVIEWED EDIT — never done from this report by this
-script.
+READ-ONLY / REPORT-ONLY, in both directions: this module and its CLI never
+mutate a task record or a manifest file. Every database connection it opens is
+a read-only SQLite URI (``sqlite3.connect(f"file:{path}?mode=ro", uri=True)``),
+so the sweep is structurally incapable of writing to the live WAL database the
+running orchestrator holds open. Manifest YAML on disk is only ever read. There
+is no ``--apply`` flag and no MCP client is ever constructed. RESYNCING A
+DRIFTED SIDECAR, OR FIXING AN UNBOUND LABEL, IS A SEPARATE, REVIEWED EDIT —
+never done from this report by this script.
 
-WHAT THE SWEEP IS FOR (task 4545). ``metadata.delivered_checks`` is copied
+THE DRIFT DIRECTION (task 4545). ``metadata.delivered_checks`` is copied
 exactly ONE WAY, sidecar -> task record, at ``commit_planning``
 (fused-memory/src/fused_memory/server/manifest_stamping.py step 5, the
 ``for task in doc.tasks:`` block that builds a ``DeliveredCheckMeta`` per
@@ -48,6 +50,24 @@ preservation seam's gz-consumer row is exactly that: correct-and-superseded,
 task 3578 restored gzip reading after 3618 removed it), both may pass, or one of
 each. Whether a check is satisfied on main is the δ gate's question and
 ``verify_delivered_checks_on_main``'s, not this script's.
+
+THE LABEL-BINDING DIRECTION (task 4907). The drift walk is keyed on each
+sidecar's STAMPED task_id, so it cannot see a task whose ``prd_task_label``
+matches no sidecar entry at all. ``commit_planning``'s stamper binds nothing
+for such a task and copies it no ``delivered_checks``, and says nothing. This
+direction walks from every task the stamper would admit to the sidecar it would
+open, and reports each label that tracked sidecar does not declare as an
+UNBOUND LABEL, in its own list. It came out of the task-4590 stamp-coverage
+audit and task 4907's adjudication of the rows that audit left.
+
+AN UNBOUND LABEL IS NOT BY ITSELF A DEFECT. A sidecar is scoped, not a per-task
+registry (plans/capability-delivered-checks-prd.md §"Sketch of approach",
+"Coverage caveat (scope)"), and may legitimately omit a label. The adjudicated
+cases are recorded in the ``.capability-manifest.md`` twins, each under
+"Unbound task labels (task 4907 adjudication)". Only a LIVE row, whose task is
+not yet done or cancelled, makes a run dirty. Fixing one is a separate,
+reviewed edit, made on the task side unless the PRD's own decomposition plan
+declares the label, in which case the sidecar is completed instead.
 """
 from __future__ import annotations
 
@@ -1027,22 +1047,36 @@ def format_json(audits: list[ProjectAudit]) -> str:
 
 
 def _is_dirty(audits: list[ProjectAudit]) -> bool:
-    """Exit 1 keys on findings OR a failed manifest discovery.
+    """Exit 1 keys on findings, a failed manifest discovery, OR a LIVE unbound
+    label.
 
     The second disjunct is not belt-and-braces. An empty corpus and a clean
     corpus are INDISTINGUISHABLE in the finding count, and only one of them is
     good news — so a run that could not enumerate the corpus must never exit 0
     (docs/legibility/design-invariants.md, no-silent-fail-soft).
+
+    The third is deliberately ASYMMETRIC. A historical unbound row is reported
+    but not dirty, because a done or cancelled task can no longer be touched by
+    a future ``commit_planning``. A live one can, and while it is live is the
+    only time its label is still cheap to fix. See :attr:`UnboundLabel.is_live`.
     """
-    return any(a.findings or a.coverage.git_discovery_failed for a in audits)
+    return any(
+        a.findings
+        or a.coverage.git_discovery_failed
+        or any(row.is_live for row in a.unbound_labels)
+        for a in audits
+    )
 
 
 # The per-script NAMES survive because this script's epilog wording is its own,
 # but the VALUES have ONE home: the returns live in _task_db_scan.run_audit_cli,
-# so a local re-spelling would drift from what actually gets returned.
-# test_exit_constants_alias_the_shared_tier_3_codes is what keeps these honest.
-EXIT_OK = AUDIT_EXIT_OK                            # swept; no drift
-EXIT_DRIFT = AUDIT_EXIT_FINDINGS                   # a drifted descriptor, or a
+# so a local re-spelling would drift from what actually gets returned. The
+# label-binding direction changed what makes a run dirty (_is_dirty), not these
+# values. test_exit_constants_alias_the_shared_tier_3_codes keeps them honest.
+EXIT_OK = AUDIT_EXIT_OK                            # swept; no drift and no
+                                                   # LIVE unbound label
+EXIT_DRIFT = AUDIT_EXIT_FINDINGS                   # a drifted descriptor, a
+                                                   # LIVE unbound label, or a
                                                    # failed manifest discovery
 EXIT_NO_ROOT = AUDIT_EXIT_NO_ROOT                  # no project root resolved to
                                                    # a readable tasks.db
@@ -1053,25 +1087,33 @@ EXIT_NOTHING_AUDITED = AUDIT_EXIT_NOTHING_AUDITED  # roots resolved but EVERY
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "READ-ONLY sweep for capability-manifest delivered_check "
-            "descriptors that have drifted from the "
-            "metadata.delivered_checks entry on their producer task. "
+            "READ-ONLY sweep of capability-manifest sidecars against the task "
+            "store, in two directions. DESCRIPTOR DRIFT (sidecar -> task): a "
+            "delivered_check descriptor that has drifted from the "
+            "metadata.delivered_checks entry on its producer task. "
             "delivered_checks is copied one way, sidecar -> task, at "
             "commit_planning and never syncs back, so a hand-repaired task "
             "record sits beside a stale sidecar that any re-decompose would "
-            "re-stamp over the repair. Reporting only -- never mutates a task "
-            "record or a manifest. Resyncing a drifted sidecar is a separate, "
-            "individually-reviewed edit."
+            "re-stamp over the repair. LABEL BINDING (task -> sidecar): a "
+            "task whose prd_task_label its tracked sidecar does not declare, "
+            "so commit_planning binds nothing for it. Reporting only -- never "
+            "mutates a task record or a manifest. Resyncing a drifted sidecar "
+            "or fixing an unbound label is a separate, individually-reviewed "
+            "edit."
         ),
         epilog=(
-            "exit codes: 0 = swept, every compared descriptor agrees; 1 = at "
-            "least one drifted descriptor, OR the manifest corpus could not be "
-            "enumerated (an empty corpus and a clean corpus are "
-            "indistinguishable in the finding count, and only one is good "
-            "news); 2 = no project root resolved to a readable tasks.db; 3 = "
-            "roots resolved but every one failed to audit, so NOTHING was "
-            "swept (never treat 3 as a clean run). A drift row means the two "
-            "spellings DISAGREE -- it is not a claim that either one passes."
+            "exit codes: 0 = swept, every compared descriptor agrees and no "
+            "unbound label is live; 1 = at least one drifted descriptor, OR a "
+            "LIVE unbound label (its task not yet done or cancelled; a "
+            "historical one is reported but does not count), OR the manifest "
+            "corpus could not be enumerated (an empty corpus and a clean "
+            "corpus are indistinguishable in the finding count, and only one "
+            "is good news); 2 = no project root resolved to a readable "
+            "tasks.db; 3 = roots resolved but every one failed to audit, so "
+            "NOTHING was swept (never treat 3 as a clean run). A drift row "
+            "means the two spellings DISAGREE -- it is not a claim that either "
+            "one passes. An unbound label is not by itself a defect -- a "
+            "sidecar may deliberately omit one."
         ),
     )
     parser.add_argument(
@@ -1096,7 +1138,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--json", action="store_true",
-        help="Emit a JSON object (findings plus coverage) instead of a report.",
+        help=(
+            "Emit a JSON object (findings, unbound labels and coverage) instead "
+            "of a report."
+        ),
     )
     return parser
 
@@ -1138,12 +1183,16 @@ def _warn_manifest_root_across_roots(
 
 
 def main(argv: list[str] | None = None) -> int:
-    """CLI entry point.
+    """CLI entry point: sweep both directions, descriptor drift (sidecar -> task)
+    and label binding (task -> sidecar), for every resolved project root.
 
-    Exit codes: 0 = swept, every compared descriptor agrees; 1 = a drifted
-    descriptor OR a manifest corpus that could not be enumerated; 2 = no
-    project root resolved to a readable tasks.db; 3 = roots resolved but EVERY
-    one failed to audit, so NOTHING was swept.
+    Exit codes: 0 = swept, every compared descriptor agrees and no unbound
+    label is live; 1 = a drifted descriptor, a LIVE unbound label, OR a
+    manifest corpus that could not be enumerated; 2 = no project root resolved
+    to a readable tasks.db; 3 = roots resolved but EVERY one failed to audit,
+    so NOTHING was swept. A historical unbound label (its task done or
+    cancelled) is reported but never makes the run dirty — see
+    :func:`_is_dirty`.
 
     3 exists because 0 would otherwise be returned for two opposite outcomes —
     "swept everything, found nothing" and "swept nothing at all" — and a
