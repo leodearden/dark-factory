@@ -25,8 +25,8 @@ TWO BINDING CONTRACTS, both machine-checked:
 2. **No public entry point ever raises** (§8.3, boundary row B12).  The merge path has
    no ``VerifyInfraError`` handler, so an uncaught raise here stalls the merge queue —
    a ledger failure must never fail a verify or a merge.  Every entry point degrades to
-   an honest value (``None`` / ``[]``) and logs LOUDLY with ``exc_info``; it never fails
-   silently.  This mirrors ``chronic_flake``'s catch-all-defensive contract.
+   an honest value (``None`` / ``[]`` / ``False``) and logs LOUDLY with ``exc_info``; it
+   never fails silently.  This mirrors ``chronic_flake``'s catch-all-defensive contract.
 
 RETENTION — a named, accepted position, not an oversight (§5.2, §11 Q1).  ``flake_debt``
 is bounded by construction (one row per test); resolved rows are retained DELIBERATELY
@@ -75,6 +75,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
+from shared.task_metadata import DoneProvenance, parse_metadata
 from shared.task_statuses import TERMINAL
 
 logger = logging.getLogger(__name__)
@@ -1493,63 +1494,177 @@ async def open_debt(
         return debt_row
 
 
+async def _read_done_owner(
+    task_client: FlakeLedgerTaskClient, test_id: str, owner_task_id: str,
+) -> dict | None:
+    """*owner_task_id*'s task, read LIVE, if and only if it reads back ``done``;
+    ``None`` otherwise, each reason logged at the level it deserves.
+
+    Its own guard, like ``_ensure_owner_task``'s ``get_statuses`` read: a raising or
+    partial adapter (no ``get_task`` at all, hence ``AttributeError``) lands on the SAME
+    path as the real adapter's in-band error, so the two failure shapes cannot drift.
+    """
+    try:
+        task, error = await task_client.get_task(owner_task_id)
+    except Exception as exc:
+        task, error = None, exc
+    if error is not None:
+        logger.warning(
+            'flake_ledger: could not read owner %s of test_id=%s — the cycle stays open '
+            '(an unreadable owner is not evidence the fix landed)',
+            owner_task_id,
+            test_id,
+            exc_info=error,
+        )
+        return None
+    if task is None:
+        logger.info(
+            'flake_ledger: owner %s of test_id=%s no longer exists — the cycle stays open',
+            owner_task_id,
+            test_id,
+        )
+        return None
+    if task.get('status') != 'done':
+        logger.debug(
+            'flake_ledger: owner %s of test_id=%s is %r, not done — the cycle stays open',
+            owner_task_id,
+            test_id,
+            task.get('status'),
+        )
+        return None
+    return task
+
+
+def _resolving_commit(task: dict) -> str | None:
+    """The commit that landed *task*'s fix, from its ``metadata.done_provenance``, read
+    with the one typed metadata parser.  ``None`` when none was recorded: a task that
+    predates ``done_provenance``, or a commitless kind.
+
+    ``isinstance`` rather than ``is not None``: a blob that fails whole-model validation
+    comes back from ``parse_metadata`` UNVALIDATED, and then ``done_provenance`` is the
+    raw dict (measured).
+    """
+    metadata, _warnings = parse_metadata(task.get('metadata'), direction='read')
+    provenance = metadata.done_provenance
+    return provenance.commit if isinstance(provenance, DoneProvenance) else None
+
+
+def _stamp_resolution(
+    db_path: Path,
+    test_id: str,
+    *,
+    owner_task_id: str,
+    resolving_commit: str | None,
+    stamp: str,
+) -> bool:
+    """Close *test_id*'s open cycle for *owner_task_id* — the ONE spelling of the
+    resolution UPDATE.  ``True`` iff this call closed it.
+
+    A compare-and-set on the owner, for the reason :func:`_write_owner_task_id` is
+    conditional: the caller decided to stamp from a live read of that owner, the read
+    was an await, and another lane may have re-pointed, re-opened or closed the row
+    since.  A row the WHERE clause no longer matches was not corroborated by this call.
+    Raises on a ledger failure; the caller's B12 guard owns that.
+    """
+    conn = _open(db_path)
+    try:
+        cursor = conn.execute(
+            'UPDATE flake_debt SET resolved_at = ?, prior_resolving_commit = ? '
+            'WHERE test_id = ? AND resolved_at IS NULL AND owner_task_id = ?',
+            (stamp, resolving_commit, test_id, owner_task_id),
+        )
+        conn.commit()
+        return cursor.rowcount == 1
+    finally:
+        conn.close()
+
+
 async def resolve_debt(
     db_path: Path,
     project_id: str,
     test_id: str,
     *,
-    resolving_commit: str | None,
+    task_client: FlakeLedgerTaskClient,
     now: datetime | None = None,
-) -> None:
-    """Close *test_id*'s current debt cycle (PRD §8.3).  Called when the owning task
-    goes terminal.
+) -> bool:
+    """Close *test_id*'s current debt cycle if its owning de-flake task is live-done
+    (PRD §8.3).  ``True`` iff THIS call closed it.
 
-    The row is RETAINED, not deleted (§5.2) — η's recurrence trigger reads resolved
-    rows, so reaping one would silently disarm it.  Resolution's observable effect is
-    that the test leaves :func:`list_open_debt` while :func:`read_debt` still finds it.
+    CORROBORATED, NEVER TRUSTED (INV-3).  A stored ``owner_task_id`` is a snapshot, and
+    so is any status a caller could hand in.  The decision is therefore taken here, from
+    a live ``get_task`` read of the stored owner, and the stamp is a compare-and-set on
+    that owner (:func:`_stamp_resolution`).  The resolving commit comes from the same
+    read (``metadata.done_provenance.commit``), so status and commit cannot disagree and
+    no caller can supply a commit for a task this function never read.
 
-    ``prior_resolving_commit`` is written HERE, not on the next re-open: after a
-    resolution there is no "current" cycle for it to describe, and writing it now is
-    what lets step-18's re-entry carry it forward untouched for η's
-    ``regressed_after_resolution`` citation.
+    ONLY ``done`` RESOLVES.  ``prior_resolving_commit`` is what the
+    ``regressed_after_resolution`` L2 cites as the fix that did not hold, and a
+    cancelled de-flake task landed no fix: resolving on it would manufacture a false
+    regression.  An absent or unreadable owner is evidence of nothing, so the cycle
+    stays open and ζ's owner enforcement deals with it.  A done task with no recorded
+    commit (a legacy task, a commitless kind) does resolve, with a NULL commit.
 
-    The lookup keys on ``test_id`` ALONE — §5.3: runs.db is per-project, so test_id is
-    the primary key.  *project_id* is accepted per the §8.3 signature and used only in
-    log messages; it is NOT a dropped filter.
+    ``resolved_at`` is the LEDGER's observation time (§5.4): the task store keeps no
+    timestamps, so it records when the ledger SAW the owner done.
 
-    IDEMPOTENT, and the ``resolved_at IS NULL`` guard is what makes it so: a resolution
-    closes the CURRENT cycle exactly once, and a replayed "owning task went terminal"
-    event is a no-op rather than a second, later resolution.  Last-write-wins was the
-    alternative and is WRONG here — it would walk ``resolved_at`` forward and overwrite
-    ``prior_resolving_commit`` on an already-closed row, so the values carried into the
-    next re-open (and cited verbatim in η's ``regressed_after_resolution`` L2) would
-    describe a phantom resolution that never happened.  The guard is per-CYCLE, not
-    permanent: :func:`open_debt` sets ``resolved_at`` back to NULL on re-entry, so the
-    next cycle resolves normally.
+    CALLERS.  :func:`open_debt` is the LAZY one, before its upsert, so a recurrence after
+    a landed fix re-enters the cycle instead of quietly replacing the owner.  Task θ's
+    periodic sweep is the intended EAGER one.
 
-    A zero-rowcount UPDATE — no debt for this test, or its cycle is already closed — is a
-    legitimate no-op, not an error.  ``async`` for the same forward-compat reason as
-    :func:`open_debt` — η adds the recurrence escalation inside this function.
+    COUPLING RULE (§5.9): the ledger reads task state and never writes it; the live read
+    is the only client call made here.
 
-    *now* is canonicalised through :func:`_canonicalize_utc` exactly as ``open_debt``
-    does for ``opened_at``/``last_occurrence_at``, so an injected naive or non-UTC clock
-    cannot write ``resolved_at`` in a spelling that sorts differently from the default
-    aware-UTC path.  Same loud-on-naive treatment as ``open_debt`` too: in-repo callers
-    should always pass aware-UTC, and a naive ``now`` here is a caller bug rather than
-    untrusted input, so it is coerced (never-raises) but logged.
+    The row is RETAINED (§5.2): the recurrence trigger reads resolved rows.  An absent,
+    unowned or already-closed row returns ``False`` with no live read, so a replayed
+    resolution never walks ``resolved_at`` forward or overwrites
+    ``prior_resolving_commit``; :func:`open_debt` sets ``resolved_at`` back to NULL on
+    re-entry, so each cycle resolves once.
+
+    ONE connection when nothing is stamped, TWO when it stamps: the row read and the
+    stamp straddle a network await, so they cannot share a transaction, and the
+    compare-and-set is what makes the split safe.
+
+    Keyed on ``test_id`` alone (§5.3); *project_id* is used only in log messages.  *now*
+    goes through :func:`_canonicalize_utc` with the same loud-on-naive treatment as
+    ``open_debt``.  Never raises (B12): a failure logs with ``exc_info`` and returns
+    ``False``.
     """
     try:
         stamp = _canonicalize_utc(now or datetime.now(UTC), origin='resolve_debt')
-        conn = _open(db_path)
-        try:
-            conn.execute(
-                'UPDATE flake_debt SET resolved_at = ?, prior_resolving_commit = ? '
-                'WHERE test_id = ? AND resolved_at IS NULL',
-                (stamp, resolving_commit, test_id),
+        row = read_debt(db_path, test_id)
+        if row is None or row.resolved_at is not None:
+            return False
+        owner_task_id = row.owner_task_id
+        if not owner_task_id:
+            logger.info(
+                'flake_ledger: debt for test_id=%s has no owner, so no finished task can '
+                'close it',
+                test_id,
             )
-            conn.commit()
-        finally:
-            conn.close()
+            return False
+        task = await _read_done_owner(task_client, test_id, owner_task_id)
+        if task is None:
+            return False
+        commit = _resolving_commit(task)
+        if not _stamp_resolution(
+            db_path, test_id, owner_task_id=owner_task_id, resolving_commit=commit, stamp=stamp,
+        ):
+            logger.info(
+                'flake_ledger: did not resolve debt for test_id=%s — the row changed while '
+                'owner %s was being read (re-pointed, re-opened or already closed)',
+                test_id,
+                owner_task_id,
+            )
+            return False
+        logger.info(
+            'flake_ledger: resolved debt for test_id=%s (project_id=%s): owner %s is done, '
+            'resolving commit %s',
+            test_id,
+            project_id,
+            owner_task_id,
+            commit or '(none recorded)',
+        )
+        return True
     except Exception:
         logger.warning(
             'flake_ledger: failed to resolve debt for test_id=%s (project_id=%s)',
@@ -1557,7 +1672,7 @@ async def resolve_debt(
             project_id,
             exc_info=True,
         )
-        return None
+        return False
 
 
 def list_open_debt(db_path: Path) -> list[DebtRow]:
