@@ -2393,7 +2393,8 @@ def _search_fn(hits: dict[str, list[str]] | None = None, present: set[str] | Non
     return search
 
 
-def _run(tmp_path: Path, records=None, embed=None, search=None, ks=(1, 5), aliases_map=None):
+def _run(tmp_path: Path, records=None, embed=None, search=None, ks=(1, 5), aliases_map=None,
+         count_absent_as_miss=False):
     return _mod().run_calibration(
         records=records if records is not None else _e2e_records(),
         embed_fn=embed if embed is not None else _embed_fn(),
@@ -2403,6 +2404,7 @@ def _run(tmp_path: Path, records=None, embed=None, search=None, ks=(1, 5), alias
         provenance={'fixture_path': 'x.jsonl', 'embedder_model': 'text-embedding-3-small',
                     'embedder_dimensions': 1536},
         aliases=aliases_map,
+        count_absent_as_miss=count_absent_as_miss,
     )
 
 
@@ -3003,28 +3005,25 @@ class TestComputeRecallAtKAliasesAndPopulation:
         got = _mod().compute_recall_at_k(retrievals, [1], count_absent_as_miss=True)
         assert len(got['canonical_absent']) == 1
 
-    def test_a_child_candidate_hoists_to_its_parent_only_when_aliases_given(
-        self,
+    @pytest.mark.parametrize(('aliases', 'count_absent_as_miss'), [
+        (None, False), ({}, False), (None, True), ({'other': 'x'}, True),
+    ])
+    def test_a_child_candidate_hoists_to_its_parent_whatever_the_other_choices(
+        self, aliases, count_absent_as_miss,
     ) -> None:
-        """Mirrors write_triage.py::_canonical_id_of: a sighting/amendment
-        candidate whose metadata.parent_id is the canonical must count as a
-        hit — but only once the caller opts into alias-aware scoring
-        (aliases not None), matching the child-hoist rule to its documented
-        home in compute_recall_at_k's aliases contract."""
+        """Production files a sighting/amendment winner against its parent
+        (write_triage.py::_canonical_id_of), and the judge eval's
+        canonical_in_slate counts it the same way. So the hoist is not an
+        alias feature: it holds under every alias map and every population."""
         retrievals = [
             _retrieval_with_parents(
                 'd1', 'c1', ['z', 'child-of-c1'], {'child-of-c1': 'c1'},
             ),
         ]
-        without_aliases = _mod().compute_recall_at_k(retrievals, [5])
-        assert without_aliases['per_k'][0]['hits'] == 0, (
-            'no aliases arg: the plain candidate-id-only match must not hoist'
+        got = _mod().compute_recall_at_k(
+            retrievals, [1, 5], aliases=aliases, count_absent_as_miss=count_absent_as_miss,
         )
-        with_aliases = _mod().compute_recall_at_k(retrievals, [5], aliases={})
-        assert with_aliases['per_k'][0]['hits'] == 1, (
-            'aliases={} (explicitly given, even if empty) enables the '
-            'child-hoist rule for every candidate that carries a parent_id'
-        )
+        assert [(row['k'], row['hits']) for row in got['per_k']] == [(1, 0), (5, 1)]
 
     def test_a_child_of_an_alias_also_hoists(self) -> None:
         """A child of the ROTATED SUCCESSOR (not the original canonical)
@@ -3059,6 +3058,13 @@ class TestComputeFirstHitRanks:
         retrievals = [_retrieval('d1', 'c1', ['z', 'y'])]
         got = _mod().compute_first_hit_ranks(retrievals)
         assert got[0]['rank'] == -1
+
+    def test_a_child_of_the_canonical_reaches_it_as_recall_scores_it(self) -> None:
+        """The rank recall@k counts: a hoisted child reaches the canonical."""
+        retrievals = [
+            _retrieval_with_parents('d1', 'c1', ['z', 'child-of-c1'], {'child-of-c1': 'c1'}),
+        ]
+        assert _mod().compute_first_hit_ranks(retrievals)[0]['rank'] == 2
 
     def test_omits_alias_fields_when_no_alias_is_known_for_the_canonical(self) -> None:
         retrievals = [_retrieval('d1', 'c1', ['c1'])]
@@ -3132,16 +3138,26 @@ class TestRunCalibrationAliasesWiring:
             'd2 (canonical absent) must stay excluded when aliases is not given'
         )
 
-    def test_aliases_switches_to_the_full_population(self, tmp_path: Path) -> None:
+    def test_aliases_alone_do_not_choose_the_population(self, tmp_path: Path) -> None:
+        """Alias lookup and population are independent choices (heuristic 3)."""
         got = _run(
             tmp_path,
             search=_search_fn(hits={'d1': ['c1']}, present={'c1'}),
             aliases_map={'c2': 'c2-alias'},
         )
+        recall = got['report']['recall_at_k']
+        assert (recall['per_k'][0]['total'], recall['absent_in_denominator']) == (1, False)
+
+    def test_count_absent_as_miss_chooses_the_full_population(self, tmp_path: Path) -> None:
+        got = _run(
+            tmp_path,
+            search=_search_fn(hits={'d1': ['c1']}, present={'c1'}),
+            aliases_map={'c2': 'c2-alias'},
+            count_absent_as_miss=True,
+        )
         assert got['report']['recall_at_k']['per_k'][0]['total'] == 2, (
-            'aliases given: d2 must now be scored (as a miss, since its alias '
-            "never appears among the fake search_fn's candidates) rather than "
-            'excluded'
+            'd2 must now be scored (as a miss, since its alias never appears '
+            "among the fake search_fn's candidates) rather than excluded"
         )
 
 

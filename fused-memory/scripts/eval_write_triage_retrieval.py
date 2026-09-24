@@ -77,8 +77,8 @@ async def prefetch_retrievals(
         memory_id = str(record['memory_id'])
         cluster_id = str(record['cluster_id'])
         if cluster_id not in canonical_live:
-            canonical_live[cluster_id] = await _is_live(
-                memory_service, project_id, cluster_id,
+            canonical_live[cluster_id] = (
+                await memory_service.get_memory_by_id(project_id, cluster_id) is not None
             )
         results = await retrieve_candidates(
             memory_service, record['content'], project_id, k,
@@ -92,16 +92,6 @@ async def prefetch_retrievals(
             'canonical_present': canonical_live[cluster_id],
         }
     return retrievals
-
-
-async def _is_live(memory_service: Any, project_id: str, memory_id: str) -> bool:
-    """Is *memory_id* still in the corpus? Same reading the calibrator uses."""
-    record = await memory_service.get_memory_by_id(project_id, memory_id)
-    if record is None:
-        return False
-    if isinstance(record, dict):
-        return bool(record.get('found', True))
-    return bool(getattr(record, 'found', True))
 
 
 def retrieved_slates(

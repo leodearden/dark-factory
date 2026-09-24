@@ -12,18 +12,18 @@ import json
 import logging
 import sys
 import types
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from pathlib import Path
-from unittest.mock import AsyncMock, call
+from unittest.mock import call
 
 import pytest
 from _fm_helpers import load_script_module
+from _write_triage_store_fake import FakeMemoryService
 
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server.grouped_read import AMENDMENT_KIND, PARENT_ID_KEY, SIGHTING_KIND
 from fused_memory.server.write_triage import retrieve_candidates
-from fused_memory.services.memory_service import SearchResults
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'calibrate_write_triage.py'
 ALIASES_PATH = (
@@ -52,28 +52,7 @@ def _row(memory_id: str, **metadata) -> MemoryResult:
     )
 
 
-class _FakeMemoryService:
-    """The two MemoryService reads recall makes; ids in ``live`` resolve."""
-
-    def __init__(
-        self,
-        rows: Iterable[MemoryResult] = (),
-        *,
-        live: Iterable[str] = (),
-        degraded: bool = False,
-    ) -> None:
-        self.search = AsyncMock(return_value=SearchResults(list(rows), degraded=degraded))
-        self.live = frozenset(live)
-        self.probed: list[str] = []
-
-    async def get_memory_by_id(self, project_id: str, memory_id: str) -> dict | None:
-        self.probed.append(memory_id)
-        if memory_id not in self.live:
-            return None
-        return {'id': memory_id, 'content': '', 'metadata': {}}
-
-
-async def _hit(service: _FakeMemoryService, record: dict, mode: str, k: int = 20) -> dict:
+async def _hit(service: FakeMemoryService, record: dict, mode: str, k: int = 20) -> dict:
     return await _calib().fetch_recall_hit(
         service, record, project_id='reify', k=k, retrieval_mode=mode,
     )
@@ -83,16 +62,16 @@ class TestFetchRecallHit:
     @pytest.mark.asyncio
     async def test_production_searches_exactly_as_retrieve_candidates_does(self) -> None:
         record = _record('d1', 'c1')
-        ours = _FakeMemoryService(live={'c1'})
+        ours = FakeMemoryService(live={'c1'})
         await _hit(ours, record, 'production', k=20)
-        shipped = _FakeMemoryService()
+        shipped = FakeMemoryService()
         await retrieve_candidates(shipped, record['content'], 'reify', 20)
         assert ours.search.await_args_list == shipped.search.await_args_list
 
     @pytest.mark.asyncio
     async def test_legacy_keeps_the_historical_search_shape(self) -> None:
         record = _record('d1', 'c1')
-        service = _FakeMemoryService(live={'c1'})
+        service = FakeMemoryService(live={'c1'})
         await _hit(service, record, 'legacy', k=20)
         assert service.search.await_args_list == [
             call(query=record['content'], project_id='reify', limit=20, stores=['mem0']),
@@ -101,7 +80,7 @@ class TestFetchRecallHit:
     @pytest.mark.asyncio
     @pytest.mark.parametrize('mode', MODES)
     async def test_candidates_are_in_rank_order(self, mode: str) -> None:
-        service = _FakeMemoryService([_row('r3'), _row('r1'), _row('r2')], live={'c1'})
+        service = FakeMemoryService([_row('r3'), _row('r1'), _row('r2')], live={'c1'})
         got = await _hit(service, _record('d1', 'c1'), mode)
         assert got['candidates'] == ['r3', 'r1', 'r2']
 
@@ -118,13 +97,13 @@ class TestFetchRecallHit:
             _row('empty-parent-link', kind=SIGHTING_KIND, **{PARENT_ID_KEY: ''}),
             _row('non-str-parent-link', kind=AMENDMENT_KIND, **{PARENT_ID_KEY: 7}),
         ]
-        got = await _hit(_FakeMemoryService(rows, live={'c1'}), _record('d1', 'c1'), mode)
+        got = await _hit(FakeMemoryService(rows, live={'c1'}), _record('d1', 'c1'), mode)
         assert got['candidate_parents'] == {'sighting': 'p1', 'amendment': 'p2'}
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('mode', MODES)
     async def test_canonical_presence_is_read_from_the_store(self, mode: str) -> None:
-        service = _FakeMemoryService(live={'c1'})
+        service = FakeMemoryService(live={'c1'})
         present = await _hit(service, _record('d1', 'c1'), mode)
         absent = await _hit(service, _record('d2', 'gone'), mode)
         assert (present['canonical_present'], absent['canonical_present']) == (True, False)
@@ -136,13 +115,13 @@ class TestFetchRecallHit:
     async def test_degraded_is_read_off_the_search_results(
         self, mode: str, degraded: bool,
     ) -> None:
-        service = _FakeMemoryService([_row('c1')], live={'c1'}, degraded=degraded)
+        service = FakeMemoryService([_row('c1')], live={'c1'}, degraded=degraded)
         got = await _hit(service, _record('d1', 'c1'), mode)
         assert got['degraded'] is degraded
 
     @pytest.mark.asyncio
     async def test_an_unknown_mode_raises_naming_the_vocabulary(self) -> None:
-        service = _FakeMemoryService(live={'c1'})
+        service = FakeMemoryService(live={'c1'})
         with pytest.raises(ValueError, match='bogus') as excinfo:
             await _hit(service, _record('d1', 'c1'), 'bogus')
         for mode in _calib().RETRIEVAL_MODES:
@@ -343,7 +322,7 @@ class TestRemeasureRecall:
 
     @staticmethod
     def _remeasure(tmp_path: Path, base: dict, *, records=None, provenance=None,
-                   searched: list[str] | None = None) -> dict:
+                   searched: list[str] | None = None, count_absent_as_miss=True) -> dict:
         return _calib().remeasure_recall(
             base_report=base,
             records=records if records is not None else _records(),
@@ -356,6 +335,7 @@ class TestRemeasureRecall:
             provenance=provenance if provenance is not None else TestRemeasureRecall._this_run(),
             bands_from=_BANDS_FROM,
             aliases=_ALIASES,
+            count_absent_as_miss=count_absent_as_miss,
         )
 
     def test_the_band_section_is_the_base_reports(self, tmp_path: Path) -> None:
@@ -375,6 +355,14 @@ class TestRemeasureRecall:
             (1, 1, 2), (20, 2, 2),
         ]
         assert recall['absent_in_denominator'] is True
+
+    def test_aliases_alone_do_not_choose_the_population(self, tmp_path: Path) -> None:
+        base = self._base(tmp_path)
+        recall = self._remeasure(tmp_path, base, count_absent_as_miss=False)['report'][
+            'recall_at_k'
+        ]
+        assert [(r['k'], r['total']) for r in recall['per_k']] == [(1, 1), (20, 1)]
+        assert recall['absent_in_denominator'] is False
 
     def test_provenance_is_the_bases_band_side_plus_this_runs_recall_side(
         self, tmp_path: Path,
