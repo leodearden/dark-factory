@@ -66,12 +66,14 @@ function endpointsFor(win) {
   };
 }
 
-// Keys fetched on a USER ACTION rather than by the poll loop, parameterised
-// per project. One declared row today: `terminal`, the mechanism PRD leaf
-// gamma3 fetches `?terminal=<project>` through.
+// Keys fetched on a USER ACTION rather than by the poll loop, each parameterised
+// by the one value its caller already holds. Two declared rows today:
+// `terminal`, the mechanism PRD leaf gamma3 fetches `?terminal=<project>`
+// through, and `taskProse`, the Task Detail pane's description/details for the
+// selected task, addressed by the row's own uid (`<project>/T-<id>`).
 //
 // A ROW CARRIES BUILDERS, NOT TEMPLATE STRINGS, and nothing re-derives either
-// one at a call site — a caller holds a project name and asks for the row, so
+// one at a call site — a caller holds the parameter and asks for the row, so
 // the url/key pair is constructed in exactly one place and cannot drift.
 //
 // `key(param)` names BOTH what the response body calls the value and what
@@ -82,13 +84,21 @@ function endpointsFor(win) {
 // DF_DATA block above and why datumFor exists.
 //
 // Note which half is encoded: the url must survive HTTP parsing, and the key
-// must be the name a caller can look up with the project string it already
-// holds. No call site should have to know which is which.
+// must be the name a caller can look up with the parameter it already holds.
+// No call site should have to know which is which.
 const ON_DEMAND_KEYS = {
   terminal: {
     url: project => `/api/v2/dashboard/tasks?terminal=${encodeURIComponent(project)}`,
     key: project => `TASKS_TERMINAL:${project}`,
     spec: DATUM,
+  },
+  // Encoded segment by segment, so the uid's own '/' stays the separator the
+  // route's /task/{project}/T-{id} template splits on. PLAIN: prose is not a
+  // measurement.
+  taskProse: {
+    url: uid => '/api/v2/dashboard/task/' + uid.split('/').map(encodeURIComponent).join('/'),
+    key: uid => `TASK_PROSE:${uid}`,
+    spec: PLAIN,
   },
 };
 
@@ -109,6 +119,8 @@ window.DF_DATA = {
   //   `agent` is worktree PRESENCE (it stays truthy after the agent dies);
   //   `stranded` (task 3543) is the independent liveness verdict, computed
   //   server-side from the claim columns via shared.task_claimant.is_stranded.
+  //   Rows carry no description/details: the Task Detail pane fetches those
+  //   for the selected task only, via ON_DEMAND_KEYS.taskProse.
   ACTIVE_TASKS: [],
   TASKS_OFFLINE: false,
   TASKS_OFFLINE_PROJECTS: [],
@@ -497,6 +509,24 @@ const REFRESH_OUTCOMES = Object.freeze({
   skippedBackoff: 'skipped-backoff',
 });
 
+// What a caller WAITING on an on-demand value shows, from the value now in
+// DF_DATA and the outcome of its own latest request (`null` until that request
+// settles). It lives beside the outcomes because it is what each one means to
+// such a caller: a value in hand is shown whatever the latest attempt did, so a
+// failed refresh keeps the last good value; skippedInFlight means a request for
+// the same key is already on its way; any other outcome means nothing is coming.
+const ON_DEMAND_VIEWS = Object.freeze({
+  ready: 'ready',
+  loading: 'loading',
+  unavailable: 'unavailable',
+});
+
+function onDemandView(value, outcome) {
+  if (value !== undefined && value !== null) return ON_DEMAND_VIEWS.ready;
+  if (outcome === null || outcome === REFRESH_OUTCOMES.skippedInFlight) return ON_DEMAND_VIEWS.loading;
+  return ON_DEMAND_VIEWS.unavailable;
+}
+
 // `stateKey` names the flow-control, staleness and receipt entry this request
 // owns, and defaults to pollKey(url) — so every poll-loop call is unchanged
 // and every existing direct caller keeps working. An on-demand request passes
@@ -738,6 +768,8 @@ const DF_DATA_LOADER_API = {
   ON_DEMAND_KEYS,
   requestOnDemand,
   REFRESH_OUTCOMES,
+  ON_DEMAND_VIEWS,
+  onDemandView,
 };
 
 if (typeof module !== 'undefined' && module.exports) {
