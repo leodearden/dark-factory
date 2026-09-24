@@ -180,6 +180,15 @@ class TestFetchTaskProse:
 
         assert read == TaskProse(description='d', details='t')
 
+    async def test_an_empty_result_is_a_soft_failure_not_empty_prose(self, tmp_path):
+        """An unparseable tool result must not render as 'this task has no prose'."""
+        root, config = _project(tmp_path, _URL_1)
+
+        read = await _read(_FusedMemory({9101: {}}), config, root, 19)
+
+        assert isinstance(read, TaskReadOffline)
+        assert 'empty result' in read.detail
+
     async def test_every_url_unreachable_is_offline_naming_each_url(self, tmp_path):
         root, config = _project(tmp_path, _URL_1, _URL_2)
         fused_memory = _FusedMemory({
