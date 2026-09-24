@@ -233,7 +233,11 @@ from legibility.inventory import (  # type: ignore[reportMissingImports]  # noqa
     count_residual_gz,
     iter_json_lines,
 )
-from shared.cli_boundary import LoudArgumentParser, run_cli  # noqa: E402
+from shared.cli_boundary import (  # noqa: E402
+    LoudArgumentParser,
+    reset_stdout_failure_state,
+    run_cli,
+)
 from shared.memory_eval_metrics import (  # noqa: E402
     RUN_STAMP_ENV_VAR,
     MetricSchemaError,
@@ -1146,6 +1150,14 @@ def _build_parser() -> LoudArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    report_path: Path | None = None
+
+    def _written_report() -> str | None:
+        if report_path is None:
+            return None
+        return f'the report was written to {report_path}'
+
+    reset_stdout_failure_state(detail=_written_report)
     args = _build_parser().parse_args(argv)
     tool_names = frozenset(args.tool_names) if args.tool_names else SEARCH_TOOL_NAMES
 

@@ -86,7 +86,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
-from shared.cli_boundary import LoudArgumentParser, run_cli
+from shared.cli_boundary import (
+    LoudArgumentParser,
+    reset_stdout_failure_state,
+    run_cli,
+)
 
 logger = logging.getLogger('memory_eval_retrieval_probe')
 
@@ -3017,11 +3021,21 @@ async def _probe(args: argparse.Namespace, registry: TopicRegistry) -> ProbeOutc
 def main(argv: list[str] | None = None) -> int:
     """Parse, run, print. Every stdout print sits outside every handled failure,
     so a stdout failure always reaches ``shared/src/shared/cli_boundary.py::run_cli``."""
+    outcome: ProbeOutcome | None = None
+
+    def _written_artifacts() -> str | None:
+        if outcome is None:
+            return None
+        return (
+            f'the metrics were written to {outcome.metrics_path} '
+            f'and the report to {outcome.report_path}'
+        )
+
+    reset_stdout_failure_state(detail=_written_artifacts)
     args = build_parser().parse_args(argv)
     logging.basicConfig(
         level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
     )
-    outcome: ProbeOutcome | None = None
     try:
         if args.derive_registry:
             text = _derive_registry_text()
