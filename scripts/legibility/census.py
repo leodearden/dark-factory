@@ -3147,7 +3147,8 @@ def _build_default_commit(project_root):
 
 
 # ---------------------------------------------------------------------------
-# main(argv) -- CLI: `python scripts/legibility/census.py [--force]`
+# main(argv) -- CLI: `python scripts/legibility/census.py --project-root <root>
+#                      [--config <path>] [--force]`
 # ---------------------------------------------------------------------------
 
 def _parse_cli_date(value: str) -> date:
@@ -3259,8 +3260,9 @@ def main(argv: list[str] | None = None) -> int:
 
     Three OPERATOR COST-CONTROL flags bound what a single run may spend,
     each defaulting to today's unbounded behavior so a flagless
-    invocation -- notably the nightly trickle's, which passes no extra
-    argv -- is unchanged: ``--max-batches N`` bounds mining (the
+    invocation -- notably the nightly trickle's, which passes only
+    ``--project-root``/``--config`` and no cost-control flags -- is
+    unchanged: ``--max-batches N`` bounds mining (the
     capped-away sessions are NOT re-mined by a later census -- this run
     still advances ``last_census_at``, so the next window starts here),
     ``--max-verify-clusters N`` bounds per-cluster verification (a deferred
@@ -3303,9 +3305,14 @@ def main(argv: list[str] | None = None) -> int:
         description="Legibility periodic-census runner "
         "(plans/confusion-reduction-prd.md section 5.7, task eta).",
     )
+    # Required, deliberately no default: an implicit-cwd default on a
+    # money-spending entrypoint was the root enabler of task 3269. A
+    # resolved-project-id default was rejected as a second guessing mechanism.
     parser.add_argument(
-        "--project-root", default=".",
-        help="Root of the project being censused (default: %(default)s).",
+        "--project-root", required=True,
+        help="ABSOLUTE root of the project being censused. Required -- there "
+        "is deliberately no default, so the census can never silently target "
+        "whatever directory it happens to be launched from.",
     )
     parser.add_argument(
         "--config", default=None,
@@ -3350,10 +3357,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    # Resolved, not used raw: --project-root defaults to "." and is routinely
-    # passed relative. An unresolved relative root would make the stage cwd
-    # binding below vacuous (cwd="." IS the launcher's cwd — exactly the bug
-    # that binding exists to close) and would silently falsify
+    # Resolved, not used raw: --project-root is required but may still be
+    # passed relative by an operator. An unresolved relative root would make
+    # the stage cwd binding below vacuous (cwd="." IS the launcher's cwd —
+    # exactly the bug that binding exists to close) and would silently falsify
     # _verify_prompt's own "ABSOLUTE paths only" contract, since it
     # interpolates str(project_root) straight into the prompt. One resolve()
     # at the CLI boundary makes the prompt text, the subprocess cwd and all
@@ -3387,6 +3394,22 @@ def main(argv: list[str] | None = None) -> int:
         cfg = config.load_config(config_path)
     except Exception as exc:  # noqa: BLE001 - a broken/missing config fails loud at CLI startup
         print(f"census: failed to load config at {config_path}: {exc}", file=sys.stderr)
+        return 1
+
+    # Two identity sources must agree: --project-root drives the codebook,
+    # state, report and payload paths and the stage cwd, while cfg.project_root
+    # drives the census window and archive roots and cfg.project_id stamps
+    # every filing. A mismatch is a bad argument, never a deferral -- the same
+    # shape as the not-a-directory check above.
+    cfg_project_root = Path(cfg.project_root).resolve()
+    if cfg_project_root != project_root:
+        print(
+            f"census: --project-root {project_root} disagrees with the "
+            f"project_root in {config_path} ({cfg.project_root!r} -> "
+            f"{cfg_project_root}); refusing to run a mixed-project census "
+            f"(project_id={cfg.project_id!r})",
+            file=sys.stderr,
+        )
         return 1
 
     now = datetime.now(UTC)
