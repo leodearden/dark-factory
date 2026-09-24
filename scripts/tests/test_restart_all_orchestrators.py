@@ -1186,6 +1186,16 @@ _TIMELINE_POLL_INTERVAL_SECS = 1
 # unrelated to the drain_gate branch under test. Three poll intervals rather
 # than a bare `2.0`, so the margin scales if the poll interval ever does.
 _FIRST_TRANSITION_DELAY_SECS = 3 * _TIMELINE_POLL_INTERVAL_SECS
+# ONE binding feeding both the grace and the timeout -- see
+# test_defer_withholds_restart_while_busy. Here the grace is a
+# MUST-NEVER-BE-REACHED bound rather than a wait-proving one: if the
+# in-loop resume regresses, the run silently consumes the spawn timeout
+# instead of force-firing early and looking like a pass.
+_IN_LOOP_RESUME_SPAWN_TIMEOUT_SECS = 15
+# Longer than the worst spawn-to-first-poll latency measured under load (2.80s
+# at loadavg ~90 on 32 cores, task 5838) and than the 3s wall-clock offset
+# (_FIRST_TRANSITION_DELAY_SECS) at which the first rewrite currently fires.
+_SLOW_START_SECS = 4
 
 
 @contextlib.contextmanager
@@ -1386,6 +1396,51 @@ def _busy_unit_drain_run(tmp_path, timeline, *, spawn_timeout, **knobs):
     return result, _load_state(state_path), fired
 
 
+def _assert_resumed_from_the_busy_loop(result, state, polls):
+    """Assert drain_gate's IN-LOOP resume: defer on a busy read, then resume
+    on an idle read taken straight from the busy poll loop.
+
+    `polls` is `_read_poll_trace` output. The ledger is what pins the ORDER
+    in which the gate observed the unit's states; stdout only implies it.
+    """
+    context = (
+        f"ledger={polls!r} stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert result.returncode == 0, context
+    assert polls[:1] == [("busy", UNIT_R)], (
+        f"the gate's FIRST poll must read {UNIT_R} busy. A first poll of "
+        f"anything else means the drain landed before the gate ever saw the "
+        f"unit busy -- the 2026-09-23 merge-gate red (task 5348 sighting 1): "
+        f"no defer line, rc 0, restart recorded. An EMPTY ledger instead "
+        f"means the script never wrote ORCH_DRAIN_POLL_TRACE_FILE: the knob "
+        f"did not reach it, or the write failed (see stderr). {context}"
+    )
+    assert len(polls) >= 2, (
+        f"an in-loop resume takes at least two polls: the busy read that "
+        f"deferred and the idle read that resumed. Fewer means the script "
+        f"left the gate without its busy loop ever polling. {context}"
+    )
+    assert polls == [("busy", UNIT_R)] * (len(polls) - 1) + [("idle", UNIT_R)], (
+        f"the ledger's COUNT is fine; its shape is not. Every poll after the "
+        f"first busy one must read busy until one final idle: a stale/absent "
+        f"record is a detour through drain_await_fresh (the OTHER resume "
+        f"site), and a ledger ending on busy is a force-fire. {context}"
+    )
+    assert f"deferring restart of {UNIT_R}: mid-merge" in result.stdout, (
+        f"expected a defer line before the resume; {context}"
+    )
+    assert f"resuming restart of {UNIT_R}: drained" in result.stdout, (
+        f"expected the in-loop idle resume line; {context}"
+    )
+    assert "force-restarting" not in result.stdout.lower(), (
+        f"expected a resume, not a force-fire; {context}"
+    )
+    assert ["--user", "restart", UNIT_R] in state["calls"], (
+        f"expected a restart call for {UNIT_R}; got calls={state['calls']!r} "
+        f"{context}"
+    )
+
+
 def test_busy_unit_that_drains_mid_defer_resumes_and_restarts(tmp_path):
     """The ordinary successful outcome of a --drain redeploy: drain_gate's
     IN-LOOP idle verdict (scripts/restart-all-orchestrators.sh::drain_gate,
@@ -1393,39 +1448,44 @@ def test_busy_unit_that_drains_mid_defer_resumes_and_restarts(tmp_path):
     before any stale/absent handoff). A unit that goes busy, then drains
     WHILE deferred, must resume the restart from inside the poll loop rather
     than waiting out the full busy grace."""
-    # ONE binding feeding both the grace and the timeout -- see
-    # test_defer_withholds_restart_while_busy. Here the grace is a
-    # MUST-NEVER-BE-REACHED bound rather than a wait-proving one: if the
-    # in-loop resume regresses, the run silently consumes the spawn timeout
-    # instead of force-firing early and looking like a pass.
-    spawn_timeout = 15
+    trace_path = tmp_path / "drain-poll-trace.tsv"
+    spawn_timeout = _IN_LOOP_RESUME_SPAWN_TIMEOUT_SECS
 
-    result, state, fired = _busy_unit_drain_run(
+    result, state, _ = _busy_unit_drain_run(
         tmp_path, [("idle", _FIRST_TRANSITION_DELAY_SECS, _HB_IDLE)],
         spawn_timeout=spawn_timeout,
         ORCH_RESTART_FORCE_FIRE_AFTER_SECS=str(wait_proof_grace_secs(spawn_timeout)),
+        ORCH_DRAIN_POLL_TRACE_FILE=str(trace_path),
     )
 
-    assert result.returncode == 0, (
-        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    _assert_resumed_from_the_busy_loop(result, state, _read_poll_trace(trace_path))
+
+
+def test_a_slow_start_still_defers_before_the_drain_lands(tmp_path):
+    """The test above with the gate's first poll landing AFTER the drain, as
+    host load makes it land: the 2026-09-23 merge-gate red.
+
+    BASH_ENV is sourced by bash before the script's first line, so the late
+    start is charged against the same spawn budget real slowness is, and
+    modelling it needs no change to FAKE_SYSTEMCTL_SRC, whose verbatim mirror
+    lives in tests/scripts/test_orchestrator_watchdog.py. The budget is the
+    test above's plus the deterministic stall, so the load-dependent part of
+    the run keeps exactly that test's headroom.
+    """
+    slow_start = tmp_path / "slow-start.sh"
+    slow_start.write_text(f"sleep {_SLOW_START_SECS}\n")
+    trace_path = tmp_path / "drain-poll-trace.tsv"
+    spawn_timeout = _IN_LOOP_RESUME_SPAWN_TIMEOUT_SECS + _SLOW_START_SECS
+
+    result, state, _ = _busy_unit_drain_run(
+        tmp_path, [("idle", _FIRST_TRANSITION_DELAY_SECS, _HB_IDLE)],
+        spawn_timeout=spawn_timeout,
+        ORCH_RESTART_FORCE_FIRE_AFTER_SECS=str(wait_proof_grace_secs(spawn_timeout)),
+        ORCH_DRAIN_POLL_TRACE_FILE=str(trace_path),
+        BASH_ENV=str(slow_start),
     )
-    # Non-vacuity: proves the gate really deferred first, rather than sailing
-    # through an idle first read.
-    assert f"deferring restart of {UNIT_R}: mid-merge" in result.stdout, (
-        f"expected a defer line before the resume; got stdout={result.stdout!r}"
-    )
-    assert f"resuming restart of {UNIT_R}: drained" in result.stdout, (
-        f"expected the in-loop idle resume line; got stdout={result.stdout!r}"
-    )
-    assert "force-restarting" not in result.stdout.lower(), (
-        f"expected a resume, not a force-fire; got stdout={result.stdout!r}"
-    )
-    assert ["--user", "restart", UNIT_R] in state["calls"], (
-        f"expected a restart call for {UNIT_R}; got calls={state['calls']!r}"
-    )
-    assert "idle" in fired, (
-        f"the scheduled idle transition never landed: fired={fired!r}"
-    )
+
+    _assert_resumed_from_the_busy_loop(result, state, _read_poll_trace(trace_path))
 
 
 @pytest.mark.parametrize(
