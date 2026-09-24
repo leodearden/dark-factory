@@ -19,10 +19,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 UNIT = "memory-metadata-coverage-census.service"
+INSTALLER = "scripts/install-memory-metadata-coverage-census-timer.sh"
 UNIT_FIELDS = ("LoadState", "Result", "ExecMainStatus", "ExecMainExitTimestamp")
 SYSTEMD_UTC_TIMESTAMP = "%a %Y-%m-%d %H:%M:%S UTC"
 DEFAULT_REPO = "/home/leo/src/dark-factory"
 HISTORY_RELPATH = Path("plans") / "memory-metadata-coverage-history.json"
+
+
+class NotReporting(Exception):
+    """A named reason the census is not producing readings."""
 
 
 def read_unit_state() -> dict[str, str]:
@@ -36,6 +41,15 @@ def read_unit_state() -> dict[str, str]:
     return dict(
         line.split("=", 1) for line in completed.stdout.splitlines() if "=" in line
     )
+
+
+def require_installed(state: dict[str, str]) -> None:
+    load_state = state.get("LoadState", "")
+    if load_state != "loaded":
+        raise NotReporting(
+            f"NOT INSTALLED: {UNIT} has LoadState={load_state!r}; "
+            f"arm the 05:00 timer with {INSTALLER}"
+        )
 
 
 def history_path() -> Path:
@@ -52,16 +66,26 @@ def age_hours(then: datetime) -> float:
     return (datetime.now(UTC) - then).total_seconds() / 3600
 
 
-def main(argv: list[str]) -> int:
+def assess() -> str:
     state = read_unit_state()
+    require_installed(state)
     last_run = datetime.strptime(
         state["ExecMainExitTimestamp"], SYSTEMD_UTC_TIMESTAMP
     ).replace(tzinfo=UTC)
     row = newest_stamp(history_path())
-    print(
+    return (
         f"OK: {UNIT} last ran {age_hours(last_run):.1f}h ago; "
         f"newest history row {age_hours(row):.1f}h ago"
     )
+
+
+def main(argv: list[str]) -> int:
+    try:
+        verdict = assess()
+    except NotReporting as reason:
+        print(reason, file=sys.stderr)
+        return 1
+    print(verdict)
     return 0
 
 
