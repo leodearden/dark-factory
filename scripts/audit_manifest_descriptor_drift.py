@@ -88,8 +88,8 @@ from _task_db_scan import (
 # copy of this script running from a worktree would validate manifests using
 # the MAIN checkout's schema — and this script is EXPECTED to run from a
 # worktree (that is what --manifest-root is for). Same reasoning and same form
-# as audit_combine_gate_marker_loss.py (tasks 2881/2882/3329). The
-# shared.capability_manifest import below MUST stay after this insert.
+# as audit_combine_gate_marker_loss.py (tasks 2881/2882/3329). The shared.*
+# imports below MUST stay after this insert.
 _SHARED_SRC = Path(__file__).resolve().parent.parent / "shared" / "src"
 if str(_SHARED_SRC) not in sys.path:
     sys.path.insert(0, str(_SHARED_SRC))
@@ -98,6 +98,7 @@ from shared.capability_manifest import (  # noqa: E402
     DeliveredCheckMeta,
     load_capability_manifest,
 )
+from shared.task_statuses import TERMINAL  # noqa: E402
 
 # The kinds the stamper actually copies. manifest_stamping.py step 5 reads
 # `if check is None or check.kind not in ('grep', 'script'): continue`, so a
@@ -485,6 +486,27 @@ class UnboundLabel(NamedTuple):
     status: str
     manifest: str
     declared_labels: tuple[str, ...]
+
+    @property
+    def is_live(self) -> bool:
+        """Whether a future ``commit_planning`` can still touch this task.
+
+        The hazard an unbound label carries is that a planning batch touching
+        its task stamps and copies nothing. A done or cancelled task can no
+        longer be touched that way, so its row is historical: still REPORTED,
+        but not dirty. A live row can still cost something, and while it is
+        live its label is still cheap to fix.
+
+        Defined as ``status not in shared.task_statuses.TERMINAL``, compared as
+        the raw string tasks.db holds (``TaskStatus`` is a ``StrEnum``) and never
+        converted with ``TaskStatus(status)``, which raises on an unknown value.
+        So an unknown or empty status is live by construction: the check fails
+        toward reporting, never toward a confident zero.
+
+        A property is not a NamedTuple field, so ``_asdict()`` omits it; the JSON
+        writer carries it explicitly.
+        """
+        return self.status not in TERMINAL
 
 
 class ProjectAudit(NamedTuple):
