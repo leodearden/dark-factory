@@ -1042,12 +1042,16 @@ def _apply_incompleteness_policy(
         )
 
 
-def _first_row_per_uuid(rows: list[list]) -> list[list]:
+def _first_row_per_uuid(rows: list[list], *, reader: str) -> list[list]:
     """Keep the first row for each column-0 uuid, in order.
 
-    Paging introduces duplicates a single query never could: an insert that
-    sorts before the current offset makes the next page's SKIP re-emit the
-    previous page's last row (the hazard enumerate_entity_nodes documents).
+    Paging introduces duplicates a single query never could.  Each page is a
+    separate query against a graph under concurrent write, so a row inserted
+    with a uuid sorting BEFORE the current offset shifts every later row up by
+    one, and the next page's SKIP re-returns the previous page's last row.  A
+    consumer of an unpaginated read was entitled to assume a uuid never
+    repeats; every paged reader restores that guarantee here.  Rows dropped
+    are counted at DEBUG under ``reader``, the calling method's name.
     """
     seen: set = set()
     unique: list[list] = []
@@ -1056,6 +1060,13 @@ def _first_row_per_uuid(rows: list[list]) -> list[list]:
             continue
         seen.add(row[0])
         unique.append(row)
+    if len(unique) < len(rows):
+        logger.debug(
+            '%s: %d row(s) repeated a uuid already seen, most likely re-emitted '
+            'across a SKIP/LIMIT boundary by a concurrent insert; kept the '
+            'first-seen row for each',
+            reader, len(rows) - len(unique),
+        )
     return unique
 
 
@@ -1668,7 +1679,10 @@ class GraphitiBackend:
         try:
             # The full set is still read, now in keyset pages, because the
             # created_at sort must see every episode: a cap-truncated set would
-            # silently select the wrong episodes, not merely fewer of them.
+            # silently select the wrong episodes, not merely fewer of them. The
+            # cheaper bounded read (ORDER BY created_at ... LIMIT last_n) was
+            # declined; its cost and reasons are in
+            # plans/falkordb-resultset-cap-audit.md.
             episodes = await asyncio.wait_for(
                 _read_all_group_episodes(driver, group_ids),
                 timeout=self._read_timeout,
@@ -2174,29 +2188,14 @@ class GraphitiBackend:
         Raises:
             IncompleteEnumerationError: The read was structurally incomplete.
         """
-        graph = self._graph_for(group_id)
-        paged = await _paged_ro_query(
-            graph,
-            _EMBEDDED_ENTITY_NODES_PAGE_TEMPLATE,
-            _EMBEDDED_ENTITY_NODES_CENSUS,
-        )
-        stale = [
-            (row[0], row[1], dim)
-            for row in _first_row_per_uuid(paged.rows)
-            if (dim := _embedding_dim(row[2])) != expected_dim
-        ]
-        _apply_incompleteness_policy(
-            paged,
-            method='query_stale_node_embeddings',
+        return await self._query_stale_embeddings(
+            expected_dim,
             group_id=group_id,
-            returned_count=len(stale),
+            page_template=_EMBEDDED_ENTITY_NODES_PAGE_TEMPLATE,
+            census_cypher=_EMBEDDED_ENTITY_NODES_CENSUS,
+            method='query_stale_node_embeddings',
             noun='stale node embeddings',
-            consequence=(
-                'must not be taken as the full stale set, because a reindex '
-                'driven by it would look finished when it is not'
-            ),
         )
-        return stale
 
     @_canonicalize_group_args
     async def query_stale_edge_embeddings(
@@ -2210,23 +2209,44 @@ class GraphitiBackend:
         Raises:
             IncompleteEnumerationError: The read was structurally incomplete.
         """
-        graph = self._graph_for(group_id)
-        paged = await _paged_ro_query(
-            graph,
-            _EMBEDDED_EDGES_PAGE_TEMPLATE,
-            _EMBEDDED_EDGES_CENSUS,
+        return await self._query_stale_embeddings(
+            expected_dim,
+            group_id=group_id,
+            page_template=_EMBEDDED_EDGES_PAGE_TEMPLATE,
+            census_cypher=_EMBEDDED_EDGES_CENSUS,
+            method='query_stale_edge_embeddings',
+            noun='stale edge embeddings',
         )
+
+    async def _query_stale_embeddings(
+        self,
+        expected_dim: int,
+        *,
+        group_id: str,
+        page_template: str,
+        census_cypher: str,
+        method: str,
+        noun: str,
+    ) -> list[tuple[str, str, int]]:
+        """Page (uuid, name, vector) rows; return those whose dim != expected_dim.
+
+        The one body of the two stale-embedding reads, which differ only in the
+        population paged (``page_template``/``census_cypher``, as for
+        ``_paged_ro_query``) and the ``method``/``noun`` they report under.
+        """
+        graph = self._graph_for(group_id)
+        paged = await _paged_ro_query(graph, page_template, census_cypher)
         stale = [
             (row[0], row[1], dim)
-            for row in _first_row_per_uuid(paged.rows)
+            for row in _first_row_per_uuid(paged.rows, reader=method)
             if (dim := _embedding_dim(row[2])) != expected_dim
         ]
         _apply_incompleteness_policy(
             paged,
-            method='query_stale_edge_embeddings',
+            method=method,
             group_id=group_id,
             returned_count=len(stale),
-            noun='stale edge embeddings',
+            noun=noun,
             consequence=(
                 'must not be taken as the full stale set, because a reindex '
                 'driven by it would look finished when it is not'
@@ -2275,7 +2295,7 @@ class GraphitiBackend:
                 'valid_at': row[3],
                 'invalid_at': row[4],
             }
-            for row in _first_row_per_uuid(paged.rows)
+            for row in _first_row_per_uuid(paged.rows, reader='query_edges_by_time_range')
         ]
         _apply_incompleteness_policy(
             paged,
@@ -4318,9 +4338,9 @@ class GraphitiBackend:
             page_size: Rows per page. Must stay strictly below the server's
                 result-set cap — see _paged_ro_query.
 
-        Rows are deduplicated on ``n.uuid`` across ALL pages — see the loop
-        body for why paging makes that necessary where a single query never
-        did.
+        Rows are deduplicated on ``n.uuid`` across ALL pages — see
+        ``_first_row_per_uuid`` for why paging makes that necessary where a
+        single query never did.
 
         Returns:
             (nodes, paged) where *nodes* is the same list list_entity_nodes
@@ -4336,38 +4356,14 @@ class GraphitiBackend:
             _ENTITY_NODES_CENSUS,
             page_size=page_size,
         )
-        # Dedup on n.uuid, built ONCE across every page — mirroring the
-        # (n.uuid, e.uuid) map in enumerate_all_valid_edges, and necessary for
-        # the same reason: this is a hazard PAGING INTRODUCED, not one it
-        # inherited.  Each page is a separate query against a graph under
-        # concurrent write, so an Entity inserted with a uuid sorting BEFORE
-        # the current offset shifts every later row up by one and the next
-        # page's SKIP re-returns the previous page's last row.  A single
-        # unpaginated query could never return a uuid twice, so every consumer
-        # is entitled to assume it cannot happen — and the ones downstream do:
-        # detect_stale_with_edges reports one stale entry per element and uses
-        # len(entities) as its total_count denominator, and
-        # rebuild_entity_summaries would schedule two concurrent writers for
-        # the repeated node.
-        seen: set[str] = set()
-        nodes: list[dict] = []
-        for row in paged.rows:
-            uuid = row[0]
-            if uuid in seen:
-                logger.debug(
-                    'enumerate_entity_nodes: node uuid %r seen on more than '
-                    'one page — most likely a row re-emitted across a '
-                    'SKIP/LIMIT boundary by a concurrent insert; keeping '
-                    'first-seen row',
-                    uuid,
-                )
-                continue
-            seen.add(uuid)
-            nodes.append({
-                'uuid': uuid,
-                'name': row[1] or '',
-                'summary': row[2] or '',
-            })
+        # The consumers downstream rely on the dedup: detect_stale_with_edges
+        # reports one stale entry per element and uses len(entities) as its
+        # total_count denominator, and rebuild_entity_summaries would schedule
+        # two concurrent writers for a repeated node.
+        nodes = [
+            {'uuid': row[0], 'name': row[1] or '', 'summary': row[2] or ''}
+            for row in _first_row_per_uuid(paged.rows, reader='enumerate_entity_nodes')
+        ]
         return nodes, paged
 
     @_canonicalize_group_args

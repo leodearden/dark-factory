@@ -109,11 +109,18 @@ Method: `grep -n "ro_query(\|get_by_group_ids\|\.execute_query(" fused-memory/sr
 - `query_stale_edge_embeddings` (task 4869). It has no `invalid_at` filter, so it includes superseded edges, which still need re-embedding.
 - `query_edges_by_time_range` (task 4869). It is bounded only by the caller's window, and its consumer (`CleanupManager.find_stale_edges`) feeds `bulk_remove_edges`.
 
-All five apply the shared `_apply_incompleteness_policy`: STRUCTURAL kinds raise `IncompleteEnumerationError`, EMPIRICAL kinds warn and return. The three 4869 reads dedup re-emitted boundary rows with `_first_row_per_uuid`.
+All five apply the shared `_apply_incompleteness_policy`: STRUCTURAL kinds raise `IncompleteEnumerationError`, EMPIRICAL kinds warn and return. The three 4869 reads and `enumerate_entity_nodes` dedup re-emitted boundary rows with `_first_row_per_uuid`.
 
 ### PAGINATED via keyset through graphiti-core
 
 - `retrieve_episodes` -> `_read_all_group_episodes` (task 4869). The truncation was the worst shape of this bug. graphiti-core orders by uuid DESC, so a capped read dropped the lowest uuids. The Python `created_at` sort then picked the most recent of the survivors: the WRONG episodes, not merely fewer. Page-budget exhaustion raises rather than returning a uuid-ordered prefix.
+  - What it costs (reasoned from the query text, not measured). Every keyset page runs graphiti-core's `MATCH (e:Episodic) WHERE e.group_id IN $group_ids AND e.uuid < $uuid RETURN DISTINCT ... ORDER BY uuid DESC LIMIT $limit`. That matches and sorts every episode below the cursor, `content` included. The read is therefore O(P · N log N) in the database and O(N) in transfer, and it grows with the group's episode count. The caller wants only `last_n` episodes, which `fused-memory/src/fused_memory/server/tools.py::get_episodes` caps at 1000.
+  - DECLINED ALTERNATIVE: a bounded read ordered by `created_at`. Before task 4869, a comment in `retrieve_episodes` named the cheaper fix: our own Cypher with `ORDER BY e.created_at DESC, e.uuid DESC LIMIT $last_n`. With `last_n` at most 1000, below the cap, it would need no paging at all. It would make `_read_all_group_episodes` unnecessary and turn the O(N) transfer into an O(`last_n`) one. The task-4869 plan declined it for three reasons:
+    1. It hard-codes graphiti-core's episode RETURN projection and record decoder (`get_episodic_node_from_record`) in this repo. The keyset path calls the public `EpisodicNode.get_by_group_ids` and inherits both.
+    2. The database would sort `created_at` values as stored. `_as_sortable_utc` reads a naive datetime as UTC and sorts a missing `created_at` last. The ordering tests for tasks 2055 and 2079 (`fused-memory/tests/test_get_episodes_ordering.py`, `fused-memory/tests/test_get_episodes_ordering_residual.py`) pin that behaviour, and a server-side sort would drop it.
+    3. Its correctness rests on the 1000 bound, which lives in `tools.py` and not in `retrieve_episodes`. Another caller that passed a `last_n` above the cap would be silently truncated again.
+
+    Re-open it only with a measurement showing that this cold-path read's cost matters, and with an answer to reasons 2 and 3.
 
 ### UNPAGINATED BY DESIGN, warns at the cap
 
