@@ -1732,7 +1732,7 @@ caught up on next boot/login rather than silently skipped) and
 `RandomizedDelaySec=300`.
 
 Per-job docs: [docs/flag-marker-sweep-recurring.md](docs/flag-marker-sweep-recurring.md)
-for the 03:30 job; the sections below for the 03:00 and 05:00 ones.
+for the 03:30 job; the sections below for the 03:00, 04:00 and 05:00 ones.
 
 **04:30 is free.** The nightly reify closure-staleness sweep and its
 `consume_redispatch_requests` drain that used to hold that slot were retired by
@@ -1834,6 +1834,56 @@ legibility-trickle@<project>`):
   nothing is capped. Read the run's per-digest failures for what each account
   actually reported — a fleet-wide near-cap warning and a backend fault both
   land here.
+
+### Nightly legibility transcript check (04:00)
+
+**What it does.** Runs `check_transcript_persistence.py`, task 2893's
+registry-to-transcript reconciliation detector, once a day per project. It
+alarms on "a session ran but left no transcript". Exit 0 means clean. Exit 1
+means a lost-transcript finding; the detector also best-effort POSTs an
+`escalate_info`, but the non-zero exit is the authoritative signal, since a
+down escalation server is swallowed. So a night with a finding leaves the
+unit `failed`. That is the alarm, not a broken unit, and the liveness probe
+below tells the two apart.
+
+**Why no `--check-preventer`.** The comment in
+`legibility-transcript-check@.service` (task 2901 DD2) says the 2893 guard
+regex missed `spawn-claude.sh`'s mid-line export, so the flag would make the
+timer exit 1 every night. Task 2923 fixed that regex on 2026-07-23. Measured
+on 2026-09-24, the guard finds the export, so the comment is stale. Whether to
+enable the flag is an open decision owned by task 5859.
+
+| File | Role |
+|---|---|
+| `scripts/legibility/check_transcript_persistence.py` | The detector |
+| `scripts/legibility-transcript-check@.service` | `Type=oneshot`, `%i` = project_id |
+| `scripts/legibility-transcript-check@.timer` | `OnCalendar=*-*-* 04:00:00` |
+| `scripts/legibility/install-transcript-check-timer.sh` | Idempotent, self-verifying installer |
+| `scripts/legibility/check_transcript_check_liveness.sh` | The "did the unit run?" probe |
+
+**Deploy.** `scripts/legibility/install-transcript-check-timer.sh
+<project_id>`, run from `/home/leo/src/dark-factory` once per project
+(`dark_factory`, `reify`). It runs as a deterministic `before_done` task,
+because the sandbox cannot write `~/.config/systemd/user/`: task 5855
+(dark_factory) and task 5856 (reify).
+
+**Liveness.** Tasks 5857 (dark_factory) and 5858 (reify) are delayed-milestone
+predicates. Each runs `check_transcript_check_liveness.sh <project_id> 72`
+seven days after its project's deploy lands. Both a clean run
+(`Result=success`, `ExecMainStatus=0`) and a firing run (`Result=exit-code`,
+`ExecMainStatus=1`) count as ALIVE, because for this detector exit 1 is the
+normal alarm. Never-ran, staleness, an abnormal `Result`, or `ExecMainStatus`
+empty or ≥2 all FAIL. That is the opposite of `check_trickle_liveness.sh`,
+where exit 1 means the pipeline broke. These milestones are one-shot: a `done`
+predicate never runs again.
+
+**Superseded by a recurring chain.** This timer is the interim runner. The
+recurring-deterministic-tasks PRD
+([docs/prds/recurring-deterministic-tasks.md](docs/prds/recurring-deterministic-tasks.md),
+r6 = task 4681) makes transcript-check a chain of predicate tasks. When that
+chain is seeded, retire this timer and `check_transcript_check_liveness.sh` in
+the same change, or every finding is filed twice. Do not add a second
+recurring probe here.
 
 ### Nightly canonical/topic coverage census (05:00)
 
