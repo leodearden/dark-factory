@@ -65,7 +65,7 @@ import logging
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import httpx
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
@@ -76,6 +76,7 @@ from dashboard.data.task_runtime import fetch_task_runtime
 from dashboard.data.tasks import (
     fetch_external_statuses,
     fetch_statuses,
+    fetch_task_page,
     fetch_tasks,
     task_is_stranded,
 )
@@ -144,23 +145,71 @@ _PER_PROJECT_MCP_CALLS: tuple[str, ...] = (
     'get_tasks[terminal]',
 )
 
+# Per-HTTP-REQUEST budget for the Tasks tab's own MCP calls, threaded into
+# every call ``_shape_one_project`` issues.
+#
+# MEASURED 2026-09-07 against the live fused-memory (localhost:8002), 9
+# configured roots, caches cleared per root, per-call timeout temporarily
+# raised to 10.0 so a slow root reported its real latency instead of a
+# ReadTimeout: per-CALL max 2.696 s, per-ROOT wall max 2.876 s (dark-factory
+# 5128 tasks, reify 7279), p95 across roots 1.695 s. Everything else was
+# under 0.1 s — the distribution is two big trees and seven small ones, not a
+# uniform cost.
+#
+# 4.4 = 1.5 * the 2.876 s per-root wall max, rounded up to one decimal.
+#
+# WHY 2.0 IS TOO SMALL, on evidence rather than on principle: at
+# ``tasks.DEFAULT_PER_CALL_TIMEOUT`` the same measurement's truly-cold render
+# marked dark-factory, reify AND autopilot-video OFFLINE and shipped 208 of
+# 3045 active rows — i.e. the Tasks tab reported the three largest projects
+# unreachable while fused-memory was serving them fine, which is what the
+# journal's ``fetch_tasks[reify] failed for http://localhost:8002:
+# ReadTimeout`` lines are. Offline is a claim that the read demonstrably
+# failed; a per-call budget below the honest service time turns that claim
+# into a lie on every cold render.
+#
+# WHY THE SERVER COST SCALES WITH TREE SIZE even though this read is
+# status-narrowed: there is no field projection at any layer and the backend
+# query is ``SELECT *`` feeding a fixed 14-key row — see ``fetch_tasks``'
+# docstring, which records the limitation, and task 4390, which is the open
+# follow-up to add projection. Until that lands, narrowing the STATUSES does
+# not narrow the WORK, so a 5 000-task tree costs what a 5 000-task tree
+# costs and the budget has to be sized for it.
+#
+# WHY THIS IS TASKS-TAB-LOCAL rather than a bump of the shared
+# ``tasks.DEFAULT_PER_CALL_TIMEOUT``: that constant feeds
+# ``tasks.DEFAULT_WHOLE_OPERATION_BUDGET``, which
+# ``orchestrator._ORCHESTRATORS_PER_ROOT_BUDGET``,
+# ``merge_queue._TASK_TITLES_BUDGET`` and ``app._TASK_CARDS_BUDGET`` all bind
+# BY REFERENCE (task 4788). Raising the shared default to fix the Tasks tab
+# would silently widen three unrelated route budgets — none of which fetches
+# a 5 000-task tree, so none of which needs it.
+# ``test_tasks_budget.py`` assertion (e) pins both halves of this.
+_TASKS_PER_CALL_TIMEOUT = 4.4
+
 # Whole-operation bound for ONE project root, enforced by ``asyncio.wait_for``
 # in ``collect_tasks_with_counts``.
 #
-# ``tasks.DEFAULT_PER_CALL_TIMEOUT`` (2.0) * 3 calls = 6.0 <= 7.0, leaving
-# 1.0 s of slack so this deadline is a real backstop for non-MCP overhead
+# ``_TASKS_PER_CALL_TIMEOUT`` (4.4) * 3 calls = 13.2 <= 14.0, leaving
+# 0.8 s of slack so this deadline is a real backstop for non-MCP overhead
 # (JSON decode, row shaping, event-loop scheduling) rather than coinciding
 # exactly with the sum of its parts — the same reasoning as healthz's
 # ``_DB_PROBE_TIMEOUT * 3 = 2.7 <= _HEALTHZ_TOTAL_BUDGET = 3.0``.
 #
+# It moved 7.0 -> 14.0 only because ``_TASKS_PER_CALL_TIMEOUT`` moved 2.0 ->
+# 4.4: the parts-fit-the-whole shape is unchanged and the slack is still
+# named. It is NOT an independent widening, and must not be raised on its own.
+#
 # What that sum does and does NOT claim: it bounds the sum of the
 # PER-HTTP-REQUEST budgets. It does NOT bound a cold MCP session, which
 # performs three posts (initialize, notifications/initialized, tools/call) and
-# so can reach ``3 * DEFAULT_PER_CALL_TIMEOUT`` for a SINGLE tool call. That
+# so can reach ``3 * _TASKS_PER_CALL_TIMEOUT`` for a SINGLE tool call — the
+# TAB'S per-call term, not the shared default, since that is what every call
+# below threads. That
 # residual is exactly what this ``wait_for`` layer exists to cap: the two
 # layers are complementary, not redundant (the same two-layer note
 # ``dashboard/src/dashboard/data/task_runtime.py``'s module docstring carries).
-_TASKS_PER_PROJECT_BUDGET = 7.0
+_TASKS_PER_PROJECT_BUDGET = 14.0
 
 # Whole-handler deadline for the entire multi-project aggregation.
 #
@@ -170,10 +219,81 @@ _TASKS_PER_PROJECT_BUDGET = 7.0
 # structural worst case of roughly ``roots * 3 posts * 10 s`` with no cap at
 # all.
 #
-# Raising any one of these three constants requires re-checking the others —
-# they are mutually constrained, and ``test_tasks_budget.py`` enforces that.
+# DELIBERATELY UNCHANGED at 20.0 while ``_TASKS_PER_PROJECT_BUDGET`` doubled.
+# The obvious "fix" for a cold render that runs out of budget is to widen this
+# toward ``data.js``'s 30 000 ms abort, and it is the wrong one: the measured
+# payload is ~14 MB, and the 10 s of remaining headroom is what serialises and
+# ships it. Spend that headroom on more fetching and the handler delivers a
+# payload the browser has already aborted — a 15s-handler-behind-a-5s-caller,
+# which is the exact failure ``test_healthz_deadline.py`` exists to prevent
+# and strictly worse than degrading a root. The root-count problem is solved
+# by CONCURRENCY (``_TASKS_ROOT_CONCURRENCY``) and the fairness problem by
+# ROTATION, neither of which costs headroom.
+#
+# Raising any one of these constants requires re-checking the others — they
+# are mutually constrained, and ``test_tasks_budget.py`` enforces that.
 # None of them may be raised toward ``memory.mcp_tool_call``'s 10 s default.
+#
+# AFTER-STATE, measured 2026-09-07 (task 4884 step-20), same method as the
+# before-numbers above: caches cleared, then a cold ``GET
+# /api/v2/dashboard/tasks``, 10 repetitions, 9 configured roots, live
+# fused-memory. RAW NUMBERS, because this is the capacity baseline the next
+# change reads:
+#
+#   before (per-call 2.0, sequential, fixed order): 208 of 3045 active rows;
+#     dark-factory, reify AND autopilot-video all marked OFFLINE.
+#   after:  rows 295 / 1167 / 1562 / 1689 / 1776 / 2680 / 2806 / 2857 /
+#           2924 / 3043; wall 9.8–22.4 s; payload 0.9–14.3 MB.
+#
+# HONEST VERDICT, both halves. FAIRNESS (rotation) holds: the degraded/offline
+# set differed on every one of the 10 renders, against the journal's fixed
+# trailing pair (solar-challenge-platform, pump-web-ui) every render.
+# COMPLETENESS does NOT hold unconditionally: 3 of 10 renders came back fully
+# clean (0 offline, 0 degraded, 2806–3043 rows in 9.8–13.4 s), the other 7
+# degraded or offlined between one and six roots. So a cold render CAN now
+# serve every root inside the budget, but is not guaranteed to.
+#
+# Deliberately NOT closed by raising this constant. Doing so would buy the
+# clean render by making failure impossible, which is exactly what #4795
+# acceptance 3 forbids and what ``test_tasks_budget.py`` (c) blocks — and it
+# would spend the serialisation headroom the 14.3 MB payload measured above
+# actually needs. The residual is the un-projected ``SELECT *`` read (task
+# 4390); until that lands the honest markers are the answer, not a wider bound.
+#
+# CONFOUND, stated so the numbers are not over-read: these were taken with the
+# production dashboard also polling the SAME single fused-memory server every
+# 3 s, so they include real contention and are a pessimistic bound, not a
+# quiet-system best case.
 _TASKS_TOTAL_BUDGET = 20.0
+
+# How many project roots ``collect_tasks_with_counts`` may have in flight.
+#
+# WHY > 1: the walk used to be SEQUENTIAL, so N roots cost the SUM of their
+# per-root costs against one ``_TASKS_TOTAL_BUDGET``. At the incident's 9
+# roots that sum exceeded the total, and because the walk order was fixed the
+# SAME trailing roots were reported degraded on every render (the journal's
+# repeated ``project pump-web-ui: skipped — the 20.0s Tasks budget was
+# already spent``). At width W the worst case becomes roughly
+# ``ceil(N / W) * _TASKS_PER_PROJECT_BUDGET``.
+#
+# WHY BOUNDED rather than a plain unbounded ``gather``: ``burndown.py``
+# records the measurement (see ``_SNAPSHOT_PAGE_SIZE`` and
+# ``_fetch_snapshot_tasks``). A full fan-out over every root goes against a
+# SINGLE fused-memory server where the requests serialise SERVER-side anyway,
+# on the SAME shared httpx client the 3 s render polls use — "a live
+# httpx.PoolTimeout risk for request-path handlers". Unbounded concurrency
+# would therefore buy this endpoint nothing (the server is the bottleneck)
+# while spending every other endpoint's connections.
+#
+# NOTE that ``app._build_http_limits`` scales ``max_connections`` with the
+# fleet size, which makes the POOL look like the constraint it is not. Raising
+# this width because the pool grew would be reading the wrong number: the
+# ceiling here is the single MCP server's own serialisation, not connections.
+#
+# 4 covers the measured shape of the fan-out — two big roots (dark-factory
+# 5128 tasks, reify 7279) and seven that finish in under 0.1 s — in
+# ``ceil(9/4) = 3`` waves. ``test_tasks_budget.py`` (f) holds it in (1, 8].
+_TASKS_ROOT_CONCURRENCY = 4
 
 # Defensive-visibility threshold: a PRD with an unusually large number of live
 # done/cancelled members beyond the per-bucket cap logs a warning, so a
@@ -217,6 +337,71 @@ def _all_project_roots(config: DashboardConfig) -> list[Path]:
             seen.add(r)
             roots.append(r)
     return roots
+
+
+# Admission-order rotation offset for `collect_tasks_with_counts`, advanced by
+# one slot per render. Module state, like the `_*_cache` objects elsewhere in
+# this package, with a matching `_reset_root_rotation()` test hook.
+_root_rotation_offset: int = 0
+
+
+def _reset_root_rotation() -> None:
+    """Reset the admission-order rotation. Test hook.
+
+    Same shape as the ``_*_cache_clear`` hooks in ``tasks.py``: rotation is
+    module state, so a test that asserts an ORDER has to be able to start from
+    a known offset rather than inherit whatever the previous test left.
+    """
+    global _root_rotation_offset
+    _root_rotation_offset = 0
+
+
+def _rotated_project_roots(config: DashboardConfig) -> list[Path]:
+    """``_all_project_roots`` rotated left by one more slot on each call.
+
+    WHAT THIS CLOSES. `collect_tasks_with_counts` cannot always serve every
+    root inside `_TASKS_TOTAL_BUDGET`, and with a FIXED walk order the roots
+    that lose are always the same ones — the last ones. The journal of the
+    2026-08-27 incident shows exactly that: `project solar-challenge-platform:
+    skipped — the 20.0s Tasks budget was already spent before this project was
+    reached` and `project pump-web-ui: skipped ...`, the same trailing pair,
+    render after render. Those two projects were effectively invisible on the
+    Tasks tab for the duration.
+
+    ROTATION MAKES STARVATION FAIR, NOT ABSENT. This is the load-bearing
+    claim, and it is deliberately weaker than it looks: with 9 roots and a
+    20.0 s budget some render will still fail to serve some roots. What
+    rotation guarantees is that the starved SET rotates, so no root is
+    permanently invisible. What reports the starvation is unchanged — the
+    honest `TASKS_DEGRADED_PROJECTS` / `TASKS_OFFLINE_PROJECTS` markers task
+    3857 built. Do not read this helper as a fix for degraded rows; read it as
+    the reason a degraded row is transient rather than permanent.
+
+    DETERMINISTIC ROUND-ROBIN, NOT RANDOMISATION. A shuffle would also spread
+    the starvation, and was rejected: an operator comparing two consecutive
+    renders can predict which roots were served under a round-robin and cannot
+    under a shuffle, and a test can assert the former (see
+    ``TestCollectTasksWithCountsFairness``) but only sample the latter.
+    Reproducibility in an incident is worth more here than any property a
+    random order would buy.
+
+    SEPARATE HELPER, deliberately. ``_all_project_roots`` stays byte-identical
+    and primary-first: ``app.py``, ``scheduler.py``, ``collect_done_counts``
+    and ``test_app.py``'s patch point all depend on that ordering, so rotating
+    in place would silently repoint every one of them at a different project.
+    Only ``collect_tasks_with_counts``' admission loop calls this.
+
+    Rotation changes ADMISSION order only. Output is re-assembled in canonical
+    ``_all_project_roots`` order by the caller, so the rendered table does not
+    reshuffle on every 3 s poll.
+    """
+    global _root_rotation_offset
+    roots = _all_project_roots(config)
+    if not roots:
+        return roots
+    offset = _root_rotation_offset % len(roots)
+    _root_rotation_offset = (_root_rotation_offset + 1) % len(roots)
+    return roots[offset:] + roots[:offset]
 
 
 def _task_uid(project: str, task_id: int) -> str:
@@ -544,7 +729,8 @@ async def _shape_one_project(
     2. ``fetch_statuses(...)`` — the compact map, ~95% smaller, supplying both
        *done_count* and the terminal population that positions (3).  Issued
        concurrently with (1);
-    3. ``fetch_tasks(statuses=sorted(_TERMINAL_STATUSES), page_size=..., offset=...)``
+    3. ``fetch_task_page(statuses=sorted(_TERMINAL_STATUSES), page_size=...,
+       offset=...)``
        — a bounded window of terminal rows, issued ONLY when a terminal cap is
        actually requested.  ``collect_active_tasks``'s scheduler path passes
        both caps as 0 and therefore transfers no terminal row at all.
@@ -640,9 +826,21 @@ async def _shape_one_project(
     # the trade this change set out to make. Cached, the two endpoints share
     # one read and consecutive polls collapse. See
     # tasks._FETCH_STATUSES_TTL_SECONDS for why 5 s.
+    #
+    # Both carry the Tasks-tab-LOCAL _TASKS_PER_CALL_TIMEOUT rather than
+    # tasks.DEFAULT_PER_CALL_TIMEOUT: this tab is the only caller that reads a
+    # 5 000-task tree, and at the shared 2.0 s default the measurement of
+    # 2026-09-07 marked the three largest roots OFFLINE on a cold render. See
+    # the constant for the numbers and for why the shared default may not move.
     fetched, status_map = await asyncio.gather(
-        fetch_tasks(client, config, project_root, statuses=sorted(_ACTIVE_STATUSES)),
-        fetch_statuses(client, config, project_root),
+        fetch_tasks(
+            client, config, project_root,
+            statuses=sorted(_ACTIVE_STATUSES),
+            timeout=_TASKS_PER_CALL_TIMEOUT,
+        ),
+        fetch_statuses(
+            client, config, project_root, timeout=_TASKS_PER_CALL_TIMEOUT,
+        ),
     )
     if isinstance(fetched, dict) and fetched.get('offline'):
         return [], True, 0
@@ -684,13 +882,17 @@ async def _shape_one_project(
                 'filed can be missing from the Tasks tab',
                 project, n_terminal, window, window,
             )
+        # fetch_task_page, not fetch_tasks: this read wants a PARTIAL answer
+        # (the WARNING above says so), and after task 5018 that contract is in
+        # the function name rather than in an argument combination.
         # page_size/offset slice a list ordered by ASCENDING id, so reaching
         # the high-id end requires a computed offset rather than a LIMIT.
-        terminal = await fetch_tasks(
+        terminal = await fetch_task_page(
             client, config, project_root,
             statuses=sorted(_TERMINAL_STATUSES),
             page_size=window,
             offset=max(0, n_terminal - window),
+            timeout=_TASKS_PER_CALL_TIMEOUT,
         )
         if isinstance(terminal, list):
             # DEDUP, not concatenate. The two fetches are separate cached
@@ -700,8 +902,8 @@ async def _shape_one_project(
             # tab uses as a map key and as its selection identity — so the
             # task renders twice, as pending AND as done.
             #
-            # This is not a narrow race. fetch_tasks caches per (root,
-            # narrowing) for the TTL, and the terminal key embeds an offset
+            # This is not a narrow race. Both reads cache per (root,
+            # narrowing, mode) for the TTL, and the terminal key embeds an offset
             # that changes on EVERY completion — so a completion mints a fresh
             # terminal key (cold, sees 'done') while the active key is still
             # served from an entry up to a full TTL old (still 'pending').
@@ -844,14 +1046,28 @@ async def collect_tasks_with_counts(
     - *done_counts* maps project label → total done task count (pre-cap)
     - *degraded_projects* lists project labels the budget did not deliver
 
-    **Bounded as a whole, not merely per call.**  The walk over project roots
-    is sequential, so without a deadline this function's worst case is the SUM
-    of every project's worst case — unbounded in the number of configured
-    roots, and behind a browser ``fetch`` that aborts at 30 s.  A
-    ``loop.time()`` deadline (``_TASKS_TOTAL_BUDGET``) is taken up front and
-    each project is run under ``asyncio.wait_for`` at
-    ``min(remaining, _TASKS_PER_PROJECT_BUDGET)``, copying ``app.healthz``'s
-    loop shape rather than inventing one.
+    **Bounded as a whole, not merely per call.**  A ``loop.time()`` deadline
+    (``_TASKS_TOTAL_BUDGET``) is taken up front and each project is run under
+    ``asyncio.wait_for`` at ``min(remaining, _TASKS_PER_PROJECT_BUDGET)``,
+    copying ``app.healthz``'s loop shape rather than inventing one.
+
+    **Concurrent at a bounded width.**  The walk used to be SEQUENTIAL, which
+    made this function's worst case the SUM of every project's worst case —
+    so at the 9 roots of the 2026-08-27 incident the total budget could not
+    fit them all and the trailing roots degraded on every render.  Roots are
+    now admitted through an ``asyncio.Semaphore(_TASKS_ROOT_CONCURRENCY)``, so
+    the worst case is roughly ``ceil(roots / _TASKS_ROOT_CONCURRENCY) *
+    _TASKS_PER_PROJECT_BUDGET``.  The deadline is still what BOUNDS it —
+    concurrency changes the cost, not the guarantee.  The width is bounded
+    rather than unbounded because the fan-out targets a single fused-memory
+    server (where the requests serialise server-side regardless) over the
+    shared httpx client the render polls use; see ``_TASKS_ROOT_CONCURRENCY``.
+
+    Concurrency changes ADMISSION order only.  ``remaining`` is computed after
+    a root acquires its slot — a root that waited for one pays for the wait
+    rather than being handed a stale budget — and every result is collected
+    into a per-root slot and re-assembled in ROOT order, so completion order
+    can never reach the payload.
 
     Expiry yields a PARTIAL payload with explicit per-project markers, never a
     truncated-but-confident one: every project that timed out or never got its
@@ -928,73 +1144,133 @@ async def collect_tasks_with_counts(
     # them as a healthy project with a confident "0 done". That is the
     # invisible-failure class this task exists to close.
     count_unknown_projects: list[str] = []
-    for root in _all_project_roots(config):
+
+    # ROTATED for admission, canonical for output. The rotation is what stops
+    # the same trailing roots being starved on every render; see
+    # _rotated_project_roots. `roots` below is the canonical order the results
+    # are re-assembled in.
+    roots = _all_project_roots(config)
+    admission_order = _rotated_project_roots(config)
+    # Admission control, not a work queue: the coroutines are all created up
+    # front and the semaphore decides how many are inside _shape_one_project
+    # at once. See _TASKS_ROOT_CONCURRENCY for why the width is bounded.
+    slots = asyncio.Semaphore(_TASKS_ROOT_CONCURRENCY)
+
+    async def _one(root: Path) -> dict[str, Any]:
+        """Shape ONE root, returning a result record — never mutating shared state.
+
+        Every branch returns a record instead of appending to the outer lists.
+        Appending from inside a concurrent coroutine would order the payload by
+        COMPLETION, and the Tasks tab renders ``all_active`` directly, so the
+        table would reshuffle on every 3 s poll. The caller re-assembles these
+        records in ROOT order below.
+
+        The record carries NO label: the caller pairs each one with the root
+        that produced it, which is the only identity that is unique (see the
+        re-assembly below).
+        """
         label = _project_label(root)
-        remaining = deadline - loop.time()
-        if remaining <= 0:
-            # Never got its turn. A silently missing project reads as "no
-            # active work" on the Tasks tab, which is the same class of
-            # invisible failure the fan-out logging policy was raised to
-            # WARNING to close.
+        async with slots:
+            # AFTER admission, deliberately: a root that queued for a slot has
+            # already spent part of the whole-handler budget, and handing it a
+            # `remaining` measured before the wait would let the walk overrun
+            # the deadline by up to one wave.
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                # Never got its turn. A silently missing project reads as "no
+                # active work" on the Tasks tab, which is the same class of
+                # invisible failure the fan-out logging policy was raised to
+                # WARNING to close.
+                logger.warning(
+                    'project %s: skipped — the %.1fs Tasks budget was already '
+                    'spent before this project was reached; its rows and done '
+                    'count are UNKNOWN for this render (not zero, and not offline)',
+                    label, _TASKS_TOTAL_BUDGET,
+                )
+                return {'degraded': True}
+            try:
+                active, offline, done_count = await asyncio.wait_for(
+                    _shape_one_project(
+                        client, config, root,
+                        max_done_per_project=max_done_per_project,
+                        max_cancelled_per_project=max_cancelled_per_project,
+                        now=effective_now,
+                        runtime=runtime_by_label.get(label),
+                    ),
+                    timeout=min(remaining, _TASKS_PER_PROJECT_BUDGET),
+                )
+            except TimeoutError:
+                logger.warning(
+                    'project %s: exceeded its %.1fs share of the %.1fs Tasks '
+                    'budget (%.1fs remained) — its rows and done count are '
+                    'UNKNOWN for this render (not zero, and not offline)',
+                    label, _TASKS_PER_PROJECT_BUDGET, _TASKS_TOTAL_BUDGET, remaining,
+                )
+                return {'degraded': True}
+            except Exception:
+                # DEFENSE IN DEPTH, and deliberately broad. The fan-out
+                # normally converts a failed read into the offline marker, so
+                # nothing here is a demonstrated crash — but without this
+                # clause ANY unexpected exception (a decode error, a shaping
+                # bug, an httpx transport error that escaped the fan-out)
+                # unwinds the whole GATHER and 500s the handler, throwing away
+                # every healthy project. That is the same "one bad root blanks
+                # the whole tab" failure TASKS_OFFLINE exists to close,
+                # relocated from the banner to the handler, and one root must
+                # not be able to cause it.
+                #
+                # It must stay INSIDE _one for that to hold: hoisted to the
+                # gather (as return_exceptions=True) it would still catch the
+                # exception, but only after asyncio.gather had already been
+                # given the chance to propagate it, and the per-root offline/
+                # degraded routing below would have nothing to key on.
+                #
+                # OFFLINE, not degraded: the read demonstrably FAILED, which is
+                # what offline means. degraded is reserved for "the budget
+                # never let us find out" — the distinction the two branches
+                # above draw, and merging them here would undo it.
+                #
+                # exc_info is load-bearing: an exception absorbed into a
+                # routine offline marker with no traceback is a bug that
+                # renders as an outage forever. The log is what separates
+                # "fused-memory is down" from "our own shaping code raised".
+                logger.warning(
+                    'project %s: unexpected error while shaping its rows — the '
+                    'project is marked offline for this render so the remaining '
+                    'roots still render; this is a BUG, not an outage',
+                    label, exc_info=True,
+                )
+                return {'offline': True}
+        return {'active': active, 'offline': offline, 'done_count': done_count}
+
+    # return_exceptions=False is correct here BECAUSE the broad `except
+    # Exception` above lives INSIDE _one: nothing can escape to the gather, so
+    # there is no exception for it to swallow, and a real escape (a bug in this
+    # assembly code, a CancelledError) must still propagate rather than be
+    # silently converted into a result object.
+    results = await asyncio.gather(*(_one(root) for root in admission_order))
+    # Keyed by ROOT, never by label. `_project_label` is the directory
+    # BASENAME, so two configured roots can share one (``/a/proj`` and
+    # ``/b/proj``) — and a label-keyed dict collapses them, which would extend
+    # the survivor's rows into `all_active` TWICE (duplicate `_task_uid`s, the
+    # React tab's map key) and drop the other root's rows entirely. Roots are
+    # deduped by `_all_project_roots`, so this pairing is total and 1:1;
+    # `strict=True` says so rather than trusting it.
+    by_root = dict(zip(admission_order, results, strict=True))
+
+    # CANONICAL ROOT order — neither completion order nor admission order.
+    # This is the only place the shared accumulators are written.
+    for root in roots:
+        result = by_root[root]
+        label = _project_label(root)
+        if result.get('degraded'):
             degraded_projects.append(label)
-            logger.warning(
-                'project %s: skipped — the %.1fs Tasks budget was already '
-                'spent before this project was reached; its rows and done '
-                'count are UNKNOWN for this render (not zero, and not offline)',
-                label, _TASKS_TOTAL_BUDGET,
-            )
             continue
-        try:
-            active, offline, done_count = await asyncio.wait_for(
-                _shape_one_project(
-                    client, config, root,
-                    max_done_per_project=max_done_per_project,
-                    max_cancelled_per_project=max_cancelled_per_project,
-                    now=effective_now,
-                    runtime=runtime_by_label.get(label),
-                ),
-                timeout=min(remaining, _TASKS_PER_PROJECT_BUDGET),
-            )
-        except TimeoutError:
-            degraded_projects.append(label)
-            logger.warning(
-                'project %s: exceeded its %.1fs share of the %.1fs Tasks '
-                'budget (%.1fs remained) — its rows and done count are '
-                'UNKNOWN for this render (not zero, and not offline)',
-                label, _TASKS_PER_PROJECT_BUDGET, _TASKS_TOTAL_BUDGET, remaining,
-            )
-            continue
-        except Exception:
-            # DEFENSE IN DEPTH, and deliberately broad. The fan-out normally
-            # converts a failed read into the offline marker, so nothing here
-            # is a demonstrated crash — but without this clause ANY unexpected
-            # exception (a decode error, a shaping bug, an httpx transport
-            # error that escaped the fan-out) unwinds the whole loop and 500s
-            # the handler, throwing away every healthy project already
-            # collected. That is the same "one bad root blanks the whole tab"
-            # failure TASKS_OFFLINE exists to close, relocated from the banner
-            # to the handler, and one root must not be able to cause it.
-            #
-            # OFFLINE, not degraded: the read demonstrably FAILED, which is
-            # what offline means. degraded is reserved for "the budget never
-            # let us find out" — the distinction the two branches above draw,
-            # and merging them here would undo it.
-            #
-            # exc_info is load-bearing: an exception absorbed into a routine
-            # offline marker with no traceback is a bug that renders as an
-            # outage forever. The log is what separates "fused-memory is down"
-            # from "our own shaping code raised".
+        if result.get('offline'):
             offline_projects.append(label)
-            logger.warning(
-                'project %s: unexpected error while shaping its rows — the '
-                'project is marked offline for this render so the remaining '
-                'roots still render; this is a BUG, not an outage',
-                label, exc_info=True,
-            )
             continue
-        if offline:
-            offline_projects.append(label)
-        elif done_count is not None:
+        done_count = result['done_count']
+        if done_count is not None:
             done_counts[label] = done_count
         else:
             # done_count is None => the compact status map read failed for an
@@ -1006,7 +1282,7 @@ async def collect_tasks_with_counts(
             # confident "0 done". Naming the root here is what lets the
             # banner and the header say UNKNOWN instead.
             count_unknown_projects.append(label)
-        all_active.extend(active)
+        all_active.extend(result['active'])
 
     if resolve_external:
         # Gather the deduped union of external dep ids for ACTIVE (non-done) rows only.

@@ -5,7 +5,43 @@
 # bare-MagicMock config gate (also runs in merge-queue verify; see hooks/project-checks)
 lint_command: "uv run --directory shared ruff check src/ tests/ && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests"
 test_command: "uv run --directory shared pytest tests/ --tb=short -q --timeout=300"
-type_check_command: "uv run --directory shared pyright src/ tests/"
+# --threads 8 (task 5408). THE CANONICAL RATIONALE for this flag across the
+# workspace — sampler/orchestrator.yaml carries the same flag and points here,
+# keeping only what is local to it.
+#
+# (i) WHY. pyright is this module's LONG POLE at the merge gate: ~65s pyright
+#     against ~45s pytest (sampler: ~11s against ~4s), so the type leg is where
+#     its wall-clock actually is and threading the test leg alone would leave
+#     most of it on the table. MEASURED on orchestrator: 2.0x, 240s -> 118s,
+#     with 0 errors on either arm — the verdict is unchanged by the flag.
+#     Validated on the pinned pyright 1.1.408 that the flag parses BEFORE the
+#     positional targets: `uv run --directory sampler pyright --threads 8 src/
+#     tests/` -> rc=0, "0 errors, 0 warnings, 0 informations".
+#
+# (ii) NOTHING MAY ADD --stats (or --outputjson-style siblings) to this command.
+#     `--threads` is MUTUALLY EXCLUSIVE with `--stats`: measured, `pyright
+#     --threads 8 --stats <file>` exits 4 saying "'threads' option cannot be
+#     used with 'stats' option" — it checks nothing at all. That is not left as
+#     a comment: tests/scripts/test_merge_gate_parallelism_config.py RUNS
+#     pyright with the flag and carries that rc=4 case as the negative control
+#     proving the probe is not vacuous.
+#
+# (iii) THIS EDIT IS WHAT REACHES THE MERGE GATE'S LEG-2 UNSCOPED TYPE CHECK.
+#     merge_queue.py::_run_unscoped_typechecks re-runs each module's OWN
+#     type_check_command verbatim (dataclasses.replace(mc, test_command=None,
+#     lint_command=None) at role='merge'), so there is no separate leg-2 command
+#     to edit — this one is it.
+#
+# DO NOT mirror this into dark-factory-orchestrator.yaml::type_check_command.
+# That seven-clause `cd <member> && npx pyright` chain is the fleet FALLBACK,
+# used only when no module config is discovered at all, and two guards forbid
+# touching it: tests/scripts/test_pyright_version_pin.py::
+# test_the_fleet_chain_stays_bare_npx_pyright pins every clause to exactly
+# ["npx","pyright"] (the root package.json pin is the only thing between that
+# gate and a floating pyright version), and tests/scripts/
+# test_module_type_check_invocation.py carries a ROOT-CONFIG CARVE-OUT paragraph
+# naming this exact widening as the mistake to avoid.
+type_check_command: "uv run --directory shared pyright --threads 8 src/ tests/"
 
 # Per-module verify budget (task 3473). Before this, shared declared nothing
 # here and fell HARD through to the repo-root whole-fleet ceiling — see the
@@ -84,7 +120,11 @@ type_check_command: "uv run --directory shared pyright src/ tests/"
 # verify.run_full_verification asyncio.gathers over module_configs.values(),
 # which is NINE registered configs today — the six this task closed plus
 # scripts, tests/scripts, and the dominant `orchestrator` segment measured at
-# 1366.23s in task 3062.
+# 1366.23s in task 3062 (a pre-cap, 2026-07-31 figure — task 4902 superseded
+# it with a heavier post-cap measurement; the current canonical figure is
+# tests/scripts/test_fallback_verify_config.py::MEASURED_FLEET_SEGMENT_SECS,
+# key 'orchestrator', not repeated here. A heavier segment only strengthens
+# the "materially heavier" argument below, never weakens it).
 #
 # Two mechanisms bound the residual gap to a true production run. NEITHER is
 # credited in the sizing — they are stated so a reader can see the gap is

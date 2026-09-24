@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import json
 import logging
+import time
 import uuid as uuid_mod
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -13,6 +16,12 @@ import aiosqlite
 from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daemon
 
 logger = logging.getLogger(__name__)
+
+#: The clock ``prune_write_ops`` measures its wall-clock deadline against, named
+#: at module scope so a test can substitute one without reaching into the stdlib
+#: ``time`` module globally. Monotonic, so a clock adjustment mid-sweep cannot
+#: turn a 30 s budget into an unbounded one.
+_monotonic = time.monotonic
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS write_ops (
@@ -72,11 +81,11 @@ CREATE TABLE IF NOT EXISTS write_ops (
     --               the write. That case is separable: the queue prefixes
     --               terminal_error with POST_EXECUTE_DEAD_PREFIX
     --               ('post-execute failure (the backend write LANDED; ...)')
-    --               when the failure happened after the backend call
-    --               succeeded. Absent that prefix, terminal_error is the
-    --               queue's own f'{type(exc).__name__}: {exc}' from a failed
-    --               execute. When in doubt, check backend_ops (joined on
-    --               write_op_id) before replaying.
+    --               when a backend write for the item had landed. Before
+    --               replaying, read the queue row's structured `executed`
+    --               rather than matching that prefix; its domain and the
+    --               replay rule are in
+    --               services/durable_queue.py::DurableWriteQueue.get_dead_items.
     --
     -- LAST-WRITE-WINS: replay_dead resets a dead item to pending, so a
     -- dead-letter that is later replayed and lands correctly re-stamps
@@ -220,6 +229,46 @@ CREATE TABLE IF NOT EXISTS idempotent_ops (
     result TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+-- referent_findings: the durable half of leaf zeta's diagnosis (task 4984).
+-- `_verify_episode_referents` returns its findings in-process and they are then
+-- gone, so an episode whose edges were fully diagnosed with no path to repair
+-- left nothing a later pass could act on.
+--
+-- A DIAGNOSIS LOG, NOT A WORK QUEUE. There is deliberately no status/claimed
+-- column: a row records what was TRUE of the graph at one moment, not an
+-- instruction, so the phase-5 replay pass must re-verify a row against the live
+-- graph before acting on it. That is the fail-closed direction, and the same one
+-- `ReferentFinding.resolvable` takes by defaulting to False. A status column now
+-- would pre-empt phase 5's own read-path choice with speculative generality.
+--
+-- HOW A READER DRAINS IT, given no status column: WriteJournal.get_referent_findings
+-- returns the OLDEST page and takes an `after_seq` cursor over the sqlite rowid,
+-- which is the only total insertion order here — one episode's findings are
+-- written in ONE batched commit and deliberately share a single `created_at`.
+-- RETENTION is NOT yet wired: the startup sweep that runs prune_mem0_intents /
+-- prune_idempotent_ops / prune_write_ops lives in server/main.py, outside task
+-- 4984's locks, so growth is watched rather than bounded for now (the write path
+-- is the ~0.2%-of-edges finding path, so the rate is low, not zero).
+--
+-- No ALTER migration: initialize() runs executescript(SCHEMA_SQL) unconditionally
+-- and this DDL is IF NOT EXISTS, so a fresh AND an existing database both pick
+-- the table up on the next start (same reasoning as the idx_wo_created block
+-- above). _migrate() is for ALTER TABLE column additions.
+CREATE TABLE IF NOT EXISTS referent_findings (
+    id TEXT PRIMARY KEY,
+    group_id TEXT,
+    episode_uuid TEXT,
+    payload TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+-- ONE index, serving the ONLY planned read's filter (`WHERE group_id = ?`); the
+-- rowid ordering that read applies on top of it is free, since an index entry
+-- already carries the rowid. The idx_wo_created note above measures what a new
+-- index costs on a populated table — 47 s of startup DDL against a ~120 s
+-- watchdog grace; this table starts EMPTY so that build is free today, and must
+-- not be multiplied later without taking that measurement again.
+CREATE INDEX IF NOT EXISTS idx_rf_group_time ON referent_findings(group_id, created_at);
 """
 
 
@@ -229,6 +278,7 @@ class WriteJournal:
     def __init__(self, data_dir: Path | str):
         self.data_dir = Path(data_dir)
         self._db: aiosqlite.Connection | None = None
+        self._dropped: collections.Counter[str] = collections.Counter()
 
     async def initialize(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -398,6 +448,7 @@ class WriteJournal:
                     ),
                 )
         except Exception as e:
+            self._dropped[operation] += 1
             logger.warning(f'Failed to log write_op: {e}')
 
     async def log_backend_op(
@@ -434,7 +485,155 @@ class WriteJournal:
                     ),
                 )
         except Exception as e:
+            self._dropped[operation] += 1
             logger.warning(f'Failed to log backend_op: {e}')
+
+    async def log_referent_finding(
+        self, *, payload: dict, group_id: str, episode_uuid: str
+    ) -> None:
+        """Persist ONE referent finding. Fire-and-forget — never raises.
+
+        The singular convenience over :meth:`log_referent_findings`, which owns
+        the only INSERT. One commit either way, so a caller already holding an
+        episode's findings should hand them over together rather than call this
+        in a loop — see that method's BATCHED note for what the loop costs.
+        """
+        await self.log_referent_findings(
+            [payload], group_id=group_id, episode_uuid=episode_uuid,
+        )
+
+    async def log_referent_findings(
+        self, payloads: Sequence[dict], *, group_id: str, episode_uuid: str
+    ) -> None:
+        """Persist ONE EPISODE's referent findings, in ONE commit. Never raises.
+
+        Modelled on :meth:`log_backend_op` and counting its losses on the SAME
+        ``_dropped`` counter (INV-5) rather than growing a second, divergent
+        one. The contract matters to the caller: it runs inside the per-group
+        identity lock AFTER the episode write has already committed, so a
+        journal fault must cost a diagnosis and never the write — and because
+        the guard is here, no call site needs a try/except of its own.
+
+        BATCHED, not per finding, because every commit here is a
+        ``synchronous=FULL`` fsync (~1-5 ms, and up to the 5000 ms
+        ``busy_timeout`` under contention) taken while that identity lock
+        serializes same-group writes. An episode's finding count has NO
+        ceiling — the verify pass's warn cap is documented as capping the log
+        and nothing else — so a storm episode of 50-100 misattached ends would
+        hold the lock for 50-500 ms of fsyncs one row at a time. One
+        transaction makes that cost per EPISODE instead of per finding.
+
+        A dropped batch counts EVERY row it lost, because
+        :meth:`journal_drop_stats` reports rows LOST rather than calls failed.
+        """
+        if not payloads:
+            return
+        try:
+            # ONE timestamp for the batch: these rows are one episode's
+            # diagnosis, taken under one lock at one moment, and stamping them
+            # microseconds apart would invent a precision the observation does
+            # not have. `get_referent_findings` orders on the rowid precisely
+            # so a shared `created_at` cannot scramble their order.
+            created_at = datetime.now(UTC).isoformat()
+            async with self._txn() as db:
+                await db.executemany(
+                    """INSERT INTO referent_findings
+                       (id, group_id, episode_uuid, payload, created_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    [
+                        (
+                            str(uuid_mod.uuid4()),
+                            group_id,
+                            episode_uuid,
+                            json.dumps(payload),
+                            created_at,
+                        )
+                        for payload in payloads
+                    ],
+                )
+        except Exception as e:
+            self._dropped['referent_finding'] += len(payloads)
+            logger.warning(
+                f'Failed to log {len(payloads)} referent_finding row(s): {e}'
+            )
+
+    async def get_referent_findings(
+        self,
+        *,
+        group_id: str | None = None,
+        after_seq: int | None = None,
+        limit: int = 1000,
+    ) -> list[dict]:
+        """The OLDEST *limit* findings, in insertion order, ``payload`` decoded.
+
+        OLDEST-FIRST AND TRUNCATED AT *limit* — say it plainly, because the
+        table has no prune path and no status column to mark a row handled (it
+        is a diagnosis log, not a work queue). A consumer of a table longer
+        than one page that does not carry *after_seq* forward therefore re-reads
+        the same oldest page forever and never reaches a newer diagnosis. Pass
+        the ``seq`` of the last row handled to get the next page.
+
+        ``seq`` is the row's sqlite ``rowid``: assigned at INSERT, so it is the
+        ONE key that totally orders these rows the way they were written —
+        including inside a batched commit, where every row deliberately shares
+        one ``created_at``. It is also gap-tolerant as a cursor: a future
+        retention sweep deleting the oldest rows cannot renumber the newer ones
+        under a reader mid-page.
+
+        Unlike :meth:`log_referent_findings` this one MAY raise: it is an
+        operator/replay read, not a hot write path, and an unreadable journal is
+        an answer the caller has to see rather than an empty list to act on.
+        """
+        db = self._require_db()
+        clauses: list[str] = []
+        params: list = []
+        if group_id is not None:
+            clauses.append('group_id = ?')
+            params.append(group_id)
+        if after_seq is not None:
+            clauses.append('rowid > ?')
+            params.append(after_seq)
+        where = f'WHERE {" AND ".join(clauses)} ' if clauses else ''
+        params.append(limit)
+        async with db.execute(
+            f'SELECT rowid AS seq, * FROM referent_findings {where}'
+            'ORDER BY rowid LIMIT ?',
+            params,
+        ) as cursor:
+            return [
+                {**dict(row), 'payload': json.loads(row['payload'])}
+                for row in await cursor.fetchall()
+            ]
+
+    def journal_drop_stats(self) -> dict:
+        """Return ``{'dropped_total': int, 'by_operation': dict}`` — rows LOST.
+
+        Both ``log_write_op`` and ``log_backend_op`` are fire-and-forget by
+        design, which means a burst of lost rows is otherwise indistinguishable
+        from a quiet period. That fail-soft became LOAD-BEARING the moment leaf
+        eta (task 3213) began computing a metric from these rows: a dropped
+        search row is a search the metric silently scores as "never asked",
+        which is a wrong answer rather than a missing one.
+
+        Process-local and reset by a restart, like every other in-process
+        counter here — this exists to make a live burst VISIBLE, not to keep
+        durable statistics. The returned dicts are copies, so a reader cannot
+        mutate the journal's internal state.
+        """
+        return {
+            'dropped_total': sum(self._dropped.values()),
+            'by_operation': dict(self._dropped),
+        }
+
+    def record_journal_drop(self, operation: str) -> None:
+        """Count a row lost by an OUT-OF-PACKAGE fallback on the same counter.
+
+        ``server/tools.py::_log_read`` has its own outer ``except``; it fires
+        rarely, because the two log methods above swallow their failures first,
+        but when it does the row is just as lost. It feeds this counter rather
+        than growing a second, divergent one (INV-5).
+        """
+        self._dropped[operation] += 1
 
     async def get_ops_by_causation(self, causation_id: str) -> list[dict]:
         """Return all write_ops and backend_ops for a causation_id."""
@@ -817,6 +1016,185 @@ class WriteJournal:
             return deleted
         except Exception as e:
             logger.error(f'Failed to prune mem0_intents: {e}')
+            return 0
+
+    async def prune_write_ops(
+        self,
+        *,
+        read_older_than_days: float,
+        search_older_than_days: float,
+        write_older_than_days: float,
+        batch_size: int,
+        max_rows: int,
+        max_seconds: float,
+    ) -> int:
+        """Age out ``write_ops`` past three independent retention horizons.
+
+        Same fire-and-forget contract as ``prune_mem0_intents`` — logs loudly,
+        never raises, returns the count deleted, returns 0 when uninitialised.
+        Intended to run once at startup.
+
+        EVERY BOUND IS REQUIRED, with no default here. The six numbers have a
+        single home — ``config/schema.py::WriteJournalConfig`` — and the sole
+        production caller (``server/main.py``) already passes all six from it.
+        A second copy as signature defaults would be a copy nothing reads, kept
+        equal to the first only by a drift-guard test; requiring the arguments
+        deletes the copy instead of policing it.
+
+        THREE HORIZONS, because the rows are not interchangeable. Measured
+        2026-09-11 over a never-pruned 157-day span: non-search READS are
+        34,669,782 rows (97.9% of the table — ``get_task``, ``get_tasks``,
+        ``get_statuses``, ``get_external_statuses``, ~220,800/day) and have no
+        downstream consumer, so 30 days is generous incident-forensics headroom.
+        SEARCH reads are the opposite in both directions: only 481,447 rows
+        (1.36%, ~3,066/day), and they are the SOLE data source for leaf eta's
+        write-after-miss metric (task 3213) plus leaf theta's retro corpus
+        (task 3214), which evaluate against trailing baseline windows — so a
+        short horizon would silently starve the metric, and a long one is nearly
+        free (365 days is ~1.1M rows). WRITES are the durable audit trail joined
+        by ``causation_id`` in ``reconciliation/stats_verifier.py`` and are 0.73%
+        of volume, so 730 days costs essentially nothing.
+
+        BATCHED AND DOUBLY BOUNDED, unlike this file's two sibling prunes, whose
+        tables are small enough for a single unbounded DELETE. This one runs
+        against a table measured at 35,428,715 rows / 16 GB, and the
+        ``idx_wo_created`` note in ``SCHEMA_SQL`` above measures 47 s merely to
+        build one index on a copy of it, against ``STARTUP_GRACE_SECS = 120`` in
+        ``scripts/orchestrator-watchdog.py``. That same note states the failure
+        mode: a long write-lock on a serving instance SILENTLY DROPS journal rows,
+        because ``busy_timeout`` is 5000 ms and ``log_write_op`` swallows its own
+        errors. A multi-minute startup DELETE would therefore corrupt the very
+        telemetry it is pruning. Each batch commits in its own transaction so the
+        lock is released between batches (chunked-delete precedent:
+        ``services/durable_queue.py::delete_dead``), and the sweep stops on
+        whichever bound comes first. ``max_rows`` is only a PROXY for the risk;
+        ``max_seconds`` bounds it directly, because rows-per-second is not
+        knowable in advance — it depends on page-cache warmth and on six index
+        b-trees per delete. The deadline is checked BETWEEN batches, never
+        mid-batch.
+
+        WHAT "DRAINS OVER SUCCESSIVE RESTARTS" REQUIRES, stated so the claim is
+        checkable rather than hopeful. Non-search reads accrue at ~220,800/day,
+        so a sweep only makes net progress if it removes more than
+        220,800/(redeploys per day) rows — at an ASSUMED 1-3 fleet redeploys per
+        day that is ~74,000-220,800 rows per run, i.e. ~2,500-7,400 rows/sec
+        against the stock 30 s deadline. The accrual rate is measured; the
+        redeploy cadence is an estimate, not a pinned figure (see OPERATIONS.md
+        §"Fleet redeploy & watchdog"), so treat the required rate as an order of
+        magnitude and the LOGGED rate below as the real answer. Below that the backlog never clears
+        while the WARNING fires forever and reads as normal, so the achieved
+        rate is MEASURED and logged (rows and rows/sec) on every partial sweep
+        rather than assumed. If the first production run comes in under it, the
+        two ways out are raising ``prune_max_seconds`` (a config leaf, restart
+        to apply) for the drain phase, or a one-off operator-run bulk delete
+        against a stopped server, where no startup grace applies. A first run
+        against the current backlog legitimately needs many restarts either way,
+        which the WARNING discloses rather than hides.
+
+        ``terminal_status='dead'`` rows are NOT exempted, unlike the dead-letters
+        ``prune_mem0_intents`` deliberately preserves: a dead ``write_ops`` row
+        carries no replay payload, only a record that an outcome was terminal, so
+        age is the only thing that should decide its fate.
+
+        THIS BOUNDS GROWTH; IT DOES NOT RECLAIM DISK. Measured on the live
+        journal: ``PRAGMA auto_vacuum`` is 0 (NONE) and ``freelist_count`` is 0.
+        With auto-vacuum off a DELETE returns pages to SQLite's freelist for
+        REUSE by later inserts; it does not return them to the filesystem, so
+        ``ls -lh`` still reports ~16 GB after a fully successful prune — and the
+        freed pages are exactly what absorbs the new per-result search detail in
+        place. Reclaiming the space needs an offline ``VACUUM``, a full-file
+        rewrite requiring another ~16 GB of scratch, which is categorically not
+        a startup operation.
+        """
+        horizons = (
+            # Cheapest first, and each written against an index that already
+            # exists — no new DDL, because building one on this table would
+            # reintroduce the startup stall the batching exists to avoid.
+            #
+            # The two kind-scoped horizons range-seek idx_wo_kind_time
+            # (kind, created_at), so the cutoff bounds the scan. The search
+            # horizon does NOT: idx_wo_operation is on (operation) alone, so it
+            # seeks the operation='search' partition and applies created_at as
+            # a residual filter — a scan of that whole partition (~481k rows
+            # measured) on every startup, even once the horizon is drained.
+            # Correct, and cheap relative to the read horizon, but it is a
+            # partition scan and not a seek. Only widen the index to
+            # (operation, created_at) if that scan ever shows up in startup
+            # timings: the DDL cost above is the reason it is not there today.
+            ('read', "kind = 'read' AND operation <> 'search' AND created_at < ?",
+             read_older_than_days),       # idx_wo_kind_time — seek
+            ('search', "operation = 'search' AND created_at < ?",
+             search_older_than_days),     # idx_wo_operation — partition scan
+            ('write', "kind = 'write' AND created_at < ?",
+             write_older_than_days),      # idx_wo_kind_time — seek
+        )
+        try:
+            deadline = _monotonic() + max_seconds
+            total = 0
+            by_horizon: dict[str, int] = {}
+            halted = ''
+            backlog: list[str] = []
+
+            for label, predicate, older_than_days in horizons:
+                if halted:
+                    # Never attempted under this run's bounds — unknown, so
+                    # reported as a backlog rather than assumed drained.
+                    backlog.append(label)
+                    continue
+                cutoff = (datetime.now(UTC) - timedelta(days=older_than_days)).isoformat()
+                while True:
+                    limit = min(batch_size, max_rows - total)
+                    if limit <= 0:
+                        halted = 'row budget'
+                        backlog.append(label)
+                        break
+                    async with self._txn() as db:
+                        cursor = await db.execute(
+                            f'DELETE FROM write_ops WHERE id IN '
+                            f'(SELECT id FROM write_ops WHERE {predicate} LIMIT ?)',
+                            (cutoff, limit),
+                        )
+                        removed = max(cursor.rowcount, 0)
+                    total += removed
+                    by_horizon[label] = by_horizon.get(label, 0) + removed
+                    if removed < limit:
+                        break  # a short batch means this horizon is drained
+                    if total >= max_rows:
+                        halted = 'row budget'
+                        backlog.append(label)
+                        break
+                    if _monotonic() >= deadline:
+                        halted = 'deadline'
+                        backlog.append(label)
+                        break
+
+            if total:
+                logger.info(
+                    'Pruned %d write_ops rows (read>%sd: %d, search>%sd: %d, '
+                    'write>%sd: %d); frees pages for reuse, does not shrink the file',
+                    total,
+                    read_older_than_days, by_horizon.get('read', 0),
+                    search_older_than_days, by_horizon.get('search', 0),
+                    write_older_than_days, by_horizon.get('write', 0),
+                )
+            if halted:
+                # The achieved rate is the ONLY thing that says whether "drains
+                # over successive restarts" is true on this disk: reads accrue
+                # at ~220,800/day, so a sweep sustaining less than
+                # ~2,500-7,400 rows/sec (at 1-3 redeploys/day) never catches up
+                # and this WARNING would otherwise repeat forever looking normal.
+                elapsed = max(_monotonic() - (deadline - max_seconds), 1e-9)
+                logger.warning(
+                    'write_ops prune stopped early on the %s after %d rows in %.1fs '
+                    '(%.0f rows/sec; ~2500-7400 rows/sec is needed to beat the '
+                    '~220,800 reads/day accrual at 1-3 redeploys/day); horizons '
+                    'still holding a backlog: %s. The table drains over successive '
+                    'restarts only while that rate holds.',
+                    halted, total, elapsed, total / elapsed, ', '.join(backlog),
+                )
+            return total
+        except Exception as e:
+            logger.error(f'Failed to prune write_ops: {e}')
             return 0
 
     async def get_usage_stats(

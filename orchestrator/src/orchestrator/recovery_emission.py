@@ -40,8 +40,10 @@ DESCRIBE what it already decided.  Three specific guards make that concrete:
    selection ONLY — never for the veto answer.  ``PinReport.pins`` deliberately
    treats an info-severity record and a dead-L0 as non-pinning, so swapping it
    in at the reconcile sweep or the scheduler phase would change which tasks
-   get reverted or redispatched.  That rewiring is task eta (3541), behind the
-   operator flip; ``pins.py``'s own docstring already assigns it there.
+   get reverted or redispatched.  Task 3541 performed that rewiring AT THE
+   CALL SITES, through ``orchestrator.recovery_pins``; this module still does
+   not decide a veto, and must not start — it DESCRIBES a disposition its
+   caller already reached.
 2. ``TruthReport.escalation_store_unavailable`` is recorded and EMITTED but is
    deliberately not folded into ``task_ground_truth._shape``'s table key.
    Folding it would flip a store-outage strand from REVERT_TO_PENDING to LEAVE.
@@ -131,10 +133,13 @@ class RecoverySite(enum.StrEnum):
     plain string holds without an explicit ``.value`` and a member JSON-encodes
     as its spelling.
 
-    ``deterministic_recon_sweep`` and ``deterministic_recon_deploy`` are the
-    duplicated deterministic-recon predicate.  They are DELIBERATELY two labels
-    rather than one: collapsing the pair is task eta's job (3541), and a shared
-    label would hide exactly the duplication eta needs to measure.
+    ``deterministic_recon_sweep`` and ``deterministic_recon_deploy`` were the
+    two halves of the duplicated deterministic-recon predicate.  Task 3541
+    collapsed the pair, so only ``deterministic_recon_deploy`` can still
+    CHARGE.  ``deterministic_recon_sweep`` is RETAINED, not vestigial: a
+    pre-collapse orchestrator charged it, and such streak entries survive in
+    the registry across the deploy that lands the collapse — the sweep's
+    two-site release is what stands them down.
     """
 
     #: ``Harness._reconcile_one_stranded`` — the classify/apply seam, per sweep.
@@ -393,11 +398,15 @@ def pin_buckets(
     must never be collapsed into "no records", because a false ``[]`` reads as
     "nothing held this task" (the esc-3163 collapse).
 
-    Consulted for id bucketing and reason selection ONLY.  Every call site
-    keeps its own veto predicate (``bool(rows)`` /
-    ``bool(report.open_escalations)``) byte-identical — rewiring those to
-    ``PinReport.pins`` is task eta (3541), and doing it here would change
-    dispositions.
+    Consulted for id bucketing and reason selection ONLY — never for a veto
+    answer.  Since task 3541 every call site consumes ``PinReport`` through
+    ``orchestrator.recovery_pins`` and has ALREADY decided by the time it
+    reaches this function; deciding here too would put the answer in two
+    places, which is the drift INV-5 exists to prevent.
+
+    ``live_claimant=False`` below is EXACT at all three sweep sites (each has
+    established no incarnation holds the task) and free at the dispatch gate,
+    whose ``vetoes_done_flip`` answer is liveness-independent.
     """
     from escalation.pins import classify_pins  # noqa: PLC0415
 

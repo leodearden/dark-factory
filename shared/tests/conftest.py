@@ -90,3 +90,33 @@ def reload_module_under_env(monkeypatch):
         monkeypatch.undo()
         for module in reloaded:
             importlib.reload(module)
+
+
+@pytest.fixture(scope='session')
+def first_party_tree():
+    """The whole first-party source tree, read and parsed ONCE per session.
+
+    The single source every gate module in this directory walks (task 4520).
+    Before it, ``test_silent_fallthrough_gate.tree_scan_data`` and
+    ``test_config_dir_archival_gate._scan`` each did the read+parse privately,
+    so the same 461 files were read twice and parsed three times — and since
+    pytest-timeout arms its timer over the WHOLE runtest protocol
+    (``func_only=False``), that duplicated work was charged to whichever single
+    test item happened to trigger the fixture, producing ERROR-at-setup bursts
+    under load.
+
+    Session-scoped so the cost is paid at most once. The provider is itself
+    memoized on the resolved root, so a direct
+    ``parse_first_party_tree(REPO_ROOT)`` call returns the same object.
+
+    That cost has two halves, and this fixture is what makes the second one
+    process-lifetime: ~5s of CPU paid once, and ~361 MB of ASTs retained until
+    the process exits (they were transient before task 4520).
+    ``parse_first_party_tree``'s docstring records both measurements and why
+    the trade is currently made in CPU's favour — read it before tuning either.
+
+    Consumers walk the ASTs READ-ONLY — they are shared with every other gate.
+    """
+    from silent_fallthrough_scan import parse_first_party_tree
+
+    return parse_first_party_tree(REPO_ROOT)

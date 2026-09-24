@@ -15,6 +15,12 @@ Steps covered:
   step-8  GREEN — route finalize-head handler through the chokepoint
   step-9  RED  — CASCADE path fault injection + release idempotency
   step-10 GREEN — route cascade handler through the chokepoint
+
+These real-git cases observe the lane through an injected ``VerifyPort``
+rather than a patch of ``run_scoped_verification``.  What that does and
+does NOT stub of the post-merge gate chain is stated once, with the
+measurement behind it, in ``_merge_lane_verifier_doubles.py``'s module
+docstring.
 """
 
 from __future__ import annotations
@@ -23,9 +29,10 @@ import asyncio
 import contextlib
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _merge_lane_verifier_doubles import ScriptedVerifier
 from _orch_helpers import MERGE_RESULT_TIMEOUT
 
 # Reuse the γ harness two-host fakes (established cross-test-module import
@@ -185,12 +192,12 @@ class TestResolveAndReleaseContract:
             git_ops, config, 'task/rr-a', 'rr_a.py', 'a = 1\n', speculative=True,
         )
         worker._register_owned_merge_worktree(item.merge_wt)
-        assert item.merge_wt in worker._owned_merge_worktrees
+        assert str(item.merge_wt.resolve()) in worker.snapshot()['owned_merge_worktrees']
         assert item.merge_wt is not None and item.merge_wt.exists()
         permit = await worker._speculation_ledger.acquire()
         item.permit = permit
 
-        depth0 = worker._speculation_slot._value
+        depth0 = worker.snapshot()['speculation']['slot_available']
         outcome = MergeOutcome('blocked', reason='x')
 
         await worker._resolve_and_release(item, outcome, chain_failed=True)
@@ -198,10 +205,12 @@ class TestResolveAndReleaseContract:
         assert req.result.done()
         assert req.result.result() is outcome
         assert not item.merge_wt.exists(), 'merge worktree must be removed from disk'
-        assert item.merge_wt not in worker._owned_merge_worktrees, (
+        assert str(item.merge_wt.resolve()) not in (
+            worker.snapshot()['owned_merge_worktrees']
+        ), (
             'merge worktree must be deregistered from the owned ledger'
         )
-        assert worker._speculation_slot._value == depth0 + 1, (
+        assert worker.snapshot()['speculation']['slot_available'] == depth0 + 1, (
             'speculation permit must be released exactly once for a speculative item'
         )
         assert permit.released is True
@@ -227,14 +236,14 @@ class TestResolveAndReleaseContract:
         permit = await worker._speculation_ledger.acquire()
         entry.permit = permit
         worker._speculation_ledger.release(permit)  # simulate already-released
-        depth0 = worker._speculation_slot._value
+        depth0 = worker.snapshot()['speculation']['slot_available']
         outcome = MergeOutcome('blocked', reason='y')
 
         await worker._resolve_and_release(entry, outcome, chain_failed=True)
 
         assert req.result.done()
         assert req.result.result() is outcome
-        assert worker._speculation_slot._value == depth0, (
+        assert worker.snapshot()['speculation']['slot_available'] == depth0, (
             'slot must not be double-released for an already-released permit'
         )
         assert permit.released is True
@@ -414,7 +423,7 @@ class TestDispatchErrorChokepoint:
 
         worker._dispatch_item = _raising_dispatch  # type: ignore[method-assign]
 
-        depth0 = worker._speculation_slot._value
+        depth0 = worker.snapshot()['speculation']['slot_available']
 
         await driver(worker, item)
 
@@ -425,14 +434,16 @@ class TestDispatchErrorChokepoint:
         outcome = req.result.result()
         assert outcome.status == 'blocked'
         assert outcome.reason.startswith('Verifier error:'), outcome.reason
-        assert worker._speculation_slot._value == depth0 + 1, (
+        assert worker.snapshot()['speculation']['slot_available'] == depth0 + 1, (
             'speculation permit must be released exactly once'
         )
         assert permit.released is True
         assert item.merge_wt is not None and not item.merge_wt.exists(), (
             'merge worktree must be removed from disk'
         )
-        assert item.merge_wt not in worker._owned_merge_worktrees, (
+        assert str(item.merge_wt.resolve()) not in (
+            worker.snapshot()['owned_merge_worktrees']
+        ), (
             'merge worktree must be deregistered from the owned ledger'
         )
         assert worker._n_failed is True
@@ -493,7 +504,7 @@ class TestDispatchErrorChokepoint:
 
         # Simulate the waiter detaching before the dispatch error fires.
         assert req.result.cancel()
-        depth0 = worker._speculation_slot._value
+        depth0 = worker.snapshot()['speculation']['slot_available']
 
         await _drive_verifier_loop_fill(worker, item)
 
@@ -504,14 +515,14 @@ class TestDispatchErrorChokepoint:
             'abandoned Future must remain cancelled, not overwritten '
             '(no InvalidStateError from set_result on a cancelled Future)'
         )
-        assert worker._speculation_slot._value == depth0 + 1, (
+        assert worker.snapshot()['speculation']['slot_available'] == depth0 + 1, (
             'resource release must still proceed for an abandoned waiter (no leak)'
         )
         assert permit.released is True
         assert item.merge_wt is not None and not item.merge_wt.exists(), (
             'merge worktree must still be cleaned up for an abandoned waiter'
         )
-        assert item.merge_wt not in worker._owned_merge_worktrees
+        assert str(item.merge_wt.resolve()) not in worker.snapshot()['owned_merge_worktrees']
         assert worker._n_failed is True
 
 
@@ -583,7 +594,7 @@ class TestPassthroughFinalizeErrorChokepoint:
         worker._dispatch_item = _passthrough_dispatch  # type: ignore[method-assign]
         worker._finalize_inflight = _raising_finalize  # type: ignore[method-assign]
 
-        depth0 = worker._speculation_slot._value
+        depth0 = worker.snapshot()['speculation']['slot_available']
 
         await driver(worker, item)
 
@@ -598,7 +609,7 @@ class TestPassthroughFinalizeErrorChokepoint:
         assert entry.permit is None, (
             'this passthrough entry never carried a permit (fixture invariant)'
         )
-        assert worker._speculation_slot._value == depth0, (
+        assert worker.snapshot()['speculation']['slot_available'] == depth0, (
             'no release: the entry has no lease/merge_wt/permit to release '
             '(a real passthrough DecidedItem is never dispatched with these)'
         )
@@ -728,7 +739,7 @@ class TestFinalizeHeadErrorChokepoint:
         )
 
         calls = _spy_on_resolve_and_release(worker)
-        depth0 = worker._speculation_slot._value
+        depth0 = worker.snapshot()['speculation']['slot_available']
 
         await _drive_verifier_loop_fill(worker, item)
 
@@ -744,7 +755,7 @@ class TestFinalizeHeadErrorChokepoint:
         assert outcome.status == 'blocked'
         assert outcome.reason.startswith('Verifier error:'), outcome.reason
         assert worker._n_failed is True
-        assert worker._speculation_slot._value == depth0 + 1, (
+        assert worker.snapshot()['speculation']['slot_available'] == depth0 + 1, (
             'the permit must be released exactly once total, despite two '
             'release attempts (the simulated _finalize_inflight finally, '
             'then the chokepoint) — PermitLedger.release is idempotent'
@@ -754,7 +765,9 @@ class TestFinalizeHeadErrorChokepoint:
             'worktree was already cleaned by the (simulated real) '
             '_finalize_inflight finally; the chokepoint call must not error'
         )
-        assert item.merge_wt not in worker._owned_merge_worktrees, (
+        assert str(item.merge_wt.resolve()) not in (
+            worker.snapshot()['owned_merge_worktrees']
+        ), (
             'worktree ledger entry stays deregistered'
         )
         # Loop continues past the failed head: the only _inflight entry was
@@ -763,7 +776,7 @@ class TestFinalizeHeadErrorChokepoint:
         # no cascade fires → the loop reaches the queued None sentinel and
         # returns cleanly (no exception propagated out of _verifier_loop, or
         # _drive_verifier_loop_fill's asyncio.wait_for would have raised).
-        assert not worker._inflight
+        assert worker.snapshot()['occupancy']['inflight_total'] == 0
 
     async def test_finalize_head_cancelled_error_propagates_and_skips_chokepoint(
         self, git_ops: GitOps, config: OrchestratorConfig,
@@ -909,12 +922,14 @@ class TestCascadeErrorChokepoint:
         wt_b = await _make_branch_with_file(git_ops, 'task/rrcas-b', 'rrcas_b.py', 'b = 2\n')
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, q)
+        worker = SpeculativeMergeWorker(
+            git_ops, q, verifier=ScriptedVerifier(_gated_local),
+        )
         _inject_two_host_allocator(worker, gated_remote)
         calls = _spy_on_resolve_and_release(worker)
 
         # Capture initial slot depth so we can verify exact-once release later.
-        depth0 = worker._speculation_slot._value
+        depth0 = worker.snapshot()['speculation']['slot_available']
 
         event_loop = asyncio.get_running_loop()
         req_a = MergeRequest(
@@ -944,60 +959,60 @@ class TestCascadeErrorChokepoint:
         outcome_b: MergeOutcome | None = None
         outcome_c: MergeOutcome | None = None
 
-        with patch('orchestrator.merge_queue.run_scoped_verification', _gated_local):
-            worker_task = asyncio.create_task(worker.run())
+        worker_task = asyncio.create_task(worker.run())
 
-            await q.put(req_a)
-            await q.put(req_b)
+        await q.put(req_a)
+        await q.put(req_b)
 
-            # Wait for both verifies to enter (true concurrent overlap).
-            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
-            await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+        # Wait for both verifies to enter (true concurrent overlap).
+        await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+        await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
 
-            # N fails → head-failure cascade fires → _killer_remerge raises for N+1.
-            gate_a_release.set()
+        # N fails → head-failure cascade fires → _killer_remerge raises for N+1.
+        gate_a_release.set()
 
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
-            assert outcome_a.status not in ('done', 'already_merged'), (
-                f'Expected N to fail, got status={outcome_a.status!r}.'
-            )
+        outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
+        assert outcome_a.status not in ('done', 'already_merged'), (
+            f'Expected N to fail, got status={outcome_a.status!r}.'
+        )
 
-            # Unblock N+1's inner verify coroutine so it exits cleanly (the
-            # cascade already cancelled the outer verify_task).
-            gate_b_release.set()
+        # Unblock N+1's inner verify coroutine so it exits cleanly (the
+        # cascade already cancelled the outer verify_task).
+        gate_b_release.set()
 
-            with contextlib.suppress(TimeoutError):
-                outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
+        with contextlib.suppress(TimeoutError):
+            outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
 
-            # SLOT EXACT-ONCE (measured BEFORE stop(), which over-releases for
-            # safety): see the MEASUREMENT NOTE in TestCascadeErrorContainment
-            # (test_merge_queue_concurrent_verify.py) — the merger perpetually
-            # holds one speculative look-ahead permit, so a single correct
-            # release leaves _value at depth0 - 1; a double-release (naive
-            # unconditional re-release) would push it back up to depth0.
-            expected_slot = depth0 - 1
-            assert worker._speculation_slot._value == expected_slot, (
-                f'Expected speculation slot at depth0-1={expected_slot} '
-                f'(merger holds one look-ahead permit), '
-                f'got {worker._speculation_slot._value!r}.'
-            )
+        # SLOT EXACT-ONCE (measured BEFORE stop(), which over-releases for
+        # safety): see the MEASUREMENT NOTE in TestCascadeErrorContainment
+        # (test_merge_queue_concurrent_verify.py) — the merger perpetually
+        # holds one speculative look-ahead permit, so a single correct
+        # release leaves _value at depth0 - 1; a double-release (naive
+        # unconditional re-release) would push it back up to depth0.
+        expected_slot = depth0 - 1
+        slot_now = worker.snapshot()['speculation']['slot_available']
+        assert slot_now == expected_slot, (
+            f'Expected speculation slot at depth0-1={expected_slot} '
+            f'(merger holds one look-ahead permit), '
+            f'got {slot_now!r}.'
+        )
 
-            # Loop-survival signal: a third request should dispatch on the
-            # local host and resolve "done".
-            wt_c = await _make_branch_with_file(
-                git_ops, 'task/rrcas-c', 'rrcas_c.py', 'c = 3\n'
-            )
-            req_c = MergeRequest(
-                task_id='rrcas-c', branch=QueuedBranch.parse('task/rrcas-c', config.git.branch_prefix), worktree=wt_c,
-                pre_rebased=False, task_files=None, module_configs=[],
-                config=config, result=event_loop.create_future(), lane='normal',
-            )
-            await q.put(req_c)
+        # Loop-survival signal: a third request should dispatch on the
+        # local host and resolve "done".
+        wt_c = await _make_branch_with_file(
+            git_ops, 'task/rrcas-c', 'rrcas_c.py', 'c = 3\n'
+        )
+        req_c = MergeRequest(
+            task_id='rrcas-c', branch=QueuedBranch.parse('task/rrcas-c', config.git.branch_prefix), worktree=wt_c,
+            pre_rebased=False, task_files=None, module_configs=[],
+            config=config, result=event_loop.create_future(), lane='normal',
+        )
+        await q.put(req_c)
 
-            with contextlib.suppress(TimeoutError):
-                outcome_c = await asyncio.wait_for(req_c.result, timeout=MERGE_RESULT_TIMEOUT)
+        with contextlib.suppress(TimeoutError):
+            outcome_c = await asyncio.wait_for(req_c.result, timeout=MERGE_RESULT_TIMEOUT)
 
-            await worker.stop()
+        await worker.stop()
 
         with contextlib.suppress(Exception):
             await asyncio.wait_for(worker_task, timeout=5.0)
@@ -1040,7 +1055,9 @@ class TestCascadeErrorChokepoint:
             'downstream merge worktree must be cleaned (by the in-body release; '
             'the chokepoint must not need to touch it again)'
         )
-        assert entry_arg.merge_wt not in worker._owned_merge_worktrees
+        assert str(entry_arg.merge_wt.resolve()) not in (
+            worker.snapshot()['owned_merge_worktrees']
+        )
 
     async def test_cascade_remote_lease_double_cancel_does_not_park_healthy_slot(
         self,
@@ -1121,7 +1138,9 @@ class TestCascadeErrorChokepoint:
         wt_b = await _make_branch_with_file(git_ops, 'task/rrcdc-b', 'rrcdc_b.py', 'b = 2\n')
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, q)
+        worker = SpeculativeMergeWorker(
+            git_ops, q, verifier=ScriptedVerifier(_gated_local),
+        )
         _inject_two_host_allocator(worker, gated_remote)
         calls = _spy_on_resolve_and_release(worker)
 
@@ -1153,66 +1172,67 @@ class TestCascadeErrorChokepoint:
         outcome_b: MergeOutcome | None = None
         outcome_c: MergeOutcome | None = None
 
-        with patch('orchestrator.merge_queue.run_scoped_verification', _gated_local):
-            worker_task = asyncio.create_task(worker.run())
+        worker_task = asyncio.create_task(worker.run())
 
-            await q.put(req_a)
-            await q.put(req_b)
+        await q.put(req_a)
+        await q.put(req_b)
 
-            # Wait for both verifies to enter (true concurrent overlap).
-            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
-            await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+        # Wait for both verifies to enter (true concurrent overlap).
+        await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+        await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
 
-            # N fails → head-failure cascade fires → _killer_remerge raises for N+1.
-            gate_a_release.set()
+        # N fails → head-failure cascade fires → _killer_remerge raises for N+1.
+        gate_a_release.set()
 
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
-            assert outcome_a.status not in ('done', 'already_merged'), (
-                f'Expected N to fail, got status={outcome_a.status!r}.'
-            )
+        outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
+        assert outcome_a.status not in ('done', 'already_merged'), (
+            f'Expected N to fail, got status={outcome_a.status!r}.'
+        )
 
-            # Unblock N+1's inner verify coroutine so it exits cleanly (the
-            # cascade already cancelled the outer verify_task).
-            gate_b_release.set()
+        # Unblock N+1's inner verify coroutine so it exits cleanly (the
+        # cascade already cancelled the outer verify_task).
+        gate_b_release.set()
 
-            with contextlib.suppress(TimeoutError):
-                outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
+        with contextlib.suppress(TimeoutError):
+            outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
 
-            # ── LOAD-BEARING RED assertion (task 2160/η step-9) ───────────────
-            # Only the cascade's own _abort_remote_verify pre-cancel (call 1)
-            # and the in-body cancel_and_release (call 2) may fire. A
-            # regression that re-runs cancel_and_release on the
-            # already-in-body-released lease from the chokepoint issues a
-            # 3rd call.
-            assert gated_remote.cancel_verify.call_count == 2, (
-                f'Expected exactly 2 cancel_verify calls (abort pre-cancel + '
-                f'in-body release only); the chokepoint must not re-issue a '
-                f'3rd cancel on the already-in-body-released remote lease, '
-                f'got {gated_remote.cancel_verify.call_count}.'
-            )
-            assert worker._host_allocator is not None
-            assert worker._host_allocator.is_busy('laptop') is False, (
-                'Expected the laptop slot to remain FREE (not PARKED) at '
-                'post-cascade quiescence; a redundant 3rd cancel_verify '
-                '(rc != 0) would have parked a healthy slot.'
-            )
+        # ── LOAD-BEARING RED assertion (task 2160/η step-9) ───────────────
+        # Only the cascade's own _abort_remote_verify pre-cancel (call 1)
+        # and the in-body cancel_and_release (call 2) may fire. A
+        # regression that re-runs cancel_and_release on the
+        # already-in-body-released lease from the chokepoint issues a
+        # 3rd call.
+        assert gated_remote.cancel_verify.call_count == 2, (
+            f'Expected exactly 2 cancel_verify calls (abort pre-cancel + '
+            f'in-body release only); the chokepoint must not re-issue a '
+            f'3rd cancel on the already-in-body-released remote lease, '
+            f'got {gated_remote.cancel_verify.call_count}.'
+        )
+        laptop = next(
+            h for h in worker.snapshot()['hosts'] if h['name'] == 'laptop'
+        )
+        assert laptop['slot_state'] == 'free', (
+            'Expected the laptop slot to remain FREE (not PARKED) at '
+            'post-cascade quiescence; a redundant 3rd cancel_verify '
+            '(rc != 0) would have parked a healthy slot.'
+        )
 
-            # Loop-survival signal: a third request should dispatch on the
-            # local host and resolve "done".
-            wt_c = await _make_branch_with_file(
-                git_ops, 'task/rrcdc-c', 'rrcdc_c.py', 'c = 3\n'
-            )
-            req_c = MergeRequest(
-                task_id='rrcdc-c', branch=QueuedBranch.parse('task/rrcdc-c', config.git.branch_prefix), worktree=wt_c,
-                pre_rebased=False, task_files=None, module_configs=[],
-                config=config, result=event_loop.create_future(), lane='normal',
-            )
-            await q.put(req_c)
+        # Loop-survival signal: a third request should dispatch on the
+        # local host and resolve "done".
+        wt_c = await _make_branch_with_file(
+            git_ops, 'task/rrcdc-c', 'rrcdc_c.py', 'c = 3\n'
+        )
+        req_c = MergeRequest(
+            task_id='rrcdc-c', branch=QueuedBranch.parse('task/rrcdc-c', config.git.branch_prefix), worktree=wt_c,
+            pre_rebased=False, task_files=None, module_configs=[],
+            config=config, result=event_loop.create_future(), lane='normal',
+        )
+        await q.put(req_c)
 
-            with contextlib.suppress(TimeoutError):
-                outcome_c = await asyncio.wait_for(req_c.result, timeout=MERGE_RESULT_TIMEOUT)
+        with contextlib.suppress(TimeoutError):
+            outcome_c = await asyncio.wait_for(req_c.result, timeout=MERGE_RESULT_TIMEOUT)
 
-            await worker.stop()
+        await worker.stop()
 
         with contextlib.suppress(Exception):
             await asyncio.wait_for(worker_task, timeout=5.0)
@@ -1292,11 +1312,13 @@ class TestCascadeErrorChokepoint:
         wt_b = await _make_branch_with_file(git_ops, 'task/rrcr-b', 'rrcr_b.py', 'b = 2\n')
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, q)
+        worker = SpeculativeMergeWorker(
+            git_ops, q, verifier=ScriptedVerifier(_gated_local),
+        )
         allocator = _inject_two_host_allocator(worker, gated_remote)
         calls = _spy_on_resolve_and_release(worker)
 
-        depth0 = worker._speculation_slot._value
+        depth0 = worker.snapshot()['speculation']['slot_available']
 
         event_loop = asyncio.get_running_loop()
         req_a = MergeRequest(
@@ -1325,53 +1347,53 @@ class TestCascadeErrorChokepoint:
         outcome_b: MergeOutcome | None = None
         outcome_c: MergeOutcome | None = None
 
-        with patch('orchestrator.merge_queue.run_scoped_verification', _gated_local):
-            worker_task = asyncio.create_task(worker.run())
+        worker_task = asyncio.create_task(worker.run())
 
-            await q.put(req_a)
-            await q.put(req_b)
+        await q.put(req_a)
+        await q.put(req_b)
 
-            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
-            await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+        await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+        await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
 
-            # N fails → head-failure cascade fires → in-body cancel_and_release raises.
-            gate_a_release.set()
+        # N fails → head-failure cascade fires → in-body cancel_and_release raises.
+        gate_a_release.set()
 
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
-            assert outcome_a.status not in ('done', 'already_merged'), (
-                f'Expected N to fail, got status={outcome_a.status!r}.'
-            )
+        outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
+        assert outcome_a.status not in ('done', 'already_merged'), (
+            f'Expected N to fail, got status={outcome_a.status!r}.'
+        )
 
-            gate_b_release.set()
+        gate_b_release.set()
 
-            with contextlib.suppress(TimeoutError):
-                outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
+        with contextlib.suppress(TimeoutError):
+            outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
 
-            # Loop-survival signal — see the NOTE in the sibling γ-harness
-            # test: in this secondary-failure path set_result precedes the
-            # slot release, so the slot assertion is placed AFTER outcome_c
-            # resolves (below), not here.
-            wt_c = await _make_branch_with_file(
-                git_ops, 'task/rrcr-c', 'rrcr_c.py', 'c = 3\n'
-            )
-            req_c = MergeRequest(
-                task_id='rrcr-c', branch=QueuedBranch.parse('task/rrcr-c', config.git.branch_prefix), worktree=wt_c,
-                pre_rebased=False, task_files=None, module_configs=[],
-                config=config, result=event_loop.create_future(), lane='normal',
-            )
-            await q.put(req_c)
+        # Loop-survival signal — see the NOTE in the sibling γ-harness
+        # test: in this secondary-failure path set_result precedes the
+        # slot release, so the slot assertion is placed AFTER outcome_c
+        # resolves (below), not here.
+        wt_c = await _make_branch_with_file(
+            git_ops, 'task/rrcr-c', 'rrcr_c.py', 'c = 3\n'
+        )
+        req_c = MergeRequest(
+            task_id='rrcr-c', branch=QueuedBranch.parse('task/rrcr-c', config.git.branch_prefix), worktree=wt_c,
+            pre_rebased=False, task_files=None, module_configs=[],
+            config=config, result=event_loop.create_future(), lane='normal',
+        )
+        await q.put(req_c)
 
-            with contextlib.suppress(TimeoutError):
-                outcome_c = await asyncio.wait_for(req_c.result, timeout=MERGE_RESULT_TIMEOUT)
+        with contextlib.suppress(TimeoutError):
+            outcome_c = await asyncio.wait_for(req_c.result, timeout=MERGE_RESULT_TIMEOUT)
 
-            expected_slot = depth0 - 1  # one permit held by the merger look-ahead
-            assert worker._speculation_slot._value == expected_slot, (
-                f'Expected speculation slot at depth0-1={expected_slot} '
-                f'(merger holds one look-ahead permit), '
-                f'got {worker._speculation_slot._value!r}.'
-            )
+        expected_slot = depth0 - 1  # one permit held by the merger look-ahead
+        slot_now = worker.snapshot()['speculation']['slot_available']
+        assert slot_now == expected_slot, (
+            f'Expected speculation slot at depth0-1={expected_slot} '
+            f'(merger holds one look-ahead permit), '
+            f'got {slot_now!r}.'
+        )
 
-            await worker.stop()
+        await worker.stop()
 
         with contextlib.suppress(Exception):
             await asyncio.wait_for(worker_task, timeout=5.0)
@@ -1413,7 +1435,9 @@ class TestCascadeErrorChokepoint:
             'downstream merge worktree must be cleaned BY THE CHOKEPOINT '
             '(in-body cleanup never ran — the raise happened before it)'
         )
-        assert entry_arg.merge_wt not in worker._owned_merge_worktrees
+        assert str(entry_arg.merge_wt.resolve()) not in (
+            worker.snapshot()['owned_merge_worktrees']
+        )
 
     async def test_cascade_requeued_entry_skips_chokepoint(
         self,
@@ -1455,7 +1479,9 @@ class TestCascadeErrorChokepoint:
         wt_b = await _make_branch_with_file(git_ops, 'task/rrhalt-b', 'rrhalt_b.py', 'b = 2\n')
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, q)
+        worker = SpeculativeMergeWorker(
+            git_ops, q, verifier=ScriptedVerifier(_gated_local),
+        )
         _inject_two_host_allocator(worker, gated_remote)
         worker.VERIFY_ABANDON_POLL_SECS = 0.01  # fast abort-poll for determinism
         calls = _spy_on_resolve_and_release(worker)
@@ -1485,26 +1511,25 @@ class TestCascadeErrorChokepoint:
 
         worker._remerge = _spy_remerge  # type: ignore[method-assign]
 
-        with patch('orchestrator.merge_queue.run_scoped_verification', _gated_local):
-            worker_task = asyncio.create_task(worker.run())
+        worker_task = asyncio.create_task(worker.run())
 
-            await q.put(req_a)
-            await q.put(req_b)
+        await q.put(req_a)
+        await q.put(req_b)
 
-            await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
-            await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
+        await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
+        await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
 
-            # Set operator halt — both abort-polls fire within 0.01s.
-            worker._operator_halt.set()
+        # Set operator halt — both abort-polls fire within 0.01s.
+        worker.operator_halt('test: abort both in-flight verifies')
 
-            # Give abort-polls time to fire and requeue.
-            await asyncio.sleep(0.15)
+        # Give abort-polls time to fire and requeue.
+        await asyncio.sleep(0.15)
 
-            # Release gates so the leaked inner tasks can complete (harmlessly).
-            gate_a_release.set()
-            gate_b_release.set()
+        # Release gates so the leaked inner tasks can complete (harmlessly).
+        gate_a_release.set()
+        gate_b_release.set()
 
-            await worker.stop()
+        await worker.stop()
 
         with contextlib.suppress(Exception):
             await asyncio.wait_for(worker_task, timeout=5.0)
@@ -1573,11 +1598,7 @@ class TestResolveAndReleaseLedgerIdempotency:
 
         assert req.result.done()
         assert req.result.result() is outcome
-        assert (
-            worker._speculation_ledger.slot_available
-            + len(worker._speculation_ledger.live)
-            == worker._speculation_depth
-        ), (
+        assert worker.speculation_accounting_violations() == [], (
             'permit must be released exactly once across both '
             '_resolve_and_release calls (idempotent second call)'
         )

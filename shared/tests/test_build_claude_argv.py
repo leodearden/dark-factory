@@ -6,7 +6,11 @@ argv assembly, shared by the non-sandbox (_invoke_claude) and sandbox
 from __future__ import annotations
 
 import json
+import tempfile
 from pathlib import Path
+from unittest.mock import patch
+
+import pytest
 
 from shared.cli_invoke import (
     _REAL_BUILTIN_TOOLS_DENYLIST,
@@ -413,6 +417,65 @@ def test_no_mcp_servers_config_is_truthy_and_emits_strict_flag() -> None:
         _cleanup(temp_files)
 
 
+def test_build_claude_argv_resume_keeps_mcp_config_and_strict_flag() -> None:
+    """The MCP scoping survives --resume, the path real runs actually exercise.
+
+    Every AgentLoop turn >= 2 and every cap-retry reaches the CLI through
+    ``--resume``, so the four strict_mcp_config cases above — all of which pass
+    ``resume_session_id=None`` — cover only the first turn of any real run.
+    The resume half of the invariant was asserted only in prose, in the
+    docstrings of
+    ``fused-memory/src/fused_memory/reconciliation/agent_loop.py::AgentLoop._call_claude_cli``
+    and ``fused-memory/src/fused_memory/reconciliation/judge.py::Judge._call_judge_cli``,
+    and prose cannot fail a suite.
+
+    What that prose claims, and what this pins: the ``if mcp_config:`` block of
+    ``shared/src/shared/cli_invoke.py::build_claude_argv`` sits OUTSIDE its
+    ``if resume_session_id: / elif session_id:`` conditional.  A refactor moving
+    that block into the ``elif session_id:`` branch would silently drop both
+    --mcp-config and --strict-mcp-config from every turn >= 2 — reinstating the
+    ambient ``.mcp.json`` merge under ``bypassPermissions``, where the wildcard
+    deny is no protection because an ``output_schema`` expands it into a
+    BUILT-INS-ONLY list carrying no MCP pattern — while the whole existing
+    suite stayed green.
+    """
+    cmd, temp_files = build_claude_argv(
+        model='opus',
+        max_budget_usd=5.0,
+        system_prompt='sys prompt text',
+        max_turns=50,
+        permission_mode='bypassPermissions',
+        allowed_tools=None,
+        disallowed_tools=['*'],
+        mcp_config=no_mcp_servers_config(),
+        output_schema={'type': 'object'},
+        effort=None,
+        resume_session_id='resume-abc',
+        session_id='sess-ignored',
+        strict_mcp_config=True,
+    )
+    try:
+        # We really are on the resume path, not merely passing the kwarg.
+        assert '--resume' in cmd, f'got {cmd!r}'
+        assert cmd[cmd.index('--resume') + 1] == 'resume-abc', f'got {cmd!r}'
+        assert '--session-id' not in cmd, f'got {cmd!r}'
+
+        assert '--mcp-config' in cmd, f'got {cmd!r}'
+        assert len(temp_files) == 2, f'expected sysprompt + mcp temp files; got {temp_files!r}'
+        _sysprompt_path, mcp_path = temp_files
+        assert cmd[cmd.index('--mcp-config') + 1] == mcp_path, f'got {cmd!r}'
+        # The on-disk artifact, not just the flag: zero MCP servers.
+        with open(mcp_path) as f:
+            assert json.load(f) == {'mcpServers': {}}
+
+        # The flag rides immediately after the --mcp-config <path> pair, so the
+        # ordering contract is pinned on the resume path too.
+        assert '--strict-mcp-config' in cmd, f'got {cmd!r}'
+        assert cmd.index('--strict-mcp-config') == cmd.index('--mcp-config') + 2, f'got {cmd!r}'
+    finally:
+        _cleanup(temp_files)
+
+
 # ── ARG_MAX / no-positional-prompt guard (task 3147) ─────────────────────────
 
 # Flags this builder emits with NO value of their own.  The walk below needs
@@ -527,3 +590,65 @@ def test_argv_never_carries_the_user_prompt() -> None:
             i = j
     finally:
         _cleanup(temp_files)
+
+
+def test_build_claude_argv_unlinks_temp_files_when_build_raises() -> None:
+    """Pins the exception-path cleanup contract documented on
+    ``shared/src/shared/cli_invoke.py::build_claude_argv``: "On exception
+    (e.g. a non-serializable mcp_config), any temp files already created
+    during this call are unlinked before the exception propagates — callers
+    never need to clean up after a raised call."
+
+    Distinct from ``test_cli_invoke.py``'s ``test_temp_files_cleaned_up_on_error``,
+    which covers ``invoke_claude_agent``'s caller-side ``finally`` unlink after a
+    SUCCESSFUL build whose subprocess later fails. This test instead covers
+    ``build_claude_argv``'s OWN ``except`` block on a build that never returns —
+    the call raises, so the caller never gets a ``temp_files`` list to clean up
+    with; ``build_claude_argv`` must have already cleaned up everything itself.
+
+    A truthy-but-non-serializable ``mcp_config`` enters the ``if mcp_config:``
+    branch and fails inside ``json.dump`` — i.e. AFTER the sysprompt file is
+    already on disk, so both created files are on the line when the except
+    block runs. Asserting cleanup of EVERY recorded path (not just the
+    sysprompt one) matters: a mutation that moves the ``mcp_config_path``
+    ``temp_files.append`` to after the failing ``json.dump`` leaks only the
+    mcp file while the sysprompt file is still correctly unlinked, and a test
+    that checked only the sysprompt path would pass right through that
+    regression.
+    """
+    created: list[str] = []
+    original_mkstemp = tempfile.mkstemp
+
+    def tracking_mkstemp(*args, **kwargs):
+        fd, path = original_mkstemp(*args, **kwargs)
+        created.append(path)
+        return fd, path
+
+    with (
+        patch('shared.cli_invoke.tempfile.mkstemp', side_effect=tracking_mkstemp),
+        pytest.raises(TypeError, match='not JSON serializable'),
+    ):
+        build_claude_argv(
+            model='opus',
+            max_budget_usd=5.0,
+            system_prompt='sys prompt text',
+            max_turns=50,
+            permission_mode='bypassPermissions',
+            allowed_tools=None,
+            disallowed_tools=None,
+            mcp_config={'mcpServers': object()},
+            output_schema=None,
+            effort=None,
+            resume_session_id=None,
+            session_id=None,
+        )
+
+    # Anti-vacuity guard: prove the files were actually created before the
+    # failure, so a regression that stopped creating them in the first place
+    # couldn't make the cleanup assertion below pass trivially.
+    assert len(created) == 2, f'expected sysprompt + mcp temp files to be created; got {created!r}'
+    assert Path(created[0]).name.startswith('sysprompt_'), f'got {created!r}'
+    assert Path(created[1]).name.startswith('mcp_'), f'got {created!r}'
+
+    for path in created:
+        assert not Path(path).exists(), f'temp file leaked after build_claude_argv raised: {path}'

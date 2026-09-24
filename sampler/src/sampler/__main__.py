@@ -6,9 +6,17 @@ SQLite DB at data/load-samples.db (relative to the repo root WorkingDirectory).
 
 This module is intentionally thin — all business logic lives in sampler.sampler
 and sampler.store so it can be unit-tested.  The live integration signal
-(``systemctl --user is-active dark-factory-load-sampler.timer`` plus
-``sqlite3 data/load-samples.db 'SELECT COUNT(DISTINCT metric) FROM samples
-WHERE ts > strftime(...)' `` returning >= 7) validates this shell.
+(``systemctl --user is-active dark-factory-load-sampler.timer`` plus a
+``SELECT COUNT(DISTINCT metric) FROM samples WHERE ts > ...`` query against
+data/load-samples.db) validates this shell; ``scripts/install-load-sampler.sh``
+runs exactly that check after arming the timer.
+
+That count is NOT a fixed number and the check must not assume one. A healthy
+tick writes 6 PSI + 3 process + 2 runqueue rows, plus TWO rows per cgroup leaf
+discovered at collection time — 25 in total on this host today, where seven
+``orchestrator-*.service`` leaves are present, and a different number on a
+host with a different unit population. So the floor worth asserting is that
+rows arrived at all, not that a particular count did.
 """
 
 from __future__ import annotations
@@ -19,7 +27,11 @@ import sys
 import time
 from pathlib import Path
 
-from sampler.metrics import collect_process_metrics, collect_psi
+from sampler.metrics import (
+    collect_load_metrics,
+    collect_process_metrics,
+    collect_psi,
+)
 from sampler.sampler import run_tick
 from sampler.store import LoadSampleStore
 
@@ -56,7 +68,7 @@ def main() -> None:
     try:
         psi = collect_psi()
     except Exception:
-        logger.exception('Failed to collect PSI metrics; writing process metrics only')
+        logger.exception('Failed to collect PSI metrics; writing the other groups only')
         psi = {}
 
     try:
@@ -68,17 +80,30 @@ def main() -> None:
         # run_tick writes ZERO process rows — distinguishable from a fabricated
         # healthy 0.0.  Per-process NoSuchProcess/AccessDenied are still
         # silently skipped inside the counters (benign mid-scan deaths).
-        logger.exception('Failed to collect process metrics; writing PSI metrics only')
+        logger.exception('Failed to collect process metrics; writing the other groups only')
         process_metrics = {}
 
-    run_tick(store, now, psi=psi, process_metrics=process_metrics)
+    try:
+        load_metrics = collect_load_metrics()
+    except Exception:
+        # The THIRD loud degrade point. The load group reads /proc/stat and
+        # cgroupfs — kernel surfaces unrelated to the psutil process scan — so
+        # it fails independently and must not take the process metrics with it,
+        # nor be taken down by them. Same fallback as its two siblings: an
+        # EMPTY dict, so run_tick writes ZERO load rows. That is the shape that
+        # makes a fabricated healthy 0.0 impossible (task 1817).
+        logger.exception('Failed to collect load metrics; writing the other groups only')
+        load_metrics = {}
+
+    run_tick(store, now, psi=psi, process_metrics=process_metrics, load_metrics=load_metrics)
     store.maybe_vacuum(now)
 
     logger.info(
-        'tick ts=%d psi=%s process=%s',
+        'tick ts=%d psi=%s process=%s load=%s',
         now,
         {k: f'{v:.2f}' for k, v in psi.items()},
         {k: f'{v:.0f}' for k, v in process_metrics.items()},
+        {k: f'{v:.2f}' for k, v in load_metrics.items()},
     )
 
 

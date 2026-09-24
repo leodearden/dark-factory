@@ -679,15 +679,11 @@ _XDIST_CRASH_WITH_REAL_FAILURE_OUTPUT = (
     + '========== 1 failed, 2 passed in 5.00s ==========\n'
 )
 
-# Same crash signature, but co-occurring with the ENUMERATED known load-flake
-# failure (esc-2496-3): under host CPU oversubscription a bare second-worker
-# hard-crash ([gwN] node down) can co-occur with the PGID-liveness race in
-# test_cli.py::test_verify_merge_cancel_end_to_end, which emits a
-# genuine-looking FAILED line for that one known-flaky test. The allow-listed
-# FAILED line — and its E-traceback / failure summary — are attributable to
-# the known flake, not a real regression, so this must still reclassify as a
-# bare crash.
-_XDIST_CRASH_WITH_KNOWN_LOAD_FLAKE_OUTPUT = (
+# Same crash signature, co-occurring with a FAILED line for
+# test_cli.py::test_verify_merge_cancel_end_to_end — the one test a retired
+# allow-list (esc-2496-3) used to exempt as a known load flake. No test is
+# exempt any more, so this is a real failure like any other.
+_XDIST_CRASH_WITH_FORMERLY_EXEMPT_TEST_FAILURE_OUTPUT = (
     XDIST_WORKER_CRASH_OUTPUT
     + 'E   AssertionError: expected process group to be alive\n'
     + 'FAILED orchestrator/tests/test_cli.py::test_verify_merge_cancel_end_to_end - '
@@ -695,50 +691,12 @@ _XDIST_CRASH_WITH_KNOWN_LOAD_FLAKE_OUTPUT = (
     + '========== 1 failed, 2 passed in 5.00s ==========\n'
 )
 
-# Fixture (a) PLUS a genuine, non-allow-listed FAILED line — the strictness
-# guard: a real in-scope failure co-occurring with the known flake must still
-# route to the debugger, never blanket-discounted just because a
-# known-flake FAILED line is also present.
-_XDIST_CRASH_KNOWN_FLAKE_PLUS_GENUINE_OUTPUT = (
-    _XDIST_CRASH_WITH_KNOWN_LOAD_FLAKE_OUTPUT
-    + 'E   AssertionError: expected 3, got 4\n'
-    + 'FAILED orchestrator/tests/test_scheduler.py::test_dispatch_order - AssertionError\n'
-    + '========== 2 failed, 2 passed in 5.00s ==========\n'
-)
-
 # Crash signature + a FAILED line with no extractable pytest node-id (no
-# ``.py::`` substring — e.g. a doctest target). "No extractable node-id"
-# must be treated the same as "not on the allow-list": False.
+# ``.py::`` substring — e.g. a doctest target). The veto keys on the FAILED
+# line itself, never on a parseable node-id.
 _XDIST_CRASH_WITH_UNPARSEABLE_FAILED_NODEID_OUTPUT = (
     XDIST_WORKER_CRASH_OUTPUT
-    + 'E   AssertionError: doctest output mismatch\n'
     + 'FAILED some_doctest.txt::x\n'
-    + '========== 1 failed, 2 passed in 5.00s ==========\n'
-)
-
-# Fixture (a) PLUS a genuine ERROR (fixture/setup) failure for a DIFFERENT
-# test. An ERROR failure surface produces no FAILED line of its own, so the
-# per-FAILED-line allow-list check alone would never see it — the veto must
-# independently check for a co-occurring ERROR node-id.
-_XDIST_CRASH_KNOWN_FLAKE_PLUS_ERROR_NODEID_OUTPUT = (
-    _XDIST_CRASH_WITH_KNOWN_LOAD_FLAKE_OUTPUT
-    + 'ERROR orchestrator/tests/test_other.py::test_needs_fixture - '
-    'Exception: fixture setup failed\n'
-)
-
-# Fixture (a) PLUS a genuine whole-module collection ERROR (bare file, no
-# ``::``, no FAILED line) — same strictness guard as above, bare-file form.
-_XDIST_CRASH_KNOWN_FLAKE_PLUS_COLLECTION_ERROR_OUTPUT = (
-    _XDIST_CRASH_WITH_KNOWN_LOAD_FLAKE_OUTPUT
-    + "ERROR orchestrator/tests/test_broken.py - ImportError: cannot import name 'foo'\n"
-)
-
-# Fixture (a) PLUS a genuine INTERNALERROR (pytest plugin/internal crash) —
-# same strictness guard, no FAILED line of its own.
-_XDIST_CRASH_KNOWN_FLAKE_PLUS_INTERNALERROR_OUTPUT = (
-    _XDIST_CRASH_WITH_KNOWN_LOAD_FLAKE_OUTPUT
-    + 'INTERNALERROR> Traceback (most recent call last):\n'
-    + 'INTERNALERROR> RuntimeError: plugin crashed\n'
 )
 
 
@@ -853,10 +811,9 @@ _XDIST_CRASH_ATTRIBUTED_PLUS_GENUINE_OUTPUT = (
 )
 
 # task 5082, facet 1: the crash-attributed FAILED line PLUS an INTERNALERROR.
-# The task-4066 veto must keep dominating the NEW acceptance clause exactly as
-# it dominates the _KNOWN_LOAD_FLAKE_NODEID_RES clause beside it — an
-# INTERNALERROR produces no FAILED line of its own, so the per-FAILED-line
-# check would never see it.
+# The task-4066 INTERNALERROR veto must keep dominating the NEW acceptance
+# clause — an INTERNALERROR produces no FAILED line of its own, so discounting
+# the crash-attributed FAILED line must never discount it too.
 _XDIST_CRASH_ATTRIBUTED_PLUS_INTERNALERROR_OUTPUT = (
     XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT
     + 'INTERNALERROR> Traceback (most recent call last):\n'
@@ -946,73 +903,28 @@ class TestBareXdistWorkerCrashDetector:
         )
         assert verify._is_bare_xdist_worker_crash(output) is False
 
-    def test_crash_with_known_load_flake_failed_is_true(self):
-        """Crash signature + ONLY the enumerated known-load-flake FAILED line -> True.
+    def test_crash_with_formerly_exempt_test_failure_is_false(self):
+        """Crash signature + a FAILED line for the once-allow-listed test -> False.
 
-        esc-2496-3: a bare second-worker hard-crash co-occurring with the
-        known PGID-liveness race in
-        test_cli.py::test_verify_merge_cancel_end_to_end must still
-        reclassify as transient infra so the bounded retry fires instead of
-        the debugger.
+        test_cli.py::test_verify_merge_cancel_end_to_end was exempted as a
+        known load flake (esc-2496-3) until the exemption outlived its fix
+        (task 2733). A failure of that test beside a crash is a real failure:
+        it must reach the debugger, not the bounded infra retry.
         """
-        assert verify._is_bare_xdist_worker_crash(_XDIST_CRASH_WITH_KNOWN_LOAD_FLAKE_OUTPUT) is True
-
-    def test_known_flake_plus_genuine_failure_is_false(self):
-        """Known-flake FAILED line PLUS a genuine, non-allow-listed FAILED line -> False.
-
-        Strictness guard: a real in-scope failure must still route to the
-        debugger even when a known load-flake FAILED line is also present —
-        never blanket-discount every FAILED line just because the crash
-        signature and one known flake co-occur.
-        """
-        result = verify._is_bare_xdist_worker_crash(_XDIST_CRASH_KNOWN_FLAKE_PLUS_GENUINE_OUTPUT)
+        result = verify._is_bare_xdist_worker_crash(
+            _XDIST_CRASH_WITH_FORMERLY_EXEMPT_TEST_FAILURE_OUTPUT
+        )
         assert result is False
 
-    def test_crash_with_unparseable_failed_nodeid_is_false(self):
-        """A FAILED line with no extractable ``.py::`` node-id -> False.
+    def test_crash_with_lone_unparseable_failed_line_is_false(self):
+        """A FAILED line is a veto on its own, node-id or no node-id -> False.
 
-        "No extractable node-id" must be treated the same as "not on the
-        allow-list" — never assume an unparseable FAILED line is a known
-        flake just because the crash signature is present.
+        The only fixture whose sole failure surface is the FAILED line (no
+        ``E   `` traceback, no summary), so it is what pins the FAILED-line
+        term of the veto set.
         """
         result = verify._is_bare_xdist_worker_crash(
             _XDIST_CRASH_WITH_UNPARSEABLE_FAILED_NODEID_OUTPUT
-        )
-        assert result is False
-
-    def test_known_flake_plus_error_nodeid_is_false(self):
-        """Known-flake FAILED line PLUS a genuine ERROR (fixture/setup) failure
-        for a different test -> False.
-
-        An ERROR failure surface produces no FAILED line of its own, so the
-        per-FAILED-line allow-list check alone would never see it. Before
-        the ERROR/INTERNALERROR veto, this output would have returned True
-        (the lone FAILED line is the allow-listed known flake), silently
-        masking the genuine ERROR.
-        """
-        result = verify._is_bare_xdist_worker_crash(
-            _XDIST_CRASH_KNOWN_FLAKE_PLUS_ERROR_NODEID_OUTPUT
-        )
-        assert result is False
-
-    def test_known_flake_plus_collection_error_is_false(self):
-        """Known-flake FAILED line PLUS a genuine whole-module collection ERROR
-        (bare file, no ``::``) -> False. Same gap as the ERROR-node-id case
-        above, for the bare-file collection-failure form."""
-        result = verify._is_bare_xdist_worker_crash(
-            _XDIST_CRASH_KNOWN_FLAKE_PLUS_COLLECTION_ERROR_OUTPUT
-        )
-        assert result is False
-
-    def test_known_flake_plus_internalerror_is_false(self):
-        """Known-flake FAILED line PLUS a genuine INTERNALERROR -> False.
-
-        A pytest plugin/internal crash produces no FAILED line of its own
-        either, so it needs the same independent veto as the ERROR cases
-        above.
-        """
-        result = verify._is_bare_xdist_worker_crash(
-            _XDIST_CRASH_KNOWN_FLAKE_PLUS_INTERNALERROR_OUTPUT
         )
         assert result is False
 
@@ -1415,36 +1327,16 @@ class TestRunVerificationXdistWorkerCrashRetry:
         assert result.category == 'test_failure'
 
     @pytest.mark.asyncio
-    async def test_crash_with_known_load_flake_raises_verify_infra_error(self, tmp_path: Path):
-        """Acceptance: crash + enumerated known-flake FAILED line routes to the
-        bounded infra-retry, not the debugger (esc-2496-3)."""
-        config = self._make_config(tmp_path)
-
-        async def fake_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
-            if 'pytest' in cmd:
-                return 1, _XDIST_CRASH_WITH_KNOWN_LOAD_FLAKE_OUTPUT, False
-            return 0, '', False
-
-        with (
-            patch('orchestrator.verify._run_cmd', side_effect=fake_cmd),
-            pytest.raises(verify.VerifyInfraError) as exc_info,
-        ):
-            await verify.run_verification(tmp_path, config)
-
-        assert exc_info.value.phase == 'xdist_worker_crash'
-        assert exc_info.value.errno is None
-
-    @pytest.mark.asyncio
-    async def test_crash_with_known_flake_plus_genuine_failure_does_not_raise(
+    async def test_crash_with_formerly_exempt_test_failure_does_not_raise(
         self, tmp_path: Path,
     ):
-        """Acceptance: a real in-scope FAILED co-occurring with the known flake
-        must still route to the debugger — no blanket retry."""
+        """Acceptance: a failure of the once-allow-listed test beside a crash
+        routes to the debugger as a real failure — no infra retry."""
         config = self._make_config(tmp_path)
 
         async def fake_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
             if 'pytest' in cmd:
-                return 1, _XDIST_CRASH_KNOWN_FLAKE_PLUS_GENUINE_OUTPUT, False
+                return 1, _XDIST_CRASH_WITH_FORMERLY_EXEMPT_TEST_FAILURE_OUTPUT, False
             return 0, '', False
 
         with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):

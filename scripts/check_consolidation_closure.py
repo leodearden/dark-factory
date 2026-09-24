@@ -7,13 +7,18 @@ check and refuses when the cluster is not in the PRD §3 Option-C end state
 enforcement; this script is the same question asked *before* you try, so a
 curator can see the offending ids without burning a refused transition.
 
-It is deliberately a THIN wrapper, not a second opinion. The verdict comes
-from ``fused_memory.reconciliation.consolidation_gate.evaluate_closure`` —
-the same pure predicate the seam calls — and the scroll cap is imported
-from ``TaskInterceptor._CONSOLIDATION_SCROLL_LIMIT`` rather than restated
-(INV-5). Those two imports are what make "the same mechanical check"
-literally true: a CLI with its own predicate, or merely its own cap, could
-report ``closed`` on a view the seam would reject as ``scroll_incomplete``,
+It is deliberately a THIN wrapper, not a second opinion. The CLI and the
+seam are single-sourced on FOUR things (INV-5): the PREDICATE
+(``consolidation_gate.py::evaluate_closure``), the SCROLL CAP (imported
+from ``TaskInterceptor._CONSOLIDATION_SCROLL_LIMIT`` rather than restated),
+and — since task 4808 — the UNSTAMPED DERIVATION
+(``consolidation_gate.py::resolve_unstamped_live_ids``) together with the
+EXISTENCE PROBE it awaits (``consolidation_gate.py::closure_exists_probe``,
+which owns the ``project_id``-first argument adaptation both callers would
+otherwise each re-spell). Those four imports are what make "the same
+mechanical check" literally true: a CLI with its own predicate, merely its
+own cap, its own idea of which observed members are strays, or its own
+probe scoping could report ``closed`` on a view the seam would reject,
 which is exactly the false reassurance this whole gate exists to prevent.
 
 This replaces the old prose "re-search before merging" guard with something
@@ -60,8 +65,12 @@ Usage
   python scripts/check_consolidation_closure.py --task-id 3092 --json
 
 READ-ONLY. Every database handle this script opens is a read-only SQLite
-URI and the only store call is a metadata scroll; it never writes a task,
-a memory or a status.
+URI, and the only store calls are a metadata scroll plus (task 4808) one
+raw point read per unstamped CANDIDATE — ``get_memory_by_id``, a
+non-semantic Qdrant point read. It never writes a task, a memory or a
+status. The candidate list is EMPTY for every well-formed gate (an
+observed member already stamped into the topic is subtracted before any
+read), so the common path costs exactly what it did before.
 """
 
 from __future__ import annotations
@@ -97,7 +106,9 @@ from fused_memory.reconciliation.consolidation_gate import (  # noqa: E402
     EXIT_CLOSED,
     EXIT_NOT_CLOSED,
     GATE_METADATA_KEY,
+    closure_exists_probe,
     evaluate_closure,
+    resolve_unstamped_live_ids,
 )
 
 #: "I could not run the check." Distinct from EXIT_NOT_CLOSED by design —
@@ -160,7 +171,8 @@ def render_human(verdict: Any, *, scroll: dict) -> str:
         f"closed: {verdict.closed}",
         (
             "scroll: returned={returned} total={total} truncated={truncated} "
-            "available={available} limit={limit}".format(**scroll)
+            "available={available} limit={limit} "
+            "unstamped={unstamped}".format(**scroll)
         ),
         "",
         verdict.message,
@@ -213,12 +225,32 @@ def load_task_metadata(project_root: str, task_id: str, tag: str) -> Any:
     return row[0]
 
 
-async def scroll_cluster(memory: Any, project_id: str, topic: str) -> dict:
+async def scroll_cluster(
+    memory: Any, project_id: str, topic: str, *, block: Any
+) -> dict:
     """Bind the real fused-memory scroll for one topic.
 
     COST ORDERING copies the seam: count first, scroll only on a non-zero
     count, and DISCLOSE truncation — so the common path is cheap and a
     capped scroll never reads as complete.
+
+    Also derives ``unstamped`` (task 4808) from *block*'s inert provenance,
+    through the SHARED ``consolidation_gate.py::resolve_unstamped_live_ids``
+    (over the SHARED ``consolidation_gate.py::closure_exists_probe``) — never
+    a second copy of that subtraction nor of that argument adaptation, so the
+    CLI and the seam cannot disagree about which observed members are strays.
+    It stays INSIDE this function on purpose: ``run()``'s existing
+    ``except Exception -> available: False -> EXIT_USAGE`` wrapper then
+    covers a probe failure with no new branch, matching the store-outage
+    asymmetry with the seam this module's docstring already argues for.
+
+    *block* is REQUIRED and KEYWORD-ONLY, matching the convention
+    ``consolidation_gate.py::evaluate_closure`` sets for its own
+    completeness arguments. A defaulted *block* would let a caller silently
+    fall back to pre-4808 behaviour — ``resolve_unstamped_live_ids`` treats a
+    non-Mapping gate block as "no candidates" by design — and reintroduce
+    exactly the SILENT DORMANCY this task exists to remove, with no error and
+    no log line to notice it by.
     """
     filters = {"topic": topic}
     total = await memory.count_memories_by_metadata(project_id, filters)
@@ -229,11 +261,18 @@ async def scroll_cluster(memory: Any, project_id: str, topic: str) -> dict:
             await memory.get_memories_by_metadata(project_id, filters, limit=SCROLL_LIMIT)
         )
     )
+    unstamped = await resolve_unstamped_live_ids(
+        block,
+        members=members,
+        exists=closure_exists_probe(memory),
+        project_id=project_id,
+    )
     return {
         "members": members,
         "total": total,
         "truncated": len(members) >= SCROLL_LIMIT or total > len(members),
         "available": True,
+        "unstamped": unstamped,
     }
 
 
@@ -326,10 +365,18 @@ async def run(args: argparse.Namespace, *, memory: Any = None) -> int:
 
     store_error: str | None = None
     try:
-        scrolled = await scroll_cluster(memory, args.project_id, topic)
+        scrolled = await scroll_cluster(
+            memory, args.project_id, topic, block=block
+        )
     except Exception as exc:  # noqa: BLE001 — any store failure is "could not check"
         store_error = f"{type(exc).__name__}: {exc}"
-        scrolled = {"members": [], "total": None, "truncated": False, "available": False}
+        scrolled = {
+            "members": [],
+            "total": None,
+            "truncated": False,
+            "available": False,
+            "unstamped": (),
+        }
 
     verdict = evaluate_closure(
         block,
@@ -337,6 +384,7 @@ async def run(args: argparse.Namespace, *, memory: Any = None) -> int:
         scroll_total=scrolled["total"],
         scroll_truncated=scrolled["truncated"],
         scroll_available=scrolled["available"],
+        unstamped_live_ids=scrolled["unstamped"],
     )
     scroll_facts = {
         "returned": len(scrolled["members"]),
@@ -344,6 +392,7 @@ async def run(args: argparse.Namespace, *, memory: Any = None) -> int:
         "truncated": scrolled["truncated"],
         "available": scrolled["available"],
         "limit": SCROLL_LIMIT,
+        "unstamped": list(scrolled["unstamped"]),
     }
     payload = {
         "checked": store_error is None,

@@ -48,6 +48,16 @@ Nothing enforces this mechanically, by choice — see `CONTRIBUTING.md` §2
 (esc-3815-7).
 <!-- line-pin-policy:end -->
 
+## Code quality
+
+`docs/code-quality.md` is the single normative definition of code quality
+for this repo and for every project the factory operates: quality is the
+cost and risk of the next change, and here the next change is made by an
+agent; fourteen named heuristics with their agreed readings; comments as a
+clarity smell; tests reaching a module's internals as an interface smell.
+Review, refactor and PRD work cite those heuristics by name from that file.
+Do not restate them elsewhere (INV-9). The `CONTRIBUTING.md` §4 gates are
+the floor, not the bar.
 
 ## Prerequisites
 
@@ -194,6 +204,35 @@ spellings, Tier-C `x_` namespace) — lives in **`docs/task-authoring.md`**.
 Consult it before authoring any of those fields; the shapes are
 validated at write time and a malformed spec is rejected.
 
+### Forensic reads of tasks.db
+
+Read-only sqlite against the live store is the right tool for FORENSICS —
+asking what the store says right now, mid-incident or mid-census. Operations
+still go through the MCP tools above; a direct write skips the reconciliation
+events the interceptor exists to emit.
+
+Two things about that store are not derivable from your cwd or your memory.
+WHERE it is: `.taskmaster/` is not tracked in git, so it exists only at the
+MAIN checkout and never inside your worktree — and the `.taskmaster/tasks.db`
+one directory above the real `.taskmaster/tasks/tasks.db` is a 0-byte decoy
+whose every query answers `no such table: tasks`. WHAT SHAPE it is: neither
+its columns (`no such column: created_at`) nor its value types (an INTEGER
+column hands you an `int`, so a string method on a task id raises
+`AttributeError`) survive being remembered. Ask the database; never guess.
+
+<!-- tasks-db-schema-lookup:begin
+     EXECUTED verbatim by tests/scripts/test_tasks_db_schema_convention.py.
+     Degrade it into a hand-written sqlite query and that guard goes red —
+     which is the point: the recipe stays certified to actually run. -->
+- **Task store shape**: `python scripts/tasks_db_schema.py`
+<!-- tasks-db-schema-lookup:end -->
+
+It resolves the live store from wherever you are standing (`--db` and
+`--project-root` override), prints every table with each column's declared
+type and the Python type its values arrive as, and refuses loudly rather than
+reporting an empty schema. It states no column names of its own, deliberately:
+the store is the only copy of them that cannot be stale.
+
 ## Model Routing
 
 The orchestrator resolves `(model, effort, budget_usd, max_turns)` for
@@ -265,8 +304,12 @@ Two things that section used to claim, and that measurement disproved on
 passes no arguments, so it restarts mid-merge units ungated), and the two
 tiers **can** both redeploy inside one 8h window — the clock is stamped only
 when a sweep completes, so a long sweep leaves it reading the previous deploy
-throughout. Tasks **4754** and **4755** close this. Until they land, don't
-reason as if a fleet redeploy is at most once per 8h.
+throughout. Tasks **4754** and **4755** have since closed this: a sweep now
+holds an in-flight lease that the backstop, the coordinator and (for its
+`current_unit` only) the liveness probe all honor. Two residuals remain — a
+sweep overrunning `orchestrator_restart_lease_max_age_secs` loses the lease
+and degrades to the old collision, and the fused-memory tier has no lease at
+all — so read `--report`'s `FLEET-LEASE:` line rather than assuming.
 
 ## Working in the main checkout
 

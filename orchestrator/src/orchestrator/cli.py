@@ -20,6 +20,7 @@ from orchestrator.config_census_ignore import audit_census_ignore_entries
 from orchestrator.verify_cancel import (
     WATCHDOG_HEARTBEAT_TIMEOUT_SECS,
     WATCHDOG_KILL_GRACE_SECS,
+    WatchdogTrigger,
     acquire_merge_verify_flock,
     cancel_request,
     fire_watchdog_kill,
@@ -62,7 +63,8 @@ def _env_float(name: str, default: float) -> float:
     timing constants (flock wait, watchdog heartbeat timeout/grace) are
     module-level and otherwise untunable from outside the spawned
     ``verify-merge`` child, making an integration gate wall-clock-bound on
-    the 10-15s production windows. Unset, unparseable, or non-positive
+    the production windows (since task 4195, a 90.0s heartbeat timeout plus a
+    5.0s kill grace). Unset, unparseable, or non-positive
     values fall back to *default* so production behavior is byte-identical
     when the env var is absent. The non-positive guard matters beyond
     "byte-identical": every current caller feeds a timing window
@@ -381,13 +383,28 @@ def flake_ledger_cmd(config_path: Path | None):
               default=None,
               help='Where to write the rendered probe artifact YAML (default: '
                    'routing.DEFAULT_PROBE_ARTIFACT_PATH, i.e. config/model-availability.yaml).')
-def probe_models(config_path: Path | None, models_csv: str | None, output_path: Path | None):
+@click.option('--budget-usd', 'budget_usd',
+              type=click.FloatRange(min=0.0, min_open=True),
+              default=None,
+              help='Per-invocation USD ceiling for each probe turn (default: '
+                   'routing.DEFAULT_PROBE_BUDGET_USD). Must exceed one turn of the '
+                   'most expensive probed model — undershooting it reports '
+                   'budget_too_low, not unavailability.')
+def probe_models(config_path: Path | None, models_csv: str | None, output_path: Path | None,
+                 budget_usd: float | None):
     """Probe every configured pool account x candidate model for availability
     and write the rendered status artifact (default config/model-availability.yaml).
 
     The probed model set defaults to config.routing.allowed_models plus the
     fable candidate model (see routing.probe_models); pass --models to
     override with an explicit comma-separated list.
+
+    The per-turn budget defaults to routing.DEFAULT_PROBE_BUDGET_USD and must
+    clear one turn of the most expensive probed model; a pair that aborts on
+    that ceiling is recorded as budget_too_low, never as unavailability. Such
+    pairs are counted and warned about on stderr, and a run in which EVERY
+    probed pair aborted exits non-zero -- it produced no availability
+    evidence at all, so it must not read as a successful probe.
     """
     from datetime import UTC, datetime
 
@@ -405,8 +422,10 @@ def probe_models(config_path: Path | None, models_csv: str | None, output_path: 
         else None
     )
 
+    budget = routing.DEFAULT_PROBE_BUDGET_USD if budget_usd is None else budget_usd
     report = asyncio.run(routing.probe_models(
         config.usage_cap.accounts, config.routing.allowed_models, models=models,
+        budget_usd=budget,
     ))
 
     generated_at = datetime.now(UTC).isoformat()
@@ -417,6 +436,30 @@ def probe_models(config_path: Path | None, models_csv: str | None, output_path: 
     out_path.write_text(artifact)
 
     click.echo(f'Wrote model availability artifact to {out_path}')
+
+    # A POSITIVE but mis-sized ceiling passes the parse-time FloatRange check
+    # and still yields an artifact that is uniformly and plausibly wrong, so
+    # the artifact alone cannot be the only signal: an operator who never
+    # opens the YAML would read exit 0 as evidence the models are available.
+    # The artifact is written first either way -- budget_too_low rows are
+    # honest evidence about the BUDGET, and must not be discarded.
+    statuses = [status for row in report.accounts.values() for status in row.values()]
+    aborted = sum(1 for status in statuses
+                  if status == routing.PROBE_BUDGET_TOO_LOW_STATUS)
+    if aborted:
+        click.echo(
+            f'WARNING: {aborted} of {len(statuses)} (account, model) pairs aborted '
+            f'on the budget ceiling in force (--budget-usd {budget}); those rows are '
+            f'NOT availability evidence. Re-run with a higher --budget-usd.',
+            err=True,
+        )
+        if aborted == len(statuses):
+            click.echo(
+                'Error: every probed pair aborted on the budget ceiling — this run '
+                'produced no availability evidence.',
+                err=True,
+            )
+            sys.exit(1)
 
 
 @main.command('check-config')
@@ -846,9 +889,9 @@ def verify_merge(sha: str, spec_json: str, config_path: Path | None, request_id:
         grace_secs = _env_float('ORCH_WATCHDOG_KILL_GRACE_SECS', WATCHDOG_KILL_GRACE_SECS)
         watchdog_fired = threading.Event()
 
-        def _on_watchdog_fire() -> None:
+        def _on_watchdog_fire(trigger: WatchdogTrigger) -> None:
             watchdog_fired.set()
-            fire_watchdog_kill(pgid, grace_secs=grace_secs)
+            fire_watchdog_kill(pgid, trigger=trigger, grace_secs=grace_secs)
 
         watchdog_thread = start_stdin_watchdog(
             pgid, heartbeat_timeout=heartbeat_timeout, fire=_on_watchdog_fire
@@ -1301,7 +1344,11 @@ def _run_single_eval(
         build_plan_quality_report,
         format_plan_quality_table,
     )
-    from orchestrator.evals.runner import run_architect_eval, run_eval
+    from orchestrator.evals.runner import (
+        campaign_usage_gate,
+        run_architect_eval,
+        run_eval,
+    )
 
     all_configs = EVAL_CONFIGS
 
@@ -1316,61 +1363,69 @@ def _run_single_eval(
         configs = all_configs
 
     async def _run():
-        architect_results = []
-        for cfg in configs:
-            if cfg.role == 'architect':
-                # θ: plan-only architect eval — downstream roles frozen.
-                # run_architect_eval manages its own eval worktree at the
-                # fixture's pre_task_commit, so it takes no worktree_path.
-                result = await run_architect_eval(
-                    task_path, cfg, base_config, timeout_override=timeout,
-                )
-                architect_results.append(result)
-                plan_quality = result.metrics.get('plan_quality')
-                # A cap-tainted cell names its infra failure inline, so an
-                # operator watching the run sees it LIVE rather than a bare
-                # `plan_quality=None` that reads like a scoring quirk. Healthy
-                # cells echo exactly as before.
-                #
-                # 'unmeasurable', not 'cap-tainted': the flag covers every cause
-                # that left no model content (cap hit, auth failure,
-                # model-not-found, wedge, harness error), and a PERMANENT config
-                # error must not read to the operator as a transient cap window.
-                # The marker that follows always names the actual cause.
-                taint = (
-                    f' unmeasurable: {result.metrics.get("invocation_error")}'
-                    if result.metrics.get('cap_tainted') else ''
-                )
-                # `steps=` is echoed BESIDE the score (task 3302) because it is
-                # the plan-production predicate the whole pipeline now keys on:
-                # `steps=0` beside any plan_quality means the architect produced
-                # nothing, which the final table floors to 0.0. Showing it live
-                # is what stops a no-plan candidate from looking healthy for the
-                # length of a campaign.
-                click.echo(
-                    f'{result.task_id} × {result.config_name}: '
-                    f'{result.outcome} plan_quality={plan_quality} '
-                    f'steps={result.metrics.get("plan_steps")}{taint} '
-                    f'({result.wall_clock_ms / 1000:.1f}s)'
-                )
-            else:
-                result = await run_eval(
-                    task_path, cfg, base_config, timeout_override=timeout,
-                    worktree_path=worktree_path,
-                )
-                click.echo(
-                    f'{result.task_id} × {result.config_name}: '
-                    f'{result.outcome} ({result.wall_clock_ms / 1000:.1f}s)'
-                )
+        # ONE gate for the whole config loop (task 4427) — see
+        # campaign_usage_gate for the argument. Specific to this site: the loop
+        # is a campaign the μ stage functions never pass through, so it owns a
+        # gate of its own, and BOTH dispatch branches share it so cap state a
+        # config proved is inherited by every config after it, architect and
+        # implementer alike.
+        async with campaign_usage_gate(base_config) as gate:
+            architect_results = []
+            for cfg in configs:
+                if cfg.role == 'architect':
+                    # θ: plan-only architect eval — downstream roles frozen.
+                    # run_architect_eval manages its own eval worktree at the
+                    # fixture's pre_task_commit, so it takes no worktree_path.
+                    result = await run_architect_eval(
+                        task_path, cfg, base_config, timeout_override=timeout,
+                        usage_gate=gate,
+                    )
+                    architect_results.append(result)
+                    plan_quality = result.metrics.get('plan_quality')
+                    # A cap-tainted cell names its infra failure inline, so an
+                    # operator watching the run sees it LIVE rather than a bare
+                    # `plan_quality=None` that reads like a scoring quirk. Healthy
+                    # cells echo exactly as before.
+                    #
+                    # 'unmeasurable', not 'cap-tainted': the flag covers every cause
+                    # that left no model content (cap hit, auth failure,
+                    # model-not-found, wedge, harness error), and a PERMANENT config
+                    # error must not read to the operator as a transient cap window.
+                    # The marker that follows always names the actual cause.
+                    taint = (
+                        f' unmeasurable: {result.metrics.get("invocation_error")}'
+                        if result.metrics.get('cap_tainted') else ''
+                    )
+                    # `steps=` is echoed BESIDE the score (task 3302) because it is
+                    # the plan-production predicate the whole pipeline now keys on:
+                    # `steps=0` beside any plan_quality means the architect produced
+                    # nothing, which the final table floors to 0.0. Showing it live
+                    # is what stops a no-plan candidate from looking healthy for the
+                    # length of a campaign.
+                    click.echo(
+                        f'{result.task_id} × {result.config_name}: '
+                        f'{result.outcome} plan_quality={plan_quality} '
+                        f'steps={result.metrics.get("plan_steps")}{taint} '
+                        f'({result.wall_clock_ms / 1000:.1f}s)'
+                    )
+                else:
+                    result = await run_eval(
+                        task_path, cfg, base_config, timeout_override=timeout,
+                        worktree_path=worktree_path, usage_gate=gate,
+                    )
+                    click.echo(
+                        f'{result.task_id} × {result.config_name}: '
+                        f'{result.outcome} ({result.wall_clock_ms / 1000:.1f}s)'
+                    )
 
-        # Surface the θ plan-quality table across all architect runs.
-        if architect_results:
-            click.echo('')
-            click.echo(
-                format_plan_quality_table(
-                    build_plan_quality_report(architect_results)
+            # Surface the θ plan-quality table across all architect runs.
+            if architect_results:
+                click.echo('')
+                click.echo(
+                    format_plan_quality_table(
+                        build_plan_quality_report(architect_results)
+                    )
                 )
-            )
 
     asyncio.run(_run())
 

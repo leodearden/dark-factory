@@ -1,5 +1,6 @@
 """Tests for reconciliation stage configuration (CLI-native MCP execution)."""
 
+import contextlib
 import json
 import logging
 from contextlib import contextmanager
@@ -52,6 +53,11 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _run_briefing_known_gaps_script,
     _select_proactive_sample,
     _suppress_same_run_human_operator_dups,
+)
+from fused_memory.reconciliation.standing_decision_constants import (
+    CATEGORY_STANDING_DECISION_STORM,
+    GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+    SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
 )
 from fused_memory.reconciliation.task_filter import (
     MAX_CANCELLED_TASKS_RETAINED,
@@ -172,6 +178,12 @@ class TestMockTypesConstant:
 # cannot mislead a stage about the reconciliation queue — not a formality.
 _REVIEWED_STAGE_SAFE = {
     'mcp__escalation__claim_warm_worktree',
+    # declare_pin (task 4377) is stamp_triage's structural twin: a
+    # restrictive-only write that marks a record as load-bearing.  Against the
+    # reconciliation queue it can only ever answer "not found" — it reads no
+    # per-task escalation state, so it cannot present a categorical [] as
+    # proof of absence, which is the harm DISALLOW_ESCALATION_READS exists for.
+    'mcp__escalation__declare_pin',
     'mcp__escalation__escalate_blocker',
     'mcp__escalation__escalate_info',
     'mcp__escalation__get_merge_halt_status',
@@ -2032,6 +2044,16 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # Always present (task-2029 amendment), even when nothing was flagged —
             # symmetric with stats['stage2_flag_markers_acknowledged'].
             'stage1_flag_markers_acknowledged': 0,
+            # Always present (task 2896 γ): stays 0 on the empty-flags path — the
+            # entity-standing-decision filter only runs inside `if items_flagged`.
+            'entity_standing_decision_suppressed': 0,
+            # Always present (task 4223): the preservation-specimen guard runs
+            # ABOVE the remediation early-return, so all three keys are on EVERY
+            # report. All stay empty here — no flag was emitted, so the guard
+            # short-circuits before any corroboration read.
+            'preservation_specimen_suppressed': 0,
+            'preservation_specimen_unresolved': 0,
+            'preservation_specimen_citations': {},
             # Always present on the full-cycle path (task 2229 W5-λ): 1 when the
             # deterministic write_cycle_summary helper upserted the authoritative
             # ledger row. This test's mock_deps memory_service is an unconfigured
@@ -2061,6 +2083,34 @@ class TestProjectIdValidation(BaseStageValidationTest):
             'curator_gate_resolution_scanned': 0,
             'curator_gate_resolution_flags_emitted': 0,
             'curator_gate_resolution_errors': 0,
+            # Always present (task 4574, mirrors stage1_fetch_degraded above): set
+            # before the remediation early-return so the key is unconditionally
+            # present. 0 here because this test's mock_deps stub out the LLM-driving
+            # super().run() call, so assemble_payload's episode/Mem0 freshness
+            # filters — the only place that increments this counter — never run,
+            # leaving it at its __init__/reset value of 0.
+            'stage1_undatable_freshness_records': 0,
+            # Always present (task 3052), zeroed in the same block as the
+            # task-3084 curator-gate trio above and for the same reason: they
+            # are set BEFORE the remediation early-return, so a caller reading
+            # report.stats never has to .get() them.  All eight stay 0 here —
+            # the orphaned-recon-escalation sweep is guarded on BOTH
+            # _escalation_queue and taskmaster being set, and this stage is
+            # built from mock_deps with no escalation queue, so it never runs.
+            'orphaned_recon_escalations_scanned': 0,
+            'orphaned_recon_escalations_terminal': 0,
+            'orphaned_recon_escalations_missing': 0,
+            'orphaned_recon_escalations_live': 0,
+            'orphaned_recon_escalations_ambiguous': 0,
+            'orphaned_recon_escalations_unresolvable': 0,
+            'orphaned_recon_escalations_errors': 0,
+            'orphaned_recon_escalations_flags_emitted': 0,
+            # Always present (task 4814), pre-initialised beside the
+            # task-2312/2229/3084 pre-inits above and before the
+            # remediation early-return.  Stays 0 here: no active task is
+            # human-gate-owned, so the deterministic gate-owned
+            # suggested_action normalizer rewrites nothing.
+            'gate_owned_suggested_actions_normalized': 0,
         }
         assert result.started_at is not None
         assert result.started_at <= result.completed_at
@@ -2157,6 +2207,16 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # Always present (task-2029 amendment), even when nothing was flagged —
             # symmetric with stats['stage2_flag_markers_acknowledged'].
             'stage1_flag_markers_acknowledged': 0,
+            # Always present (task 2896 γ): stays 0 on the empty-flags path — the
+            # entity-standing-decision filter only runs inside `if items_flagged`.
+            'entity_standing_decision_suppressed': 0,
+            # Always present (task 4223): the preservation-specimen guard runs
+            # ABOVE the remediation early-return, so all three keys are on EVERY
+            # report. All stay empty here — no flag was emitted, so the guard
+            # short-circuits before any corroboration read.
+            'preservation_specimen_suppressed': 0,
+            'preservation_specimen_unresolved': 0,
+            'preservation_specimen_citations': {},
             # Always present on the full-cycle path (task 2229 W5-λ): 1 when the
             # deterministic write_cycle_summary helper upserted the authoritative
             # ledger row. This test's mock_deps memory_service is an unconfigured
@@ -2186,6 +2246,34 @@ class TestProjectIdValidation(BaseStageValidationTest):
             'curator_gate_resolution_scanned': 0,
             'curator_gate_resolution_flags_emitted': 0,
             'curator_gate_resolution_errors': 0,
+            # Always present (task 4574, mirrors stage1_fetch_degraded above): set
+            # before the remediation early-return so the key is unconditionally
+            # present. 0 here because this test's mock_deps stub out the LLM-driving
+            # super().run() call, so assemble_payload's episode/Mem0 freshness
+            # filters — the only place that increments this counter — never run,
+            # leaving it at its __init__/reset value of 0.
+            'stage1_undatable_freshness_records': 0,
+            # Always present (task 3052), zeroed in the same block as the
+            # task-3084 curator-gate trio above and for the same reason: they
+            # are set BEFORE the remediation early-return, so a caller reading
+            # report.stats never has to .get() them.  All eight stay 0 here —
+            # the orphaned-recon-escalation sweep is guarded on BOTH
+            # _escalation_queue and taskmaster being set, and this stage is
+            # built from mock_deps with no escalation queue, so it never runs.
+            'orphaned_recon_escalations_scanned': 0,
+            'orphaned_recon_escalations_terminal': 0,
+            'orphaned_recon_escalations_missing': 0,
+            'orphaned_recon_escalations_live': 0,
+            'orphaned_recon_escalations_ambiguous': 0,
+            'orphaned_recon_escalations_unresolvable': 0,
+            'orphaned_recon_escalations_errors': 0,
+            'orphaned_recon_escalations_flags_emitted': 0,
+            # Always present (task 4814), pre-initialised beside the
+            # task-2312/2229/3084 pre-inits above and before the
+            # remediation early-return.  Stays 0 here: no active task is
+            # human-gate-owned, so the deterministic gate-owned
+            # suggested_action normalizer rewrites nothing.
+            'gate_owned_suggested_actions_normalized': 0,
         }
         assert result.started_at is not None
         assert result.started_at <= result.completed_at
@@ -16019,3 +16107,638 @@ class TestSweepStaleMem0PoolTombstones:
 
         assert result == 0
         tombstone.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Task 2896 γ — MemoryConsolidator wires filter_entity_standing_decisions +
+# maybe_escalate_suppression_storm (Hook A):
+#   • an ACTIVE entity_standing_decision suppresses matching Stage-1 flags
+#     BEFORE dedup_flags (no marker churn);
+#   • the always-present entity_standing_decision_suppressed stat counts them;
+#   • suppressed flags are EXCLUDED from acknowledge_resolved_flags (suppression
+#     is not resolution — recurrence history preserved);
+#   • one decision suppressing more than the per-cycle threshold files a
+#     reconciliation_standing_decision_storm L1 escalation for its entity.
+#
+# RED until step-10 wires the filter + storm helper into memory_consolidator.py.
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryConsolidatorEntityStandingDecision:
+    """MemoryConsolidator.run() honors ACTIVE entity_standing_decision rows (task 2896 γ)."""
+
+    # Canonical 8-4-4-4-12 sample UUID for the seeded standing decision.
+    _U = 'b0057f3d-1234-4abc-8def-0123456789ab'
+
+    @pytest.fixture
+    def mock_deps(self):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
+        }
+
+    def _make_base_report(self, items_flagged):
+        return StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=items_flagged,
+            stats={},
+            llm_calls=1,
+            tokens_used=100,
+        )
+
+    async def _ledger_with_active_decision(self, tmp_path):
+        """Real initialized ReconLedgerStore holding ONE active standing decision for self._U."""
+        from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
+
+        ledger = ReconLedgerStore(tmp_path / 'reconciliation.db')
+        await ledger.initialize()
+        await ledger.upsert_entity_standing_decision(
+            project_id='p',
+            entity_uuid=self._U,
+            grounds=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+            decided_at='2026-01-01T00:00:00+00:00',
+            expires_at='2099-01-01T00:00:00+00:00',
+            edge_count_at_decision=42,
+            evidence={'note': 'seed'},
+            state='active',
+        )
+        return ledger
+
+    def _strong_flag(self, flag_type: str) -> dict:
+        """A flag that STRONG-matches the seeded decision (entity_uuid + grounds stamps)."""
+        return {
+            'entity_uuid': self._U,
+            'grounds': GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+            'flag_type': flag_type,
+            'description': 'entity is too large / topic-conflated',
+        }
+
+    @pytest.mark.asyncio
+    async def test_active_decision_suppresses_matching_flag_and_sets_stat(
+        self, mock_deps, tmp_path
+    ):
+        """(a) A flag matching an active standing decision is suppressed BEFORE
+        dedup_flags; an unrelated flag survives; the stat counts the suppression."""
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.scope = _scope('p', '/proj')
+        stage.episode_limit = 10
+        stage.memory_limit = 10
+
+        ledger = await self._ledger_with_active_decision(tmp_path)
+        stage.memory.recon_ledger = ledger
+
+        matching = self._strong_flag('oversized_entity')
+        unrelated = {'task_id': '9', 'flag_type': 'missing_deliverable'}
+        base_report = self._make_base_report([matching, unrelated])
+
+        # dedup_flags passthrough spy — record what it sees to prove the standing
+        # decision suppressed the matching flag BEFORE dedup (no marker churn).
+        dedup_seen: list = []
+
+        async def _dedup_spy(**kwargs):
+            dedup_seen.append(list(kwargs.get('flags', [])))
+            return kwargs.get('flags', [])
+
+        try:
+            with (
+                patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+                patch(
+                    'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                    new=_dedup_spy,
+                ),
+                patch(
+                    'fused_memory.reconciliation.stages.memory_consolidator.filter_false_absence_flags',
+                    new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
+                ),
+                patch(
+                    'fused_memory.reconciliation.stages.memory_consolidator.acknowledge_resolved_flags',
+                    new=AsyncMock(return_value=0),
+                ),
+            ):
+                report = await stage.run(
+                    events=[],
+                    watermark=Watermark(project_id='p'),
+                    prior_reports=[],
+                    run_id='r-esd-a',
+                )
+        finally:
+            await ledger.close()
+
+        # Always-present stat counts the single suppression.
+        assert report.stats['entity_standing_decision_suppressed'] == 1
+        # Matching flag suppressed; unrelated flag survives.
+        assert matching not in (report.items_flagged or [])
+        assert unrelated in (report.items_flagged or [])
+        # Suppression happened BEFORE dedup_flags — the matching flag never reached it.
+        assert len(dedup_seen) == 1
+        assert matching not in dedup_seen[0]
+        assert unrelated in dedup_seen[0]
+
+    @pytest.mark.asyncio
+    async def test_suppressed_flag_excluded_from_acknowledgment(
+        self, mock_deps, tmp_path
+    ):
+        """(b) Suppression is NOT resolution: a flag dropped by the standing-decision
+        filter is EXCLUDED from acknowledge_resolved_flags, so its stage1_flag_marker
+        (recurrence history) is preserved for when the decision is later lifted."""
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.scope = _scope('p', '/proj')
+        stage.episode_limit = 10
+        stage.memory_limit = 10
+
+        ledger = await self._ledger_with_active_decision(tmp_path)
+        stage.memory.recon_ledger = ledger
+
+        matching = self._strong_flag('oversized_entity')
+        base_report = self._make_base_report([matching])
+
+        ack_mock = AsyncMock(return_value=0)
+
+        try:
+            with (
+                patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+                patch(
+                    'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                    new=AsyncMock(side_effect=lambda **kwargs: kwargs.get('flags', [])),
+                ),
+                patch(
+                    'fused_memory.reconciliation.stages.memory_consolidator.filter_false_absence_flags',
+                    new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
+                ),
+                patch(
+                    'fused_memory.reconciliation.stages.memory_consolidator.acknowledge_resolved_flags',
+                    new=ack_mock,
+                ),
+            ):
+                report = await stage.run(
+                    events=[],
+                    watermark=Watermark(project_id='p'),
+                    prior_reports=[],
+                    run_id='r-esd-b',
+                )
+        finally:
+            await ledger.close()
+
+        # The flag was suppressed (proves the filter ran)…
+        assert report.stats['entity_standing_decision_suppressed'] == 1
+        assert matching not in (report.items_flagged or [])
+        # …but it must NOT be acknowledged as resolved (recurrence preserved).
+        ack_mock.assert_awaited_once()
+        assert ack_mock.await_args is not None
+        resolved = ack_mock.await_args.kwargs.get('resolved_flags', [])
+        assert matching not in resolved
+
+    @pytest.mark.asyncio
+    async def test_storm_escalation_filed_when_one_decision_suppresses_many(
+        self, mock_deps, tmp_path
+    ):
+        """(c) When one active decision suppresses more than the per-cycle threshold,
+        a reconciliation_standing_decision_storm L1 escalation is filed for its entity.
+
+        Driven against a REAL EscalationQueue: the filing folds through
+        submit_or_dedupe, and a MagicMock cannot witness what was persisted or
+        under which key.
+        """
+        from escalation.queue import EscalationQueue
+
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.scope = _scope('p', '/proj')
+        stage.episode_limit = 10
+        stage.memory_limit = 10
+
+        queue = EscalationQueue(tmp_path / 'escalations')
+        stage._escalation_queue = queue
+
+        ledger = await self._ledger_with_active_decision(tmp_path)
+        stage.memory.recon_ledger = ledger
+
+        n = SUPPRESSION_STORM_THRESHOLD_PER_CYCLE + 1
+        storm_flags = [self._strong_flag(f'oversized_entity_{i}') for i in range(n)]
+        base_report = self._make_base_report(storm_flags)
+
+        try:
+            with (
+                patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+                patch(
+                    'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                    new=AsyncMock(side_effect=lambda **kwargs: kwargs.get('flags', [])),
+                ),
+                patch(
+                    'fused_memory.reconciliation.stages.memory_consolidator.filter_false_absence_flags',
+                    new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
+                ),
+                patch(
+                    'fused_memory.reconciliation.stages.memory_consolidator.acknowledge_resolved_flags',
+                    new=AsyncMock(return_value=0),
+                ),
+            ):
+                report = await stage.run(
+                    events=[],
+                    watermark=Watermark(project_id='p'),
+                    prior_reports=[],
+                    run_id='r-esd-c',
+                )
+        finally:
+            await ledger.close()
+
+        # All N flags matched U → all suppressed.
+        assert report.stats['entity_standing_decision_suppressed'] == n
+        # Exactly one storm escalation filed for U in the storm category, findable
+        # by the entity: task_id is the read key, so a filing that left it ''
+        # would be a record no per-entity lookup can reach.
+        pending = queue.get_by_task(self._U, status='pending', level=1)
+        assert len(pending) == 1
+        esc = pending[0]
+        assert esc.task_id == self._U
+        assert esc.category == CATEGORY_STANDING_DECISION_STORM
+        assert esc.level == 1
+        assert esc.agent_role == 'reconciliation-stage1'
+        assert esc.dedupe_fingerprint, 'the fold key must be stamped on the record'
+        assert self._U in f'{esc.summary}\n{esc.detail}'
+
+    @pytest.mark.asyncio
+    async def test_stat_is_present_on_a_remediation_pass(self, mock_deps):
+        """The suppression stat is present (0) even on a remediation pass.
+
+        A remediation pass returns before the filter chain, so the stat can only
+        be there if it is pre-inited above that early return.  Stage 1's whole
+        stats blob is serialized verbatim into Stage 2's prompt, and the
+        always-present convention is exactly the promise that a consumer never
+        has to distinguish "0" from "absent" (reviewer finding correctness,
+        amendment pass).
+        """
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.scope = _scope('p', '/proj')
+        stage.episode_limit = 10
+        stage.memory_limit = 10
+        stage.remediation_findings = [{'description': 'fix me'}]
+
+        base_report = self._make_base_report([self._strong_flag('oversized_entity')])
+        esd_mock = AsyncMock()
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.'
+                'filter_entity_standing_decisions',
+                new=esd_mock,
+            ),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='p'),
+                prior_reports=[],
+                run_id='r-esd-remediation',
+            )
+
+        assert report.stats['entity_standing_decision_suppressed'] == 0
+        assert esd_mock.await_count == 0, 'a remediation pass must not run the filter'
+
+
+# ---------------------------------------------------------------------------
+# Task 4223 — MemoryConsolidator wires filter_preservation_specimen_flags +
+# maybe_escalate_preservation_suppression_storm ABOVE the remediation
+# early-return:
+#   • a stranded flag for a corroborated preservation specimen is dropped on a
+#     FULL cycle AND on a REMEDIATION pass (the load-bearing regression — the
+#     two post-widening recurrences of this false positive, runs f16954ae and
+#     720ebf37, were both remediation runs, and anything wired beside Hook A at
+#     the filter chain is unreachable from there);
+#   • preservation_specimen_suppressed / _unresolved are always-present stats,
+#     explicit 0 on a cycle that suppressed nothing, remediation included;
+#   • a suppressed flag is EXCLUDED from acknowledge_resolved_flags (suppression
+#     is not resolution — the invariant Hook A maintains);
+#   • a guard failure never aborts the stage or half-mutates items_flagged.
+#
+# RED until step-14 wires the guard into memory_consolidator.py.
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryConsolidatorPreservationSpecimenGuard:
+    """MemoryConsolidator.run() declines stranded flags for preserved specimens."""
+
+    _GUARD = (
+        'fused_memory.reconciliation.stages.memory_consolidator.'
+        'filter_preservation_specimen_flags'
+    )
+    _CITATION = 'a8fd36a8-46db-4ca8-a21c-554c38a918ee'
+
+    @pytest.fixture
+    def mock_deps(self):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        return {
+            'memory_service': AsyncMock(),
+            'taskmaster': AsyncMock(),
+            'journal': AsyncMock(),
+            'config': config,
+            'scope': _scope('test_project', '/tmp/test'),
+        }
+
+    def _make_stage(self, mock_deps):
+        stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
+        stage.scope = _scope('p', '/proj')
+        stage.episode_limit = 10
+        stage.memory_limit = 10
+        # Hook A is not under test here; leave it nothing to read.
+        stage.memory.recon_ledger = None
+        return stage
+
+    def _make_base_report(self, items_flagged):
+        return StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=items_flagged,
+            stats={},
+            llm_calls=1,
+            tokens_used=100,
+        )
+
+    @staticmethod
+    def _stranded_flag(task_id='3105', flag_type='task_stranded_no_claimant'):
+        return {
+            'task_id': task_id,
+            'flag_type': flag_type,
+            'category': 'task_memory_mismatch',
+            'severity': 'moderate',
+            'actionable': True,
+            'description': f'Task {task_id} is in-progress with no claimant and no heartbeat.',
+            'suggested_action': f'File an operator gate task to reset task {task_id}.',
+        }
+
+    def _corroborating_memory(self, stage):
+        """Point the stage's Mem0 channel at task 3105's real preservation row."""
+        row = {
+            'id': self._CITATION,
+            'metadata': {
+                'kind': 'investigation_outcome',
+                'task_id': '3105',
+                'actionable': False,
+                'data': 'Task 3105 is the sole preserved live validation specimen '
+                        'for gate task 3546.',
+            },
+        }
+        stage.memory.get_memories_by_metadata = AsyncMock(
+            side_effect=lambda project_id, filters: (
+                [row] if str(filters.get('task_id')) == '3105' else []
+            ),
+        )
+        stage.memory.get_entity = AsyncMock(return_value={'nodes': [], 'edges': []})
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _full_cycle(base_report, **extra):
+        """BaseStage.run stubbed to *base_report*, plus the filter-chain stubs.
+
+        An ExitStack rather than a parenthesized ``with``: the stub set is built
+        per test, and ``with (a, *stubs)`` parses as a TUPLE, not as a group of
+        context managers.
+        """
+        stubs = {
+            'dedup_flags': AsyncMock(side_effect=lambda **kw: kw.get('flags', [])),
+            'filter_false_absence_flags': AsyncMock(
+                side_effect=lambda taskmaster, project_root, flags: flags,
+            ),
+            'acknowledge_resolved_flags': AsyncMock(return_value=0),
+        }
+        stubs.update(extra)
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            )
+            for name, mock in stubs.items():
+                stack.enter_context(
+                    patch(
+                        f'fused_memory.reconciliation.stages.memory_consolidator.{name}',
+                        new=mock,
+                    ),
+                )
+            yield
+
+    @pytest.mark.asyncio
+    async def test_full_cycle_suppresses_corroborated_stranded_flag(self, mock_deps):
+        """(a) The finding that twice became a destructive gate task is dropped."""
+        stage = self._make_stage(mock_deps)
+        self._corroborating_memory(stage)
+
+        specimen = self._stranded_flag()
+        unrelated = {'task_id': '4102', 'flag_type': 'missing_deliverable'}
+        base_report = self._make_base_report([specimen, unrelated])
+
+        with self._full_cycle(base_report):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='p'), prior_reports=[],
+                run_id='r-4223-full',
+            )
+
+        assert specimen not in (report.items_flagged or [])
+        assert unrelated in (report.items_flagged or [])
+        assert report.stats['preservation_specimen_suppressed'] == 1
+        assert report.stats['preservation_specimen_unresolved'] == 0
+        # Not just the count: the citation travels into the stats blob Stage 2
+        # is handed verbatim, so the suppression is never anonymous there.
+        assert report.stats['preservation_specimen_citations'] == {'3105': self._CITATION}
+
+    @pytest.mark.asyncio
+    async def test_remediation_pass_suppresses_too(self, mock_deps):
+        """(b) THE regression this task exists for.
+
+        memory_consolidator's remediation early-return sits ABOVE the whole
+        filter chain, so a guard wired beside Hook A would be unreachable here —
+        and the two recurrences that continued AFTER the blanket
+        stage1_flag_suppression for task 3105 was widened (run f16954ae
+        2026-08-26, run 720ebf37 2026-09-11) were both remediation runs.
+        """
+        stage = self._make_stage(mock_deps)
+        self._corroborating_memory(stage)
+        stage.remediation_findings = [{'description': 'fix me'}]
+
+        specimen = self._stranded_flag(flag_type='stranded_merge_phase_liveness')
+        base_report = self._make_base_report([specimen])
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='p'), prior_reports=[],
+                run_id='r-4223-remediation',
+            )
+
+        assert specimen not in (report.items_flagged or [])
+        assert report.stats['preservation_specimen_suppressed'] == 1
+        assert report.stats['preservation_specimen_citations'] == {'3105': self._CITATION}
+
+    @pytest.mark.asyncio
+    async def test_stats_are_present_and_zero_on_a_quiet_full_cycle(self, mock_deps):
+        """(c) Always-present, explicit 0 — never absent.
+
+        Stage 1's whole stats blob is serialized verbatim into Stage 2's prompt,
+        and the always-present convention is the promise that a consumer never
+        has to tell "0" from "absent".
+        """
+        stage = self._make_stage(mock_deps)
+        stage.memory.get_memories_by_metadata = AsyncMock(return_value=[])
+        stage.memory.get_entity = AsyncMock(return_value={'nodes': [], 'edges': []})
+
+        base_report = self._make_base_report([{'task_id': '9', 'flag_type': 'task_absent'}])
+
+        with self._full_cycle(base_report):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='p'), prior_reports=[],
+                run_id='r-4223-quiet',
+            )
+
+        assert report.stats['preservation_specimen_suppressed'] == 0
+        assert report.stats['preservation_specimen_unresolved'] == 0
+
+    @pytest.mark.asyncio
+    async def test_stats_are_present_and_zero_on_a_quiet_remediation_pass(self, mock_deps):
+        """(c) Same promise on the path that returns before the filter chain."""
+        stage = self._make_stage(mock_deps)
+        stage.memory.get_memories_by_metadata = AsyncMock(return_value=[])
+        stage.memory.get_entity = AsyncMock(return_value={'nodes': [], 'edges': []})
+        stage.remediation_findings = [{'description': 'fix me'}]
+
+        base_report = self._make_base_report([{'task_id': '9', 'flag_type': 'task_absent'}])
+
+        with patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='p'), prior_reports=[],
+                run_id='r-4223-quiet-remediation',
+            )
+
+        assert report.stats['preservation_specimen_suppressed'] == 0
+        assert report.stats['preservation_specimen_unresolved'] == 0
+
+    @pytest.mark.asyncio
+    async def test_unresolved_corroboration_is_counted_and_keeps_the_flag(self, mock_deps):
+        """A degraded read keeps the flag AND shows up in the stats (INV-11)."""
+        stage = self._make_stage(mock_deps)
+        stage.memory.get_memories_by_metadata = AsyncMock(side_effect=TimeoutError('down'))
+        stage.memory.get_entity = AsyncMock(side_effect=RuntimeError('also down'))
+
+        specimen = self._stranded_flag()
+        base_report = self._make_base_report([specimen])
+
+        with self._full_cycle(base_report):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='p'), prior_reports=[],
+                run_id='r-4223-degraded',
+            )
+
+        assert specimen in (report.items_flagged or [])
+        assert report.stats['preservation_specimen_suppressed'] == 0
+        assert report.stats['preservation_specimen_unresolved'] == 1
+
+    @pytest.mark.asyncio
+    async def test_suppressed_flag_is_excluded_from_acknowledgment(self, mock_deps):
+        """(d) Suppression is NOT resolution.
+
+        The dropped flag's stage1_flag_marker must survive, so recurrence
+        history is intact for when the preservation citation is retired.
+
+        Enforced by ORDER, not by a signature exclusion: the guard runs above
+        the acknowledgment snapshot, so a suppressed flag is never an
+        acknowledgment candidate.  This test is what fails if that order is
+        ever reversed without adding the exclusion Hook A carries.
+        """
+        stage = self._make_stage(mock_deps)
+        self._corroborating_memory(stage)
+
+        specimen = self._stranded_flag()
+        # A surviving flag is required, not decoration: the acknowledgment block
+        # is guarded on ``if report.items_flagged:``, so suppressing the only
+        # flag would skip the very path this test is about.
+        survivor = {'task_id': '4102', 'flag_type': 'missing_deliverable'}
+        base_report = self._make_base_report([specimen, survivor])
+        ack_mock = AsyncMock(return_value=0)
+
+        with self._full_cycle(base_report, acknowledge_resolved_flags=ack_mock):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='p'), prior_reports=[],
+                run_id='r-4223-ack',
+            )
+
+        assert report.stats['preservation_specimen_suppressed'] == 1
+        ack_mock.assert_awaited_once()
+        assert ack_mock.await_args is not None
+        resolved = ack_mock.await_args.kwargs.get('resolved_flags', [])
+        assert specimen not in resolved
+
+    @pytest.mark.asyncio
+    async def test_guard_failure_never_aborts_the_stage(self, mock_deps):
+        """(e) Best-effort: the cycle completes with items_flagged untouched."""
+        stage = self._make_stage(mock_deps)
+        specimen = self._stranded_flag()
+        base_report = self._make_base_report([specimen])
+
+        with self._full_cycle(
+            base_report,
+            filter_preservation_specimen_flags=AsyncMock(
+                side_effect=RuntimeError('guard exploded'),
+            ),
+        ):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='p'), prior_reports=[],
+                run_id='r-4223-boom',
+            )
+
+        assert specimen in (report.items_flagged or [])
+        assert report.stats['preservation_specimen_suppressed'] == 0
+        assert report.stats['preservation_specimen_unresolved'] == 0
+        # Pre-inited above the early return, so the key is never conditionally
+        # absent — the always-present convention the sibling stats follow.
+        assert report.stats['preservation_specimen_citations'] == {}
+
+    @pytest.mark.asyncio
+    async def test_guard_failure_on_a_remediation_pass_is_also_swallowed(self, mock_deps):
+        """(e) Both paths call the guard, so both must survive its failure."""
+        stage = self._make_stage(mock_deps)
+        stage.remediation_findings = [{'description': 'fix me'}]
+        specimen = self._stranded_flag()
+        base_report = self._make_base_report([specimen])
+
+        with (
+            patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+            patch(self._GUARD, new=AsyncMock(side_effect=RuntimeError('guard exploded'))),
+        ):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='p'), prior_reports=[],
+                run_id='r-4223-boom-remediation',
+            )
+
+        assert specimen in (report.items_flagged or [])
+        assert report.stats['preservation_specimen_suppressed'] == 0
+
+    @pytest.mark.asyncio
+    async def test_storm_escalation_filed_on_a_full_cycle(self, mock_deps, tmp_path):
+        """The INV-4 escape is wired, and only where an escalation queue exists."""
+        from escalation.queue import EscalationQueue
+
+        from fused_memory.reconciliation.preservation_specimen_guard import (
+            PRESERVATION_SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
+        )
+
+        stage = self._make_stage(mock_deps)
+        self._corroborating_memory(stage)
+        queue = EscalationQueue(tmp_path / 'escalations')
+        stage._escalation_queue = queue
+
+        n = PRESERVATION_SUPPRESSION_STORM_THRESHOLD_PER_CYCLE + 1
+        storm_flags = [self._stranded_flag(flag_type=f'task_stranded_v{i}') for i in range(n)]
+        base_report = self._make_base_report(storm_flags)
+
+        with self._full_cycle(base_report):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='p'), prior_reports=[],
+                run_id='r-4223-storm',
+            )
+
+        assert report.stats['preservation_specimen_suppressed'] == n
+        pending = queue.get_by_task('3105', status='pending', level=1)
+        assert len(pending) == 1
+        assert pending[0].category == 'reconciliation_preservation_specimen_storm'
