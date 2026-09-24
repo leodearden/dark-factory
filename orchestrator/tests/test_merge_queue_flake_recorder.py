@@ -578,6 +578,10 @@ class _ExplodingTaskClient:
         self.calls.append('get_statuses')
         raise RuntimeError('mcp dispatch failed')
 
+    async def get_task(self, task_id: str) -> tuple[dict | None, Exception | None]:
+        self.calls.append('get_task')
+        raise RuntimeError('mcp dispatch failed')
+
     async def commit_planning(self, task_ids: list[str]) -> None:
         self.calls.append('commit_planning')
         raise RuntimeError('mcp dispatch failed')
