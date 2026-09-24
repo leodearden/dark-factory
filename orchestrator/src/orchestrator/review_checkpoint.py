@@ -42,7 +42,11 @@ REFLECTION_INSTRUCTIONS = """\
    - **Architectural insights** — structural observations about how modules interact, where
      coupling is tight or loose, where the design is fragile
      (`category="decisions_and_rationale"`)
-   - Use `add_memory(content=..., category=..., project_id="{project_id}", agent_id="claude-review-{review_id}")`
+   - Use `add_memory(content=..., category=..., project_id="{project_id}", agent_id="claude-review-{review_id}")`,
+     adding `entities` to declare the task(s) the insight is about, for example:
+     `add_memory(content="Task 3127's retry loop swallows the timeout error", category="observations_and_summaries", project_id="{project_id}", agent_id="claude-review-{review_id}", entities=[{{'kind': 'task', 'id': 3127}}])`
+   - Declare only the referents the insight is about, and pass `[]` when none apply. Omitting
+     `entities` always succeeds; a declaration that your own content contradicts is rejected
    - Write each insight as its own memory — don't batch into one blob
    - Skip anything obvious from the code itself; focus on what a future agent couldn't easily rediscover"""
 
