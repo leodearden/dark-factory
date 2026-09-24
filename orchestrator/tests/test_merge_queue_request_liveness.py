@@ -2609,7 +2609,12 @@ class TestContendedLeaseDefers:
         _lease_held_reset = _held_lane_reset(warm_path, foreign_pgid)
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = make_lane(warm_git_ops, q)
+        # The streak stamps are read off the worker's injected clock, so the
+        # seed and the final elapsed check must use that SAME clock: the real
+        # time.monotonic() only agrees with FakeClock's fixed base while host
+        # uptime happens to sit below it.
+        clock = FakeClock()
+        worker = make_lane(warm_git_ops, q, clock=clock)
         worker.CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS = 0.0
         # A cap this task's seeded stamp is FAR past, so the only thing that can
         # keep this defer alive is recognising the streak as broken.
@@ -2625,7 +2630,7 @@ class TestContendedLeaseDefers:
         # with nothing since — a gap no defer cadence can explain (the raiser
         # here carries no wait at all and the throttle is 0, so the staleness
         # window is its 60s floor).
-        _long_ago = time.monotonic() - 3600.0
+        _long_ago = clock.monotonic() - 3600.0
         worker._contended_lease_requeues[task_id] = 1
         worker._contended_lease_first_defer_at[task_id] = _long_ago
         worker._contended_lease_last_defer_at[task_id] = _long_ago
@@ -2653,7 +2658,7 @@ class TestContendedLeaseDefers:
             f'continued; got {worker._contended_lease_requeues.get(task_id)!r}'
         )
         assert (
-            time.monotonic() - worker._contended_lease_first_defer_at[task_id]
+            clock.monotonic() - worker._contended_lease_first_defer_at[task_id]
             < worker.MAX_CONTENDED_LEASE_DEFER_SECS
         ), (
             'the new streak must date from THIS defer — a stamp still inside '

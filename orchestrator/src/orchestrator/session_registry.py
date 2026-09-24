@@ -1272,6 +1272,120 @@ def merge_decision_enrichment(
     )
 
 
+def merge_same_queue_refile(
+    existing: DecisionRecord,
+    incoming: DecisionRecord,
+) -> DecisionRecord:
+    """Fold the SAME watcher's re-filing of its OWN id into an existing record.
+
+    Deliberate SIBLING of merge_decision_enrichment above -- read the two
+    together. Same custody set, opposite treatment of the watcher-owned half.
+    This is the other axis of _run_write_decision's upsert: not two watchers
+    seeing one gate through two queues (that is enrichment), but ONE watcher
+    re-filing its own stable id across a restart, which both watcher SKILL.md
+    files promise is idempotent.
+
+    Field policy:
+
+    - ``text`` / ``severity`` / ``task_id`` / ``session_id`` /
+      ``escalation_id`` / ``options`` / ``escalations_dir`` -- from
+      *incoming*, VERBATIM, including a severity DOWNGRADE and a field going
+      EMPTY. The watcher is the sole authority on its own escalation, and
+      freezing the first values (enrichment's fill-if-empty +
+      _max_decision_severity) would strand stale prose and a stale severity
+      in the cockpit queue forever. This is the whole reason the same-queue
+      case is not just routed through merge_decision_enrichment.
+    - ``filed_at`` / ``state`` / ``manual_boost`` -- from *existing*
+      (CUSTODY), and it is the SAME set merge_decision_enrichment keeps,
+      because custody does not depend on which queue re-filed. ``filed_at``
+      is queue AGE, which drives the cockpit's ordering, and a restart is not
+      news about it. ``manual_boost`` is the OPERATOR's C5 field, written by
+      set_manual_boost. ``state`` is the operator's / reaper's DISPOSITION,
+      written by update_decision_state.
+    - ``id`` / ``project`` -- not forced here, unlike enrichment (which
+      rebuilds from *existing*): this helper rebuilds from *incoming*, and
+      its caller has already established both are equal -- the id is the
+      on-disk file key, and _run_write_decision reaches this arm only after
+      ``existing.project == project``. Do not widen those preconditions
+      without revisiting this line.
+
+    WHY ``state`` IS SAFE TO HOLD HERE BUT NOT CROSS-QUEUE (task 3872). This
+    helper is scoped by its caller to a SAME-project, SAME-queue re-file, and
+    within ONE queue an ``esc-<taskid>-<n>`` id is unique -- that is the
+    entire premise of task 3528's queue axis. So this is the same gate the
+    human already answered or dropped rather than a new ask, and preserving
+    their disposition is respecting a VERIFIED human act. Across queues the
+    id namespaces genuinely collide (dark_factory runs ``data/escalations``
+    and ``data/reconciliation/escalations`` over one namespace), so a
+    non-open cross-queue filing may be an unrelated NEW ask;
+    _run_write_decision deliberately keeps today's full overwrite there.
+
+    THAT UNIQUENESS IS STRONG BUT NOT ABSOLUTE, and the hole is named here
+    once rather than rounded off, because every other statement of this
+    policy (the caller's comment, both watcher SKILLs) leans on it:
+    EscalationQueue._recover_seq_from_disk (escalation/queue.py) rebuilds a
+    LOST or corrupt per-task seq counter by scanning the queue root and
+    archive, and its own docstring concedes both bounds -- the archive half
+    is bounded by prune_archive retention, and an id minted but not yet
+    submitted when the counter was lost is invisible to the scan. After a
+    counter loss an id CAN therefore be re-minted inside one queue, landing a
+    genuinely NEW gate on a closed row that this helper then holds closed --
+    invisible in C5b, which filters to state=='open', i.e. the fail-CLOSED
+    direction. The residual needs a counter loss to reach and is far narrower
+    than the unbounded harm below, and _run_write_decision's divergence
+    WARNING is its backstop: the hold is ANNOUNCED for a human or agent to
+    adjudicate rather than applied silently, which is exactly the case that
+    reads it.
+
+    WHY THIS IS NOT THE FAIL-CLOSED DIRECTION the reaper docstrings in this
+    module warn about. "An over-held decision is a human-triageable row,
+    while a falsely closed one is invisible" governs the REAPER's join across
+    an id namespace it CANNOT verify -- an automatic close on uncertain
+    evidence. Here identity is knowable (above, down to the one named
+    counter-loss residual) and the closure came from an
+    operator's explicit C5b act (cockpit/app.py -> update_decision_state(...,
+    DROPPED)) or from the reaper resolving against an escalation in this SAME
+    queue. The alternative is not a benign over-surfacing but an UNBOUNDED
+    one: a watcher re-files on EVERY restart while an item stays parked, and
+    reap_answered_decisions skips a non-open record ("already resolved -- no
+    re-close"), so without this the operator's dismissal is undone forever
+    and C5b's drop action is inert for exactly the class of row it exists
+    for. The escape hatch for a genuinely NEW ask at a closed id is to FILE
+    IT UNDER A NEW ID -- the remedy that exists on a shipped surface, and the
+    one _run_write_decision's divergence WARNING points a watcher at.
+    Re-opening the row IN PLACE is deliberately not offered as the headline
+    remedy, because today it needs a direct registry write: this module's
+    update_decision_state has no operator-facing caller that re-opens (the
+    cockpit's C5b decision pane writes DROPPED only) and the argparse below
+    exposes write-decision / reap-decisions but no update-decision-state
+    verb. Say "file a new id" until one of those exists.
+
+    ADDITIVE-SAFE: ``state`` is copied as an opaque ``str``, never coerced
+    through DecisionState -- mirrors DecisionRecord's own no-coercion note,
+    so a disposition a future writer adds round-trips instead of being reset
+    to 'open' by a module that has not been taught about it.
+
+    KNOWN RESIDUAL: a LEGACY unstamped (``escalations_dir=''``) non-open
+    record re-filed by its own watcher does NOT reach this helper, because
+    the caller's queue-equality test cannot resolve ``'' == stamp``. Guessing
+    whose namespace an unstamped record belongs to is precisely what
+    _merge_queue_and_escalation_id refuses to do, and task 3640's back-fill
+    is draining that population; it is left as the full overwrite rather than
+    papered over here.
+
+    PURE and side-effect-free -- including of LOGGING, which stays in the CLI
+    verb at the policy boundary (mirroring how enrichment's queue warnings
+    live in _merge_queue_and_escalation_id, not in the writer). Returns a NEW
+    record via dataclasses.replace and mutates neither argument.
+    """
+    return dataclasses.replace(
+        incoming,
+        filed_at=existing.filed_at,
+        state=existing.state,
+        manual_boost=existing.manual_boost,
+    )
+
+
 @contextlib.contextmanager
 def decision_id_lock(decision_id: str, root: Path | str | None = None) -> Iterator[None]:
     """Per-decision-id exclusive advisory lock using a stable sidecar file.
@@ -4037,30 +4151,53 @@ def _run_write_decision(
     construction (it is the same dir it passes to reap-decisions), so there
     is no legitimate write-path caller.
 
-    UPSERT, NOT A BLIND OVERWRITE (task 3559). Against an OPEN record at the
-    same id, three cases are told apart:
+    UPSERT, NOT A BLIND OVERWRITE (task 3559). Against an existing record at
+    the same id, three cases are told apart:
 
     - DIFFERENT project -- an id COLLISION, not one gate seen twice, since
       DecisionRecords are fleet-global while ``esc-<taskid>-<n>`` task
       numbering restarts per project. REFUSED (loud, fail-soft, nothing
       written): merging would hide this ask inside the other project's row
-      and overwriting would delete that row.
+      and overwriting would delete that row. Scoped to an OPEN incumbent --
+      a closed row in another project is a question already dealt with, so a
+      filing there starts a new ask.
     - DIFFERENT queue stamp -- the second watcher observing the same human
       gate through another queue (the observed esc-5914-1 MODE-2 shape), so
       the filing is folded in via merge_decision_enrichment rather than
-      clobbering or downgrading what the first watcher wrote.
+      clobbering or downgrading what the first watcher wrote. Also scoped to
+      an OPEN incumbent, and for the same reason: ACROSS queues the
+      ``esc-<taskid>-<n>`` namespaces genuinely collide, so a filing against
+      a closed row may be an unrelated NEW ask.
     - MATCHING queue stamp -- the SAME watcher re-filing across a restart,
       which both SKILL.md files promise is idempotent, so its whole view
-      lands (including fields going down or empty). Only ``filed_at`` and
-      ``manual_boost`` are held back, as CUSTODY: a restart is not news
-      about queue age and says nothing about the operator's C5 boost, which
-      belongs to set_manual_boost. Same rule merge_decision_enrichment
-      applies cross-queue -- custody does not depend on which queue re-filed.
+      lands (including fields going down or empty). ``filed_at``,
+      ``manual_boost`` AND ``state`` are held back, as CUSTODY: a restart is
+      not news about queue age, says nothing about the operator's C5 boost
+      (set_manual_boost's field), and is not a disposition
+      (update_decision_state's). Same custody set merge_decision_enrichment
+      keeps -- custody does not depend on which queue re-filed.
+
+      THIS ARM IS NOT SCOPED TO AN OPEN RECORD (task 3872), unlike the two
+      above. Within ONE queue an ``esc-<taskid>-<n>`` id is unique (task
+      3528's premise), so a same-project same-queue re-file is definitively
+      the SAME gate the human already answered or dropped -- identity is
+      certain here in a way it is not on the cross-queue axis. The harm it
+      removes is concrete and unbounded: both watcher SKILLs tell an agent to
+      re-file its stable id on EVERY restart while an item stays parked, and
+      reap_answered_decisions skips a non-open decision, so without this an
+      operator's C5b dismissal is undone on the next restart and again
+      forever -- the drop action is inert for exactly the class of row it
+      exists for. Holding the state back is announced with a WARNING (below),
+      since this is the one place the verb declines to do what the filer
+      asked.
 
     Everything else keeps today's full overwrite: no existing record (the
-    normal first-filing case), an unreadable/corrupt one, or a NON-open one
-    (a question the human already dealt with -- a new filing there starts a
-    new ask, boost and age included).
+    normal first-filing case), an unreadable/corrupt one, or a non-open one
+    reached on either QUEUE-axis exception above -- a different project, or a
+    different queue stamp (including the legacy unstamped population task
+    3640 is draining, whose '' stamp matches no real queue). In each of those
+    the incumbent cannot be shown to be the same gate, so a new filing starts
+    a new ask, boost and age included.
 
     On success, prints the filed record's id (mirrors `launching` printing
     the record dir and `lease-claim` printing `decision=`) so the caller can
@@ -4174,7 +4311,7 @@ def _run_write_decision(
                 # Absent (the common first-filing case), unreadable, or
                 # corrupt: all fall through to writing fresh.
                 existing = None
-            if existing is not None and existing.state == DecisionState.OPEN:
+            if existing is not None:
                 if normalize_project_token(existing.project) != canonical_project:
                     # SAME id, DIFFERENT project: an id COLLISION, not a
                     # MODE-2 collapse. Both SKILL.md files tell a watcher to
@@ -4206,54 +4343,108 @@ def _run_write_decision(
                     # Refusing is the non-destructive, deterministic choice --
                     # the same first-writer-wins policy _merge_queue_and_
                     # escalation_id applies to a conflicting queue stamp.
-                    # Scoped to an OPEN record for the same reason the rest of
-                    # this branch is: a non-open row is a question already
-                    # dealt with, and a new filing there starts a new ask.
-                    logger.error(
-                        'write-decision refusing to file %s for project %s: an OPEN '
-                        'decision already exists at that id for a DIFFERENT project '
-                        '(%s). DecisionRecords are fleet-global while esc-<taskid>-<n> '
-                        'ids restart per project, so this is an id COLLISION, not a '
-                        'MODE-2 cross-queue collapse of one human gate -- merging '
-                        'would hide this ask inside the other project\'s cockpit row '
-                        'and overwriting would delete that row, so neither is safe. '
-                        'The existing row is left intact and THIS ask did not reach '
-                        'the cockpit; it is still carried by the in-session note / '
-                        'afk-digest line this filing accompanies. Re-file it under an '
-                        'id that is unique fleet-wide.',
-                        decision_id,
-                        project,
-                        existing.project,
-                    )
-                    return
-                if normalize_escalations_dir(existing.escalations_dir) != stamp:
+                    #
+                    # STILL scoped to an OPEN incumbent after task 3872, on
+                    # the QUEUE axis's own reasoning: two projects always run
+                    # different queue dirs, so a cross-project collision is by
+                    # construction a CROSS-queue filing, where the
+                    # esc-<taskid>-<n> namespaces genuinely collide and a
+                    # closed row cannot be shown to be the same gate. A filing
+                    # there is a new ask, so `record` stays `incoming` and it
+                    # keeps today's full overwrite.
+                    if existing.state == DecisionState.OPEN:
+                        logger.error(
+                            'write-decision refusing to file %s for project %s: an OPEN '
+                            'decision already exists at that id for a DIFFERENT project '
+                            '(%s). DecisionRecords are fleet-global while '
+                            'esc-<taskid>-<n> ids restart per project, so this is an id '
+                            'COLLISION, not a MODE-2 cross-queue collapse of one human '
+                            'gate -- merging would hide this ask inside the other '
+                            'project\'s cockpit row and overwriting would delete that '
+                            'row, so neither is safe. The existing row is left intact '
+                            'and THIS ask did not reach the cockpit; it is still '
+                            'carried by the in-session note / afk-digest line this '
+                            'filing accompanies. Re-file it under an id that is unique '
+                            'fleet-wide.',
+                            decision_id,
+                            project,
+                            existing.project,
+                        )
+                        return
+                elif normalize_escalations_dir(existing.escalations_dir) == stamp:
+                    # A MATCHING stamp is the SAME watcher re-filing across a
+                    # restart, which both SKILL.md files promise is a plain
+                    # idempotent overwrite -- text, severity and task_id are
+                    # its own to revise, including downwards -- with the
+                    # CUSTODY fields (filed_at, manual_boost, state) held
+                    # back. merge_same_queue_refile carries the reasoning.
+                    #
+                    # NOT scoped to an OPEN record (task 3872), unlike the two
+                    # arms around it. This is the ONE axis on which identity
+                    # is knowable: within a single queue an esc-<taskid>-<n>
+                    # id is unique (task 3528's premise), so a same-project
+                    # same-queue re-file is the same gate the human already
+                    # answered or dropped -- modulo the counter-loss re-mint
+                    # hole merge_same_queue_refile names, which the WARNING
+                    # just below is the backstop for. Re-opening it would
+                    # make an operator's C5b dismissal impossible to ever make
+                    # stick -- a watcher re-files on EVERY restart while an
+                    # item stays parked, and reap_answered_decisions skips a
+                    # non-open record, so nothing would ever close it again.
+                    record = merge_same_queue_refile(existing, incoming)
+                    if existing.state != DecisionState.OPEN:
+                        # THE ONE PLACE THIS VERB DECLINES WHAT THE FILER
+                        # ASKED FOR: the filing carries state=open (the
+                        # default above) and the row stays closed. Loud, per
+                        # this repo's loud-over-silent-degradation norm, and
+                        # because the watcher SKILLs' own rule is to
+                        # ADJUDICATE such a divergence rather than assume the
+                        # re-file landed -- which needs it to be visible.
+                        #
+                        # Guarded on non-open so the COMMON path stays quiet:
+                        # a same-queue re-file against an open record is every
+                        # watcher restart for every still-parked item, nothing
+                        # is declined there, and a warning on each one is how
+                        # this one gets tuned out.
+                        #
+                        # stdout is deliberately untouched (the id is still
+                        # printed below): both SKILLs document "no id on
+                        # stdout means your filing did not land" as the
+                        # did-it-work signal, and this filing DID land.
+                        logger.warning(
+                            'write-decision kept decision %s in state %r rather than '
+                            're-opening it: this re-file came from the SAME queue (%s) '
+                            'as the record it matched, so it is the same gate a human '
+                            'already answered or dropped, not a new ask. Your text, '
+                            'severity and ids DID land, but the row stays CLOSED and '
+                            'will NOT reappear in the cockpit decision queue, which '
+                            'shows only state=open rows. Re-opening it would make an '
+                            'operator\'s cockpit disposition impossible to ever make '
+                            'stick, since a watcher re-files its stable id on every '
+                            'restart while an item stays parked. ADJUDICATE this rather '
+                            'than re-filing blindly: if the gate is genuinely a NEW ask, '
+                            'file it under a NEW id -- that is the remedy with a shipped '
+                            'surface, since re-opening this row in place currently needs '
+                            'a direct registry write (the cockpit decision pane offers a '
+                            'drop action but no re-open, and there is no '
+                            'update-decision-state CLI verb).',
+                            decision_id,
+                            str(existing.state),
+                            stamp,
+                        )
+                elif existing.state == DecisionState.OPEN:
                     # A DIFFERENT queue filing against a live record: this is
                     # the MODE-2 cross-queue collapse, so enrich rather than
                     # overwrite.
                     record = merge_decision_enrichment(existing, incoming)
-                else:
-                    # A MATCHING stamp is the SAME watcher re-filing across a
-                    # restart, which both SKILL.md files promise is a plain
-                    # idempotent overwrite -- text, severity and task_id are
-                    # its own to revise, including downwards.
-                    #
-                    # But filed_at and manual_boost are CUSTODY fields, and
-                    # custody does not depend on which queue the re-file came
-                    # from: merge_decision_enrichment already keeps both on
-                    # the cross-queue path, and the same reasoning binds here.
-                    # A watcher restart is not new information about queue AGE
-                    # (filed_at drives the cockpit's ordering), and it is not
-                    # information about the OPERATOR's C5 boost at all -- that
-                    # is set_manual_boost's field, written by a different
-                    # subsystem. Without this, an operator who boosts a row to
-                    # the top of the queue silently loses it on the next
-                    # watcher restart, which is precisely the "second writer
-                    # downgrades an open record" shape this task removes.
-                    record = dataclasses.replace(
-                        incoming,
-                        filed_at=existing.filed_at,
-                        manual_boost=existing.manual_boost,
-                    )
+                # else: a DIFFERENT queue filing against a NON-open record --
+                # including the legacy unstamped ('' stamp) population task
+                # 3640 is draining, which matches no real queue. Across queues
+                # the id namespaces collide, so this may be an unrelated NEW
+                # ask; holding it closed would make a live gate invisible,
+                # which is the fail-CLOSED direction _run_reap_decisions'
+                # docstring rules out. `record` stays `incoming`: today's full
+                # overwrite, unchanged.
 
             if write_decision(record):
                 print(record.id)

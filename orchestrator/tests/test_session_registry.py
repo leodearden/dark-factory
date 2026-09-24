@@ -6006,6 +6006,217 @@ def test_merge_decision_enrichment_touches_only_the_documented_fields() -> None:
 
     assert merged == dataclasses.replace(existing, severity='urgent')
 
+# ---------------------------------------------------------------------------
+# Task 3872: merge_same_queue_refile -- the SAME watcher re-filing its own id
+# ---------------------------------------------------------------------------
+
+
+def test_merge_same_queue_refile_holds_the_cockpit_owned_fields() -> None:
+    """The three COCKPIT-owned fields survive a same-queue re-file at any state.
+
+    Sibling of test_merge_decision_enrichment_keeps_custody_fields_with_the_
+    first_filer: the custody set is the same one, because custody does not
+    depend on which queue re-filed. ``filed_at`` is queue age (it drives the
+    cockpit's ordering, and a watcher restart is not news about it),
+    ``manual_boost`` is the operator's C5 field (set_manual_boost's), and
+    ``state`` is the operator's / reaper's disposition
+    (update_decision_state's) -- so a watcher restart must not restamp the
+    age, reset the boost, or RE-OPEN a row the human already dropped.
+
+    ``id``/``project`` are asserted unchanged as the caller's PRECONDITION,
+    not as a field this helper forces: unlike merge_decision_enrichment (which
+    rebuilds from *existing* and so pins them structurally), this helper
+    rebuilds from *incoming*, and is only ever reached from
+    _run_write_decision after ``existing.project == project`` and with the id
+    as the on-disk file key. Stating it here is what makes a future caller
+    that widens those preconditions fail loudly rather than silently reassign
+    a live row to another project.
+    """
+    existing = _make_decision(
+        id='esc-5914-1',
+        project='df',
+        filed_at='2026-07-07T00:00:00+00:00',
+        state=sr.DecisionState.DROPPED,
+        manual_boost=7,
+    )
+    incoming = _make_decision(
+        id='esc-5914-1',
+        project='df',
+        filed_at='2026-08-19T00:00:00+00:00',
+        state=sr.DecisionState.OPEN,
+        manual_boost=0,
+    )
+
+    merged = sr.merge_same_queue_refile(existing, incoming)
+
+    assert merged.filed_at == '2026-07-07T00:00:00+00:00'
+    assert merged.state == sr.DecisionState.DROPPED
+    assert merged.manual_boost == 7
+    assert merged.id == 'esc-5914-1'
+    assert merged.project == 'df'
+
+
+def test_merge_same_queue_refile_takes_the_watcher_owned_fields_verbatim() -> None:
+    """The WATCHER-owned half lands exactly as filed -- downgrades and empties too.
+
+    This is the half that keeps the watcher the sole authority on its own
+    escalation, and the one place this helper deliberately differs from
+    merge_decision_enrichment: there a second watcher may only FILL fields
+    the first left empty and may never downgrade severity
+    (_max_decision_severity), because two watchers are two views of one gate.
+    Here there is only ONE view -- the same watcher's, revised -- so freezing
+    the first values would strand stale prose and a stale severity in the
+    cockpit queue forever.
+    """
+    queue = '/queues/orch'
+    existing = _make_decision(
+        text='the original prose',
+        severity='critical',
+        task_id='5914',
+        session_id='watcher-df-1',
+        escalation_id='esc-5914-1',
+        options=['yes', 'no'],
+        escalations_dir=queue,
+    )
+    incoming = _make_decision(
+        text='the rephrased prose',
+        severity='info',
+        task_id=None,
+        session_id=None,
+        escalation_id='esc-5914-2',
+        options=None,
+        escalations_dir=queue,
+    )
+
+    merged = sr.merge_same_queue_refile(existing, incoming)
+
+    assert merged.text == 'the rephrased prose'
+    assert merged.severity == 'info'  # a DOWNGRADE lands (unlike enrichment)
+    assert merged.task_id is None  # ...and so does an EMPTYING
+    assert merged.session_id is None
+    assert merged.escalation_id == 'esc-5914-2'
+    assert merged.options is None
+    assert merged.escalations_dir == queue
+
+
+@pytest.mark.parametrize(
+    'state',
+    [
+        sr.DecisionState.ANSWERED,
+        sr.DecisionState.DROPPED,
+        'deferred-by-hand',
+    ],
+)
+def test_merge_same_queue_refile_preserves_an_unrecognized_state_verbatim(
+    state: str,
+) -> None:
+    """``state`` is copied as an opaque str, never coerced through DecisionState.
+
+    Mirrors DecisionState's own documented additive-safe contract:
+    DecisionRecord.state is a plain ``str`` with NO from_dict coercion, so an
+    unrecognized value must round-trip rather than raise -- or, here, be
+    silently reset to 'open'. A disposition some future writer adds is
+    therefore held back by this helper for free, instead of needing this
+    module to be taught about it first.
+    """
+    existing = _make_decision(state=state)
+    incoming = _make_decision(state=sr.DecisionState.OPEN)
+
+    assert sr.merge_same_queue_refile(existing, incoming).state == state
+
+
+def test_merge_same_queue_refile_is_pure() -> None:
+    """Neither argument may be mutated in place.
+
+    Mirrors test_merge_decision_enrichment_is_pure. The helper is
+    deliberately side-effect-free -- including of LOGGING, which stays in the
+    CLI verb at the policy boundary -- so it is trivially testable in
+    isolation, and so a caller holding the pre-merge record (e.g. to name the
+    held-back state in its divergence warning) still sees what it read.
+    """
+    existing = _make_decision(id='esc-5914-1', text='first?', state='dropped')
+    incoming = _make_decision(id='esc-5914-1', text='second?', state='open')
+    before_existing = existing.to_dict()
+    before_incoming = incoming.to_dict()
+
+    merged = sr.merge_same_queue_refile(existing, incoming)
+
+    assert merged is not existing
+    assert merged is not incoming
+    assert existing.to_dict() == before_existing
+    assert incoming.to_dict() == before_incoming
+
+
+def test_same_queue_refile_and_enrichment_agree_on_the_custody_field_set() -> None:
+    """THE ANTI-DIVERGENCE INVARIANT: one custody set, two merge branches.
+
+    After task 3872 the write-decision upsert has two merge arms --
+    merge_decision_enrichment (cross-queue) and merge_same_queue_refile
+    (same-queue) -- and the load-bearing shared rule is WHICH fields are
+    cockpit-owned. They differ only in how the WATCHER-owned half is taken
+    (fill-if-empty + severity-max vs. verbatim). Add a fourth custody field
+    to one and forget the other and the regression is silent: every
+    field-specific test above still passes.
+
+    Arranged so the two halves are separable. *existing* leaves every
+    fill-if-empty field empty (text/task_id/session_id/escalation_id/options/
+    severity), so BOTH helpers take the watcher-owned half from *incoming*
+    and the two runs can only differ on custody. The queue axis is
+    neutralized (equal normalized ``escalations_dir`` on both), which is also
+    the precondition of the same-queue arm.
+
+    ``id``/``project``/``escalations_dir`` land in the set because both
+    records agree on them, not because either helper had to choose -- that
+    agreement is exactly the caller's precondition for this arm, so the set
+    is spelled out in full rather than filtered down to the three fields that
+    genuinely differ.
+    """
+    queue = '/queues/orch'
+    existing = _make_decision(
+        text='',
+        task_id=None,
+        session_id=None,
+        escalation_id=None,
+        options=None,
+        severity='',
+        filed_at='2026-07-07T00:00:00+00:00',
+        state=sr.DecisionState.DROPPED,
+        manual_boost=7,
+        escalations_dir=queue,
+    )
+    incoming = _make_decision(
+        text="the watcher's current view",
+        task_id='5914',
+        session_id='watcher-df-1',
+        escalation_id='esc-5914-1',
+        options=['yes', 'no'],
+        severity='critical',
+        filed_at='2026-08-19T00:00:00+00:00',
+        state=sr.DecisionState.OPEN,
+        manual_boost=0,
+        escalations_dir=queue,
+    )
+
+    def _kept_from_existing(merged: sr.DecisionRecord) -> set[str]:
+        return {
+            f.name
+            for f in dataclasses.fields(sr.DecisionRecord)
+            if getattr(merged, f.name) == getattr(existing, f.name)
+        }
+
+    enriched = _kept_from_existing(sr.merge_decision_enrichment(existing, incoming))
+    refiled = _kept_from_existing(sr.merge_same_queue_refile(existing, incoming))
+
+    assert enriched == refiled
+    assert refiled == {
+        'id',
+        'project',
+        'filed_at',
+        'state',
+        'manual_boost',
+        'escalations_dir',
+    }
+
 
 # ---------------------------------------------------------------------------
 # Project-token canonicalization (task 3807)
@@ -7550,6 +7761,250 @@ def test_main_write_decision_same_queue_refile_still_fully_overwrites(
     assert listed[0].manual_boost == 9  # the operator's boost survives
     assert listed[0].filed_at == filed_at  # queue age not restamped
 
+@pytest.mark.parametrize(
+    'closed_state',
+    [
+        sr.DecisionState.DROPPED,
+        sr.DecisionState.ANSWERED,
+        'deferred-by-hand',
+    ],
+)
+def test_main_write_decision_same_queue_refile_does_not_resurrect_a_closed_record(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    closed_state: str,
+) -> None:
+    """THE HEADLINE REGRESSION (task 3872), at the CLI boundary.
+
+    An operator dismisses a still-PARKED row in the cockpit decision queue
+    (C5b), and the watcher that filed it restarts. Both watcher SKILLs tell
+    an agent to re-file the same stable id on every restart while an item
+    stays parked -- so before this change the dismissal was silently undone
+    on the very next restart, and again, and again: the guarded upsert block
+    was scoped to an OPEN record, so a non-open one fell through to
+    ``record = incoming``, a freshly constructed record carrying state=open,
+    manual_boost=0 and a restamped filed_at. reap_answered_decisions likewise
+    skips a non-open decision, so nothing downstream re-closed it either.
+    C5b's drop action was therefore INERT for exactly the class of row it
+    exists for, and the operator's dismissal could never stick.
+
+    Arranged through the REAL cross-subsystem sequence rather than a
+    hand-built record: filed through the verb, then triaged via the same
+    set_manual_boost / update_decision_state helpers cockpit/app.py calls,
+    then re-filed through the verb from the SAME queue.
+
+    Parametrized over an unrecognized state as well as the two DecisionState
+    members, since DecisionRecord.state is a plain str with no from_dict
+    coercion -- a disposition a future writer adds must be held back too,
+    not silently reset to 'open' by a module that has not been taught it.
+
+    The final two asserts are what keep this from over-firing into "a closed
+    row is frozen": the watcher's OWN fields still land, so the row's prose
+    and severity stay current even while it stays closed.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+
+    rc1 = _file_decision(
+        id='esc-5914-1',
+        project='df',
+        text='Adopt the reify plan?',
+        severity='critical',
+        task_id='5914',
+        escalations_dir=str(orch),
+    )
+    filed_at = sr.list_decisions(root=tmp_path)[0].filed_at
+    # The operator triages the row in the cockpit: boosts it, then dismisses
+    # it. Same two helpers cockpit/app.py's C5b drop action calls.
+    assert sr.set_manual_boost('esc-5914-1', 9, root=tmp_path) is not None
+    assert sr.update_decision_state('esc-5914-1', closed_state, root=tmp_path) is not None
+
+    # ...and the watcher restarts, re-filing its own id from its own queue.
+    rc2 = _file_decision(
+        id='esc-5914-1',
+        project='df',
+        text='reify? (rephrased)',
+        severity='info',
+        escalations_dir=str(orch),
+    )
+
+    assert rc1 == 0
+    assert rc2 == 0
+    listed = sr.list_decisions(root=tmp_path)
+    assert [d.id for d in listed] == ['esc-5914-1']
+    survivor = listed[0]
+    assert survivor.state == closed_state  # the operator's disposition STICKS
+    assert survivor.manual_boost == 9  # ...as does their boost
+    assert survivor.filed_at == filed_at  # ...and queue age is not restamped
+    assert survivor.text == 'reify? (rephrased)'  # but the row is not FROZEN
+    assert survivor.severity == 'info'  # ...a downgrade still lands
+
+
+@pytest.mark.parametrize(
+    'closed_state', [sr.DecisionState.DROPPED, sr.DecisionState.ANSWERED]
+)
+def test_main_write_decision_cross_queue_refile_of_a_closed_record_still_overwrites(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    closed_state: str,
+) -> None:
+    """The deliberately-UNCHANGED neighbour: the QUEUE is the discriminator.
+
+    Stated adjacently to the test above so a future reader cannot mistake
+    task 3872's change for "non-open records are now always protected". The
+    axis is the QUEUE, not the state: within ONE queue an ``esc-<taskid>-<n>``
+    id is unique (task 3528's premise), so a same-queue re-file is
+    definitively the same gate the human already dealt with. ACROSS queues
+    the id namespaces genuinely collide -- dark_factory runs
+    ``data/escalations`` and ``data/reconciliation/escalations`` over one
+    namespace -- so a non-open cross-queue filing may be an unrelated NEW
+    ask, and holding it closed would make a live gate invisible, which is
+    the fail-CLOSED direction _run_reap_decisions' docstring rules out.
+
+    Absorbs (task 3872's amendment pass) the older
+    test_main_write_decision_non_open_record_is_still_overwritten, which
+    pinned this same orch-seed -> recon-file shape for an ANSWERED record and
+    is now parametrized in here instead of kept as a near-clone whose
+    docstring ("protection is scoped to an OPEN record") had gone false on
+    the same-queue axis. This version files through the CLI verb on both
+    sides and carries an operator boost as well, so the contrast with the
+    same-queue case is visible in every custody field rather than only in
+    `state`.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, recon = _two_queues(tmp_path)
+
+    _file_decision(
+        id='esc-5914-1',
+        project='df',
+        text='Adopt the reify plan?',
+        severity='critical',
+        escalations_dir=str(orch),
+    )
+    assert sr.set_manual_boost('esc-5914-1', 9, root=tmp_path) is not None
+    assert sr.update_decision_state('esc-5914-1', closed_state, root=tmp_path) is not None
+
+    # A DIFFERENT queue files the same id -- possibly an unrelated new ask.
+    rc = _file_decision(
+        id='esc-5914-1',
+        project='df',
+        text='a brand new question that merely shares the id',
+        severity='info',
+        escalations_dir=str(recon),
+    )
+
+    assert rc == 0
+    listed = sr.list_decisions(root=tmp_path)
+    assert [d.id for d in listed] == ['esc-5914-1']
+    survivor = listed[0]
+    assert survivor.state == sr.DecisionState.OPEN  # re-opened: a new ask
+    assert survivor.manual_boost == 0
+    assert survivor.text == 'a brand new question that merely shares the id'
+    assert survivor.escalations_dir == sr.normalize_escalations_dir(recon)
+
+def test_main_write_decision_warns_when_a_same_queue_refile_is_held_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Holding a closed row closed must be LOUD, not silent.
+
+    This is the ONE place the verb deliberately declines to do what the filer
+    asked: the watcher's filing carries ``state=open`` (the verb's own
+    default) and the row stays closed. The repo's loud-over-silent-degradation
+    norm applies, and the watcher SKILLs' own discipline is to ADJUDICATE such
+    a divergence rather than assume the re-file landed -- which it can only do
+    if the divergence is visible.
+
+    The message must name BOTH the decision id and the held state, so an
+    operator or agent reading the log can tell WHICH row and WHAT disposition
+    was preserved; a bare "held back" line would send them to read the file.
+
+    stdout is asserted UNCHANGED on purpose: both SKILLs document "if the id
+    doesn't come back on stdout, your filing did not land" as the
+    did-it-work signal, and this filing DID land (its text and severity were
+    written) -- so repurposing that channel as a failure indicator here would
+    break a contract agents already rely on. The divergence goes to the log.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+
+    _file_decision(
+        id='esc-5914-1',
+        project='df',
+        text='Adopt the reify plan?',
+        severity='critical',
+        escalations_dir=str(orch),
+    )
+    assert (
+        sr.update_decision_state('esc-5914-1', sr.DecisionState.DROPPED, root=tmp_path)
+        is not None
+    )
+    capsys.readouterr()  # discard the first filing's stdout
+
+    with caplog.at_level(logging.WARNING):
+        rc = _file_decision(
+            id='esc-5914-1',
+            project='df',
+            text='reify? (rephrased)',
+            severity='info',
+            escalations_dir=str(orch),
+        )
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == 'esc-5914-1'  # the id still lands
+    held = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and 'esc-5914-1' in r.getMessage()
+    ]
+    assert held, 'holding a closed row closed must be logged, not silent'
+    assert 'dropped' in held[0].getMessage()  # names the PRESERVED disposition
+
+
+def test_main_write_decision_same_queue_refile_of_an_open_record_is_quiet(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """THE NOISE GUARD: the ordinary restart re-file must say nothing.
+
+    A same-queue re-file against an OPEN record is by far the common path --
+    every watcher restart, for every still-parked item. Nothing the filer
+    asked for was declined there (it files ``state=open`` and the row IS
+    open), so a warning would be pure noise, and a warning on every restart
+    is how the genuinely-actionable one above gets tuned out.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+
+    _file_decision(
+        id='esc-5914-1',
+        project='df',
+        text='Adopt the reify plan?',
+        severity='critical',
+        escalations_dir=str(orch),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        rc = _file_decision(
+            id='esc-5914-1',
+            project='df',
+            text='reify? (rephrased)',
+            severity='info',
+            escalations_dir=str(orch),
+        )
+
+    assert rc == 0
+    assert sr.list_decisions(root=tmp_path)[0].state == sr.DecisionState.OPEN
+    noise = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and 'esc-5914-1' in r.getMessage()
+    ]
+    assert not noise, f'the common restart path must be quiet, got: {noise}'
+
 
 def test_main_write_decision_same_id_different_project_is_refused(
     monkeypatch: pytest.MonkeyPatch,
@@ -7630,43 +8085,78 @@ def test_main_write_decision_same_id_different_project_is_refused(
     assert 'dark_factory' in refusals[0].getMessage()
 
 
-def test_main_write_decision_non_open_record_is_still_overwritten(
+def test_main_write_decision_cross_project_filing_over_a_closed_record_overwrites(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Protection is scoped to an OPEN record, as the task words it.
+    """The cross-PROJECT refusal keeps its OPEN scoping (task 3872).
 
-    An ANSWERED record is a question the human already dealt with; a second
-    watcher filing that id is starting a NEW ask, not enriching a live one,
-    so it gets today's plain overwrite (which re-opens it -- state comes
-    from the incoming record). Enriching instead would silently graft the
-    new question onto a closed row's history.
+    The other half of the test above, and the arm task 3872 left deliberately
+    alone: the refusal fires only while the INCUMBENT is open, because
+    refusing exists to protect a LIVE row (with an operator's boost and
+    disposition on it) from being deleted. A closed incumbent is not such a
+    row, and two projects always run different queue dirs -- so a
+    cross-project collision is by construction a CROSS-queue filing, on the
+    axis where ``esc-<taskid>-<n>`` namespaces genuinely collide and a closed
+    record cannot be shown to be the same gate. Holding it closed there would
+    hide a live gate, the fail-CLOSED direction _run_reap_decisions rules
+    out, so it takes today's plain overwrite instead.
+
+    Pinned at the CLI boundary because the restructured guard in
+    _run_write_decision made ``existing.state == OPEN`` a NEW decision point
+    INSIDE the cross-project arm, whose false branch is this overwrite: with
+    nothing here, tightening that arm to refuse EVERY cross-project filing
+    (including against a closed incumbent) passes the whole decision suite.
+
+    The no-ERROR assert is half the point: a refusal here would be the
+    silent-drop failure -- the row overwritten or not, but this project's ask
+    never reaching the cockpit either way.
     """
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
     orch, recon = _two_queues(tmp_path)
-    sr.write_decision(
-        _make_decision(
-            id='esc-5914-1',
-            project='df',
-            text='the old, answered question',
-            state=sr.DecisionState.ANSWERED,
-            escalations_dir=sr.normalize_escalations_dir(orch),
-        ),
-        root=tmp_path,
-    )
 
     _file_decision(
-        id='esc-5914-1',
+        id='esc-42-1',
         project='df',
-        text='a brand new question',
-        escalations_dir=str(recon),
+        text='Adopt the reify plan?',
+        severity='info',
+        escalations_dir=str(orch),
+    )
+    # The operator triages df's row in the cockpit and dismisses it.
+    assert sr.set_manual_boost('esc-42-1', 9, root=tmp_path) is not None
+    assert (
+        sr.update_decision_state('esc-42-1', sr.DecisionState.DROPPED, root=tmp_path)
+        is not None
     )
 
+    with caplog.at_level(logging.ERROR):
+        rc = _file_decision(
+            id='esc-42-1',
+            project='reify',
+            text='an unrelated reify gate that merely shares the id',
+            severity='critical',
+            escalations_dir=str(recon),
+        )
+
+    assert rc == 0
     listed = sr.list_decisions(root=tmp_path)
-    assert [d.id for d in listed] == ['esc-5914-1']
-    assert listed[0].text == 'a brand new question'
-    assert listed[0].state == sr.DecisionState.OPEN
-    assert listed[0].escalations_dir == sr.normalize_escalations_dir(recon)
+    assert [d.id for d in listed] == ['esc-42-1']
+    survivor = listed[0]
+    # Fully overwritten -- not refused, and no custody held for the other
+    # project's dead row.
+    assert survivor.project == 'reify'
+    assert survivor.text == 'an unrelated reify gate that merely shares the id'
+    assert survivor.severity == 'critical'
+    assert survivor.state == sr.DecisionState.OPEN
+    assert survivor.manual_boost == 0
+    assert survivor.escalations_dir == sr.normalize_escalations_dir(recon)
+    refusals = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.ERROR and 'esc-42-1' in r.getMessage()
+    ]
+    assert not refusals, f'a closed incumbent must not be defended, got: {refusals}'
 
 
 def test_main_write_decision_enriches_a_legacy_unstamped_record(
