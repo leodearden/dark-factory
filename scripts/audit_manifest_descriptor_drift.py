@@ -431,6 +431,23 @@ class AuditCoverage(NamedTuple):
     enumerated at all — the one case where a zero finding count means nothing.
     Every field after the counts is defaulted so it is purely additive to
     positional construction.
+
+    THE LABEL-BINDING DIRECTION CLOSES ITS OWN IDENTITY, for the same reason:
+    ``ProjectAudit.unbound_labels`` must never read as the whole population it
+    came from. ``manifest_bearing_tasks`` counts every task the stamper would
+    admit, and each lands in exactly one class::
+
+        manifest_bearing_tasks == tasks_bound_to_a_declared_label
+                                  + len(ProjectAudit.unbound_labels)
+                                  + tasks_without_a_tracked_sidecar
+                                  + tasks_on_an_unparseable_sidecar
+
+    A sidecar that is absent or untracked and one that is tracked but will not
+    parse are separate terms, because only the second IS tracked. Both classes
+    are COUNTED and never itemized in ``uncomparable_details``. The first is a
+    stamper no-op that numbers in the hundreds live, and would bury the rows
+    the report exists to show. The second's sidecar is already named in
+    ``manifest_parse_failure_details``.
     """
 
     manifests_swept: int
@@ -445,6 +462,10 @@ class AuditCoverage(NamedTuple):
     manifest_parse_failure_details: tuple[str, ...] = ()
     uncomparable_details: tuple[str, ...] = ()
     git_discovery_failed: bool = False
+    manifest_bearing_tasks: int = 0
+    tasks_bound_to_a_declared_label: int = 0
+    tasks_without_a_tracked_sidecar: int = 0
+    tasks_on_an_unparseable_sidecar: int = 0
 
 
 class UnboundLabel(NamedTuple):
@@ -504,12 +525,27 @@ def _unbound_sort_key(row: UnboundLabel) -> tuple[str, int]:
     return (row.manifest, row.task_id)
 
 
-def _unbound_labels(
+class LabelBindingSweep(NamedTuple):
+    """The label-binding direction's rows, and the population they came from.
+
+    The four counts partition ``manifest_bearing_tasks`` together with
+    ``len(unbound_labels)`` — see :class:`AuditCoverage`.
+    """
+
+    unbound_labels: list[UnboundLabel]
+    manifest_bearing_tasks: int
+    tasks_bound_to_a_declared_label: int
+    tasks_without_a_tracked_sidecar: int
+    tasks_on_an_unparseable_sidecar: int
+
+
+def _sweep_label_bindings(
     bindings: tuple[ManifestBinding, ...],
     declared_by_manifest: dict[str, tuple[str, ...]],
     unparseable_manifests: set[str],
-) -> list[UnboundLabel]:
-    """Every binding whose tracked, parsed sidecar does not declare its label.
+) -> LabelBindingSweep:
+    """Classify every binding, and list those whose tracked, parsed sidecar
+    does not declare their label.
 
     Mirrors the stamper's own matching in
     fused-memory/src/fused_memory/server/manifest_stamping.py::_stamp_capability_manifests_impl.
@@ -535,21 +571,33 @@ def _unbound_labels(
 
     Never invent a sidecar entry for a label the plan does not declare.
     """
-    rows = [
-        UnboundLabel(
-            task_id=binding.task_id,
-            label=binding.label,
-            status=binding.status,
-            manifest=binding.manifest,
-            declared_labels=declared_by_manifest[binding.manifest],
-        )
-        for binding in bindings
-        if binding.manifest not in unparseable_manifests
-        and binding.manifest in declared_by_manifest
-        and binding.label not in declared_by_manifest[binding.manifest]
-    ]
+    rows: list[UnboundLabel] = []
+    bound = without_tracked_sidecar = on_unparseable_sidecar = 0
+    for binding in bindings:
+        if binding.manifest in unparseable_manifests:
+            on_unparseable_sidecar += 1
+            continue
+        declared = declared_by_manifest.get(binding.manifest)
+        if declared is None:
+            without_tracked_sidecar += 1
+        elif binding.label in declared:
+            bound += 1
+        else:
+            rows.append(UnboundLabel(
+                task_id=binding.task_id,
+                label=binding.label,
+                status=binding.status,
+                manifest=binding.manifest,
+                declared_labels=declared,
+            ))
     rows.sort(key=_unbound_sort_key)
-    return rows
+    return LabelBindingSweep(
+        unbound_labels=rows,
+        manifest_bearing_tasks=len(bindings),
+        tasks_bound_to_a_declared_label=bound,
+        tasks_without_a_tracked_sidecar=without_tracked_sidecar,
+        tasks_on_an_unparseable_sidecar=on_unparseable_sidecar,
+    )
 
 
 def audit_project(project_root: str, manifest_root: str | None = None) -> ProjectAudit:
@@ -590,6 +638,10 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
                 task_entries_with_no_sidecar_capability=0,
                 uncomparable_details=(str(exc),),
                 git_discovery_failed=True,
+                manifest_bearing_tasks=0,
+                tasks_bound_to_a_declared_label=0,
+                tasks_without_a_tracked_sidecar=0,
+                tasks_on_an_unparseable_sidecar=0,
             ),
         )
 
@@ -716,12 +768,13 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
                 )
 
     findings.sort(key=_drift_sort_key)
+    label_bindings = _sweep_label_bindings(
+        scan.manifest_bindings, declared_by_manifest, unparseable_manifests)
     return ProjectAudit(
         project_root=root,
         manifest_root=manifests_root,
         findings=findings,
-        unbound_labels=_unbound_labels(
-            scan.manifest_bindings, declared_by_manifest, unparseable_manifests),
+        unbound_labels=label_bindings.unbound_labels,
         coverage=AuditCoverage(
             manifests_swept=manifests_swept,
             mechanical_capabilities_compared=compared,
@@ -734,6 +787,10 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
             task_entries_with_no_sidecar_capability=orphaned_entries,
             manifest_parse_failure_details=tuple(parse_failure_details),
             uncomparable_details=tuple(uncomparable_details),
+            manifest_bearing_tasks=label_bindings.manifest_bearing_tasks,
+            tasks_bound_to_a_declared_label=label_bindings.tasks_bound_to_a_declared_label,
+            tasks_without_a_tracked_sidecar=label_bindings.tasks_without_a_tracked_sidecar,
+            tasks_on_an_unparseable_sidecar=label_bindings.tasks_on_an_unparseable_sidecar,
         ),
     )
 
@@ -811,6 +868,12 @@ def _format_coverage(coverage: AuditCoverage) -> list[str]:
             ("unconvertible sidecar descriptors:",
              coverage.unconvertible_sidecar_descriptors),
             ("manifests that failed to parse:", coverage.manifest_parse_failures),
+            # The label-binding direction. With the unbound-label count these
+            # partition the manifest-bearing tasks; see AuditCoverage.
+            ("manifest-bearing tasks:", coverage.manifest_bearing_tasks),
+            ("tasks bound to a declared label:", coverage.tasks_bound_to_a_declared_label),
+            ("tasks with no tracked sidecar:", coverage.tasks_without_a_tracked_sidecar),
+            ("tasks on an unparseable sidecar:", coverage.tasks_on_an_unparseable_sidecar),
         ],
         details=(*coverage.manifest_parse_failure_details, *coverage.uncomparable_details),
     )
