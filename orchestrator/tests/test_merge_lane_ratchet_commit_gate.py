@@ -174,17 +174,31 @@ class _Repo:
         repo = cls.seeded(tmp_path)
         repo.git('switch', '--quiet', '-c', 'task')
         repo._commit_side('ours', ours, ours_ledger)
-        repo.git('switch', '--quiet', 'main')
-        repo._commit_side('theirs', theirs, theirs_ledger)
-        repo.git('switch', '--quiet', 'task')
-        if before_merge is not None:
-            before_merge(repo)
-        repo.git('merge', 'main', check=False)
-        merge_head = repo.git('rev-parse', '-q', '--verify', 'MERGE_HEAD', check=False)
-        assert merge_head, '`git merge main` did not stop on the sentinel conflict'
-        repo._write('conflict.txt', 'resolved\n')
-        repo.stage('conflict.txt')
+        repo.merge_main(theirs=theirs, theirs_ledger=theirs_ledger, before_merge=before_merge)
         return repo
+
+    def merge_main(
+        self,
+        *,
+        theirs: dict | _Baseline | None = None,
+        theirs_ledger: dict | None = None,
+        before_merge: Callable[[_Repo], None] | None = None,
+    ) -> None:
+        """Commit *theirs* on main, then `git merge main` on 'task' until it STOPS.
+
+        One round of :meth:`mid_merge`, callable again once a round's merge is
+        committed -- the shape of a branch that merges main more than once.
+        """
+        self.git('switch', '--quiet', 'main')
+        self._commit_side('theirs', theirs, theirs_ledger)
+        self.git('switch', '--quiet', 'task')
+        if before_merge is not None:
+            before_merge(self)
+        self.git('merge', 'main', check=False)
+        merge_head = self.git('rev-parse', '-q', '--verify', 'MERGE_HEAD', check=False)
+        assert merge_head, '`git merge main` did not stop on the sentinel conflict'
+        self._write('conflict.txt', 'resolved\n')
+        self.stage('conflict.txt')
 
     def _commit_side(
         self, side: str, baseline: dict | _Baseline | None, ledger: dict | None
@@ -195,7 +209,9 @@ class _Repo:
             self.write_baseline(baseline)
         if ledger is not None:
             self.write_ledger(ledger)
-        self._write('conflict.txt', f'{side}\n')
+        # UNIQUE PER COMMIT: a sentinel main rewrote unchanged since the merge
+        # base would merge cleanly, and a second round would never stop.
+        self._write('conflict.txt', f'{side} on {self.git("rev-parse", "HEAD")}\n')
         self.commit_all(f'{side}: move the ratchet artifacts')
 
     def git(self, *args: str, check: bool = True) -> str:
@@ -769,6 +785,32 @@ class TestAConflictedMergeLedgerIsAuditedAgainstBothParents:
 
         result = repo.gate()
 
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    def test_a_branch_that_kept_ours_then_theirs_can_merge_main_again(
+        self, tmp_path: Path
+    ) -> None:
+        # Once a branch keeps ours-then-theirs, main's ledger no longer extends
+        # the branch's prefix. git still merges the next round's text cleanly,
+        # interleaving the two histories, and that clean merge must pass.
+        ours_own, theirs_own = _record([], '5722'), _record([], '3620')
+        theirs_next = _record([], '3790')
+        repo = _Repo.mid_merge(
+            tmp_path,
+            ours_ledger=_ledger_with(ours_own),
+            theirs_ledger=_ledger_with(theirs_own),
+        )
+        repo.write_ledger(_ledger_with(ours_own, theirs_own))
+        repo.stage(metrics.LEDGER_RELPATH)
+        first_round = repo.gate()
+        assert first_round.returncode == 0, first_round.stdout + first_round.stderr
+        repo.commit_all('merge main, keeping ours then theirs')
+
+        repo.merge_main(theirs_ledger=_ledger_with(theirs_own, theirs_next))
+
+        merged = metrics.load_ledger(repo.root / metrics.LEDGER_RELPATH)
+        assert merged['raises'] == [ours_own, theirs_own, theirs_next]
+        result = repo.gate()
         assert result.returncode == 0, result.stdout + result.stderr
 
     def test_keeping_heads_ledger_over_merge_heads_entry_is_refused(

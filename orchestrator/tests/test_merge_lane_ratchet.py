@@ -2767,9 +2767,11 @@ class TestLedgerMergedEntries:
 
     A conflicted merge finished with `git commit` runs pre-commit with
     MERGE_HEAD set (esc-3620-11), so its staged ledger descends from two
-    recorded histories, not one. Each side's entries must survive whole, in
-    whichever block order the resolver kept them, and only what follows both is
-    the merge's OWN -- the one thing that may cover a raise the merge makes.
+    recorded histories, not one. Each parent's entries must survive whole AND
+    in that parent's own order; the two histories may interleave, the way git's
+    merge of the text interleaves them, but nothing foreign may sit among them.
+    Only what follows both histories and belongs to NEITHER parent is the
+    merge's OWN -- the one thing that may cover a raise the merge makes.
     """
 
     @staticmethod
@@ -2801,9 +2803,9 @@ class TestLedgerMergedEntries:
     def test_both_sides_additions_are_accepted_in_either_block_order(
         self, theirs_first: bool
     ) -> None:
-        # A resolver facing a both-sides-appended conflict keeps both blocks in
-        # whichever order the conflict shows them; neither order rewrites
-        # anything either parent recorded.
+        # A resolver facing a both-sides-appended conflict keeps both entries in
+        # whichever order the conflict shows them; either interleaving keeps
+        # each parent's entries unchanged and in that parent's own order.
         history, ours_own, theirs_own = self._entries()
         blocks = [theirs_own, ours_own] if theirs_first else [ours_own, theirs_own]
 
@@ -2855,6 +2857,92 @@ class TestLedgerMergedEntries:
                 _ledger(history, theirs_own),
                 _ledger(history, forged, ours_own),
             )
+
+    @staticmethod
+    def _merged_before() -> tuple[dict, dict, dict, dict]:
+        """Shared history, ours' own, theirs' own, and theirs' next addition.
+
+        The shape of a branch that merged main once, kept ours-then-theirs, and
+        now merges main again after main appended one more entry.
+        """
+        return (
+            _ledger_record('5485'),
+            _ledger_record('5792'),
+            _ledger_record('3620'),
+            _ledger_record('3790'),
+        )
+
+    def test_a_branch_that_kept_ours_then_theirs_can_merge_again(self) -> None:
+        # The reviewer's case, measured: git merges [h,o,t] and [h,t,t2] over
+        # base [h,t] cleanly to [h,o,t,t2]. No block order reproduces that.
+        history, ours_own, theirs_own, theirs_next = self._merged_before()
+
+        assert metrics.ledger_merged_entries(
+            _ledger(history, ours_own, theirs_own),
+            _ledger(history, theirs_own, theirs_next),
+            _ledger(history, ours_own, theirs_own, theirs_next),
+        ) == []
+
+    def test_a_branch_merging_after_another_landed_interleaves(self) -> None:
+        # Main now carries another branch's ours-then-theirs order, and this
+        # branch appended past the entry the two share.
+        history, other_own, shared, _theirs_next = self._merged_before()
+        ours_next = _ledger_record('5801')
+
+        assert metrics.ledger_merged_entries(
+            _ledger(history, shared, ours_next),
+            _ledger(history, other_own, shared),
+            _ledger(history, other_own, shared, ours_next),
+        ) == []
+
+    def test_the_merges_own_entries_follow_an_interleaved_history(self) -> None:
+        history, ours_own, theirs_own, theirs_next = self._merged_before()
+        own = _ledger_record('5900')
+
+        assert metrics.ledger_merged_entries(
+            _ledger(history, ours_own, theirs_own),
+            _ledger(history, theirs_own, theirs_next),
+            _ledger(history, ours_own, theirs_own, theirs_next, own),
+        ) == [own]
+
+    def test_reordering_one_parents_own_entries_is_refused(self) -> None:
+        # Ours recorded its own entry BEFORE the shared one; moving it after
+        # theirs' history rewrites the order ours recorded.
+        history, ours_own, theirs_own, theirs_next = self._merged_before()
+
+        with pytest.raises(metrics.AppendOnlyViolation) as excinfo:
+            metrics.ledger_merged_entries(
+                _ledger(history, ours_own, theirs_own),
+                _ledger(history, theirs_own, theirs_next),
+                _ledger(history, theirs_own, theirs_next, ours_own),
+            )
+
+        assert 'append-only' in str(excinfo.value)
+
+    def test_a_foreign_entry_inside_the_histories_is_refused(self) -> None:
+        history, ours_own, theirs_own, theirs_next = self._merged_before()
+        foreign = _ledger_record('5900')
+
+        with pytest.raises(metrics.AppendOnlyViolation):
+            metrics.ledger_merged_entries(
+                _ledger(history, ours_own, theirs_own),
+                _ledger(history, theirs_own, theirs_next),
+                _ledger(history, foreign, ours_own, theirs_own, theirs_next),
+            )
+
+    @pytest.mark.parametrize('with_own', [False, True], ids=['copy-only', 'copy-then-own'])
+    def test_a_copied_parent_entry_is_not_the_merges_own(self, with_own: bool) -> None:
+        # A duplicate of a recorded entry after both histories is still
+        # HISTORY: counting it as coverage is the standing permission
+        # LEDGER_README forbids.
+        history, ours_own, theirs_own, _theirs_next = self._merged_before()
+        own = [_ledger_record('5900')] if with_own else []
+
+        assert metrics.ledger_merged_entries(
+            _ledger(history, ours_own),
+            _ledger(history, theirs_own),
+            _ledger(history, ours_own, theirs_own, theirs_own, *own),
+        ) == own
 
 
 class TestUnrecordedRaises:
