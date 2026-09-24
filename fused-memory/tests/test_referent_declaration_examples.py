@@ -43,6 +43,8 @@ import ast
 import inspect
 import re
 from dataclasses import dataclass
+from functools import partial
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -196,7 +198,21 @@ _GROUP_ID = 'dark_factory'
 #: certified for SHAPE only. Named here so that is a visible choice.
 _CONTENT_NAMING_NO_TASK = 'Fallback content for a contentless example; it names no task.'
 
-_GUARDED_SITES = (('recon-prompt-fragment', render_referent_declaration_guidance),)
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _read_repo_doc(relative: str) -> str:
+    path = REPO_ROOT / relative
+    assert path.is_file(), f'{relative} is gone; update _GUARDED_SITES to its new home.'
+    return path.read_text()
+
+
+_GUARDED_DOCS = ('CLAUDE.md', '.claude/commands/memory.md', 'skills/reflect/SKILL.md')
+
+_GUARDED_SITES = (
+    ('recon-prompt-fragment', render_referent_declaration_guidance),
+    *((doc, partial(_read_repo_doc, doc)) for doc in _GUARDED_DOCS),
+)
 
 
 def _rejection(example: DeclaredExample) -> str | None:
