@@ -67,6 +67,7 @@ from audit_manifest_descriptor_drift import (
     load_task_store_scan,
 )
 from shared.capability_manifest import load_capability_manifest
+from shared.task_statuses import TERMINAL, TaskStatus
 
 # ---------------------------------------------------------------------------
 # Fixtures. The tasks-table schema and the tasks.db builder live in
@@ -1103,6 +1104,66 @@ def test_coverage_block_counts_the_label_binding_classes_as_aligned_rows(
     assert "    tasks with no tracked sidecar:      1" in lines
     assert "    tasks on an unparseable sidecar:    0" in lines
     assert "918273" not in report
+
+
+# LIVE or HISTORICAL — the mechanical form of task 4907's adjudication. The
+# hazard an unbound label carries is that a future commit_planning touching its
+# task stamps and copies nothing, and that can only happen to a task that is not
+# yet terminal.
+
+def _row_with_status(status: str) -> UnboundLabel:
+    return UnboundLabel(task_id=7, label="ω", status=status,
+                        manifest="plans/x-prd.capability-manifest.yaml",
+                        declared_labels=("α",))
+
+
+@pytest.mark.parametrize("status", ["done", "cancelled"])
+def test_a_done_or_cancelled_row_is_historical(status):
+    """No future commit_planning can touch a terminal task, so its label can no
+    longer cost anything. It is still REPORTED; it just is not live."""
+    assert _row_with_status(status).is_live is False
+
+
+@pytest.mark.parametrize(
+    "status", ["pending", "deferred", "blocked", "in-progress", "merge-deferred"])
+def test_a_non_terminal_row_is_live(status):
+    """A deferred or blocked task can still be pulled back into a planning
+    batch, and while it is live its label is still cheap to fix."""
+    assert _row_with_status(status).is_live is True
+
+
+@pytest.mark.parametrize("status", ["", "archived", "DONE"],
+                         ids=["empty", "unknown", "case-variant"])
+def test_an_unrecognised_status_is_live(status):
+    """Fails toward REPORTING. A status the shared vocabulary does not know is
+    never read as a confident 'nothing to fix'."""
+    assert _row_with_status(status).is_live is True
+
+
+def test_liveness_is_the_shared_terminal_set_not_a_local_copy():
+    """Across the whole vocabulary, a row is live exactly when its status is
+    outside shared.task_statuses.TERMINAL. Statuses are passed as the raw
+    strings tasks.db holds, so a local re-spelling of the terminal set that
+    drifts from the shared one fails here."""
+    for status in TaskStatus:
+        assert _row_with_status(status.value).is_live is (status not in TERMINAL), status
+
+
+def test_live_and_historical_rows_share_one_list(tmp_path, make_tasks_db):
+    """ONE list, both kinds, every row named. The live subset is derived from
+    it rather than reported in place of it."""
+    root = _make_project(
+        tmp_path, make_tasks_db,
+        tasks=[_labelled(7, status="done", label="ω"),
+               _labelled(8, status="pending", label="ψ"),
+               _labelled(9, status="cancelled", label="χ")],
+        manifests=[("plans/x-prd.capability-manifest.yaml", _declaring("α"))],
+    )
+
+    rows = audit_project(str(root)).unbound_labels
+
+    assert [(row.task_id, row.label) for row in rows] == [(7, "ω"), (8, "ψ"), (9, "χ")]
+    assert [row.task_id for row in rows if row.is_live] == [8]
 
 
 # ---------------------------------------------------------------------------
