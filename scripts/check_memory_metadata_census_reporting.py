@@ -12,6 +12,7 @@ healthy-looking unit can still have stopped the trend. OPERATIONS.md §12
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -25,6 +26,10 @@ SYSTEMD_UTC_TIMESTAMP = "%a %Y-%m-%d %H:%M:%S UTC"
 NEVER_RAN_TIMESTAMPS = frozenset({"", "n/a"})
 DEFAULT_REPO = "/home/leo/src/dark-factory"
 HISTORY_RELPATH = Path("plans") / "memory-metadata-coverage-history.json"
+USAGE = (
+    "usage: check_memory_metadata_census_reporting.py <hours>\n"
+    "  <hours>: the freshness window, a finite positive number"
+)
 
 
 class NotReporting(Exception):
@@ -34,11 +39,21 @@ class NotReporting(Exception):
 def read_unit_state() -> dict[str, str]:
     # systemctl renders timestamps in the caller's local zone; pin it so the
     # format parsed below is the only one that can arrive.
-    completed = subprocess.run(
-        ["systemctl", "--user", "show", "-p", ",".join(UNIT_FIELDS), UNIT],
-        env={**os.environ, "TZ": "UTC"},
-        capture_output=True, text=True, timeout=30,
-    )
+    try:
+        completed = subprocess.run(
+            ["systemctl", "--user", "show", "-p", ",".join(UNIT_FIELDS), UNIT],
+            env={**os.environ, "TZ": "UTC"},
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise NotReporting(
+            f"UNREADABLE UNIT STATE: could not read unit state of {UNIT} ({exc})"
+        ) from None
+    if completed.returncode != 0:
+        raise NotReporting(
+            f"UNREADABLE UNIT STATE: could not read unit state of {UNIT}: "
+            f"systemctl exited {completed.returncode} ({completed.stderr.strip()!r})"
+        )
     return dict(
         line.split("=", 1) for line in completed.stdout.splitlines() if "=" in line
     )
@@ -77,6 +92,16 @@ def last_run_age(state: dict[str, str], window_hours: float) -> float:
             f"outside the {window_hours:g}h window"
         )
     return age
+
+
+def require_succeeded(state: dict[str, str]) -> None:
+    result = state.get("Result", "")
+    status = state.get("ExecMainStatus", "")
+    if result != "success" or status != "0":
+        raise NotReporting(
+            f"FAILED LAST RUN: {UNIT} last run ended Result={result!r} "
+            f"ExecMainStatus={status!r}; read journalctl --user -u {UNIT} -n 100"
+        )
 
 
 def history_path() -> Path:
@@ -153,6 +178,7 @@ def assess(window_hours: float) -> str:
     state = read_unit_state()
     require_installed(state)
     run_age = last_run_age(state, window_hours)
+    require_succeeded(state)
     row_age = history_row_age(window_hours)
     return (
         f"OK: {UNIT} last ran {run_age:.1f}h ago; "
@@ -160,9 +186,23 @@ def assess(window_hours: float) -> str:
     )
 
 
-def main(argv: list[str]) -> int:
+def parse_window(args: list[str]) -> float | None:
+    if len(args) != 1:
+        return None
     try:
-        verdict = assess(float(argv[1]))
+        hours = float(args[0])
+    except ValueError:
+        return None
+    return hours if math.isfinite(hours) and hours > 0 else None
+
+
+def main(argv: list[str]) -> int:
+    window_hours = parse_window(argv[1:])
+    if window_hours is None:
+        print(USAGE, file=sys.stderr)
+        return 2
+    try:
+        verdict = assess(window_hours)
     except NotReporting as reason:
         print(reason, file=sys.stderr)
         return 1
