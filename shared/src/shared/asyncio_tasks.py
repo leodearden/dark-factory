@@ -25,7 +25,7 @@ import asyncio
 import logging
 from collections.abc import Callable
 
-__all__ = ['track_task']
+__all__ = ['abandon_task', 'track_task']
 
 logger = logging.getLogger(__name__)
 
@@ -71,3 +71,24 @@ def track_task(
             )
 
     task.add_done_callback(_release)
+
+
+def abandon_task(
+    task: asyncio.Task,
+    *registries: set[asyncio.Task],
+    on_done: Callable[[asyncio.Task], None] | None = None,
+) -> None:
+    """Cancel *task* without awaiting it, and track it until it has unwound.
+
+    For a caller that stopped waiting on *task* exceptionally — its own
+    budget expired, or it was itself cancelled. ``asyncio.wait(...,
+    timeout=...)`` does not cancel what it waits on, and awaiting the
+    cancellation would re-introduce the very hang the timeout exists to
+    bound, so the task is cancelled and handed to :func:`track_task`.
+
+    The task is in every registry when this returns, before the loop runs
+    again, so a caller may read ``len(registry)`` straight afterwards as a
+    backlog gauge.
+    """
+    task.cancel()
+    track_task(task, *registries, on_done=on_done)
