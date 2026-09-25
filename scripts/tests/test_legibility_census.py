@@ -2244,7 +2244,13 @@ def test_run_census_unlanded_commit_rolls_back_every_written_path_and_escalates(
     assert "census-state" in call["summary"] + detail
 
 
-def test_run_census_dry_run_unlanded_rolls_back_the_payloads_file_too(tmp_path):
+def test_run_census_dry_run_unlanded_rolls_back_the_payloads_file_and_keeps_its_facts(
+    tmp_path,
+):
+    """The payloads file is rolled back like the report. The dry-run record
+    survives only for what still holds -- nothing filed, how many payloads --
+    and its path names where the file was WRITTEN (the CensusOutcome
+    contract); where it is now is ``rollback``'s to say."""
     payloads_path = tmp_path / "confusion-census-2026-07-14-payloads.json"
     fake_roll_back = _make_fake_roll_back(
         unlanded.Rollback(quarantine_dir=tmp_path / "q" / "census-2026-07-14-x", paths=("a",)),
@@ -2256,9 +2262,12 @@ def test_run_census_dry_run_unlanded_rolls_back_the_payloads_file_too(tmp_path):
     outcome = mod.run_census(**kwargs)
 
     assert outcome.status == "unlanded"
-    assert outcome.dry_run is not None
-    assert outcome.dry_run.path == str(payloads_path)
     assert str(payloads_path) in fake_roll_back.calls[0]["paths"]
+    assert outcome.report_path is None
+    assert outcome.filed_ticket_ids == []
+    assert outcome.dry_run is not None
+    assert outcome.dry_run.payload_count == 1
+    assert outcome.dry_run.path == str(payloads_path)
 
 
 def _git(repo, *args):

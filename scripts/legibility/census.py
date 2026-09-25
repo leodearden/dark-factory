@@ -1799,7 +1799,14 @@ class CensusOutcome:
     pipeline ran and filed its tickets, but its commit did not land, so
     every written path -- census-state included -- was handed to
     ``roll_back`` to be quarantined and restored to HEAD; ``rollback``
-    says whether that restore completed)."""
+    says whether that restore completed).
+
+    On an ``"unlanded"`` outcome ``rollback`` is the one authority on where
+    each written output now is, and no other field points at a live file:
+    ``report_path`` is ``None``, and ``dry_run`` is kept only for the facts
+    that still hold (nothing was filed; ``payload_count`` payloads were
+    built) -- its ``path`` names where the payloads file was WRITTEN, not
+    where it is now."""
 
     status: str
     reason: str | None = None
@@ -1969,8 +1976,10 @@ def _unlanded(
 
     ONE owner of the ``"unlanded"`` shape, as ``_defer`` is of the deferral
     shape. *landed* is the outcome the run would have returned had its
-    commit landed; the unlanded outcome is that one minus the report it no
-    longer has. The escalation is best-effort for the same reason as
+    commit landed; the unlanded outcome is that one with every output --
+    report and dry-run payloads file alike -- rolled back (see
+    ``CensusOutcome`` for what its fields then name). The escalation is
+    best-effort for the same reason as
     ``_defer``'s: the ERROR line is the real signal either way.
     """
     rollback = roll_back(paths=commit_paths)
