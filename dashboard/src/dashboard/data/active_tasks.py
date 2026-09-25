@@ -443,10 +443,13 @@ def _build_task_row(
     no-provenance value) falls back to deriving it from metadata, which is
     safe because re-deriving a true ``None`` is idempotent.
 
-    *now* is the reference instant for the strand verdict, threaded from the
-    caller's single per-pass ``resolve_now`` (see ``_shape_one_project``) —
-    this function never reads the clock itself, so every row in one pass is
-    judged against the same instant.
+    *now* is the reference instant for the strand verdict — this function
+    never reads the clock itself, so every row in one pass is judged against
+    the same instant. ``_shape_one_project`` passes the rows' own ``as_of``
+    (the instant they were measured, matching ``task_snapshot._strand_split``),
+    NOT the render instant, so a stale half is not re-judged against a later
+    clock; ``shape_terminal_rows`` passes the render instant, which a terminal
+    row never consults (the predicate gates on ``in-progress``).
     """
     metadata = task.get('metadata') or {}
     meta_files = list(metadata.get('files') or [])
@@ -664,9 +667,16 @@ def _shape_one_project(
     alternative is blanking a project's table on one failed refresh, which is
     strictly less informative than showing what was last true.
 
-    *now* is the caller's single resolved instant: every row's ``started`` and
-    every ``stranded`` verdict share it, so two rows from different projects
-    cannot disagree about what time it is.
+    *now* is the caller's single resolved instant for the LIVE runtime: every
+    row's ``started`` shares it, so two rows from different projects cannot
+    disagree about what time it is. The ``stranded`` verdict is NOT judged at
+    *now* but at ``snapshot.rows.as_of`` — the instant the rows were measured
+    — for the reason ``task_snapshot._strand_split`` gives: a heartbeat
+    beating when the rows were read was live then, and re-judging a STALE half
+    against a later clock would badge every claim as abandoned while the
+    unit's own ``in_progress_stranded`` (judged at ``as_of``) says none is.
+    Both go through ``tasks.task_is_stranded`` at the same instant, so the
+    badge and the split cannot disagree on either the fresh or the stale path.
 
     *runtime* is this project's ``TaskRuntimeSnapshot`` (resolved ONCE by the
     caller — see ``collect_tasks_with_counts`` — via ``fetch_task_runtime``).
@@ -679,6 +689,9 @@ def _shape_one_project(
     tasks = snapshot.rows.value or []
     if not tasks:
         return []
+    # ``value is not None <=> as_of is not None`` holds by construction on the
+    # unit; the fallback only keeps a row shaped if that triad were ever broken.
+    judged_at = snapshot.rows.as_of if snapshot.rows.as_of is not None else now
 
     runtime_status = _probe_status(runtime)
     runtime_index: dict[int, TaskRuntimeEntry] = (
@@ -695,7 +708,7 @@ def _shape_one_project(
             continue
         rt = _runtime_fields(runtime_index, runtime_status, task_id, now=now)
         uid = task_uid(project, task_id)
-        row = _build_task_row(project, task, task_id, rt, uid, now=now)
+        row = _build_task_row(project, task, task_id, rt, uid, now=judged_at)
         # active rows: started from the runtime entry; deps from task tree.
         row['started'] = rt['started']
         row['deps'] = _resolve_deps(task, by_id, project, status_map=snapshot.status_map)

@@ -2348,6 +2348,51 @@ class TestTheReturnedUnitsCarryTheShapedRows:
         assert 'ReadTimeout' in (rows.reason or ''), rows.reason
         assert rows.value == active == fresh
 
+    async def test_a_stale_rows_half_is_strand_judged_when_it_was_measured(
+        self, tmp_path, monkeypatch, dummy_client,
+    ):
+        """Row badges on a STALE half agree with the unit's own ``in_progress_stranded``.
+
+        Both go through ``task_is_stranded`` at ``rows.as_of``, the instant the
+        rows were measured. Judging the badge at the render instant instead
+        would, once the substrate has been unreachable longer than
+        ``STRANDED_HEARTBEAT_TTL``, badge every claim as abandoned while the
+        split (judged at ``as_of``) reports none — the same rows disagreeing
+        with themselves on one wire payload.
+        """
+        import dashboard.data.task_snapshot as snapshot_mod
+        from dashboard.data.tasks import STRANDED_HEARTBEAT_TTL
+
+        (root,) = self._roots(tmp_path, 'df')
+        claimed = _raw_row(1, 'in-progress')
+        claimed['claimant_run_id'] = 'run-live'
+        claimed['heartbeat_at'] = _STUB_AS_OF.isoformat()
+        rows_in = [claimed, _raw_row(2, 'pending')]
+        healthy, _calls = _canned_mcp(rows_in, {int(r['id']): r['status'] for r in rows_in})
+        monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', healthy)
+        config = DashboardConfig(project_root=root)
+        fresh, fresh_units = await collect_tasks_with_counts(dummy_client, config, now=_STUB_AS_OF)
+        assert [row['stranded'] for row in fresh if row['status'] == 'in-progress'] == [False]
+        assert fresh_units['df'].in_progress_stranded == 0
+
+        async def _rows_read_fails(client, url, tool, args, **kwargs):
+            if tool == 'get_tasks':
+                raise httpx.ReadTimeout('canned read timeout')
+            return await healthy(client, url, tool, args, **kwargs)
+
+        monkeypatch.setattr('dashboard.data.tasks.mcp_tool_call', _rows_read_fails)
+        monkeypatch.setattr(snapshot_mod, 'SNAPSHOT_TTL_SECONDS', 0.0)
+        much_later = _STUB_AS_OF + STRANDED_HEARTBEAT_TTL + timedelta(minutes=1)
+        active, snapshots = await collect_tasks_with_counts(dummy_client, config, now=much_later)
+
+        unit = snapshots['df']
+        assert unit.rows.state is DatumState.STALE
+        assert unit.rows.as_of == _STUB_AS_OF
+        assert (unit.in_progress_live, unit.in_progress_stranded) == (1, 0)
+        badged = [row['stranded'] for row in active if row['status'] == 'in-progress']
+        assert badged == [False], 'the badge must be judged at as_of, like the split'
+        assert unit.rows.value == active == fresh
+
 
 # ---------------------------------------------------------------------------
 # collect_tasks_with_counts whole-handler budget (task 3857 steps 13/14)
