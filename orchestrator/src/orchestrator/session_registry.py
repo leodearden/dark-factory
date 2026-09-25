@@ -3336,9 +3336,10 @@ class LeaseHolder:
 
     session_slug: a CLAIMANT-CHOSEN ownership token, NOT a session-registry
         record key. The skills prescribe ``<lease-role>-<project>-<pid>``
-        (skills/escalation-watcher/SKILL.md:50,
-        skills/recon-escalation-watcher/SKILL.md:87,
-        skills/unblock/SKILL.md:42). Do NOT pass it to ``read_record``.
+        (escalation-watcher's and recon-escalation-watcher's "Claiming the
+        ... Lease" sections, and unblock's "Claim the unblock lease"). Do NOT
+        pass it to ``read_record``; the holder's record is reached through
+        ``record_slug`` below.
 
         THIS DOCSTRING USED TO CLAIM THE OPPOSITE -- that it was "the
         holder's own session-registry slug (see build_session_slug), letting
@@ -3362,18 +3363,33 @@ class LeaseHolder:
         human-readable contention/refusal message.
     pid: the holder process's pid; liveness is checked via _pid_alive.
     start_ts: ISO-8601 timestamp of when this holder claimed the lease.
+    record_slug: the holder's session-registry record key, resolved at claim
+        time from *pid*'s pointer (``resolve_session_slug_for_pid``). '' when
+        it could not be resolved or the body predates the field -- an
+        absence of evidence, never evidence of absence.
     """
 
     session_slug: str
     pid: int
     start_ts: str
+    record_slug: str = ''
 
     def to_dict(self) -> dict[str, Any]:
-        return {'session_slug': self.session_slug, 'pid': self.pid, 'start_ts': self.start_ts}
+        return {
+            'session_slug': self.session_slug,
+            'pid': self.pid,
+            'start_ts': self.start_ts,
+            'record_slug': self.record_slug,
+        }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> LeaseHolder:
-        return cls(session_slug=data['session_slug'], pid=data['pid'], start_ts=data['start_ts'])
+        return cls(
+            session_slug=data['session_slug'],
+            pid=data['pid'],
+            start_ts=data['start_ts'],
+            record_slug=data.get('record_slug') or '',
+        )
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict())
