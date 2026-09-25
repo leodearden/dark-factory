@@ -65,18 +65,32 @@ class _FakeEscalationQueue:
 
     *open_l2* controls the dedup path: when truthy, get_by_task returns it so the
     filer treats an open L2 as already present and does NOT re-submit.
+
+    *pending_from_submitted* answers from what was actually SUBMITTED instead, keyed on
+    ``task_id`` (and the asked-for status and level) the way the real queue's lookup
+    is.  A fixed *open_l2* gives the same answer for every key, so it can only show
+    that the filer ASKS.  Keying on what was filed is what shows a pending escalation
+    under one key leaves every other key free to file.
     """
 
-    def __init__(self, open_l2=None) -> None:
+    def __init__(self, open_l2=None, *, pending_from_submitted: bool = False) -> None:
         self.submitted: list = []
         self.get_by_task_calls: list = []
         self._open_l2 = open_l2
+        self._pending_from_submitted = pending_from_submitted
 
     def make_id(self, task_id: str) -> str:
         return f'esc-{task_id}-1'
 
     def get_by_task(self, task_id, *, status=None, level=None):
         self.get_by_task_calls.append((task_id, status, level))
+        if self._pending_from_submitted:
+            return [
+                esc for esc in self.submitted
+                if esc.task_id == task_id
+                and (status is None or esc.status == status)
+                and (level is None or esc.level == level)
+            ]
         return self._open_l2
 
     def submit(self, esc) -> None:
@@ -1138,29 +1152,52 @@ class TestRegressedAfterResolution:
         """(b) A pending L2 for the same regression is not re-filed; the dedup key is
         per (test, cycle), because each regression is a DISTINCT failed fix citing a
         distinct commit.  One global sentinel would let the first pending L2 swallow a
-        second test's regression, or a later cycle's."""
+        second test's regression, or a later cycle's.
+
+        The queue answers from what was really filed, so both halves are shown against
+        pending L2s.  The same (test, cycle) observed again, here through a second
+        ledger, is deduped.  A later cycle of that test, and another test's cycle, each
+        file their own while the first L2 is still pending."""
+        q = _FakeEscalationQueue(pending_from_submitted=True)
         client = _FakeLedgerTaskClient()
-        q = _FakeEscalationQueue(open_l2=[object()])
         wired = {'task_client': client, 'escalation_queue': q}
         await self._observe(tmp_path, 0, **wired)
         client.finish('deflake-1', commit=self.COMMIT)
         await self._observe(tmp_path, 1, **wired)
+
+        replay_root = tmp_path / 'replay'
+        replay_client = _FakeLedgerTaskClient()
+        replay = {'task_client': replay_client, 'escalation_queue': q}
+        await self._observe(replay_root, 0, **replay)
+        replay_client.finish('deflake-1', commit=self.COMMIT)
+        await self._observe(replay_root, 1, **replay)
+
         client.finish('deflake-2', commit='f' * 40)
         await self._observe(tmp_path, 2, **wired)
         await self._observe(tmp_path, 3, self.OTHER_TEST_ID, **wired)
         client.finish('deflake-4', commit='e' * 40)
         await self._observe(tmp_path, 4, self.OTHER_TEST_ID, **wired)
 
-        assert q.submitted == [], 'an open L2 for the same regression is never re-filed'
-        consulted = [
-            call for call in q.get_by_task_calls
-            if call[0] != flake_recorder._MERGE_FLAKE_SUPPRESSION_STORM_SENTINEL
+        filed = [
+            esc for esc in q.submitted
+            if esc.category == flake_recorder.REGRESSED_AFTER_RESOLUTION
         ]
-        assert [(status, level) for _, status, level in consulted] == [('pending', 2)] * 3
-        test_cycle_2, test_cycle_3, other_cycle_2 = (task_id for task_id, _, _ in consulted)
-        assert len({test_cycle_2, test_cycle_3, other_cycle_2}) == 3, consulted
-        assert self.TEST_ID in test_cycle_2 and self.TEST_ID in test_cycle_3
-        assert self.OTHER_TEST_ID in other_cycle_2
+        expected = [
+            (self.TEST_ID, 2, self.COMMIT),
+            (self.TEST_ID, 3, 'f' * 40),
+            (self.OTHER_TEST_ID, 2, 'e' * 40),
+        ]
+        assert len(filed) == len(expected), [esc.summary for esc in filed]
+        for esc, (test_id, cycle, commit) in zip(filed, expected, strict=True):
+            assert test_id in esc.task_id, esc.task_id
+            assert f'(cycle {cycle})' in esc.summary, esc.summary
+            assert commit in esc.evidence[0]['ref'], esc.evidence
+        assert len({esc.task_id for esc in filed}) == 3, [esc.task_id for esc in filed]
+
+        keys = {esc.task_id for esc in filed}
+        lookups = [call for call in q.get_by_task_calls if call[0] in keys]
+        assert [(status, level) for _, status, level in lookups] == [('pending', 2)] * 4
+        assert lookups[1] == lookups[0], 'the replay asked under the SAME key, and was deduped'
 
     async def test_a_commitless_resolution_is_named_as_such(self, tmp_path: Path) -> None:
         """(c) The owner finished with no commit on record: the regression is still
