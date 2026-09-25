@@ -5736,6 +5736,40 @@ async def test_remediation_pass_failure_records_traceback_and_sqlite_classificat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('make_error', 'errorname', 'errorcode', 'error_type', 'message'), _RUN_FAILURE_CASES,
+)
+async def test_run_full_cycle_failure_records_traceback_and_sqlite_classification(
+    journal, event_buffer, mock_memory_service, caplog,
+    make_error, errorname, errorcode, error_type, message,
+):
+    """The full-cycle driver records the same failure evidence as the
+    remediation pass, including the SQLite classification, and names it in
+    its ERROR line."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    await event_buffer.push(_make_event())
+    harness.stages[0].run = _raising_stage_run(make_error)
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2])
+
+    with caplog.at_level(logging.ERROR), pytest.raises(type(make_error())):
+        await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+    [row] = await journal.get_recent_runs('test-project', limit=1)
+    assert row.run_type == 'full'
+    assert row.status == 'failed'
+    _assert_run_failure_record(
+        row.stage_reports['_error'],
+        error_type=error_type, failed_stage='memory_consolidator', message=message,
+        errorname=errorname, errorcode=errorcode,
+    )
+    _assert_one_classified_failure_line(
+        caplog, 'Reconciliation failed:',
+        run_id=row.id, errorname=errorname, errorcode=errorcode,
+    )
+
+
+@pytest.mark.asyncio
 async def test_shielded_stage_report_persistence_still_propagates_cancellation(
     journal, event_buffer, mock_memory_service,
 ):
