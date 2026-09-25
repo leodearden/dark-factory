@@ -1960,6 +1960,9 @@ class ReconciliationConfig(BaseModel):
     # reactive procedural_knowledge consolidation, not because the write path runs
     # inside reconciliation. Read live per add_memory write off the shared config
     # object, so it satisfies the reload.py live-read reload-safety rule.
+    # Machine-derived clusters from server/topic_cluster_store.py merge AFTER this
+    # list at read time and, unlike it, ARE project-scoped
+    # (server/near_duplicate_guard.py::resolve_topic_guard_clusters).
     procedural_knowledge_topic_guard_clusters: list[ProceduralTopicCluster] = Field(
         default_factory=_default_topic_guard_clusters,
         description=(
