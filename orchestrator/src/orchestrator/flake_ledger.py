@@ -63,6 +63,7 @@ do NOT wire a second filing path through this module — ζ owns the single fili
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -1435,6 +1436,14 @@ def _report_regression(row: DebtRow, hook: Callable[[DebtRow], None] | None) -> 
         )
 
 
+# How long, in seconds, the owner read that closes a cycle may take.  A healthy
+# `get_task` answers in well under a second, but `mcp_call` retries through a
+# fused-memory restart for ~120s
+# (`orchestrator/src/orchestrator/mcp_lifecycle.py::McpSession._retry_backoffs`), as long
+# as the recorder's whole per-observation filing budget.
+_RESOLVE_BUDGET_SECS = 10.0
+
+
 async def open_debt(
     db_path: Path,
     project_id: str,
@@ -1443,6 +1452,7 @@ async def open_debt(
     task_client: FlakeLedgerTaskClient | None = None,
     now: datetime | None = None,
     on_regressed_after_resolution: Callable[[DebtRow], None] | None = None,
+    resolve_budget_secs: float = _RESOLVE_BUDGET_SECS,
 ) -> DebtRow | None:
     """Open (or advance) the single ``flake_debt`` row for *test_id* (PRD §8.3).
 
@@ -1466,6 +1476,12 @@ async def open_debt(
     detection race-free with no sweep at all: ``owner_task_id`` changes only inside this
     function, so the done owner is still on the row when the next suppression arrives,
     whether or not an eager sweep has run.  The eager sweep is task θ's.
+
+    The close's owner read is the only network wait BEFORE the upsert, so it is bounded
+    by *resolve_budget_secs*: a slow or hung read fails like any other, costing the
+    resolution and never the occurrence.  Only a caller's own budget that expires inside
+    that bound can still cancel the call ahead of its upsert, which loses the same thing
+    as a test that budget skipped outright.
 
     REGRESSION REPORT (task η).  A RE-ENTRY means the test flaked again after its fix
     landed, and *on_regressed_after_resolution* receives the re-entered row EXACTLY ONCE
@@ -1508,14 +1524,31 @@ async def open_debt(
         )
         return None
 
-    observed = _aware(now or datetime.now(UTC), origin='open_debt')
+    # Resolved ahead of the lazy close, which needs the same instant, so it gets its own
+    # guard: B12 holds for a `now` that is not a datetime at all.
+    try:
+        observed = _aware(now or datetime.now(UTC), origin='open_debt')
+        stamp = _canonicalize_utc(observed)
+    except Exception:
+        logger.warning(
+            'flake_ledger: failed to open debt for test_id=%s (project_id=%s) — now=%r '
+            'is not a usable observation instant',
+            test_id,
+            project_id,
+            now,
+            exc_info=True,
+        )
+        return None
+
     if task_client is not None:
-        # Outside the upsert's guard, and safe there: resolve_debt never raises, so a
-        # failed resolution costs only the resolution — never the occurrence below.
-        await resolve_debt(db_path, project_id, test_id, task_client=task_client, now=observed)
+        # Outside the upsert's guard, and safe there: the close never raises and its
+        # read is bounded, so a failed or slow resolution costs only the resolution.
+        await _resolve(
+            db_path, project_id, test_id,
+            task_client=task_client, now=observed, read_budget_secs=resolve_budget_secs,
+        )
 
     try:
-        stamp = _canonicalize_utc(observed)
         conn = _open(db_path)
         try:
             # ONE statement, deliberately.  SQL evaluates every SET right-hand side against
@@ -1607,7 +1640,7 @@ async def open_debt(
 
 
 async def _read_done_owner(
-    task_client: FlakeLedgerTaskClient, test_id: str, owner_task_id: str,
+    task_client: FlakeLedgerTaskClient, test_id: str, owner_task_id: str, *, budget_secs: float,
 ) -> dict | None:
     """*owner_task_id*'s task, read LIVE, if and only if it reads back ``done``;
     ``None`` otherwise, each reason logged at the level it deserves.
@@ -1615,9 +1648,13 @@ async def _read_done_owner(
     Its own guard, like ``_ensure_owner_task``'s ``get_statuses`` read: a raising or
     partial adapter (no ``get_task`` at all, hence ``AttributeError``) lands on the SAME
     path as the real adapter's in-band error, so the two failure shapes cannot drift.
+    So does a read that outlives *budget_secs* (``TimeoutError``): see
+    :data:`_RESOLVE_BUDGET_SECS`.
     """
     try:
-        task, error = await task_client.get_task(owner_task_id)
+        task, error = await asyncio.wait_for(
+            task_client.get_task(owner_task_id), timeout=budget_secs,
+        )
     except Exception as exc:
         task, error = None, exc
     if error is not None:
@@ -1738,9 +1775,27 @@ async def resolve_debt(
 
     Keyed on ``test_id`` alone (§5.3); *project_id* is used only in log messages.  *now*
     goes through :func:`_canonicalize_utc` with the same loud-on-naive treatment as
-    ``open_debt``.  Never raises (B12): a failure logs with ``exc_info`` and returns
-    ``False``.
+    ``open_debt``.  The live read is bounded by :data:`_RESOLVE_BUDGET_SECS`, and one
+    that outlives it is a failed read.  Never raises (B12): a failure logs with
+    ``exc_info`` and returns ``False``.
     """
+    return await _resolve(
+        db_path, project_id, test_id,
+        task_client=task_client, now=now, read_budget_secs=_RESOLVE_BUDGET_SECS,
+    )
+
+
+async def _resolve(
+    db_path: Path,
+    project_id: str,
+    test_id: str,
+    *,
+    task_client: FlakeLedgerTaskClient,
+    now: datetime | None,
+    read_budget_secs: float,
+) -> bool:
+    """:func:`resolve_debt`'s body, with the owner read's bound left to the caller:
+    :func:`open_debt` passes its own ``resolve_budget_secs``."""
     try:
         stamp = _canonicalize_utc(now or datetime.now(UTC), origin='resolve_debt')
         row = read_debt(db_path, test_id)
@@ -1754,7 +1809,9 @@ async def resolve_debt(
                 test_id,
             )
             return False
-        task = await _read_done_owner(task_client, test_id, owner_task_id)
+        task = await _read_done_owner(
+            task_client, test_id, owner_task_id, budget_secs=read_budget_secs,
+        )
         if task is None:
             return False
         commit = _resolving_commit(task)

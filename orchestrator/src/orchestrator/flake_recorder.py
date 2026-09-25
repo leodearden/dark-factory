@@ -449,7 +449,12 @@ async def record_merge_flake_suppression(
     ``on_regressed_after_resolution`` hook rather than being read off the returned row,
     because the hook fires BEFORE the ledger's owner filing awaits anything: the filing
     budget below can cancel that filing, and the returned row with it, but never the
-    escalation.  It needs a ``task_client`` like the debt row it rides on.
+    escalation of a re-entry already written.  The one await AHEAD of the ledger's
+    upsert is its owner read, which the ledger bounds itself so a slow read cannot eat
+    this budget; a budget that expires inside that read costs the test its occurrence
+    upsert this time, exactly as it does a test it skipped, and the re-entry and its
+    escalation land at the next suppression.  It needs a ``task_client`` like the debt
+    row it rides on.
 
     ORDER IS THE CONTRACT, not an incidental sequence — local/durable first (the
     occurrence rows), then the in-process live signals (the event, the streak), then the

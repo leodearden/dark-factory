@@ -2255,6 +2255,17 @@ class TestOpenDebtRecorroboratesTheOwner:
         assert filed_at is None or client.calls.index('get_statuses') < filed_at, client.calls
 
 
+class _HangingTaskClient(_FakeTaskClient):
+    """A client whose ``get_task`` never answers — a fused-memory restart seen from the
+    ledger's side of the seam, where ``mcp_call`` keeps retrying for ~120s."""
+
+    async def get_task(self, task_id: str) -> tuple[dict | None, Exception | None]:
+        self.calls.append('get_task')
+        self.task_calls.append(task_id)
+        await asyncio.Event().wait()
+        raise AssertionError('unreachable: the event is never set')
+
+
 @pytest.mark.asyncio
 class TestOpenDebtClosesAFinishedCycle:
     """``open_debt`` closes the current cycle FIRST when its owner is live-done — the
@@ -2411,6 +2422,66 @@ class TestOpenDebtClosesAFinishedCycle:
         assert row is not None and row.opened_at == self.LATER.isoformat()
         naive = [r.getMessage() for r in caplog.records if 'naive' in r.getMessage()]
         assert len(naive) == 1 and 'open_debt' in naive[0], naive
+
+    async def test_an_unusable_now_degrades_to_none(self, tmp_path: Path, caplog) -> None:
+        """(g) B12 covers the observation instant too.  It is resolved BEFORE the lazy
+        close, so a ``now`` that is not a datetime must degrade to ``None``, loudly, and
+        never raise out of an entry point documented never to.  An observation that
+        cannot be stamped touches neither the client nor the row."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await _open_owned_debt(db_path, self.TEST_ID, now=self.NOW)
+        before = self._raw(db_path)
+        client = _FakeTaskClient(statuses={'task-901': 'pending'})
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            row = await open_debt(
+                db_path, 'dark_factory', self.TEST_ID,
+                task_client=client,
+                now='2026-08-06T13:00:00+00:00',  # type: ignore[arg-type]
+            )
+
+        assert row is None
+        assert client.calls == []
+        assert self._raw(db_path) == before
+        _assert_logged_loudly(caplog)
+
+    async def test_a_hung_resolution_read_costs_only_the_resolution(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """(h) The lazy close runs BEFORE the upsert, so it is BOUNDED.  A read that
+        never answers degrades to no resolution this time and the occurrence still
+        lands.  Unbounded, it would hold the durable write hostage: the recorder's
+        per-observation budget cancels whatever is in flight, and a fused-memory restart
+        keeps one read retrying for about as long as that whole budget."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await _open_owned_debt(db_path, self.TEST_ID, now=self.NOW)
+        client = _HangingTaskClient(statuses={'task-901': 'pending'})
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_ledger'):
+            row = await asyncio.wait_for(
+                open_debt(
+                    db_path, 'dark_factory', self.TEST_ID,
+                    task_client=client, now=self.LATER, resolve_budget_secs=0.05,
+                ),
+                timeout=5,
+            )
+
+        raw = self._raw(db_path)
+        assert raw['last_occurrence_at'] == self.LATER.isoformat()
+        assert raw['open_count'] == 1 and raw['resolved_at'] is None
+        assert raw['owner_task_id'] == 'task-901'
+        assert row is not None and row.owner_task_id == 'task-901'
+        assert client.submit_calls == []
+        timed_out = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and self.TEST_ID in r.getMessage()
+            and 'task-901' in r.getMessage()
+        ]
+        assert timed_out, caplog.text
 
 
 @pytest.mark.asyncio
