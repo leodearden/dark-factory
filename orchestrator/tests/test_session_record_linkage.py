@@ -986,3 +986,116 @@ class TestLeaseClaimPrintsHolderRecordLast:
 
         assert lines[0] == 'decision=proceed'
         assert lines[2:] == [f'slug={_LEASE}-{self._PID}']
+
+
+def _decision(**overrides: object) -> sr.DecisionRecord:
+    fields: dict[str, object] = {
+        'id': 'esc-4237-1',
+        'project': 'dark_factory',
+        'text': 'Adopt the plan?',
+        'filed_at': '2026-09-25T12:00:00+00:00',
+        'escalations_dir': '/queues/orch',
+        **overrides,
+    }
+    return sr.DecisionRecord(**fields)  # pyright: ignore[reportArgumentType]
+
+
+def _write_decision_raw(root: Path, body: dict[str, object]) -> None:
+    path = sr.decision_path_for_id(str(body['id']), root=root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(body), encoding='utf-8')
+
+
+class TestDecisionRecordSlug:
+    _SLUG = 'role-proj-uuid'
+
+    def test_record_slug_round_trips(self) -> None:
+        decision = _decision(session_id='watcher-df-51795', record_slug=self._SLUG)
+
+        assert decision.to_dict()['record_slug'] == self._SLUG
+        assert sr.DecisionRecord.from_dict(decision.to_dict()) == decision
+        assert sr.DecisionRecord.from_json(decision.to_json()) == decision
+
+    def test_record_slug_survives_the_registry(self, tmp_path: Path) -> None:
+        sr.write_decision(_decision(record_slug=self._SLUG), root=tmp_path)
+
+        [listed] = sr.list_decisions(root=tmp_path)
+
+        assert listed.record_slug == self._SLUG
+
+    def test_the_field_defaults_to_blank(self) -> None:
+        assert _decision().record_slug == ''
+
+    def test_a_legacy_body_parses_blank_and_keeps_its_session_id(self, tmp_path: Path) -> None:
+        _write_decision_raw(
+            tmp_path,
+            {
+                'id': 'esc-4237-1',
+                'project': 'dark_factory',
+                'text': 'Adopt the plan?',
+                'filed_at': '2026-09-12T00:00:00+00:00',
+                'session_id': 'watcher-df-51795',
+                'escalations_dir': '/home/leo/src/dark-factory/data/escalations',
+            },
+        )
+
+        [listed] = sr.list_decisions(root=tmp_path)
+
+        assert listed.record_slug == ''
+        assert listed.session_id == 'watcher-df-51795'
+
+    def test_an_explicit_null_parses_blank(self) -> None:
+        body = {**_decision().to_dict(), 'record_slug': None}
+
+        assert sr.DecisionRecord.from_dict(body).record_slug == ''
+
+    @pytest.mark.parametrize(
+        ('record_slug', 'session_id', 'expected'),
+        [
+            (_SLUG, 'watcher-df-51795', _SLUG),
+            ('', 'watcher-df-51795', 'watcher-df-51795'),
+            ('', '', None),
+            ('', None, None),
+        ],
+        ids=['record-slug-wins', 'session-id-fallback', 'both-blank', 'blank-and-none'],
+    )
+    def test_linked_session_slug(
+        self, record_slug: str, session_id: str | None, expected: str | None
+    ) -> None:
+        decision = _decision(record_slug=record_slug, session_id=session_id)
+
+        assert decision.linked_session_slug == expected
+
+    def test_enrichment_keeps_an_existing_record_slug(self) -> None:
+        existing = _decision(record_slug=self._SLUG)
+        incoming = _decision(record_slug='the-second-filers-record')
+
+        merged = sr.merge_decision_enrichment(existing, incoming)
+
+        assert merged.record_slug == self._SLUG
+
+    def test_enrichment_fills_a_blank_record_slug_like_session_id(self) -> None:
+        existing = _decision(session_id=None, record_slug='')
+        incoming = _decision(session_id='watcher-recon-2', record_slug=self._SLUG)
+
+        merged = sr.merge_decision_enrichment(existing, incoming)
+
+        assert merged.session_id == 'watcher-recon-2'
+        assert merged.record_slug == self._SLUG
+
+    @pytest.mark.parametrize('incoming_slug', ['the-restarted-watchers-record', ''])
+    def test_a_same_queue_refile_takes_record_slug_verbatim(self, incoming_slug: str) -> None:
+        existing = _decision(
+            record_slug=self._SLUG,
+            filed_at='2026-07-07T00:00:00+00:00',
+            state=sr.DecisionState.DROPPED,
+            manual_boost=7,
+        )
+        incoming = _decision(record_slug=incoming_slug, filed_at='2026-09-25T00:00:00+00:00')
+
+        merged = sr.merge_same_queue_refile(existing, incoming)
+
+        assert merged.record_slug == incoming_slug
+        assert merged.filed_at == '2026-07-07T00:00:00+00:00'
+        assert merged.state == sr.DecisionState.DROPPED
+        assert merged.manual_boost == 7
