@@ -17,8 +17,7 @@ claims that really are about a call COUNT.
 
 What the ticker reports is the WORST GAP between its turns, not how many turns
 it got: a wedge puts a hard floor under that gap, while a tick count also
-tracks machine speed and would red on a busy CI box.  ``_max_gap_ceiling``
-carries the measurements behind that choice.
+tracks machine speed and would red on a busy CI box.
 
 Harness scaffolding is re-created locally rather than imported from
 tests/test_harness.py — the convention set by tests/reconciliation/test_active_runs.py,
@@ -66,9 +65,7 @@ PROJECT_ROOT = '/tmp/test-project'
 TICK_SECONDS = 0.005
 
 #: How long each stubbed blocking primitive sleeps, in the thread it should be
-#: running in.  Both are 250ms so the stall a wedge would produce is an order of
-#: magnitude clear of the worst scheduler hiccup measured here (see
-#: _max_gap_ceiling); the value is a margin, not a timing the code depends on.
+#: running in — a margin over scheduler jitter, not a timing the code relies on.
 SCAN_BLOCK_SECONDS = 0.25
 PROBE_BLOCK_SECONDS = 0.25
 
@@ -76,29 +73,9 @@ PROBE_BLOCK_SECONDS = 0.25
 def _max_gap_ceiling(blocked_seconds: float) -> float:
     """The longest loop stall tolerated while *blocked_seconds* of work runs.
 
-    THE SIGNAL IS THE WORST GAP BETWEEN TICKS, NOT HOW MANY TICKS THERE WERE,
-    and that choice is the product of a measurement that refuted the count.
-
-    A count conflates three things: how long the loop was held, how long the
-    whole pass took, and how fine the loop's timer granularity happens to be.
-    Only the first is the defect.  Measured here: the same passing test scored
-    37-89 ticks across ten UNLOADED runs, and dipped under a floor of 30 during
-    a full-suite run on a contended machine (that run took 747s; a quiet one
-    took 244s).  A guard that reds when the machine is busy is worse than no
-    guard, because it teaches its readers to ignore it.
-
-    The gap does not have that problem, because a wedge sets a HARD floor under
-    it: if the blocking call runs on the loop thread, no tick can fire for its
-    whole duration, so the worst gap is at least *blocked_seconds*.  That floor
-    is structural, not statistical.  Offloaded, the worst gap is only a
-    scheduler hiccup.
-
-    BOTH ENDS MEASURED on this tree, with the ceiling at 125ms:
-      - offloaded (passing):  11, 13, 21, 21, 23, 46 ms  -> up to 2.7x below
-      - wedged (hops removed): 258ms for the scan, 517ms for the two probes
-        back to back                                      -> 2.1-4.1x above
-    Neither end is close to the line, and they are separated by an order of
-    magnitude.
+    A call held on the loop thread stalls it for at least *blocked_seconds*;
+    offloaded, the worst gap is only scheduler jitter.  Half the block splits
+    the two.
     """
     return blocked_seconds / 2
 
@@ -246,14 +223,11 @@ async def _worst_loop_stall(coro) -> tuple[int, float]:
     """Await *coro* while a 5ms ticker watches the loop; return (ticks, worst gap).
 
     The worst gap is the longest the event loop went without giving the ticker
-    control — see :func:`_max_gap_ceiling` for why that, and not the tick
-    count, is the signal.  The tick count comes back too, purely so a caller
-    can reject a vacuous measurement in which the ticker never ran at all.
+    control — the signal, per the module docstring.  The tick count comes back
+    only so a caller can reject a measurement in which the ticker never ran.
 
-    The default thread-pool executor is warmed FIRST, deliberately.  Its
-    cold-start cost lands as a one-off ~100ms stall that has nothing to do with
-    whether the code under test offloads; measuring through it would price a
-    fixed startup into every threshold and eat most of the margin.
+    The thread-pool executor is warmed first so its one-off cold-start stall is
+    not measured as if the code under test had caused it.
     """
     await asyncio.to_thread(lambda: None)
 
@@ -323,7 +297,8 @@ async def _prepare_pass(
     """Wire a harness to drive ``_run_remediation_pass`` over *findings*.
 
     Returns ``(harness, esc_queue, run_pass)`` where ``run_pass()`` returns a
-    fresh coroutine for the pass — so a caller can hand it to ``_ticks_while``.
+    fresh coroutine for the pass — so a caller can hand it to
+    ``_worst_loop_stall``.
     """
     harness = _make_harness(journal, event_buffer, memory_service)
     esc_queue = EscalationQueue(tmp_path / 'esc')
