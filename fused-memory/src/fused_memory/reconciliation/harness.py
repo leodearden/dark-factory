@@ -50,6 +50,9 @@ from fused_memory.reconciliation.cli_stage_runner import (
     gc_run_config_dir,
     recon_config_base_dir,
 )
+from fused_memory.reconciliation.escalation_archive import (
+    scan_recently_resolved_fingerprints,
+)
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.finding_task_escalation import (
     FINDING_TASK_ESCALATION_CATEGORY,
@@ -115,10 +118,7 @@ try:
         submit_or_dedupe,
     )
     from escalation.models import Escalation  # type: ignore[import-untyped]
-    from escalation.queue import (  # type: ignore[import-untyped]
-        EscalationQueue,
-        iter_all_escalation_paths,
-    )
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
     from escalation.server import (  # type: ignore[import-untyped]
         create_server as create_escalation_server,
     )
@@ -912,6 +912,45 @@ class ReconciliationHarness:
         # still be re-filed.  Cleared when a graph recovers, so a later re-drift
         # is loud again.
         self._last_missing_indices: dict[str, tuple] = {}
+        # Task 5550: one-slot memo for `_memoised_resolved_fingerprints`,
+        # `(scan_key, str(queue_dir), fingerprints)`.  Calls under the same
+        # scan_key (a run_id) share one archive walk; a call under any other key
+        # evicts the slot, so runs whose `_escalate`s interleave each walk again.
+        # A record resolved mid-run is unseen until the next run — at most one
+        # extra escalation, the fail-open direction.
+        self._resolved_fps_memo: tuple[str, str, frozenset[str]] | None = None
+
+    def _scan_resolved_fingerprints(self, *, now: datetime) -> frozenset[str]:
+        """The archive scan under this harness's window and category policy.
+
+        Synchronous and unbounded (see ``reconciliation/escalation_archive.py``):
+        a coroutine may reach it only through ``asyncio.to_thread``.
+        """
+        return scan_recently_resolved_fingerprints(
+            self._escalation_queue.queue_dir,  # type: ignore[union-attr]
+            now=now,
+            window=timedelta(seconds=_RESOLVED_RECURRENCE_WINDOW_SECONDS),
+            categories=_RECON_DEDUP_CONFIG.infra_dedupe_categories,  # type: ignore[union-attr]
+        )
+
+    def _memoised_resolved_fingerprints(
+        self, scan_key: str | None, *, now: datetime,
+    ) -> frozenset[str]:
+        """:meth:`_scan_resolved_fingerprints`, walked once per consecutive *scan_key*.
+
+        Blocks its caller for the walk on a miss, so only the already-sync
+        `_escalate` path calls it.  ``scan_key=None`` scans on every call and
+        leaves the memo untouched.
+        """
+        if scan_key is None:
+            return self._scan_resolved_fingerprints(now=now)
+        queue_dir = str(self._escalation_queue.queue_dir)  # type: ignore[union-attr]
+        memo = self._resolved_fps_memo
+        if memo is not None and memo[:2] == (scan_key, queue_dir):
+            return memo[2]
+        fingerprints = self._scan_resolved_fingerprints(now=now)
+        self._resolved_fps_memo = (scan_key, queue_dir, fingerprints)
+        return fingerprints
 
     async def _notify_judge_halt(self, project_id: str, reason: str) -> None:
         """WP-D: forward judge halts to the backlog policy exactly once.
@@ -2738,7 +2777,9 @@ class ReconciliationHarness:
                     [],
                     summary,
                 )
-            if self._finding_recently_resolved(category, fingerprint, resolved_fps=resolved_fps):
+            if self._finding_recently_resolved(
+                category, fingerprint, resolved_fps=resolved_fps, scan_key=run_id,
+            ):
                 logger.info(
                     'reconciliation.escalation_suppressed_recently_resolved',
                     extra={
@@ -4951,11 +4992,12 @@ class ReconciliationHarness:
         *,
         now=None,
         resolved_fps: frozenset[str] | None = None,
+        scan_key: str | None = None,
     ) -> bool:
         """Return True iff a recently-resolved escalation matches category + fingerprint.
 
         Mirrors _finding_has_open_escalation but scans resolved/dismissed escalations
-        in the full queue root + archive via iter_all_escalation_paths.  Used by
+        in the full queue root + archive via escalation_archive's scan.  Used by
         _escalate() to suppress re-firing of a finding whose matching escalation was
         resolved within _RESOLVED_RECURRENCE_WINDOW_SECONDS (task 1669).
 
@@ -4963,7 +5005,12 @@ class ReconciliationHarness:
         escalations within the recurrence window (filtered to recon categories by the
         caller).  When supplied (built once by _run_remediation_pass), the check is an
         O(1) set membership test — no archive scan.  Pass None to fall back to the full
-        iter_all_escalation_paths scan per-call (direct / unit-test use).
+        archive scan (direct / unit-test use).
+
+        scan_key: memo key for that fallback scan (task 5550).  _escalate passes its
+        run_id, so consecutive fallback checks in one run share one archive walk —
+        see _memoised_resolved_fingerprints.  None scans per call and touches no memo
+        state (the direct / unit-test path above).
 
         Gate: only covers categories in _RECON_DEDUP_CONFIG.infra_dedupe_categories,
         matching the category gate used by submit_or_dedupe.
@@ -4982,31 +5029,10 @@ class ReconciliationHarness:
             return fingerprint in resolved_fps
         try:
             effective_now = now if now is not None else datetime.now(UTC)
-            window = timedelta(seconds=_RESOLVED_RECURRENCE_WINDOW_SECONDS)
-            for path in iter_all_escalation_paths(  # type: ignore[possibly-undefined]
-                self._escalation_queue.queue_dir
-            ):
-                try:
-                    esc = Escalation.from_json(path.read_text())  # type: ignore[possibly-undefined]
-                except Exception:
-                    continue
-                if not (
-                    esc.status in ('resolved', 'dismissed')
-                    and esc.category == category
-                    and esc.dedupe_fingerprint == fingerprint
-                ):
-                    continue
-                if not esc.resolved_at:
-                    continue
-                try:
-                    resolved = datetime.fromisoformat(esc.resolved_at)
-                except (ValueError, TypeError):
-                    continue
-                if resolved.tzinfo is None:
-                    resolved = resolved.replace(tzinfo=UTC)
-                if effective_now - resolved <= window:
-                    return True
-            return False
+            # The fingerprint hashes its category first, so membership in the
+            # category-set scan is the category + fingerprint match.
+            fps = self._memoised_resolved_fingerprints(scan_key, now=effective_now)
+            return fingerprint in fps
         except Exception as e:
             logger.warning(
                 'reconciliation.recently_resolved_check_failed',
@@ -5759,6 +5785,9 @@ class ReconciliationHarness:
                 # Fail-open: on any scan error, leave resolved_fps empty (no
                 # suppressions) and proceed with full escalation — same philosophy
                 # as the pending_fps build in _maybe_remediate.
+                #
+                # Task 5550: the walk is unbounded, so it runs in a worker thread;
+                # to_thread can itself raise, hence the try/except.
                 resolved_fps: frozenset[str] = frozenset()
                 if (
                     HAS_ESCALATION
@@ -5766,32 +5795,9 @@ class ReconciliationHarness:
                     and _RECON_DEDUP_CONFIG is not None
                 ):
                     try:
-                        _now = datetime.now(UTC)
-                        _window = timedelta(seconds=_RESOLVED_RECURRENCE_WINDOW_SECONDS)
-                        _rfps: set[str] = set()
-                        for _path in iter_all_escalation_paths(  # type: ignore[possibly-undefined]
-                            self._escalation_queue.queue_dir
-                        ):
-                            try:
-                                _esc = Escalation.from_json(_path.read_text())  # type: ignore[possibly-undefined]
-                            except Exception:
-                                continue
-                            if not (
-                                _esc.status in ('resolved', 'dismissed')
-                                and _esc.category in _RECON_DEDUP_CONFIG.infra_dedupe_categories
-                                and _esc.dedupe_fingerprint
-                                and _esc.resolved_at
-                            ):
-                                continue
-                            try:
-                                _resolved = datetime.fromisoformat(_esc.resolved_at)
-                            except (ValueError, TypeError):
-                                continue
-                            if _resolved.tzinfo is None:
-                                _resolved = _resolved.replace(tzinfo=UTC)
-                            if _now - _resolved <= _window:
-                                _rfps.add(_esc.dedupe_fingerprint)
-                        resolved_fps = frozenset(_rfps)
+                        resolved_fps = await asyncio.to_thread(
+                            self._scan_resolved_fingerprints, now=datetime.now(UTC),
+                        )
                     except Exception as _rfps_err:
                         logger.warning(
                             'reconciliation.recently_resolved_check_failed',
@@ -5925,6 +5931,16 @@ class ReconciliationHarness:
                         )
                         return False
 
+                # Task 5550: liveness is loop-constant per task id here, like
+                # `_sched_state` above, so each id's git probes run once per pass.
+                _live_by_task: dict[str, bool] = {}
+
+                async def _task_is_live_memoised(tid: str) -> bool:
+                    """`_task_is_live`, asked once per id per pass."""
+                    if tid not in _live_by_task:
+                        _live_by_task[tid] = await _task_is_live(tid)
+                    return _live_by_task[tid]
+
                 for finding in actionable_remaining:
                     persistence = await self._finding_persistence_count(project_id, finding)
                     if persistence >= _INTEGRITY_FINDING_RECURRENCE_THRESHOLD:
@@ -5984,7 +6000,7 @@ class ReconciliationHarness:
                         ]
                         any_live = False
                         for tid in cited_task_ids:
-                            if await _task_is_live(tid):
+                            if await _task_is_live_memoised(tid):
                                 any_live = True
                                 break
                         if any_live:
@@ -6125,7 +6141,7 @@ class ReconciliationHarness:
                                 )
                             elif (
                                 routed_task_id not in cited_task_ids
-                                and await _task_is_live(routed_task_id)
+                                and await _task_is_live_memoised(routed_task_id)
                             ):
                                 logger.info(
                                     'reconciliation.integrity_escalation_suppressed_live_workflow_routed_target',
