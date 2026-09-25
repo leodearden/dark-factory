@@ -1,45 +1,30 @@
-"""The ONE home for the pending-anchor-fold escalation filer skeleton (INV-5).
+"""The pending-anchor-fold escalation filer skeleton, in one place (INV-5).
 
-Seven fused-memory filers had each been carrying this body verbatim: a
-defensive optional-``escalation``-package import, a guarded
-``EscalationQueue`` construction, a ``get_by_task(anchor, status='pending')``
-dedupe fold, and a never-raise ``Escalation(...)`` + ``queue.submit(...)``.
-One of them says so in its own source ("Copied shape-for-shape from
-``server/markup_tripwire.emit_markup_storm_escalation``").  Seven copies of a
-never-raise alarm path means seven places a guard can be forgotten — and
-``candidate_key_escalation`` had already forgotten one (see
-:func:`file_folded_escalation`'s queue-construction guard).
+:func:`file_folded_escalation` owns the defensive optional-``escalation``
+import, the guarded ``EscalationQueue`` construction, the
+``get_by_task(anchor, status='pending')`` dedupe fold, and the never-raise
+``Escalation(...)`` + ``queue.submit(...)``.  Each caller keeps its own
+``_ANCHOR_TASK_ID`` / ``_AGENT_ROLE`` / ``_CATEGORY`` constants and builds its
+own summary and detail.
 
-WHAT LIVES HERE is the SKELETON only.  Each caller keeps its own
-``_ANCHOR_TASK_ID`` / ``_AGENT_ROLE`` / ``_CATEGORY`` constants and its own
-summary/detail/suggested_action construction in its own module: that is the
-caller's content, and hoisting it would make the helper a grab-bag of seven
-unrelated alarms.
+EVERY FILER'S ANCHOR MUST BE UNIQUE.  A filer that dedupes against an anchor
+somebody else keeps open never files again, and that silence is
+indistinguishable from health.  Measured: the L1 escalation watcher squatted
+the ``markup-tripwire`` anchor, and the tripwire filed nothing from 2026-08-16
+to 2026-08-19 while 41 rejections occurred.  So ``anchor_task_id`` is required
+and keyword-only with no default, which makes a shared anchor impossible to
+introduce by omission.  Each caller keeps its anchor in its own module, where
+``tests/test_folded_escalation.py::TestNoTwoFilersShareAnAnchor`` reads it and
+fails on a collision.
 
-WHY ``anchor_task_id`` IS REQUIRED, WITH NO DEFAULT.  A filer that dedupes
-against an anchor somebody else keeps open never files again, and that silence
-is indistinguishable from health.  MEASURED (the anchor-squat incident, pinned
-by ``server/write_triage.py``'s comment block and by
-``tests/test_folded_escalation.py::TestNoTwoFilersShareAnAnchor``): the L1
-escalation watcher squatted the ``markup-tripwire`` anchor, so the tripwire
-filed NOTHING from 2026-08-16 to 2026-08-19 while 41 rejections occurred — all
-17 records sat at ``dedupe_count`` 0, i.e. the fold was not even folding, it
-was simply never firing.  A required keyword-only parameter with no default
-makes a shared anchor impossible to introduce by OMISSION: forgetting it is a
-``TypeError`` at call time, not a silently disabled alarm.
-
-NOT THE HOME FOR the ``submit_or_dedupe`` content-fingerprint family —
+NOT THE HOME FOR the ``submit_or_dedupe`` content-fingerprint family:
 :mod:`fused_memory.middleware.scope_violation_escalator`,
 :mod:`fused_memory.middleware.mem0_update_storm_escalator` and
-:mod:`fused_memory.middleware.entity_mint_storm_escalator`.  Those do not carry
-this skeleton at all: they dedupe on ``compute_content_fingerprint`` +
-``DedupeConfig`` through ``escalation.dedupe.submit_or_dedupe`` over a CACHED
-per-project queue, at ``severity='info'``.  ``ScopeViolationEscalator._submit``
-is already the extracted one-home for that family's three modes, and its
-docstring states that keeping the dedup policy in one place is load-bearing
-(the task-3119 mislabelling defect).  Folding them in here would replace
-content-fingerprint dedupe with pending-anchor dedupe — a behaviour regression,
-not a refactor.  Do not "finish the job" by migrating them.
+:mod:`fused_memory.middleware.entity_mint_storm_escalator`.  They dedupe on
+``compute_content_fingerprint`` + ``DedupeConfig`` over a cached per-project
+queue, and ``ScopeViolationEscalator._submit`` is already that family's one
+home.  Routing them through here would replace content-fingerprint dedupe with
+pending-anchor dedupe, which is a behaviour change, not a consolidation.
 """
 
 from __future__ import annotations
@@ -52,17 +37,8 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 
-# Defensive import, lifted verbatim from the seven copies this module replaces:
-# the `escalation` workspace package is optional (minimal CI envs, unit tests
-# without escalation infra, deployments that have not installed it). When it is
-# missing every filer becomes a logged no-op, so each caller's own
-# never-fail-the-write guarantee is never at risk.
-#
-# This is ALSO the monkeypatch seam every migrated caller's tests now target:
-# the names live here and NOT in the callers (no compatibility re-export), so a
-# stale `setattr(caller_module, 'EscalationQueue', ...)` fails loudly with
-# AttributeError instead of silently becoming a no-op that leaves the test
-# passing for the wrong reason.
+# The `escalation` workspace package is optional (minimal CI envs, deployments
+# that have not installed it); without it every filer is a logged no-op.
 try:
     from escalation.models import Escalation  # type: ignore[import-untyped]
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped,no-redef]
@@ -74,11 +50,7 @@ _QUEUE_DIRNAME: str = 'data/escalations'
 
 
 def _suffix(context: str) -> str:
-    """Render the caller's *context* as a trailing log clause, or nothing.
-
-    Kept out of the format arguments so a caller that supplies no context gets
-    a clean message rather than a dangling ``()``.
-    """
+    """Render the caller's *context* as a trailing log clause, or nothing."""
     return f' ({context})' if context else ''
 
 
@@ -104,104 +76,39 @@ def file_folded_escalation(
 
     Args:
         project_root: The affected project's root; the escalation lands in that
-            project's OWN ``data/escalations`` queue. Never defaulted to the
-            server cwd, where no operator watches.
+            project's own ``data/escalations`` queue.  ``None`` is a
+            DEBUG-logged no-op.
         anchor_task_id: The synthetic task id the record is filed under and the
-            fold is keyed on. REQUIRED and keyword-only, with NO default — see
-            the module docstring's anchor-squat incident. Callers keep this as
-            their own module-level constant (or compute it per-ref/per-writer);
-            it must never be shared with another filer.
-        agent_role: The filer's role string, e.g.
-            ``'fused-memory/referent-repair-guard'``.
-        category: The escalation category, e.g. ``'referent_repair_storm'``.
-        severity: ``'blocking'`` or ``'info'`` — the CALLER's choice. Two of the
-            seven filers file at ``info``; the helper never imposes one.
+            fold is keyed on.  Required, with no default, and never shared with
+            another filer: see the module docstring.
+        agent_role: The filer's role string.
+        category: The escalation category.
+        severity: ``'blocking'`` or ``'info'``; the caller's choice.
         summary: One-line operator-facing summary.
         detail: The INV-2 structured evidence, already rendered by the caller.
         suggested_action: What a triager should do.
-        logger: The CALLER's logger, so every record is attributed to the
-            caller's module name rather than to this helper.
-        log_label: The caller's grep token (``'write_triage'``,
-            ``'markup_tripwire'``, ...), prefixed onto every emitted message.
-            Existing detail text tells triagers to grep for these.
-        level: Escalation level. Defaults to 1.
-
-            BORN AT L1, NOT L0. The L0-routes-to-the-steward rule governs an
-            escalation filed BY A DISPATCHED AGENT about its own task; it does
-            not reach here. ``Steward._pick_escalation`` reads
-            ``escalation_queue.get_by_task(self.task_id, status='pending',
-            level=0)`` (``orchestrator/src/orchestrator/steward.py::Steward``),
-            scoped to the REAL task that steward was spawned for. Every filer
-            using this helper is a background server process filing under a
-            synthetic anchor that is never dispatched and therefore never has a
-            steward — so an L0 entry here would have no consumer at all. It
-            would be reached only by
-            ``HarnessRunner._reap_orphan_l0_escalations``, which promotes
-            unclaimed L0s to L1 after ``orphan_l0_timeout_secs``. Filing at L0
-            would therefore not route the alarm to a steward; it would merely
-            DELAY it by that timeout before landing exactly where L1 puts it
-            immediately. For a storm escape whose whole purpose is that a
-            regression not be absorbed silently, a built-in delay is the wrong
-            default. ``emit_markup_residue_escalation`` overrides this with a
-            caller-supplied level.
-        dedupe: When true (the default), fold into an already-open escalation
-            under *anchor_task_id* instead of filing a duplicate. Set false
-            only when each record is the sole surviving copy of a DIFFERENT
-            payload — ``emit_markup_residue_escalation`` is the one such caller,
-            where folding two records together would destroy the very data the
-            record exists to preserve.
-        context: The caller's own free-text description of the subject, e.g.
-            ``"fail-open storm 'unknown_key'"``. Appended to every emitted
-            message INCLUDING the quiet no-op arms, where an operator most
-            needs to know what went unescalated.
-        on_fold: Called with the EXISTING escalation object when a fold occurs,
-            instead of the helper's default fold line. It exists so a caller
-            can keep fold-time logging on ITS OWN logger and at its own level:
-            ``emit_markup_storm_escalation`` compares the folded burst's
-            outcome against the open record's and logs at ERROR when they
-            differ, and ``tests/server/test_markup_tripwire.py`` asserts that
-            record's ``.name`` is ``fused_memory.server.markup_tripwire``. A
-            hook that raises is caught and logged — it is caller-supplied
-            logging on a never-raise path, and must not become a new way to
-            break the write path.
-        no_escalation_level: The level the package-unavailable arm is emitted
-            at. Defaults to ``logging.DEBUG``.
-
-            A CALLER CONCERN because the callers measurably disagree. Six of
-            the seven filers folded in here logged a missing optional
-            ``escalation`` package at DEBUG, as a detail;
-            :mod:`fused_memory.middleware.referent_repair_storm_escalator`
-            deliberately treated it as a LOST ALARM and logged it at WARNING
-            (that module at merge-base 6f9cddb0bb). A repair storm is a
-            sustained scanner/resolver regression against a measured ~0.22%
-            base rate, so in an env without the optional package the DEBUG
-            default emits nothing at all at the default threshold — the
-            silence this module's own docstring argues against.
-
-            THE DEFAULT IS DELIBERATELY NOT RAISED FOR EVERYONE. Whether DEBUG
-            is the right HOUSE level for a lost alarm is a fleet-wide design
-            question with its own blast radius (``orchestrator/mcp/markup_sink``
-            logs the same condition at WARNING), and it is filed as TASK 5775
-            rather than settled here. It is not a regression this consolidation
-            introduced, and bumping the default would silently change six
-            callers inside a refactor contracted to be behaviour-preserving —
-            so raise it at the CALLERS that want it, not here.
-
-            NO EQUIVALENT KNOB EXISTS FOR THE ``project_root is None`` ARM, by
-            choice: all seven callers agreed on DEBUG for it at the merge base,
-            and it means "this caller has no queue to file into", not "an alarm
-            was lost". Nor is there a ``fold_level`` — ``on_fold`` above already
-            owns fold-arm customisation, and a second knob for the same arm
-            would be exactly the duplicate-mechanism shape this module exists
-            to pay down.
+        logger: The caller's logger, so records are attributed to the caller's
+            module rather than to this helper.
+        log_label: The caller's grep token, prefixed onto every emitted
+            message.
+        level: Escalation level; defaults to 1.  Callers file under synthetic
+            anchors that no steward ever claims, so an L0 record only waits
+            for ``HarnessRunner._reap_orphan_l0_escalations`` to promote it.
+        dedupe: Fold into an already-open escalation under *anchor_task_id*
+            instead of filing a duplicate.  Pass false when each record holds
+            a distinct payload that a fold would discard.
+        context: The caller's description of the subject, appended to every
+            emitted message, including the no-op arms.
+        on_fold: Called with the existing escalation in place of the default
+            INFO fold line, so a caller can log the fold on its own logger at
+            its own level.  An exception from it is logged, never raised.
+        no_escalation_level: Log level for the package-unavailable arm;
+            defaults to DEBUG.
 
     Returns the escalation id — freshly filed, or the id of the already-open
     escalation under this anchor when one exists — or ``None`` when filing was
     not possible. NEVER raises.
     """
-    # DEBUG with no knob, unlike the package-unavailable arm below: this means
-    # "this caller has no queue to file into", not "an alarm was lost", and all
-    # seven callers agreed on DEBUG for it at the merge base.
     if project_root is None:
         logger.debug(
             '%s: no project_root, so there is no project queue to file into; '
@@ -228,27 +135,10 @@ def file_folded_escalation(
         )
         return None
 
-    # DEDUPE-FOLD. Once a project is storming, EVERY subsequent event breaches
-    # the threshold again — the streak only grows until a clean pass resets it.
-    # Filing per breach would bury the operator queue under near-identical
-    # entries and make the real signal (one project, one regression) harder to
-    # see, not easier. `anchor_task_id` is a stable per-caller anchor, so any
-    # still-pending escalation under it IS this caller's open alarm.
-    #
-    # THE ANCHOR MUST STAY PER-CALLER, and it is threaded through BOTH this
-    # lookup and `make_id`/`task_id` below from the SAME parameter, so it is
-    # structurally impossible to file under one anchor while deduping against
-    # another. Two filers sharing an anchor is not a cosmetic collision: the
-    # second one goes permanently silent behind the first one's open record,
-    # and that silence reads exactly like health. See the module docstring for
-    # the measured incident.
-    #
-    # A read failure falls THROUGH to filing rather than aborting: a possible
-    # duplicate is a far cheaper failure than a silenced alarm, and this arm is
-    # reached only when the queue directory is already misbehaving. This guard
-    # must never `return` — returning early here would convert a transient
-    # queue-scan error into exactly the permanent silence the fold's anchor
-    # discipline exists to prevent.
+    # While a condition persists every event breaches again, so filing per
+    # breach would bury the queue; any pending record under the anchor IS this
+    # caller's open alarm. A read failure falls THROUGH to filing: a possible
+    # duplicate is far cheaper than a silenced alarm.
     existing = []
     if dedupe:
         try:
@@ -266,8 +156,6 @@ def file_folded_escalation(
             try:
                 on_fold(existing[0])
             except Exception:
-                # Caller-supplied logging on a never-raise path: a broken hook
-                # must cost its own log line, never the fold result.
                 logger.exception(
                     '%s: the on_fold hook failed while folding into %s%s',
                     log_label, existing[0].id, _suffix(context),
@@ -279,12 +167,9 @@ def file_folded_escalation(
             )
         return existing[0].id
 
-    # `Escalation(...)` is constructed INSIDE the guard deliberately, matching
-    # `ScopeViolationEscalator._submit`'s stated reason: a malformed payload
-    # must degrade to "no escalation", never to an exception out of the guard.
-    # The events these filers complain about have already committed by the time
-    # this runs; a queue I/O failure must cost the operator a heads-up, never
-    # the write.
+    # Constructed inside the guard so a malformed payload degrades to no
+    # escalation. The event being complained about has already committed; a
+    # failure here must cost the operator a heads-up, never the write.
     try:
         esc = Escalation(  # type: ignore[possibly-unbound]
             id=queue.make_id(anchor_task_id),

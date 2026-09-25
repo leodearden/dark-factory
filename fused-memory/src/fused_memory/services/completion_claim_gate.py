@@ -738,23 +738,11 @@ def make_commit_probe(repo_root: Path | str) -> Callable[[str], bool | None]:
 # Operator-facing escalation
 # --------------------------------------------------------------------------- #
 #
-# The filer skeleton is SHARED, not copied: it lives in
-# ``middleware/_folded_escalation`` (task 4854). This comment used to read
-# "copied shape-for-shape from server/markup_tripwire.emit_markup_storm_
-# escalation" — an in-tree confession of the duplication that also read as an
-# instruction to copy it again, which is how seven copies accumulated. Do not
-# re-copy the skeleton; call the helper.
-#
-# The CHOICE OF CHANNEL is unchanged and is this module's own. The recon_report
-# filer is NOT usable here: it silently DROPS findings when no Stage-2 run is
-# active, and an episode arrives at arbitrary times, so a gate that filed
-# through it would go quiet exactly when nothing else is watching. Opening the
-# project's queue directly is what makes the finding survive to an operator.
-#
-# The ANCHOR did not move either — ``file_folded_escalation`` takes
-# ``anchor_task_id`` as a required keyword-only parameter with NO default, and
-# this prefix stays here so ``TestNoTwoFilersShareAnAnchor`` reads every filer's
-# anchor FROM ITS OWN HOME and fails on a colliding rename.
+# Filed through ``middleware/_folded_escalation`` into the project's own queue.
+# The recon_report filer is NOT usable here: it silently DROPS findings when no
+# Stage-2 run is active, and an episode arrives at arbitrary times, so a gate
+# that filed through it would go quiet exactly when nothing else is watching.
+# Anchors must be unique across filers — see that module's docstring.
 _ANCHOR_PREFIX: str = 'unverified-claim'
 _AGENT_ROLE: str = 'fused-memory/completion-claim-gate'
 _CATEGORY: str = 'unverified_completion_claim'
@@ -790,11 +778,6 @@ def emit_unverified_claim_escalation(
     ref = str(entries[0].get('ref') or '').strip()
     if not ref:
         return None
-    # PER-REF, not per-project: two different false claims are two different
-    # findings and each deserves its own record, while a writer repeating the
-    # SAME claim collapses onto the one open escalation instead of minting a
-    # new one per episode. Computed here and passed to the helper, which
-    # threads it through both the dedup lookup and the filing.
     anchor = f'{_ANCHOR_PREFIX}-{ref}'
 
     detail = '\n'.join(
@@ -830,13 +813,6 @@ def emit_unverified_claim_escalation(
         ]
     )
 
-    # The filer skeleton — the defensive import, the guarded queue open, the
-    # best-effort dedup fold on `anchor`, and the never-raise submit — lives in
-    # `middleware/_folded_escalation`. A `None` project_root and an absent
-    # escalation package are both quiet no-ops there, as they were here, and a
-    # queue I/O failure degrades to `None` plus a log line: the episode is
-    # already ingested and tagged, and the WARNING at the call site has already
-    # recorded the finding, so the operator only loses the queued heads-up.
     return file_folded_escalation(
         project_root,
         anchor_task_id=anchor,

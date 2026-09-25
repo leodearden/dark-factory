@@ -7,24 +7,14 @@ connection-open, it skips building the partial UNIQUE index and calls
 :func:`emit_residual_candidate_key_escalation` so an operator sees the
 residuals surfaced as an escalation, not just a log line.
 
-The filer skeleton it uses lives in
-:mod:`fused_memory.middleware._folded_escalation`, which is the ONE home for
-that shape (task 4854).  NOT
-:mod:`fused_memory.middleware.scope_violation_escalator`, which this docstring
-used to name: that module belongs to a DIFFERENT family, deduping on a content
-fingerprint via ``escalation.dedupe.submit_or_dedupe`` over a cached queue
-rather than on a pending anchor.  What the shared helper provides here:
+Filing goes through :mod:`fused_memory.middleware._folded_escalation`:
 
-* Defensive import of the optional ``escalation`` workspace package — when
-  missing (minimal envs, tests without escalation infra), this becomes a
-  logged no-op so the migration's fail-safe guarantee is never at risk.
+* Without the optional ``escalation`` workspace package it is a logged no-op,
+  so the migration's fail-safe guarantee is never at risk.
 * Escalations land in ``{project_root}/data/escalations`` — the affected
   project's own queue.
-* Queue CONSTRUCTION and ``submit`` are both wrapped so a queue I/O failure
-  never raises — the migration's self-gating skip has already happened by the
-  time this is called; escalation is purely additive.  The construction guard
-  is new (task 4854): this module used to construct the queue unguarded, which
-  contradicted its own "NEVER raises" promise on a read-only ``project_root``.
+* A queue I/O failure never raises — the migration's self-gating skip has
+  already happened by the time this is called; escalation is purely additive.
 * Dedups against an already-open escalation for the same anchor before
   filing a new one (review amendment) — a connection (and therefore this
   migration step) runs at most once per project_root per process, so a
@@ -41,17 +31,10 @@ from fused_memory.middleware._folded_escalation import file_folded_escalation
 
 logger = logging.getLogger(__name__)
 
-# Anchor task_id threaded through ``EscalationQueue.make_id`` AND the dedupe
-# fold by ``file_folded_escalation``, so the resulting escalation IDs (e.g.
+# Anchor task_id, so the resulting escalation IDs (e.g.
 # ``esc-candidate-key-migration-1``) are easily greppable and distinct from the
-# path-guard's ``task-path-guard`` series.
-#
-# STAYS A CONSTANT OF THIS MODULE even though the filer body is now shared: a
-# filer deduping against an anchor somebody else keeps open never files again,
-# and that silence is indistinguishable from health. `tests/server/
-# test_write_triage.py` and the pairwise regression in
-# `tests/test_folded_escalation.py` both read this FROM HERE, which is what
-# makes a colliding rename fail a test instead of going silent in production.
+# path-guard's ``task-path-guard`` series. Must be unique across filers — see
+# the ``middleware/_folded_escalation`` module docstring.
 _ANCHOR_TASK_ID: str = 'candidate-key-migration'
 
 _AGENT_ROLE: str = 'fused-memory/candidate-key-migration'
@@ -105,11 +88,6 @@ def emit_residual_candidate_key_escalation(
         'connection-open will re-audit and land the index automatically.',
     ]
 
-    # The dedup described in the module docstring, the defensive import, the
-    # guarded queue and the never-raise submit all live in
-    # `middleware/_folded_escalation`. `_ANCHOR_TASK_ID` is passed explicitly
-    # because the helper has NO default for it — sharing an anchor with another
-    # filer would silence one of them behind the other's open record.
     return file_folded_escalation(
         project_root,
         anchor_task_id=_ANCHOR_TASK_ID,

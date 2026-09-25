@@ -66,14 +66,6 @@ from shared.toolcall_markup import (  # noqa: F401
     strip_markup_override,
 )
 
-# The defensive optional-``escalation`` import, the guarded queue open, the
-# dedupe fold and the never-raise submit all live in
-# ``middleware/_folded_escalation`` since task 4854 — seven filers carried that
-# body verbatim, and this module's own source used to say so. When the
-# ``escalation`` package is missing (minimal CI envs, deployments that never
-# installed it) filing degrades to a logged no-op THERE. This module sits on
-# the MCP write path, so it must never make a write fail — the rejection is
-# already decided by the time escalation is attempted.
 from fused_memory.middleware._folded_escalation import file_folded_escalation
 
 logger = logging.getLogger(__name__)
@@ -123,15 +115,8 @@ _MARKUP_STORM_WINDOW_SECONDS = 3600.0
 
 # Escalation wiring. _ANCHOR_TASK_ID is a stable per-project anchor (not a real
 # task id) so the resulting ids form one greppable ``esc-markup-tripwire-N``
-# series and the dedup check has something to key on.
-#
-# The FILER BODY around these is shared (``middleware/_folded_escalation``); the
-# ANCHORS deliberately are not. ``file_folded_escalation`` takes
-# ``anchor_task_id`` as a required keyword-only parameter with NO default, so a
-# shared anchor cannot be introduced by omission, and these constants stay right
-# here so ``TestNoTwoFilersShareAnAnchor`` reads every filer's anchor FROM ITS
-# OWN HOME and fails on a colliding rename. Sharing the body is safe; sharing an
-# anchor is the squat incident ``emit_markup_storm_escalation`` documents below.
+# series and the dedup check has something to key on. Anchors must be unique
+# across filers — see the ``middleware/_folded_escalation`` module docstring.
 _ANCHOR_TASK_ID: str = 'markup-tripwire'
 _AGENT_ROLE: str = 'fused-memory/markup-tripwire'
 _CATEGORY: str = 'mcp_markup_write_storm'
@@ -308,16 +293,7 @@ def emit_markup_storm_escalation(
     outcome = outcome if isinstance(outcome, str) and outcome else None
 
     def _on_fold(existing: Any) -> None:
-        """The fold-time logging, kept HERE rather than in the shared helper.
-
-        Two properties make this a caller hook rather than helper behaviour.
-        It reads ``_recorded_outcome`` off the open record — a comparison only
-        this filer's own detail layout supports — and it must be emitted on
-        THIS module's logger: ``tests/server/test_markup_tripwire.py`` filters
-        caplog on ``r.name == 'fused_memory.server.markup_tripwire'`` and
-        ``levelname == 'ERROR'``, because that line is what an operator greps
-        for the burst the queue does not name.
-        """
+        """Log the fold, comparing this burst's outcome with the open record's."""
         open_outcome = _recorded_outcome(existing)
         if open_outcome == outcome:
             logger.info(
@@ -432,13 +408,6 @@ def emit_markup_storm_escalation(
         'not against 3083.',
     ])
 
-    # The filer skeleton — the defensive import, the guarded queue open, the
-    # dedup fold on `anchor_task_id`, and the never-raise submit — lives in
-    # `middleware/_folded_escalation`. A `None` project_root and an absent
-    # escalation package are both quiet no-ops there, as they were here. A
-    # queue I/O failure likewise degrades to `None` plus a log line: the write
-    # has already been rejected and the ERROR log at the call site has already
-    # recorded the burst, so the operator only loses the queued heads-up.
     return file_folded_escalation(
         project_root,
         anchor_task_id=anchor_task_id,
@@ -547,13 +516,6 @@ def emit_markup_residue_escalation(
         str(raw_value),
     ])
 
-    # `dedupe=False` is the one place this diverges from its sibling, and the
-    # docstring above says why: folding two residue records together would
-    # destroy a caller payload, which is the exact loss this record prevents.
-    # Everything else — the guarded queue open and the never-raise submit —
-    # comes from the shared skeleton in `middleware/_folded_escalation`, where
-    # a submit failure degrades to `None` plus a log line and the payload
-    # survives only in the caller-facing log line, as it did here.
     return file_folded_escalation(
         project_root,
         anchor_task_id=anchor_task_id,

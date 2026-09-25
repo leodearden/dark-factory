@@ -921,34 +921,11 @@ def _record_fail_open(
 
 # --- the storm escalation (INV-4) ------------------------------------------
 #
-# Escalation wiring copied shape-for-shape from
-# ``markup_tripwire.emit_markup_storm_escalation``, which took it from
-# ``middleware/candidate_key_escalation.py``.
-#
 # _ANCHOR_TASK_ID is a stable per-project anchor (not a real task id) so the
 # resulting ids form one greppable ``esc-write-triage-fail-open-N`` series and
-# the dedup check has something to key on.
-#
-# It is THIS LEAF'S OWN and is shared with nobody, which is load-bearing rather
-# than tidy. Measured: the L1 escalation watcher files its own cluster records
-# under the ``markup-tripwire`` anchor and SQUATS it — the tripwire filed
-# nothing 2026-08-16..2026-08-19 while 41 rejections occurred, all 17 records
-# sitting at dedupe_count 0. A filer that dedupes against an anchor somebody
-# else keeps open never files again, and the resulting silence is
-# indistinguishable from health. That incident is why
-# ``emit_markup_storm_escalation`` grew its ``anchor_task_id`` parameter, and
-# it is why "simplifying" this into a shared anchor would disable the alarm.
-#
-# THE CONSOLIDATION DID NOT TOUCH THAT. Task 4854 moved the filer BODY — the
-# defensive import, the guarded queue, the fold, the never-raise submit — into
-# ``middleware/_folded_escalation``, which SEVEN filers now share. The ANCHOR
-# deliberately did not go with it: ``file_folded_escalation`` takes
-# ``anchor_task_id`` as a required keyword-only parameter with NO default, so
-# a shared anchor cannot be introduced by omission (forgetting it is a
-# TypeError, not a silently disabled alarm), and this constant stays right
-# here so ``TestNoTwoFilersShareAnAnchor`` can read every filer's anchor FROM
-# ITS OWN HOME and fail on a colliding rename. Sharing the body is safe;
-# sharing the anchor is the incident above.
+# the dedup check has something to key on. It must be shared with nobody: a
+# filer deduping against an anchor somebody else keeps open never files again
+# — see the ``middleware/_folded_escalation`` module docstring.
 _ANCHOR_TASK_ID: str = 'write-triage-fail-open'
 _AGENT_ROLE: str = 'fused-memory/write-triage'
 _CATEGORY: str = 'write_triage_fail_open_storm'
@@ -1027,10 +1004,6 @@ def emit_triage_fail_open_storm_escalation(
     ])
 
 
-    # The filer skeleton — the defensive import, the guarded queue open, the
-    # best-effort dedup fold on `_ANCHOR_TASK_ID`, and the never-raise submit —
-    # lives in `middleware/_folded_escalation`. A `None` project_root and an
-    # absent escalation package are both quiet no-ops there, as they were here.
     return file_folded_escalation(
         project_root,
         anchor_task_id=_ANCHOR_TASK_ID,

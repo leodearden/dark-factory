@@ -44,12 +44,8 @@ the live memory-write path (via ``asyncio.to_thread`` off
 ``MemoryService._repair_episode_referents``), where a raise would fail an
 already-committed episode's reconcile chain because the COMPLAINT ABOUT the
 write failed.  The repairs it is complaining about have already landed by the
-time this runs; escalation is purely additive.  That contract is now KEPT IN
-ONE PLACE: the defensive optional-package import, the guarded queue, the
-dedupe-fold and the never-raise submit all live in
-:mod:`fused_memory.middleware._folded_escalation`, which this module calls.
-What stays here is this alarm's own identity (``_ANCHOR_TASK_ID`` and friends)
-and its own evidence rendering.
+time this runs; escalation is purely additive.  Filing goes through
+:mod:`fused_memory.middleware._folded_escalation`, which keeps that contract.
 """
 
 from __future__ import annotations
@@ -63,20 +59,11 @@ from fused_memory.middleware._folded_escalation import file_folded_escalation
 
 logger = logging.getLogger(__name__)
 
-#: Anchor task_id handed to ``file_folded_escalation``, which threads it through
-#: both ``EscalationQueue.make_id`` and the fold lookup — so the resulting ids
-#: (``esc-referent-repair-storm-1``, ...) are greppable and distinct from the
-#: other fused-memory series — and, more importantly, so
-#: ``get_by_task(_ANCHOR_TASK_ID, status='pending')`` is a stable per-project
-#: lookup for "is this alarm already open".
-#:
-#: STAYS A CONSTANT OF THIS MODULE even though the filer body is now shared: a
-#: filer deduping against an anchor somebody else keeps open never files again,
-#: and that silence is indistinguishable from health.  The pairwise regression
-#: that catches a colliding rename
-#: (``tests/test_folded_escalation.py::TestNoTwoFilersShareAnAnchor``) reads
-#: every filer's anchor FROM ITS OWN HOME, which only works while this lives
-#: here.
+#: Anchor task_id, so the resulting ids (``esc-referent-repair-storm-1``, ...)
+#: are greppable and distinct from the other fused-memory series, and so the
+#: fold has a stable per-project key for "is this alarm already open".  Must be
+#: unique across filers — see the ``middleware/_folded_escalation`` module
+#: docstring.
 _ANCHOR_TASK_ID: str = 'referent-repair-storm'
 
 _AGENT_ROLE: str = 'fused-memory/referent-repair-guard'
@@ -157,21 +144,9 @@ def emit_referent_repair_storm_escalation(
         records_json,
     ]
 
-    # The filer skeleton — defensive import, guarded queue, the DEDUPE-FOLD on
-    # `_ANCHOR_TASK_ID`, and the never-raise submit — lives in
-    # `middleware/_folded_escalation`.  `_ANCHOR_TASK_ID` stays a constant of
-    # THIS module and is passed in explicitly: the helper has no default for it,
-    # because a filer that dedupes against an anchor somebody else keeps open
-    # goes permanently silent and that silence reads exactly like health.
-    #
     def _announce_fold(existing: Any) -> None:
-        """Re-emit the merge-base fold line: WARNING, on THIS module's logger.
-
-        The fold is a SUPPRESSION, and while a project is storming it is the
-        only ongoing evidence the regression is still firing — at the helper's
-        INFO default that evidence vanishes from a default-threshold log, and
-        an operator sees one old escalation and no sign of the storm behind it.
-        """
+        """Log the fold at WARNING: while a project storms, it is the only
+        ongoing evidence the regression is still firing."""
         logger.warning(
             'referent_repair_storm: %s already open for project_id=%r '
             '(streak now %d, %d repair(s) this episode); folding into it '
@@ -179,21 +154,9 @@ def emit_referent_repair_storm_escalation(
             existing.id, project_id, streak, repairs,
         )
 
-    # The fold itself is why the anchor is per-project rather than per-episode:
-    # once a project is storming, EVERY subsequent episode breaches the
-    # threshold again, and filing per breach would bury the operator queue.
-    #
-    # THIS FILER IS DELIBERATELY LOUDER THAN ITS SIX SIBLINGS, on both quiet
-    # arms: `no_escalation_level` raises the missing-optional-package arm, and
-    # `_announce_fold` raises the fold arm. A repair storm is a sustained
-    # scanner/resolver regression against a measured ~0.22% base rate, not a
-    # routine event, so neither "the alarm could not be filed" nor "the alarm
-    # is still firing" may sit below an operator's default threshold. Do NOT
-    # "simplify" these two arguments away to match the siblings — that is
-    # exactly the flattening this restores: at merge-base 6f9cddb0bb BOTH arms
-    # of this function were `logger.warning`, and the only symptom of their
-    # downgrade was absence of output. Whether DEBUG is the right HOUSE level
-    # for the six siblings is task 5775, not this module's call to make.
+    # Both quiet arms are raised to WARNING: a repair storm is a sustained
+    # scanner/resolver regression against a ~0.22% base rate, so neither a lost
+    # alarm nor a folded one may sit below the default threshold.
     return file_folded_escalation(
         project_root,
         anchor_task_id=_ANCHOR_TASK_ID,

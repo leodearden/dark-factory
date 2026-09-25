@@ -34,13 +34,6 @@ from collections.abc import Callable, Iterable, Sequence
 from shared.storm_counter import StormCounter
 
 from fused_memory.memory_metadata import MetadataViolation
-
-# The defensive optional-``escalation`` import, the guarded queue open, the
-# per-anchor dedup fold and the never-raise submit all live in
-# ``middleware/_folded_escalation`` since task 4854.  When the package is
-# missing (minimal CI envs, deployments that have not installed it) filing
-# degrades to a logged no-op THERE, rather than breaking the memory write path
-# that calls this module.
 from fused_memory.middleware._folded_escalation import file_folded_escalation
 
 logger = logging.getLogger(__name__)
@@ -365,9 +358,6 @@ def file_unknown_key_storm_escalation(
     writer without masking a second, different writer that also crossed.
     """
     writer = agent_id if agent_id else UNSET_AGENT_ID
-    # PER-WRITER, not the series base name: only this computed anchor is ever
-    # passed to the helper, which threads it through both the dedup lookup and
-    # the filing.  ``_ANCHOR_TASK_ID`` stays the greppable family prefix.
     anchor = writer_anchor_task_id(project_id, agent_id)
 
     key_list = ', '.join(repr(k) for k in keys)
@@ -393,13 +383,6 @@ def file_unknown_key_storm_escalation(
         'fused-memory config.',
     ])
 
-    # The filer skeleton — the defensive import, the guarded queue open, the
-    # best-effort dedup fold on `anchor`, and the never-raise submit — lives in
-    # `middleware/_folded_escalation`.  An absent escalation package is a quiet
-    # no-op there, as it was here, and a queue I/O failure degrades to `None`
-    # plus a log line: a raise here would fail the write because the
-    # *complaint about* the write failed, turning a census warning into a lost
-    # memory.
     return file_folded_escalation(
         project_root,
         anchor_task_id=anchor,
