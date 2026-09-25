@@ -42,7 +42,13 @@ from unittest.mock import AsyncMock, call, patch
 import pytest
 
 from orchestrator.config import GitConfig, OrchestratorConfig
-from orchestrator.git_ops import PROTECTED_PREFIXES, GitOps, WarmBaseHealth, WorktreeKind
+from orchestrator.git_ops import (
+    PROTECTED_PREFIXES,
+    GitOps,
+    SeedLaneLock,
+    WarmBaseHealth,
+    WorktreeKind,
+)
 from orchestrator.verify import VerifyResult
 
 # ---------------------------------------------------------------------------
@@ -919,21 +925,18 @@ class TestEphemeralWorktreeErrorDisposition:
 
 
 # ---------------------------------------------------------------------------
-# task 2567 step-1: GitOps._seed_warm_lane gains take_lane_lock
+# task 2567 step-1 / task 4913: GitOps._seed_warm_lane's lane_lock mode
 # ---------------------------------------------------------------------------
 
 
 class TestSeedWarmLaneLaneLock:
-    """task 2567 step-1: pins the new ``take_lane_lock`` param on
-    ``GitOps._seed_warm_lane`` — the deadlock-avoidance seam for
-    ``ephemeral_worktree``'s upcoming CM-routed seed (task 2567's
-    LOAD-BEARING correctness fix: the CM already holds ``<lane_dir>.lock``
-    for its entire lifetime, so a naive seed call would self-deadlock
-    against the SAME lock path and time out after
-    ``_SEED_WARM_LANE_LOCK_WAIT_SECS``).
-
-    RED today: ``_seed_warm_lane`` has no ``take_lane_lock`` kwarg, so any
-    call passing it raises ``TypeError``.
+    """Pins how ``GitOps._seed_warm_lane``'s ``lane_lock`` mode
+    (:class:`SeedLaneLock`) shapes the outer ``<lane_dir>.lock`` wrapper —
+    the deadlock-avoidance seam for ``ephemeral_worktree``'s CM-routed seed
+    (task 2567: the CM already holds ``<lane_dir>.lock`` for its entire
+    lifetime, so a seed that re-took it would self-deadlock against the SAME
+    lock path and time out after ``_SEED_WARM_LANE_LOCK_WAIT_SECS``).  Only
+    ``TAKE`` builds the wrapper.
     """
 
     @staticmethod
@@ -945,8 +948,13 @@ class TestSeedWarmLaneLaneLock:
         scripts_dir.mkdir(parents=True, exist_ok=True)
         (scripts_dir / 'seed-warm-lane.sh').write_text('#!/usr/bin/env bash\nexit 0\n')
 
-    def test_take_lane_lock_false_omits_outer_flock(self, tmp_path: Path) -> None:
-        """(a): take_lane_lock=False -> argv[0] is the script path and
+    @pytest.mark.parametrize(
+        'lane_lock', [SeedLaneLock.HELD_BY_CALLER, SeedLaneLock.LEFT_TO_SCRIPT],
+    )
+    def test_non_take_modes_omit_outer_flock(
+        self, tmp_path: Path, lane_lock: SeedLaneLock,
+    ) -> None:
+        """(a): any mode but TAKE -> argv[0] is the script path and
         '<lane_dir>.lock' appears nowhere in argv."""
         git_ops = GitOps(GitConfig(), tmp_path)
         lane = tmp_path / '_lane-0'
@@ -959,23 +967,24 @@ class TestSeedWarmLaneLaneLock:
 
         with patch('orchestrator.git_ops._run', side_effect=_fake_run):
             rc = asyncio.run(
-                git_ops._seed_warm_lane(lane, '--fresh-checkout', take_lane_lock=False)
+                git_ops._seed_warm_lane(lane, '--fresh-checkout', lane_lock=lane_lock)
             )
 
         assert rc == 0, f'expected rc=0 from the fake script; got {rc}'
         assert len(calls) == 1, f'expected exactly 1 subprocess call; got {calls}'
         cmd = calls[0]
         script_path = str(lane / 'scripts' / 'seed-warm-lane.sh')
-        lane_lock = str(lane) + '.lock'
+        lane_lock_file = str(lane) + '.lock'
         assert cmd[0] == script_path, (
-            f'expected argv[0] to be the script path when take_lane_lock=False; got {cmd!r}'
+            f'expected argv[0] to be the script path when lane_lock={lane_lock.name}; '
+            f'got {cmd!r}'
         )
-        assert lane_lock not in cmd, (
-            f'expected {lane_lock!r} to be absent from argv; got {cmd!r}'
+        assert lane_lock_file not in cmd, (
+            f'expected {lane_lock_file!r} to be absent from argv; got {cmd!r}'
         )
 
-    def test_default_take_lane_lock_true_includes_outer_flock(self, tmp_path: Path) -> None:
-        """(b): default (take_lane_lock=True) -> argv begins with
+    def test_default_take_includes_outer_flock(self, tmp_path: Path) -> None:
+        """(b): default (lane_lock=TAKE) -> argv begins with
         'flock -x -w 30 -E 124 <lane_dir>.lock' then the script."""
         git_ops = GitOps(GitConfig(), tmp_path)
         lane = tmp_path / '_lane-0'
@@ -1004,12 +1013,12 @@ class TestSeedWarmLaneLaneLock:
             f'expected the script path right after the outer flock argv; got {cmd!r}'
         )
 
-    def test_symlink_base_take_lane_lock_false_keeps_inner_gen_flock(
+    def test_symlink_base_caller_held_lock_keeps_inner_gen_flock(
         self, tmp_path: Path,
     ) -> None:
-        """(c): a symlink base (target -> .gen.N) with take_lane_lock=False
-        still includes the INNER 'flock -s <gen>.lock' wrapper — only the
-        OUTER lane lock is dropped."""
+        """(c): a symlink base (target -> .gen.N) with HELD_BY_CALLER still
+        includes the INNER 'flock -s <gen>.lock' wrapper — only the OUTER
+        lane lock is dropped."""
         base_dir = tmp_path / 'bases'
         base_dir.mkdir()
         gen_dir = base_dir / '.gen.0'
@@ -1034,7 +1043,9 @@ class TestSeedWarmLaneLaneLock:
 
         with patch('orchestrator.git_ops._run', side_effect=_fake_run):
             rc = asyncio.run(
-                git_ops._seed_warm_lane(lane, '--fresh-checkout', take_lane_lock=False)
+                git_ops._seed_warm_lane(
+                    lane, '--fresh-checkout', lane_lock=SeedLaneLock.HELD_BY_CALLER,
+                )
             )
 
         assert rc == 0, f'expected rc=0 from the fake script; got {rc}'
@@ -1060,8 +1071,8 @@ class TestEphemeralWorktreeWarmSeed:
     ``ephemeral_worktree`` — the reflink-seed integration point for the
     main-health probe. When True and the warm-lane CoW seed base is
     resolvable, the CM seeds the minted worktree's ``target/`` from the
-    shared base (via ``_seed_warm_lane(..., take_lane_lock=False)``, since
-    the CM already holds ``<lane_dir>.lock``) before the body runs. Any
+    shared base (via ``_seed_warm_lane(..., lane_lock=HELD_BY_CALLER)``,
+    since the CM already holds ``<lane_dir>.lock``) before the body runs. Any
     seed fault is fail-soft (proceed COLD, body still runs); a
     non-resolvable base skips the seed subprocess entirely; default False
     keeps ``run_main_tip_sweep`` (MAIN_SWEEP) byte-identical.
@@ -1070,7 +1081,7 @@ class TestEphemeralWorktreeWarmSeed:
     call passing it raises ``TypeError``.
     """
 
-    def test_warm_seed_true_and_base_ok_seeds_fresh_checkout_without_lane_lock(
+    def test_warm_seed_true_and_base_ok_seeds_fresh_checkout_under_the_cm_held_lock(
         self, tmp_path: Path,
     ) -> None:
         git_ops = GitOps(GitConfig(), tmp_path)
@@ -1093,7 +1104,7 @@ class TestEphemeralWorktreeWarmSeed:
 
         assert len(entered_paths) == 1, 'expected the CM body to run exactly once'
         mock_seed.assert_awaited_once_with(
-            entered_paths[0], '--fresh-checkout', take_lane_lock=False,
+            entered_paths[0], '--fresh-checkout', lane_lock=SeedLaneLock.HELD_BY_CALLER,
         )
 
     @pytest.mark.parametrize('seed_rc', [75, 127])

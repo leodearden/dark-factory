@@ -530,7 +530,7 @@ _STEAL_RETRYABLE: frozenset['WarmLaneUnavailable'] = frozenset()  # populated be
 # The seed-warm-lane.sh opt-in flag under which BOTH of the script's lane-lock
 # refusal arms — the ``flock -n`` immediate refusal and the ``flock -w`` queue
 # timeout — exit 77 with a ``LANE_LOCK_CONTENDED:`` stderr marker instead of the
-# shared 75.  Passed UNGATED by ``take_lane_lock``; see
+# shared 75.  Passed for every :class:`SeedLaneLock` mode; see
 # :meth:`GitOps._seed_warm_lane` for why.
 _SEED_DISTINCT_LOCK_REFUSAL_RC_FLAG = '--distinct-lock-refusal-rc'
 
@@ -1007,6 +1007,25 @@ class WarmBaseHealth(Enum):
     OK = 'ok'
     ABSENT = 'absent'
     INDETERMINATE = 'indeterminate'
+
+
+class SeedLaneLock(Enum):
+    """Who holds ``<lane_dir>.lock`` while seed-warm-lane.sh runs — the one
+    axis :meth:`GitOps._seed_warm_lane`'s locking varies on (task 4913).
+
+    * ``TAKE`` — ``_seed_warm_lane`` takes the lock itself with its bounded
+      outer ``flock -x`` and tells the script it is held.  The default, and
+      the pool-acquire path.
+    * ``HELD_BY_CALLER`` — the caller already holds it for the whole call.  No
+      outer flock (re-taking it would self-deadlock into rc 124), but the
+      script is still told it is held, otherwise a self-locking script refuses
+      against the caller's own lock.
+    * ``LEFT_TO_SCRIPT`` — nobody holds it.  No outer flock and no assertion;
+      a self-locking script takes it itself.
+    """
+    TAKE = 'take'
+    HELD_BY_CALLER = 'held_by_caller'
+    LEFT_TO_SCRIPT = 'left_to_script'
 
 
 class WarmLaneUnavailable(Enum):
@@ -3083,9 +3102,11 @@ class GitOps:
                 :attr:`WarmBaseHealth.OK`), CoW-seeds the minted
                 worktree's ``target/`` from the shared warm base via
                 :meth:`_seed_warm_lane` (mode ``'--fresh-checkout'``,
-                ``take_lane_lock=False`` since this CM already holds
-                ``<lane_dir>.lock`` for its own lifetime — see the Note
-                below) after a successful add and BEFORE the body runs,
+                ``lane_lock=SeedLaneLock.HELD_BY_CALLER`` since this CM
+                already holds ``<lane_dir>.lock`` for its own lifetime —
+                see the Note below — so seed neither re-takes the lock nor
+                lets the script re-take it) after a successful add and
+                BEFORE the body runs,
                 turning a cold from-scratch build into a warm incremental
                 one. Any non-zero seed rc (absent script, disk pressure,
                 generic fault) is logged and the CM proceeds COLD — a
@@ -3143,8 +3164,9 @@ class GitOps:
         # for the CM's entire lifetime so gc.sh's `flock -n` orphan-removal
         # contender (gc.sh:564-574) sees a live consumer and preserves this
         # worktree instead of force-removing it out from under a still-
-        # running probe/sweep (task 2507).
-        lock_path = base / f'{tmp_path.name}.lock'
+        # running probe/sweep (task 2507). Derived through lane_lock_path so
+        # the lock held here IS the lock asserted to seed below.
+        lock_path = lane_lock_path(tmp_path)
 
         _MAX_ADD_RETRIES = 3
         worktree_added = False
@@ -3209,11 +3231,11 @@ class GitOps:
             # so a probe/sweep opted into warm_seed starts from a pre-built
             # main instead of a cold from-scratch recompile. Fail-soft: any
             # non-zero seed rc just logs and proceeds COLD — never raises,
-            # never removes the worktree. take_lane_lock=False because this
-            # CM already holds <lane_dir>.lock (above) for its entire
-            # lifetime; re-taking it inside _seed_warm_lane would
-            # self-deadlock against the identical path (see that method's
-            # take_lane_lock docstring note).
+            # never removes the worktree. HELD_BY_CALLER because this CM
+            # already holds <lane_dir>.lock (above) for its entire lifetime:
+            # re-taking it inside _seed_warm_lane would self-deadlock against
+            # the identical path, and leaving it to the script would make a
+            # self-locking script refuse against our own lock (task 4913).
             #
             # task 2567 amendment: the whole gate is wrapped in a broad
             # except so the never-raise contract is structural rather than
@@ -3228,30 +3250,10 @@ class GitOps:
                 try:
                     if self._warm_lane_base_resolvable() is WarmBaseHealth.OK:
                         seed_rc = await self._seed_warm_lane(
-                            tmp_path, '--fresh-checkout', take_lane_lock=False,
+                            tmp_path, '--fresh-checkout',
+                            lane_lock=SeedLaneLock.HELD_BY_CALLER,
                         )
-                        _seed_self_refused = seed_rc != 0 and (
-                            _seed_rc_to_unavailable(seed_rc)
-                            is WarmLaneUnavailable.LANE_LOCK_CONTENDED
-                        )
-                        if _seed_self_refused:
-                            # --assume-lane-lock-held is gated on
-                            # take_lane_lock, so this take_lane_lock=False
-                            # caller never sends it and a self-locking seed
-                            # script refuses against OUR OWN lock every time
-                            # (flock is not re-entrant across a process tree,
-                            # so the "other live consumer" is this process).
-                            # rc 77 makes that legible; it does not prevent it.
-                            logger.info(
-                                'ephemeral_worktree(%s): warm seed SELF-refused '
-                                'on %s.lock (rc=%d, lane-lock contention) — this '
-                                'CM holds that lock itself and cannot assert it '
-                                'to seed, so the seed is a no-op against a '
-                                'self-locking script; proceeding COLD '
-                                '(fail-soft)',
-                                kind.name, tmp_path, seed_rc,
-                            )
-                        elif seed_rc != 0:
+                        if seed_rc != 0:
                             logger.info(
                                 'ephemeral_worktree(%s): warm seed failed (rc=%d) '
                                 'for %s — proceeding COLD (fail-soft)',
@@ -5227,7 +5229,8 @@ class GitOps:
             )
 
     async def _seed_warm_lane(
-        self, lane_dir: Path, mode: str, *, take_lane_lock: bool = True,
+        self, lane_dir: Path, mode: str, *,
+        lane_lock: SeedLaneLock = SeedLaneLock.TAKE,
     ) -> int:
         """Run seed-warm-lane.sh to CoW-seed the lane's target/ from the warm base.
 
@@ -5263,19 +5266,16 @@ class GitOps:
         ``target/`` at once — see that method's "Lane-lock coupling gap"
         docstring note for the full race analysis (now closed).
 
-        **``take_lane_lock`` (task 2567)**: when ``False``, the OUTER
-        ``flock -x <lane_dir>.lock`` wrapper described above is omitted
-        entirely — only the INNER per-gen-dir ``flock -s <gen>.lock``
-        (symlink branch only; a different path) is still taken. Callers
-        that already hold ``<lane_dir>.lock`` themselves for the whole
-        call (e.g. :meth:`GitOps.ephemeral_worktree`'s CM-lifetime flock,
-        task 2507) MUST pass ``take_lane_lock=False`` — re-acquiring the
-        IDENTICAL path from the same process would self-deadlock against
-        the bounded wait below, timing out at
-        ``_SEED_WARM_LANE_LOCK_TIMEOUT_RC`` after
-        ``_SEED_WARM_LANE_LOCK_WAIT_SECS`` on every call. Default ``True``
-        keeps every other existing caller (``acquire_warm_lane``,
-        ``create_interactive_worktree``, recycle) byte-identical.
+        **``lane_lock``**: who holds ``<lane_dir>.lock`` during the seed —
+        see :class:`SeedLaneLock` for what each mode does.  Only ``TAKE``
+        (the default: ``acquire_warm_lane``, ``create_interactive_worktree``,
+        recycle) builds the OUTER wrapper above; the INNER per-gen-dir
+        ``flock -s <gen>.lock`` (symlink branch only; a different path) is
+        taken in every mode.  ``HELD_BY_CALLER`` exists for
+        :meth:`GitOps.ephemeral_worktree`, whose CM-lifetime flock (task
+        2507) already holds the IDENTICAL path: re-acquiring it would
+        self-deadlock against the bounded wait below, and NOT asserting it
+        would let a self-locking script refuse against the CM's own lock.
 
         **Bounded wait, not unbounded (task 2599 amendment)**: seeding runs
         on the latency-sensitive warm-lane acquisition hot path, so the
@@ -5339,25 +5339,26 @@ class GitOps:
             # note — so a live-but-wedged holder fails closed with a
             # distinct, diagnosable rc instead of stalling this hot path
             # forever.
-            lane_lock = lane_lock_path(lane_dir)
+            lane_lock_file = lane_lock_path(lane_dir)
             lane_lock_flock = (
                 [
                     'flock', '-x',
                     '-w', str(_SEED_WARM_LANE_LOCK_WAIT_SECS),
                     '-E', str(_SEED_WARM_LANE_LOCK_TIMEOUT_RC),
-                    str(lane_lock),
+                    str(lane_lock_file),
                 ]
-                if take_lane_lock
+                if lane_lock is SeedLaneLock.TAKE
                 else []
             )
-            # reify 5556: when WE hold the outer lane lock above, seed must NOT
-            # re-open+flock the same file. reify's seed-warm-lane.sh acquires
-            # ${LANE_DIR}.lock by DEFAULT under --fresh-checkout as of reify
-            # 7b20d010c6 (task 5354) — previously opt-in via --lane-lock — and
-            # flock is not re-entrant across a process tree, so the script's
-            # own flock -n self-refuses against this method's lock and exits
-            # 75. That 75 WAS indistinguishable from genuine disk pressure at
-            # _seed_rc_to_unavailable, so every dispatch requeued as
+            # reify 5556: whenever the lane lock is already held — by the outer
+            # wrapper above (TAKE) or by our caller (HELD_BY_CALLER) — seed
+            # must NOT re-open+flock the same file. reify's seed-warm-lane.sh
+            # acquires ${LANE_DIR}.lock by DEFAULT under --fresh-checkout as of
+            # reify 7b20d010c6 (task 5354) — previously opt-in via --lane-lock
+            # — and flock is not re-entrant across a process tree, so the
+            # script's own flock -n self-refuses against the held lock and
+            # exits 75. That 75 WAS indistinguishable from genuine disk
+            # pressure at _seed_rc_to_unavailable, so every dispatch requeued as
             # WarmLaneDiskPressure with agent_invocations=0, released the lane,
             # and re-picked the same lowest-index free lane: a fleet-wide
             # dispatch livelock (349 requeues / 4 completions per day).
@@ -5372,7 +5373,10 @@ class GitOps:
             # working seed into a hard fault. Probe absent → omit the flag and
             # keep the pre-5354 behaviour, where the script never self-locks.
             seed_flags: list[str] = []
-            if take_lane_lock and _seed_script_supports_assume_lane_lock_held(script):
+            if (
+                lane_lock is not SeedLaneLock.LEFT_TO_SCRIPT
+                and _seed_script_supports_assume_lane_lock_held(script)
+            ):
                 seed_flags.append(_SEED_ASSUME_LANE_LOCK_HELD_FLAG)
             # Opt in to the distinct lane-lock refusal code so a refusal
             # arrives as 77 instead of 75 (see
@@ -5380,11 +5384,12 @@ class GitOps:
             # same per-lane-vintage reason as the flag above, failing CLOSED to
             # today's rc-75 behaviour.
             #
-            # Deliberately NOT gated on take_lane_lock, unlike the flag above:
-            # that one matters only when WE hold the outer lock, whereas the
-            # refusal arms this one names are reachable precisely in the
-            # take_lane_lock=False shape (the ephemeral_worktree CM, which locks
-            # for itself).  Gating it would make it inert in the cases it exists
+            # Deliberately NOT gated on lane_lock, unlike the flag above: that
+            # one is sent only when the lock is already held (TAKE /
+            # HELD_BY_CALLER), whereas the refusal arms this one names are
+            # reachable whenever the SCRIPT self-locks — LEFT_TO_SCRIPT, or any
+            # mode against a self-locking script that cannot be told the lock
+            # is held.  Gating it would make it inert in the cases it exists
             # for; passing it always is safe because the script accepts it as
             # inert wherever no refusal is reachable, never as a usage error.
             if _seed_script_supports_distinct_lock_refusal_rc(script):
@@ -5430,7 +5435,7 @@ class GitOps:
                     '%s — a concurrent holder (thin rm -rf / GC reclaim / '
                     'another seed) is still live; failing closed rather '
                     'than risk a torn target/ (rc=%d)',
-                    _SEED_WARM_LANE_LOCK_WAIT_SECS, lane_lock, rc,
+                    _SEED_WARM_LANE_LOCK_WAIT_SECS, lane_lock_file, rc,
                 )
             elif rc == 77:
                 # Its own branch, beside the 124 outer-lock-timeout branch

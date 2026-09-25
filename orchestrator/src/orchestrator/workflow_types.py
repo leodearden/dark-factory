@@ -456,9 +456,9 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
         # ACCEPTED RISK — the live-but-wedged holder. flock releases a lock on
         # holder *death*, never on a stuck-but-live process (the reason
         # GitOps._seed_warm_lane bounds the wait at all), so a hung thin
-        # `rm -rf`, a stalled GC reclaim, or a caller that passes
-        # take_lane_lock=True while already holding the lock produces rc=124 on
-        # EVERY attempt and does NOT self-clear. On the steal path the retry
+        # `rm -rf`, a stalled GC reclaim, or a caller that seeds with the
+        # default lane_lock=SeedLaneLock.TAKE while already holding the lock
+        # produces rc=124 on EVERY attempt and does NOT self-clear. On the steal path the retry
         # driver moves to a DIFFERENT lane (LANE_LOCK_TIMEOUT is in
         # git_ops._STEAL_RETRYABLE), but a FREE-lane acquire re-picks the same
         # lowest-index lane, so this uncounted row lets such a task requeue
