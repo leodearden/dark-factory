@@ -2132,25 +2132,25 @@ def create_mcp_server(
                 entry.get('observed'), UNVERIFIED_CLAIM_TAG,
             )
 
-    async def _tag_unverified_completion_claims(
-        content: str, agent_id: str | None, project_id: str
-    ) -> dict[str, Any] | None:
-        """Run the completion-claim gate for a write tool; the ONE home for it.
+    def _report_unverified_claims(
+        flag: dict[str, Any], agent_id: str | None, project_id: str
+    ) -> dict[str, Any]:
+        """Report a write the completion-claim gate flagged; the ONE home for it.
 
-        Returns None when there is nothing to tag. Otherwise it logs every
-        flagged claim, files (or folds onto) the per-ref operator escalation for
-        the writer's project, and returns the structured flag, carrying
-        ``escalation_id`` when an escalation was filed. It LABELS and
-        escalates, never rejects: the caller forwards ``unverified_claim=True``
-        to the service so the tag reaches the stored artefacts, and echoes the
-        returned flag under ``UNVERIFIED_CLAIM_TAG`` in its response.
+        The gate has two halves, and each write tool runs them in this order:
+        ``_completion_claim_gate`` BEFORE the service call, so the caller can
+        forward ``unverified_claim=True`` and the tag reaches the stored
+        artefacts; then this, only AFTER the service has accepted the write,
+        because both things it emits say the write was INGESTED. A write
+        rejected anywhere, at a tool guard or inside the service, reports
+        nothing.
 
+        It logs every flagged claim, files (or folds onto) the per-ref operator
+        escalation for the writer's project, and returns the flag to echo under
+        ``UNVERIFIED_CLAIM_TAG``, carrying ``escalation_id`` when one was filed.
         The tag labels the corpus; the escalation reaches an operator. Both,
         or the finding lives only in a WARNING nobody greps (INV-4).
         """
-        flag = await _completion_claim_gate(content, agent_id, project_id)
-        if flag is None:
-            return None
         _log_unverified_claims(flag, agent_id)
         # emit_unverified_claim_escalation is built never to raise, but a call
         # site that RELIED on that promise would turn a future regression there
@@ -3246,10 +3246,9 @@ def create_mcp_server(
         # episode when one cannot be confirmed. Deliberately NOT under a
         # recon-stage- guard like the 2824 gate immediately above: this one only
         # labels, so it costs a non-recon writer nothing, and a false completion
-        # claim damages the corpus identically whoever writes it.
-        unverified_flag = await _tag_unverified_completion_claims(
-            content, agent_id, project_id,
-        )
+        # claim damages the corpus identically whoever writes it. Reported only
+        # after the service call below; see _report_unverified_claims.
+        unverified_flag = await _completion_claim_gate(content, agent_id, project_id)
         causation_id, op_source, _ = _extract_causation(metadata, agent_id)
         extra: dict[str, Any] = {}
         if unverified_flag is not None:
@@ -3280,8 +3279,12 @@ def create_mcp_server(
             **extra,
         )
         payload = result.model_dump()
-        if unverified_flag is not None and isinstance(payload, dict):
-            payload[UNVERIFIED_CLAIM_TAG] = unverified_flag
+        if unverified_flag is not None:
+            unverified_flag = _report_unverified_claims(
+                unverified_flag, agent_id, project_id,
+            )
+            if isinstance(payload, dict):
+                payload[UNVERIFIED_CLAIM_TAG] = unverified_flag
         return payload
 
     @mcp.tool()
@@ -3798,12 +3801,12 @@ def create_mcp_server(
                 return build_near_duplicate_block(
                     agent_id, content, near_dup_match, near_dup_threshold
                 )
-        # task 4715: after EVERY reject guard above, so a write that never lands
-        # pays no authority I/O and files no escalation; for every writer, like
-        # add_episode's. See _tag_unverified_completion_claims for the contract.
-        unverified_flag = await _tag_unverified_completion_claims(
-            content, agent_id, project_id,
-        )
+        # task 4715: checked after every tool-level reject guard above, so a
+        # write they reject pays no authority I/O; for every writer, like
+        # add_episode's. Reported only once the service has accepted the write
+        # (below), so a service-level reject files nothing either; see
+        # _report_unverified_claims for the contract.
+        unverified_flag = await _completion_claim_gate(content, agent_id, project_id)
         claim_kwargs: dict[str, Any] = (
             {'unverified_claim': True} if unverified_flag is not None else {}
         )
@@ -3995,7 +3998,9 @@ def create_mcp_server(
             attached_to = None
         ack = result.model_dump()
         if unverified_flag is not None:
-            ack[UNVERIFIED_CLAIM_TAG] = unverified_flag
+            ack[UNVERIFIED_CLAIM_TAG] = _report_unverified_claims(
+                unverified_flag, agent_id, project_id,
+            )
         if triage_decision is not None:
             # Purely ADDITIVE over the AddMemoryResponse: every existing caller
             # reads those fields and must keep working untouched.

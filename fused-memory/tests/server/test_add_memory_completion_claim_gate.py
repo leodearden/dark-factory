@@ -4,7 +4,8 @@
 this pins that `add_memory` runs it too: a contradicted or unconfirmable claim
 naming concrete work is INGESTED and TAGGED (never rejected), the tag reaches
 the service at both of the tool's call sites, the flag is echoed on the
-response, and one operator escalation is filed per ref.
+response, and one operator escalation is filed per ref, only once the service
+has accepted the write.
 
 The emitter is NOT monkeypatched. Every server registers `dark_factory` at
 `tmp_path`, so the real `emit_unverified_claim_escalation` files into
@@ -18,12 +19,14 @@ fire on it and a recon-stage agent_id observes THIS gate in isolation.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 
+from fused_memory.memory_metadata import MemoryMetadataValidationError, MetadataViolation
 from fused_memory.server.tools import create_mcp_server
 
 # The write-triage harness, imported rather than re-derived (the established
@@ -77,6 +80,13 @@ def _pending_escalations(root: Path) -> list:
     if not queue_dir.exists():
         return []
     return EscalationQueue(queue_dir).get_pending()
+
+
+def _gate_warnings(caplog) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records
+        if r.getMessage().startswith('completion_claim_gate.unverified')
+    ]
 
 
 class TestContradictedClaimsAreTagged:
@@ -212,6 +222,33 @@ class TestGateOrdering:
         mock_service.add_memory.assert_not_awaited()
         task_interceptor.get_statuses.assert_not_awaited()
         assert _pending_escalations(tmp_path) == []
+
+    @pytest.mark.asyncio
+    async def test_a_service_level_metadata_reject_reports_nothing(self, tmp_path, caplog):
+        # What MemoryService.add_memory raises under memory_metadata.enforce
+        # when a violation is fatal; the claim was checked, the write never landed.
+        mock_service = _mock_service()
+        mock_service.add_memory.side_effect = MemoryMetadataValidationError([
+            MetadataViolation(
+                key='topic', code='invalid_topic_slug',
+                message='topic is malformed', fatal=True,
+            ),
+        ])
+        server, _ = _server(mock_service, tmp_path, statuses=_IN_PROGRESS)
+
+        with caplog.at_level(logging.DEBUG):
+            result = await _call(server)
+
+        assert result.get('error_type') == 'MemoryMetadataValidationError', f'{result!r}'
+        assert mock_service.add_memory.call_args.kwargs.get('unverified_claim') is True
+        assert _pending_escalations(tmp_path) == [], (
+            'an escalation saying the write was ingested was filed for a write '
+            'the service rejected'
+        )
+        assert _gate_warnings(caplog) == [], (
+            f'the INGESTED-and-tagged line was logged for a rejected write: '
+            f'{_gate_warnings(caplog)!r}'
+        )
 
 
 class TestBothServiceCallSitesCarryTheTag:
