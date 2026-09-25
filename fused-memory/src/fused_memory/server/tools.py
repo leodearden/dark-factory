@@ -129,6 +129,7 @@ from fused_memory.server.near_duplicate_guard import (
     resolve_topic_guard_clusters,
 )
 from fused_memory.server.tool_errors import mcp_tool_errors
+from fused_memory.server.topic_cluster_store import TopicClusterStore
 from fused_memory.server.write_triage import (
     CANONICAL_ID_KEY,
     FAIL_OPEN_ESCALATION_ID_KEY,
@@ -1165,6 +1166,7 @@ def create_mcp_server(
     event_queue: EventQueue | None = None,
     curator_usage_gate: UsageGate | None = None,
     known_projects: dict[str, str] | None = None,
+    topic_cluster_store: TopicClusterStore | None = None,
 ) -> FastMCP:
     """Create and configure the FastMCP server with all tools."""
 
@@ -3684,7 +3686,9 @@ def create_mcp_server(
             # TOPIC-keyed rather than category-keyed: unlike the cosine guard
             # below, this check is not scoped to a single category — it covers
             # every category in _TOPIC_GUARD_GATED_CATEGORIES.
-            topic_clusters = resolve_topic_guard_clusters(memory_service)
+            topic_clusters = resolve_topic_guard_clusters(
+                memory_service, runtime_store=topic_cluster_store, project_id=project_id
+            )
             if topic_clusters:
                 topic_match = find_matching_topic_cluster(content, topic_clusters)
                 if topic_match is not None:
