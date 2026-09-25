@@ -36,7 +36,7 @@ from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
 
 from fused_memory.config.schema import ProceduralTopicCluster
 
-__all__ = ['TopicClusterStore']
+__all__ = ['TopicClusterStore', 'TopicClusterStoreError']
 
 _SCHEMA = """\
 CREATE TABLE IF NOT EXISTS topic_clusters (
@@ -74,6 +74,17 @@ _SELECT_ALL_SQL = (
 )
 
 
+class TopicClusterStoreError(RuntimeError):
+    """A persisted topic-cluster row failed re-validation at :meth:`TopicClusterStore.open`.
+
+    Rows land only through :meth:`TopicClusterStore.upsert`, which accepts
+    nothing but a validated :class:`ProceduralTopicCluster`. A row that fails
+    re-validation therefore means tampering or an unmigrated model change.
+    Both are startup conditions an operator must fix, which is exactly the
+    config path's posture when a cluster fails validation at load.
+    """
+
+
 class TopicClusterStore:
     """Persistent-connection sync SQLite store of derived topic clusters.
 
@@ -101,8 +112,13 @@ class TopicClusterStore:
     def open(self) -> None:
         """Open the connection, apply durability pragmas, ensure schema, hydrate.
 
+        A failed ``open()`` closes its connection before raising, so it can be
+        retried once the file is fixed.
+
         Raises:
             RuntimeError: if called while already open.
+            TopicClusterStoreError: naming EVERY persisted row that fails
+                re-validation through :class:`ProceduralTopicCluster`.
         """
         if self._conn is not None:
             raise RuntimeError(f'{type(self).__name__} already opened')
@@ -112,7 +128,7 @@ class TopicClusterStore:
             apply_full_durability_pragmas_sync(conn, busy_timeout_ms=self._busy_timeout_ms)
             conn.executescript(_SCHEMA)
             conn.commit()
-            clusters = _hydrate(conn)
+            clusters = _hydrate(conn, self._db_path)
         except BaseException:
             conn.close()
             raise
@@ -143,7 +159,16 @@ class TopicClusterStore:
         category: str | None = None,
         run_id: str | None = None,
     ) -> None:
-        """Insert or replace the row for ``(project_id, cluster.topic_id)`` (one commit)."""
+        """Insert or replace the row for ``(project_id, cluster.topic_id)`` (one commit).
+
+        Raises:
+            TypeError: if ``cluster`` is not a validated ``ProceduralTopicCluster``.
+            RuntimeError: if the store is not open.
+        """
+        if not isinstance(cluster, ProceduralTopicCluster):
+            raise TypeError(
+                f'upsert() takes a validated ProceduralTopicCluster, got {type(cluster).__name__}'
+            )
         conn = self._require_conn()
         conn.execute(
             _UPSERT_SQL,
@@ -168,9 +193,31 @@ class TopicClusterStore:
         return [by_topic[topic_id] for topic_id in sorted(by_topic)]
 
 
-def _hydrate(conn: sqlite3.Connection) -> dict[str, dict[str, ProceduralTopicCluster]]:
+def _hydrate(
+    conn: sqlite3.Connection, db_path: Path
+) -> dict[str, dict[str, ProceduralTopicCluster]]:
     clusters: dict[str, dict[str, ProceduralTopicCluster]] = {}
+    offenders: list[str] = []
     for project_id, topic_id, cluster_json in conn.execute(_SELECT_ALL_SQL):
-        cluster = ProceduralTopicCluster.model_validate(json.loads(cluster_json))
+        try:
+            cluster = ProceduralTopicCluster.model_validate(json.loads(cluster_json))
+        except ValueError as exc:
+            offenders.append(f'  ({project_id!r}, {topic_id!r}): {exc}')
+            continue
         clusters.setdefault(project_id, {})[topic_id] = cluster
+    if offenders:
+        raise TopicClusterStoreError(_invalid_rows_message(db_path, offenders))
     return clusters
+
+
+def _invalid_rows_message(db_path: Path, offenders: list[str]) -> str:
+    listing = '\n'.join(offenders)
+    return (
+        f'topic-cluster store {db_path} holds {len(offenders)} row(s) that fail '
+        f're-validation as ProceduralTopicCluster (topic_id is a slug per '
+        f'fused_memory.topic_slug):\n{listing}\n'
+        f'These rows are machine-derived: only a validated upsert writes them, so '
+        f'this means tampering or an unmigrated model change. Delete the offending '
+        f'row(s) or the file; that loses only derived clusters, which the next '
+        f'consolidate_memories of each topic re-seeds.'
+    )
