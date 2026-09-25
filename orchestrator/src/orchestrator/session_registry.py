@@ -2544,6 +2544,58 @@ def reap_stale_records(
     return reaped
 
 
+def _is_stale_session_pointer(path: Path, root: Path | str | None) -> bool:
+    try:
+        pid = int(path.name)
+    except ValueError:
+        return True
+    if pid <= 0 or path.name != str(pid) or not _pid_alive(pid):
+        return True
+    try:
+        slug = path.read_text(encoding='utf-8').strip()
+    except (OSError, ValueError):
+        return True
+    return not _is_record_key(slug) or not record_path_for_slug(slug, root=root).is_file()
+
+
+def reap_stale_session_pointers(root: Path | str | None = None) -> list[Path]:
+    """Remove every ``sessions-by-pid/`` entry that can no longer serve a reader.
+
+    An entry is stale when its name is not a canonical positive pid, its pid
+    is dead, its content is not a record key, or the record it names has no
+    ``record.json``. A dead pid's pointer goes even while its record still
+    exists: its owner can never query it again, and a process that reuses
+    the pid must not inherit it. Record bodies are never parsed, so the cost
+    is O(pointer files), not O(records).
+
+    This is a separate sweep from ``reap_stale_records`` because that one
+    derives identity from each record's PATH and never reads the body, so it
+    cannot know which pointers name the records it removes. Returns the
+    removed paths; an entry that cannot be removed is logged and skipped.
+    """
+    base = session_pointers_dir(root)
+    if not base.is_dir():
+        return []
+    entries = sorted(base.iterdir())
+    removed: list[Path] = []
+    for path in entries:
+        if not _is_stale_session_pointer(path, root):
+            continue
+        try:
+            path.unlink()
+        except OSError as exc:
+            logger.warning('reap_stale_session_pointers: failed to remove %s: %s', path, exc)
+            continue
+        removed.append(path)
+    logger.info(
+        'reap_stale_session_pointers: removed %d of %d pointer(s) under %s',
+        len(removed),
+        len(entries),
+        base,
+    )
+    return removed
+
+
 ORPHAN_EXIT_CODE: int = 200
 """Synthetic exit code stamped by ``mark_orphaned_sessions_exited`` when a
 non-terminal session's ``launcher_pid`` is provably dead but no real exit
@@ -4014,6 +4066,10 @@ def _run_launching(env: Mapping[str, str]) -> str:
     The bounded prune (``limit=REAP_BATCH_LIMIT``) caps its own scan/rmtree
     cost per call regardless of backlog size; the CLI ``reap`` verb
     (``_run_reap``) remains the operator's unbounded full-drain path.
+
+    Last, ``reap_stale_session_pointers`` drops dead-pid and dangling pid
+    pointers, under the same per-sweep guard; spawns are its only regular
+    driver.
     """
     title = env.get('CLAUDE_SPAWN_TITLE', '') or ''
     prompt = env.get('CLAUDE_SPAWN_PROMPT', '') or ''
@@ -4047,6 +4103,8 @@ def _run_launching(env: Mapping[str, str]) -> str:
         mark_windowless_wm_sessions_exited()
     with contextlib.suppress(Exception):
         reap_stale_records(limit=REAP_BATCH_LIMIT)
+    with contextlib.suppress(Exception):
+        reap_stale_session_pointers()
     return str(record_dir)
 
 
@@ -4103,10 +4161,16 @@ def _run_reap() -> list[ReapedSessionRecord]:
     it reaps exactly the live-pid / age<1h wm-display zombies (a closed
     terminal window with a still-alive launcher_pid) the pid/TTL sweep is
     forced to keep, so `reap` must drive both before deleting.
+
+    ``reap_stale_session_pointers`` runs after the deletion so pointers to
+    records removed in this same pass go too; the return value still lists
+    only the removed record dirs.
     """
     mark_orphaned_sessions_exited()
     mark_windowless_wm_sessions_exited()
-    return reap_stale_records()
+    reaped = reap_stale_records()
+    reap_stale_session_pointers()
+    return reaped
 
 
 def _run_lease_claim(name: str, slug: str, pid: int | None, policy_value: str) -> None:
