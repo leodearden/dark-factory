@@ -644,12 +644,10 @@ _MIGRATED_FILERS: tuple[_Filer, ...] = (
         logging.DEBUG,
         1,
     ),
-    # THE ONE EXCEPTION, and the defect this table exists to fence. A repair
-    # storm is a sustained scanner/resolver regression against a measured
-    # ~0.22% base rate, so an env without the optional `escalation` package
-    # emitting nothing at the default threshold is a LOST ALARM, not a detail.
-    # Merge-base 6f9cddb0bb logged it at WARNING; consolidation flattened it to
-    # DEBUG and 417 passing tests said nothing.
+    # THE ONE LOG-LEVEL EXCEPTION. A repair storm is a sustained
+    # scanner/resolver regression against a measured ~0.22% base rate, so an
+    # env without the optional `escalation` package emitting nothing at the
+    # default threshold is a LOST ALARM, not a detail.
     _Filer(
         'referent_repair_storm_escalator',
         'fused_memory.middleware.referent_repair_storm_escalator',
@@ -748,8 +746,7 @@ class TestEveryFilerPinsItsForwardedLevels:
 
     def test_the_table_covers_every_folded_filer_and_names_its_exceptions(self):
         """Anti-vacuity: a parametrized fence passes trivially for a filer that
-        is simply absent from the table, which is how the predecessor
-        anchor sweep missed two of them."""
+        is simply absent from the table."""
         assert {f.label for f in _MIGRATED_FILERS} == {
             'write_triage',
             'markup_tripwire storm',
@@ -782,7 +779,7 @@ class TestEveryFilerPinsItsForwardedLevels:
 
 
 # ---------------------------------------------------------------------------
-# The anchor-collision regression, generalised (task 4854).
+# The anchor-collision regression.
 #
 # Deliberately NOT decorated with `_needs_escalation`: it reads module
 # constants and needs no queue, and an alarm that only fires where the
@@ -845,7 +842,7 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
     )
 
     return {
-        # -- the seven filers task 4854 folded into `_folded_escalation` -----
+        # -- the seven filers that call `file_folded_escalation` ------------
         'write_triage': WRITE_TRIAGE_ANCHOR,
         'markup_tripwire storm (the SQUATTED one)': TRIPWIRE_ANCHOR,
         'markup_tripwire residue': TRIPWIRE_RESIDUE_ANCHOR,
@@ -897,14 +894,8 @@ class TestNoTwoFilersShareAnAnchor:
     `anchor_task_id` parameter (see its docstring), and it is why no filer
     may share an anchor with any other. Asserted against every filer's
     constants IMPORTED FROM THEIR OWN HOMES, so a future rename that collides
-    is caught here rather than in production silence.
-
-    GENERALISED FROM one-vs-seven to PAIRWISE by task 4854. The narrower
-    predecessor lived in `tests/server/test_write_triage.py` and compared
-    write_triage's anchor against its siblings only, so a collision between
-    any two OTHER filers passed it unnoticed — and it named neither
-    `completion_claim_gate` nor `memory_metadata_census`, the two filers that
-    task discovered.
+    is caught here rather than in production silence. PAIRWISE, so a
+    collision between any two filers fails, not only one against the rest.
     """
 
     def test_every_pair_of_anchors_is_distinct(self) -> None:
@@ -940,7 +931,7 @@ class TestNoTwoFilersShareAnAnchor:
 
     def test_the_sweep_covers_every_filer_on_the_queue(self) -> None:
         """Anti-vacuity: a pairwise sweep passes trivially if a filer is left
-        out, which is exactly how the predecessor missed two of them."""
+        out."""
         anchors = _anchors_read_from_their_own_homes()
 
         for required in (
@@ -972,13 +963,9 @@ class TestTheFiledAnchorAndTheLookupAreTheSame:
     It would produce a record nobody dedupes against (unbounded duplicates)
     or a lookup nobody files under (permanent suppression). Pinned by
     capturing the anchor the dedup read is called with and comparing it to
-    the `task_id` that actually landed.
-
-    MOVED HERE by task 4854 from `tests/server/test_write_triage.py`, where it
-    could only ever prove the property for one caller. Both uses are now
-    threaded from the SINGLE `anchor_task_id` parameter of
-    `file_folded_escalation`, so this is where the property lives — and one
-    test now covers every filer that calls it.
+    the `task_id` that actually landed. Both are threaded from the single
+    `anchor_task_id` parameter, so one test covers every filer that calls the
+    helper.
     """
 
     def test_the_dedup_lookup_uses_the_anchor_that_is_filed(

@@ -28,6 +28,7 @@ through it and the test content needs no markup-proofing.)
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import json
 import logging
 import types
@@ -36,7 +37,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from fused_memory.config.schema import ProceduralTopicCluster
-from fused_memory.middleware import _folded_escalation
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server import tools, write_triage
@@ -1182,7 +1182,7 @@ def _filed_escalations(root) -> list[dict]:
 
 
 @pytest.mark.skipif(
-    not _folded_escalation.HAS_ESCALATION,
+    importlib.util.find_spec('escalation') is None,
     reason='the escalation package is not installed in this environment',
 )
 class TestTheFailOpenStormReachesAnOperator:

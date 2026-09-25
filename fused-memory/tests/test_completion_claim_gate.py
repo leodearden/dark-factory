@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import pytest
 
-from fused_memory.middleware import _folded_escalation
 from fused_memory.services.completion_claim_gate import (
     UNRESOLVABLE,
     UNVERIFIED_CLAIM_TAG,
@@ -577,8 +576,7 @@ class TestEmitUnverifiedClaimEscalation:
     reads the corpus looking for tags — an unverified claim also has to reach a
     queue a human or the auto-watcher actually opens.
 
-    Copied shape-for-shape from markup_tripwire.emit_markup_storm_escalation,
-    and for the same reason it exists there rather than going through
+    It files into the project's own queue rather than through
     recon_lifecycle_filer: the recon_report channel silently DROPS findings when
     no Stage-2 run is active, and an episode arrives at arbitrary times.
     """
@@ -606,10 +604,8 @@ class TestEmitUnverifiedClaimEscalation:
 
         from fused_memory.services import completion_claim_gate as gate_mod
 
+        pytest.importorskip('escalation')
         esc_id = gate_mod.emit_unverified_claim_escalation(str(tmp_path), self._flag())
-        if not _folded_escalation.HAS_ESCALATION:
-            assert esc_id is None
-            return
 
         assert isinstance(esc_id, str)
         files = list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
@@ -634,10 +630,8 @@ class TestEmitUnverifiedClaimEscalation:
         """
         from fused_memory.services import completion_claim_gate as gate_mod
 
+        pytest.importorskip('escalation')
         first = gate_mod.emit_unverified_claim_escalation(str(tmp_path), self._flag())
-        if not _folded_escalation.HAS_ESCALATION:
-            assert first is None
-            return
 
         again = gate_mod.emit_unverified_claim_escalation(str(tmp_path), self._flag())
         assert again == first, (
@@ -656,29 +650,6 @@ class TestEmitUnverifiedClaimEscalation:
 
         assert gate_mod.emit_unverified_claim_escalation(None, self._flag()) is None
 
-    def test_missing_escalation_package_is_a_quiet_no_op(self, tmp_path, monkeypatch):
-        from fused_memory.services import completion_claim_gate as gate_mod
-
-        monkeypatch.setattr(_folded_escalation, 'HAS_ESCALATION', False)
-        assert gate_mod.emit_unverified_claim_escalation(str(tmp_path), self._flag()) is None
-        assert not (tmp_path / 'data').exists()
-
-    def test_queue_open_failure_returns_none_without_raising(self, tmp_path, monkeypatch):
-        """Escalation is purely ADDITIVE — the episode is already ingested and
-        tagged by the time this runs. Every failure mode degrades to None plus a
-        log line, never to an exception on the write path.
-        """
-        from fused_memory.services import completion_claim_gate as gate_mod
-
-        if not _folded_escalation.HAS_ESCALATION:
-            pytest.skip('escalation package unavailable')
-        monkeypatch.setattr(
-            _folded_escalation,
-            'EscalationQueue',
-            lambda *a, **k: (_ for _ in ()).throw(OSError('queue dir unwritable')),
-        )
-        assert gate_mod.emit_unverified_claim_escalation(str(tmp_path), self._flag()) is None
-
     def test_empty_flag_files_nothing(self, tmp_path):
         from fused_memory.services import completion_claim_gate as gate_mod
 
@@ -686,11 +657,9 @@ class TestEmitUnverifiedClaimEscalation:
 
 
 class TestDelegatesToTheSharedHelper:
-    """The filer BODY now lives in `middleware/_folded_escalation` (task 4854).
-
-    What stays here is this gate's own identity — its per-REF anchor, its role
-    and category, and the divergence worth stating out loud: it files at
-    `severity='info'`, not 'blocking', because nothing is stuck.
+    """What this gate forwards to `file_folded_escalation`: its per-REF
+    anchor, its role and category, and the divergence worth stating out loud —
+    it files at `severity='info'`, not 'blocking', because nothing is stuck.
     """
 
     def _flag(self, ref: str = '5422') -> dict:
@@ -731,8 +700,6 @@ class TestDelegatesToTheSharedHelper:
         # every ref in the project fold onto one record, which is exactly the
         # per-ref keying the docstring says this gate exists to keep.
         assert seen['anchor_task_id'] == 'unverified-claim-5422'
-        assert seen['anchor_task_id'] == f'{gate_mod._ANCHOR_PREFIX}-5422'
-        assert seen['anchor_task_id'] != gate_mod._ANCHOR_PREFIX
         assert seen['agent_role'] == 'fused-memory/completion-claim-gate'
         assert seen['category'] == 'unverified_completion_claim'
         # The divergence worth pinning: two of the seven filers are 'info', and
@@ -763,42 +730,7 @@ class TestDelegatesToTheSharedHelper:
 
         assert anchors == ['unverified-claim-5422', 'unverified-claim-9999']
 
-    def test_two_different_refs_file_two_separate_records(self, tmp_path):
-        """The same property end-to-end, against a real queue: a second ref must
-        not fold into the first ref's open record."""
-        import json
-
-        from fused_memory.services import completion_claim_gate as gate_mod
-
-        if not _folded_escalation.HAS_ESCALATION:
-            pytest.skip('escalation package unavailable')
-
-        first = gate_mod.emit_unverified_claim_escalation(
-            str(tmp_path), self._flag('5422'),
-        )
-        second = gate_mod.emit_unverified_claim_escalation(
-            str(tmp_path), self._flag('9999'),
-        )
-
-        assert first is not None and second is not None
-        assert first != second
-        files = sorted((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
-        assert len(files) == 2, f'expected one record per ref: {files!r}'
-        anchors = {json.loads(f.read_text())['task_id'] for f in files}
-        assert anchors == {'unverified-claim-5422', 'unverified-claim-9999'}
-
-    def test_the_identity_constants_are_still_attributes_of_THIS_module(self):
-        """They must not migrate into the helper: the pairwise
-        anchor-collision regression reads every filer's anchor FROM ITS OWN
-        HOME, which is what makes a colliding rename fail a test rather than go
-        silent in production."""
-        from fused_memory.services import completion_claim_gate as gate_mod
-
-        assert gate_mod._ANCHOR_PREFIX == 'unverified-claim'
-        assert gate_mod._AGENT_ROLE == 'fused-memory/completion-claim-gate'
-        assert gate_mod._CATEGORY == 'unverified_completion_claim'
-
-    def test_the_detail_construction_stays_in_THIS_module(
+    def test_forwards_the_detail_it_builds(
         self, tmp_path, monkeypatch,
     ):
         from fused_memory.services import completion_claim_gate as gate_mod

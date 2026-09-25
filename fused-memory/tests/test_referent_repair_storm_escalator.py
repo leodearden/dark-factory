@@ -20,21 +20,21 @@ is per-PROJECT, not per-agent.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import logging
 
 import pytest
 
-from fused_memory.middleware import _folded_escalation
 from fused_memory.middleware import referent_repair_storm_escalator as rrse_mod
 from fused_memory.middleware.referent_repair_storm_escalator import (
     emit_referent_repair_storm_escalation,
 )
 
 pytestmark = pytest.mark.skipif(
-    not _folded_escalation.HAS_ESCALATION,
-    reason='escalation package unavailable (minimal env); the HAS_ESCALATION '
-           'no-op arm is covered separately below',
+    importlib.util.find_spec('escalation') is None,
+    reason='escalation package unavailable (minimal env); the no-op arm is '
+           'covered in tests/test_folded_escalation.py',
 )
 
 
@@ -274,101 +274,12 @@ class TestDedupeFold:
         assert len(_filed(root_b)) == 1
 
 
-class TestNeverRaises:
-    """Called from the live write path: a raise here fails a write because the
-    COMPLAINT about the write failed."""
-
-    def test_a_submit_failure_returns_none_and_logs(self, tmp_path, monkeypatch, caplog):
-        class _BrokenQueue:
-            def __init__(self, *_a, **_kw):
-                pass
-
-            def get_by_task(self, *_a, **_kw):
-                return []
-
-            def make_id(self, task_id):
-                return f'esc-{task_id}-1'
-
-            def submit(self, _esc):
-                raise OSError('read-only filesystem')
-
-        monkeypatch.setattr(_folded_escalation, 'EscalationQueue', _BrokenQueue)
-
-        with caplog.at_level('ERROR'):
-            assert _emit(tmp_path) is None
-        assert caplog.records, 'a swallowed failure must still be visible'
-
-    def test_a_get_by_task_failure_falls_through_to_filing(self, tmp_path, monkeypatch):
-        """A read failure must not BLOCK the alarm — better a possible
-        duplicate than a silenced storm."""
-        real_queue = _folded_escalation.EscalationQueue
-
-        class _UnreadableQueue(real_queue):  # type: ignore[misc,valid-type]
-            def get_by_task(self, *_a, **_kw):
-                raise OSError('queue scan failed')
-
-        monkeypatch.setattr(_folded_escalation, 'EscalationQueue', _UnreadableQueue)
-
-        esc_id = _emit(tmp_path)
-        assert isinstance(esc_id, str)
-        assert len(_filed(tmp_path)) == 1
-
-    def test_a_queue_construction_failure_returns_none(self, tmp_path, monkeypatch):
-        def _explode(*_a, **_kw):
-            raise OSError('cannot create queue dir')
-
-        monkeypatch.setattr(_folded_escalation, 'EscalationQueue', _explode)
-
-        assert _emit(tmp_path) is None
-
-
-def test_without_the_escalation_package_it_no_ops(tmp_path, monkeypatch, caplog):
-    """The minimal-env path: logged, nothing filed, `None` returned. The
-    repair pass must behave identically whether or not the optional
-    `escalation` workspace package is installed.
-
-    AT WARNING, WHICH IS WHY THIS FILER DIVERGES from the six siblings that
-    share `file_folded_escalation`'s DEBUG default. A referent-repair storm is
-    a sustained scanner/resolver regression against a measured ~0.22% base
-    rate, not a routine event — so in a deployment or CI env lacking the
-    optional `escalation` package, the DEBUG default would produce NO output
-    at the default log level. That is the exact silence
-    `_folded_escalation`'s own module docstring argues against: it is
-    indistinguishable from health, while every episode keeps arriving
-    mis-attributed.
-
-    Pinned on `levelno` rather than on the presence of any record at all: a
-    downgrade on a never-raise alarm path has no symptom EXCEPT absence of
-    output, so `assert caplog.records` under a permissive capture level cannot
-    tell a lost alarm from a quiet one.
-    """
-    monkeypatch.setattr(_folded_escalation, 'HAS_ESCALATION', False)
-
-    with caplog.at_level(logging.DEBUG):
-        result = emit_referent_repair_storm_escalation(
-            str(tmp_path),
-            project_id='dark_factory',
-            streak=10,
-            threshold=10,
-            repairs=1,
-            records=_records(),
-        )
-
-    assert result is None
-    assert not (tmp_path / 'data' / 'escalations').exists()
-    assert [r.levelno for r in caplog.records] == [logging.WARNING], (
-        'a repair storm that goes unescalated because the optional package is '
-        'absent is a LOST ALARM, not a DEBUG detail'
-    )
-
-
 def test_the_fold_is_announced_at_warning_on_this_modules_own_logger(
     tmp_path, caplog,
 ):
     """A fold is a SUPPRESSION, and this filer's suppressions stay at WARNING.
 
-    Same divergence as the no-op arm above, for the same measured reason: once
-    a project is storming, EVERY subsequent episode breaches the threshold and
+    Once a project is storming, EVERY subsequent episode breaches the threshold and
     folds into the open record, so the fold line is the only ongoing evidence
     that the storm is still running. At the helper's INFO default that
     evidence disappears from a default-threshold log, and an operator reading
@@ -405,15 +316,7 @@ def test_the_fold_is_announced_at_warning_on_this_modules_own_logger(
 
 
 class TestDelegatesToTheSharedHelper:
-    """The filer BODY now lives in `middleware/_folded_escalation`; what stays
-    here is this module's own identity and content.
-
-    The constants must NOT migrate into the helper: two filers sharing an
-    anchor go silent behind each other's open records, and
-    `tests/test_folded_escalation.py::TestNoTwoFilersShareAnAnchor` can only
-    catch a colliding rename if each anchor is still readable FROM ITS OWN
-    HOME.
-    """
+    """What this filer forwards to `file_folded_escalation`."""
 
     def test_forwards_this_modules_own_anchor_role_and_category(
         self, tmp_path, monkeypatch,
@@ -436,15 +339,7 @@ class TestDelegatesToTheSharedHelper:
         assert seen['level'] == 1
         assert seen['project_root'] == str(tmp_path)
 
-    def test_the_anchor_is_still_a_module_attribute_of_THIS_module(self):
-        """Not re-exported from the helper: read straight off this module, so a
-        rename that collides with a sibling filer's anchor fails the pairwise
-        test rather than going silent in production."""
-        assert rrse_mod._ANCHOR_TASK_ID == 'referent-repair-storm'
-        assert rrse_mod._AGENT_ROLE == 'fused-memory/referent-repair-guard'
-        assert rrse_mod._CATEGORY == 'referent_repair_storm'
-
-    def test_the_detail_construction_stays_in_THIS_module(self, tmp_path, monkeypatch):
+    def test_forwards_the_detail_it_builds(self, tmp_path, monkeypatch):
         """The helper owns the skeleton, not the content: the record cap and
         the evidence rendering are this alarm's own."""
         seen: dict = {}

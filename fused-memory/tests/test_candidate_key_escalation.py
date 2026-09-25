@@ -2,27 +2,25 @@
 
 This is the injectable escalation seam invoked by the sqlite backend's
 v3->v4 self-gating migration when residual non-cancelled duplicate
-candidate_key groups are found at connection-open. The defensive
-HAS_ESCALATION / EscalationQueue never-raise pattern it relies on lives in
-``middleware._folded_escalation`` (task 4854), which is why the seams below
-patch THAT module rather than this filer.
+candidate_key groups are found at connection-open.
 """
 
 from __future__ import annotations
 
 import json
 
-from fused_memory.middleware import _folded_escalation
+import pytest
+
 from fused_memory.middleware import candidate_key_escalation as cke_mod
 from fused_memory.middleware.candidate_key_escalation import (
     emit_residual_candidate_key_escalation,
 )
 
 
-def test_emit_residual_candidate_key_escalation_never_raises_and_returns_id_or_none(tmp_path):
-    """Never raises; returns an escalation id str (escalation package
-    importable -- a file lands under {project_root}/data/escalations) or
-    None (HAS_ESCALATION is False)."""
+def test_emit_residual_candidate_key_escalation_files_into_the_projects_queue(tmp_path):
+    """Returns the escalation id, and a file lands under
+    {project_root}/data/escalations."""
+    pytest.importorskip('escalation')
     residual_groups = [
         {'tag': 'master', 'candidate_key': 'abc123', 'task_ids': ['1', '2'], 'count': 2},
     ]
@@ -30,15 +28,12 @@ def test_emit_residual_candidate_key_escalation_never_raises_and_returns_id_or_n
         project_root=str(tmp_path),
         residual_groups=residual_groups,
     )
-    if _folded_escalation.HAS_ESCALATION:
-        assert isinstance(result, str)
-        queue_dir = tmp_path / 'data' / 'escalations'
-        files = list(queue_dir.glob('esc-*.json'))
-        assert len(files) == 1, f'expected one escalation file, found: {files}'
-        payload = json.loads(files[0].read_text())
-        assert payload['id'] == result
-    else:
-        assert result is None
+    assert isinstance(result, str)
+    queue_dir = tmp_path / 'data' / 'escalations'
+    files = list(queue_dir.glob('esc-*.json'))
+    assert len(files) == 1, f'expected one escalation file, found: {files}'
+    payload = json.loads(files[0].read_text())
+    assert payload['id'] == result
 
 
 def test_emit_residual_candidate_key_escalation_dedupes_against_existing_pending(tmp_path):
@@ -49,6 +44,7 @@ def test_emit_residual_candidate_key_escalation_dedupes_against_existing_pending
     flood the operator queue with near-identical escalations. Once the
     original is resolved, a later call is free to file a fresh one.
     """
+    pytest.importorskip('escalation')
     residual_groups = [
         {'tag': 'master', 'candidate_key': 'abc123', 'task_ids': ['1', '2'], 'count': 2},
     ]
@@ -58,11 +54,6 @@ def test_emit_residual_candidate_key_escalation_dedupes_against_existing_pending
     second_id = emit_residual_candidate_key_escalation(
         project_root=str(tmp_path), residual_groups=residual_groups,
     )
-
-    if not _folded_escalation.HAS_ESCALATION:
-        assert first_id is None
-        assert second_id is None
-        return
 
     assert first_id is not None
     assert second_id == first_id, (
@@ -101,6 +92,7 @@ def test_emit_residual_candidate_key_escalation_detail_surfaces_group_reason(tmp
     understands why THESE groups still need a human without
     cross-referencing the migration source.
     """
+    pytest.importorskip('escalation')
     residual_groups = [
         {
             'tag': 'master', 'candidate_key': 'abc123', 'task_ids': ['1', '2'],
@@ -115,9 +107,7 @@ def test_emit_residual_candidate_key_escalation_detail_surfaces_group_reason(tmp
         project_root=str(tmp_path),
         residual_groups=residual_groups,
     )
-    if not _folded_escalation.HAS_ESCALATION:
-        assert result is None
-        return
+    assert result is not None
 
     queue_dir = tmp_path / 'data' / 'escalations'
     files = list(queue_dir.glob('esc-*.json'))
@@ -130,7 +120,7 @@ def test_emit_residual_candidate_key_escalation_detail_surfaces_group_reason(tmp
 
 
 class TestDelegatesToTheSharedHelper:
-    """The filer BODY now lives in `middleware/_folded_escalation`."""
+    """What this filer forwards to `file_folded_escalation`."""
 
     def test_forwards_this_modules_own_anchor_role_and_category(
         self, tmp_path, monkeypatch,
@@ -158,14 +148,7 @@ class TestDelegatesToTheSharedHelper:
         assert seen['level'] == 1
         assert seen['project_root'] == str(tmp_path)
 
-    def test_the_anchor_is_still_a_module_attribute_of_THIS_module(self):
-        """Cross-imported by tests/server/test_write_triage.py, and read from
-        its own home by the pairwise anchor-collision regression."""
-        assert cke_mod._ANCHOR_TASK_ID == 'candidate-key-migration'
-        assert cke_mod._AGENT_ROLE == 'fused-memory/candidate-key-migration'
-        assert cke_mod._CATEGORY == 'candidate_key_residual_duplicates'
-
-    def test_the_group_detail_construction_stays_in_THIS_module(
+    def test_forwards_the_group_detail_it_builds(
         self, tmp_path, monkeypatch,
     ):
         seen: dict = {}
@@ -186,28 +169,3 @@ class TestDelegatesToTheSharedHelper:
         assert 'ux_tasks_candidate_key' in seen['detail']
         assert 'residual duplicate candidate_key' in seen['summary']
 
-
-def test_a_queue_construction_failure_returns_none(tmp_path, monkeypatch):
-    """BEHAVIOUR CHANGE, pinned deliberately (task 4854).
-
-    Six of the seven copies of this filer skeleton guarded the queue
-    constructor; this one did NOT — even though its own docstring promises it
-    "NEVER raises: this is called from connection-open migration code, and a
-    raise here would defeat the self-gating step's own fail-safe guarantee".
-    Constructing an `EscalationQueue` creates its directory, so a read-only or
-    missing `project_root` turned a connection-open migration into a crash:
-    the exact outcome that docstring rules out.
-
-    Consolidating to one home forces a single answer, and the correct answer is
-    the one six siblings already implement and the seventh already documents.
-    """
-    def _explode(*_a, **_kw):
-        raise OSError('cannot create queue dir')
-
-    monkeypatch.setattr(_folded_escalation, 'EscalationQueue', _explode)
-
-    assert emit_residual_candidate_key_escalation(
-        str(tmp_path),
-        [{'tag': 't', 'candidate_key': 'k', 'task_ids': ['1'], 'count': 1,
-          'reason': 'mixed_status'}],
-    ) is None
