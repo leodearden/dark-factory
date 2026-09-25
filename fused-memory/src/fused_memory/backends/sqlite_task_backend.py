@@ -3034,6 +3034,12 @@ class SqliteTaskBackend:
                 )
                 refuse_leaked_task_text(
                     {'title': title, 'description': description, 'details': details},
+                    arguments=dict(
+                        project_root=project_root, prompt=prompt, title=title,
+                        description=description, details=details,
+                        dependencies=dependencies, priority=priority,
+                        metadata=metadata, tag=tag, status=status,
+                    ),
                 )
 
                 # Index-independent dedup guard (fm-task-dedup self-heal
@@ -3303,6 +3309,13 @@ class SqliteTaskBackend:
             # must not block the write that remediates it.
             refuse_leaked_task_text(
                 {'title': title, 'description': description, 'details': new_details},
+                arguments=dict(
+                    task_id=task_id, project_root=project_root, prompt=prompt,
+                    metadata=metadata, append=append, tag=tag,
+                    metadata_mode=metadata_mode, title=title,
+                    description=description, details=details, priority=priority,
+                    status=status, dependencies=dependencies,
+                ),
             )
 
             new_metadata: str | None = None

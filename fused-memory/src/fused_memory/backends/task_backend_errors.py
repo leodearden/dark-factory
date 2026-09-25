@@ -86,16 +86,30 @@ class LeakedEnvelopeMarkupError(TaskmasterError):
     Attributes:
         column: The task-text column whose value carries the fragment.
         fragment: The leaked fragment, from the stray closing tag onward.
+        recovered: The arguments the fragment swallowed, name -> value, i.e.
+            what the write would otherwise have silently defaulted. Empty when
+            no boundary is provable, never a guess.
+        clean_value: The column's value up to the fragment, or ``None`` under
+            that same condition.
     """
 
-    def __init__(self, column: str, fragment: str) -> None:
+    def __init__(
+        self,
+        column: str,
+        fragment: str,
+        recovered: dict[str, str],
+        clean_value: str | None,
+    ) -> None:
         super().__init__(
             'LEAKED_ENVELOPE_MARKUP',
             f'Refusing to store task text: {column!r} carries a leaked tool-call '
-            f'fragment {fragment!r}, so arguments after it may have been swallowed',
+            f'fragment {fragment!r}, so arguments after it may have been swallowed; '
+            f'recovered={recovered!r} clean_value={clean_value!r}',
         )
         self.column = column
         self.fragment = fragment
+        self.recovered = recovered
+        self.clean_value = clean_value
 
 
 class TaskNotFoundError(TaskmasterError):
