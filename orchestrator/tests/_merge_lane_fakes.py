@@ -9,7 +9,8 @@ the lane filed; ``lane_state``/``lane_entry`` read an item's state back off
 the lane's public ``snapshot()`` census. ``make_lane`` builds a lane on all three at once, so a test
 that owns its worker never falls back to a production adapter by omission,
 and ``drive_merge`` plays the merger for a caller that enqueues onto a queue
-nothing is draining.
+nothing is draining. ``main_health_probe_spawned`` reads off a red
+``MergeOutcome`` whether it left a detached main-health probe running.
 
 Imported by bare module name (``from _merge_lane_fakes import ...``), like
 ``_orch_helpers`` -- ``orchestrator/tests/`` has no ``__init__.py``.
@@ -26,6 +27,8 @@ from typing import Any
 from orchestrator.merge_gates import PostMergePyrightResult
 from orchestrator.merge_lane import MergeLane
 from orchestrator.merge_lane.types import DiskGuardOutcome
+from orchestrator.merge_queue import MAIN_HEALTH_PROBE_PENDING_NOTE
+from orchestrator.merge_types import MergeOutcome
 from orchestrator.verify import VerifyResult
 
 
@@ -59,6 +62,25 @@ def lane_finalizing(lane: MergeLane) -> list[dict[str, Any]]:
     entry is stuck mid-finalize".
     """
     return [e for e in lane.snapshot()['entries'] if e['state'] == 'finalizing']
+
+
+def main_health_probe_spawned(outcome: MergeOutcome) -> bool:
+    """Whether a red *outcome* left a detached main-health probe in flight.
+
+    Reads ``merge_queue.py::MAIN_HEALTH_PROBE_PENDING_NOTE``, which
+    ``_run_post_merge_verify`` appends to a red outcome's reason whenever
+    ``_spawn_main_health_probe`` put a probe in flight -- the only trace the
+    probe leaves on the outcome.
+
+    A lane scene over a real tmp repo must keep this False. The probe adds
+    and removes a ``_mainprobe-*`` worktree in the scene's repo while the
+    scene carries on, so a concurrent ``git worktree add`` in the scene can
+    die with "fatal: Invalid path '<repo>/.git/worktrees/_mainprobe-<hex>'"
+    (task 5870); and the probe is a project-wide verify of the tmp repo that
+    can outlive the verdict (task 5811). A scene switches it off with
+    ``escalate_preexisting_main_break=False`` in its ``OrchestratorConfig``.
+    """
+    return MAIN_HEALTH_PROBE_PENDING_NOTE in outcome.reason
 
 
 @dataclasses.dataclass(frozen=True)
