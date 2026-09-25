@@ -10,7 +10,9 @@ the lane's public ``snapshot()`` census. ``make_lane`` builds a lane on all thre
 that owns its worker never falls back to a production adapter by omission,
 and ``drive_merge`` plays the merger for a caller that enqueues onto a queue
 nothing is draining. ``main_health_probe_spawned`` reads off a red
-``MergeOutcome`` whether it left a detached main-health probe running.
+``MergeOutcome`` whether it left a detached main-health probe running, and
+``lane_scene_config`` builds a scene's ``OrchestratorConfig`` with that probe
+off.
 
 Imported by bare module name (``from _merge_lane_fakes import ...``), like
 ``_orch_helpers`` -- ``orchestrator/tests/`` has no ``__init__.py``.
@@ -24,6 +26,7 @@ from collections.abc import Collection, Coroutine, Mapping
 from pathlib import Path
 from typing import Any
 
+from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.merge_gates import PostMergePyrightResult
 from orchestrator.merge_lane import MergeLane
 from orchestrator.merge_lane.types import DiskGuardOutcome
@@ -77,10 +80,25 @@ def main_health_probe_spawned(outcome: MergeOutcome) -> bool:
     scene carries on, so a concurrent ``git worktree add`` in the scene can
     die with "fatal: Invalid path '<repo>/.git/worktrees/_mainprobe-<hex>'"
     (task 5870); and the probe is a project-wide verify of the tmp repo that
-    can outlive the verdict (task 5811). A scene switches it off with
-    ``escalate_preexisting_main_break=False`` in its ``OrchestratorConfig``.
+    can outlive the verdict (task 5811). A scene switches it off by building
+    its config with ``lane_scene_config``.
     """
     return MAIN_HEALTH_PROBE_PENDING_NOTE in outcome.reason
+
+
+def lane_scene_config(
+    project_root: Path, git: GitConfig, **overrides: Any,
+) -> OrchestratorConfig:
+    """The ``OrchestratorConfig`` for a lane scene over a real tmp repo.
+
+    The main-health probe is off (``escalate_preexisting_main_break=False``);
+    ``main_health_probe_spawned`` says why. *overrides* are any further
+    ``OrchestratorConfig`` fields the scene needs.
+    """
+    return OrchestratorConfig(
+        project_root=project_root, git=git,
+        escalate_preexisting_main_break=False, **overrides,
+    )
 
 
 @dataclasses.dataclass(frozen=True)

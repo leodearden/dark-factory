@@ -32,7 +32,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _merge_lane_fakes import main_health_probe_spawned
+from _merge_lane_fakes import lane_scene_config, main_health_probe_spawned
 from _merge_lane_verifier_doubles import ScriptedVerifier
 from _orch_helpers import MERGE_RESULT_TIMEOUT
 
@@ -100,14 +100,8 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    """Single-host (no verify_runners) OrchestratorConfig.
-
-    main-health probe off: see _merge_lane_fakes.py::main_health_probe_spawned
-    """
-    return OrchestratorConfig(
-        project_root=git_repo, git=git_config,
-        escalate_preexisting_main_break=False,
-    )
+    """Single-host (no verify_runners) OrchestratorConfig."""
+    return lane_scene_config(git_repo, git_config)
 
 
 async def _make_branch_with_file(

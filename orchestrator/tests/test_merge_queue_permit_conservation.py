@@ -28,7 +28,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from _merge_lane_fakes import FakeVerifier, main_health_probe_spawned
+from _merge_lane_fakes import FakeVerifier, lane_scene_config, main_health_probe_spawned
 from _orch_helpers import MERGE_RESULT_TIMEOUT
 from test_merge_queue_concurrent_verify import (
     _fake_verify_result,
@@ -38,7 +38,7 @@ from test_merge_queue_concurrent_verify import (
     _make_request,
 )
 
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane import MergeLane
 
@@ -304,7 +304,7 @@ class TestPrefetchLookaheadAndAttachConservation:
             gate_b_release, gate_b_entered, passed=True, name='pc-attach-laptop',
         )
 
-        config = OrchestratorConfig(project_root=git_ops.project_root, git=git_config)
+        config = lane_scene_config(git_ops.project_root, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/pc-attach-a', 'pc_attach_a.py', 'a = 1\n',
         )
@@ -377,7 +377,7 @@ class TestFallbackConservation:
         gate_b_prerelease.set()
         fake_remote = _gated_runner(gate_b_prerelease, passed=True, name='pc-fallback-laptop')
 
-        config = OrchestratorConfig(project_root=git_ops.project_root, git=git_config)
+        config = lane_scene_config(git_ops.project_root, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/pc-fallback-a', 'pc_fallback_a.py', 'a = 1\n',
         )
@@ -458,10 +458,7 @@ class TestCascadeRemergeConservation:
             gate_b_release, gate_b_entered, passed=True, name='pc-cascade-laptop',
         )
 
-        config = OrchestratorConfig(
-            project_root=git_ops.project_root, git=git_config,
-            escalate_preexisting_main_break=False,
-        )
+        config = lane_scene_config(git_ops.project_root, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/pc-cascade-a', 'pc_cascade_a.py', 'a = 1\n',
         )
@@ -552,7 +549,7 @@ class TestShutdownRetainedPermitConservation:
         gate_b_prerelease.set()
         fake_remote = _gated_runner(gate_b_prerelease, passed=True, name='pc-shutdown-laptop')
 
-        config = OrchestratorConfig(project_root=git_ops.project_root, git=git_config)
+        config = lane_scene_config(git_ops.project_root, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/pc-shutdown-a', 'pc_shutdown_a.py', 'a = 1\n',
         )
@@ -633,7 +630,7 @@ class TestLedgerLiveEmptiesAfterTransferRelease:
             gate_b_release, gate_b_entered, passed=True, name='pc-live-empties-laptop',
         )
 
-        config = OrchestratorConfig(project_root=git_ops.project_root, git=git_config)
+        config = lane_scene_config(git_ops.project_root, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/pc-live-a', 'pc_live_a.py', 'a = 1\n',
         )
@@ -755,7 +752,7 @@ class TestEarlyContinueTerminalTransferClearsSpecBase:
                 await gate_a_release.wait()
             return _fake_verify_result(passed=True)
 
-        config = OrchestratorConfig(project_root=git_ops.project_root, git=git_config)
+        config = lane_scene_config(git_ops.project_root, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/pc-term-a', 'pc_term_a.py', 'a = 1\n',
         )

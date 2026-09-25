@@ -33,6 +33,7 @@ from _merge_lane_fakes import (
     FakeVerifier,
     VerifyScript,
     hangs_until,
+    lane_scene_config,
     main_health_probe_spawned,
     passes,
     raises,
@@ -138,10 +139,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(
-        project_root=git_repo, git=git_config,
-        escalate_preexisting_main_break=False,
-    )
+    return lane_scene_config(git_repo, git_config)
 
 
 def _make_request(
@@ -23459,10 +23457,7 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
             push_after_advance=False,
             persistent_merge_worktree=True,
         )
-        warm_config = OrchestratorConfig(
-            project_root=config.project_root,
-            git=warm_git_config,
-        )
+        warm_config = lane_scene_config(config.project_root, warm_git_config)
 
         wt = await _make_branch_with_file(git_ops, 'warm-swap', 'ws.py', 'x = 1\n')
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
@@ -24170,10 +24165,7 @@ class TestRefreshWarmBaseWiring:
             push_after_advance=False,
             persistent_merge_worktree=True,
         )
-        warm_config = OrchestratorConfig(
-            project_root=config.project_root,
-            git=warm_git_config,
-        )
+        warm_config = lane_scene_config(config.project_root, warm_git_config)
 
         wt = await _make_branch_with_file(git_ops, 'rwb-warm', 'rwb_w.py', 'x = 1\n')
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()

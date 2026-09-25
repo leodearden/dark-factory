@@ -102,6 +102,7 @@ from _merge_lane_fakes import (
     FakeVerifier,
     VerifyScript,
     fails,
+    lane_scene_config,
     main_health_probe_spawned,
     passes,
 )
@@ -179,10 +180,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(
-        project_root=git_repo, git=git_config,
-        escalate_preexisting_main_break=False,
-    )
+    return lane_scene_config(git_repo, git_config)
 
 
 # ── Request builder ───────────────────────────────────────────────────────────

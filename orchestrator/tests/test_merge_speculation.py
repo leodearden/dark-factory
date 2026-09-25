@@ -55,6 +55,7 @@ from _merge_lane_fakes import (
     FakeVerifier,
     VerifyScript,
     hangs_until,
+    lane_scene_config,
     main_health_probe_spawned,
     passes,
 )
@@ -779,7 +780,7 @@ async def _spec_lane_git_ops(
     # see the storage is really there (git_ops.py::GitOps.acquire_spec_lane).
     git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
     git_ops.mark_pool_storage_present()
-    return git_ops, OrchestratorConfig(project_root=repo, git=git_config)
+    return git_ops, lane_scene_config(repo, git_config)
 
 
 class _AdvanceFailingGitOps(GitOps):
@@ -1526,7 +1527,7 @@ class TestLateArrivalAttaches:
         )
 
         # ── Build branches ─────────────────────────────────────────────────────
-        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        config = lane_scene_config(spec_git_repo, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/late1-a', 'late1_a.py', 'a = 1\n',
         )
@@ -1731,7 +1732,7 @@ class TestLateArrivalCleanCAS:
         )
 
         # ── Build branches (disjoint files) ──────────────────────────────────
-        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        config = lane_scene_config(spec_git_repo, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/late3-a', 'late3_a.py', 'a = 1\n',
         )
@@ -1931,10 +1932,7 @@ class TestLateArrivalFailCascade:
         )
 
         # ── Build disjoint branches ───────────────────────────────────────────
-        config = OrchestratorConfig(
-            project_root=spec_git_repo, git=git_config,
-            escalate_preexisting_main_break=False,
-        )
+        config = lane_scene_config(spec_git_repo, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/late5-a', 'late5_a.py', 'a = 1\n',
         )
@@ -2139,7 +2137,7 @@ class TestLateArrivalGuards:
         fake_remote = _gated_runner(gate_b_prerelease, passed=True, name='fallback7-laptop')
 
         # ── Build branches ────────────────────────────────────────────────────
-        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        config = lane_scene_config(spec_git_repo, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/guard7-a', 'guard7_a.py', 'a = 1\n',
         )
@@ -2228,7 +2226,7 @@ class TestLateArrivalGuards:
         gate_b_prerelease.set()
         fake_remote = _gated_runner(gate_b_prerelease, passed=True, name='depth7-laptop')
 
-        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        config = lane_scene_config(spec_git_repo, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/dk7-a', 'dk7_a.py', 'a = 1\n',
         )
@@ -2320,7 +2318,7 @@ class TestLateArrivalGuards:
         gate_b_prerelease.set()
         fake_remote = _gated_runner(gate_b_prerelease, passed=True, name='sv7-laptop')
 
-        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        config = lane_scene_config(spec_git_repo, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/sv7-a', 'sv7_a.py', 'a = 1\n',
         )
@@ -2409,7 +2407,7 @@ class TestLateArrivalGuards:
         gate_b_prerelease.set()
         fake_remote = _gated_runner(gate_b_prerelease, passed=True, name='k1-7-laptop')
 
-        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        config = lane_scene_config(spec_git_repo, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/k1-7-a', 'k1_7_a.py', 'a = 1\n',
         )
@@ -2536,7 +2534,7 @@ class TestLateArrivalGuards:
             gate_b_prerelease, passed=True, name='shutdown-guard-laptop',
         )
 
-        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        config = lane_scene_config(spec_git_repo, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/shutdown-guard-a', 'shutdown_guard_a.py', 'a = 1\n',
         )
@@ -2707,7 +2705,7 @@ class TestLateArrivalSubmissionOrderCAS:
         )
 
         # ── Build disjoint branches ───────────────────────────────────────────
-        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        config = lane_scene_config(spec_git_repo, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/cas8-a', 'cas8_a.py', 'a = 1\n',
         )

@@ -42,6 +42,7 @@ from _merge_lane_fakes import (
     VerifyScript,
     fails,
     hangs_until,
+    lane_scene_config,
     main_health_probe_spawned,
     raises,
 )
@@ -760,14 +761,8 @@ def _timeout_mark_offenders(
 
 
 def _make_config_no_runners(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    """Single-host OrchestratorConfig (no verify_runners).
-
-    main-health probe off: see _merge_lane_fakes.py::main_health_probe_spawned
-    """
-    return OrchestratorConfig(
-        project_root=git_repo, git=git_config,
-        escalate_preexisting_main_break=False,
-    )
+    """Single-host OrchestratorConfig (no verify_runners)."""
+    return lane_scene_config(git_repo, git_config)
 
 
 def _make_config_with_runner(

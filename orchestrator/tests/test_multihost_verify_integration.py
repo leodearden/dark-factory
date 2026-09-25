@@ -66,6 +66,7 @@ from _merge_lane_fakes import (
     FakeVerifier,
     VerifyScript,
     fails,
+    lane_scene_config,
     main_health_probe_spawned,
     passes,
 )
@@ -1232,15 +1233,11 @@ def host_config(host_repo: Path, host_git_config: GitConfig) -> OrchestratorConf
     alarm thresholds from config is what keeps these tests off the worker's
     internals.  The reprobe CADENCE is the injected clock's job -- see
     ``_ShortSleepClock`` for why config alone cannot set it.
-
-    main-health probe off: see _merge_lane_fakes.py::main_health_probe_spawned
     """
-    return OrchestratorConfig(
-        project_root=host_repo,
-        git=host_git_config,
+    return lane_scene_config(
+        host_repo, host_git_config,
         verify_host_unreachable_escalate_after_n=1,
         verify_host_unreachable_escalate_after_secs=0.0,  # streak-only
-        escalate_preexisting_main_break=False,
     )
 
 

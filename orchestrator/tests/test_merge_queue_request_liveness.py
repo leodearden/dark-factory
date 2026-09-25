@@ -52,6 +52,7 @@ from _merge_lane_fakes import (
     fails,
     hangs_until,
     lane_finalizing,
+    lane_scene_config,
     lane_state,
     main_health_probe_spawned,
     make_lane,
@@ -106,14 +107,8 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    """Single-host (no verify_runners) OrchestratorConfig.
-
-    main-health probe off: see _merge_lane_fakes.py::main_health_probe_spawned
-    """
-    return OrchestratorConfig(
-        project_root=git_repo, git=git_config,
-        escalate_preexisting_main_break=False,
-    )
+    """Single-host (no verify_runners) OrchestratorConfig."""
+    return lane_scene_config(git_repo, git_config)
 
 
 # ── Warm-lane variants (task 3003, pre-1) ──────────────────────────────────
@@ -148,14 +143,8 @@ def warm_git_ops(warm_git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def warm_config(git_repo: Path, warm_git_config: GitConfig) -> OrchestratorConfig:
-    """Single-host OrchestratorConfig with the warm merge-verify lane ON.
-
-    main-health probe off: see _merge_lane_fakes.py::main_health_probe_spawned
-    """
-    return OrchestratorConfig(
-        project_root=git_repo, git=warm_git_config,
-        escalate_preexisting_main_break=False,
-    )
+    """Single-host OrchestratorConfig with the warm merge-verify lane ON."""
+    return lane_scene_config(git_repo, warm_git_config)
 
 
 def _make_request(
