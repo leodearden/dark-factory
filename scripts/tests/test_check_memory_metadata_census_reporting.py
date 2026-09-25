@@ -23,6 +23,7 @@ import pytest
 
 SCRIPT = Path(__file__).parent.parent / "check_memory_metadata_census_reporting.py"
 UNIT = "memory-metadata-coverage-census.service"
+TIMER = "memory-metadata-coverage-census.timer"
 HISTORY_RELPATH = Path("plans") / "memory-metadata-coverage-history.json"
 INSTALLER = "scripts/install-memory-metadata-coverage-census-timer.sh"
 
@@ -206,6 +207,13 @@ def test_not_installed_verdict_is_reached_without_reading_history(tmp_path):
     assert HISTORY_RELPATH.name not in result.stderr, result.stderr
 
 
+def _assert_named_failure(result, *fragments):
+    assert result.returncode != 0, result.stdout
+    assert "Traceback" not in result.stderr, result.stderr
+    for fragment in fragments:
+        assert fragment in result.stderr, (fragment, result.stderr)
+
+
 def test_not_installed_and_never_ran_are_told_apart(tmp_path):
     fresh_history = _history_with_newest_stamp(_hours_ago(2))
     not_installed_dir = tmp_path / "not_installed"
@@ -221,15 +229,11 @@ def test_not_installed_and_never_ran_are_told_apart(tmp_path):
         never_ran_dir, "48", fields=_never_ran_fields(), history=fresh_history,
     )
 
-    assert "not installed" in not_installed.stderr.lower(), not_installed.stderr
+    _assert_named_failure(not_installed, "NOT INSTALLED")
+    _assert_named_failure(never_ran, "NEVER RAN")
+    assert "NEVER RAN" not in not_installed.stderr, not_installed.stderr
+    assert "NOT INSTALLED" not in never_ran.stderr, never_ran.stderr
     assert not_installed.stderr != never_ran.stderr
-
-
-def _assert_named_failure(result, *fragments):
-    assert result.returncode != 0, result.stdout
-    assert "Traceback" not in result.stderr, result.stderr
-    for fragment in fragments:
-        assert fragment in result.stderr, (fragment, result.stderr)
 
 
 def test_empty_exit_timestamp_is_never_ran(tmp_path):
@@ -253,6 +257,18 @@ def test_na_exit_timestamp_is_never_ran(tmp_path):
     _assert_named_failure(result, "never run")
 
 
+def test_never_ran_is_conditional_on_the_timer_being_armed(tmp_path):
+    result = _run(
+        tmp_path, "48",
+        fields=_never_ran_fields(),
+        history=_history_with_newest_stamp(_hours_ago(2)),
+    )
+
+    _assert_named_failure(
+        result, "NEVER RAN", f"systemctl --user list-timers {TIMER}", INSTALLER
+    )
+
+
 def test_last_run_older_than_window_is_stale(tmp_path):
     result = _run(
         tmp_path, "48",
@@ -262,7 +278,21 @@ def test_last_run_older_than_window_is_stale(tmp_path):
         history=_history_with_newest_stamp(_hours_ago(2)),
     )
 
-    _assert_named_failure(result, "72.0h", "48h")
+    _assert_named_failure(result, "STALE LAST RUN", "72.0h", "48h")
+
+
+def test_stale_last_run_names_the_timer_arming_check(tmp_path):
+    result = _run(
+        tmp_path, "48",
+        fields=_healthy_fields(
+            ExecMainExitTimestamp=_systemd_timestamp(_hours_ago(72))
+        ),
+        history=_history_with_newest_stamp(_hours_ago(2)),
+    )
+
+    _assert_named_failure(
+        result, "STALE LAST RUN", f"systemctl --user list-timers {TIMER}", INSTALLER
+    )
 
 
 def test_last_run_just_inside_window_passes(tmp_path):
@@ -394,7 +424,22 @@ def test_failed_result_fails_naming_it(tmp_path):
         history=_history_with_newest_stamp(_hours_ago(2)),
     )
 
-    _assert_named_failure(result, "Result='failed'")
+    _assert_named_failure(result, "FAILED LAST RUN", "Result='failed'")
+    assert TIMER not in result.stderr, result.stderr
+
+
+def test_failed_last_run_outranks_a_stale_one_and_reports_its_age(tmp_path):
+    result = _run(
+        tmp_path, "48",
+        fields=_healthy_fields(
+            Result="failed",
+            ExecMainExitTimestamp=_systemd_timestamp(_hours_ago(72)),
+        ),
+        history=_history_with_newest_stamp(_hours_ago(2)),
+    )
+
+    _assert_named_failure(result, "FAILED LAST RUN", "Result='failed'", "72.0h")
+    assert "STALE LAST RUN" not in result.stderr, result.stderr
 
 
 def test_nonzero_exec_main_status_fails_naming_it(tmp_path):

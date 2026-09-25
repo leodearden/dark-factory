@@ -20,7 +20,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 UNIT = "memory-metadata-coverage-census.service"
+TIMER = "memory-metadata-coverage-census.timer"
 INSTALLER = "scripts/install-memory-metadata-coverage-census-timer.sh"
+ARMING_CHECK = (
+    f"confirm {TIMER} is armed with `systemctl --user list-timers {TIMER}` "
+    f"and run {INSTALLER} if it is not listed"
+)
 UNIT_FIELDS = ("LoadState", "Result", "ExecMainStatus", "ExecMainExitTimestamp")
 SYSTEMD_UTC_TIMESTAMP = "%a %Y-%m-%d %H:%M:%S UTC"
 NEVER_RAN_TIMESTAMPS = frozenset({"", "n/a"})
@@ -73,7 +78,8 @@ def last_run_time(state: dict[str, str]) -> datetime:
     if raw in NEVER_RAN_TIMESTAMPS:
         raise NotReporting(
             f"NEVER RAN: {UNIT} is installed but has never run "
-            f"(ExecMainExitTimestamp={raw!r}); its first reading lands at the next 05:00"
+            f"(ExecMainExitTimestamp={raw!r}); the first reading lands at the next "
+            f"05:00 only if the timer is armed: {ARMING_CHECK}"
         )
     try:
         return datetime.strptime(raw, SYSTEMD_UTC_TIMESTAMP).replace(tzinfo=UTC)
@@ -84,23 +90,22 @@ def last_run_time(state: dict[str, str]) -> datetime:
         ) from None
 
 
-def last_run_age(state: dict[str, str], window_hours: float) -> float:
-    age = age_hours(last_run_time(state))
-    if age > window_hours:
-        raise NotReporting(
-            f"STALE LAST RUN: {UNIT} last ran {age:.1f}h ago, "
-            f"outside the {window_hours:g}h window"
-        )
-    return age
-
-
-def require_succeeded(state: dict[str, str]) -> None:
+def require_succeeded(state: dict[str, str], run_age: float) -> None:
     result = state.get("Result", "")
     status = state.get("ExecMainStatus", "")
     if result != "success" or status != "0":
         raise NotReporting(
-            f"FAILED LAST RUN: {UNIT} last run ended Result={result!r} "
-            f"ExecMainStatus={status!r}; read journalctl --user -u {UNIT} -n 100"
+            f"FAILED LAST RUN: {UNIT} last run, {run_age:.1f}h ago, ended "
+            f"Result={result!r} ExecMainStatus={status!r}; "
+            f"read journalctl --user -u {UNIT} -n 100"
+        )
+
+
+def require_recent_run(run_age: float, window_hours: float) -> None:
+    if run_age > window_hours:
+        raise NotReporting(
+            f"STALE LAST RUN: {UNIT} last ran {run_age:.1f}h ago, "
+            f"outside the {window_hours:g}h window; {ARMING_CHECK}"
         )
 
 
@@ -178,8 +183,9 @@ def age_hours(then: datetime) -> float:
 def assess(window_hours: float) -> str:
     state = read_unit_state()
     require_installed(state)
-    run_age = last_run_age(state, window_hours)
-    require_succeeded(state)
+    run_age = age_hours(last_run_time(state))
+    require_succeeded(state, run_age)
+    require_recent_run(run_age, window_hours)
     row_age = history_row_age(window_hours)
     return (
         f"OK: {UNIT} last ran {run_age:.1f}h ago; "
