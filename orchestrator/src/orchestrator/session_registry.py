@@ -3330,6 +3330,33 @@ class LeaseMutation(StrEnum):
     FAULTED = 'faulted'
 
 
+class HolderRecordState(StrEnum):
+    """What a lease holder's ``record_slug`` says about its registry record.
+
+    An axis INDEPENDENT of pid liveness (``holder_alive``): neither
+    overrides the other, and reading them together is the caller's job.
+
+    UNLINKED: the holder carries no ``record_slug`` (a body that predates the
+        field, or a claimant whose pointer was unresolvable), so nothing was
+        looked up. No evidence either way -- in particular NOT evidence that
+        the holder is alive or gone.
+    ABSENT: a ``record_slug`` WAS carried and no record exists under it: the
+        record has been reaped. Evidence the holder's session is gone.
+    UNREADABLE: the ``record_slug`` is not a record key, or its record
+        exists but cannot be read or parsed.
+    ACTIVE: the record's status is not terminal. For a hand-launched holder
+        that tracks its terminal, not the claude process, so ACTIVE never
+        overrides a dead pid.
+    EXITED: the record's status is terminal (``TERMINAL_STATUSES``).
+    """
+
+    UNLINKED = 'unlinked'
+    ABSENT = 'absent'
+    UNREADABLE = 'unreadable'
+    ACTIVE = 'active'
+    EXITED = 'exited'
+
+
 @dataclass(frozen=True)
 class LeaseHolder:
     """Serialized identity of a lease's current holder -- the exact ``.lease`` file body.
@@ -3397,6 +3424,25 @@ class LeaseHolder:
     @classmethod
     def from_json(cls, raw: str) -> LeaseHolder:
         return cls.from_dict(json.loads(raw))
+
+
+def holder_record_state(
+    holder: LeaseHolder | None, *, root: Path | str | None = None
+) -> HolderRecordState:
+    """Classify *holder*'s registry record -- see ``HolderRecordState``. Never raises."""
+    if holder is None or not holder.record_slug:
+        return HolderRecordState.UNLINKED
+    if not _is_record_key(holder.record_slug):
+        return HolderRecordState.UNREADABLE
+    try:
+        record = read_record(holder.record_slug, root=root)
+    except FileNotFoundError:
+        return HolderRecordState.ABSENT
+    except (OSError, CorruptSessionRecord):
+        return HolderRecordState.UNREADABLE
+    if record.status in TERMINAL_STATUSES:
+        return HolderRecordState.EXITED
+    return HolderRecordState.ACTIVE
 
 
 @dataclass(frozen=True)
