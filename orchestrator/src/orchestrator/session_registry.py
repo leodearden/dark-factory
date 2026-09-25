@@ -4241,7 +4241,9 @@ def _run_reap() -> list[ReapedSessionRecord]:
     return reaped
 
 
-def _run_lease_claim(name: str, slug: str, pid: int | None, policy_value: str) -> None:
+def _run_lease_claim(
+    name: str, slug: str, pid: int | None, policy_value: str, *, record_slug: str = ''
+) -> None:
     """Run the ``lease-claim`` verb: ALWAYS prints a ``decision=<value>`` line + message.
 
     *pid* is the claimant's long-lived session pid. Resolving it in code
@@ -4256,6 +4258,8 @@ def _run_lease_claim(name: str, slug: str, pid: int | None, policy_value: str) -
     therefore a defensive path for a DIRECT caller (a test, a future in-process
     caller), not the CLI's route -- and it stays, so this function remains
     correct standalone rather than depending on a caller it cannot see.
+    *record_slug* likewise arrives resolved from ``main()``, from that same
+    pid; it is never resolved here, so the fallback path records ''.
 
     This carries its OWN fail-open guard, independent of main()'s outer
     try/except: a fault raised by claim_lease itself (a corrupt lease body,
@@ -4268,7 +4272,12 @@ def _run_lease_claim(name: str, slug: str, pid: int | None, policy_value: str) -
     try:
         if pid is None:
             pid = resolve_session_pid()
-        holder = LeaseHolder(session_slug=slug, pid=pid, start_ts=datetime.now(UTC).isoformat())
+        holder = LeaseHolder(
+            session_slug=slug,
+            pid=pid,
+            start_ts=datetime.now(UTC).isoformat(),
+            record_slug=record_slug,
+        )
         claim = claim_lease(name, holder=holder, policy=LeasePolicy(policy_value))
     except Exception:
         logger.error('lease-claim %s failed', name, exc_info=True)
@@ -5253,6 +5262,9 @@ def main(argv: list[str] | None = None) -> int:
     # overrides the BODY's liveness pid only, deliberately, and never the slug
     # -- the identity has to stay derivable by the mutating verbs, which have no
     # --pid at all (see that flag's help, and the parser.error below).
+    # The body pid has a third consumer: the holder's `record_slug` is read from
+    # THAT pid's pointer, so the record's claude_owner_pid cross-checks the very
+    # pid the body records -- with no second resolution and no WARNING.
     #
     # Resolution is DEMAND-DRIVEN: an explicit --slug on a mutating verb needs
     # no pid at all (those verbs never write one), and resolving anyway would
@@ -5297,6 +5309,8 @@ def main(argv: list[str] | None = None) -> int:
                 'pid, not this session\'s identity, and lease-heartbeat/lease-release have no '
                 '--pid at all -- only --slug is honoured by all three verbs.'
             )
+        if args.verb == 'lease-claim':
+            args.record_slug = resolve_session_slug_for_pid(args.pid) or ''
 
     if args.verb == 'close-decision':
         return _run_close_decision(
@@ -5320,7 +5334,9 @@ def main(argv: list[str] | None = None) -> int:
         elif args.verb == 'reap':
             _run_reap()
         elif args.verb == 'lease-claim':
-            _run_lease_claim(args.name, args.slug, args.pid, args.policy)
+            _run_lease_claim(
+                args.name, args.slug, args.pid, args.policy, record_slug=args.record_slug
+            )
         elif args.verb == 'lease-heartbeat':
             _run_lease_heartbeat(args.name, args.slug, args.force)
         elif args.verb == 'lease-release':
