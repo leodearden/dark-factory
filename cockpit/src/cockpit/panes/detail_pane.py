@@ -91,11 +91,13 @@ def render_decision_detail(
     question scrolls off the bottom rather than pushing the ids out of view.
     Pure -- no clock read (now is injected), no writes.
 
-    The linked session resolves decision.session_id against *sessions* by
-    session_slug. An UNRESOLVED session_id is the expected shape today, not
-    a bug in this renderer: session_id carries a C8 watcher's lease token
-    rather than a session_slug (task 4237). It is therefore rendered raw and
-    marked unresolved, so an operator can tell a broken link from no link.
+    The linked session resolves decision.linked_session_slug (record_slug,
+    falling back to session_id) against *sessions* by session_slug. An
+    UNRESOLVED link means the decision carries no record_slug -- a filing
+    that predates it, or a filer whose pid pointer was unresolvable, leaving
+    only session_id, a C8 watcher's lease token -- or that its session record
+    has been reaped. It is therefore rendered raw and marked unresolved, so
+    an operator can tell a broken link from no link.
     """
     lines = [
         f'decision_id: {decision.id}',
@@ -105,7 +107,7 @@ def render_decision_detail(
         f'severity: {decision.severity}',
         f'state: {decision.state}',
         f'filed: {decision.filed_at} ({format_age(decision.filed_at, now)})',
-        f'session: {_linked_session(decision.session_id, sessions)}',
+        f'session: {_linked_session(decision.linked_session_slug, sessions)}',
     ]
     if decision.options:
         lines.append(f'options: {", ".join(decision.options)}')
@@ -113,13 +115,13 @@ def render_decision_detail(
     return '\n'.join(lines)
 
 
-def _linked_session(session_id: str | None, sessions: Sequence[SessionRecord]) -> str:
-    """Render *session_id* as a linked-session value -- see render_decision_detail."""
-    if not session_id:
+def _linked_session(slug: str | None, sessions: Sequence[SessionRecord]) -> str:
+    """Render *slug* as a linked-session value -- see render_decision_detail."""
+    if not slug:
         return ABSENT_PLACEHOLDER
-    session = next((s for s in sessions if s.session_slug == session_id), None)
+    session = next((s for s in sessions if s.session_slug == slug), None)
     if session is None:
-        return f'{session_id} (unresolved)'
+        return f'{slug} (unresolved)'
     return session.session_slug
 
 
