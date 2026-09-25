@@ -705,6 +705,66 @@ def wait_subtree_gone(pgid: int, *, timeout: float, interval: float = 0.1) -> bo
     return subtree_and_leader_gone(pgid)
 
 
+class ProcState(NamedTuple):
+    """A pid's ``/proc/<pid>/stat`` state letter and parent pid."""
+
+    state: str
+    ppid: int
+
+    @property
+    def exited(self) -> bool:
+        """A zombie has terminated and is only awaiting its (possibly reparented) parent's reap."""
+        return self.state in ('Z', 'X')
+
+
+def read_proc_state(pid: int) -> ProcState | None:
+    """*pid*'s :class:`ProcState`, or None when it has no ``/proc`` entry.
+
+    Parsed after the LAST ``') '`` exactly as
+    :func:`orchestrator.verify_cancel.read_ppid_map` does, since ``comm`` may
+    hold spaces or parens.  A malformed stat raises rather than reading as gone.
+    """
+    try:
+        raw = Path(f'/proc/{pid}/stat').read_text()
+    except OSError:
+        return None
+    fields = raw.rsplit(') ', 1)[1].split()
+    return ProcState(state=fields[0], ppid=int(fields[1]))
+
+
+def wait_pids_exited(
+    pids: set[int],
+    *,
+    timeout: float,
+    interval: float = 0.05,
+    _read_state=None,
+    _clock=None,
+) -> dict[int, ProcState]:
+    """Poll until every pid in *pids* has exited; return the still-RUNNING ones.
+
+    Each survivor maps to its last observed :class:`ProcState`; an empty dict
+    means every pid exited.  A zombie counts as exited: reaping a reparented
+    orphan is its subreaper's job (``systemd --user`` on this fleet), not the
+    code under test's -- the same criterion as
+    ``orchestrator/tests/test_verify_cancel.py::_is_running`` (task 3955).
+
+    The verdict is always the probe of the returning iteration, so a caller
+    descheduled across the deadline never asserts on a stale observation;
+    ``timeout=0`` is exactly one probe.
+    """
+    read = _read_state or read_proc_state
+    clock = _clock or time.monotonic
+    deadline = clock() + timeout
+    while True:
+        running = {
+            pid: state for pid in pids
+            if (state := read(pid)) is not None and not state.exited
+        }
+        if not running or clock() >= deadline:
+            return running
+        time.sleep(interval)
+
+
 def kill_holder_tree(
     proc: subprocess.Popen,
     *,
@@ -2540,7 +2600,7 @@ def test_read_proc_state_reports_an_unreaped_zombie_as_exited():
 
         state = read_proc_state(child.pid)
         assert state == ProcState(state='Z', ppid=os.getpid())
-        assert state.exited is True
+        assert state is not None and state.exited is True
         assert wait_pids_exited({child.pid}, timeout=0) == {}
 
         child.wait()
@@ -2852,17 +2912,14 @@ def _wait_until_zombie(pid: int, *, timeout: float = 5.0) -> bool:
 
     Deliberately does NOT use ``Popen.wait()``/``poll()``: those reap the
     process, which is precisely the state transition the caller here needs
-    to NOT happen.  Reads the state field positionally from the tail after
-    the last ``)`` so a comm containing spaces or parens cannot skew it.
+    to NOT happen.  Reads the state via :func:`read_proc_state`.
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        try:
-            stat = Path(f'/proc/{pid}/stat').read_text()
-        except OSError:
+        state = read_proc_state(pid)
+        if state is None:
             return False  # already reaped by someone else, or gone
-        tail = stat.rpartition(')')[2].split()
-        if tail and tail[0] == 'Z':
+        if state.state == 'Z':
             return True
         time.sleep(0.02)
     return False
