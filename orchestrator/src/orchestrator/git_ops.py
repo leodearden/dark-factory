@@ -66,6 +66,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, NamedTuple, TypedDict
 
+from shared.git_async import run_git
 from shared.proc_group import (
     reap_process_groups,
     scan_process_groups_under_path,
@@ -73,6 +74,7 @@ from shared.proc_group import (
 )
 from shared.transcript_archive import archive_before_delete
 
+from orchestrator import rebase_recovery
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import TASK_META_DIRNAME, GitConfig, TranscriptArchiveConfig
 from orchestrator.lane_lifecycle import (
@@ -2524,72 +2526,42 @@ async def _run(
     worktree (recoverable race) from other ``FileNotFoundError``\\ s (e.g.
     missing binary on ``PATH``).
 
-    Stdin feeding (``input_text``): when provided, the child is spawned with
-    ``stdin=PIPE`` and ``input_text.encode()`` is written to it via
-    ``communicate(input=...)``.  This is what lets callers pipe a diff into a
-    stdin-only filter such as ``git patch-id`` (see
-    :meth:`GitOps.find_equivalent_commit`).  When ``None`` (the default) the
-    behaviour is exactly as before — stdin is not piped and the child inherits
-    the parent's — so no existing caller is affected.  The capability is inert
-    unless ``input_text`` is passed.
+    A thin adapter over :func:`shared.git_async.run_git` (task 3778), which
+    owns the spawn mechanism and its rationale: the ``LC_ALL=C`` locale pin
+    :func:`_git_clean_failure_is_benign` depends on, stdin feeding, and the
+    task-2608 cancellation kill+reap.  What stays here is orchestrator-
+    specific: the :class:`WorktreeMissing` taxonomy and the 3-tuple return.
+    ``run_git`` is imported by bare name so ``git_ops.run_git`` is the single
+    patchable spawn seam.
 
-    Locale: ``LC_ALL=C`` and ``LANG=C`` are forced in the child environment so
-    that git (and other tools) always emit English-locale diagnostics.  This is
-    required for :func:`_git_clean_failure_is_benign`, which substring-matches
-    English warning text; a non-C locale would produce translated output that
-    the matcher cannot recognise, silently defeating the R3 ENOENT-tolerance
-    fix for the 4892-class warm-lane FAULT.
+    ``input_text``, when given, is piped to the child's stdin, e.g. a diff
+    into ``git patch-id`` (see :meth:`GitOps.find_equivalent_commit`).
 
-    Cancellation safety (task 2608): if the ``await proc.communicate()`` below
-    is cancelled — e.g. by a caller wrapping ``_run`` in
-    ``asyncio.wait_for(..., timeout=...)``, as delivered_checks.py's
-    ``_run_script_check`` does for script-kind delivered checks — the spawned
-    child would otherwise keep running as an orphan with its stdout/stderr
-    pipes open. For a persistently-hung script this recurred every scheduler
-    sweep, leaking a process and file descriptors. The child is now
-    best-effort killed and reaped before the triggering exception (including
-    ``asyncio.CancelledError``) is re-raised.
+    No ``timeout`` is passed: callers that want one wrap this call in their
+    own ``asyncio.wait_for``, whose cancellation the kill+reap covers.
+
+    Deliberately UNBOUNDED (``bounded=False``): this runs operator scripts
+    and oracle commands as well as git, and a caller-side ``wait_for`` would
+    otherwise count queue time as a verdict.  The shared module's "WHO SHOULD
+    OPT OUT OF THE BOUND" section is the full argument;
+    ``test_a_long_running_script_cannot_delay_a_concurrent_git_call`` pins it.
     """
     # Pre-flight: a missing cwd surfaces as a generic FileNotFoundError from
     # posix_spawn whose .filename is not reliably set.  Check explicitly so we
     # can raise a typed exception consumers can pattern-match on.
     if cwd is not None and not Path(cwd).is_dir():
         raise WorktreeMissing(cwd)
-    # Force a stable C locale so git output is always in English and amenable
-    # to substring matching (see docstring above).
-    _env = {**os.environ, 'LC_ALL': 'C', 'LANG': 'C'}
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=str(cwd) if cwd else None,
-            stdin=asyncio.subprocess.PIPE if input_text is not None else None,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=_env,
-        )
+        result = await run_git(cmd, cwd, input_text=input_text, bounded=False)
     except FileNotFoundError as e:
         # Race: cwd existed at the pre-flight check but vanished before spawn.
         # Re-classify as WorktreeMissing if cwd is now gone; otherwise the
-        # error is about the binary itself.
+        # error is about the binary itself.  This is precisely why the shared
+        # helper must NOT swallow FileNotFoundError.
         if cwd is not None and not Path(cwd).is_dir():
             raise WorktreeMissing(cwd) from e
         raise
-    try:
-        stdout, stderr = await proc.communicate(
-            input=input_text.encode() if input_text is not None else None,
-        )
-    except BaseException:
-        # The await was interrupted (most commonly asyncio.CancelledError from
-        # a caller-side asyncio.wait_for(..., timeout=...)) before the child
-        # exited. Best-effort kill + reap it so it doesn't leak as an orphan
-        # process with dangling stdout/stderr pipes, then propagate the
-        # original exception unchanged.
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()  # already exited
-        with contextlib.suppress(BaseException):
-            await proc.wait()  # reap is best-effort; never let it mask the original error
-        raise
-    return proc.returncode if proc.returncode is not None else 1, stdout.decode().strip(), stderr.decode().strip()
+    return result.returncode, result.stdout, result.stderr
 
 
 def _git_clean_failure_is_benign(stderr: str) -> bool:
@@ -9606,8 +9578,8 @@ class GitOps:
         rebases the branch in *worktree* onto that ref instead.  This is used
         by ``stack_train_branches`` to chain members into a linear stack.
 
-        Returns True on success.  On failure, aborts the rebase so the
-        worktree is left in a clean state, and returns False.
+        Returns True on success.  On failure, ATTEMPTS a guarded abort and
+        returns False — which does NOT imply a clean worktree: aborts fail.
 
         Caller must NOT hold ``_merge_lock`` — this is designed to run
         outside the lock so multiple tasks can rebase concurrently in
@@ -9619,7 +9591,7 @@ class GitOps:
             cwd=worktree,
         )
         if rc != 0:
-            await _run(['git', 'rebase', '--abort'], cwd=worktree)
+            await rebase_recovery.guarded_abort('rebase', worktree, _run)
             logger.info(f'Pre-merge rebase failed in {worktree}: {err}')
             return False
         return True
@@ -9891,8 +9863,8 @@ class GitOps:
 
         On a rebase conflict the member is added to *ejected*; the last-good
         predecessor is NOT advanced, so the next member re-links onto the last
-        survivor (re-link invariant).  The conflicting branch is left clean by
-        rebase_onto_main's ``git rebase --abort``.
+        survivor (re-link invariant).  rebase_onto_main ATTEMPTS a guarded
+        abort on the conflicting branch; a clean tree is not guaranteed.
 
         A missing worktree directory is treated as an eject (defensive;
         logged at WARNING level).
@@ -10013,8 +9985,7 @@ class GitOps:
             cwd=solo_wt,
         )
         if rc != 0:
-            # Abort the rebase and clean up both the worktree and temp branch.
-            await _run(['git', 'rebase', '--abort'], cwd=solo_wt)
+            await rebase_recovery.guarded_abort('rebase', solo_wt, _run)
             logger.info(
                 'materialize_member_solo: rebase conflict for member %s '
                 '(predecessor=%s): %s — cleaning up',
@@ -13760,7 +13731,7 @@ class GitOps:
             logger.warning(
                 f'Rebase failed (attempt {attempt + 1}): {rebase_err}'
             )
-            await _run(['git', 'rebase', '--abort'], cwd=merge_worktree)
+            await rebase_recovery.guarded_abort('rebase', merge_worktree, _run)
 
             if full_branch is None:
                 # No branch to re-merge from — cannot recover
@@ -14994,7 +14965,7 @@ class GitOps:
 
     async def abort_merge(self, cwd: Path) -> None:
         """Abort an in-progress merge."""
-        await _run(['git', 'merge', '--abort'], cwd=cwd)
+        await rebase_recovery.guarded_abort('merge', cwd, _run)
         logger.info('Merge aborted')
 
     async def rename_worktree(

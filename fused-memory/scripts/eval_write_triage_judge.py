@@ -495,7 +495,14 @@ CAVEATS: tuple[str, ...] = (
     'The duplicate class accepts BOTH `restated` and `amended`, because the '
     "curator's labels do not separate a verbatim restatement from a "
     'rediscovery carrying a novel fragment. The split between them is '
-    'reported as a distribution and is not scored as error.',
+    'reported as a distribution and is not scored as error. NOT SCORED IS '
+    'NOT THE SAME AS NOT CONSEQUENTIAL: `_TRIAGE_ATTACH_KINDS` in '
+    '`server/tools.py` files a `restated` verdict as a SIGHTING, which '
+    '`grouped_read` only counts, and an `amended` one as an AMENDMENT, whose '
+    "text is digested into the canonical's grouped read. A swing between the "
+    'two therefore changes what an operator reads while leaving every '
+    'accuracy above unmoved, so read this split as a behaviour selector '
+    'rather than as noise.',
     'The distractor class is a control this script constructs, not a curator '
     'label: one case per cluster whose slate carries no correct attach target '
     'at all. It is what distinguishes a judge that classifies from a judge '

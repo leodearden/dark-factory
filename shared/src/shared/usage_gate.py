@@ -19,7 +19,6 @@ import contextlib
 import json
 import logging
 import os
-import re
 import signal
 import time
 from dataclasses import dataclass, field
@@ -48,11 +47,13 @@ from shared.invocation_outcome import (
     classify_invocation,
 )
 
-# Aliased on import: this module defines its own _parse_resets_at below, and a
-# same-name import would shadow it — breaking the
-# orchestrator/src/orchestrator/usage_gate.py re-export and its tests. The two
-# differ deliberately: the strict copy returns None on parse failure, the local
-# fork fabricates `now + 1h` (see the note at its definition).
+# Aliased on import by convention, not necessity: shared.invocation_outcome is
+# the sole owner of the bare _parse_resets_at name, so every other module
+# imports it under an explicit alias and a reader can tell at the call site
+# exactly which parser is running. Enforced by
+# shared/tests/test_auth_failed.py::TestSingleResetsParserOwnership, which
+# fails any production call to the bare name outside the owning module — the
+# guard that keeps a fabricating fork from being re-introduced here.
 from shared.invocation_outcome import _parse_resets_at as _parse_resets_at_strict
 from shared.proc_group import terminate_process_group
 
@@ -1851,14 +1852,13 @@ class UsageGate:
             # strings downstream. Skip entirely when there's no "resets" hint at
             # all (true 401/403 token revocation).
             #
-            # Uses the STRICT parser deliberately: the module-local
-            # _parse_resets_at fork fabricates `now + 1h` on parse failure,
-            # which dashboard/data/costs.py::_extract_resets_at would then
-            # surface verbatim as a real recovery ETA on a revoked token. The
-            # strict copy returns None instead, so an unparseable hint is
-            # reported as explicitly UNKNOWN rather than invented (PRD 7.1.a —
-            # the invariant stated at invocation_outcome.py's _parse_resets_at).
-            # Both copies agree exactly on every parseable phrase.
+            # An UNPARSEABLE "resets" hint must persist NOTHING: whatever is
+            # stored here, dashboard/src/dashboard/data/costs.py::_extract_resets_at
+            # surfaces verbatim as a real recovery ETA, so a fabricated value
+            # would put an invented recovery time on a revoked token. The parser
+            # returns None instead (PRD 7.1.a — an unknown reset time must be
+            # reported as explicitly unknown, never fabricated; the invariant is
+            # stated at invocation_outcome.py's _parse_resets_at).
             #
             # (The old comment here justified the branch by "HTTP 429 ... routed
             # through _handle_auth_failure", which was stale: classify_invocation
@@ -2930,161 +2930,3 @@ def _read_oauth_token() -> str | None:
     except (FileNotFoundError, json.JSONDecodeError, OSError) as e:
         logger.debug(f'Cannot read OAuth credentials: {e}')
         return None
-
-
-_MONTH_ABBR = {
-    'jan': 1,
-    'feb': 2,
-    'mar': 3,
-    'apr': 4,
-    'may': 5,
-    'jun': 6,
-    'jul': 7,
-    'aug': 8,
-    'sep': 9,
-    'oct': 10,
-    'nov': 11,
-    'dec': 12,
-}
-
-
-def _parse_resets_at(text: str) -> datetime:
-    """Parse reset time from cap-hit message text.
-
-    Handles:
-    - "resets in 3h" / "resets in 45m" / "resets in 2d"
-    - "resets Mar 30, 6pm (Europe/London)" (date + time + tz)
-    - "resets 9pm (Europe/London)" / "resets 3:00 AM (US/Pacific)"
-    - Falls back to 1 hour from now
-
-    NO PRODUCTION CALLERS as of task 4042. This is the fabricating fork of
-    ``shared.invocation_outcome._parse_resets_at``: it invents ``now + 1h`` on
-    parse failure, where the strict copy returns ``None`` (PRD 7.1.a — an
-    unknown reset time must be reported as explicitly unknown, never
-    fabricated). Both live paths now use the strict copy: ``classify_invocation``
-    for its CapHit tier, and ``_handle_auth_failure`` via
-    ``_parse_resets_at_strict``. What survives here is the re-export consumed by
-    ``orchestrator/src/orchestrator/usage_gate.py`` and the ~20 tests across
-    ``shared`` and ``orchestrator`` that pin the ``now + 1h`` fallback contract —
-    which is why task 4042 did not simply delete it. Retiring or repairing this
-    fork is a separate cleanup, not a rider on a regression fix; do not add new
-    callers.
-
-    "Do not add new callers" is ENFORCED, not just asked for:
-    ``shared/tests/test_auth_failed.py::TestFabricatingForkHasNoProductionCallers``
-    AST-scans ``shared/src`` + ``orchestrator/src`` and fails on any call to the
-    bare ``_parse_resets_at`` name outside the module defining the strict copy.
-    If you are retiring this fork, delete that guard class along with this
-    definition.
-    """
-    # Relative: "resets in Xh", "resets in Xm", "resets in Xd"
-    m = re.search(r'resets\s+in\s+(\d+)\s*([hmd])', text, re.IGNORECASE)
-    if m:
-        amount = int(m.group(1))
-        unit = m.group(2).lower()
-        delta = {
-            'h': timedelta(hours=amount),
-            'm': timedelta(minutes=amount),
-            'd': timedelta(days=amount),
-        }.get(unit, timedelta(hours=1))
-        return datetime.now(UTC) + delta
-
-    # Absolute with date: "resets Mar 30, 6pm (Europe/London)" or
-    # "resets June 5, 7pm (Europe/London)". Month accepts 3-9 chars
-    # (any abbreviation through full name) and is matched against
-    # _MONTH_ABBR by its lowercased first three characters, since every
-    # English month is uniquely identified by them.
-    m = re.search(
-        r'resets\s+([A-Za-z]{3,9})\s+(\d{1,2}),?\s+'
-        r'(\d{1,2}(?::\d{2})?\s*[ap]m)\s*\(([^)]+)\)',
-        text,
-        re.IGNORECASE,
-    )
-    if m:
-        try:
-            import zoneinfo
-
-            month_str = m.group(1).lower()[:3]
-            day = int(m.group(2))
-            time_str = m.group(3).strip()
-            tz_str = m.group(4).strip()
-            tz = zoneinfo.ZoneInfo(tz_str)
-            month = _MONTH_ABBR.get(month_str)
-            if month is None:
-                raise ValueError(f'Unknown month: {month_str}')
-            for fmt in ('%I:%M %p', '%I%p', '%I:%M%p', '%I %p'):
-                try:
-                    parsed_time = datetime.strptime(time_str, fmt).time()
-                    break
-                except ValueError:
-                    continue
-            else:
-                raise ValueError(f'Cannot parse time: {time_str}')
-            now_in_tz = datetime.now(tz)
-            year = now_in_tz.year
-            target = now_in_tz.replace(
-                year=year,
-                month=month,
-                day=day,
-                hour=parsed_time.hour,
-                minute=parsed_time.minute,
-                second=0,
-                microsecond=0,
-            )
-            # If target is in the past, assume next year
-            if target <= now_in_tz:
-                target = target.replace(year=year + 1)
-            return target.astimezone(UTC)
-        except Exception:
-            pass
-
-    # Absolute: "resets Xpm (TZ)" or "resets X:XX AM (TZ)"
-    m = re.search(
-        r'resets\s+(\d{1,2}(?::\d{2})?\s*[ap]m)\s*\(([^)]+)\)',
-        text,
-        re.IGNORECASE,
-    )
-    if m:
-        try:
-            import zoneinfo
-
-            time_str = m.group(1).strip()
-            tz_str = m.group(2).strip()
-            tz = zoneinfo.ZoneInfo(tz_str)
-            for fmt in ('%I:%M %p', '%I%p', '%I:%M%p', '%I %p'):
-                try:
-                    parsed_time = datetime.strptime(time_str, fmt).time()
-                    break
-                except ValueError:
-                    continue
-            else:
-                return datetime.now(UTC) + timedelta(hours=1)
-
-            now_in_tz = datetime.now(tz)
-            target = now_in_tz.replace(
-                hour=parsed_time.hour,
-                minute=parsed_time.minute,
-                second=0,
-                microsecond=0,
-            )
-            if target <= now_in_tz:
-                target += timedelta(days=1)
-            return target.astimezone(UTC)
-        except Exception:
-            pass
-
-    # Fallback: 1 hour from now
-    return datetime.now(UTC) + timedelta(hours=1)
-
-
-def _extract_cap_message(text: str, prefix: str) -> str:
-    """Extract the full sentence containing the cap-hit prefix."""
-    lower = text.lower()
-    idx = lower.find(prefix.lower())
-    if idx == -1:
-        return ''
-    # Find the end of the sentence
-    end = text.find('\n', idx)
-    if end == -1:
-        end = min(idx + 200, len(text))
-    return text[idx:end].strip()

@@ -751,6 +751,12 @@ table { border-collapse: collapse; width: 100%; }
   font-style: italic;
 }
 
+/* Truncation disclosure above a capped heatmap — a muted caption, because it
+   qualifies the grid rather than warning about it. */
+.sched-heatmap-cap {
+  padding: 4px 2px 6px; color: var(--fg-3); font-size: 11px;
+}
+
 /* Override drawer — slides in from the right */
 .sched-drawer {
   width: 320px; flex-shrink: 0;

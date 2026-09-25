@@ -3,6 +3,9 @@
 from fused_memory.reconciliation.consolidation_gate import (
     render_consolidation_gate_section,
 )
+from fused_memory.reconciliation.graphiti_degradation_probe import (
+    render_graphiti_degradation_probe_section,
+)
 from fused_memory.reconciliation.policies.autopilot_video import (
     AUTOPILOT_VIDEO_CONTAMINATION_GUARDRAIL as _AUTOPILOT_VIDEO_CONTAMINATION_GUARDRAIL,
 )
@@ -16,9 +19,11 @@ from fused_memory.reconciliation.prompts import (
     _STAGE2_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE2_PROJECT_ID_GUIDELINE,
     AMEND_AND_EPISODE_TOOLS_BLOCK,
+    CITATION_REPAIR_TOOL_BLOCK,
     DUPLICATE_FINDING_SALVAGE_GUIDANCE,
     STALE_KNOWLEDGE_ANNOTATION_NORM,
     get_recon_report_tool_guidance,
+    render_entity_standing_decision_write_section,
     render_escalation_boundary_note,
     render_finding_provenance_section,
 )
@@ -207,6 +212,8 @@ cancel, use `set_task_status('cancelled')`; do not route the status change throu
 {get_recon_report_tool_guidance()}
 {DUPLICATE_FINDING_SALVAGE_GUIDANCE}
 
+{CITATION_REPAIR_TOOL_BLOCK}
+
 {STALE_KNOWLEDGE_ANNOTATION_NORM}
 
 ## Provenance rules for "shipped via X" edges
@@ -357,6 +364,8 @@ These two counters are orthogonal: a flag may appear as a Mem0 marker \
 (`stage1_mem0_flags_processed`) or as a structured analytical finding \
 (`stage1_analytical_findings_processed`) or both — count it in each dimension where \
 it was actually processed.
+
+{render_graphiti_degradation_probe_section(runs_probes=True)}
 
 {render_cycle_summary_section()}
 
@@ -603,6 +612,8 @@ not apply and you should treat the finding as a normal finding and act on it.
 {render_entity_standing_decision_schema_section()}
 
 {render_investigation_outcome_section()}
+
+{render_entity_standing_decision_write_section()}
 
 ## Consuming Stage 1 Refresh Failures (Task 1157)
 At the start of each cycle, check whether the Stage 1 payload includes a non-empty \

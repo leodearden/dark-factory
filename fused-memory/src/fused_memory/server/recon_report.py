@@ -3693,10 +3693,18 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
         not finished — use cite_memory/delete_finding within a live run; it
         reports the row's own status under run_status, never under status);
         journal_error (journal I/O raised — 'phase' says read/write/verify and
-        the hint says whether anything was written); repair_clobbered (the write
-        was made but a re-read does not show it, so another writer rewrote the
-        blob — retry when the run is quiescent); run_id_unknown;
-        journal_unavailable; service_not_configured.
+        the hint says whether anything was written); concurrent_modification
+        (another writer rewrote the run's stage_reports between this call's read
+        and its write, so NOTHING was written and the durable blob is untouched
+        — re-run, and an already-repaired finding then answers
+        citation_not_present); repair_clobbered (the write was made but a re-read
+        does not show it, so another writer rewrote the blob AFTER it — retry
+        when the run is quiescent); malformed_citation_repairs (the finding's
+        existing citation_repairs key is not a list, so the provenance append
+        cannot be made safely — nothing was written and no memory lookup was
+        issued, and the blob needs hand-inspection); run_id_unknown;
+        journal_unavailable;
+        service_not_configured.
 
         On success 'status' is 'repaired'; every refusal above is keyed by
         'error' and carries no 'status', so 'status' is safe to branch on.

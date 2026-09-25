@@ -713,6 +713,20 @@ class TestDeriveFromGuardClusters:
         emitted = {c['topic'] for c in _of(derived, 'topic_guard_cluster')}
         assert emitted == {c.topic_id for c in guard_clusters}
 
+    def test_a_guard_cluster_wins_a_slug_collision_with_a_census_topic(
+        self, calibration_rows, guard_clusters,
+    ):
+        """The nightly census regularly grows a topic value that equals a guard
+        slug. The guard's hand-written match phrases must survive it rather
+        than lose to a phrasing synthesised from the slug itself."""
+        slug = guard_clusters[0].topic_id
+        census = {'grand_total': {'topic': {'entries': [{'value': slug, 'count': 9}]}}}
+        result = _mod().derive_registry_candidates(calibration_rows, census, guard_clusters)
+
+        [winner] = [c for c in result.candidates if c['topic'] == slug]
+        assert winner['derived_from'] == 'topic_guard_cluster'
+        assert result.disclosures['slug_collisions_dropped'] >= 1
+
     def test_guard_phrases_seed_phrasings(self, derived, guard_clusters):
         by_slug = {c.topic_id: c for c in guard_clusters}
         for candidate in _of(derived, 'topic_guard_cluster'):

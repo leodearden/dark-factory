@@ -461,15 +461,17 @@ class TestArchiveScanLeavesTheLoop:
 
 def _stub_probe(monkeypatch, probed: list, *, live_ids: frozenset[str] = frozenset(),
                 block: float = PROBE_BLOCK_SECONDS):
-    """Replace the live-workflow detector with a blocking stub that records ids.
+    """Replace the live-workflow detector with a slow stub that records ids.
 
-    Stands in for ``is_workflow_live_for_task``, which shells out to up to three
-    ``subprocess.run(['git', ...], timeout=10)`` calls per task.
+    Stands in for ``is_workflow_live_for_task``, a coroutine since task 3778
+    whose up-to-three git probes per task each take up to 10s.  The stub
+    awaits for *block* seconds, so a stall of that size means the pass is
+    holding the loop around the probe rather than awaiting it.
     """
 
-    def _is_live(tid, _project_root, **_kw):
+    async def _is_live(tid, _project_root, **_kw):
         probed.append(str(tid))
-        time.sleep(block)
+        await asyncio.sleep(block)
         return str(tid) in live_ids
 
     monkeypatch.setattr(harness_module, 'is_workflow_live_for_task', _is_live)

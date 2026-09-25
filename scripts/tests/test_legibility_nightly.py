@@ -18,6 +18,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -42,7 +43,7 @@ from legibility.config import load_config
 
 @pytest.fixture(autouse=True)
 def _isolate_trickle_state(tmp_path, monkeypatch):
-    """Point XDG_STATE_HOME at tmp_path for EVERY test in this module.
+    """Point the legibility state root at tmp_path for EVERY test here.
 
     ``run_nightly`` records run state through ``trickle_state.record_run``
     on every exit path (task 3340), so without this an ordinary test run
@@ -53,8 +54,12 @@ def _isolate_trickle_state(tmp_path, monkeypatch):
     reaches the recorder — including the ones that assert on this module's
     WARNING records, which a failed real-home write would otherwise
     pollute.
+
+    The lever was ``XDG_STATE_HOME`` until task 4514 made
+    ``trickle_state.trickle_state_path`` environment-independent; this is
+    now the only variable it reads.
     """
-    monkeypatch.setenv('XDG_STATE_HOME', str(tmp_path / 'xdg-state'))
+    monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path / 'legibility-state'))
 
 
 def _write_config(
@@ -1005,7 +1010,8 @@ def test_evaluate_census_step_fire_with_entrypoint_launches(tmp_path):
     launcher_calls = []
     line, fire = nightly.evaluate_census_step(
         cfg, now=None, status_fetcher=None, decide=fake_decide,
-        entrypoint_exists=lambda: True, launcher=lambda: launcher_calls.append(1),
+        entrypoint_exists=lambda: True,
+        launcher=lambda project_root, **kwargs: launcher_calls.append(1),
     )
 
     assert fire is True
@@ -1036,7 +1042,7 @@ def test_evaluate_census_step_logs_the_decision_before_launching(tmp_path, caplo
     # the way a timed-out/killed census does.
     logged_at_launch = []
 
-    def _dying_launcher():
+    def _dying_launcher(project_root, **kwargs):
         logged_at_launch.extend(r.getMessage() for r in caplog.records)
         raise subprocess.TimeoutExpired(cmd='census.py', timeout=1800)
 
@@ -1180,7 +1186,7 @@ def test_default_census_launcher_logs_loud_on_nonzero_exit(monkeypatch, caplog):
     monkeypatch.setattr(nightly.subprocess, "run", fake)
 
     with caplog.at_level("WARNING", logger="legibility.nightly"):
-        result = nightly._default_census_launcher()
+        result = nightly._default_census_launcher('/some/project')
 
     assert result is None, "the launcher never raises and returns None (never-crash-the-nightly)"
     assert any(
@@ -1198,7 +1204,7 @@ def test_default_census_launcher_quiet_on_zero_exit(monkeypatch, caplog):
     monkeypatch.setattr(nightly.subprocess, "run", fake0)
 
     with caplog.at_level("WARNING", logger="legibility.nightly"):
-        result = nightly._default_census_launcher()
+        result = nightly._default_census_launcher('/some/project')
 
     assert result is None
     assert not any(
@@ -1242,7 +1248,7 @@ def test_default_census_launcher_passes_an_explicit_env_through(monkeypatch):
     seen = _spy_subprocess_run(monkeypatch)
     env = {'CLAUDE_CODE_OAUTH_TOKEN': 'tok-from-the-pool'}
 
-    nightly._default_census_launcher(env=env)
+    nightly._default_census_launcher('/some/project', env=env)
 
     assert seen['env'] is env, (
         'the census subprocess must be spawned with the env it was given, or '
@@ -1263,9 +1269,186 @@ def test_default_census_launcher_inherits_the_parent_env_by_default(monkeypatch)
     """
     seen = _spy_subprocess_run(monkeypatch)
 
-    nightly._default_census_launcher()
+    nightly._default_census_launcher('/some/project')
 
     assert seen.get('env') is None
+
+
+# ---------------------------------------------------------------------------
+# task 3269 (re-landed by task 5782): the census launch names its target
+#
+# The launcher used to run a bare `python census.py`, so census.py fell back
+# to its `--project-root "."` default and resolved against the launcher's cwd
+# -- which legibility-trickle@.service pins to /home/leo/src/dark-factory for
+# EVERY %i instance. Every fired census therefore censused dark_factory,
+# whichever project the trickle instance was for. No test inspected the argv.
+# ---------------------------------------------------------------------------
+
+def _adjacent_pair(argv: list[str], flag: str) -> list[str] | None:
+    """Return ``[flag, value]`` for the first occurrence of *flag* in *argv*.
+
+    Asserting on the ADJACENT pair (rather than mere membership of both
+    strings) is what makes "flag present but paired with the wrong value"
+    fail -- the exact failure mode under test.
+    """
+    for index, token in enumerate(argv):
+        if token == flag and index + 1 < len(argv):
+            return argv[index:index + 2]
+    return None
+
+
+def _fire_decide(project_root, *, now=None, status_fetcher=None):
+    return census_trigger.Decision(fire=True, reasons=['max-interval: 11.0d -> FIRE'])
+
+
+def test_default_census_launcher_argv_names_the_target_project(monkeypatch):
+    seen = _spy_subprocess_run(monkeypatch)
+
+    nightly._default_census_launcher('/some/other/project')
+
+    argv = seen['args']
+    assert argv[0] == sys.executable
+    assert argv[1].endswith('census.py'), f'argv[1] must be the census entrypoint, got {argv[1]!r}'
+    assert _adjacent_pair(argv, '--project-root') == ['--project-root', '/some/other/project']
+    assert '--config' not in argv, (
+        'a caller holding only a project root must not synthesize a config path'
+    )
+
+
+def test_default_census_launcher_argv_carries_config_path_when_given(monkeypatch):
+    """``--config`` pins the EXACT legibility.yaml the trickle itself loaded,
+    so the census cannot independently re-resolve to a different one."""
+    seen = _spy_subprocess_run(monkeypatch)
+    config_path = '/some/other/project/docs/legibility/legibility.yaml'
+
+    nightly._default_census_launcher('/some/other/project', config_path=config_path)
+
+    argv = seen['args']
+    assert _adjacent_pair(argv, '--config') == ['--config', config_path]
+    # ...riding the SAME argv as the project root, not replacing it.
+    assert _adjacent_pair(argv, '--project-root') == ['--project-root', '/some/other/project']
+
+
+def test_default_census_launcher_refuses_a_relative_config_path(monkeypatch):
+    seen = _spy_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError) as excinfo:
+        nightly._default_census_launcher(
+            '/some/project', config_path='docs/legibility/legibility.yaml',
+        )
+
+    assert 'docs/legibility/legibility.yaml' in str(excinfo.value)
+    assert seen == {}, 'a refused config path must never reach subprocess.run'
+
+
+def test_default_census_launcher_composes_project_root_with_the_pool_env(monkeypatch):
+    """Task 3269's argv fix and task 5488's env overlay ride the SAME launch."""
+    seen = _spy_subprocess_run(monkeypatch)
+    env = {'CLAUDE_CODE_OAUTH_TOKEN': 'tok'}
+
+    nightly._default_census_launcher('/p', env=env)
+
+    assert seen['env'] is env
+    assert seen['check'] is False
+    assert _adjacent_pair(seen['args'], '--project-root') == ['--project-root', '/p']
+
+
+def test_default_census_launcher_refuses_a_relative_project_root(monkeypatch):
+    """A relative target would resolve against the trickle's cwd -- the unit
+    file's WorkingDirectory -- which is task 3269's defect all over again."""
+    seen = _spy_subprocess_run(monkeypatch)
+
+    with pytest.raises(ValueError) as excinfo:
+        nightly._default_census_launcher('relative-proj')
+
+    assert 'relative-proj' in str(excinfo.value)
+    assert seen == {}, 'a refused target must never reach subprocess.run'
+
+
+def test_evaluate_census_step_launches_against_the_configs_project_root(tmp_path):
+    cfg = load_config(_write_config(tmp_path / 'proj_a', project_id='proj_a'))
+    calls = []
+
+    def rec(project_root, *, config_path=None):
+        calls.append((project_root, config_path))
+
+    _line, fire = nightly.evaluate_census_step(
+        cfg, now=None, status_fetcher=None, decide=_fire_decide,
+        entrypoint_exists=lambda: True, launcher=rec,
+    )
+
+    assert fire is True
+    # The config's own root -- a tmp dir, definitively NOT the pytest cwd.
+    assert calls == [(str(tmp_path / 'proj_a'), None)]
+
+
+def test_evaluate_census_step_two_project_configs_produce_two_distinct_launches(tmp_path):
+    """The production defect's own shape: a legibility-trickle@reify run and a
+    legibility-trickle@dark_factory run launched an IDENTICAL census."""
+    cfg_a = load_config(_write_config(tmp_path / 'proj_a', project_id='proj_a'))
+    cfg_b = load_config(_write_config(tmp_path / 'proj_b', project_id='proj_b'))
+    calls = []
+
+    def rec(project_root, *, config_path=None):
+        calls.append(project_root)
+
+    for cfg in (cfg_a, cfg_b):
+        nightly.evaluate_census_step(
+            cfg, now=None, status_fetcher=None, decide=_fire_decide,
+            entrypoint_exists=lambda: True, launcher=rec,
+        )
+
+    assert calls == [str(tmp_path / 'proj_a'), str(tmp_path / 'proj_b')]
+
+
+def test_evaluate_census_step_forwards_config_path_to_launcher(tmp_path):
+    config_path = _write_config(tmp_path / 'proj_a', project_id='proj_a')
+    cfg = load_config(config_path)
+    calls = []
+
+    def rec(project_root, *, config_path=None):
+        calls.append((project_root, config_path))
+
+    nightly.evaluate_census_step(
+        cfg, now=None, status_fetcher=None, decide=_fire_decide,
+        entrypoint_exists=lambda: True, launcher=rec, config_path=config_path,
+    )
+
+    assert calls == [(cfg.project_root, config_path)]
+
+
+def test_run_nightly_forwards_the_resolved_config_path_to_the_census_step(
+    tmp_path, monkeypatch,
+):
+    """The census is pinned to the legibility.yaml THIS run loaded -- made
+    absolute, so an operator's relative ``--config`` is never re-resolved
+    against the census subprocess's cwd."""
+    monkeypatch.chdir(tmp_path)
+    _write_config(tmp_path / 'proj_a', project_id='proj_a')
+    calls = []
+
+    def _spy_evaluate(cfg, **kwargs):
+        calls.append((cfg, kwargs))
+        return 'census trigger: NO-FIRE -- stub', False
+
+    monkeypatch.setattr(nightly, 'evaluate_census_step', _spy_evaluate)
+
+    nightly.run_nightly(
+        config_path='proj_a/docs/legibility/legibility.yaml',
+        projects_root=tmp_path / 'projects',
+        target_date=date(2026, 7, 13),
+        invoke=lambda prompt, model: '{"proposals": []}',
+        status_fetcher=lambda: {'statuses': {}},
+        poster=lambda url, envelope: None,
+    )
+
+    assert len(calls) == 1
+    cfg, kwargs = calls[0]
+    expected = (tmp_path / 'proj_a' / 'docs' / 'legibility' / 'legibility.yaml').resolve()
+    assert kwargs['config_path'] == expected
+    assert Path(kwargs['config_path']).is_absolute()
+    # The cfg and the config path name the SAME project.
+    assert cfg.project_root == str(tmp_path / 'proj_a')
 
 
 class TestRunNightlyBindsTheCensusLauncherToThePool:
@@ -1300,7 +1483,9 @@ class TestRunNightlyBindsTheCensusLauncherToThePool:
     def _capture_launcher(monkeypatch):
         seen = {}
 
-        def _spy_evaluate(cfg, *, now=None, status_fetcher=None, launcher=None):
+        def _spy_evaluate(
+            cfg, *, now=None, status_fetcher=None, launcher=None, config_path=None,
+        ):
             seen['launcher'] = launcher
             return 'census trigger: NO-FIRE -- stub', False
 
@@ -1312,7 +1497,7 @@ class TestRunNightlyBindsTheCensusLauncherToThePool:
         """Resolve *launcher* the way evaluate_census_step does, run it with
         subprocess.run spied, and return the env the census subprocess got."""
         seen = _spy_subprocess_run(monkeypatch)
-        (launcher if launcher is not None else nightly._default_census_launcher)()
+        (launcher if launcher is not None else nightly._default_census_launcher)('/some/project')
         return seen.get('env')
 
     def test_the_census_gets_a_pool_chosen_token_with_the_api_key_stripped(
@@ -1413,7 +1598,9 @@ class TestRunNightlyDefaultsTheCensusStatusFetcher:
             factory_calls.append(project_root)
             return sentinel
 
-        def _spy_evaluate(cfg, *, now=None, status_fetcher=None, launcher=None):
+        def _spy_evaluate(
+            cfg, *, now=None, status_fetcher=None, launcher=None, config_path=None,
+        ):
             seen['status_fetcher'] = status_fetcher
             return 'census trigger: NO-FIRE -- stub', False
 
@@ -3342,6 +3529,7 @@ class TestRunNightlyRecordsTrickleState:
 
         assert result.exit_code == 1
         doc = _one_recorded(calls)
+        assert doc['outcome'] == trickle_state.OUTCOME_FAILED
         assert doc['exit_code'] == 1
         assert doc['counters']['selected_count'] == 1
 
@@ -3354,6 +3542,7 @@ class TestRunNightlyRecordsTrickleState:
         assert result.exit_code == 1
         assert result.coder_status == 'failure'
         doc = _one_recorded(calls)
+        assert doc['outcome'] == trickle_state.OUTCOME_FAILED
         assert doc['exit_code'] == 1
         assert doc['counters']['selected_count'] == 1
 
@@ -3365,6 +3554,7 @@ class TestRunNightlyRecordsTrickleState:
 
         assert result.exit_code == 1
         doc = _one_recorded(calls)
+        assert doc['outcome'] == trickle_state.OUTCOME_FAILED
         assert doc['exit_code'] == 1
         assert doc['commit_made'] is False
 
@@ -3376,6 +3566,7 @@ class TestRunNightlyRecordsTrickleState:
 
         assert result.exit_code == 1
         doc = _one_recorded(calls)
+        assert doc['outcome'] == trickle_state.OUTCOME_FAILED
         assert doc['exit_code'] == 1
         assert doc['commit_made'] is False
 
@@ -3393,6 +3584,7 @@ class TestRunNightlyRecordsTrickleState:
             _run_e2e_nightly(tmp_path, recorder=recorder)
 
         doc = _one_recorded(calls)
+        assert doc['outcome'] == trickle_state.OUTCOME_FAILED
         assert doc['exit_code'] != 0, (
             'a crashed night must record its crash honestly'
         )
@@ -3400,6 +3592,54 @@ class TestRunNightlyRecordsTrickleState:
             'the sample was computed before the crash, so its real counters '
             'are still recordable'
         )
+
+    def test_a_crash_after_selecting_digests_records_failed_not_productive(
+        self, tmp_path
+    ):
+        """The 2026-08-18 reify shape: signal DID reach the digest stage,
+        and the pipeline broke downstream of it. Before task 4514 this
+        recorded ``productive``, streak 0, and a FRESH
+        ``last_productive_at`` — every night, for as long as the coder
+        stayed broken."""
+        recorder, calls = _recorder_spy()
+        result, _repo = _run_e2e_nightly(
+            tmp_path, branch='storm', recorder=recorder,
+        )
+
+        assert result.exit_code == 1
+        doc = _one_recorded(calls)
+        assert doc['outcome'] == trickle_state.OUTCOME_FAILED
+        assert doc['exit_code'] == 1
+        assert doc['counters']['selected_count'] >= 1, (
+            'signal reached the digest stage; the counters must still say so'
+        )
+        assert doc['consecutive_failed_runs'] == 1
+        assert doc['consecutive_barren_runs'] == 0
+        assert doc['last_productive_at'] is None
+
+    def test_result_exit_code_is_not_mutated_by_recording(self, tmp_path):
+        """Nothing in the recorder may write back onto
+        ``NightlyResult.exit_code`` — the refusal
+        ``scripts/legibility/nightly.py::_escalate_barren_streak``
+        records, because doing so would flip the unit to ``Result=failed``
+        and invert ``check_trickle_liveness.sh`` into a permanent false
+        alarm."""
+        recorder, calls = _recorder_spy()
+        clean, _repo = _run_e2e_nightly(tmp_path, recorder=recorder)
+        assert clean.exit_code == 0
+        assert _one_recorded(calls)['outcome'] == trickle_state.OUTCOME_PRODUCTIVE
+
+        storm_dir = tmp_path / 'storm'
+        storm_dir.mkdir()
+        recorder, calls = _recorder_spy()
+        stormed, _repo2 = _run_e2e_nightly(
+            storm_dir, branch='storm', recorder=recorder,
+        )
+        assert stormed.exit_code == 1, (
+            'the fail-loud branch owns the exit code; recording must not '
+            'move it in either direction'
+        )
+        assert _one_recorded(calls)['outcome'] == trickle_state.OUTCOME_FAILED
 
     def test_a_raising_recorder_never_breaks_the_run(self, tmp_path, caplog):
         """Observability must never become a new failure mode — mirroring
@@ -3463,15 +3703,16 @@ class _NightRunner:
 
     def night(self, day, kind):
         """Run one night. *kind* is 'barren' (real signal, squeezed budget),
-        'productive' (real signal, stock budget) or 'quiet' (no sessions at
-        all for this date)."""
+        'productive' (real signal, stock budget), 'quiet' (no sessions at
+        all for this date) or 'storm' (real signal, every digest's coding
+        output unparseable, so the night exits 1 and records ``failed``)."""
         target = date(2026, 7, day)
         _write_config(
             self.repo, project_id='testproj', escalation_port=8199,
             cwd_prefixes=[self.work_cwd],
             max_daily_digest_bytes=10 if kind == 'barren' else None,
         )
-        if kind in ('barren', 'productive'):
+        if kind in ('barren', 'productive', 'storm'):
             _write_transcript(
                 self.projects_root / _encode_cwd(self.work_cwd)
                 / f'session-{day}.jsonl',
@@ -3484,10 +3725,22 @@ class _NightRunner:
             projects_root=self.projects_root,
             target_date=target,
             now=datetime(2026, 7, day + 1, 3, 0, 0, tzinfo=UTC),
-            invoke=_fake_invoke_known_cause,
+            invoke=(
+                _fake_invoke_unparseable if kind == 'storm'
+                else _fake_invoke_known_cause
+            ),
             status_fetcher=None,
             poster=lambda url, env: self.escalations.append((url, env)),
         )
+
+    def recorded(self):
+        """The state document the REAL recorder just wrote for this run."""
+        status, doc = trickle_state.load_state(
+            trickle_state.trickle_state_path('testproj')
+        )
+        assert (status, doc) != ('missing', None), 'no run recorded yet'
+        assert doc is not None
+        return doc
 
 
 class TestBarrenStreakEscalation:
@@ -3500,6 +3753,74 @@ class TestBarrenStreakEscalation:
     than re-opening it, and avoids the one-shot latch's worse failure mode
     that 3270 explicitly rejected.
     """
+
+    def test_repeated_crashes_never_restamp_last_productive_at(self, tmp_path):
+        """THE "forever green" scenario, end to end through the real
+        pipeline: one productive night, then three storming ones. An
+        operator reading ``last_productive_at`` must see night one, not a
+        stamp refreshed by every crash."""
+        runner = _NightRunner(tmp_path)
+
+        runner.night(13, 'productive')
+        first = runner.recorded()
+        assert first['outcome'] == trickle_state.OUTCOME_PRODUCTIVE
+        stamp = first['last_productive_at']
+        assert stamp is not None
+
+        for night, expected_streak in ((14, 1), (15, 2), (16, 3)):
+            result = runner.night(night, 'storm')
+            assert result.exit_code == 1
+            doc = runner.recorded()
+            assert doc['outcome'] == trickle_state.OUTCOME_FAILED
+            assert doc['consecutive_failed_runs'] == expected_streak
+            assert doc['last_productive_at'] == stamp, (
+                'a night that crashed did nothing productive; restamping '
+                'here is the lie that makes a broken pipeline read healthy'
+            )
+
+    def test_a_failed_night_does_not_fire_the_barren_streak_escalation(
+        self, tmp_path
+    ):
+        """``_escalate_barren_streak`` returns early unless the outcome is
+        ``barren``, so a crashed night cannot fire it — the crash is
+        already owned by that run's own fail-loud escalation."""
+        runner = _NightRunner(tmp_path)
+        runner.night(13, 'barren')
+        runner.night(14, 'barren')
+
+        stormed = runner.night(15, 'storm')
+
+        assert stormed.exit_code == 1
+        assert stormed.barren_escalated is False
+        assert _streak_escalations(runner.escalations) == []
+
+    def test_a_failed_night_carries_the_barren_streak_forward(self, tmp_path):
+        """barren, barren, FAILED, barren — the FOURTH night is the one
+        that reaches the threshold. Asserting exactly one streak
+        escalation across all four proves the carry-forward cannot
+        double-fire the exact-equality edge trigger."""
+        runner = _NightRunner(tmp_path)
+
+        runner.night(13, 'barren')
+        runner.night(14, 'barren')
+        assert runner.recorded()['consecutive_barren_runs'] == 2
+
+        runner.night(15, 'storm')
+        carried = runner.recorded()
+        assert carried['outcome'] == trickle_state.OUTCOME_FAILED
+        assert carried['consecutive_barren_runs'] == 2, (
+            'a crashed run is evidence about the RUN, not about whether '
+            'signal is flowing'
+        )
+
+        fourth = runner.night(16, 'barren')
+
+        assert runner.recorded()['consecutive_barren_runs'] == 3
+        assert fourth.barren_escalated is True
+        assert len(_streak_escalations(runner.escalations)) == 1, (
+            'the streak passes through the threshold value at most once, so '
+            'the carry-forward cannot produce a second edge trigger'
+        )
 
     def test_threshold_default_is_three(self):
         """One barren night can be an ordinary bad day; three consecutive
@@ -3905,7 +4226,7 @@ def test_post_escalation_reports_false_on_a_tool_error_envelope(
 
 def _stub_census_launcher_and_pool(monkeypatch):
     """Stub both of a ``main()``-driven run's reaches into the real world, and
-    return the launcher's call list.
+    return the launcher's call list, one ``(args, kwargs)`` pair per call.
 
     MANDATORY, not cosmetic, on both counts. On FIRE the real launcher
     subprocess-runs scripts/legibility/census.py (real LLM spend + real git
@@ -3918,7 +4239,8 @@ def _stub_census_launcher_and_pool(monkeypatch):
     """
     launcher_calls = []
     monkeypatch.setattr(
-        nightly, '_default_census_launcher', lambda env=None: launcher_calls.append(1),
+        nightly, '_default_census_launcher',
+        lambda *args, **kwargs: launcher_calls.append((args, kwargs)),
     )
 
     class _EmptyPool:
@@ -4013,7 +4335,7 @@ def test_main_run_fires_the_tasks_landed_condition_end_to_end(
 
     # (i) condition (b) fired all the way through the production entrypoint.
     assert exit_code == 0
-    assert launcher_calls == [1], (
+    assert len(launcher_calls) == 1, (
         'the census launcher never fired end-to-end. Read the captured log '
         'BEFORE suspecting the wiring: task 4085 turns any exception out of '
         '`decide` into a quiet synthetic NO-FIRE line rather than a '
@@ -4040,6 +4362,12 @@ def test_main_run_fires_the_tasks_landed_condition_end_to_end(
         'tasks-landed: 130 landed since last census (threshold 120) -> FIRE' in m
         for m in messages
     ), messages
+
+    # (iv) task 3269: the census launched from the systemd entry point is aimed
+    # at THIS project and THIS legibility.yaml, never at the process cwd.
+    launch_args, launch_kwargs = launcher_calls[0]
+    assert launch_args == (str(tmp_path),)
+    assert launch_kwargs['config_path'] == Path(config_path).resolve()
 
 
 def test_main_run_fails_safe_when_the_defaulted_fetcher_cannot_reach_fused_memory(

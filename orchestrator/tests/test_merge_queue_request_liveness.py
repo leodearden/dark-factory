@@ -689,13 +689,14 @@ async def _make_merged_item(
 
 
 # ── Driving the in-flight abort poll (task 2420's subject) ────────────────
-# The poll measures its no-progress budget off `ClockPort.monotonic` but waits
-# on `asyncio.wait(timeout=VERIFY_ABANDON_POLL_SECS)`, so the two are driven
-# separately: the injected clock jumps an hour per duration reading (crossing
-# production's real 90-minute INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS in two
-# polls, with no rescaled budget to keep in step with production), while
-# VERIFY_ABANDON_POLL_SECS alone stays small so those polls happen promptly.
-# Nothing below depends on how long the host takes to run them.
+# The poll takes BOTH its no-progress measurement and its cadence from the
+# injected clock, so there is one time source to drive rather than two. `tick`
+# is what drives it here: the clock jumps an hour per duration reading, which
+# crosses production's real 90-minute INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS in
+# two polls with no rescaled budget to keep in step with production. The
+# poll's own per-wait charge is VERIFY_ABANDON_POLL_SECS, which every test
+# below keeps small so those polls also happen promptly in real time. Nothing
+# below depends on how long the host takes to run them.
 _LANE_SECS_PER_READING = 3600.0
 
 #: Hard stop for `_poll_for_lane_budgets`, so a dead abort poll fails with a
@@ -2608,7 +2609,12 @@ class TestContendedLeaseDefers:
         _lease_held_reset = _held_lane_reset(warm_path, foreign_pgid)
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = make_lane(warm_git_ops, q)
+        # The streak stamps are read off the worker's injected clock, so the
+        # seed and the final elapsed check must use that SAME clock: the real
+        # time.monotonic() only agrees with FakeClock's fixed base while host
+        # uptime happens to sit below it.
+        clock = FakeClock()
+        worker = make_lane(warm_git_ops, q, clock=clock)
         worker.CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS = 0.0
         # A cap this task's seeded stamp is FAR past, so the only thing that can
         # keep this defer alive is recognising the streak as broken.
@@ -2624,7 +2630,7 @@ class TestContendedLeaseDefers:
         # with nothing since — a gap no defer cadence can explain (the raiser
         # here carries no wait at all and the throttle is 0, so the staleness
         # window is its 60s floor).
-        _long_ago = time.monotonic() - 3600.0
+        _long_ago = clock.monotonic() - 3600.0
         worker._contended_lease_requeues[task_id] = 1
         worker._contended_lease_first_defer_at[task_id] = _long_ago
         worker._contended_lease_last_defer_at[task_id] = _long_ago
@@ -2652,7 +2658,7 @@ class TestContendedLeaseDefers:
             f'continued; got {worker._contended_lease_requeues.get(task_id)!r}'
         )
         assert (
-            time.monotonic() - worker._contended_lease_first_defer_at[task_id]
+            clock.monotonic() - worker._contended_lease_first_defer_at[task_id]
             < worker.MAX_CONTENDED_LEASE_DEFER_SECS
         ), (
             'the new streak must date from THIS defer — a stamp still inside '

@@ -263,6 +263,29 @@ _STEM_SQL = (
     'SELECT metric, ts, value FROM samples WHERE metric GLOB ? ORDER BY metric, ts'
 )
 
+# The corpus TICK COUNT, counted rather than fetched. ``coverage_table`` wants
+# only how MANY ticks the corpus holds, and TICK_METRIC is written on every
+# completed tick -- ~518k rows at the 30-day steady state this script's
+# docstring cites. Reading that series to take its `len()` materialised ~518k
+# (ts, value) tuples on every run.
+#
+# WHICH runs stop paying that: the ones that do NOT select the runqueue arm --
+# the ε2 `--arm own_cpu_some_avg10` cut, and a single-PSI-arm run. ε1
+# `--arm runqueue_ratio` and the default full run still materialise the clock,
+# because the runqueue arm DECLARES TICK_METRIC as its readability series and
+# computes its coverage row from those points; those two now also pay one extra
+# index-only COUNT over the same rows. That is the deliberate price of counting
+# uniformly: the denominator stays one fact about the CORPUS rather than
+# something derived from whichever arms a run happened to select.
+#
+# Measured in this worktree against the real schema: this statement plans as
+# `SEARCH samples USING COVERING INDEX idx_samples_metric_ts (metric=?)` --
+# index-only, no table access and no temp B-tree. The series fetch it replaces
+# plans as a NON-covering `SEARCH samples USING INDEX idx_samples_metric_ts
+# (metric=?)`, because it has to read `value` off the table for every row it
+# then discards.
+_COUNT_SQL = 'SELECT COUNT(*) FROM samples WHERE metric = ?'
+
 
 def _fetch(con: sqlite3.Connection, selectors: list[str]) -> Series:
     """``{metric: [(ts, value) in ts order]}`` for every selector, one home.
@@ -281,18 +304,43 @@ def _fetch(con: sqlite3.Connection, selectors: list[str]) -> Series:
     return series
 
 
-def read_series(
-    db: Path, arm: str | None
-) -> tuple[Series, Series, list[str]]:
-    """Return the value series, the READABILITY series, and any degradations.
+class CorpusRead(NamedTuple):
+    """One read of the corpus: the values, the evidence about them, the clock.
 
-    The two are returned apart and never merged: a ``*_read_ok`` row is
+    A named record rather than a four-slot tuple because two of those slots
+    are the same type: a caller that transposed ``series`` and ``readability``
+    would be silently wrong in both directions, and ``read.ticks_in_corpus``
+    says at the call site what a fourth position does not. ``ArmSpec`` is this
+    file's existing precedent for the shape, so this adds no new idiom, and a
+    NamedTuple still unpacks positionally for a caller that prefers it.
+    """
+
+    series: Series
+    readability: Series
+    ticks_in_corpus: int
+    degradations: list[str]
+
+
+def read_series(db: Path, arm: str | None) -> CorpusRead:
+    """Read one arm's values, the readability evidence about them, and the clock.
+
+    The first two are returned apart and never merged: a ``*_read_ok`` row is
     evidence ABOUT a series, not a sample of it, so pooling them would corrupt
-    the very percentiles and hold fractions it exists to qualify. The
-    readability series always carries ``TICK_METRIC``, whichever *arm* was
-    asked for, because it is the denominator of every coverage row
-    (``coverage_table``) — an ``--arm own_cpu_some_avg10`` run needs the corpus
-    tick count as much as a full one does.
+    the very percentiles and hold fractions it exists to qualify.
+
+    ``ticks_in_corpus`` is the corpus tick count — the denominator of every
+    coverage row (``coverage_table``), which an ``--arm own_cpu_some_avg10``
+    run needs as much as a full one does. It is COUNTED, not fetched (see
+    ``_COUNT_SQL``), so the readability dict carries exactly the metrics the
+    selected arms DECLARE and nothing else: ``TICK_METRIC`` appears there for
+    the runqueue arm, which declares it, and for no other.
+
+    NO VALUE ROWS is still ``no_samples_in_window`` — the name is literally
+    true — but the readability series and the tick count are returned BESIDE
+    it rather than discarded, because they are what tells an absent sampler
+    apart from a present one that never got a reading, and those two call for
+    opposite next actions. An unreadable DATABASE still returns nothing:
+    there, nothing was read, so there is nothing to report.
 
     Opened ``file:...?mode=ro`` so a calibration run can never write to the
     live corpus. A ':' selector matches every per-cgroup leaf under that stem,
@@ -322,23 +370,27 @@ def read_series(
     try:
         con = sqlite3.connect(f'file:{db}?mode=ro', uri=True)
     except sqlite3.Error as exc:
-        return {}, {}, [f'db_unavailable: {db} ({exc})']
+        return CorpusRead({}, {}, 0, [f'db_unavailable: {db} ({exc})'])
 
     try:
         series = _fetch(con, selectors)
-        readability = _fetch(con, sorted(
-            {TICK_METRIC} | {spec.readability for spec in specs if spec.readability}
-        ))
+        readability = _fetch(
+            con, sorted({spec.readability for spec in specs if spec.readability})
+        )
+        # Same connection and same guard as the fetches, so an unreadable
+        # corpus still degrades by name instead of raising past the caller.
+        (tick_rows,) = con.execute(_COUNT_SQL, (TICK_METRIC,)).fetchone()
+        ticks_in_corpus = int(tick_rows)
     except sqlite3.Error as exc:
-        return {}, {}, [f'db_unavailable: {db} ({exc})']
+        return CorpusRead({}, {}, 0, [f'db_unavailable: {db} ({exc})'])
     finally:
         con.close()
 
     if not series:
-        return {}, {}, [
+        return CorpusRead({}, readability, ticks_in_corpus, [
             f'no_samples_in_window: no rows for {sorted(selectors)} in {db}'
-        ]
-    return series, readability, []
+        ])
+    return CorpusRead(series, readability, ticks_in_corpus, [])
 
 
 def percentile_table(
@@ -744,6 +796,35 @@ def _arm_for(metric: str, specs: list[ArmSpec]) -> str | None:
     return None
 
 
+def _value_metric_for(metric: str, specs: list[ArmSpec]) -> str | None:
+    """The VALUE series a ``*_read_ok`` metric is evidence ABOUT, or None.
+
+    The mirror image of the two lines ``coverage_table`` uses in the forward
+    direction, written against the same ArmSpec fields and the same ':'
+    partition — so the stem/non-stem rule is stated once per direction and a
+    metric reached from either side computes an identical row.
+
+    Needed because a series readable on NO tick writes no value row at all, so
+    the readability side is the only side it appears on.
+
+    The ``None`` is a BACKSTOP, not the thing that scopes an ``--arm`` run.
+    That is done on the FETCH side: ``read_series`` asks for exactly the
+    selected specs' own ``readability`` values, and ``_fetch`` issues an exact
+    match and a ``<selector>:*`` GLOB — so every key reaching here is already
+    one of those values, with or without a ':' tail, and a spec always matches.
+    None is returned only for a caller passing *specs* that disagree with the
+    ones the dict was fetched under. Widen that fetch — a blanket
+    ``{TICK_METRIC} | ...`` union again, or every readability metric at once —
+    and this filter will NOT hold the line: an ``--arm runqueue_ratio`` run
+    would start reporting ``own_cpu_some10:<leaf>`` rows.
+    """
+    stem, separator, tail = metric.partition(':')
+    for spec in specs:
+        if spec.readability == stem:
+            return f'{spec.selector}:{tail}' if separator else spec.selector
+    return None
+
+
 def hold_table(
     series: dict[str, list[tuple[int, float]]],
     specs: list[ArmSpec],
@@ -813,6 +894,8 @@ def coverage_table(
     series: Series,
     readability: Series,
     specs: list[ArmSpec],
+    *,
+    ticks_in_corpus: int,
 ) -> dict[str, Coverage | None]:
     """Per VALUE metric, the readable-tick coverage its numbers rest on.
 
@@ -822,13 +905,15 @@ def coverage_table(
     a fortnight or the 3% of it that was readable, and those are opposite
     verdicts for setting a dispatch threshold.
 
-    The fraction is readable ticks over the CORPUS tick count, ``TICK_METRIC``'s
-    row count — not over the row count of the arm's own ``*_read_ok`` metric.
-    The two agree only for a readability metric written on every tick, which
-    ``runqueue_read_ok`` is and ``own_read_ok:<leaf>`` is not: that one is
-    written only on ticks its leaf was discovered, so a leaf present for 3 days
-    of a 14-day corpus has 3 days of rows, all readable, and dividing by its
-    own row count would call that full coverage.
+    The fraction is readable ticks over *ticks_in_corpus*, the corpus tick
+    count ``read_series`` counted — not over the row count of the arm's own
+    ``*_read_ok`` metric. The two agree only for a readability metric written
+    on every tick, which ``runqueue_read_ok`` is and ``own_read_ok:<leaf>`` is
+    not: that one is written only on ticks its leaf was discovered, so a leaf
+    present for 3 days of a 14-day corpus has 3 days of rows, all readable, and
+    dividing by its own row count would call that full coverage. Taken as a
+    parameter rather than derived here, so the denominator is a fact about the
+    CORPUS and not about which arms this run happened to select.
 
     ``None`` for an arm whose collector emits no readability metric — the four
     host-PSI arms. Reporting a fabricated 1.0 there would be the same class of
@@ -836,13 +921,36 @@ def coverage_table(
 
     Keyed by the value metric so a ':' stem reports PER LEAF: one cgroup can be
     unreadable while its siblings are fine, which is exactly the case worth
-    seeing.
+    seeing. A series with READABILITY rows and no value rows gets a row too,
+    reached backwards through ``_value_metric_for`` — because the fully
+    unreadable leaf is precisely the one that writes no value row: the sampler
+    records ``own_read_ok:<leaf>`` = 0.0 on every tick it discovered the leaf
+    and nothing else. Iterating the value series alone therefore hid the exact
+    case this keying exists to expose.
     """
-    ticks_in_corpus = len(readability.get(TICK_METRIC, []))
+    # The UNION of both sides, because each carries a case the other cannot.
+    # Without the readability side, a series readable on no tick is invisible
+    # (no value rows to iterate). Without the value side, the four PSI arms
+    # vanish — they declare no readability metric, so nothing reaches them
+    # backwards, and their coverage is a reported ``None`` rather than nothing.
+    # Sorted, so the JSON payload's key order does not depend on which side a
+    # metric arrived from.
+    covered = {
+        metric for metric in series if _arm_for(metric, specs) is not None
+    } | {
+        value_metric
+        for evidence in readability
+        if (value_metric := _value_metric_for(evidence, specs)) is not None
+    }
     out: dict[str, Coverage | None] = {}
-    for metric in series:
+    for metric in sorted(covered):
         arm = _arm_for(metric, specs)
         spec = ARM_METRIC_SELECTORS[arm] if arm else None
+        # Unreachable: `covered`'s series side was filtered on `_arm_for`, and
+        # every metric on its readability side was built from a SELECTED
+        # spec's own selector, so `_arm_for` resolves that too. Kept as a
+        # backstop because the alternative to skipping is an AttributeError
+        # below -- a traceback and a non-zero rc, an infra fault to ε1/ε2.
         if spec is None:
             continue
         if spec.readability is None:
@@ -851,20 +959,22 @@ def coverage_table(
         _stem, separator, tail = metric.partition(':')
         key = f'{spec.readability}:{tail}' if separator else spec.readability
         points = readability.get(key, [])
+        rows = len(points)
         readable = sum(1 for _ts, value in points if value == 1.0)
         out[metric] = {
             'ticks_in_corpus': ticks_in_corpus,
-            'ticks_with_a_row': len(points),
+            'ticks_with_a_row': rows,
             'readable': readable,
-            # None, not 0.0, when either count is zero. No clock is an unknown
-            # denominator and no readability row is no evidence about the
-            # series; 0.0 is the claim "we looked and it was never readable",
-            # and the floor check below would then report absence of evidence
-            # as a below-floor verdict about the corpus. Same class of defect
-            # as the fabricated 1.0 refused above.
+            # None whenever the counts cannot yield a ratio anyone knows.
+            # Never 0.0: that would be the claim "we looked and it was never
+            # readable", and the floor check below would then report the
+            # absence of evidence as a verdict about the corpus — the same
+            # class of defect as the fabricated 1.0 refused above. WHICH
+            # reason the counts fail has one home, ``_unknown_cause``, which
+            # both report channels name it from.
             'readable_fraction': (
                 round(readable / ticks_in_corpus, 4)
-                if ticks_in_corpus and points else None
+                if 0 < rows <= ticks_in_corpus else None
             ),
             'readability_metric': key,
         }
@@ -878,18 +988,25 @@ def _below_floor(stats: Coverage) -> list[tuple[str, str]]:
     ratio. Presence is rows over corpus ticks: a tick with no ``*_read_ok`` row
     is a tick the series' leaf was not discovered on — a unit restarted, added,
     removed or renamed. Readability is readable ticks over the ticks the series
-    was present. A shortfall split between the two can leave both above the
-    floor while ``readable_fraction`` dips below it; that fraction is still
-    printed beside every hold ladder, but neither cause alone is a finding.
+    was present, and a ZERO numerator there is reported as its own cause rather
+    than as the extreme of that one: a series read on no tick has no hold
+    fractions to read against its coverage, which is the action
+    ``low_readability`` asks for. A shortfall split between the two can leave
+    both above the floor while ``readable_fraction`` dips below it; that
+    fraction is still printed beside every hold ladder, but neither cause alone
+    is a finding.
 
-    An unknown coverage (either count zero) has no cause to name, so it yields
-    nothing here rather than a division by zero — which would be a non-zero rc,
-    an infra fault to ε1/ε2.
+    An UNKNOWN coverage has no cause to name, whichever reason it is unknown
+    for (``_unknown_cause`` names those), so it yields nothing here rather than
+    a division by zero — which would be a non-zero rc, an infra fault to ε1/ε2.
+    One condition covers every reason: a fraction exists exactly when the
+    series has rows and no more of them than the corpus has ticks, which is
+    also exactly when both denominators below are non-zero.
     """
+    if stats['readable_fraction'] is None:
+        return []
     corpus, rows, readable = (
         stats['ticks_in_corpus'], stats['ticks_with_a_row'], stats['readable'])
-    if not corpus or not rows:
-        return []
     out = []
     if rows / corpus < D11_READABILITY_FLOOR:
         out.append((
@@ -900,7 +1017,16 @@ def _below_floor(stats: Coverage) -> list[tuple[str, str]]:
             'was not discovered), so its hold fractions describe that span, not '
             'the whole corpus',
         ))
-    if readable / rows < D11_READABILITY_FLOOR:
+    if readable == 0:
+        out.append((
+            'never_readable',
+            f'was discovered on {rows}/{corpus} corpus ticks and readable on '
+            'none of them — a tick with no readable value writes no value row, '
+            'so this series has no candidate-threshold section above; its '
+            'absence there is failed reads, not a leaf that was never '
+            'discovered',
+        ))
+    elif readable / rows < D11_READABILITY_FLOOR:
         out.append((
             'low_readability',
             f'readable on {readable}/{rows} of the ticks it was present '
@@ -910,6 +1036,55 @@ def _below_floor(stats: Coverage) -> list[tuple[str, str]]:
     return out
 
 
+def _unknown_cause(stats: Coverage) -> tuple[str, str] | None:
+    """Why a coverage has NO fraction — one ``(degradation, detail)``, or None.
+
+    ``_below_floor``'s mirror for the case where there is no ratio to judge,
+    in the same pair shape and for the same reason: the report line and the
+    degradation list both need a cause name and the same wording, and
+    recomputing the condition in each is how ``_coverage_line`` came to print
+    "a coverage needs both" for a corpus that had both (heuristic 11).
+
+    The two reasons are different findings. ``unknown_readability`` is an
+    ABSENCE — a count is zero, so the corpus carries no evidence either way,
+    which usually means the collector never ran. ``impossible_coverage`` is an
+    INVARIANT VIOLATION: a readability row is written ON a tick and
+    ``sampler/src/sampler/store.py::write_tick`` writes one whole tick in one
+    transaction, so no corpus the sampler wrote can hold more readability rows
+    than ticks. Only a hand-seeded or partly restored one can, and it says the
+    CLOCK is wrong rather than the series.
+
+    ``rows > corpus`` is checked FIRST, which decides the one corpus both
+    names would otherwise fit: a ZERO clock with readability rows present.
+    That is the violation, not the absence — a readability row is written ON
+    a tick, so N of them mean at least N ticks happened, and a clock of 0
+    contradicts them exactly as any other too-small clock does.
+    ``unknown_readability`` is reached only when ``rows == 0``.
+    """
+    if stats['readable_fraction'] is not None:
+        return None
+    corpus, rows = stats['ticks_in_corpus'], stats['ticks_with_a_row']
+    metric = stats['readability_metric']
+    if rows > corpus:
+        return (
+            'impossible_coverage',
+            f'rests on {rows} `{metric}` rows against only {corpus} '
+            f'`{TICK_METRIC}` clock rows, which cannot be true — a readability '
+            'row is written ON a tick, and the sampler writes one whole tick in '
+            'one transaction, so no corpus it wrote holds more of them than '
+            'ticks. Reported as unknown rather than as the fraction above 1 it '
+            'computes to, because the same broken clock with half the reads '
+            'failing would instead yield a plausible-looking number resting on '
+            'the very same fault',
+        )
+    return (
+        'unknown_readability',
+        f'rests on {rows} `{metric}` rows and {corpus} `{TICK_METRIC}` clock '
+        'rows, and a coverage needs both — so the hold fractions are over '
+        'readable ticks of unknown count, which is not the same as zero',
+    )
+
+
 def _coverage_line(stats: Coverage | None) -> str:
     """The report's one-line coverage verdict printed beside a hold ladder."""
     if stats is None:
@@ -917,14 +1092,10 @@ def _coverage_line(stats: Coverage | None) -> str:
             'Coverage: no readability metric for this arm, so the hold '
             'fractions below are over readable ticks of unknown count.'
         )
-    if stats['readable_fraction'] is None:
-        return (
-            f"Coverage: UNKNOWN — the corpus holds {stats['ticks_with_a_row']} "
-            f"`{stats['readability_metric']}` rows and {stats['ticks_in_corpus']} "
-            f'`{TICK_METRIC}` clock rows, and a coverage needs both, so the '
-            'hold fractions below are over readable ticks of unknown count. '
-            'See degradations.'
-        )
+    unknown = _unknown_cause(stats)
+    if unknown is not None:
+        _cause, detail = unknown
+        return f'Coverage: UNKNOWN — {detail}. See degradations.'
     causes = [cause for cause, _detail in _below_floor(stats)]
     return (
         f"Coverage: readable on {stats['readable']}/{stats['ticks_in_corpus']} "
@@ -940,30 +1111,28 @@ def readability_degradations(
 ) -> list[str]:
     """Name each series whose coverage is below the floor, or NOT KNOWN.
 
-    Three separate degradations, because they call for three different operator
+    Five separate degradations, because they call for five different operator
     readings: ``low_readability`` says the collector ran on the series and often
     failed, so read the hold fractions against that coverage;
-    ``partial_presence`` says the series existed for only part of the corpus,
+    ``never_readable`` says it failed EVERY time, so there are no hold
+    fractions to read at all and the series has no candidate-threshold section
+    above to read them in; ``partial_presence`` says the series existed for
+    only part of the corpus,
     so its hold fractions describe that span, not the whole window; and
     ``unknown_readability`` says the corpus carries no evidence either way,
-    which usually means the collector never ran at all. Folding any one into
-    another sends an operator hunting a flaky read that never happened.
+    which usually means the collector never ran at all; and
+    ``impossible_coverage`` says the corpus holds more readability rows than
+    ticks, which no corpus the sampler wrote can, so the CLOCK is what needs
+    looking at and not the series. Folding any one into another sends an
+    operator hunting a flaky read that never happened.
     """
     out = []
     for metric, stats in sorted(coverage.items()):
         if stats is None:
             continue
-        if stats['readable_fraction'] is None:
-            out.append(
-                f"unknown_readability: {metric} coverage is unknown — not zero: "
-                f"the corpus holds {stats['ticks_with_a_row']} "
-                f"{stats['readability_metric']} rows and "
-                f"{stats['ticks_in_corpus']} {TICK_METRIC} clock rows, and a "
-                'coverage needs both. Its hold fractions below are over '
-                'readable ticks of unknown count.'
-            )
-            continue
-        out += [f'{cause}: {metric} {detail}' for cause, detail in _below_floor(stats)]
+        unknown = _unknown_cause(stats)
+        causes = [unknown] if unknown is not None else _below_floor(stats)
+        out += [f'{cause}: {metric} {detail}' for cause, detail in causes]
     return out
 
 
@@ -1071,14 +1240,17 @@ def main(argv: list[str] | None = None) -> int:
     now = datetime.now(UTC)
     stamp = now.strftime('%Y-%m-%d')
 
-    series, readability, degradations = read_series(args.db, args.arm)
+    corpus = read_series(args.db, args.arm)
+    series = corpus.series
+    degradations = list(corpus.degradations)
     specs = (
         [ARM_METRIC_SELECTORS[args.arm]] if args.arm
         else list(ARM_METRIC_SELECTORS.values())
     )
     percentiles = percentile_table({m: [v for _, v in pts] for m, pts in series.items()})
     holds = hold_table(series, specs)
-    coverage = coverage_table(series, readability, specs)
+    coverage = coverage_table(
+        series, corpus.readability, specs, ticks_in_corpus=corpus.ticks_in_corpus)
     degradations += readability_degradations(coverage)
     local_block, local_degradations = load_psi_admission_block(args.config, 'local')
     peer_block, peer_degradations = load_psi_admission_block(args.peer_config, 'peer')

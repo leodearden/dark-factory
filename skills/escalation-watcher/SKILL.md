@@ -462,13 +462,22 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   (Observed with `esc-5914-1`, where both queues surfaced the same reify gate; that duplicate
   landing on one id is the *correct* outcome — one question, one cockpit row — but only if the
   second filer doesn't degrade the first one's record.)
-  Two deliberate limits: a re-file from the **same** queue is still a plain idempotent whole-file
-  overwrite — that is the restart promise above, and you are the sole authority on your own
-  escalation — and only an `open` record is protected, since a filing against an `answered` one is
-  a new ask rather than an enrichment of a live question. Even that same-queue overwrite holds
-  `filed_at` and `manual_boost` back, though: queue age and the operator's cockpit boost are never
-  yours to revise, so your restart cannot bump a row to the top of the age ordering or silently
-  drop a boost an operator set between your two filings.
+  Two deliberate limits, both drawn on the **queue** axis. A re-file from the **same** queue is
+  still a plain idempotent whole-file overwrite of everything that is *yours* — text, severity and
+  the task/session/escalation ids all land verbatim, downgrades and emptied fields included,
+  because that is the restart promise above and you are the sole authority on your own escalation.
+  What it does **not** touch is the record's custody: `filed_at`, `manual_boost` **and `state`**
+  stay with the record, at **any** state (task 3872). So your restart cannot bump a row to the top
+  of the age ordering, cannot drop a boost an operator set between your two filings, and cannot
+  **re-open a row an operator already answered or dropped** — within one queue an
+  `esc-<taskid>-<n>` id is unique, so your re-file is the same gate the human already dealt with
+  rather than a new ask. (Unique, but not *absolutely*: an id can be re-minted inside one queue
+  after a lost sequence counter, which is precisely why the hold is announced with a `WARNING` for
+  you to adjudicate rather than applied silently — see below.) Across queues those id namespaces
+  genuinely collide, so the second
+  limit is that a filing from a **different** queue against a closed record is still a plain
+  overwrite that re-opens it: there it may truly be an unrelated new question, and holding it
+  closed would hide a live gate instead of surfacing it.
 
   **Across *projects*, a shared id is a collision, not a shared gate.** Decision ids are
   fleet-global while `esc-<taskid>-<n>` numbering restarts per project, so `esc-42-1` under two
@@ -492,11 +501,16 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
     merges spellings that differ only by case or separator; only an entry in
     `PROJECT_TOKEN_ALIASES` can bridge a project whose filed decisions fold to something *other*
     than its declared `memory.project_id`, and today `df → dark_factory` is the only such entry.
-    **solar-challenge is the known open case**: its config declares `my_solar_challenge`, but its
-    decisions are filed under `solar-challenge`/`solar_challenge` (which fold together, but not
-    onto `my_solar_challenge`), so reaping it with the declared token matches **zero** rows —
-    pass `solar_challenge` there until the alias decision (task 3813) lands. To check your own
-    project, list the tokens its rows actually carry:
+    **solar-challenge is the known standing case**: its config declares `my_solar_challenge`, but
+    its decisions are filed under `solar-challenge`/`solar_challenge` (which fold together, but
+    not onto `my_solar_challenge`), so reaping it with the declared token matches **zero** rows —
+    pass `solar_challenge` there. That guidance is **permanent, not provisional**: task 3813
+    decided the alias question and **declined** it (the fold left no split to heal, and the
+    identity question is an open human gate in that project marked "Do NOT auto-act"), recording
+    the evidence in `PROJECT_TOKEN_ALIASES_DECLINED`. You no longer have to remember this
+    unaided — `write-decision` and `reap-decisions` both **warn** if you pass
+    `my_solar_challenge`, so the mismatch announces itself instead of returning a silent
+    zero-row no-op. To check your own project, list the tokens its rows actually carry:
     ```bash
     python3 -c "import json,glob,collections;print(collections.Counter(json.load(open(f))['project'] for f in glob.glob('$HOME/.claude/fleet/decisions/*.json')))"
     ```
@@ -530,9 +544,19 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   once. It is **not** a respelling of the queue-less `''` state: `''` means *nobody told us* and
   falls back to project-only scoping, while `<unknown>` means *we looked and could not tell* and
   the reaper refuses to close it at all.
-- The verb always files `state=open` and prints the filed id on success for your own cross-link
-  (e.g. into the digest line). It is fail-soft — a registry fault is logged and swallowed, never
-  raised, so filing a decision can never crash the watch loop or block the park itself.
+- The verb files `state=open` for a **new** record, but it never re-opens a row an operator already
+  answered or dropped when you re-file from your own queue (task 3872). What you will *see*: the
+  filed id still comes back on stdout — that signal is unchanged, and your filing did land, since
+  your text/severity/ids were written — plus a `WARNING` on stderr naming the state it held. That
+  warning means a human dealt with this gate while it sat parked, so **adjudicate** it rather than
+  re-filing blindly on your next restart. If the ask is genuinely new, **file it under a new id** —
+  that is the remedy with a shipped surface. Re-opening the row *in place* currently needs a direct
+  registry write: the cockpit's decision pane offers a drop action but no re-open, and there is no
+  `update-decision-state` CLI verb — so ask an operator for that only when a new id genuinely will
+  not do. Either way, do not try to force the row open by re-filing.
+- The verb prints the filed id on success for your own cross-link (e.g. into the digest line). It
+  is fail-soft — a registry fault is logged and swallowed, never raised, so filing a decision can
+  never crash the watch loop or block the park itself.
 
 This is additive at every "leave pending" / "tell the human" / "park" moment below — do the
 existing action exactly as documented, and also run `write-decision` once per parked item.
@@ -1341,6 +1365,17 @@ record's own pending status. If a probe fires, the ask flips from "human must de
 must ratify and propagate": recover the ruling, present it for ratification, and propagate it into
 the record via amendment. This applies equally to `risk_identified` parks below.
 
+<!-- scope-not-delivered:begin the two closure forms and the worked example live in the policy
+     document named below and are deliberately NOT copied here: that document is their authority,
+     exactly as this skill is the authority for the six conditions it declines to copy back. Held
+     by tests/scripts/test_shadow_ruling_doc_contract.py. -->
+**A `scope-not-delivered` record closes only two ways.** That is a record stating that ONE ITEM of
+a task's scope was not deliverable by that task; it closes only by one of the two closure forms in
+`docs/escalation-standing-policy.md`, never by a bare accept. That policy is IN FORCE now (Leo,
+2026-09-21, esc-4811-3) — not one of the shadow-mode candidate classes further down this file —
+and it grants no one authority to close such a record.
+<!-- scope-not-delivered:end -->
+
 #### Standing rule: accept verified info-level design deviations (Leo, 2026-09-17)
 
 The watcher may close a `design_concern` itself, without parking it, **only when ALL of these
@@ -1390,6 +1425,8 @@ human can revoke this rule at any time.
 - **Excluded: esc-4811-3.** "Fixture expansion (plan item 4) is not deliverable" is a *scope item
   not delivered*, bearing on a reason behind the human's write_triage HOLD. That fails condition 6
   even though it is info-level and well-evidenced, and its task was blocked on it (condition 4).
+  It is a `scope-not-delivered` record, so how it may be closed is governed by the closure policy
+  above rather than by this rule.
 
 ### `risk_identified` (info)
 
@@ -1470,6 +1507,126 @@ Infrastructure problems — database connectivity, MCP failures, service outages
 `recon_failure`, `recon_backlog_overflow`, `recon_stale_run`, `recon_integrity_issue` — these are all fused-memory reconciliation problems.
 
 Reconciliation is infrastructure that affects memory quality across the entire system. **Tell the human** with full details. Track as a todo. These may indicate systematic issues that need root-cause investigation rather than point fixes. Also file a DecisionRecord via `write-decision` (see "Filing Parked Decisions to the Cockpit Registry" above).
+
+## Shadow-mode standing-policy rulings (measurement only)
+
+`docs/escalation-standing-policy.md` proposes classes of L2 that an adjudicating session could one
+day rule without waiting for the human. **None of them is adopted.** This section adds one thing to
+your loop and it is not an action: for an L2 you *would* rule under that policy, record what you
+would have ruled, then **handle the record exactly as its category section above says** — which for
+`risk_identified` and `design_concern` still means escalating to the human and filing the cockpit
+DecisionRecord. The stamp changes nothing about what you do.
+
+### Never stamp a record you are going to rule yourself
+
+This rule comes before the mechanics because skimming past it is how the measurement goes bad.
+
+A `design_concern` you close under "Standing rule: accept verified info-level design deviations
+(Leo, 2026-09-17)" above gets **no shadow stamp**. You are the adjudicator there, so there is no
+independent decision to compare your proposal against.
+
+The reason, in one line you can check: the weekly count reads `resolved_by` back through
+`escalation/src/escalation/classify.py::classify_resolver_tier`, where `escalation-watcher`
+classifies as `human` — exactly like a Leo ruling. A stamp plus a self-close is therefore the
+session agreeing with itself, and it would push a class toward its own adoption threshold on the
+strength of your own actions.
+
+The count does catch it: such a record is bucketed `self_resolved` and dropped from every rate. So a
+violation costs the sample, not the truth — but it still costs the sample.
+
+### Stamping
+
+Write the proposal as one `x_shadow_ruling:` line inside `triage_note`:
+
+```text
+x_shadow_ruling: {"class": "risk_identified_branch_behind_main", "proposed_action": "close_only", "evidence": "git merge-base --is-ancestor main task/4821 -> rc=0; branch is not behind", "confidence": 0.9}
+```
+
+Call it as `stamp_triage(escalation_id=..., triaged_by=..., triage_note=...)`. The `class` must be
+one of the first-tranche slugs and `proposed_action` one of the reversible-action slugs, both
+enumerated in `docs/escalation-standing-policy.md`. `evidence` quotes the deciding probe output
+verbatim — not a conclusion about it. `confidence` is in `[0.0, 1.0]`.
+
+A payload outside those vocabularies is discarded by the reader, so it is a lost sample rather than
+a loud error. This one is thrown away:
+
+```text <!-- shadow-guard: negative -->
+x_shadow_ruling: {"class": "risk_identified_branch_behind_main", "proposed_action": "restart", "evidence": "looks fine", "confidence": 0.9}
+```
+
+`restart` is a C1 action but it is not *reversible*, so it is not in the reversible-action list and
+the whole payload is dropped.
+
+### CAUTION: `stamp_triage` REPLACES `triage_note`, it never appends
+
+Verified in `escalation/src/escalation/queue.py::stamp_triage`: passing a non-empty `triage_note`
+overwrites the existing one wholesale.
+
+So on an **already-triaged** record you must re-send the previous note's content with the
+`x_shadow_ruling:` line appended on its own line. Send the marker alone and you destroy the earlier
+predicate and probe. (Omitting `triage_note` entirely is the safe freshness-bump form — it leaves
+the existing note untouched.)
+
+Re-stamping therefore leaves the note carrying **two** marker lines, which is expected and safe:
+the weekly count reads the **last** one as the record's ruling and treats the earlier lines as
+superseded. Append the new marker below the old one rather than editing the old one in place — and
+if the newest line is malformed the record is counted in `rejected_stamps`, never scored against
+the stale proposal above it.
+
+The marker goes on its **own line** of a note that still satisfies the freshness contract in
+"Reading a triage-ack annotation" above: a named world-facing predicate plus the probe used to check
+it. A shadow stamp is not a substitute for that predicate — and per that same subsection, a
+predicate about the record's own status is vacuous. A well-formed stamped note looks like:
+
+```text
+task-4821 branch tip not behind main | probe: git merge-base --is-ancestor main task/4821 -> rc=0
+x_shadow_ruling: {"class": "risk_identified_branch_behind_main", "proposed_action": "close_only", "evidence": "git merge-base --is-ancestor main task/4821 -> rc=0; branch is not behind", "confidence": 0.9}
+```
+
+### Never stamp a human-forever gate
+
+`docs/escalation-standing-policy.md` lists all seven. Two are detectable from the record itself and
+`escalation/src/escalation/shadow_ruling.py::mechanically_gated` finds them: a `milestone_gate`
+category and the `orchestrator-deterministic` role. The other five — model admission, physical
+operator actions, irreversible deletions, spend or eval launches, and a post-breaker
+`resume_scheduler` — have no signal on the record, so they are your judgement. A stamp on any of
+them is reported as `gated_stamps` and excluded from every rate.
+
+### Two facts about attribution and timing
+
+**Attribution here is a convention, not a guarantee.**
+`escalation/src/escalation/server.py::stamp_triage` overrides `triaged_by` from the
+`X-Escalation-Identity` header **only when that header is present**. The auto-watcher sends one, so
+for it the attribution is server-enforced; this session does not, so `triaged_by` is whatever you
+pass. This NARROWS the general statement in "Reading a triage-ack annotation" above for your own
+stamps. Therefore: **pass the same identity string you resolve with**, or `triaged_by` and
+`resolved_by` never compare and the `self_resolved` check silently never fires.
+
+**Stamp before the record is resolved.** `stamp_triage` refuses anything that is not `pending`, so a
+stamp written after the close is simply not written.
+
+### The weekly count
+
+```
+uv run --directory escalation python -m escalation.shadow_ruling \
+    --queue-dir <project_root>/data/escalations
+```
+
+Read it as: `agreed` / `diverged` over the **comparable** denominator printed beside the rate;
+`not_comparable` for proposals whose action is task-side and leaves no `resolution_action` to check
+against; `non_human_resolver` for a record no human resolved at all — a cascade, a sweep, the
+steward — counted per class, because the aggregate `resolver_tiers` line says only which tier took
+the sample; `gated_stamps`, `self_resolved` and `rejected_stamps` for stamps excluded from every rate
+— those three are counted over the same window as the rate. A class whose records are mostly
+`self_resolved` is not a class with a small sample — it is not measurable yet, and a non-zero
+`rejected_stamps` means the count could not read that many markers at all.
+
+`unresolved_lifetime` is the exception and says so in its name: a pending record has no
+`resolved_at` to window on, so that number is the standing backlog at sweep time, not a count from
+the window in the header.
+
+A class adopts only when task 3346 has landed **and** it has met the threshold in
+`docs/escalation-standing-policy.md`. Until both hold, keep stamping and keep escalating.
 
 ## Context Conservation
 

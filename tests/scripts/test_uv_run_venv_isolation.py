@@ -70,6 +70,7 @@ _EXPECTED_UV_RUN_UNITS = frozenset(
         "scripts/dashboard.service.template",
         "scripts/fused-memory.service.template",
         "scripts/legibility-transcript-check@.service",
+        "scripts/legibility-trickle-health@.service",
         "scripts/legibility-trickle@.service",
         "scripts/local-model-serving/lms-arm@.service",
         "scripts/orchestrator-autopilot-video.service",

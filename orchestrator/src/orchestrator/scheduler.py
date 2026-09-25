@@ -11,13 +11,14 @@ import random
 import re
 import time
 from collections import deque
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, MutableSet, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, overload, runtime_checkable
 
 from shared import safe_io
+from shared.capability_manifest import CHECK_SUBJECT_FIELD
 from shared.cli_invoke import is_server_error_status
 from shared.locking import (
     files_to_modules,
@@ -42,6 +43,7 @@ from orchestrator.config import (
 from orchestrator.delivered_checks import DeliveredCheckResult, run_delivered_check
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.fm_retry import fm_retry_backoffs
+from orchestrator.guard_state import PersistentSet, guard_path
 from orchestrator.hold_history import HoldHistory
 from orchestrator.mcp_lifecycle import mcp_call
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
@@ -63,6 +65,13 @@ from orchestrator.recovery_emission import (
 from orchestrator.recovery_pins import records_pin_blocked_recovery
 from orchestrator.streaks import StreakCounter, StreakRegistry
 from orchestrator.task_status import ACTIVE_TASK_STATUSES, TERMINAL_STATUSES
+
+# How long a task is remembered as having been non-pending (task 5352).  An
+# upper bound on the subject, not a tuning dial: thirty days is the horizon
+# over which a resurrected task could still be pending and still be claiming
+# an age bonus it did not earn.  The longest of the four guard TTLs because
+# its subject is the longest-lived.
+_RESURRECTION_GUARD_TTL = timedelta(days=30)
 
 if TYPE_CHECKING:
     # Task 2408 mechanism 2: the scheduler only ever calls read-only methods
@@ -716,7 +725,9 @@ def _build_delivered_check_escalation(
     site (:meth:`Scheduler._compute_delivered_check_cache`) rather than
     passed in from delta's minimal per-tick ``fail_detail_by_dep`` shape,
     so the escalation can name the pattern/script/args/paths/expect that
-    delta's dispatch-gate cache does not persist.
+    delta's dispatch-gate cache does not persist. The per-kind subject
+    field comes from ``shared.capability_manifest.CHECK_SUBJECT_FIELD``,
+    so a new check kind never renders a field its descriptor lacks.
 
     Pure rendering — no side effects, no scheduler state.
     """
@@ -731,11 +742,16 @@ def _build_delivered_check_escalation(
         f'Delivered check {name!r} (kind={kind}) failed against main@{sha12}.',
         f'Dependency: task {dep_id} (status={dep_status}).',
     ]
+    # Name the field the descriptor ACTUALLY has. The former grep/script
+    # binary emitted a bare `pattern: None` for any third kind, into a body
+    # that routes straight to a human.
+    subject_field = CHECK_SUBJECT_FIELD.get(kind or '', 'pattern')
+    if subject_field != 'paths':
+        # kind='path' is its own subject, and `paths:` is already emitted
+        # unconditionally below — printing it twice would be its own defect.
+        lines.append(f'{subject_field}: {check.get(subject_field)}')
     if kind == 'script':
-        lines.append(f'script: {check.get("script")}')
         lines.append(f'args: {check.get("args", [])}')
-    else:
-        lines.append(f'pattern: {check.get("pattern")}')
     lines.append(f'paths: {check.get("paths", [])}')
     lines.append(f'expect: {check.get("expect")}')
     lines.append('observed: FAILED')
@@ -2136,7 +2152,22 @@ class Scheduler:
         # non-pending status so a cancelled->pending resurrection starts
         # fresh (no accumulated age).
         self._pending_anchor: dict[str, int] = {}
-        self._was_non_pending: set[str] = set()
+        # The mark that makes that resurrection reset stick.  Restart-durable
+        # since task 5352: held in memory, it was cleared by the ~8-15h fleet
+        # redeploy, so a resurrected task re-anchored to its own (low) numeric
+        # id and collected its full accumulated age bonus again — once per
+        # redeploy, at the expense of the genuinely-old pending tasks the
+        # starvation watchdog is there to protect.  It decays after
+        # _RESURRECTION_GUARD_TTL, so the mark cannot outlive its subject.
+        #
+        # NOT the state-snapshot path: scheduler_state.json is a throttled,
+        # content-deduped, write-only OBSERVABILITY artifact that is never read
+        # back as authoritative state, and overloading it would make a
+        # dashboard file load-bearing for dispatch fairness.
+        self._was_non_pending: MutableSet[str] = PersistentSet(
+            guard_path(self._project_root, 'scheduler_was_non_pending.json'),
+            ttl=_RESURRECTION_GUARD_TTL,
+        )
         # Effective-priority cache: populated at the end of each acquire_next tick
         # so get_state_snapshot() can include it without re-fetching tasks.
         # Empty dict before the first tick.
@@ -5404,7 +5435,18 @@ class Scheduler:
           non-pending, anchor to *current max_id* (resurrection resets age).
         - On any non-pending observation, drop the anchor and mark the task
           as ever-non-pending so the next pending appearance is a fresh start.
+
+        That last mark survives a restart (task 5352), so a resurrection resets
+        age ONCE rather than once per fleet redeploy.  The marks are collected
+        here and recorded in a single batch after the loop: this method
+        re-observes every non-pending task on every ~15s tick, and a cold start
+        seeing N of them would otherwise perform N writes of an N-entry file.
+        Batching is safe by construction — a task has exactly one status, so
+        the branch that WRITES a mark (non-pending) and the branch that READS
+        one (pending) are mutually exclusive within a single call, and no id can
+        be both.
         """
+        newly_non_pending: set[str] = set()
         for t in tasks:
             tid = str(t.get('id', ''))
             if not tid:
@@ -5413,7 +5455,7 @@ class Scheduler:
             if status != 'pending':
                 self._pending_anchor.pop(tid, None)
                 if status:
-                    self._was_non_pending.add(tid)
+                    newly_non_pending.add(tid)
                 continue
             if tid in self._pending_anchor:
                 continue
@@ -5425,6 +5467,7 @@ class Scheduler:
                 self._pending_anchor[tid] = int(tid)
             else:
                 self._pending_anchor[tid] = max_id
+        self._was_non_pending |= newly_non_pending
 
     def _compute_score(
         self,
@@ -6231,6 +6274,7 @@ class Scheduler:
         """
         stale_ids: set[str] = set()
         terminal_ids: set[str] = set()
+        newly_non_pending: set[str] = set()
         all_tracked: set[str] = (
             set(self._last_dispatch_at)
             | set(self._skip_count)
@@ -6246,8 +6290,11 @@ class Scheduler:
                 self._skip_count.pop(tid_str, None)
                 self._module_cache.pop(tid_str, None)
                 self._pending_anchor.pop(tid_str, None)
-                self._was_non_pending.add(tid_str)
+                newly_non_pending.add(tid_str)
                 stale_ids.add(tid_str)
+        # Recorded in one batch, for the same reason as _update_age_anchors:
+        # this sweep re-observes the same terminal ids on every tick.
+        self._was_non_pending |= newly_non_pending
         starvation_non_eligible = {
             tid for tid in self._starvation_escalated
             if ctx.status_map.get(tid) in _STARVATION_NON_ELIGIBLE

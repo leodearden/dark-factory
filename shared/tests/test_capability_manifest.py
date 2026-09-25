@@ -12,8 +12,9 @@ convention (see plans/capability-delivered-checks-prd.md §Contract):
     checked-in sidecar (not just the one committed exemplar TestLoader
     covers), built on the sibling test-support module
     shared/tests/capability_manifest_corpus.py (task 3362).
-  - TestDeliveredCheckMeta / TestMetadataRegistration: the
-    metadata.delivered_checks registered sub-model.
+  - TestDeliveredCheckMeta / TestMechanicalCheckKinds / TestMetadataRegistration:
+    the metadata.delivered_checks registered sub-model and the derived
+    MECHANICAL_CHECK_KINDS vocabulary its consumers import.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from __future__ import annotations
 import re
 import subprocess
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, get_args
 
 import pytest
 import yaml
@@ -39,8 +40,11 @@ from capability_manifest_corpus import (
 )
 from pydantic import BaseModel, ValidationError
 
+import shared.capability_manifest as capability_manifest_module
 import shared.task_metadata as task_metadata_module
 from shared.capability_manifest import (
+    CHECK_SUBJECT_FIELD,
+    MECHANICAL_CHECK_KINDS,
     CapabilityManifestDoc,
     DeliveredCheck,
     DeliveredCheckMeta,
@@ -96,6 +100,27 @@ class TestDeliveredCheck:
     def test_manual_check_with_reason_constructs(self):
         check = DeliveredCheck(kind='manual', reason='judged by test fixtures')
         assert check.reason == 'judged by test fixtures'
+
+    def test_path_check_present_constructs(self):
+        check = DeliveredCheck(
+            kind='path', expect='present', paths=['orchestrator/tests/test_x.py']
+        )
+        assert check.kind == 'path'
+        assert check.expect == 'present'
+        assert check.paths == ['orchestrator/tests/test_x.py']
+        assert check.pattern is None
+        assert check.script is None
+
+    def test_path_check_absent_constructs(self):
+        check = DeliveredCheck(kind='path', expect='absent', paths=['legacy/dead_module.py'])
+        assert check.expect == 'absent'
+        assert check.paths == ['legacy/dead_module.py']
+
+    def test_path_check_with_several_paths_constructs(self):
+        check = DeliveredCheck(
+            kind='path', expect='present', paths=['a/one.py', 'b/two.py', 'c/three.py']
+        )
+        assert check.paths == ['a/one.py', 'b/two.py', 'c/three.py']
 
     @pytest.mark.parametrize(
         'kwargs',
@@ -185,6 +210,55 @@ class TestDeliveredCheck:
                 },
                 id='script_with_reason',
             ),
+            pytest.param({'kind': 'path', 'paths': ['a/one.py']}, id='path_missing_expect'),
+            pytest.param({'kind': 'path', 'expect': 'present'}, id='path_missing_paths'),
+            pytest.param(
+                {'kind': 'path', 'expect': 'present', 'paths': []}, id='path_empty_paths'
+            ),
+            pytest.param(
+                {'kind': 'path', 'expect': 'sideways', 'paths': ['a/one.py']},
+                id='path_expect_not_in_vocab',
+            ),
+            pytest.param(
+                {'kind': 'path', 'expect': 'present', 'paths': ['a/one.py'], 'pattern': 'foo'},
+                id='path_with_pattern',
+            ),
+            pytest.param(
+                {
+                    'kind': 'path',
+                    'expect': 'present',
+                    'paths': ['a/one.py'],
+                    'script': 'scripts/x.sh',
+                },
+                id='path_with_script',
+            ),
+            pytest.param(
+                {
+                    'kind': 'path',
+                    'expect': 'present',
+                    'paths': ['a/one.py'],
+                    'args': ['--flag'],
+                },
+                id='path_with_args',
+            ),
+            pytest.param(
+                {
+                    'kind': 'path',
+                    'expect': 'present',
+                    'paths': ['a/one.py'],
+                    'timeout_secs': 30,
+                },
+                id='path_with_timeout_secs',
+            ),
+            pytest.param(
+                {
+                    'kind': 'path',
+                    'expect': 'present',
+                    'paths': ['a/one.py'],
+                    'reason': 'nope',
+                },
+                id='path_with_reason',
+            ),
         ],
     )
     def test_invalid_specs_rejected(self, kwargs):
@@ -217,6 +291,98 @@ class TestDeliveredCheck:
         message = str(exc_info.value)
         assert 'grep' in message
         assert 'reason' in message
+
+    def test_error_names_kind_and_field_for_path_missing_paths(self):
+        with pytest.raises(ValidationError) as exc_info:
+            DeliveredCheck(kind='path', expect='present')
+        message = str(exc_info.value)
+        assert 'path' in message
+        assert 'paths' in message
+
+    def test_error_names_kind_and_field_for_path_with_pattern(self):
+        # A path check asserts existence, never content: naming `pattern`
+        # alongside kind='path' is the exact grep/path confusion this kind
+        # exists to prevent, so the rejection must name both.
+        with pytest.raises(ValidationError) as exc_info:
+            DeliveredCheck(kind='path', expect='present', paths=['a/one.py'], pattern='foo')
+        message = str(exc_info.value)
+        assert 'path' in message
+        assert 'pattern' in message
+
+
+class TestPathCheckHygiene:
+    """kind='path' entries must be repo-relative, non-empty, and '..'-free.
+
+    Stricter than kind='grep' on the SAME field, and deliberately so: for
+    grep, `paths` merely NARROWS a search, so a bad entry degrades to a
+    wider-or-empty scope. For kind='path' the entry IS the assertion, and
+    a pathspec git cannot resolve inside the repository exits 128, which
+    the runner maps to ERRORED — a fail-safe wait with no streak bump and
+    no escalation, i.e. a SILENT INDEFINITE HOLD on every dependent. One
+    typo'd leading slash would wedge a dependent forever while emitting
+    nothing a human would ever see, so the descriptor is refused loudly at
+    authoring time instead.
+    """
+
+    @pytest.mark.parametrize(
+        'bad_path',
+        [
+            pytest.param('/etc/passwd', id='absolute'),
+            pytest.param('/orchestrator/tests/test_x.py', id='absolute_repo_shaped'),
+            pytest.param('../outside.py', id='parent_segment_leading'),
+            pytest.param('orchestrator/../../outside.py', id='parent_segment_interior'),
+            pytest.param('', id='empty'),
+            pytest.param('   ', id='whitespace_only'),
+        ],
+    )
+    def test_delivered_check_rejects_bad_path(self, bad_path):
+        with pytest.raises(ValidationError) as exc_info:
+            DeliveredCheck(kind='path', expect='present', paths=[bad_path])
+        assert repr(bad_path) in str(exc_info.value)
+
+    @pytest.mark.parametrize(
+        'bad_path',
+        [
+            pytest.param('/etc/passwd', id='absolute'),
+            pytest.param('../outside.py', id='parent_segment_leading'),
+            pytest.param('', id='empty'),
+        ],
+    )
+    def test_delivered_check_meta_rejects_bad_path(self, bad_path):
+        with pytest.raises(ValidationError) as exc_info:
+            DeliveredCheckMeta(name='cap-one', kind='path', expect='present', paths=[bad_path])
+        assert repr(bad_path) in str(exc_info.value)
+
+    def test_bad_entry_alongside_good_entries_is_still_rejected(self):
+        with pytest.raises(ValidationError) as exc_info:
+            DeliveredCheck(
+                kind='path', expect='present', paths=['a/one.py', '/etc/passwd', 'b/two.py']
+            )
+        assert repr('/etc/passwd') in str(exc_info.value)
+
+    @pytest.mark.parametrize(
+        'good_path',
+        [
+            pytest.param(
+                'orchestrator/tests/test_workflow_merge_gating_strand.py', id='nested_file'
+            ),
+            pytest.param('README.md', id='repo_root_file'),
+            pytest.param('shared/src/shared/', id='trailing_slash_directory'),
+            pytest.param('scripts/audit_combine_gate_marker_loss.py', id='script_path'),
+        ],
+    )
+    def test_ordinary_repo_relative_paths_are_still_accepted(self, good_path):
+        # Positive control: the rule must not be satisfiable by rejecting
+        # everything.
+        check = DeliveredCheck(kind='path', expect='present', paths=[good_path])
+        assert check.paths == [good_path]
+
+    def test_grep_paths_are_not_subject_to_the_stricter_rule(self):
+        # The asymmetry is the point: for grep, `paths` only narrows a
+        # search, so it keeps its existing (unvalidated) latitude.
+        check = DeliveredCheck(kind='grep', pattern='foo', expect='present', paths=['../x/'])
+        assert check.paths == ['../x/']
+
 
 
 class TestManifestCapability:
@@ -799,8 +965,8 @@ tasks:
         ]
 
     def test_only_script_kind_is_extracted(self, tmp_path):
-        # grep / manual / a capability with NO delivered_check at all must
-        # neither be mistaken for a script check nor raise on the missing
+        # grep / path / manual / a capability with NO delivered_check at all
+        # must neither be mistaken for a script check nor raise on the missing
         # `delivered_check`.
         sidecar = self._write(
             tmp_path,
@@ -831,6 +997,14 @@ tasks:
         delivered_check:
           kind: manual
           reason: "covered by E8"
+      - name: "cap-path"
+        binding: "b"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          expect: present
+          paths:
+            - orchestrator/tests/test_x.py
       - name: "cap-unchecked"
         binding: "b"
         verdict: PASS
@@ -1465,9 +1639,56 @@ class TestDeliveredCheckMeta:
         assert check.script == 'scripts/x.sh'
         assert check.timeout_secs == 30
 
+    def test_path_entry_with_name_constructs(self):
+        check = DeliveredCheckMeta(
+            name='cap-three',
+            kind='path',
+            expect='present',
+            paths=['orchestrator/tests/test_x.py'],
+        )
+        assert check.name == 'cap-three'
+        assert check.kind == 'path'
+        assert check.expect == 'present'
+        assert check.paths == ['orchestrator/tests/test_x.py']
+
+    def test_path_entry_absent_constructs(self):
+        check = DeliveredCheckMeta(
+            name='cap-four', kind='path', expect='absent', paths=['legacy/dead.py']
+        )
+        assert check.expect == 'absent'
+
     def test_manual_kind_rejected(self):
         with pytest.raises(ValidationError):
             DeliveredCheckMeta(name='cap-one', kind='manual')  # type: ignore[arg-type]
+
+    def test_path_missing_expect_rejected(self):
+        with pytest.raises(ValidationError):
+            DeliveredCheckMeta(name='cap-one', kind='path', paths=['a/one.py'])
+
+    def test_path_missing_paths_rejected(self):
+        with pytest.raises(ValidationError):
+            DeliveredCheckMeta(name='cap-one', kind='path', expect='present')
+
+    def test_path_empty_paths_rejected(self):
+        with pytest.raises(ValidationError):
+            DeliveredCheckMeta(name='cap-one', kind='path', expect='present', paths=[])
+
+    def test_path_with_script_field_rejected(self):
+        with pytest.raises(ValidationError):
+            DeliveredCheckMeta(
+                name='cap-one',
+                kind='path',
+                expect='present',
+                paths=['a/one.py'],
+                script='scripts/x.sh',
+            )
+
+    def test_path_error_names_deliveredcheckmeta_and_the_field(self):
+        with pytest.raises(ValidationError) as exc_info:
+            DeliveredCheckMeta(name='cap-one', kind='path', expect='present')
+        message = str(exc_info.value)
+        assert 'DeliveredCheckMeta' in message
+        assert 'paths' in message
 
     def test_missing_name_rejected(self):
         with pytest.raises(ValidationError):
@@ -1514,6 +1735,60 @@ class TestDeliveredCheckMeta:
             DeliveredCheckMeta(name='cap-one', kind='grep', expect='present')
         message = str(exc_info.value)
         assert 'DeliveredCheckMeta: pattern is required' in message
+
+
+class TestMechanicalCheckKinds:
+    """MECHANICAL_CHECK_KINDS — the one place "mechanical" is defined.
+
+    Mechanical is not an independent concept that happens to coincide with
+    DeliveredCheckMeta's vocabulary — it IS that vocabulary, definitionally:
+    mechanical means "copied into metadata.delivered_checks", and
+    DeliveredCheckMeta is precisely the model of a metadata entry. The
+    derivation assertion below is the point of this class: it is what makes
+    adding a future kind impossible to half-apply.
+    """
+
+    def test_value_is_the_three_mechanical_kinds(self):
+        assert MECHANICAL_CHECK_KINDS == ('grep', 'script', 'path')
+
+    def test_is_derived_from_the_delivered_check_meta_literal(self):
+        assert (
+            get_args(DeliveredCheckMeta.model_fields['kind'].annotation)
+            == MECHANICAL_CHECK_KINDS
+        )
+
+    def test_does_not_contain_manual(self):
+        # Derived from DeliveredCheckMeta, NOT DeliveredCheck: the latter
+        # also carries 'manual', the one kind that must never be copied
+        # into metadata.
+        assert 'manual' not in MECHANICAL_CHECK_KINDS
+        assert 'manual' in get_args(DeliveredCheck.model_fields['kind'].annotation)
+
+    def test_is_exported_in_module_all(self):
+        assert 'MECHANICAL_CHECK_KINDS' in capability_manifest_module.__all__
+
+
+class TestCheckSubjectField:
+    """CHECK_SUBJECT_FIELD — the per-kind field a failure is ABOUT."""
+
+    def test_maps_each_mechanical_kind_to_its_subject(self):
+        assert CHECK_SUBJECT_FIELD == {
+            'grep': 'pattern',
+            'script': 'script',
+            'path': 'paths',
+        }
+
+    def test_covers_exactly_the_mechanical_kinds(self):
+        # The coupling that keeps a future kind from being added to one and
+        # missed in the other, leaving a renderer with no subject to name.
+        assert set(CHECK_SUBJECT_FIELD) == set(MECHANICAL_CHECK_KINDS)
+
+    def test_every_subject_is_a_real_descriptor_field(self):
+        for field in CHECK_SUBJECT_FIELD.values():
+            assert field in DeliveredCheckMeta.model_fields
+
+    def test_is_exported_in_module_all(self):
+        assert 'CHECK_SUBJECT_FIELD' in capability_manifest_module.__all__
 
 
 class TestMetadataRegistration:

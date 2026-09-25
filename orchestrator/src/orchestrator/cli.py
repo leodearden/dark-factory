@@ -1344,7 +1344,11 @@ def _run_single_eval(
         build_plan_quality_report,
         format_plan_quality_table,
     )
-    from orchestrator.evals.runner import run_architect_eval, run_eval
+    from orchestrator.evals.runner import (
+        campaign_usage_gate,
+        run_architect_eval,
+        run_eval,
+    )
 
     all_configs = EVAL_CONFIGS
 
@@ -1359,61 +1363,69 @@ def _run_single_eval(
         configs = all_configs
 
     async def _run():
-        architect_results = []
-        for cfg in configs:
-            if cfg.role == 'architect':
-                # θ: plan-only architect eval — downstream roles frozen.
-                # run_architect_eval manages its own eval worktree at the
-                # fixture's pre_task_commit, so it takes no worktree_path.
-                result = await run_architect_eval(
-                    task_path, cfg, base_config, timeout_override=timeout,
-                )
-                architect_results.append(result)
-                plan_quality = result.metrics.get('plan_quality')
-                # A cap-tainted cell names its infra failure inline, so an
-                # operator watching the run sees it LIVE rather than a bare
-                # `plan_quality=None` that reads like a scoring quirk. Healthy
-                # cells echo exactly as before.
-                #
-                # 'unmeasurable', not 'cap-tainted': the flag covers every cause
-                # that left no model content (cap hit, auth failure,
-                # model-not-found, wedge, harness error), and a PERMANENT config
-                # error must not read to the operator as a transient cap window.
-                # The marker that follows always names the actual cause.
-                taint = (
-                    f' unmeasurable: {result.metrics.get("invocation_error")}'
-                    if result.metrics.get('cap_tainted') else ''
-                )
-                # `steps=` is echoed BESIDE the score (task 3302) because it is
-                # the plan-production predicate the whole pipeline now keys on:
-                # `steps=0` beside any plan_quality means the architect produced
-                # nothing, which the final table floors to 0.0. Showing it live
-                # is what stops a no-plan candidate from looking healthy for the
-                # length of a campaign.
-                click.echo(
-                    f'{result.task_id} × {result.config_name}: '
-                    f'{result.outcome} plan_quality={plan_quality} '
-                    f'steps={result.metrics.get("plan_steps")}{taint} '
-                    f'({result.wall_clock_ms / 1000:.1f}s)'
-                )
-            else:
-                result = await run_eval(
-                    task_path, cfg, base_config, timeout_override=timeout,
-                    worktree_path=worktree_path,
-                )
-                click.echo(
-                    f'{result.task_id} × {result.config_name}: '
-                    f'{result.outcome} ({result.wall_clock_ms / 1000:.1f}s)'
-                )
+        # ONE gate for the whole config loop (task 4427) — see
+        # campaign_usage_gate for the argument. Specific to this site: the loop
+        # is a campaign the μ stage functions never pass through, so it owns a
+        # gate of its own, and BOTH dispatch branches share it so cap state a
+        # config proved is inherited by every config after it, architect and
+        # implementer alike.
+        async with campaign_usage_gate(base_config) as gate:
+            architect_results = []
+            for cfg in configs:
+                if cfg.role == 'architect':
+                    # θ: plan-only architect eval — downstream roles frozen.
+                    # run_architect_eval manages its own eval worktree at the
+                    # fixture's pre_task_commit, so it takes no worktree_path.
+                    result = await run_architect_eval(
+                        task_path, cfg, base_config, timeout_override=timeout,
+                        usage_gate=gate,
+                    )
+                    architect_results.append(result)
+                    plan_quality = result.metrics.get('plan_quality')
+                    # A cap-tainted cell names its infra failure inline, so an
+                    # operator watching the run sees it LIVE rather than a bare
+                    # `plan_quality=None` that reads like a scoring quirk. Healthy
+                    # cells echo exactly as before.
+                    #
+                    # 'unmeasurable', not 'cap-tainted': the flag covers every cause
+                    # that left no model content (cap hit, auth failure,
+                    # model-not-found, wedge, harness error), and a PERMANENT config
+                    # error must not read to the operator as a transient cap window.
+                    # The marker that follows always names the actual cause.
+                    taint = (
+                        f' unmeasurable: {result.metrics.get("invocation_error")}'
+                        if result.metrics.get('cap_tainted') else ''
+                    )
+                    # `steps=` is echoed BESIDE the score (task 3302) because it is
+                    # the plan-production predicate the whole pipeline now keys on:
+                    # `steps=0` beside any plan_quality means the architect produced
+                    # nothing, which the final table floors to 0.0. Showing it live
+                    # is what stops a no-plan candidate from looking healthy for the
+                    # length of a campaign.
+                    click.echo(
+                        f'{result.task_id} × {result.config_name}: '
+                        f'{result.outcome} plan_quality={plan_quality} '
+                        f'steps={result.metrics.get("plan_steps")}{taint} '
+                        f'({result.wall_clock_ms / 1000:.1f}s)'
+                    )
+                else:
+                    result = await run_eval(
+                        task_path, cfg, base_config, timeout_override=timeout,
+                        worktree_path=worktree_path, usage_gate=gate,
+                    )
+                    click.echo(
+                        f'{result.task_id} × {result.config_name}: '
+                        f'{result.outcome} ({result.wall_clock_ms / 1000:.1f}s)'
+                    )
 
-        # Surface the θ plan-quality table across all architect runs.
-        if architect_results:
-            click.echo('')
-            click.echo(
-                format_plan_quality_table(
-                    build_plan_quality_report(architect_results)
+            # Surface the θ plan-quality table across all architect runs.
+            if architect_results:
+                click.echo('')
+                click.echo(
+                    format_plan_quality_table(
+                        build_plan_quality_report(architect_results)
+                    )
                 )
-            )
 
     asyncio.run(_run())
 

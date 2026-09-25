@@ -15,6 +15,7 @@ import asyncio
 import collections
 import contextlib
 import dataclasses
+import functools
 import json
 import logging
 import math
@@ -23,11 +24,21 @@ import shutil
 import time
 import traceback
 import uuid
-from collections.abc import Awaitable, Callable, Collection, Iterator, Mapping, Sequence
+from collections.abc import (
+    Awaitable,
+    Callable,
+    Collection,
+    Iterator,
+    Mapping,
+    MutableSet,
+    Sequence,
+)
+from datetime import timedelta
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
+from orchestrator import chronic_flake
 from orchestrator.critical_gate import critical_filing_gate
 from orchestrator.delivered_checks import gate_mark_done_on_delivered_checks
 from orchestrator.dry_run_unblock import run_dry_run_unblock
@@ -43,6 +54,7 @@ from orchestrator.git_ops import (
     WorktreeMissing,
     _run,
 )
+from orchestrator.guard_state import PersistentSet, guard_path
 from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.landing_evidence import (
     LandingEvidenceVerdict,
@@ -519,10 +531,10 @@ to retry after the offending member catches up) from a post-merge block."""
 TRAIN_REBASE_CONFLICT_REASON_PREFIX = 'Train merge rejected: tip branch rebase conflict'
 """Prefix of the ``MergeOutcome.reason`` string emitted when the tip-branch
 rebase-onto-main step of a ``GroupMergeRequest`` fails with conflicts.
-``rebase_onto_main`` already ran ``git rebase --abort``, so the worktree is
-left clean.  The downstream classifier surfaces this to the enqueuer so the
-tip task can be re-rebased in its own worktree before the train is
-re-submitted."""
+``rebase_onto_main`` ATTEMPTED a guarded ``git rebase --abort``; that can
+fail, so this is not proof of a clean tree.  The downstream classifier
+surfaces this to the enqueuer so the tip task can be re-rebased in its own
+worktree before the train is re-submitted."""
 
 TRAIN_VERIFY_FAILED_REASON_PREFIX = (
     'Train union verify failed (re-verifying members as singles)'
@@ -2485,13 +2497,14 @@ def _merge_boundary_module_configs(
     return effective_merge_module_configs(config, module_configs)
 
 
-def _record_flake_observation(
+async def _record_flake_observation(
     result: VerifyResult,
     req: MergeRequest,
     *,
     merge_sha: str,
     event_store: EventStore | None,
     escalation_queue: Any,
+    task_client: Any,
 ) -> None:
     """Record whatever flake observation *result* carries (PRD task ε, §5.8).
 
@@ -2506,7 +2519,7 @@ def _record_flake_observation(
     ``EventStore``, an escalation queue, ``project_root``, ``merge_sha`` and
     ``task_id`` at once.
 
-    That co-location is what makes the three side-effects — the durable
+    That co-location is what makes the side-effects — the durable
     ``flake_occurrence`` row, the ``merge_flake_suppressed`` fact and the INV-4
     storm-streak bump — unconditional BY CONSTRUCTION rather than dependent on
     which host happened to run the verify.  Before ε they fired inline inside the
@@ -2514,10 +2527,18 @@ def _record_flake_observation(
     at all, the remote host has no event store, and its streak counter died with
     its process.
 
+    Task ζ binds a FOURTH effect on the same seam — the ``flake_debt`` row and the
+    de-flake task filed against it (PRD §5.9) — and that is exactly why the binding
+    stays here rather than at the three call sites.  ``task_client`` is the only
+    piece of context the three could plausibly disagree on, since it rides on the
+    WORKER rather than on the verify: a site that forgot it would silently stop
+    enforcing the invariant for whichever observations flow through it, with no
+    failure anywhere.  One seam, one answer to who owns the debt row.
+
     Never raises (the recorder owns that guarantee), so a lost measurement can
     never fail a verify or stall the merge queue.
     """
-    record_merge_flake_suppression(
+    await record_merge_flake_suppression(
         result,
         project_root=req.config.project_root,
         project_id=req.config.fused_memory.project_id,
@@ -2525,6 +2546,7 @@ def _record_flake_observation(
         task_id=req.task_id,
         event_store=event_store,
         escalation_queue=escalation_queue,
+        task_client=task_client,
     )
 
 
@@ -2547,6 +2569,7 @@ async def _run_post_merge_verify(
     keep_worktrees: Collection[Path] | None = None,
     runner: VerifyRunner | None = None,
     escalation_queue: Any = None,
+    task_client: Any = None,
     halt_hook: Callable[[str], None] | None = None,
     dry_run_handles: _DryRunInvestigationHandles | None = None,
     main_health_probe_handles: _MainHealthProbeHandles | None = None,
@@ -2573,6 +2596,11 @@ async def _run_post_merge_verify(
     ``'Verification error: ...'`` outcome.
 
     Args:
+        task_client: Optional task client (``submit_task`` / ``get_statuses`` /
+            ``commit_planning``) threaded to the flake recorder so a suppressed
+            merge red acquires a de-flake task at write time (PRD task ζ, §5.9).
+            Threaded like ``escalation_queue``; with ``None`` the recorder opens
+            no debt row.
         max_narrowed: Budget for the classified-infra-transient retry loop
             (task 2835) when this call's failed-only retry was actually
             NARROWED — i.e. the D2 producer inside that branch built a
@@ -3105,19 +3133,14 @@ async def _run_post_merge_verify(
     # masked red that the inline pre-ε emit would have reported at the moment it
     # happened.  `superseded_observations` is empty on every path where no retry
     # carried an observation, which is the overwhelmingly common case.
-    for superseded in superseded_observations:
-        _record_flake_observation(
-            superseded, req,
-            merge_sha=merge_sha,
-            event_store=event_store,
-            escalation_queue=escalation_queue,
-        )
-    _record_flake_observation(
-        verify, req,
-        merge_sha=merge_sha,
-        event_store=event_store,
-        escalation_queue=escalation_queue,
+    record_observation = functools.partial(
+        _record_flake_observation, req=req, merge_sha=merge_sha,
+        event_store=event_store, escalation_queue=escalation_queue,
+        task_client=task_client,
     )
+    for superseded in superseded_observations:
+        await record_observation(superseded)
+    await record_observation(verify)
 
     # Invoke the optional result-capture callback (PRD §10 invariant 6(b)):
     # called with the FINAL VerifyResult (after any ENOSPC retry) so the
@@ -3210,12 +3233,7 @@ async def _run_post_merge_verify(
             # recording it here is what keeps this detective-control path from
             # regressing.  Inside the `try`, after the await, so a raised verify
             # (handled below) records nothing — there is no verdict to record.
-            _record_flake_observation(
-                local_verify, req,
-                merge_sha=merge_sha,
-                event_store=event_store,
-                escalation_queue=escalation_queue,
-            )
+            await record_observation(local_verify)
         except RunnerUnavailable as exc:
             # Fail-safe: a closed/flaky laptop trust-anchor must never block a
             # remote green (symmetric with DriftDetector's Invariant 5).
@@ -5836,6 +5854,12 @@ _COALESCE_TRAIN_ID_PREFIX = 'coalesce-'
 # event has one of these states is excluded from train formation.
 _COALESCE_RISKY_TERMINAL_STATES: frozenset[str] = frozenset({'blocked', 'error'})
 
+# How long a one-strike derail marker is remembered (task 5352).  An upper
+# bound on the subject, not a tuning dial: seven days is a generous outer
+# bound on a task's residency in the merge queue, and the marker must not
+# outlive the task it was recorded against.
+_COALESCE_DERAIL_TTL = timedelta(days=7)
+
 
 class _TrainMergeHost(Protocol):
     """Narrow Protocol exposing per-worker state required by ``_do_train_merge``.
@@ -7305,6 +7329,8 @@ async def _do_train_merge(
         narrowed_retries=worker._post_merge_verify_narrowed_retries,
         event_store=event_store,
         merge_sha=merge_commit,
+        escalation_queue=getattr(worker, '_escalation_queue', None),
+        task_client=getattr(worker, '_flake_task_client', None),
     )
     if verify_outcome is not None:
         reason = verify_outcome.reason
@@ -9484,6 +9510,37 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._shadow_state_path: Path | None = (
             _root / 'data' / 'orchestrator' / 'warm_verify_shadow.json'
         ) if _root is not None else None
+        # Task ζ (PRD §5.9): the task client `_run_post_merge_verify` threads to the
+        # flake recorder, so a suppressed merge red acquires a de-flake task AT WRITE
+        # TIME.  Built here because this is the only scope holding both a scheduler
+        # and a project root; `Any` deliberately, so the worker's "never imports the
+        # scheduler" layering note stays honest — the adapter is duck-typed over
+        # `dispatch_tool` exactly as `_dry_run_handles` is over its handles.
+        #
+        # No import cycle: `chronic_flake` imports only `config`/`shared`, never
+        # `merge_queue`.  It is REUSED rather than re-derived because task 2358
+        # already built this adapter over the same seam and ζ only needed it to grow
+        # `get_statuses`/`commit_planning` — a second client would be the
+        # two-implementations-that-must-agree drift INV-5 exists to prevent.
+        #
+        # None on a bare-harness worker (no scheduler) or a mock git_ops with no
+        # project_root, mirroring `_shadow_state_path` above.  The recorder then
+        # opens no debt row at all rather than an unowned one — see
+        # `orchestrator/src/orchestrator/flake_recorder.py::record_merge_flake_suppression`.
+        #
+        # Read at TWO sites: `_run_inflight_verify`'s `_run_post_merge_verify`
+        # dispatch (the VERIFY HALF of `_verify_and_advance` — grep the former, it
+        # is the name that exists), and `_do_train_merge`'s (via `getattr`, since it takes the narrow
+        # `_TrainMergeHost` Protocol).  Both are covered by
+        # `orchestrator/tests/test_merge_queue_flake_recorder.py::TestWorkerBuildsTheFlakeTaskClient`
+        # — this construction is the one seam whose failure mode is SILENT (a site that
+        # never supplies a client stops enforcing §5.9 with nothing anywhere going red),
+        # so "the parameter is honoured" is not the same test as "the worker supplies it".
+        self._flake_task_client: Any = (
+            chronic_flake.SchedulerChronicFlakeTaskClient(scheduler, _root)
+            if scheduler is not None and _root is not None
+            else None
+        )
         # Drift-check cadence persistence (task 2886 fix 1a) — same None-safe
         # project_root-derived pattern as _shadow_state_path above.  Persisting
         # the drift land counter here (authoritative over the in-memory
@@ -9922,10 +9979,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # δ/1720 one-strike registry — task_ids of members whose coalesce-formed
         # train derailed (MergeOutcome('blocked') on a train with train_id
         # startswith _COALESCE_TRAIN_ID_PREFIX).  Keyed by task_id so the marker
-        # survives re-dispatch as a new MergeRequest with the same task_id.
-        # Process-lifetime (cleared only on worker restart); injectable predicate
-        # is the seam for richer decay/flakiness policies later.
-        self._coalesce_derailed_task_ids: set[str] = set()
+        # survives re-dispatch as a new MergeRequest with the same task_id —
+        # and, since task 5352, a worker restart too: the marker is persisted
+        # under project_root/data/orchestrator/guards/ and decays only via
+        # _COALESCE_DERAIL_TTL, which IS the decay policy this comment used to
+        # defer to a richer injectable predicate.  Unlike the sibling
+        # _..._state_path attributes above there is no Path|None to thread and
+        # no is-None branch at the call site: guard_path returns None for an
+        # absent project_root and PersistentSet absorbs it as the in-memory mode.
+        self._coalesce_derailed_task_ids: MutableSet[str] = PersistentSet(
+            guard_path(_root, 'coalesce_derailed_task_ids.json'),
+            ttl=_COALESCE_DERAIL_TTL,
+        )
         # α liveness ledger: ephemeral _merge-<uuid> worktrees owned by THIS
         # SpeculativeMergeWorker instance.  Touched every _heartbeat_loop tick
         # so the stale-worktree reaper (coalesce_or_enqueue_merge_request) never
@@ -14964,10 +15029,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         for a train whose train_id startswith _COALESCE_TRAIN_ID_PREFIX.  Adds
         each task_id to self._coalesce_derailed_task_ids so the next coalescing
         pass (default predicate) excludes them from train formation.
+
+        The marks are durable (task 5352): before that, they lived only in this
+        worker's memory, so the ~8-15h fleet redeploy cleared them and the
+        identical poison train re-formed on that cadence.  The whole batch is
+        recorded with one ``|=``, which the registry persists as a single
+        write.
         """
         if not member_task_ids:
             return
-        self._coalesce_derailed_task_ids.update(member_task_ids)
+        self._coalesce_derailed_task_ids |= set(member_task_ids)
         logger.info(
             'Coalesce one-strike: marked %d task(s) after coalesce-train derail: %s',
             len(member_task_ids), member_task_ids,
@@ -15153,16 +15224,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         None (eligible).  Signals implemented here use only worker-reachable
         substrate (no scheduler import):
 
-          1. One-strike registry (cheapest, in-memory first):
+          1. One-strike registry (cheapest — check first):
              If req.task_id is in self._coalesce_derailed_task_ids (a prior
              coalesce-formed train that included this task derailed), exclude.
-             Filled in step-6; always empty until then.
+             Still the cheaper signal — a lookup against a warm in-process
+             cache, versus signal 2's sqlite query — but no longer purely
+             in-memory: the registry is restart-durable (task 5352).
 
           2. Event-store blocked history:
              If the branch's most-recent terminal merge outcome was 'blocked' or
-             'error', exclude.  Filled in step-4.
+             'error', exclude.
         """
-        # Signal 1: one-strike registry (cheapest, in-memory — check first).
+        # Signal 1: one-strike registry (cheapest — check first).
         if req.task_id in self._coalesce_derailed_task_ids:
             return 'coalesce_derailed_one_strike'
         # Signal 2: event-store blocked history.
@@ -18178,6 +18251,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 keep_worktrees=set(self._owned_merge_worktrees),
                 runner=None if lease.is_local else lease.runner,
                 escalation_queue=self._escalation_queue,
+                task_client=self._flake_task_client,
                 # task 2886 fix 3 (PRD §3.4 / decision 4): thread the synchronous
                 # all-lane halt so a CONCLUDED cross-check divergence stops the
                 # queue the instant it is detected — BEFORE any further adoption —
@@ -18254,7 +18328,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 )
                 _progress_probe_secs = self.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS / 2
             while True:
-                done, _ = await asyncio.wait(
+                done = await self._clock.wait_for_any(
                     {verify_task},
                     timeout=self.VERIFY_ABANDON_POLL_SECS,
                 )

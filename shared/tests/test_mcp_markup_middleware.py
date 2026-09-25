@@ -2675,6 +2675,43 @@ class TestB10StormEscape:
         assert storm['window_seconds'] == 3600.0
         assert storm['project'] == '/srv/alpha'
 
+    async def test_the_operator_facing_error_line_routes_at_the_live_prd(self, caplog):
+        """Regression for the stale-routing defect (task 4467).
+
+        The greppable ``markup_guard_storm`` ERROR line must send an operator
+        to report a recurrence against the live PRD, not against DF task 3083
+        — which is DONE and CLOSED to appends, so a reader sent there reports
+        it nowhere. Same correction commit e0ea6e3fe9 already made to the
+        ``_markup_gate`` ERROR line and commit 2b38fd89a2 made across
+        ``markup_tripwire.py``.
+        """
+        clock = _Clock()
+        h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
+
+        with caplog.at_level('ERROR', logger='shared.mcp_markup_middleware'):
+            for _ in range(3):
+                await self._repair(h)
+                clock.advance(60)
+
+        storm_lines = [
+            r.getMessage() for r in caplog.records
+            if r.name == 'shared.mcp_markup_middleware'
+            and r.levelname == 'ERROR'
+            and r.getMessage().startswith('markup_guard_storm')
+        ]
+        assert storm_lines, (
+            f'expected a greppable markup_guard_storm ERROR line, got: {caplog.text!r}'
+        )
+        # Citing the live owner's path is the whole contract, and it is the one
+        # check that survives any rewording of the sentence around it. Pinning
+        # phrases instead ('not against 3083') would fail a correct rewrite,
+        # and a negative pin ('see DF 3083' not in ...) is evaded by any other
+        # spelling of the same stale route.
+        for line in storm_lines:
+            assert 'toolcall-markup-containment-prd.md' in line, (
+                f'must name the live owner, not the closed predecessor: {line!r}'
+            )
+
     # -- the rate limit, and the window ------------------------------------
 
     async def test_a_fourth_event_inside_the_window_does_not_re_fire(self):

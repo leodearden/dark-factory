@@ -35,7 +35,7 @@ import types
 import urllib.error
 import urllib.parse
 
-import pytest  # pyright: ignore[reportMissingImports]
+import pytest
 import yaml
 from orchestrator.config import YamlSettingsSource, _deep_merge, _load_defaults
 

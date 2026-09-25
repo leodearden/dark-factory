@@ -3,6 +3,7 @@
 import contextlib
 import json
 import logging
+import subprocess
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -10,7 +11,11 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import assert_id_title_pairing, make_8df8_scenario
+from _fm_helpers import (
+    as_async_run_git,
+    assert_id_title_pairing,
+    make_8df8_scenario,
+)
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
 
 import fused_memory.reconciliation.stages.base as base_module
@@ -2105,6 +2110,12 @@ class TestProjectIdValidation(BaseStageValidationTest):
             'orphaned_recon_escalations_unresolvable': 0,
             'orphaned_recon_escalations_errors': 0,
             'orphaned_recon_escalations_flags_emitted': 0,
+            # Always present (task 4814), pre-initialised beside the
+            # task-2312/2229/3084 pre-inits above and before the
+            # remediation early-return.  Stays 0 here: no active task is
+            # human-gate-owned, so the deterministic gate-owned
+            # suggested_action normalizer rewrites nothing.
+            'gate_owned_suggested_actions_normalized': 0,
         }
         assert result.started_at is not None
         assert result.started_at <= result.completed_at
@@ -2262,6 +2273,12 @@ class TestProjectIdValidation(BaseStageValidationTest):
             'orphaned_recon_escalations_unresolvable': 0,
             'orphaned_recon_escalations_errors': 0,
             'orphaned_recon_escalations_flags_emitted': 0,
+            # Always present (task 4814), pre-initialised beside the
+            # task-2312/2229/3084 pre-inits above and before the
+            # remediation early-return.  Stays 0 here: no active task is
+            # human-gate-owned, so the deterministic gate-owned
+            # suggested_action normalizer rewrites nothing.
+            'gate_owned_suggested_actions_normalized': 0,
         }
         assert result.started_at is not None
         assert result.started_at <= result.completed_at
@@ -12632,7 +12649,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
         live_task = {'id': int(live_task_id), 'title': 'Live task', 'status': 'in-progress'}
         other_task = {'id': int(not_live_task_id), 'title': 'Other task', 'status': 'pending'}
 
-        def _fake_detect(task_id, project_root, **kwargs):
+        async def _fake_detect(task_id, project_root, **kwargs):
             if str(task_id) == live_task_id:
                 return WorkflowLiveness(
                     is_live=True,
@@ -12684,7 +12701,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
 
         not_live_task = {'id': 100, 'title': 'Other task', 'status': 'pending'}
 
-        def _fake_detect(task_id, project_root, **kwargs):
+        async def _fake_detect(task_id, project_root, **kwargs):
             return WorkflowLiveness(
                 is_live=False,
                 worktree_registered=False,
@@ -12723,7 +12740,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
 
         live_task_id = '4321'
 
-        def _fake_detect(task_id, project_root, **kwargs):
+        async def _fake_detect(task_id, project_root, **kwargs):
             return WorkflowLiveness(
                 is_live=True,
                 worktree_registered=True,
@@ -12805,7 +12822,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
             [deferred_task, pending_task]
         )
 
-        with patch('subprocess.run', side_effect=_no_git_signals):
+        with patch('fused_memory.services.live_workflow_detector.run_git', side_effect=as_async_run_git(_no_git_signals)):
             payload = await stage.assemble_payload([], watermark, [])
 
         assert '### Live-Workflow Signals' in payload, (
@@ -12892,7 +12909,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
             [blocked_deterministic_task, blocked_normal_task]
         )
 
-        with patch('subprocess.run', side_effect=_no_git_signals):
+        with patch('fused_memory.services.live_workflow_detector.run_git', side_effect=as_async_run_git(_no_git_signals)):
             payload = await stage.assemble_payload([], watermark, [])
 
         # Task 2409: the normal blocked task (742) no longer keeps the signal in the
@@ -12990,7 +13007,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
             [bare_normal_task, bare_kindless_task, with_worktree_task]
         )
 
-        with patch('subprocess.run', side_effect=_signals):
+        with patch('fused_memory.services.live_workflow_detector.run_git', side_effect=as_async_run_git(_signals)):
             payload = await stage.assemble_payload([], watermark, [])
 
         assert '### Live-Workflow Signals' in payload, (
@@ -13026,12 +13043,13 @@ class TestRenderLiveWorkflowSectionEmptyTasksNoOp:
     deletion has a characterization test to break if it regresses.
     """
 
-    def test_empty_tasks_returns_empty_string(self):
+    @pytest.mark.asyncio
+    async def test_empty_tasks_returns_empty_string(self):
         from fused_memory.reconciliation.stages.task_knowledge_sync import (
             _render_live_workflow_section,
         )
 
-        result = _render_live_workflow_section(tasks=[], project_root=ProjectRoot('/p'))
+        result = await _render_live_workflow_section(tasks=[], project_root=ProjectRoot('/p'))
 
         assert result == ''
 
@@ -13137,7 +13155,7 @@ class TestRenderLiveWorkflowSectionCorroborationGate:
             }
         }
 
-    def _render(self, tmp_path, task, monkeypatch):
+    async def _render(self, tmp_path, task, monkeypatch):
         import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
         from fused_memory.reconciliation.stages.task_knowledge_sync import (
             _render_live_workflow_section,
@@ -13147,14 +13165,15 @@ class TestRenderLiveWorkflowSectionCorroborationGate:
         # fail against the fake PID in the lock file — orchestrator_started_at
         # only parses the `started` token and needs no live PID).
         monkeypatch.setattr(tks_module, 'is_orchestrator_live_for', lambda _pr: True)
-        with patch('subprocess.run', side_effect=self._git_side_effect()):
-            return _render_live_workflow_section(
+        with patch('fused_memory.services.live_workflow_detector.run_git', side_effect=as_async_run_git(self._git_side_effect())):
+            return await _render_live_workflow_section(
                 [task], ProjectRoot(str(tmp_path)), now=self._NOW
             )
 
     # ----- cases -----
 
-    def test_uncorroborated_in_progress_task_is_dropped(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_uncorroborated_in_progress_task_is_dropped(self, tmp_path, monkeypatch):
         """(a) No fresh claimant, absent from scheduler_state, routing decision
         BEFORE the restart => indeterminate => task/2763 NOT listed."""
         self._write_lock(tmp_path, self._STARTED)
@@ -13166,14 +13185,15 @@ class TestRenderLiveWorkflowSectionCorroborationGate:
             'metadata': self._routing_metadata(self._STARTED - timedelta(hours=1)),
         }
 
-        result = self._render(tmp_path, task, monkeypatch)
+        result = await self._render(tmp_path, task, monkeypatch)
 
         assert self._BRANCH not in result, (
             f"Expected {self._BRANCH} DROPPED (worktree+orchestrator-only, no "
             f"corroboration => indeterminate); got:\n{result!r}"
         )
 
-    def test_fresh_claimant_keeps_task_listed(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_fresh_claimant_keeps_task_listed(self, tmp_path, monkeypatch):
         """(b) A fresh claimant_run_id + recent heartbeat corroborates => listed."""
         self._write_lock(tmp_path, self._STARTED)
         self._write_scheduler_state(tmp_path)
@@ -13185,14 +13205,15 @@ class TestRenderLiveWorkflowSectionCorroborationGate:
             'metadata': self._routing_metadata(self._STARTED - timedelta(hours=1)),
         }
 
-        result = self._render(tmp_path, task, monkeypatch)
+        result = await self._render(tmp_path, task, monkeypatch)
 
         assert self._BRANCH in result, (
             f"Expected {self._BRANCH} LISTED (fresh claimant/heartbeat "
             f"corroborates); got:\n{result!r}"
         )
 
-    def test_scheduler_holder_keeps_task_listed(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_scheduler_holder_keeps_task_listed(self, tmp_path, monkeypatch):
         """(c) task_id present in scheduler_state current_holders => listed."""
         self._write_lock(tmp_path, self._STARTED)
         self._write_scheduler_state(
@@ -13204,14 +13225,15 @@ class TestRenderLiveWorkflowSectionCorroborationGate:
             'metadata': self._routing_metadata(self._STARTED - timedelta(hours=1)),
         }
 
-        result = self._render(tmp_path, task, monkeypatch)
+        result = await self._render(tmp_path, task, monkeypatch)
 
         assert self._BRANCH in result, (
             f"Expected {self._BRANCH} LISTED (scheduler holder corroborates); "
             f"got:\n{result!r}"
         )
 
-    def test_post_restart_routing_keeps_task_listed(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_post_restart_routing_keeps_task_listed(self, tmp_path, monkeypatch):
         """(d) routing.latest.decided_at AFTER the restart => listed."""
         self._write_lock(tmp_path, self._STARTED)
         self._write_scheduler_state(tmp_path)
@@ -13221,14 +13243,15 @@ class TestRenderLiveWorkflowSectionCorroborationGate:
             'metadata': self._routing_metadata(self._STARTED + timedelta(minutes=30)),
         }
 
-        result = self._render(tmp_path, task, monkeypatch)
+        result = await self._render(tmp_path, task, monkeypatch)
 
         assert self._BRANCH in result, (
             f"Expected {self._BRANCH} LISTED (post-restart routing decision "
             f"corroborates); got:\n{result!r}"
         )
 
-    def test_gate_is_in_progress_only(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_gate_is_in_progress_only(self, tmp_path, monkeypatch):
         """(e) A non-in-progress task (review) with the same worktree+
         orchestrator-only signals and NO corroboration is still listed — the
         corroboration gate is in-progress-only."""
@@ -13240,7 +13263,7 @@ class TestRenderLiveWorkflowSectionCorroborationGate:
             'metadata': self._routing_metadata(self._STARTED - timedelta(hours=1)),
         }
 
-        result = self._render(tmp_path, task, monkeypatch)
+        result = await self._render(tmp_path, task, monkeypatch)
 
         assert self._BRANCH in result, (
             f"Expected {self._BRANCH} (status=review) STILL listed — the "
@@ -13315,7 +13338,7 @@ class TestRenderLiveWorkflowSectionPendingPureGate:
 
         return side_effect
 
-    def _render(self, tmp_path, task, monkeypatch, *, worktree_for_branch=None):
+    async def _render(self, tmp_path, task, monkeypatch, *, worktree_for_branch=None):
         import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
         from fused_memory.reconciliation.stages.task_knowledge_sync import (
             _render_live_workflow_section,
@@ -13323,16 +13346,19 @@ class TestRenderLiveWorkflowSectionPendingPureGate:
 
         monkeypatch.setattr(tks_module, 'is_orchestrator_live_for', lambda _pr: True)
         with patch(
-            'subprocess.run',
-            side_effect=self._git_side_effect(worktree_for_branch=worktree_for_branch),
+            'fused_memory.services.live_workflow_detector.run_git',
+            side_effect=as_async_run_git(
+                self._git_side_effect(worktree_for_branch=worktree_for_branch)
+            ),
         ):
-            return _render_live_workflow_section(
+            return await _render_live_workflow_section(
                 [task], ProjectRoot(str(tmp_path)), now=self._NOW
             )
 
     # ----- cases -----
 
-    def test_pending_pure_gate_is_dropped(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_pending_pure_gate_is_dropped(self, tmp_path, monkeypatch):
         """(a) THE SYMPTOM — task 3845's exact shape is dropped entirely."""
         task = {
             'id': self._TASK_ID,
@@ -13340,7 +13366,7 @@ class TestRenderLiveWorkflowSectionPendingPureGate:
             'metadata': dict(self._PURE_GATE_METADATA),
         }
 
-        result = self._render(tmp_path, task, monkeypatch)
+        result = await self._render(tmp_path, task, monkeypatch)
 
         assert self._BRANCH not in result, (
             f"Expected {self._BRANCH} DROPPED (pending deterministic pure gate, "
@@ -13350,7 +13376,8 @@ class TestRenderLiveWorkflowSectionPendingPureGate:
             f"Expected an EMPTY section (the only task was dropped); got:\n{result!r}"
         )
 
-    def test_pending_before_done_deterministic_is_still_listed(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_pending_before_done_deterministic_is_still_listed(self, tmp_path, monkeypatch):
         """(b) NARROWING — a pending deterministic task WITH before_done may be
         mid-deploy inside DeterministicRunner, so its signal is kept."""
         task = {
@@ -13362,14 +13389,15 @@ class TestRenderLiveWorkflowSectionPendingPureGate:
             },
         }
 
-        result = self._render(tmp_path, task, monkeypatch)
+        result = await self._render(tmp_path, task, monkeypatch)
 
         assert f'- {self._BRANCH}: orchestrator' in result, (
             f"Expected {self._BRANCH} STILL listed with the orchestrator signal "
             f"(before_done disqualifies the pure-gate shape); got:\n{result!r}"
         )
 
-    def test_pending_normal_task_is_still_listed(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_pending_normal_task_is_still_listed(self, tmp_path, monkeypatch):
         """(c) Ordinary pending tasks are completely unaffected."""
         task = {
             'id': self._TASK_ID,
@@ -13377,14 +13405,15 @@ class TestRenderLiveWorkflowSectionPendingPureGate:
             'metadata': {'task_kind': 'normal'},
         }
 
-        result = self._render(tmp_path, task, monkeypatch)
+        result = await self._render(tmp_path, task, monkeypatch)
 
         assert f'- {self._BRANCH}: orchestrator' in result, (
             f"Expected pending NORMAL task {self._BRANCH} STILL listed — rule 5 is "
             f"deterministic-only; got:\n{result!r}"
         )
 
-    def test_pure_gate_with_registered_worktree_is_still_listed(self, tmp_path, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_pure_gate_with_registered_worktree_is_still_listed(self, tmp_path, monkeypatch):
         """(d) Per-task evidence wins — only the bare project-wide orchestrator
         signal is suppressed, never a real worktree."""
         task = {
@@ -13393,7 +13422,7 @@ class TestRenderLiveWorkflowSectionPendingPureGate:
             'metadata': dict(self._PURE_GATE_METADATA),
         }
 
-        result = self._render(
+        result = await self._render(
             tmp_path, task, monkeypatch, worktree_for_branch=self._BRANCH
         )
 
@@ -16095,6 +16124,510 @@ class TestSweepStaleMem0PoolTombstones:
 
         assert result == 0
         tombstone.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# task 3778 step-7: the worktree-list hoist is CONSTANT in the task count
+# ---------------------------------------------------------------------------
+
+
+class TestRenderLiveWorkflowSectionHoistsWorktreeList:
+    """`git worktree list` runs ONCE per render, not once per task.
+
+    The measured defect: `_render_live_workflow_section` already hoists three
+    per-render invariants (`is_orchestrator_live_for`, `read_scheduler_state`,
+    `orchestrator_started_at`) but not the fourth and most expensive one — the
+    whole-repo worktree list, which `detect_live_workflow` re-ran inside
+    `_check_worktree_registered` on every single task. At ~513 worktrees that
+    is ~40 ms x ~500 tasks ≈ 20 s of a measured 29 s render.
+
+    The assertion is deliberately a PER-ITEM PROPERTY — worktree-list count
+    == 1 for every N — and NOT a total-subprocess count. A better
+    implementation (e.g. memoizing the remaining per-task log/rev-list probes)
+    must not read RED here; what is being pinned is that this one call is
+    constant in N rather than proportional to it.
+    """
+
+    _NOW = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+
+    @staticmethod
+    def _counting_side_effect(branch_prefix: str = 'task/'):
+        """A `subprocess.run` fake tallying calls per git subcommand.
+
+        Reports every task's worktree as registered so each task stays live and
+        the render actually does its per-task work.
+        """
+        counts = {'worktree_list': 0, 'log': 0, 'rev_list': 0}
+
+        def side_effect(args, **kwargs):
+            if '--porcelain' in args:
+                counts['worktree_list'] += 1
+                stanzas = ''.join(
+                    f'worktree /tmp/wt{i}\nHEAD abc123{i}\n'
+                    f'branch refs/heads/{branch_prefix}{i}\n\n'
+                    for i in range(200)
+                )
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0, stdout=stanzas, stderr='',
+                )
+            if 'rev-list' in args:
+                counts['rev_list'] += 1
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0, stdout='3', stderr='',
+                )
+            counts['log'] += 1
+            return subprocess.CompletedProcess(
+                args=args, returncode=1, stdout='', stderr='',
+            )
+
+        return side_effect, counts
+
+    @staticmethod
+    def _tasks(n: int) -> list[dict]:
+        return [{'id': str(i), 'status': 'pending'} for i in range(n)]
+
+    @pytest.mark.parametrize('n_tasks', [1, 8, 30])
+    @pytest.mark.asyncio
+    async def test_worktree_list_probe_count_is_constant_in_task_count(self, n_tasks):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _render_live_workflow_section,
+        )
+
+        side_effect, counts = self._counting_side_effect()
+
+        with patch('fused_memory.services.live_workflow_detector.run_git', side_effect=as_async_run_git(side_effect)):
+            await _render_live_workflow_section(
+                tasks=self._tasks(n_tasks),
+                project_root=ProjectRoot('/p'),
+                now=self._NOW,
+            )
+
+        assert counts['worktree_list'] == 1, (
+            f'expected exactly 1 hoisted worktree list for {n_tasks} tasks, '
+            f"got {counts['worktree_list']} — the probe is still per-task"
+        )
+
+    @pytest.mark.asyncio
+    async def test_rendered_text_is_unchanged_by_the_hoist(self):
+        """Behaviour preservation: same fixture inputs, same section text.
+
+        Renders once with the hoist active and once with the hoist reporting
+        *unknown* (which degrades to exactly the pre-hoist per-task probe
+        path), and pins that the two agree byte-for-byte.
+        """
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _render_live_workflow_section,
+        )
+
+        side_effect, _ = self._counting_side_effect()
+        tasks = self._tasks(4)
+
+        with patch('fused_memory.services.live_workflow_detector.run_git', side_effect=as_async_run_git(side_effect)):
+            hoisted = await _render_live_workflow_section(
+                tasks=tasks, project_root=ProjectRoot('/p'), now=self._NOW,
+            )
+
+        side_effect, _ = self._counting_side_effect()
+        with (
+            patch('fused_memory.services.live_workflow_detector.run_git', side_effect=as_async_run_git(side_effect)),
+            # `{}` from worktree_index_kwargs means *unknown* — omit the kwarg.
+            # (A known-empty repo would be `{'worktree_index': {}}`.)
+            patch.object(tks, 'worktree_index_kwargs', return_value={}),
+        ):
+            per_task = await _render_live_workflow_section(
+                tasks=tasks, project_root=ProjectRoot('/p'), now=self._NOW,
+            )
+
+        assert hoisted == per_task
+        assert 'Live-Workflow Signals' in hoisted
+
+    @pytest.mark.asyncio
+    async def test_unknown_hoist_degrades_to_the_per_task_probe(self):
+        """Fail-safe: an unknown index must not delete the section.
+
+        The hoist is an optimisation; when it reports *unknown* (`{}` from
+        `worktree_index_kwargs`), every task falls back to its own probe and the
+        render is exactly what it was before task 3778.
+
+        The seam is the wrapper's RETURN value, not an exception from it: the
+        wrapper now owns the fail-safe catch, so patching it to raise would pin
+        a state production can no longer reach. That catch is unit-tested where
+        it lives (test_live_workflow_detector.py::TestWorktreeIndexKwargs).
+        """
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _render_live_workflow_section,
+        )
+
+        side_effect, counts = self._counting_side_effect()
+
+        with (
+            patch('fused_memory.services.live_workflow_detector.run_git', side_effect=as_async_run_git(side_effect)),
+            patch.object(tks, 'worktree_index_kwargs', return_value={}),
+        ):
+            result = await _render_live_workflow_section(
+                tasks=self._tasks(3), project_root=ProjectRoot('/p'), now=self._NOW,
+            )
+
+        assert 'Live-Workflow Signals' in result, 'a broken hoist dropped the section'
+        assert counts['worktree_list'] == 3, 'each task must fall back to its own probe'
+
+    @pytest.mark.asyncio
+    async def test_a_failing_probe_warns_and_still_renders_from_the_fallback(self, caplog):
+        """The costly degradation is LOUD, driven by a real failing `run_git`.
+
+        The end-to-end version of the detector's own unit tests, with NOTHING
+        stubbed between the renderer and the failing subprocess: a non-zero
+        `git worktree list` makes the hoist unknown, which then costs one extra
+        probe PER TASK (up to `_GIT_TIMEOUT` each when git hangs). The renderer's
+        `except Exception` can never see that — `worktree_index_for` returns its
+        sentinel rather than raising — so the WARNING has to come from the
+        detector, and the section must still render off the surviving signals.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _render_live_workflow_section,
+        )
+
+        detector_logger = 'fused_memory.services.live_workflow_detector'
+        calls = {'worktree_list': 0}
+
+        def failing_worktree_list(args, **kwargs):
+            if '--porcelain' in args:
+                calls['worktree_list'] += 1
+                return subprocess.CompletedProcess(
+                    args=args, returncode=128, stdout='', stderr='not a git repository',
+                )
+            if 'rev-list' in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0, stdout='3', stderr='',
+                )
+            # `git log -1 --format=%cI` — a commit an hour before `_NOW`, so
+            # recent_commit still reports these tasks live without the worktree
+            # signal the broken probe can no longer supply.
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout='2026-01-01T11:00:00+00:00\n', stderr='',
+            )
+
+        with (
+            caplog.at_level(logging.DEBUG, logger=detector_logger),
+            patch(
+                'fused_memory.services.live_workflow_detector.run_git',
+                side_effect=as_async_run_git(failing_worktree_list),
+            ),
+        ):
+            result = await _render_live_workflow_section(
+                tasks=self._tasks(3), project_root=ProjectRoot('/p'), now=self._NOW,
+            )
+
+        warnings = [
+            r.getMessage() for r in caplog.records
+            if r.name == detector_logger and r.levelno >= logging.WARNING
+        ]
+        assert warnings, (
+            'a failing worktree-list probe must warn — at DEBUG this cost ~20 s '
+            'per render with nothing above DEBUG to say why'
+        )
+        assert all('worktree_index_unavailable' in m for m in warnings), warnings
+        # 1 hoist + one fallback probe per task: the repetition IS the signal.
+        assert calls['worktree_list'] == 4, calls
+        assert 'Live-Workflow Signals' in result, (
+            'a failing probe must not delete the section — recent_commit still '
+            'reports these tasks live'
+        )
+
+
+class TestRenderLiveWorkflowSectionCapsFanOut:
+    """The detector fan-out is bounded by `MAX_ACTIVE_TASKS_RENDERED` (task 3778).
+
+    The renderer is handed the FULL `filtered.active_tasks` list, but the
+    Active Task Tree both call sites render is capped at
+    `task_filter.MAX_ACTIVE_TASKS_RENDERED` (= 50) via the prefix slice
+    `tree.active_tasks[:max_tasks]` (task_filter.py:1614). So on a large
+    project ~90% of the per-task git probing was computed and then discarded,
+    and the section could name a task the tree had already omitted.
+
+    Capping in the RENDERER rather than at the two call sites means
+    task_knowledge_sync and memory_consolidator cannot drift apart. The cap
+    must use the SAME deterministic prefix slice as the tree, so the section is
+    always a subset of what the tree shows.
+
+    Per the no-silent-caps principle (mirroring
+    `reconciliation.done_task_audit_render_capped`, task_knowledge_sync.py:3618)
+    the drop must be LOUD: a WARNING naming total / rendered / omitted.
+    """
+
+    _NOW = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    _LOGGER = 'fused_memory.reconciliation.stages.task_knowledge_sync'
+    _CAP_EVENT = 'reconciliation.live_workflow_render_capped'
+
+    @staticmethod
+    def _tasks(n: int) -> list[dict]:
+        return [{'id': str(i), 'status': 'pending'} for i in range(n)]
+
+    @staticmethod
+    def _recording_detector(probed: list[str]):
+        """A `detect_live_workflow` fake recording every task_id it is asked about.
+
+        Reports every task live, so a cap can only come from the renderer
+        declining to probe — never from a task being filtered out downstream.
+        """
+        from fused_memory.services.live_workflow_detector import WorkflowLiveness
+
+        async def fake(task_id, project_root, **kwargs):
+            probed.append(str(task_id))
+            return WorkflowLiveness(
+                is_live=True,
+                worktree_registered=True,
+                recent_commit=False,
+                orchestrator_live=False,
+                branch=f'task/{task_id}',
+                last_commit_at=None,
+            )
+
+        return fake
+
+    async def _render(self, tasks, monkeypatch):
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _render_live_workflow_section,
+        )
+
+        probed: list[str] = []
+        monkeypatch.setattr(
+            tks_module, 'detect_live_workflow', self._recording_detector(probed)
+        )
+        # Neutralise the (already-tested) per-render hoists so this class
+        # measures only the fan-out, with no real subprocess. `{'worktree_index':
+        # {}}` is the "known empty repo" answer, which engages the hoist and
+        # suppresses the per-task probes; a bare `{}` would mean *unknown* and
+        # degrade to them. The fake must be a COROUTINE function: production
+        # awaits `worktree_index_kwargs`, and `monkeypatch.setattr` performs no
+        # async auto-detection — unlike `patch.object`, which returns an
+        # AsyncMock when the target is a coroutine function. A sync
+        # `lambda _pr: {...}` here is not neutral: it makes the await raise
+        # TypeError, which the detector's fail-safe swallows into the degraded
+        # per-task-probe branch, so the cap would be measured with the hoist
+        # broken rather than engaged.
+        async def _worktree_index_kwargs(_pr):
+            return {'worktree_index': {}}
+
+        monkeypatch.setattr(tks_module, 'worktree_index_kwargs', _worktree_index_kwargs)
+        result = await _render_live_workflow_section(
+            tasks=tasks, project_root=ProjectRoot('/p'), now=self._NOW,
+        )
+        return result, probed
+
+    # ----- cases -----
+
+    @pytest.mark.asyncio
+    async def test_probes_only_the_first_max_active_tasks_rendered(self, monkeypatch):
+        """(a) 60 tasks in => exactly the first 50 probed, none beyond.
+
+        The prefix slice must match `render_active_section`'s, so the section
+        can never name a task the Active Task Tree omitted.
+        """
+        from fused_memory.reconciliation.task_filter import MAX_ACTIVE_TASKS_RENDERED
+
+        tasks = self._tasks(60)
+        result, probed = await self._render(tasks, monkeypatch)
+
+        assert probed == [str(i) for i in range(MAX_ACTIVE_TASKS_RENDERED)], (
+            f'expected the first {MAX_ACTIVE_TASKS_RENDERED} task ids probed in '
+            f'order; got {len(probed)} probes ({probed[:3]}...{probed[-3:]})'
+        )
+        # ...and nothing past the cap leaked into the rendered section.
+        assert 'task/50' not in result
+        assert 'task/59' not in result
+        assert 'task/49' in result
+
+    @pytest.mark.asyncio
+    async def test_overflow_is_logged_loudly(self, monkeypatch, caplog):
+        """(b) No silent truncation: a WARNING names total, rendered, omitted."""
+        from fused_memory.reconciliation.task_filter import MAX_ACTIVE_TASKS_RENDERED
+
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            await self._render(self._tasks(60), monkeypatch)
+
+        capped = [r for r in caplog.records if self._CAP_EVENT in r.getMessage()]
+        assert capped, (
+            f'expected a {self._CAP_EVENT} WARNING when the fan-out is clipped; '
+            f'got {[r.getMessage() for r in caplog.records]}'
+        )
+        record = capped[0]
+        assert record.levelno == logging.WARNING
+        assert getattr(record, 'total_active', None) == 60
+        assert getattr(record, 'rendered', None) == MAX_ACTIVE_TASKS_RENDERED
+        assert getattr(record, 'omitted', None) == 60 - MAX_ACTIVE_TASKS_RENDERED
+
+    @pytest.mark.parametrize('n_tasks', [1, 7, 50])
+    @pytest.mark.asyncio
+    async def test_at_or_below_the_cap_probes_everything_and_stays_quiet(
+        self, n_tasks, monkeypatch, caplog
+    ):
+        """(c) The steady state must not raise a false alarm."""
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            _result, probed = await self._render(self._tasks(n_tasks), monkeypatch)
+
+        assert probed == [str(i) for i in range(n_tasks)], (
+            f'{n_tasks} tasks is at/below the cap — all of them must be probed'
+        )
+        capped = [r for r in caplog.records if self._CAP_EVENT in r.getMessage()]
+        assert not capped, f'false overflow alarm at n={n_tasks}: {capped}'
+
+        # ...and quiet means quiet. Filtering caplog on _CAP_EVENT alone once
+        # hid a real WARNING firing on every run of this class: the hoist fake
+        # was sync, so the renderer's fail-safe caught the TypeError and
+        # degraded to a per-task probe. Any swallowed degradation in the
+        # renderer now fails here instead of hiding behind an event-name filter.
+        noisy = [
+            r for r in caplog.records
+            if r.name == self._LOGGER
+            and r.levelno >= logging.WARNING
+            and self._CAP_EVENT not in r.getMessage()
+        ]
+        assert not noisy, (
+            f'the steady state at n={n_tasks} must be silent at WARNING+; got '
+            f'{[r.getMessage() for r in noisy]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_cap_follows_the_constant_not_a_second_literal(self, monkeypatch, caplog):
+        """(d) The bound is the imported constant, so it cannot drift from the tree.
+
+        Monkeypatching `MAX_ACTIVE_TASKS_RENDERED` in the renderer's namespace
+        must move the cap; a hard-coded `50` in the renderer reads RED here.
+        """
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+
+        monkeypatch.setattr(tks_module, 'MAX_ACTIVE_TASKS_RENDERED', 5)
+
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            _result, probed = await self._render(self._tasks(12), monkeypatch)
+
+        assert probed == [str(i) for i in range(5)], (
+            f'cap did not follow the constant — expected 5 probes, got {len(probed)}'
+        )
+        capped = [r for r in caplog.records if self._CAP_EVENT in r.getMessage()]
+        assert capped, 'overflow against the patched cap must still be reported'
+        assert getattr(capped[0], 'rendered', None) == 5
+        assert getattr(capped[0], 'omitted', None) == 7
+
+    @pytest.mark.asyncio
+    async def test_a_clipped_section_says_so_in_its_own_header(self, monkeypatch):
+        """(e) The payload discloses its own scope — the WARNING is not enough.
+
+        Both stage prompts tell the LLM that absence from this section means
+        "no live signal". Under a cap, absence has a second meaning — past the
+        cap, never probed — and the LLM reads the payload, not the renderer's
+        docstring or the operator's log. So the header itself has to carry the
+        qualification.
+        """
+        from fused_memory.reconciliation.task_filter import MAX_ACTIVE_TASKS_RENDERED
+
+        result, _probed = await self._render(self._tasks(60), monkeypatch)
+
+        header = result.splitlines()[0]
+        assert header.startswith('### Live-Workflow Signals'), header
+        assert str(MAX_ACTIVE_TASKS_RENDERED) in header and '60' in header, (
+            f'the header must name what was probed out of what: {header!r}'
+        )
+        assert 'probed' in header, header
+
+    @pytest.mark.asyncio
+    async def test_an_uncapped_section_keeps_the_bare_header(self, monkeypatch):
+        """(f) ...and the common case reads exactly as it did before the cap."""
+        result, _probed = await self._render(self._tasks(3), monkeypatch)
+
+        assert result.splitlines()[0] == '### Live-Workflow Signals', (
+            'an unclipped render must not acquire a scope note'
+        )
+
+
+class TestLiveWorkflowRenderIsNonBlocking:
+    """The renderer must not pin the event loop while it shells out to git.
+
+    This is the defect task 3778 exists to fix, stated as a test: the recon
+    payload assembler awaited a SYNC `_render_live_workflow_section` that ran
+    blocking `subprocess.run` once per active task, so for 15-43 s at a stretch
+    nothing else on the loop — health checks, heartbeats, MCP replies — could
+    run at all.
+
+    The assertion is a TICKER: a coroutine incrementing a counter every 50 ms
+    runs concurrently with a render whose git probes each take real awaited
+    time. A non-blocking renderer lets the ticker keep ticking; a blocking one
+    pins it at ~0. This is what a `loop_lag`-style field could only report
+    after the fact.
+    """
+
+    _NOW = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+
+    def test_renderer_is_a_coroutine_function(self):
+        import inspect
+
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _render_live_workflow_section,
+        )
+
+        assert inspect.iscoroutinefunction(_render_live_workflow_section)
+
+    def test_memory_consolidator_section_builder_is_a_coroutine_function(self):
+        import inspect
+
+        from fused_memory.reconciliation.stages.memory_consolidator import (
+            MemoryConsolidator,
+        )
+
+        assert inspect.iscoroutinefunction(
+            MemoryConsolidator._build_live_workflow_section
+        ), 'the second payload path must be converted too, or it raises on a coroutine'
+
+    @pytest.mark.asyncio
+    async def test_render_does_not_starve_the_event_loop(self, monkeypatch):
+        import asyncio
+
+        from shared.git_async import GitResult
+
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        from fused_memory.services import live_workflow_detector as lwd
+
+        probe_delay = 0.02
+        n_tasks = 20
+
+        async def slow_run_git(cmd, cwd=None, *, input_text=None, timeout=None):
+            await asyncio.sleep(probe_delay)
+            return GitResult(returncode=1, stdout='', stderr='')
+
+        monkeypatch.setattr(lwd, 'run_git', slow_run_git)
+        monkeypatch.setattr(tks_module, 'is_orchestrator_live_for', lambda _pr: False)
+
+        ticks = 0
+        stop = False
+
+        async def ticker():
+            nonlocal ticks
+            while not stop:
+                await asyncio.sleep(0.005)
+                ticks += 1
+
+        tick_task = asyncio.create_task(ticker())
+        try:
+            await tks_module._render_live_workflow_section(
+                tasks=[{'id': str(i), 'status': 'pending'} for i in range(n_tasks)],
+                project_root=ProjectRoot('/p'),
+                now=self._NOW,
+            )
+        finally:
+            stop = True
+            tick_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await tick_task
+
+        assert ticks > 5, (
+            f'the loop was starved during the render — only {ticks} ticks fired '
+            f'while {n_tasks} tasks were probed; a non-blocking renderer must '
+            f'let other coroutines run'
+        )
 
 
 # ---------------------------------------------------------------------------

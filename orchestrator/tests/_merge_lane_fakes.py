@@ -215,15 +215,30 @@ class FakeClock:
     BOTH by the requested seconds and yields once so other tasks run,
     keeping every requested sleep in ``sleeps``.
 
-    ``tick`` additionally advances ``mono`` on every ``monotonic()`` read.
-    That is how a test drives a lane loop which measures elapsed time off
-    this clock but waits on something else -- the in-flight verify
-    abort-poll waits on ``asyncio.wait(timeout=VERIFY_ABANDON_POLL_SECS)``
-    and only READS ``monotonic()``, so with the default ``tick`` of 0 its
-    no-progress budget can never elapse. Keeping the two counters apart is
-    what makes that safe: a test that ticks an hour per duration reading
-    does not thereby drag every ``now()`` stamp an hour into the future as a
-    side effect of however many durations the lane happened to read.
+    ``wait_for_any`` is the lane's poll cadence, and it charges ``mono``
+    the FULL requested timeout while really waiting only ``wait_cap``.
+    So a loop that polls on this clock and measures its budget off
+    ``monotonic()`` -- the in-flight verify abort-poll is the one that does
+    -- reaches that budget in a bounded number of polls with no real time
+    elapsed, and the task being polled still gets real timer slack to
+    finish in. Every requested timeout lands in ``waits``.
+
+    That slack is finite and DERIVED, so it is worth stating: a polled task
+    gets ``budget / poll * wait_cap`` seconds of real time before the loop
+    exhausts its budget and calls the task dead -- 0.2s at the settings
+    test_merge_queue_lifecycle_registry.py uses (budget 0.2, poll 0.02). A
+    test whose fake verify genuinely needs longer -- an awaited subprocess,
+    a git operation, a loaded host -- raises ``wait_cap`` rather than
+    false-aborting a healthy verify.
+
+    ``tick`` additionally advances ``mono`` on every ``monotonic()`` read,
+    for a lane loop that measures elapsed time off this clock but waits on
+    something else. Keeping the two counters apart is what makes both safe:
+    a test that ticks an hour per duration reading does not thereby drag
+    every ``now()`` stamp an hour into the future as a side effect of
+    however many durations the lane happened to read -- which is also why
+    ``wait_for_any`` moves ``mono`` alone while ``sleep``, being real
+    elapsed time, moves both.
 
     ``newest_content_mtime`` reports ``content_mtime`` -- ``None`` or a
     frozen value being a merge worktree nothing is writing to -- and
@@ -239,13 +254,16 @@ class FakeClock:
         tick: float = 0.0,
         content_mtime: float | None = None,
         content_tick: float = 0.0,
+        wait_cap: float = 0.02,
     ) -> None:
         self.time = time
         self.mono = time
         self.tick = tick
         self.content_mtime = content_mtime
         self.content_tick = content_tick
+        self.wait_cap = wait_cap
         self.sleeps: list[float] = []
+        self.waits: list[float] = []
         self.content_probes: list[Path] = []
 
     def now(self) -> float:
@@ -268,6 +286,16 @@ class FakeClock:
         self.time += secs
         self.mono += secs
         await asyncio.sleep(0)
+
+    async def wait_for_any(self, aws: Collection[Any], timeout: float) -> set[Any]:
+        self.waits.append(timeout)
+        # A REAL bounded wait, never a bare yield: a yield reschedules on the
+        # ready queue without letting any timer fire, which starves whatever
+        # is being polled. The cap is what makes the fake -- not the wall
+        # clock -- own the cadence of a production-sized poll.
+        done, _ = await asyncio.wait(aws, timeout=min(timeout, self.wait_cap))
+        self.mono += timeout
+        return done
 
 
 class RecordingEscalations:

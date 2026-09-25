@@ -415,6 +415,9 @@ lint_command: "uv run ruff check shared escalation fused-memory orchestrator das
 #   tests/scripts/test_unblock_skill_done_provenance_templates.py — reads
 #       skills/unblock/SKILL.md to validate its done_provenance payload
 #       literals against the live DoneProvenance model (task 4095).
+#   tests/scripts/test_shadow_ruling_doc_contract.py — reads
+#       skills/escalation-watcher/SKILL.md to validate its x_shadow_ruling
+#       payload literals against the live parser (task 5374).
 # So the union includes orchestrator/tests/ — the fleet's largest suite —
 # duplicated on every review checkpoint, main-tip sweep and merge full-verify.
 # That is far worse than the single-suite duplication 3485 assumed, and it
@@ -1076,7 +1079,28 @@ verify_admission_pytest_n: "8"
 # 49-72 and non-discriminating at this load, per task 3590).
 # The main-tip sweep (background role) shares this slot and was already live in
 # the 1-slot regime the 2300s figure comes from.
-verify_admission_task_slots: 1
+# RAISED 1 -> 2 (operator decision, Leo 2026-09-23). Deliberately overrides the
+# "So 2 slots is not a middle ground either" line above, which was written from
+# the 09-03 3-slot episode and never tested 2 directly. What changed since:
+#   - merge rate  9.71 -> 16.29 /day (first vs second 7d of 09-09..09-22)
+#   - merge verify duration 64.3 -> 55.2 min mean over the same split (~49 today)
+#   - 24/24 concurrency slots occupied while only 4 tasks execute; 20 park at
+#     `phase_enter verify` behind this one flock
+#   - backlog +16.6 pending/day (burndown.db 992 -> 1080 over 5.3d), median
+#     pending age 14.2d, 225 high-priority waiting
+# UNDER OBSERVATION, WITH A DATED REVERT: task 5797 fires 48h after this lands
+# and re-measures; if median task duration or timeouts/day worsen, put this back
+# to 1. That is the same reversibility clause the 09-03 raise carried, which did
+# fire and was honoured.
+# MEASUREMENT GAP, stated rather than papered over: the "~23% of ONE slot"
+# figure above could NOT be re-verified on 2026-09-23 — `workflow_verify` events
+# carry only {base_sha, branch, passed, tip_sha} and NO duration, so task-lane
+# slot-hours are not derivable from the event store at all. Only the leg COUNT
+# is: 572 workflow_verify events in 14.4d versus the ~240/14d that figure was
+# computed from. Task 5798 closes that gap. Until it lands, this knob is being
+# tuned on merge-lane duration plus queue-depth observation, not on task-lane
+# slot utilisation.
+verify_admission_task_slots: 2
 
 # Pin `-n auto` for every verify subprocess (task 3589's residual, operator
 # decision Leo 2026-09-08). pytest-xdist resolves `-n auto` via psutil physical
@@ -1254,6 +1278,30 @@ budgets:
   implementer: 20.0
   merger: 8.0
 
+# Steward LIFETIME budget (flat, per-task: one steward instance handles one
+# task's escalations and accumulates across its own invocations).  RAISED
+# 12.0 -> 20.0 on 2026-09-21 by Leo's ruling (option A of cockpit decision
+# steward-lifetime-budget-cap-2026-09-19), after SIX tasks exhausted the $12
+# cap: 3353 ($12.02), 3592 ($12.02), 5488 ($12.49), 5557 ($14.82), 5588
+# ($16.12) and 4797 ($13.29).  All six were tasks whose work was finished or
+# genuinely in progress -- the recurring shape is a steward stopping ONE call
+# short of closing out.  Three of the six overran by only 0.2-4%.  Cost of the
+# old value: three spawned /unblock sessions, two tasks left blocked (5588 at
+# HIGH with a complete green plan; 4797 mid-rebase), and -- suspected, not yet
+# measured -- stewards ceasing to drain L0s, which is one candidate cause of
+# the 27h L0 strand that esc-__stale_l0_strand_sweep__-14 reported.
+#
+# 20.0 clears the largest observed total ($16.12) with ~24% headroom while
+# keeping a real guard.  NOTE the guard is checked BEFORE an invocation and the
+# last call may overshoot (per_invocation = min(budgets.steward, remaining)),
+# so an observed total can exceed the cap; budget the ceiling accordingly.
+#
+# Green-tier hot-reloadable (config.py "Steward grace" group), so this is a
+# reload not a restart, and reverting is equally cheap.  Leo is still weighing
+# option C (a PER-TASK cap rather than this flat one); if C lands, this flat
+# value becomes the fallback for tasks carrying no explicit override.
+steward_lifetime_budget: 20.0
+
 # Per-role model overrides (project-level; defaults.yaml is the fleet default).
 # implementer/debugger sonnet -> opus on dark-factory ONLY, for a two-week
 # canary from 2026-09-10 (Leo ruling D4). Basis: on the same task population
@@ -1278,6 +1326,20 @@ models:
   # drop-guard violation and +23% per run ($1.64 vs $1.33 median) on ~18-79 runs/month.
   # Cache read is $0.25/Mtok (measured), so the swap premium is output + cache-create only.
   merger: claude-fable-5-1
+
+# Every role that runs Opus here drops effort max -> xhigh (Leo, 2026-09-24): early
+# reports on the newly released Opus show max burning many times the reasoning tokens
+# of xhigh for minimal improvement in results. This supersedes defaults.yaml's
+# eval-held architect max (task 2848). reviewer and steward already run Opus at high.
+# The Fable merger drops max -> high, the effort the D5 merger replay actually
+# validated it at (plans/fable-evidence-package-2026-09-10/merger_replay.py); max on
+# Fable was never evaluated. Hot-reloadable (green tier).
+effort:
+  architect: xhigh
+  implementer: xhigh
+  debugger: xhigh
+  merger: high
+  deep_reviewer: xhigh
 
 # Model routing (Leo ruling D6, 2026-09-10; applied 2026-09-12). Admits claude-fable-5-1
 # for exactly two roles: the merger (via models.merger above) and the steward on its
@@ -1642,3 +1704,10 @@ git:
 speculation_probe:
   probe_fraction: 0.0
   suppress_flake_rate: 0.40
+
+# Attended-mode B3 (low-risk auto-unblock) ON — Leo, 2026-09-25, after the gate check in
+# plans/escalation-watcher-prompting-study-2026-09-23.md. SKILL-FACING: read by the
+# interactive L2 watcher session (skills/escalation-watcher/SKILL.md "Applicability"),
+# never by an orchestrator process — no restart, no reload_config.
+unblock_auto:
+ attended_b3_enabled: true

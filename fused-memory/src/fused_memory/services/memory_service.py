@@ -2423,7 +2423,7 @@ class MemoryService:
                     success=True,
                 )
             return result
-        except Exception as e:
+        except (Exception, asyncio.CancelledError) as e:
             if self._write_journal:
                 await self._write_journal.log_backend_op(
                     write_op_id=write_op_id,
@@ -2432,7 +2432,7 @@ class MemoryService:
                     operation=operation,
                     payload=payload,
                     success=False,
-                    error=str(e),
+                    error=f'{type(e).__name__}: {e}',
                 )
             raise
 
@@ -3224,10 +3224,12 @@ class MemoryService:
         utils/canonical_labels.py.
 
         Survivor selection is ONE rule: the family's first member under the
-        backend's survivor-first ordering (most valid edges, then oldest, then
-        uuid) survives, every other member is merged into it, and it is renamed
-        onto the canonical name last. The earlier two-branch policy — a
-        canonically-named node wins regardless of edge count — existed to avoid
+        backend's survivor-first ordering (highest provenance_rank, then oldest,
+        then uuid — where provenance_rank is valid RELATES_TO plus Episodic
+        MENTIONS, task 4986, so episode links now count toward survival too)
+        survives, every other member is merged into it, and it is renamed onto
+        the canonical name last. The earlier two-branch policy — a
+        canonically-named node wins regardless of provenance — existed to avoid
         recreating the exact-name duplicate ``_dedup_episode_nodes`` resolves.
         Where the two policies differ is the tracked motivating case: with
         'Task 605' holding 2 edges and 'task 605' holding 13, the old rule
@@ -5727,6 +5729,10 @@ class MemoryService:
 
         result = None
         error_msg = None
+        # Set only once the backend await returns, never inferred from a None
+        # error_msg: a BaseException the handler below does not name must not
+        # journal as a success either.
+        succeeded = False
         try:
             result = await self._journaled_backend_call(
                 write_op_id=write_op_id,
@@ -5738,8 +5744,9 @@ class MemoryService:
                     content=payload['content'], scope=scope, metadata=metadata
                 ),
             )
+            succeeded = True
             return result
-        except Exception as e:
+        except (Exception, asyncio.CancelledError) as e:
             error_msg = f'{type(e).__name__}: {e}'
             raise
         finally:
@@ -5764,7 +5771,7 @@ class MemoryService:
                         'category': metadata.get('category', ''),
                     },
                     result_summary=str(result)[:500] if result else None,
-                    success=error_msg is None,
+                    success=succeeded,
                     error=error_msg,
                 )
 
@@ -6070,7 +6077,9 @@ class MemoryService:
             known_project_ids=self._known_projects,
         )
 
-        success = True
+        # Set only once enqueue() commits: `success` on a write_ops row means
+        # "the enqueue was ACCEPTED" (_execute_mem0_write has the same shape).
+        success = False
         error_msg = None
         try:
             # NO 'uuid' KEY — deliberately (task 3561). graphiti_core
@@ -6117,9 +6126,9 @@ class MemoryService:
                 },
                 callback_type='dual_write_episode',
             )
-        except Exception as e:
-            success = False
-            error_msg = str(e)
+            success = True
+        except (Exception, asyncio.CancelledError) as e:
+            error_msg = f'{type(e).__name__}: {e}'
             raise
         finally:
             if self._write_journal:
@@ -10357,8 +10366,9 @@ class MemoryService:
         """Merge two Graphiti entity nodes by redirecting edges and deleting the deprecated.
 
         Delegates to GraphitiBackend.merge_entities(), which validates both nodes,
-        redirects all edges from the deprecated node to the surviving node, deletes
-        the deprecated node, and refreshes the surviving node's summary.
+        redirects all RELATES_TO edges AND relocates Episodic MENTIONS provenance
+        from the deprecated node onto the surviving node, deletes the deprecated
+        node, and refreshes the surviving node's summary.
         Logs the operation via write journal if available.
 
         Args:
@@ -10372,7 +10382,14 @@ class MemoryService:
 
         Returns:
             Audit dict from backend: {surviving_uuid, surviving_name, deprecated_uuid,
-            deprecated_name, edges_redirected, surviving_summary}.
+            deprecated_name, deprecated_summary, edges_redirected,
+            mentions_redirected, residual_relationships_destroyed,
+            duplicate_edges_removed, surviving_summary}.
+
+            This dict is exactly what log_write_op persists as `result_summary`
+            below, so the merge's provenance record — including the deprecated
+            node's summary text, which nothing else preserves — is durable in the
+            write journal and not only in the backend's log line.
         """
         write_op_id = str(uuid_mod.uuid4())
         success = True

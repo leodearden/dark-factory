@@ -37,7 +37,7 @@ the only assertion that bites: a pasted copy compares equal field-for-field
 while being a distinct type.
 
 ``environment_map`` is the THIRD lift, and its second consumer is NOT a fourth
-checker: it is ``scripts/render_dashboard_unit.py``, the renderer setup-host.sh
+checker: it is ``scripts/render_systemd_unit.py``, the renderer setup-host.sh
 now uses in place of a truncating ``sed`` redirect to install BOTH
 dark-factory-dashboard.service (task 4793) and fused-memory.service (task 4796
 — one renderer, selected by ``--unit`` off its ``UNITS`` registry). That
@@ -77,7 +77,7 @@ reproduce, in the checkers themselves, precisely the failure they exist to
 report. ``check_dashboard_unit_parity.py`` re-exports these three names so its
 own module surface (and its test suite) stays intact, and
 ``tests/scripts/test_check_orchestrator_unit_parity.py`` (for the parser and
-``find_dropins``) and ``tests/scripts/test_render_dashboard_unit.py`` (for
+``find_dropins``) and ``tests/scripts/test_render_systemd_unit.py`` (for
 ``environment_map``) each assert the re-export is the SAME function object
 rather than a look-alike.
 
@@ -336,7 +336,7 @@ def environment_map(
 
     TWO CONSUMERS, and they must agree. ``check_dashboard_unit_parity.py``
     COMPARES these variables across the committed and installed copies;
-    ``render_dashboard_unit.py`` PRESERVES the host-local ones when
+    ``render_systemd_unit.py`` PRESERVES the host-local ones when
     setup-host.sh re-renders the installed unit. A value the checker can see
     has to be exactly a value the installer can preserve, so a second reader
     with its own idea of what an ``Environment=`` line means would let the

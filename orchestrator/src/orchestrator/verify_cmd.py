@@ -112,13 +112,16 @@ _CHAIN_OPERATOR_TOKENS = frozenset({'&&', '||', ';', '|'})
 
 # Genuinely value-taking pytest flags that consume a SEPARATE following
 # token (as opposed to a boolean flag, or a `--flag=value` single token).
-# Used by _split_pytest_args to bind a value flag to its value as an
-# adjacent pair inside base_flags at parse time, so a later base_flags
-# append (apply_pytest_numprocesses, serial_pytest, with_junitxml) can never
-# be inserted between the flag and its value (task 2727). This set must
-# stay CLOSED to only value-taking flags — listing a boolean flag (e.g.
-# -x/-s/-v/-q/-l) here would make the walk swallow the following target
-# token, a silent, worse failure than the stranded-value bug this fixes.
+# THE COMPLETE parse-side declaration: _split_pytest_args binds each of these
+# to its value as an adjacent pair inside base_flags at parse time, so a later
+# base_flags append (apply_pytest_numprocesses, serial_pytest, with_junitxml)
+# can never be inserted between the flag and its value (task 2727). A flag is
+# listed here because PYTEST takes its value as a separate token — a fact that
+# holds no matter who wrote the flag, an operator's config or this module's
+# own mutators. This set must stay CLOSED to only value-taking flags —
+# listing a boolean flag (e.g. -x/-s/-v/-q/-l) here would make the walk
+# swallow the following target token, a silent, worse failure than the
+# stranded-value bug this fixes.
 #
 # OMITTING a value-taking flag is the other direction of the same defect,
 # and task 5408 measured what it costs on a live config. With `--dist`
@@ -132,12 +135,80 @@ _CHAIN_OPERATOR_TOKENS = frozenset({'&&', '||', ';', '|'})
 # listed here: `--numprocesses`/`--maxprocesses` are xdist's long spellings
 # for the worker count and its cap, and a set that binds `-n` but not `-n`'s
 # own long spelling is the same latent defect one config rename away.
+#
+# `--timeout`/`--junitxml` were the last two omissions (task 5580, measured
+# below): value-taking flags no config had to contain, because this module
+# emits them itself.
 _PYTEST_VALUE_FLAGS = frozenset({
-    '-k', '-m', '-p', '-o', '-c', '-n', '-W',
+    '-k', '-m', '-c', '-W', '-p', '-o', '-n',
     '--maxfail', '--tb', '--rootdir', '--override-ini',
     '--deselect', '--ignore', '--ignore-glob',
     '--dist', '--numprocesses', '--maxprocesses',
+    '--timeout', '--junitxml',
 })
+
+# The SUBSET of the above that THIS MODULE's own mutators emit —
+# `-p no:xdist -o addopts=` (serial_pytest), `-n <count>`
+# (apply_pytest_numprocesses), `--timeout <secs>` (with_pytest_timeout),
+# `--junitxml <path>` (with_junitxml). A subset rather than a second
+# declaration folded into the set above, because the two answer orthogonal
+# questions: the parse side answers "does pytest take a separate value token
+# for this flag", a fact about pytest; this answers "do WE write it", a fact
+# about this module. Keeping them apart means a mutator that stops emitting a
+# flag (say serial_pytest preferring `--override-ini`) shrinks only this set
+# and cannot silently un-bind that flag for a config that still writes it.
+#
+# The one direction that must stay closed is enforced twice over: the assert
+# below holds this set inside the parse-side set at import, and
+# _append_value_flag — the single site that emits a pair — checks membership
+# here. So a future mutator emitting an undeclared value flag fails at its
+# first call, and declaring one the parser does not bind fails at import,
+# rather than either failing in the fleet.
+#
+# The drift that closes was real and costly. A merge-gate command is rewritten
+# as a STRING twice — confirm_isolated_rerun_verdict renders the scoped
+# re-run ending in `--timeout 300`, then run_verification RE-PARSES that
+# string to append `--junitxml` — and neither of those two self-emitted flags
+# was bound, so `300` came back as a test TARGET and the flag was stranded::
+#
+#     pytest -p no:xdist -o addopts= --timeout --junitxml <path> 300 <node>
+#     pytest: error: argument --timeout: expected one argument      (rc=4)
+#
+# Measured cost: every merge_gate observation in the flake ledger — 350
+# `fails_in_isolation`, ZERO `passes_in_isolation`, 2026-08-30 to 2026-09-17 —
+# recorded a rejected command as a real red (task 5580).
+_EMITTED_VALUE_FLAGS = frozenset({'-p', '-o', '-n', '--timeout', '--junitxml'})
+
+assert _EMITTED_VALUE_FLAGS <= _PYTEST_VALUE_FLAGS, (
+    f'{sorted(_EMITTED_VALUE_FLAGS - _PYTEST_VALUE_FLAGS)} are emitted as '
+    f'value flags but are not bound at parse time, so the next rewrite of a '
+    f'rendered command would strand them and admit their values as test '
+    f'targets'
+)
+
+
+def _append_value_flag(cmd: VerifyCmd, flag: str, value: str) -> VerifyCmd:
+    """Append a ``<flag> <value>`` pair to *cmd*'s ``base_flags``.
+
+    THE single site that emits such a pair, so the emit side and the parse
+    side cannot disagree: a flag this module appends is declared in
+    ``_EMITTED_VALUE_FLAGS``, which the import-time assert above holds inside
+    ``_PYTEST_VALUE_FLAGS`` — so it is, by construction, a flag
+    ``_split_pytest_args`` binds to its value when the rendered command is
+    re-parsed by the next rewrite. Without that, an unbound flag is stranded
+    and its value is admitted as a TEST TARGET — see ``_EMITTED_VALUE_FLAGS``.
+
+    The assert is the same defensive, self-describing style as ``render``'s
+    P1/P3 invariant asserts: no current caller can reach it, and it is what a
+    future mutator emitting a new value flag trips on.
+    """
+    assert flag in _EMITTED_VALUE_FLAGS, (
+        f'{flag!r} is emitted as a value flag but is not declared in '
+        f'_EMITTED_VALUE_FLAGS, so nothing holds it inside '
+        f'_PYTEST_VALUE_FLAGS and re-parsing the rendered command could '
+        f'strand it and admit {value!r} as a test target'
+    )
+    return replace(cmd, base_flags=(*cmd.base_flags, flag, value))
 
 # Canonical head phrase rendered for each structured ToolKind. CARGO_TEST/
 # CARGO_CLIPPY intentionally exclude this — cargo's rest-tokens are carried
@@ -1882,11 +1953,9 @@ def serial_pytest(cmd: VerifyCmd) -> VerifyCmd:
         if rewritten == cmd.raw:
             return cmd
         return replace(cmd, raw=rewritten)
-    return replace(
-        cmd,
-        base_flags=(
-            *_strip_xdist_worker_flags(cmd.base_flags), '-p', 'no:xdist', '-o', 'addopts=',
-        ),
+    shed = replace(cmd, base_flags=_strip_xdist_worker_flags(cmd.base_flags))
+    return _append_value_flag(
+        _append_value_flag(shed, '-p', 'no:xdist'), '-o', 'addopts=',
     )
 
 
@@ -1955,7 +2024,7 @@ def apply_pytest_numprocesses(cmd: VerifyCmd, n: str) -> VerifyCmd:
         if rewritten == cmd.raw:
             return cmd
         return replace(cmd, raw=rewritten)
-    return replace(cmd, base_flags=(*cmd.base_flags, '-n', n))
+    return _append_value_flag(cmd, '-n', n)
 
 
 def with_junitxml(cmd: VerifyCmd, junit_path: str) -> VerifyCmd:
@@ -1987,7 +2056,7 @@ def with_junitxml(cmd: VerifyCmd, junit_path: str) -> VerifyCmd:
     """
     if cmd.tool is not ToolKind.PYTEST or cmd.raw is not None:
         return cmd
-    return replace(cmd, base_flags=(*cmd.base_flags, '--junitxml', junit_path))
+    return _append_value_flag(cmd, '--junitxml', junit_path)
 
 
 def with_pytest_timeout(cmd: VerifyCmd, secs: int) -> VerifyCmd:
@@ -2018,7 +2087,7 @@ def with_pytest_timeout(cmd: VerifyCmd, secs: int) -> VerifyCmd:
     """
     if cmd.tool is not ToolKind.PYTEST or cmd.raw is not None:
         return cmd
-    return replace(cmd, base_flags=(*cmd.base_flags, '--timeout', str(secs)))
+    return _append_value_flag(cmd, '--timeout', str(secs))
 
 
 def govern_cpu(cmd: VerifyCmd, exec_path: str | None) -> VerifyCmd:

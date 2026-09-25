@@ -470,18 +470,24 @@ very next tick with no operator action, since a new SHA prunes the stale
 cache entry.
 
 **Descriptor shape** (`shared.capability_manifest.DeliveredCheckMeta`; the
-`grep`/`script` fields are mutually exclusive and cross-validated):
+per-kind fields are mutually exclusive and cross-validated):
 
 ```
 {
   name: str,                      # required; names the capability in escalations
-  kind: "grep" | "script",
+  kind: "grep" | "script" | "path",
 
-  # kind="grep" — evaluated against the COMMITTED tree at `main` via
+  # kind="grep" — file CONTENTS, against the COMMITTED tree at `main` via
   # `git grep -E -e <pattern> <ref> [-- <paths...>]`
   pattern: str,                    # required iff kind="grep"
-  expect: "present" | "absent",    # required iff kind="grep"
-  paths: [str],                    # optional, kind="grep" only
+
+  # kind="path" — file EXISTENCE, against the COMMITTED tree at `main` via
+  # `git ls-tree -r --full-tree --name-only <ref> -- <path>`, once per entry
+  expect: "present" | "absent",    # required iff kind="grep" or kind="path"
+  paths: [str],                    # optional SCOPE for kind="grep";
+                                   # required and non-empty for kind="path",
+                                   # where each entry must be repo-relative,
+                                   # non-empty and free of ".." segments
 
   # kind="script" — evaluated against the WORKING CHECKOUT via
   # `<project_root>/<script> <args>`, bounded by timeout_secs
@@ -492,9 +498,12 @@ cache entry.
 ```
 
 `grep` is the primary kind (reads exactly what's on `main`, immune to
-working-checkout dirtiness); `script` is the escape hatch for capabilities
-that can't be expressed as a pattern, at the cost of running against the
-working checkout rather than a materialized `main` tree.
+working-checkout dirtiness). `path` reads the same committed tree but asserts
+EXISTENCE rather than contents, and is CONJUNCTIVE over its `paths`: every
+listed entry must exist for `expect: "present"`, every one must be gone for
+`expect: "absent"`. `script` is the escape hatch for capabilities that can't
+be expressed as either, at the cost of running against the working checkout
+rather than a materialized `main` tree.
 
 **Dispatch-time policy**
 
@@ -518,6 +527,18 @@ A `grep` for a SYMBOL NAME asserts that a string appears in a file, not that
 a behaviour exists. It is satisfiable by prose — a comment, a docstring, or a
 variable named after the thing — so it must never stand in for a behavioural
 capability. Prefer a pattern that can only match a real implementation.
+
+For a FILE-EXISTENCE capability — "does file X exist", "was file X added",
+"was file X removed" — use `kind: "path"`, never a `kind: "grep"` pattern
+naming the file. A grep reads file CONTENTS, so a pattern naming a file can
+only go green if some file happens to mention that name in its text. The
+canonical specimen, measured: task 3536 asserted `kind: "grep"`,
+`expect: "present"`, `pattern: "test_workflow_merge_gating_strand"` scoped to
+`orchestrator/tests/`. The FILE exists on `main`, but a test module does not
+mention its own filename, so the check could never go green — and it blocked
+four dependents (3537, 3544, 3545, 3837). `kind: "path"` with
+`paths: ["orchestrator/tests/test_workflow_merge_gating_strand.py"]` says
+what was meant.
 
 When the capability IS behavioural, prefer `kind: "script"` pointing at a
 COMMITTED predicate. If the same invariant is already gated elsewhere (a
@@ -1569,6 +1590,104 @@ anything depending on that id), history, and any escalations already
 attached to it. To retire a task instead of correcting it, cancel it
 (`status="cancelled"`) rather than removing it, so the record and its id
 remain resolvable by anything that referenced it.
+
+## 10. Rotating a long-running audit-trail task
+
+A task that stays open across many reconciliation cycles accretes. Each
+cycle appends a narrative block to `description` and mints a fresh dated
+top-level key in `metadata`, and nothing ever removes either. The task
+becomes its own audit trail — which is the point — but an audit trail
+that cannot be read is not an audit trail.
+
+**The failure is measured, not hypothetical.** Three independent tasks
+have grown past the MCP tool-result ceiling:
+
+| Task | Size at failure | Symptom |
+|------|-----------------|---------|
+| `autopilot_video` 452 | 56,565 B whole-task payload | `get_task`/`update_task` responses errored client-side; writes frozen 2026-08-06 → 2026-08-24 (18 days) |
+| `solar_challenge_platform` 165 | 54,314 chars description | `get_task` hard-failed outright on max tool-result size |
+| `dark_factory` 3524 | 59,116 chars description | same hard failure; the task parking the whole consolidation backlog became unreadable |
+
+Task 452's remediation (`autopilot_video` 648) left it at ~22,800 B,
+which transports cleanly. That is the only post-remediation size anyone
+has actually measured working.
+
+### The threshold
+
+**Rotate when the whole-task payload — `title` + `description` +
+`details` + `metadata` — exceeds 20,000 bytes. Rotate down to ≤10,000
+bytes.**
+
+20,000 B is 37% of the lowest observed failure (54,314) and sits just
+under the one size measured to work (~22,800), so the rule keeps a task
+below the size known to be fine rather than merely below the size known
+to break. The headroom is deliberate: the largest single-cycle append
+measured on these tasks is 2,753 B, so 34,000 B of slack is about eleven
+worst-case cycles — enough that a task cannot cross the ceiling between
+one rotation check and the next.
+
+**Rotate pre-emptively, regardless of size, once the accrual PATTERN
+appears** — one new dated top-level metadata key per cycle, or one new
+appended description block per cycle. The pattern is the defect; the
+byte count only says how long you have left.
+
+### The shape
+
+Nothing is deleted. The TASK is bounded; the CONTENT is retained.
+
+1. **Write the archive first.** Put the full text being rotated out into
+   a mem0 `observations_and_summaries` entry — verbatim, not summarized —
+   and re-read it (`get_memory_by_id`) to confirm it landed byte-identical
+   before removing anything from the task. `add_memory` returning an id
+   does not mean it landed.
+2. **`description` becomes a rolling summary plus counts and candidate
+   lists**: what the task is, its scope as an enumerated item list with
+   each item's current state, and the open questions. Not the narrative of
+   how it got there.
+3. **Per-cycle `metadata` keys become ONE bounded array, newest-first**,
+   with an explicit cap. A value repeated identically across entries
+   (a boilerplate result string, a list of index names) is factored out to
+   a single sibling key rather than restated per entry.
+4. **Record the loss legibly.** A rollup key naming the archive memory id,
+   the before/after byte counts, how many entries were kept and how many
+   shed, and which ones. A reader must be able to tell what left and where
+   it went.
+5. **Link the archive from `memory_hints.queries`**, so the detail is
+   reachable from the task.
+6. **Leave a standing instruction on the task**: future cycles append to
+   the bounded array and drop the oldest past the cap; they do not mint a
+   new top-level key.
+
+What you shed must be the oldest and most redundant material — entries
+that record only that nothing changed. Content-bearing entries
+(a correction that reverses an earlier claim, a disposition the eventual
+execution still needs) stay on the task, restructured as data if they
+were prose.
+
+### Mechanics
+
+- `metadata_mode='replace'` is the only way to REMOVE a metadata key;
+  the default shallow merge can add and overwrite but never delete. Send
+  the complete new blob — a `replace` drops every key you omit, including
+  the gate markers (`task_kind`, `operational_mode`, `always_escalates`,
+  `execution_class`).
+- `description` is replace-only and capped at 5,000 characters. Breaching
+  the cap times out and the write does NOT land. Combining `append=True`
+  with `description`/`title`/`priority` is rejected outright.
+- Split `details` (append-capable) and `metadata`/`title` into separate
+  `update_task` calls — `append=True` silently drops `metadata` and
+  `title` passed in the same call.
+- Re-read the task from the store afterwards and confirm the status, the
+  gate markers and the untouched columns survived.
+
+**Rotation is not adjudication.** Rotating a parked gate touches its
+`description` and `metadata` only. Its status, its ruling in `details`,
+and its substantive question are out of scope.
+
+Worked precedents: `autopilot_video` 648 (mem0
+`971d0b38-426d-41f8-be8f-9515ec01cae5`) for the bounded-array trim;
+`solar_challenge_platform` 166/167 for the retain-and-tag shape;
+`autopilot_video` 654 and 655 (2026-09-22) for both applied together.
 
 ---
 

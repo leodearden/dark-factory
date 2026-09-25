@@ -37,9 +37,20 @@ a second copy of that contract would only drift out of step with it.
 What is this script's own business is the exit code: every refusal is a
 structured ``error`` dict, printed as JSON and exiting 1. Only ``status:
 repaired`` (a write that was made and verified) and ``status: dry_run`` exit 0.
-Backend failures are refusals like any other, not tracebacks — a read-only
-``data/`` raises inside the journal and comes back as ``journal_error`` with the
-``phase`` that failed, which is the one this path has actually hit.
+
+Backend failures are refusals like any other, not tracebacks. Journal I/O that
+raises is reported, not thrown: ``journal_error`` carries
+the ``phase`` that failed (read / write / verify) and a hint saying whether
+anything was written — a read-only data dir is the failure this path has
+actually hit. And a repair that IS written but does not survive the
+read-after-write check (another writer rewrote the whole blob in between) is
+reported as ``repair_clobbered`` rather than a false ``repaired``; a competing
+rewrite that lands BEFORE the write is refused as ``concurrent_modification``
+with nothing written. A backend that fails to CONNECT is reported the same way,
+as ``startup_failed`` naming the failing ``component`` (``config``, ``journal``
+or ``memory_service``), each with the hint for ITS subsystem — whatever journal
+handle had been opened is closed on every one of those paths, rather than
+leaking behind a traceback. Every one of those exits 1.
 
 The incident this was written for (task 3065 — ``memory_not_found``)
 --------------------------------------------------------------------
@@ -147,6 +158,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import sys
@@ -250,6 +262,66 @@ async def run(args: argparse.Namespace, *, journal: Any, memory: Any) -> dict[st
     )
 
 
+# A backend that failed to CONNECT, reported rather than thrown. Mirrors
+# ``citation_repair._ERR_*`` / ``_JOURNAL_ERROR_HINTS`` / ``_journal_error``,
+# with ``component`` playing the role ``phase`` plays there: the operator's one
+# question is which backend failed and whether anything was repaired.
+_ERR_STARTUP_FAILED: dict[str, str] = {
+    'error': 'startup_failed',
+    'error_type': 'ReconCitationStartupFailed',
+}
+
+_STARTUP_ERROR_HINTS: dict[str, str] = {
+    'config': (
+        'the fused-memory configuration could not be loaded, so NOTHING was '
+        'repaired, no journal was opened and no durable blob was touched. The '
+        'realistic causes are a malformed or unreadable config.yaml, or a '
+        'required setting with no default and no environment variable to '
+        'supply it — a pydantic ValidationError names the offending field. '
+        'This failure is upstream of the journal entirely, so --data-dir and '
+        'reconciliation.db are NOT the thing to check.'
+    ),
+    'journal': (
+        'the reconciliation journal could not be opened, so NOTHING was '
+        'repaired and no durable blob was touched. The realistic causes are a '
+        'missing or unreadable reconciliation.db, or a data dir that does not '
+        'exist or is not writable — check --data-dir (it defaults to the '
+        'CONFIGURED reconciliation data_dir, which is the one the running '
+        'server owns) and re-run.'
+    ),
+    'memory_service': (
+        'the memory service could not be initialized, so NOTHING was repaired '
+        'and the durable stage_reports blob is untouched — the journal was '
+        'opened and has been closed again. The realistic causes are a Qdrant '
+        'that is down or unreachable, or a missing/invalid OPENAI_API_KEY. '
+        'Corroboration needs a live Mem0 read, and a citation whose lookup '
+        'could not run is UNKNOWN, never confirmed-absent, so the repair '
+        'cannot proceed without it. Restore the backend and re-run.'
+    ),
+}
+
+
+def _startup_error(component: str, exc: BaseException) -> dict[str, Any]:
+    """The verdict for a backend that failed to construct or initialize.
+
+    The startup mirror of ``citation_repair._journal_error(phase, ...)``: the
+    raised type and message are carried as structured facts rather than
+    propagating as a traceback out of an operator tool (INV-2).
+    """
+    logger.warning(
+        'repair_recon_citation: %s startup raised %s: %s',
+        component,
+        type(exc).__name__,
+        exc,
+    )
+    return _ERR_STARTUP_FAILED | {
+        'component': component,
+        'exception_type': type(exc).__name__,
+        'exception_message': str(exc),
+        'hint': _STARTUP_ERROR_HINTS[component],
+    }
+
+
 def exit_code_for(outcome: dict[str, Any]) -> int:
     """0 only for a resolved repair or a clean dry-run; 1 for anything else.
 
@@ -285,19 +357,61 @@ def main() -> int:
         )
         from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
 
-        config = FusedMemoryConfig()
-        data_dir = Path(args.data_dir or config.reconciliation.data_dir)
-
-        journal = ReconciliationJournal(data_dir)
-        await journal.initialize()
-        memory = MemoryService(config)
-        await memory.initialize()
+        # Backend construction is INSIDE the cleanup scope: a Qdrant/OpenAI
+        # connect failure used to leave the already-opened journal unclosed and
+        # print a traceback instead of the structured JSON this script promises.
+        #
+        # Config gets its OWN component because the hint is the operator-facing
+        # half of the verdict: a ValidationError out of config.yaml reported
+        # under 'journal' would send the operator to check --data-dir and a
+        # reconciliation.db that was never even opened.
         try:
-            outcome = await run(args, journal=journal, memory=memory)
-        finally:
-            if hasattr(memory, 'close'):
+            config = FusedMemoryConfig()
+            data_dir = Path(args.data_dir or config.reconciliation.data_dir)
+        except Exception as exc:
+            return report(_startup_error('config', exc))
+
+        # Bound before the try so the except can close a journal that opened a
+        # connection and THEN failed: initialize() assigns self._db first and
+        # only afterwards applies pragmas, runs the schema script and the
+        # migrations, so a corrupt DB or a read-only file fails with a live
+        # handle nobody else holds a reference to. close() is best-effort here —
+        # the startup verdict must survive a failing teardown.
+        journal = None
+        try:
+            journal = ReconciliationJournal(data_dir)
+            await journal.initialize()
+        except Exception as exc:
+            if journal is not None:
+                with contextlib.suppress(Exception):
+                    await journal.close()
+            return report(_startup_error('journal', exc))
+
+        try:
+            try:
+                memory = MemoryService(config)
+                await memory.initialize()
+            except Exception as exc:
+                # A ``return`` here still runs the outer ``finally``, which is
+                # what closes the journal on this path. A MemoryService that
+                # failed to initialize is deliberately NOT closed: close() walks
+                # per-backend handles that may not exist yet, so calling it on a
+                # failed init risks a second exception masking the first.
+                return report(_startup_error('memory_service', exc))
+            try:
+                outcome = await run(args, journal=journal, memory=memory)
+            finally:
+                # Unconditional: MemoryService.close is always defined and is
+                # itself per-backend defensive via _safe_close, so a hasattr
+                # guard here would only hide a genuinely missing method.
                 await memory.close()
+        finally:
             await journal.close()
+
+        # Deliberately NOT inside the try: an exception out of run() must still
+        # PROPAGATE. repair_memory_citation is contractually non-raising for
+        # backend failures, so a raise from it means something genuinely
+        # unexpected and should stay loud rather than becoming tidy JSON.
         return report(outcome)
 
     return asyncio.run(_run_live())

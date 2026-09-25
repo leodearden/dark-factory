@@ -6995,9 +6995,16 @@ def create_mcp_server(
 
         When the same real-world concept exists as two separate Entity nodes (e.g.,
         'Anthropic' and 'Anthropic Inc'), use this tool to merge them. All RELATES_TO
-        edges from the deprecated node are redirected to the surviving node. The
-        deprecated node is then deleted and the surviving node's summary is rebuilt
-        from its (now-combined) edges.
+        edges from the deprecated node are redirected to the surviving node, and its
+        Episodic MENTIONS provenance is relocated onto the survivor as well — an
+        episode already linked to the survivor is left alone rather than linked
+        twice. The deprecated node is then deleted and the surviving node's summary
+        is rebuilt from its (now-combined) edges.
+
+        Every redirected edge and relocated mention carries a
+        `reassigned_from_node_uuid` audit stamp naming the node it left, and the
+        returned audit dict carries the deprecated node's summary TEXT — which the
+        rebuild above cannot reconstruct, since it reads edges only.
 
         This operation is irreversible. Always verify both UUIDs before calling.
 
@@ -7788,6 +7795,8 @@ def create_mcp_server(
                     'error': row.get('error'),
                     'timestamp': row.get('created_at'),
                     'attempts': row.get('attempts'),
+                    # Three-valued; see services/durable_queue.py::DurableWriteQueue.get_dead_items
+                    'executed': row.get('executed'),
                 }
                 if truncated:
                     item['payload_truncated'] = True
