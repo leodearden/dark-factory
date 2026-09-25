@@ -3013,6 +3013,15 @@ SESSION_PID_ENV = 'CLAUDE_PID'
 """Env var naming the long-lived ``claude`` process's pid (see resolve_session_pid)."""
 
 
+def _parse_session_pid(env: Mapping[str, str]) -> int | None:
+    """Parse *env*'s ``CLAUDE_PID`` as a positive int, else None. Never raises, never logs."""
+    try:
+        pid = int(env.get(SESSION_PID_ENV, '').strip())
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
+
 def resolve_session_pid(env: Mapping[str, str] | None = None) -> int:
     """Resolve THIS Claude Code session's long-lived pid -- the lease's liveness anchor.
 
@@ -3066,12 +3075,8 @@ def resolve_session_pid(env: Mapping[str, str] | None = None) -> int:
     """
     if env is None:
         env = os.environ
-    raw = env.get(SESSION_PID_ENV, '')
-    try:
-        pid = int(raw.strip())
-    except (AttributeError, TypeError, ValueError):
-        pid = 0
-    if pid > 0:
+    pid = _parse_session_pid(env)
+    if pid is not None:
         return pid
     logger.warning(
         'resolve_session_pid: %s is unset or unusable (%r); the lease pid/liveness '
@@ -3082,9 +3087,32 @@ def resolve_session_pid(env: Mapping[str, str] | None = None) -> int:
         'stable across tool calls either. Set $CLAUDE_PID; if you cannot, the lease '
         'slug is underivable too, so pass an explicit --slug <stable-token>.',
         SESSION_PID_ENV,
-        raw,
+        env.get(SESSION_PID_ENV, ''),
     )
     return 0
+
+
+def resolve_own_record_slug(
+    env: Mapping[str, str] | None = None, *, root: Path | str | None = None
+) -> str | None:
+    """Return THIS claude session's registry record slug, via ``$CLAUDE_PID``'s pointer.
+
+    A lease slug (``default_lease_slug``: ``<lease-name>-$CLAUDE_PID``) and a
+    registry record slug (``build_session_slug``) are different namespaces,
+    so neither can be looked up as the other. The pid pointer is the join:
+    the session hooks stamp ``sessions-by-pid/<claude pid>`` with the record
+    key, and ``resolve_session_slug_for_pid`` reads it back only while that
+    record still names the pid as its owner. Its consumers are
+    ``LeaseHolder.record_slug`` and ``DecisionRecord.record_slug``.
+
+    None when ``CLAUDE_PID`` is unusable or no vouched-for pointer exists.
+    Quiet by contract: this serves enrichment, so an unresolvable slug is a
+    blank field in the caller's result, not a log line.
+    """
+    pid = _parse_session_pid(os.environ if env is None else env)
+    if pid is None:
+        return None
+    return resolve_session_slug_for_pid(pid, root=root)
 
 
 def default_lease_slug(
