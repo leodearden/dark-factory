@@ -848,13 +848,23 @@ def derive_registry_candidates(
     derivation cannot invent: a freshly authored held-out phrasing, and the
     per-facet claim needles. Those are hand-authored, which is exactly why the
     CLI band prints rather than overwrites (see :func:`run_derive_registry`).
+
+    When two sources derive the same slug, the richer one is kept and the
+    other is counted in ``slug_collisions_dropped``. A curator gate knows its
+    canonical's hash, a guard cluster carries hand-written match phrases, and
+    a census topic has only a phrasing synthesised from its own slug. So a
+    census that grows a topic equal to a guard slug does not change the
+    entry derived for that slug.
     """
     curator_candidates, clusters_without_canonical = _derive_curator_gate_candidates(
         calibration_rows,
     )
     census = _derive_census_candidates(census_report)
-    candidates = [*curator_candidates, *census.candidates]
-    candidates.extend(_derive_guard_cluster_candidates(guard_clusters))
+    candidates = [
+        *curator_candidates,
+        *_derive_guard_cluster_candidates(guard_clusters),
+        *census.candidates,
+    ]
 
     seen: set[str] = set()
     deduped: list[dict[str, Any]] = []
