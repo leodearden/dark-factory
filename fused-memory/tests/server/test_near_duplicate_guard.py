@@ -17,7 +17,10 @@ unchanged.
 
 from __future__ import annotations
 
+import logging
 import types
+from collections.abc import Iterator
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -38,6 +41,7 @@ from fused_memory.server.near_duplicate_guard import (
     resolve_topic_cluster_autoseed_enabled,
     resolve_topic_guard_clusters,
 )
+from fused_memory.server.topic_cluster_store import TopicClusterStore
 from fused_memory.services.memory_service import RRF_K
 
 # The real post-RRF relevance_score for a rank-1 hit on the guard's
@@ -641,3 +645,100 @@ class TestResolveTopicClusterAutoseedEnabled:
 
     def test_falls_back_to_true_when_config_missing(self):
         assert resolve_topic_cluster_autoseed_enabled(types.SimpleNamespace()) is True
+
+
+_DERIVED = ProceduralTopicCluster(
+    topic_id='derived-topic',
+    phrases=['--dist loadgroup', 'max-worker-restart'],
+    hint='Consolidated topic; update canonical 0000 instead.',
+)
+
+
+@pytest.fixture
+def seeded_store(tmp_path: Path) -> Iterator[TopicClusterStore]:
+    store = TopicClusterStore(tmp_path / 'topic_clusters.db')
+    store.open()
+    store.upsert(_DERIVED, source='consolidate_memories', project_id='dark_factory')
+    try:
+        yield store
+    finally:
+        store.close()
+
+
+class _RaisingStore:
+    def list_clusters(self, project_id: str) -> list:
+        raise RuntimeError('store exploded')
+
+
+class _NonListStore:
+    def list_clusters(self, project_id: str) -> object:
+        return ('not', 'a', 'list')
+
+
+def _guard_service(config: list, *, autoseed: bool = True) -> types.SimpleNamespace:
+    return _memory_service_with_reconciliation(
+        procedural_knowledge_topic_guard_clusters=config,
+        procedural_knowledge_topic_cluster_autoseed_enabled=autoseed,
+    )
+
+
+class TestResolveMergesTheRuntimeStore:
+    """resolve_topic_guard_clusters is THE merge chokepoint for derived clusters (task 3135)."""
+
+    CONFIG = [_cluster(topic_id='cfg-a'), _cluster(topic_id='cfg-b')]
+
+    def test_without_keywords_it_returns_exactly_the_config_list(self, seeded_store):
+        assert resolve_topic_guard_clusters(_guard_service(self.CONFIG)) == self.CONFIG
+
+    def test_merges_the_projects_derived_cluster_after_the_config_seeds(self, seeded_store):
+        resolved = resolve_topic_guard_clusters(
+            _guard_service(self.CONFIG), runtime_store=seeded_store, project_id='dark_factory'
+        )
+        assert resolved == [*self.CONFIG, _DERIVED]
+
+    def test_an_inert_config_still_serves_the_derived_cluster(self, seeded_store):
+        resolved = resolve_topic_guard_clusters(
+            _guard_service([]), runtime_store=seeded_store, project_id='dark_factory'
+        )
+        assert resolved == [_DERIVED]
+
+    def test_another_projects_write_sees_config_seeds_only(self, seeded_store):
+        resolved = resolve_topic_guard_clusters(
+            _guard_service(self.CONFIG), runtime_store=seeded_store, project_id='reify'
+        )
+        assert resolved == self.CONFIG
+
+    def test_a_store_without_a_project_is_config_only(self, seeded_store):
+        resolved = resolve_topic_guard_clusters(
+            _guard_service(self.CONFIG), runtime_store=seeded_store, project_id=None
+        )
+        assert resolved == self.CONFIG
+
+    def test_a_project_without_a_store_is_config_only(self):
+        resolved = resolve_topic_guard_clusters(
+            _guard_service(self.CONFIG), runtime_store=None, project_id='dark_factory'
+        )
+        assert resolved == self.CONFIG
+
+    def test_the_kill_switch_is_read_live(self, seeded_store):
+        svc = _guard_service(self.CONFIG, autoseed=False)
+
+        def resolve() -> list:
+            return resolve_topic_guard_clusters(
+                svc, runtime_store=seeded_store, project_id='dark_factory'
+            )
+
+        assert resolve() == self.CONFIG
+        svc.config.reconciliation.procedural_knowledge_topic_cluster_autoseed_enabled = True
+        assert resolve() == [*self.CONFIG, _DERIVED]
+        svc.config.reconciliation.procedural_knowledge_topic_cluster_autoseed_enabled = False
+        assert resolve() == self.CONFIG
+
+    @pytest.mark.parametrize('store', [_RaisingStore(), _NonListStore()], ids=['raises', 'non_list'])
+    def test_a_misbehaving_store_degrades_to_config_only_and_warns(self, store, caplog):
+        with caplog.at_level(logging.WARNING, logger='fused_memory.server.near_duplicate_guard'):
+            resolved = resolve_topic_guard_clusters(
+                _guard_service(self.CONFIG), runtime_store=store, project_id='dark_factory'
+            )
+        assert resolved == self.CONFIG
+        assert any(record.levelno == logging.WARNING for record in caplog.records)
