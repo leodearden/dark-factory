@@ -1712,10 +1712,22 @@ class TestAbsoluteTmpProjectRootLiteralsAreCensused:
         assert len(sites) == 1, sites
         assert literal in sites[0], sites
 
-    def test_the_detector_ignores_a_compound_value_with_no_tmp_literal(self) -> None:
-        """Negative: seeing through a compound must not flag one whose operands
-        are all references.
+    @pytest.mark.parametrize(
+        'source',
+        [
+            'config.project_root = tmp_path or other_root\n',
+            "config.project_root = tmp_path if '/tmp/q' else other_root\n",
+            "config.project_root = tmp_path if flag == '/tmp/q' else other_root\n",
+        ],
+        ids=['references-only', 'ifexp-condition-is-a-literal', 'ifexp-condition-compares-a-literal'],
+    )
+    def test_the_detector_ignores_a_compound_value_that_binds_no_tmp_literal(
+        self, source,
+    ) -> None:
+        """Negative: seeing through a compound must not flag one whose bound
+        operands are all references.  An ``IfExp`` condition selects a value
+        rather than binding one, so a ``/tmp`` literal there is never a site.
         """
-        tree = ast.parse('config.project_root = tmp_path or other_root\n')
+        tree = ast.parse(source)
 
         assert _absolute_tmp_project_root_literals(tree) == []
