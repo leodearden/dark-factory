@@ -174,3 +174,18 @@ def test_malformed_record_is_skipped_and_its_neighbours_still_return(queue_dir):
 def test_missing_queue_dir_returns_empty_rather_than_raising(tmp_path):
     """(i) an absent directory is an empty result — the fail-open direction."""
     assert _scan(tmp_path / 'does-not-exist') == frozenset()
+
+
+@pytest.mark.parametrize(
+    ('age', 'expected'),
+    [
+        (WINDOW, frozenset({'fp-edge'})),
+        (WINDOW + timedelta(microseconds=1), frozenset()),
+    ],
+    ids=['exactly_one_window_ago_is_included', 'just_past_the_window_is_excluded'],
+)
+def test_the_window_edge_is_inclusive(queue_dir, age, expected):
+    """(j) resolved exactly *window* ago still suppresses; a microsecond later does not."""
+    _write(queue_dir, _esc('esc-edge-1', fingerprint='fp-edge', resolved_at=_iso(age)))
+
+    assert _scan(queue_dir) == expected

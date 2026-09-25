@@ -410,6 +410,45 @@ class TestArchiveScanLeavesTheLoop:
             f'expected exactly 1 archive scan for a 3-finding pass, got {len(calls)}'
         )
 
+    @pytest.mark.asyncio
+    async def test_a_failed_scan_suppresses_nothing(
+        self, journal, event_buffer, memory_service, tmp_path, monkeypatch, caplog,
+    ):
+        """Fail-open: a scan that raises costs the pass its suppressions, not its escalations."""
+        calls: list = []
+
+        def _raising_scan(queue_dir, **_kwargs):
+            calls.append(queue_dir)
+            raise OSError('archive unreadable')
+
+        monkeypatch.setattr(
+            harness_module, 'scan_recently_resolved_fingerprints', _raising_scan,
+        )
+        _stub_probe(monkeypatch, [], block=0.0)
+        findings = [_finding_citing('901'), _finding_citing('902')]
+        _, esc_queue, run_pass = await _prepare_pass(
+            journal=journal, event_buffer=event_buffer, memory_service=memory_service,
+            tmp_path=tmp_path, monkeypatch=monkeypatch,
+            findings=findings,
+            cited_tasks=[_in_progress_task('901'), _in_progress_task('902')],
+        )
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.harness'):
+            await run_pass()
+
+        assert calls, 'the archive scan never ran — the failure branch is not exercised'
+        assert [
+            r for r in caplog.records
+            if r.getMessage() == 'reconciliation.recently_resolved_check_failed'
+        ], 'the scan failure must be logged'
+        stranded = [
+            e for e in esc_queue.get_pending() if 'Persistently unresolved' in e.summary
+        ]
+        assert len(stranded) == len(findings), (
+            f'expected all {len(findings)} findings to escalate after a failed scan, '
+            f'got {len(stranded)}'
+        )
+
 
 # ── SITE 2: the live-workflow git probes ─────────────────────────────────────
 
@@ -702,24 +741,35 @@ class TestFallbackArmIsBoundedToOneScanPerRun:
     def test_the_direct_path_is_never_memoised(self, escalating_harness, monkeypatch):
         """(c) `_finding_recently_resolved` with no scan key keeps today's behaviour.
 
-        Its docstring already promises this fallback for "direct / unit-test
-        use", and the four task-1669 tests depend on it, so the unmemoised path
-        must neither read nor write the slot.
+        Its docstring promises this fallback for "direct / unit-test use", and
+        the four task-1669 tests depend on it: every direct call scans, and none
+        disturbs a run's memo, so that run's next `_escalate` is still served.
         """
         calls: list = []
         _count_scans(monkeypatch, calls)
         now = datetime.now(UTC)
 
+        def _escalate_in_run() -> None:
+            escalating_harness._escalate(
+                'recon_integrity_issue', 'run-dddd4444', 'Persistently unresolved: x',
+                finding=_finding_citing('901', description='x'),
+            )
+
+        _escalate_in_run()
+        scans_before_direct = len(calls)
         for _ in range(3):
             escalating_harness._finding_recently_resolved(
                 'recon_integrity_issue', 'some-fingerprint', now=now,
             )
+        direct_scans = len(calls) - scans_before_direct
+        _escalate_in_run()
 
-        assert len(calls) == 3, (
-            f'expected the direct path to scan every call, got {len(calls)}'
+        assert direct_scans == 3, (
+            f'expected the direct path to scan every call, got {direct_scans}'
         )
-        assert escalating_harness._resolved_fps_memo is None, (
-            'the direct path must not write the run-scoped memo slot'
+        assert len(calls) == scans_before_direct + direct_scans, (
+            "the direct path must leave the run's memo in place, but the run's "
+            'next _escalate walked the archive again'
         )
 
     def test_verdicts_are_unchanged_across_the_memo(
