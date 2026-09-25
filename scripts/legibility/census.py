@@ -3381,7 +3381,8 @@ def main(argv: list[str] | None = None) -> int:
     ``render_report``.
 
     Returns non-zero only on a genuine fail-loud error (a config-load
-    failure, or an uncaught exception from ``run_census``) -- a deferred
+    failure, an uncaught exception from ``run_census``, or an
+    ``"unlanded"`` census whose commit did not land) -- a deferred
     (headroom-preflight) outcome still exits 0, mirroring
     ``census_trigger``'s own CLI contract of reserving a non-zero exit for
     an operator-facing failure, not an expected defer/no-fire outcome.
@@ -3608,6 +3609,20 @@ def main(argv: list[str] | None = None) -> int:
             f"unverified_clusters={outcome.unverified_clusters} -- {outcome.reason}"
         )
         return 0
+
+    if outcome.status == "unlanded":
+        # run_census already logged ERROR and escalated; this line is for
+        # whoever watches the run, and the exit code for nightly's launcher.
+        rollback = (
+            outcome.rollback.describe() if outcome.rollback is not None
+            else "no rollback was recorded"
+        )
+        print(
+            f"census: commit did not land -- {rollback} "
+            f"filed_tickets={len(outcome.filed_ticket_ids)}",
+            file=sys.stderr,
+        )
+        return 1
 
     if outcome.dry_run is not None:
         # A bare filed_tickets=0 here would read as "a normal run that had
