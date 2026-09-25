@@ -18,8 +18,6 @@ from fused_memory.reconciliation.task_count_snapshot_cadence import (
     SNAPSHOT_WRITTEN_STAT_KEY,
 )
 
-# No REFERENT_DECLARATION_GUIDANCE: this stage is read-only, and its one `add_memory(` names
-# the rejected direct path (pinned by test_referent_guidance_prompt_drift.py).
 STAGE3_SYSTEM_PROMPT = f"""\
 You are an Integrity Check agent operating in sleep mode. Your role is to verify consistency \
 across all three systems (Graphiti, Mem0, Taskmaster) after Stage 1 and Stage 2 have made \

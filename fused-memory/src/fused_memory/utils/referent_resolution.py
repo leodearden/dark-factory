@@ -95,10 +95,8 @@ def render_referent_declaration_guidance() -> str:
     Composes :data:`_DECLARED_REFERENT_HINT` verbatim, so the shape sentence an
     agent is taught is the one its rejection would quote. Plain text built from
     adjacent literals: consumers interpolate it into their own f-strings, so its
-    braces need no escaping there. It carries no ``## Available Tools`` line,
-    because ``build_stage2_system_prompt`` requires exactly one of those.
-    ``fused-memory/tests/test_referent_declaration_examples.py`` runs its worked
-    example through the live gate.
+    braces need no escaping there. ``fused-memory/tests/test_referent_declaration_examples.py``
+    runs its worked example through the live gate.
     """
     return (
         '## Declaring What a Write Is About\n'

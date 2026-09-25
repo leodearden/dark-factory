@@ -181,12 +181,7 @@ On success `status` is `"repaired"`. Every refusal is keyed by `"error"` and car
 # ---------------------------------------------------------------------------
 # Shared referent-declaration guidance (task 3675)
 # ---------------------------------------------------------------------------
-# Only Stage 1 and Stage 2 interpolate this, because they are the stages that
-# list mcp__fused-memory__add_memory. Stage 3 and the judge never write, and
-# test_referent_guidance_prompt_drift.py derives that split from each prompt's
-# own tool listing and pins it in both directions. The text is rendered where
-# the entry shape is enforced; edit it there, never here. It MUST NOT contain
-# the literal '## Available Tools'.
+# Scope pinned by test_referent_guidance_prompt_drift.py.
 REFERENT_DECLARATION_GUIDANCE = render_referent_declaration_guidance()
 
 # ---------------------------------------------------------------------------

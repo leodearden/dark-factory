@@ -24,9 +24,6 @@ exception list.
 # JUDGE_SYSTEM_PROMPT explicitly instructs to cross-reference stage report
 # stats against MCP Actions, so it is the one most likely to reconstruct the
 # "stat claims a write but there is no Graphiti edge" false positive.
-#
-# No REFERENT_DECLARATION_GUIDANCE: the judge only reviews add_memory side effects and never
-# writes (pinned by test_referent_guidance_prompt_drift.py).
 JUDGE_SYSTEM_PROMPT = """\
 You are a Quality Judge reviewing a reconciliation run. You evaluate whether the reconciliation \
 agent made appropriate, well-reasoned decisions.
