@@ -17,6 +17,7 @@ fetching candidate ``MemoryResult`` objects (typically via
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any
 
 from fused_memory.models.enums import MemoryCategory, SourceStore
@@ -25,12 +26,18 @@ if TYPE_CHECKING:
     from fused_memory.config.schema import ProceduralTopicCluster
     from fused_memory.models.memory import MemoryResult
 
+logger = logging.getLogger(__name__)
+
 # Default similarity threshold when config is absent/partial/non-numeric.
 # Mirrors Mem0's own cited ~0.92 cosine dedup threshold.
 _DEFAULT_NEAR_DUP_THRESHOLD = 0.92
 
 # Default enable flag when config is absent/partial/non-numeric.
 _DEFAULT_NEAR_DUP_GUARD_ENABLED = True
+
+# Default for the machine-derived topic-cluster switch when config is
+# absent/partial/non-bool; mirrors the schema default.
+_DEFAULT_TOPIC_CLUSTER_AUTOSEED_ENABLED = True
 
 # Surfaced in the soft-block dict, the add_memory tool docstring, and
 # FUSED_MEMORY_INSTRUCTIONS so the override is discoverable at the point of
@@ -210,6 +217,52 @@ def resolve_near_dup_guard_enabled(memory_service: Any) -> bool:
     if isinstance(value, bool):
         return value
     return _DEFAULT_NEAR_DUP_GUARD_ENABLED
+
+
+def resolve_topic_cluster_autoseed_enabled(memory_service: Any) -> bool:
+    """Read the machine-derived topic-cluster switch from *memory_service*'s config.
+
+    The ONE reader of ``procedural_knowledge_topic_cluster_autoseed_enabled``,
+    shared by the ``consolidate_memories`` seed and the guard merge in
+    :func:`resolve_topic_guard_clusters`, so the two can never disagree about
+    whether the feature is on. Same defensive navigation as
+    :func:`resolve_near_dup_guard_enabled`: anything but a real ``bool`` falls
+    back to :data:`_DEFAULT_TOPIC_CLUSTER_AUTOSEED_ENABLED`.
+    """
+    value = _reconciliation_attr(
+        memory_service, 'procedural_knowledge_topic_cluster_autoseed_enabled'
+    )
+    if isinstance(value, bool):
+        return value
+    return _DEFAULT_TOPIC_CLUSTER_AUTOSEED_ENABLED
+
+
+def merge_topic_clusters(config_clusters: list, runtime_clusters: list) -> list:
+    """Return config seeds in order, then runtime clusters whose ``topic_id`` is new.
+
+    Order is load-bearing: :func:`find_matching_topic_cluster` returns the
+    FIRST qualifying cluster, so an operator's curated cluster produces the
+    diagnostic whenever both would match. On a ``topic_id`` collision the
+    config seed wins and the runtime cluster is dropped, because curated
+    ``sufficient_phrases`` and gate-task hints are what a derived cluster
+    cannot reproduce. A repeated runtime ``topic_id`` keeps its first entry.
+
+    Duck-typed on ``.topic_id`` so this module keeps importing
+    ``config.schema`` for type checking only. Returns a new list and mutates
+    neither input.
+    """
+    merged = list(config_clusters)
+    emitted = {cluster.topic_id for cluster in merged}
+    for cluster in runtime_clusters:
+        if cluster.topic_id in emitted:
+            logger.debug(
+                'topic-cluster merge: dropped runtime cluster %r (topic_id already emitted)',
+                cluster.topic_id,
+            )
+            continue
+        emitted.add(cluster.topic_id)
+        merged.append(cluster)
+    return merged
 
 
 def resolve_topic_guard_clusters(memory_service: Any) -> list:
