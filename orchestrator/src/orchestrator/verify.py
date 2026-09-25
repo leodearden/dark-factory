@@ -666,6 +666,15 @@ _PYTEST_FAILURE_SUMMARY_RE = re.compile(
 _PYTEST_TRACEBACK_E_RE = re.compile(r'^E   .+$', re.MULTILINE)
 _PYTEST_PROGRESS_BARE_RE = re.compile(r'^[\.FsxXEPp]+(\s+\[\s*\d+%\])?$')
 _PYTEST_PROGRESS_FILE_RE = re.compile(r'^\S+\.py [\.FsxXEPp]+(\s+\[\s*\d+%\])?$')
+# Unlike the two noise filters above, this CAPTURES a progress line's
+# percentage (for _crashed_session_stop_percent). Status chars are ``*`` since
+# pytest writes the final fill on a fresh line when the last status char hit
+# the line edge; ``[ \t]`` for the newline-spanning reason at
+# _PYTEST_FAILURE_SUMMARY_RE; the optional file prefix keeps the LAST match in
+# an fspath-mode session its true final line, not a stale continuation line.
+_PYTEST_PROGRESS_PERCENT_RE = re.compile(
+    r'^(?:\S+\.py )?[.FsxXEPp]*[ \t]*\[ *(\d+)%\]$', re.MULTILINE,
+)
 
 
 # Bare pytest-xdist worker-crash signature (task 2365). Grounded in
@@ -696,18 +705,48 @@ _XDIST_WORKER_CRASH_RE = re.compile(
 # Not line-anchored: xdist prints the message bare through `report_line` and
 # again as ``=== xdist: <msg> ===`` in its terminal summary.
 #
-# ACCEPTED LIMITATION: both emissions are gated on ``verbose >= 0``, so under
-# ``-q`` the marker is absent and every consumer keeps its pre-task behaviour —
-# fail-safe, since the abort label is only ever added when certain (the absence
-# of ``replacing crashed worker`` is no substitute: ``-q`` suppresses it too).
-# The detector is therefore inert on dark-factory's module-scoped legs, which
-# all pass ``-q``, and live on the root whole-suite chain in
-# dark-factory-orchestrator.yaml, which does not. esc-5082-5 records the
-# measurement and a ``-q``-robust discriminator left to a follow-up.
+# Both emissions are gated on ``verbose >= 0``, so under ``-q`` (every
+# module-scoped leg in dark-factory-orchestrator.yaml) the literal is absent;
+# _crashed_session_stop_percent below is the ``-q``-robust second witness. The
+# absence of ``replacing crashed worker`` is no substitute (``-q`` suppresses it
+# too), and the crash signature alone never labels a session aborted.
 _XDIST_SESSION_ABORTED_RE = re.compile(
     r"worker gw\d+ crashed and worker restarting disabled"
     r"|maximum crashed workers reached: \d+",
 )
+
+
+def _crashed_session_stop_percent(output: str) -> int | None:
+    """Return the percentage of collected tests a crashed session stopped at.
+
+    The ``-q``-robust truncation witness. All three facts must hold:
+
+    * An xdist crash signature (``_XDIST_WORKER_CRASH_RE``): progress below
+      100% alone also describes ``-x``/``--maxfail`` stops and killed runs.
+    * The FINAL progress line reads below ``[100%]``: pytest counts the report
+      ``xdist/dsession.py::DSession.handle_crashitem`` synthesizes for the
+      crashed test, and
+      ``_pytest/terminal.py::TerminalReporter._get_progress_information_message``
+      floors ``reported*100//collected``, so only an abandoned queue stays
+      short; a recovering run reaches ``[100%]``.
+    * A pytest failure tally AFTER that line: pytest ended its own run loop and
+      printed its summary, rather than being killed mid-run.
+
+    Returns ``None`` when any fact is missing, including when *output* has no
+    percentage progress line at all (``-v``, or the ``count``/``times``
+    console styles): the bailout literal is then the only witness.
+    """
+    if not _XDIST_WORKER_CRASH_RE.search(output):
+        return None
+    progress_lines = list(_PYTEST_PROGRESS_PERCENT_RE.finditer(output))
+    if not progress_lines:
+        return None
+    final_line = progress_lines[-1]
+    stop_percent = int(final_line.group(1))
+    pytest_ended_its_own_loop = (
+        _PYTEST_FAILURE_SUMMARY_RE.search(output, final_line.end()) is not None
+    )
+    return stop_percent if stop_percent < 100 and pytest_ended_its_own_loop else None
 
 
 def _is_worker_death_truncated_session(output: str) -> bool:
@@ -720,12 +759,19 @@ def _is_worker_death_truncated_session(output: str) -> bool:
     This is NOT the same question as "did a worker crash"
     (``_XDIST_WORKER_CRASH_RE``): a target configured with
     ``--max-worker-restart > 0`` takes xdist's sibling branch, replaces the
-    worker, and completes normally. See ``_XDIST_SESSION_ABORTED_RE`` above
-    for the full grounding and for the accepted ``-q`` limitation.
+    worker, and completes normally.
+
+    Two witnesses, either suffices: the bailout literal
+    (``_XDIST_SESSION_ABORTED_RE``), when xdist printed it at verbosity >= 0,
+    and the progress-line witness (``_crashed_session_stop_percent``), which
+    also holds under ``-q``.
 
     Returns ``False`` for falsy *output*.
     """
-    return bool(output) and _XDIST_SESSION_ABORTED_RE.search(output) is not None
+    return bool(output) and (
+        _XDIST_SESSION_ABORTED_RE.search(output) is not None
+        or _crashed_session_stop_percent(output) is not None
+    )
 
 
 def _crash_attributed_nodeids(output: str) -> set[str]:
@@ -1094,8 +1140,8 @@ def _extract_cause_hint(output: str) -> str:
       (esc-4176-6: ``1 failed, 728 passed`` truncated vs ``19622 passed`` on a
       clean re-run of the identical command).
 
-    Every other rung is untouched, so output with no bailout marker takes a
-    byte-identical path to today's.
+    Every other rung is untouched, so output with no truncation evidence takes
+    a byte-identical path to today's.
 
     Returns ``''`` for None, empty, or whitespace-only input.
     Result is stripped to a single line and capped at 200 chars.
