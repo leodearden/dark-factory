@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import pytest  # pyright: ignore[reportMissingImports]
@@ -221,3 +222,126 @@ class TestResolveOwnRecordSlug:
 
         assert sr.resolve_session_pid({'CLAUDE_PID': ''}) == 0
         assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+
+class TestReapStaleSessionPointers:
+    _SLUG = 'role-proj-uuid'
+
+    def _pointer_path(self, name: str, root: Path) -> Path:
+        return sr.session_pointers_dir(root) / name
+
+    def test_a_live_pids_pointer_to_an_existing_record_is_kept(self, tmp_path: Path) -> None:
+        sr.write_record(_record(self._SLUG, owner_pid=os.getpid()), root=tmp_path)
+        sr.write_session_pointer(os.getpid(), self._SLUG, root=tmp_path)
+
+        assert sr.reap_stale_session_pointers(root=tmp_path) == []
+        assert sr.session_pointer_path_for_pid(os.getpid(), root=tmp_path).is_file()
+
+    def test_a_dead_pids_pointer_is_removed_even_though_its_record_exists(
+        self, tmp_path: Path
+    ) -> None:
+        sr.write_record(_record(self._SLUG, owner_pid=_DEAD_PID), root=tmp_path)
+        sr.write_session_pointer(_DEAD_PID, self._SLUG, root=tmp_path)
+        pointer = sr.session_pointer_path_for_pid(_DEAD_PID, root=tmp_path)
+
+        assert sr.reap_stale_session_pointers(root=tmp_path) == [pointer]
+        assert not pointer.exists()
+
+    def test_a_live_pids_pointer_to_a_reaped_record_is_removed(self, tmp_path: Path) -> None:
+        sr.write_session_pointer(os.getpid(), self._SLUG, root=tmp_path)
+        pointer = sr.session_pointer_path_for_pid(os.getpid(), root=tmp_path)
+
+        assert sr.reap_stale_session_pointers(root=tmp_path) == [pointer]
+        assert not pointer.exists()
+
+    @pytest.mark.parametrize('content', ['', '  \n', '../escape', 'a/b', '..'])
+    def test_a_pointer_whose_content_is_not_a_record_key_is_removed(
+        self, tmp_path: Path, content: str
+    ) -> None:
+        pointer = _write_pointer_raw(os.getpid(), content, tmp_path)
+
+        assert sr.reap_stale_session_pointers(root=tmp_path) == [pointer]
+        assert not pointer.exists()
+
+    @pytest.mark.parametrize('name', ['not-a-pid', '0', '-5', '12.5'])
+    def test_a_file_not_named_by_a_positive_pid_is_removed(
+        self, tmp_path: Path, name: str
+    ) -> None:
+        sr.write_record(_record(self._SLUG, owner_pid=os.getpid()), root=tmp_path)
+        pointer = self._pointer_path(name, tmp_path)
+        pointer.parent.mkdir(parents=True)
+        pointer.write_text(self._SLUG, encoding='utf-8')
+
+        assert sr.reap_stale_session_pointers(root=tmp_path) == [pointer]
+        assert not pointer.exists()
+
+    def test_an_absent_pointer_dir_is_an_empty_pass(self, tmp_path: Path) -> None:
+        assert sr.reap_stale_session_pointers(root=tmp_path) == []
+
+    def test_a_corrupt_record_is_never_parsed_so_its_pointer_is_kept(
+        self, tmp_path: Path
+    ) -> None:
+        record_path = sr.record_path_for_slug(self._SLUG, root=tmp_path)
+        record_path.parent.mkdir(parents=True)
+        record_path.write_text('{not json', encoding='utf-8')
+        sr.write_session_pointer(os.getpid(), self._SLUG, root=tmp_path)
+
+        assert sr.reap_stale_session_pointers(root=tmp_path) == []
+        assert sr.session_pointer_path_for_pid(os.getpid(), root=tmp_path).is_file()
+
+    def test_an_entry_that_cannot_be_removed_is_skipped_and_the_pass_continues(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        stuck = self._pointer_path(str(_DEAD_PID), tmp_path)
+        stuck.mkdir(parents=True)
+        (stuck / 'occupant').write_text('x', encoding='utf-8')
+        stale = self._pointer_path('not-a-pid', tmp_path)
+        stale.write_text(self._SLUG, encoding='utf-8')
+        caplog.set_level(logging.DEBUG)
+
+        assert sr.reap_stale_session_pointers(root=tmp_path) == [stale]
+        assert stuck.is_dir()
+        assert not stale.exists()
+        assert any(str(_DEAD_PID) in r.getMessage() for r in caplog.records)
+
+
+def _launching_env(root: Path) -> dict[str, str]:
+    return {
+        'CLAUDE_FLEET_ROOT': str(root),
+        'CLAUDE_SPAWN_ROLE': 'unblock',
+        'CLAUDE_SPAWN_PROJECT': 'df',
+        'CLAUDE_SPAWN_TASK_ID': '2085',
+        'CLAUDE_SPAWN_ESCALATION_ID': 'esc-9',
+        'CLAUDE_SPAWN_TITLE': 'unblock:df#2085 routing-mechanism',
+        'CLAUDE_SPAWN_PROMPT': '/unblock 2085',
+        'CLAUDE_SPAWN_CWD': '/home/leo/src/dark-factory',
+        'CLAUDE_SPAWN_LAUNCHER_PID': '4242',
+    }
+
+
+class TestPointerSweepDrivers:
+    def test_the_reap_verb_removes_a_dead_pids_pointer(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+        sr.write_session_pointer(_DEAD_PID, 'role-proj-uuid', root=tmp_path)
+
+        assert sr.main(['reap']) == 0
+        assert not sr.session_pointer_path_for_pid(_DEAD_PID, root=tmp_path).exists()
+
+    def test_every_spawn_removes_a_dead_pids_pointer_and_still_prints_only_its_record_dir(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        for key, value in _launching_env(tmp_path).items():
+            monkeypatch.setenv(key, value)
+        sr.write_session_pointer(_DEAD_PID, 'role-proj-uuid', root=tmp_path)
+
+        assert sr.main(['launching']) == 0
+
+        slug = sr.build_session_slug('unblock', 'df', '2085', 4242)
+        expected_dir = sr.record_path_for_slug(slug, root=tmp_path).parent
+        assert capsys.readouterr().out == f'{expected_dir}\n'
+        assert not sr.session_pointer_path_for_pid(_DEAD_PID, root=tmp_path).exists()
