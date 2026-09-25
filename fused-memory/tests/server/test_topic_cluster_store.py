@@ -10,11 +10,14 @@ Covers:
   scoping (TestStoreLifecycle)
 - Mistyped/duplicate rows fail loud at ``open()`` like the config path does at
   load (TestStoreFailsLoudLikeTheConfigPath)
+- ``derive_topic_cluster``'s conservative, abstaining, deterministic phrase
+  derivation (TestDeriveTopicCluster)
 """
 
 from __future__ import annotations
 
 import json
+import random
 import sqlite3
 import uuid
 from pathlib import Path
@@ -22,7 +25,12 @@ from pathlib import Path
 import pytest
 
 from fused_memory.config.schema import ProceduralTopicCluster
-from fused_memory.server.topic_cluster_store import TopicClusterStore, TopicClusterStoreError
+from fused_memory.server.near_duplicate_guard import find_matching_topic_cluster
+from fused_memory.server.topic_cluster_store import (
+    TopicClusterStore,
+    TopicClusterStoreError,
+    derive_topic_cluster,
+)
 
 _PROJECT = 'dark_factory'
 
@@ -269,3 +277,120 @@ class TestStoreFailsLoudLikeTheConfigPath:
         finally:
             store.close()
         assert _row_count(db_path) == 0
+
+
+_XDIST_TEXTS = [
+    'When running the fused-memory suite under pytest-xdist, pass --dist loadgroup so '
+    'tests marked with the same group stay on one worker, and set --max-worker-restart 0 '
+    'to fail fast.',
+    'Gotcha: pytest-xdist workers crash silently unless you pin --max-worker-restart 0. '
+    'Use --dist loadgroup for the serial SQLite tests.',
+    'To serialise the WAL tests, run pytest-xdist with --dist loadgroup and keep '
+    '--max-worker-restart at 0 so a crashed worker is visible.',
+]
+
+_UNRELATED_NOTE = (
+    'When running the dashboard build, pass the flag so the page stays on one worker '
+    'and fail fast when a crashed build is visible to the tests.'
+)
+
+_TOPIC = 'pytest-xdist-serial-override'
+_HINT = 'Consolidated topic; update canonical 8bb3eb15 instead.'
+
+
+def _derive(texts: list[str]) -> ProceduralTopicCluster | None:
+    return derive_topic_cluster(texts, topic_id=_TOPIC, hint=_HINT)
+
+
+def _phrases_in(text: str, phrases: list[str]) -> list[str]:
+    return [phrase for phrase in phrases if phrase.lower() in text.lower()]
+
+
+class TestDeriveTopicCluster:
+    """Derivation abstains rather than emit a weak cluster (the measured over-block hazard)."""
+
+    def test_near_duplicates_yield_a_conservative_cluster(self) -> None:
+        cluster = _derive(_XDIST_TEXTS)
+
+        assert isinstance(cluster, ProceduralTopicCluster)
+        assert cluster.topic_id == _TOPIC
+        assert cluster.hint == _HINT
+        assert cluster.min_phrase_hits == 2
+        assert cluster.sufficient_phrases == []
+        assert 2 <= len(cluster.phrases) <= 6
+
+    def test_every_phrase_is_supported_by_two_texts(self) -> None:
+        cluster = _derive(_XDIST_TEXTS)
+        assert cluster is not None
+        for phrase in cluster.phrases:
+            support = [text for text in _XDIST_TEXTS if phrase.lower() in text.lower()]
+            assert len(support) >= 2, phrase
+
+    def test_no_phrase_nests_inside_another(self) -> None:
+        cluster = _derive(_XDIST_TEXTS)
+        assert cluster is not None
+        lowered = [phrase.lower() for phrase in cluster.phrases]
+        for i, outer in enumerate(lowered):
+            for j, inner in enumerate(lowered):
+                if i != j:
+                    assert inner not in outer, (inner, outer)
+
+    def test_the_cluster_matches_its_own_sources(self) -> None:
+        cluster = _derive(_XDIST_TEXTS)
+        assert cluster is not None
+        carriers = [text for text in _XDIST_TEXTS if len(_phrases_in(text, cluster.phrases)) >= 2]
+        assert carriers
+        for text in carriers:
+            assert find_matching_topic_cluster(text, [cluster]) is not None
+
+    def test_the_cluster_ignores_a_note_sharing_only_generic_english(self) -> None:
+        cluster = _derive(_XDIST_TEXTS)
+        assert cluster is not None
+        assert find_matching_topic_cluster(_UNRELATED_NOTE, [cluster]) is None
+
+    @pytest.mark.parametrize(
+        'texts',
+        [
+            pytest.param([], id='empty'),
+            pytest.param(_XDIST_TEXTS[:1], id='single_text'),
+            pytest.param(
+                [
+                    'Always run the tests before you commit the change so the reviewer sees green.',
+                    'Run the tests before you push the change and tell the reviewer about it.',
+                ],
+                id='generic_english_only',
+            ),
+            pytest.param(
+                [
+                    'Install pytest-xdist in the dev group before running anything in parallel.',
+                    'The pytest-xdist plugin parallelises collection across all available cores.',
+                ],
+                id='one_qualifying_phrase',
+            ),
+            pytest.param(
+                [_XDIST_TEXTS[0], _XDIST_TEXTS[0], 'Rotate the API key when the vault lease expires.'],
+                id='identical_texts',
+            ),
+            pytest.param(
+                [
+                    _XDIST_TEXTS[0],
+                    '  ' + _XDIST_TEXTS[0].upper().replace(' ', '\n  '),
+                    'Rotate the API key when the vault lease expires.',
+                ],
+                id='case_and_whitespace_variant',
+            ),
+        ],
+    )
+    def test_abstains_when_it_has_too_little_to_go_on(self, texts: list[str]) -> None:
+        assert _derive(texts) is None
+
+    def test_is_deterministic_across_calls_and_input_order(self) -> None:
+        first = _derive(_XDIST_TEXTS)
+        second = _derive(_XDIST_TEXTS)
+        shuffled_texts = list(_XDIST_TEXTS)
+        random.Random(3135).shuffle(shuffled_texts)
+        assert shuffled_texts != _XDIST_TEXTS
+        shuffled = _derive(shuffled_texts)
+
+        assert first is not None and second is not None and shuffled is not None
+        assert first.phrases == second.phrases == shuffled.phrases
