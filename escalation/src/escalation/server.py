@@ -35,7 +35,12 @@ from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 from escalation import git_authority
 from escalation import sweep as _sweep
 from escalation.action_effects import effect_for
-from escalation.authority import PROMOTE_ALLOWED, ROLE_LEVEL_ALLOWLIST, l2_auto_close_class
+from escalation.authority import (
+    PROMOTE_ALLOWED,
+    PROMOTE_SENTINEL_BOUND_ROLES,
+    ROLE_LEVEL_ALLOWLIST,
+    l2_auto_close_class,
+)
 from escalation.canonical import canonical_root_cause
 from escalation.declared_pins import blocking_pin_declarations, format_refusal
 from escalation.dedupe import DedupeConfig
@@ -183,6 +188,29 @@ def _derive_l2_severity(queue: EscalationQueue, member_ids: list[str]) -> str | 
     for sev in resolved[1:]:
         derived = max_severity(derived, sev)
     return derived
+
+
+def _sentinel_bound_task_ids(queue: EscalationQueue, member_ids: list[str]) -> frozenset[str]:
+    """Return the task ids a promote of *member_ids* must be minted under, or empty if unconstrained.
+
+    Non-empty only when at least one member resolves AND every RESOLVED
+    member was filed under a role in ``authority.PROMOTE_SENTINEL_BOUND_ROLES``;
+    the result is then those members' own (sentinel) task ids.  A mixed
+    cluster is unconstrained: an ordinary member already pins its real task,
+    so a real-id filing deepens nothing.  Unresolvable ids are ignored, the
+    fail-open direction — an unreadable id proves nothing and must never
+    block a human-escalation path.  Reads through ``queue.get()`` for the same
+    archive-fallback and negative-cache reasons as :func:`_derive_l2_severity`.
+    """
+    bound_task_ids: set[str] = set()
+    for mid in dict.fromkeys(member_ids):
+        member = queue.get(mid)
+        if member is None:
+            continue
+        if member.agent_role not in PROMOTE_SENTINEL_BOUND_ROLES:
+            return frozenset()
+        bound_task_ids.add(member.task_id)
+    return frozenset(bound_task_ids)
 
 
 # The role the steward's own filings carry (orchestrator.steward
@@ -2874,6 +2902,19 @@ def create_server(
         (``{'error': ..., 'code': 'level_forbidden'}``, no L2 minted); a
         header-less connection (no identity asserted) is always allowed.
 
+        **Sentinel-bound members** (task 4541): when at least one member
+        resolves and EVERY resolved member was filed under a role in
+        ``escalation.authority.PROMOTE_SENTINEL_BOUND_ROLES`` (today the
+        recovery-veto-streak alarm), a new L2 must be minted under one of
+        those members' own task ids.  Any other *task_id* is refused with
+        ``code: 'sentinel_task_id_required'`` and ``required_task_ids`` —
+        re-issue with one of them — and nothing is minted, for header-less
+        callers too.  Why: see
+        ``orchestrator/src/orchestrator/recovery_emission.py::RECOVERY_VETO_STREAK_SENTINEL_PREFIX``.
+        Unresolvable member ids are ignored (fail-open), a cluster with any
+        ordinary member is unconstrained, and a fold into an existing L2 is
+        never refused, since nothing is minted under the caller's *task_id*.
+
         Parameters
         ----------
         task_id:
@@ -2981,6 +3022,11 @@ def create_server(
         Error::
 
             {'error': '<reason>'}
+
+        Sentinel-bound refusal (see **Sentinel-bound members**)::
+
+            {'error': '<reason>', 'code': 'sentinel_task_id_required',
+             'required_task_ids': [<sorted sentinel task ids>]}
         """
         # Identity gate (PRD task-status-authority C8/D7 row C4) — checked
         # FIRST, before any validation or queue mutation, so a disallowed
@@ -3056,9 +3102,15 @@ def create_server(
                 derived = (
                     None if severity is not None else _derive_l2_severity(queue, member_ids)
                 )
-                return derived, queue.find_pending_l2_by_root_cause(root_cause)
+                return (
+                    derived,
+                    queue.find_pending_l2_by_root_cause(root_cause),
+                    _sentinel_bound_task_ids(queue, member_ids),
+                )
 
-            derived, existing_id = await asyncio.to_thread(_read_for_promote)
+            derived, existing_id, required_task_ids = await asyncio.to_thread(
+                _read_for_promote,
+            )
 
             # CREATE must land on some severity, so an underivable set fails safe
             # UP to 'blocking' — unchanged from before task 3976.
@@ -3146,6 +3198,30 @@ def create_server(
                     'creating a new L2 for root_cause=%r',
                     existing_id, root_cause,
                 )
+
+            # Sentinel identity (task 4541): judged here, on the CREATE path only
+            # — covering both the plain create and the fold-race fall-through —
+            # because the invariant concerns what is MINTED; a fold keeps the
+            # existing L2's own task_id and discards the caller's.
+            if required_task_ids and task_id not in required_task_ids:
+                required = sorted(required_task_ids)
+                logger.info(
+                    'promote_to_l2: refused task_id=%r for sentinel-bound members %s; '
+                    'required one of %s',
+                    task_id, member_ids, required,
+                )
+                return {
+                    'error': (
+                        f'every resolvable member of {member_ids} is a sentinel-class '
+                        f'record, so the L2 must be minted under one of their own task '
+                        f'ids {required}, not {task_id!r}: an L2 minted under the real '
+                        'task id is read by every veto predicate on that task, so the '
+                        'alarm about a hold would become part of the hold. Re-issue '
+                        'with task_id set to one of required_task_ids.'
+                    ),
+                    'code': 'sentinel_task_id_required',
+                    'required_task_ids': required,
+                }
 
             # Create path: build a fresh L2 and submit it.
             # Deduplicate member_ids via dict.fromkeys so duplicate ids in the input
