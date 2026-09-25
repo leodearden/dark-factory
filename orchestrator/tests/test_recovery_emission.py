@@ -7,7 +7,9 @@ disposition — lives in the module docstring under test.  This file pins the
 observable contract only.
 """
 
+import dataclasses
 import json
+import types
 
 import pytest
 
@@ -865,6 +867,155 @@ class TestEmitRecoveryVetoStreakEscalation:
         submitting.make_id.return_value = 'esc-streak-1'
         submitting.submit.side_effect = RuntimeError('disk full')
         assert _file_streak(**_streak_kwargs(submitting)) is False
+
+
+@dataclasses.dataclass(frozen=True)
+class _Pin:
+    """A pinning record as the caller already holds it — the ``PinRecord`` surface."""
+
+    id: str
+    level: int
+    severity: str = 'blocking'
+    filing_claimant_run_id: str | None = None
+
+
+class TestStreakAlarmIsPinClassAware:
+    """Task 4541 RC#1: no alarm for a hold whose every pin is already an L2.
+
+    The alarm's trigger was "a human-facing escalation is still open", so on a
+    queue where L2s legitimately stay parked it re-fired forever.  Suppression
+    applies only to an ``escalation_pinned`` hold and only to the queue write,
+    and every uncertain input still alarms.
+    """
+
+    def _queue(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        return EscalationQueue(tmp_path)
+
+    def _pending(self, queue) -> list:
+        return queue.get_by_task(_streak_sentinel('3535'), status='pending')
+
+    def test_a_hold_pinned_only_by_an_l2_files_nothing(self, tmp_path):
+        """(a) ACCEPTANCE: both halves of the bar clear, yet no alarm is filed."""
+        queue = self._queue(tmp_path)
+
+        filed = _file_streak(**_streak_kwargs(queue, pin_records=[_Pin('esc-3535-1', 2)]))
+
+        assert filed is False
+        assert self._pending(queue) == []
+
+    def test_a_hold_pinned_by_an_l1_still_files_one_alarm(self, tmp_path):
+        """(b) COUNTER-SIGNAL: a pin nobody has promoted must still alarm."""
+        queue = self._queue(tmp_path)
+
+        filed = _file_streak(**_streak_kwargs(queue, pin_records=[_Pin('esc-3535-1', 1)]))
+
+        assert filed is True
+        (alarm,) = self._pending(queue)
+        assert alarm.severity == 'blocking'
+        assert alarm.level == 1
+
+    def test_omitting_pin_records_files_as_before(self, tmp_path):
+        """(c) Backward compatibility for callers that do not pass the rows."""
+        queue = self._queue(tmp_path)
+
+        assert _file_streak(**_streak_kwargs(queue)) is True
+
+    def test_an_unreadable_store_is_never_human_parked(self, tmp_path):
+        """(d) ``pin_records=None`` proves nothing about who holds the task."""
+        queue = self._queue(tmp_path)
+
+        assert _file_streak(**_streak_kwargs(queue, pin_records=None)) is True
+
+    def test_the_escape_hatch_restores_filing(self, tmp_path):
+        """(e) ``suppress_human_parked=False`` is the pre-4541 behaviour."""
+        queue = self._queue(tmp_path)
+
+        filed = _file_streak(**_streak_kwargs(
+            queue, pin_records=[_Pin('esc-3535-1', 2)], suppress_human_parked=False,
+        ))
+
+        assert filed is True
+
+    def test_an_l1_beside_an_l2_files(self, tmp_path):
+        """(f) One unpromoted pin is enough to alarm."""
+        queue = self._queue(tmp_path)
+
+        filed = _file_streak(**_streak_kwargs(
+            queue, pin_records=[_Pin('esc-3535-1', 2), _Pin('esc-3535-2', 1)],
+        ))
+
+        assert filed is True
+
+    def test_a_hold_not_caused_by_the_pin_still_files(self, tmp_path):
+        """(g) REASON-SCOPED: an unmapped-shape hold is not held BY its open L2."""
+        from orchestrator.recovery_emission import LeaveReason
+
+        queue = self._queue(tmp_path)
+
+        filed = _file_streak(**_streak_kwargs(
+            queue, pin_records=[_Pin('esc-3535-1', 2)],
+            reason=LeaveReason.unmapped_shape,
+        ))
+
+        assert filed is True
+
+    def test_a_suppressed_hold_touches_no_queue_method(self, tmp_path):
+        """(h) COST: the gate runs before the memo, ``has_open_l1`` and the build."""
+        from unittest.mock import MagicMock
+
+        queue = MagicMock()
+
+        filed = _file_streak(**_streak_kwargs(queue, pin_records=[_Pin('esc-3535-1', 2)]))
+
+        assert filed is False
+        assert queue.method_calls == []
+
+    def test_a_long_l2_parked_hold_never_storms(self, tmp_path):
+        """(i) NO-STORM: twenty further observations file nothing and never raise."""
+        queue = self._queue(tmp_path)
+        memo: dict[str, int] = {}
+
+        for streak in range(3, 23):
+            assert _file_streak(**_streak_kwargs(
+                queue, streak=streak, filed_at=memo,
+                pin_records=[_Pin('esc-3535-1', 2)],
+            )) is False
+
+        assert self._pending(queue) == []
+
+    def test_promoting_the_pin_ends_the_refile_loop(self, tmp_path):
+        """(j) THE PRODUCTION LOOP behind the ``esc-recovery-veto-streak-backlog-*`` regeneration.
+
+        The alarm files while its pin is an L1; an operator closes the alarm
+        after the pin is promoted; the next disk check must not re-file for a
+        hold a human is already looking at.
+        """
+        queue = self._queue(tmp_path)
+        memo: dict[str, int] = {}
+        assert _file_streak(**_streak_kwargs(
+            queue, streak=3, filed_at=memo, pin_records=[_Pin('esc-3535-1', 1)],
+        )) is True
+        (alarm,) = self._pending(queue)
+        queue.resolve(alarm.id, 'the pin is with a human now', resolved_by='interactive')
+
+        refiled = _file_streak(**_streak_kwargs(
+            queue, streak=6, filed_at=memo, pin_records=[_Pin('esc-3535-1', 2)],
+        ))
+
+        assert refiled is False
+        assert self._pending(queue) == []
+
+    def test_a_corrupt_pin_record_fails_toward_the_alarm(self, tmp_path):
+        """(k) FAIL-TOWARD-SIGNAL: a classifier fault neither suppresses nor raises."""
+        queue = self._queue(tmp_path)
+
+        filed = _file_streak(**_streak_kwargs(
+            queue, pin_records=[types.SimpleNamespace(id='esc-3535-1')],
+        ))
+
+        assert filed is True
 
 
 class TestResolveRecoveryVetoStreakEscalation:
