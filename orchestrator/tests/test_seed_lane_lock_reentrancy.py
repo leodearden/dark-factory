@@ -32,7 +32,7 @@ from pathlib import Path
 import pytest
 
 from orchestrator.config import GitConfig
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import GitOps, SeedLaneLock, WorktreeKind, _run
 
 # Mirrors the real script's lock stage: refuse (75) when ${LANE_DIR}.lock is
 # already held, UNLESS the caller asserts it holds the lock itself.
@@ -164,6 +164,39 @@ echo seeded > "$lane_dir/target/seeded.bin"
 exit 0
 """
 
+# Models TODAY's reify script (post-5354 + post-5568): it takes
+# ${LANE_DIR}.lock itself unless told the caller already holds it, and refuses
+# with 77 under --distinct-lock-refusal-rc.  Stricter than the real script, it
+# VERIFIES an --assume-lane-lock-held assertion (exit 3 if the lock is in fact
+# free), so a caller asserting a lock it does not hold fails loudly instead of
+# silently dropping inv.2 exclusivity.
+_CURRENT_LOCKING_SEED_SCRIPT = """#!/usr/bin/env bash
+# Supported flags include --assume-lane-lock-held and --distinct-lock-refusal-rc.
+set -u
+lane_dir="$2"
+refusal_rc=75
+assume_held=""
+for a in "$@"; do
+    case "$a" in
+        --distinct-lock-refusal-rc) refusal_rc=77 ;;
+        --assume-lane-lock-held) assume_held=1 ;;
+    esac
+done
+if [ -z "$assume_held" ]; then
+    exec 9>"${lane_dir}.lock"
+    if ! flock -n 9; then
+        echo "LANE_LOCK_CONTENDED: ${lane_dir}.lock held by a live consumer" >&2
+        exit "$refusal_rc"
+    fi
+elif flock -n "${lane_dir}.lock" true; then
+    echo "asserted lane lock ${lane_dir}.lock is not actually held" >&2
+    exit 3
+fi
+mkdir -p "$lane_dir/target"
+echo seeded > "$lane_dir/target/seeded.bin"
+exit 0
+"""
+
 
 def _recorded_argv(lane: Path) -> list[str]:
     """The argv the stub seed script was actually handed."""
@@ -274,18 +307,19 @@ class TestSeedLaneLockReentrancy:
     async def test_flag_omitted_when_caller_does_not_take_the_lane_lock(
         self, seed_repo: Path,
     ):
-        """take_lane_lock=False: the script owns the lock, so it must still take it.
+        """LEFT_TO_SCRIPT: the script owns the lock, so it must still take it.
 
-        Callers that already hold the lock some other way pass take_lane_lock=False;
-        suppressing the script's own acquire there would drop inv.2 exclusivity
-        entirely rather than relocate it.
+        That mode is for when NOBODY holds the lock; a caller that does hold
+        it passes HELD_BY_CALLER instead.  Suppressing the script's own
+        acquire here would drop inv.2 exclusivity entirely rather than
+        relocate it.
         """
         git_ops = GitOps(_config(), seed_repo)
         lane = await _make_lane(seed_repo, git_ops, _LOCKING_SEED_SCRIPT)
 
         # Nobody holds the lock -> the script's own flock -n succeeds.
-        rc = await _seed(git_ops, 
-            lane, '--fresh-checkout', take_lane_lock=False,
+        rc = await _seed(git_ops,
+            lane, '--fresh-checkout', lane_lock=SeedLaneLock.LEFT_TO_SCRIPT,
         )
         assert rc == 0, f'unlocked seed should succeed, got rc={rc}'
 
@@ -298,15 +332,15 @@ class TestSeedLaneLockReentrancy:
         )
         try:
             await asyncio.sleep(0.5)
-            rc_locked = await _seed(git_ops, 
-                lane, '--fresh-checkout', take_lane_lock=False,
+            rc_locked = await _seed(git_ops,
+                lane, '--fresh-checkout', lane_lock=SeedLaneLock.LEFT_TO_SCRIPT,
             )
         finally:
             proc.kill()
             await proc.wait()
 
         assert rc_locked == 75, (
-            'with take_lane_lock=False and a foreign holder, the seed script must '
+            'with LEFT_TO_SCRIPT and a foreign holder, the seed script must '
             f'still self-refuse (75) — got rc={rc_locked}, meaning inv.2 '
             'single-consumer exclusivity was silently dropped'
         )
@@ -431,38 +465,30 @@ class TestDistinctLockRefusalRcPlumbing:
         )
         assert '--distinct-lock-refusal-rc' not in _recorded_argv(lane)
 
-    async def test_flag_is_passed_regardless_of_take_lane_lock(
+    async def test_flag_is_passed_for_every_lane_lock_mode(
         self, seed_repo: Path,
     ):
         """The gating fence — deliberately UNLIKE --assume-lane-lock-held.
 
-        That flag is gated on ``take_lane_lock`` (it only matters when DF holds
-        the outer lock), which
+        That flag is withheld under ``lane_lock=LEFT_TO_SCRIPT`` (it only
+        matters when the lock is already held), which
         test_flag_omitted_when_caller_does_not_take_the_lane_lock pins.  This
-        one must NOT be, because seed's refusal arms are reachable precisely
-        when the SCRIPT self-locks: take_lane_lock=False (the ephemeral-worktree
-        CM caller, which holds the lock itself), and take_lane_lock=True against
-        a pre-5354 script that ignores --assume-lane-lock-held — the original
-        esc-5556-1 self-refusal shape.  Gating it would make it inert in exactly
-        the cases it exists for.
+        one must NOT be gated, because seed's refusal arms are reachable
+        whenever the SCRIPT self-locks: LEFT_TO_SCRIPT, and any mode against a
+        self-locking script that ignores --assume-lane-lock-held — the
+        original esc-5556-1 self-refusal shape.  Gating it would make it inert
+        in exactly the cases it exists for.
         """
         git_ops = GitOps(_config(), seed_repo)
         lane = await _make_lane(seed_repo, git_ops, _ARGV_RECORDING_SEED_SCRIPT)
 
-        rc_held = await _seed(git_ops, 
-            lane, '--fresh-checkout', take_lane_lock=True,
-        )
-        assert rc_held == 0, f'take_lane_lock=True seed failed: rc={rc_held}'
-        assert '--distinct-lock-refusal-rc' in _recorded_argv(lane)
-
-        rc_free = await _seed(git_ops, 
-            lane, '--fresh-checkout', take_lane_lock=False,
-        )
-        assert rc_free == 0, f'take_lane_lock=False seed failed: rc={rc_free}'
-        assert '--distinct-lock-refusal-rc' in _recorded_argv(lane), (
-            'the flag must survive take_lane_lock=False — that is the caller '
-            'shape where the script self-locks and can therefore refuse'
-        )
+        for mode in SeedLaneLock:
+            rc = await _seed(git_ops, lane, '--fresh-checkout', lane_lock=mode)
+            assert rc == 0, f'lane_lock={mode.name} seed failed: rc={rc}'
+            assert '--distinct-lock-refusal-rc' in _recorded_argv(lane), (
+                f'the flag must be passed under lane_lock={mode.name} — every '
+                'mode can meet a self-locking script that may refuse'
+            )
 
 
 async def _commit_seed_script(repo: Path, script_body: str) -> None:
@@ -645,4 +671,51 @@ class TestLaneLockRefusalEndToEnd:
 
         assert result is WarmLaneUnavailable.DISK_PRESSURE, (
             f'a pre-5568 lane must be unchanged by task 4211, got {result!r}'
+        )
+
+
+@pytest.mark.asyncio
+class TestEphemeralWorktreeSeedsUnderItsOwnLaneLock:
+    """The ephemeral_worktree CM holds <probe>.lock for its whole lifetime, so
+    it must ASSERT that lock to seed rather than let a self-locking seed script
+    refuse against it (task 4913).
+    """
+
+    async def _probe_was_seeded(self, repo: Path, script_body: str) -> bool:
+        await _commit_seed_script(repo, script_body)
+        git_ops = GitOps(_config(), repo)
+        _, head, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
+        async with git_ops.ephemeral_worktree(
+            WorktreeKind.MAIN_PROBE, head.strip(), warm_seed=True,
+        ) as probe:
+            return (probe / 'target' / 'seeded.bin').exists()
+
+    async def test_warm_seed_populates_target_against_a_self_locking_seed_script(
+        self, seed_repo: Path,
+    ):
+        seeded = await self._probe_was_seeded(
+            seed_repo, _CURRENT_LOCKING_SEED_SCRIPT,
+        )
+
+        assert seeded, (
+            'the MAIN_PROBE worktree was not warm-seeded: the CM never asserted '
+            'its own held lane lock (--assume-lane-lock-held), so the seed '
+            'script refused with rc 77 against the CM\'s own flock and the '
+            'probe ran COLD'
+        )
+
+    async def test_warm_seed_still_seeds_a_pre_5354_lane_script(
+        self, seed_repo: Path,
+    ):
+        """The assume flag stays capability-probed on the CM path.
+
+        _LEGACY_SEED_SCRIPT exits 2 on ANY flag, so a flag sent blind would
+        turn this seed into a fault and the probe would run cold.
+        """
+        seeded = await self._probe_was_seeded(seed_repo, _LEGACY_SEED_SCRIPT)
+
+        assert seeded, (
+            'a pre-5354 seed script must still seed the probe; a missing '
+            'seeded.bin means a flag it does not support was passed blind '
+            '(exit 2) and the probe ran COLD'
         )
