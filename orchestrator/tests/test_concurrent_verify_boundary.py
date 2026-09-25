@@ -40,6 +40,7 @@ from _orch_helpers import MERGE_RESULT_TIMEOUT, wait_responsive
 # Reuse the γ harness fakes/fixtures (established cross-test-module import pattern).
 from test_merge_queue_concurrent_verify import (
     HEAVY_BARRIER_TEST_TIMEOUT,
+    _fake_verify_result,
     _gated_runner,
     _inject_two_host_allocator,
     _make_branch_with_file,
@@ -110,16 +111,7 @@ def _make_spanning_local_verify(
         gate_entered.set()
         await gate_release.wait()
         spans.append(_Span(name=name, start=t0, end=time.monotonic()))
-        return MagicMock(
-            passed=passed,
-            summary='ok' if passed else 'fail',
-            test_output='ok' if passed else 'FAILED',
-            lint_output='',
-            type_output='',
-            category='' if passed else 'test_failure',
-            timed_out=False,
-            verify_skipped=False,
-        )
+        return _fake_verify_result(passed=passed)
 
     return _impl
 
@@ -340,16 +332,8 @@ class TestB2ChainInvalidationUnderOverlap:
             if call == 0:
                 gate_a_entered.set()
                 await gate_a_release.wait()
-                return MagicMock(
-                    passed=False, summary='test_failure', test_output='FAILED',
-                    lint_output='', type_output='', category='test_failure',
-                    timed_out=False, verify_skipped=False,
-                )
-            return MagicMock(
-                passed=True, summary='ok', test_output='ok',
-                lint_output='', type_output='', category='',
-                timed_out=False, verify_skipped=False,
-            )
+                return _fake_verify_result(passed=False, summary='test_failure')
+            return _fake_verify_result(passed=True)
 
         # N+1's remote verify: gated, PASSES when released
         gated_remote = _gated_runner(gate_b_release, gate_b_entered, passed=True, name='laptop')
@@ -459,11 +443,7 @@ class TestB3HostDownMidOverlap:
         async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
             gate_a_entered.set()
             await gate_a_release.wait()
-            return MagicMock(
-                passed=True, summary='ok', test_output='ok',
-                lint_output='', type_output='', category='',
-                timed_out=False, verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True)
 
         # N+1's remote runner: raises RunnerUnavailable after signalling entry
         async def _unavailable_side(*args: Any, **kwargs: Any) -> Any:
@@ -574,16 +554,8 @@ class TestB4CancelBehavior:
             if call == 0:
                 gate_a_entered.set()
                 await gate_a_release.wait()
-                return MagicMock(
-                    passed=False, summary='fail', test_output='FAILED',
-                    lint_output='', type_output='', category='test_failure',
-                    timed_out=False, verify_skipped=False,
-                )
-            return MagicMock(
-                passed=True, summary='ok', test_output='ok',
-                lint_output='', type_output='', category='',
-                timed_out=False, verify_skipped=False,
-            )
+                return _fake_verify_result(passed=False)
+            return _fake_verify_result(passed=True)
 
         # N+1's remote: gated + cancel rc=0 (clean cancel)
         gated_remote = _gated_runner(gate_b_release, gate_b_entered, passed=True, name='laptop')
@@ -674,16 +646,8 @@ class TestB4CancelBehavior:
             if call == 0:
                 gate_a_entered.set()
                 await gate_a_release.wait()
-                return MagicMock(
-                    passed=False, summary='fail', test_output='FAILED',
-                    lint_output='', type_output='', category='test_failure',
-                    timed_out=False, verify_skipped=False,
-                )
-            return MagicMock(
-                passed=True, summary='ok', test_output='ok',
-                lint_output='', type_output='', category='',
-                timed_out=False, verify_skipped=False,
-            )
+                return _fake_verify_result(passed=False)
+            return _fake_verify_result(passed=True)
 
         # N+1's remote: gated + cancel rc=1 (fail), probe returns True (clears immediately)
         gated_remote = _gated_runner(gate_b_release, gate_b_entered, passed=True, name='laptop')
@@ -807,11 +771,7 @@ class TestB5OperatorHalt:
         async def _gated_local(*args: Any, **kwargs: Any) -> MagicMock:
             gate_a_entered.set()
             await gate_a_release.wait()
-            return MagicMock(
-                passed=True, summary='ok', test_output='ok',
-                lint_output='', type_output='', category='',
-                timed_out=False, verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True)
 
         # N+1's remote: gated, PASSES
         gated_remote = _gated_runner(gate_b_release, gate_b_entered, passed=True, name='laptop')

@@ -13,14 +13,14 @@ half, whether that measurement succeeded and why not. What lives here is the
 WALK — the budget, the admission width, the rotation, the canonical
 re-assembly — and the SHAPING of one root's rows out of one unit.
 
-Output shape (per task) matches ``data.js`` mock fixtures:
+Output shape (per task) matches ``data.js`` mock fixtures. A task's
+description/details are NOT on it: the Task Detail pane fetches them for the
+selected task from ``dashboard/src/dashboard/api/task_prose.py::api_task_prose``.
 
     {
         'id': 'dark_factory/T-19',
         'project': 'dark_factory',
         'title': '...',
-        'description': '...',
-        'details': '...',         # may be empty; many tasks have none
         'status': 'in-progress',
         'agent': 'claude-task-19',  # TaskRuntimeEntry.has_worktree; None if no worktree.
                                     # WORKTREE PRESENCE, NOT LIVENESS — see 'stranded'.
@@ -264,6 +264,17 @@ def _all_project_roots(config: DashboardConfig) -> list[Path]:
     return roots
 
 
+def project_roots_for_label(config: DashboardConfig, label: str) -> list[Path]:
+    """Every configured root whose display label is *label*, primary first.
+
+    A LIST, because the label is the directory basename and two configured
+    roots can share one — the collision ``collect_tasks_with_counts`` keys by
+    root to survive. A caller that needs one root must refuse rather than guess
+    when the list is not exactly one long.
+    """
+    return [root for root in _all_project_roots(config) if _project_label(root) == label]
+
+
 # Admission-order rotation offset for `collect_tasks_with_counts`, advanced by
 # one slot per render. Module state, like the `_*_cache` objects elsewhere in
 # this package, with a matching `_reset_root_rotation()` test hook.
@@ -329,7 +340,7 @@ def _rotated_project_roots(config: DashboardConfig) -> list[Path]:
     return roots[offset:] + roots[:offset]
 
 
-def _task_uid(project: str, task_id: int) -> str:
+def task_uid(project: str, task_id: int) -> str:
     """Project-scoped unique id used by the React tasks tab as a map key."""
     return f'{project}/T-{task_id}'
 
@@ -456,8 +467,6 @@ def _build_task_row(
         'id': uid,
         'project': project,
         'title': task.get('title') or '',
-        'description': task.get('description') or '',
-        'details': task.get('details') or '',
         'status': task.get('status'),
         'agent': rt.get('agent'),
         'loops': rt.get('loops'),
@@ -604,7 +613,7 @@ def _resolve_deps(
         dep_task = by_id.get(dep_id)
         if dep_task is not None:
             deps.append({
-                'id': _task_uid(project, dep_id),
+                'id': task_uid(project, dep_id),
                 'title': dep_task.get('title') or '',
                 'done': dep_task.get('status') == 'done',
             })
@@ -613,7 +622,7 @@ def _resolve_deps(
         if dep_status is None:
             continue
         deps.append({
-            'id': _task_uid(project, dep_id),
+            'id': task_uid(project, dep_id),
             'title': '',
             'done': dep_status == 'done',
         })
@@ -685,7 +694,7 @@ def _shape_one_project(
         if not isinstance(task_id, int):
             continue
         rt = _runtime_fields(runtime_index, runtime_status, task_id, now=now)
-        uid = _task_uid(project, task_id)
+        uid = task_uid(project, task_id)
         row = _build_task_row(project, task, task_id, rt, uid, now=now)
         # active rows: started from the runtime entry; deps from task tree.
         row['started'] = rt['started']
@@ -737,7 +746,7 @@ def shape_terminal_rows(
             continue
         rt = _runtime_fields({}, runtime_status, task_id, now=now)
         row = _build_task_row(
-            project, task, task_id, rt, _task_uid(project, task_id), now=now,
+            project, task, task_id, rt, task_uid(project, task_id), now=now,
         )
         row['started'] = 0
         row['deps'] = []
@@ -1019,7 +1028,7 @@ async def collect_tasks_with_counts(
     # Keyed by ROOT, never by label. `_project_label` is the directory
     # BASENAME, so two configured roots can share one (``/a/proj`` and
     # ``/b/proj``) — and a label-keyed dict collapses them, which would extend
-    # the survivor's rows into `all_active` TWICE (duplicate `_task_uid`s, the
+    # the survivor's rows into `all_active` TWICE (duplicate `task_uid`s, the
     # React tab's map key) and drop the other root's rows entirely. Roots are
     # deduped by `_all_project_roots`, so this pairing is total and 1:1;
     # `strict=True` says so rather than trusting it. (`snapshots` below is

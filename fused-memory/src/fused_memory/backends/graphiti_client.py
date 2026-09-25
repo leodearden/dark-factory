@@ -490,8 +490,12 @@ class IncompleteEnumerationError(Exception):
 
 
 # ---------------------------------------------------------------------------
-# Paginated whole-graph reads (task 4340)
+# Paginated whole-graph reads (tasks 4340, 4869)
 # ---------------------------------------------------------------------------
+# plans/falkordb-resultset-cap-audit.md is the one place for the dated row
+# counts, the measured paging cost, the per-read classification of every read
+# in this file, the open residual, and the ticket cross-references.  Update it
+# there, not here.
 
 _RESULTSET_SIZE = 10000
 """FalkorDB's server-wide result-set ceiling: every query returns at most this
@@ -572,155 +576,6 @@ Callers should branch on membership in this set rather than on a specific
 kind, so a future fifth structural path is covered by construction.
 """
 
-# --------------------------------------------------------------------------- #
-# RESULT-SET CAP AUDIT — every read in this file, re-checked 2026-08-17
-# (task 4340).  Recorded so the next person does not have to redo it, and
-# stated as claims with reasons so it can be FALSIFIED rather than trusted.
-#
-# THIS BLOCK IS THE ONE PLACE the measured figures, the open residual, and the
-# ticket cross-references are written down.  Everything else that used to
-# restate them — the two shim docstrings, _paged_ro_query's residual
-# paragraph, the pagination test module's docstring, and the task-4340
-# amendment in reconciliation/stale_status_snapshot_edge_sweep.py — now points
-# HERE, so a re-measurement is a one-block edit.  Keep it that way.  Moving
-# the block out of source entirely, into a reference doc, is tracked as ticket
-# tkt_0RSKFG5RX196H9CJ0RXGJCZF4F; the counts below are date-stamped precisely
-# because they rot (Entity nodes on dark_factory read 16038, then 16083, then
-# 16262 over roughly 24 hours of task 4340).
-#
-# Measured live against localhost:6379, RESULTSET_SIZE=10000:
-#
-#     graph          Entity nodes   valid-edge rows   an unpaginated read saw
-#     dark_factory       16083            25040                10000
-#     reify              23616            31659                10000
-#
-# FIXED HERE — both were measurably truncated, and they COMPOUND:
-# ``detect_stale_with_edges`` calls them on consecutive lines and the two
-# truncations were INDEPENDENT, so an entity surviving the node cut could
-# still lose every edge to the edge cut, yielding a bogus "stale, zero valid
-# facts" verdict that ``rebuild_entity_from_edges`` then WROTE BACK into
-# ``n.summary``.  Corrupting, not merely under-reporting.
-#   - get_all_valid_edges  -> enumerate_all_valid_edges
-#   - list_entity_nodes    -> enumerate_entity_nodes
-# The old names survive as thin shims with UNCHANGED signatures applying a
-# SPLIT incompleteness policy: they RAISE IncompleteEnumerationError on a
-# STRUCTURAL incompleteness (a read that was never validly performed — its
-# emptiness or prefix is fabricated, and returning it is what let '' be
-# written back over real summaries) and WARN-and-return on an EMPIRICAL one
-# (a census disagreement, transient on a continuously-written graph).  The
-# completeness signal itself is a first-class return value on the enumerate_*
-# methods, which never raise.  No consumer ACTS on it yet — the two
-# reconciliation sweeps and cleanup_count_snapshots still call the shims, so
-# they cannot yet distinguish "swept a complete corpus" from "swept what we
-# could fetch".  Filed as ticket tkt_0RSJP8CH1M9GAAJTABV8FZB4AH.
-#
-# A THIRD CONSUMER, outside this file: scripts/measure_plural_enum_guard_recall.py
-# (task 4576) pages through _paged_ro_query and composes both its Cypher
-# strings from _ALL_VALID_EDGES_MATCH, so the read-only recall probe measures
-# the same population this module enumerates.  It supplies its OWN projection
-# and its own count(DISTINCT e.uuid) census — it decides completeness in
-# distinct EDGES, not in rows — and so re-derives its own verdict rather than
-# reading paged.complete.  Comment only; nothing here changes on its account.
-#
-# MEASURED COST of paging, and the keyset rewrite it rules out.  Measured
-# 2026-08-18 against localhost:6379, warm, 3 repeats, median reported; the
-# whole enumeration (census + every page), page_size 5000:
-#
-#     graph          read          UNPAGINATED     PAGED       rows
-#     dark_factory   entity nodes     860 ms      862 ms      16262
-#     dark_factory   valid edges      771 ms     3301 ms      25382
-#     reify          entity nodes    3326 ms     1498 ms      23671
-#     reify          valid edges     3126 ms     3685 ms      31783
-#
-# The UNPAGINATED column is the OLD behaviour and returned 10000 truncated
-# rows for its money, so it is a cost floor, not a comparable answer.  One
-# full detect_stale_with_edges (both reads) costs ~4.2 s on dark_factory —
-# about +2.6 s per reconciliation cycle — and ~5.2 s on reify, which is
-# FASTER than the ~6.5 s the two truncated reads used to cost there.  Paging
-# a large result set in 5000-row chunks beats transferring one 10000-row set.
-#
-# KEYSET/SEEK PAGINATION WAS TRIED AND DECLINED, on measurement rather than
-# on taste.  The concern it answers is real in principle: ORDER BY ... SKIP k
-# LIMIT n re-scans and re-sorts the whole matched population per page, so an
-# enumeration is O(P * N log N) where a seek would be O(N log N).  For the
-# node read the seek form is available — `WHERE n.uuid > $last ORDER BY
-# n.uuid LIMIT k` over the RANGE index ensure_indices creates on
-# Entity(uuid).  Measured head to head, running SEEK FIRST each round so any
-# warm-cache advantage favoured it:
-#
-#     graph          node SEEK (keyset)        node SKIP (offset)
-#     dark_factory   [781, 904, 862] ms        [796, 862, 1610] ms
-#     reify          [1414, 1310, 1577] ms     [1814, 1498, 1214] ms
-#
-# Indistinguishable — identical medians on dark_factory, ~6% on reify, well
-# inside the run-to-run spread.  The asymptotic argument does not bite at
-# this N: 4-5 pages over ~16-24k rows, where the sort is not the bottleneck.
-# So a second paging mode in _paged_ro_query would buy no measured latency
-# and cost a second code path to keep correct.  Re-open only WITH a
-# measurement showing the sort dominating — and note the edge read, which is
-# the expensive one, cannot use it anyway: its ORDER BY is the composite
-# (e.uuid, n.uuid) needed for a total order over ROWS.
-#
-# DOWNSTREAM FAN-OUT, the other cost this fix moved.  detect_stale_dry_run
-# issues one get_valid_edges_for_node per non-empty-summary entity, and now
-# runs over the COMPLETE node set instead of a truncated 10000.  Measured
-# 0.70 ms/entity amortised at max_concurrency=10 on dark_factory (0.39 ms on
-# reify), so the full fan-out is ~9.0 s against ~7.0 s before (dark_factory)
-# and ~8.8 s against ~3.9 s (reify).  Seconds, bounded, and it is the price
-# of the answer being right; it is not a liveness risk at these sizes.
-#
-# RESIDUAL LEFT OPEN DELIBERATELY, and not an oversight: a materially-short
-# INCOMPLETE_SHORT_READ still returns a partial collection that the
-# force=True path (memory_service.py:5826-5834, MemoryService.rebuild_entity_summaries)
-# will write back, blanking the summary of any entity whose edges fell in the
-# missing remainder.  That path never consults staleness, so it writes to
-# every entity the node read returned.  Do NOT close it by tightening the shims — guard 4 fires on any
-# shortfall at all, including a single concurrently-invalidated edge, so
-# raising there would take down the live rebuild for exactly the transient
-# the warn-not-raise decision rejected.  The fix belongs at the consumer, as
-# a policy on how short is too short applied where the destructive write is
-# decided, which is the same code the ticket above must touch.
-#
-# STILL UNPAGINATED and assessed AT RISK.  Left out of 4340 only because they
-# are separable — different call chains, no shared verdict, no write-back —
-# and folding them in would have doubled the diff.  Follow-up filed as ticket
-# tkt_0RSJP82N82SNKT2BHRT3HWK3DA (a TICKET id, not a task id — the curator
-# resolves it to a task asynchronously).
-#   - query_stale_node_embeddings: ~16083 rows on dark_factory.  A truncated
-#     read makes an embedding-dimension migration look COMPLETE when it is
-#     not — the worst shape of this bug, because the operator's evidence of
-#     success is the very thing being truncated.
-#   - query_stale_edge_embeddings: ~15242/22392 rows.  No ``invalid_at``
-#     filter, so it includes superseded edges and its row count runs ahead of
-#     the valid-edge census above.
-#   - query_edges_by_time_range: bounded only by the caller's window width;
-#     any window wide enough to span >10000 edges truncates.
-#   - retrieve_episodes: reaches the same server through graphiti-core's
-#     ``get_by_group_ids(limit=None)`` rather than ``ro_query``, so it is not
-#     fixable with ``_paged_ro_query`` as-is.  Its existing comment reasons
-#     about transfer COST and about ``last_n`` being capped in tools.py;
-#     neither protects against server-side truncation.  Truncation is worse
-#     than slowness here: the Python-side ``sorted(...)[:last_n]`` would be
-#     selecting the most-recent of a truncated 10000, i.e. silently returning
-#     the wrong episodes rather than merely fewer of them.
-#
-# ASSESSED SAFE, with the reason (a bare list would not be checkable):
-#   - every uuid-keyed lookup: the key is unique, so the result is 0 or 1 rows.
-#   - every exact-name lookup: bounded by the duplicate-name count, which
-#     ``find_duplicate_entity_nodes`` reports in single digits.
-#   - every single-row aggregate: one row by construction.
-#   - server-side grouped/filtered aggregates that SCAN the whole graph but
-#     whose RESULT set is small — the cap applies to rows RETURNED, not rows
-#     scanned, so a ``count``/``collect`` folding 20k rows into a handful is
-#     safe.
-#   - ``CALL db.indexes()``: one row per index, single digits.
-#   - every per-node neighbourhood read.  ``get_valid_edges_for_node`` is
-#     called out by name because task 4340 asked about it specifically: its
-#     row count is ONE node's valid degree, and a single node would have to
-#     hold >10000 of the graph's ~12506 valid edges to reach the cap.  It is
-#     left unpaginated deliberately, not by oversight.
-# --------------------------------------------------------------------------- #
-
 
 # Page/census pairs for the paginated whole-graph reads. Each pair shares an
 # IDENTICAL MATCH/WHERE so the two numbers describe the same population and
@@ -752,6 +607,48 @@ _ENTITY_NODES_PAGE_TEMPLATE = (
     'SKIP {skip} LIMIT {limit}'
 )
 _ENTITY_NODES_CENSUS = _ENTITY_NODES_MATCH + 'RETURN count(*)'
+
+# Embedded entity nodes, for the stale-embedding read (task 4869). `n.uuid` is
+# total for the reason above. The page cut happens in WITH, before RETURN
+# projects the vector, so each page sorts node refs and materialises only
+# page_size vectors rather than carrying every matched vector through the sort.
+_EMBEDDED_ENTITY_NODES_MATCH = 'MATCH (n:Entity) WHERE n.name_embedding IS NOT NULL '
+_EMBEDDED_ENTITY_NODES_PAGE_TEMPLATE = (
+    _EMBEDDED_ENTITY_NODES_MATCH
+    + 'WITH n ORDER BY n.uuid SKIP {skip} LIMIT {limit} '
+    'RETURN n.uuid, n.name, n.name_embedding'
+)
+_EMBEDDED_ENTITY_NODES_CENSUS = _EMBEDDED_ENTITY_NODES_MATCH + 'RETURN count(*)'
+
+# Embedded edges, for the stale-embedding read (task 4869), with the same late
+# vector projection. Here `e.uuid` alone IS total, unlike _ALL_VALID_EDGES: the
+# DIRECTED pattern yields exactly one row per edge, and RELATES_TO uuids are
+# unique graph-wide (tasks 2207/2210, the invariant get_all_valid_edges' dedup
+# rests on). No invalid_at filter: superseded edges still need re-embedding.
+_EMBEDDED_EDGES_MATCH = (
+    'MATCH (n)-[e:RELATES_TO]->(m) WHERE e.fact_embedding IS NOT NULL '
+)
+_EMBEDDED_EDGES_PAGE_TEMPLATE = (
+    _EMBEDDED_EDGES_MATCH
+    + 'WITH e ORDER BY e.uuid SKIP {skip} LIMIT {limit} '
+    'RETURN e.uuid, e.name, e.fact_embedding'
+)
+_EMBEDDED_EDGES_CENSUS = _EMBEDDED_EDGES_MATCH + 'RETURN count(*)'
+
+# Edges whose valid_at falls in a window (task 4869). `e.uuid` is total for the
+# directed-pattern reason given at _EMBEDDED_EDGES_MATCH. No vector here, so the
+# plain RETURN-then-ORDER shape suffices.
+_EDGES_IN_VALID_AT_WINDOW_MATCH = (
+    'MATCH ()-[e:RELATES_TO]->() '
+    'WHERE e.valid_at >= $start AND e.valid_at <= $end '
+)
+_EDGES_IN_VALID_AT_WINDOW_PAGE_TEMPLATE = (
+    _EDGES_IN_VALID_AT_WINDOW_MATCH
+    + 'RETURN e.uuid, e.fact, e.name, e.valid_at, e.invalid_at '
+    'ORDER BY e.uuid '
+    'SKIP {skip} LIMIT {limit}'
+)
+_EDGES_IN_VALID_AT_WINDOW_CENSUS = _EDGES_IN_VALID_AT_WINDOW_MATCH + 'RETURN count(*)'
 
 
 @dataclass(frozen=True)
@@ -926,7 +823,7 @@ async def _paged_ro_query(
     is the WRONG fix — it fires on a single concurrently-invalidated edge, so
     it would take down the live rebuild for exactly the transient described
     above.  Full statement, the affected call site, and the ticket that closes
-    it are in the RESULT-SET CAP AUDIT block at the top of this module.
+    it are in plans/falkordb-resultset-cap-audit.md.
 
     Args:
         graph: FalkorDB graph handle exposing ``async ro_query(cypher, params)``.
@@ -1046,6 +943,46 @@ async def _paged_ro_query(
     )
 
 
+async def _read_all_group_episodes(
+    driver: GraphDriver,
+    group_ids: list[str],
+    *,
+    page_size: int = _DEFAULT_READ_PAGE_SIZE,
+    max_pages: int = _MAX_READ_PAGES,
+) -> list[EpisodicNode]:
+    """Read every episode in ``group_ids``, past the server's row cap.
+
+    A different mechanism from ``_paged_ro_query`` because this read goes
+    through graphiti-core, not ``ro_query``.  ``EpisodicNode.get_by_group_ids``'
+    own ``uuid_cursor`` is KEYSET paging (``uuid < cursor ORDER BY uuid DESC``),
+    and keyset pages never shift under concurrent insert.  Only an EMPTY page
+    ends the read, never a short one, so a server cap below ``page_size``
+    cannot truncate it — which is why neither ``_paged_ro_query``'s refusal
+    guard nor a census is needed.  See plans/falkordb-resultset-cap-audit.md.
+
+    Raises:
+        IncompleteEnumerationError: ``max_pages`` ran out on a non-empty page.
+    """
+    episodes: list[EpisodicNode] = []
+    cursor: str | None = None
+    for _ in range(max_pages):
+        page = await EpisodicNode.get_by_group_ids(
+            driver, group_ids, limit=page_size, uuid_cursor=cursor
+        )
+        if not page:
+            return episodes
+        episodes.extend(page)
+        cursor = min(ep.uuid for ep in page)
+    raise IncompleteEnumerationError(
+        f'_read_all_group_episodes(group_ids={group_ids!r}): the enumeration '
+        f'was structurally incomplete (incomplete_kind={INCOMPLETE_PAGE_CAP!r}): '
+        f'max_pages={max_pages} exhausted at page_size={page_size} with '
+        f'episodes_seen={len(episodes)} and the last page non-empty, so the '
+        f'episodes read are a uuid-ordered prefix and sorting them by '
+        f'created_at would select the wrong most-recent episodes'
+    )
+
+
 def _apply_incompleteness_policy(
     paged: PagedRead,
     *,
@@ -1055,16 +992,17 @@ def _apply_incompleteness_policy(
     noun: str,
     consequence: str,
 ) -> None:
-    """Apply the SPLIT incompleteness policy to a shim's PagedRead.
+    """Apply the SPLIT incompleteness policy to a paged read's PagedRead.
 
-    ONE implementation, shared by every back-compat shim over
-    ``_paged_ro_query``, because the policy is a single decision and not a
+    ONE implementation, shared by every caller of ``_paged_ro_query`` that
+    returns a plain collection (the two task-4340 back-compat shims and the
+    task-4869 reads), because the policy is a single decision and not a
     per-method opinion: copies drift, and the drift would be silent in exactly
-    the direction that matters — a shim that forgot to raise returns a
+    the direction that matters — a caller that forgot to raise returns a
     fabricated empty and the write-back path blanks summaries with it.  It is
-    also the single seam the follow-up ticket
-    (tkt_0RSJP8CH1M9GAAJTABV8FZB4AH, wire the completeness signal through to
-    consumers) has to move when the policy migrates to the consumer.
+    also the single seam the follow-up that wires the completeness signal
+    through to consumers has to move when the policy migrates to the consumer
+    (see the TICKETS section of plans/falkordb-resultset-cap-audit.md).
 
       STRUCTURAL (``INCOMPLETE_STRUCTURAL_KINDS``) -> raise
       ``IncompleteEnumerationError``.  Deterministic, non-transient, and
@@ -1077,9 +1015,9 @@ def _apply_incompleteness_policy(
 
     Args:
         paged: The PagedRead the enumeration returned.
-        method: Shim name, for the message an operator reads.
+        method: Calling method's name, for the message an operator reads.
         group_id: Graph the read targeted.
-        returned_count: Size of the collection the shim would return.
+        returned_count: Size of the collection the caller would return.
         noun: What ``returned_count`` counts, e.g. ``'entities'``/``'nodes'``.
         consequence: Method-specific clause naming what must NOT be done with
             a structurally incomplete result, appended to the raise message.
@@ -1102,6 +1040,45 @@ def _apply_incompleteness_policy(
             method, group_id, paged.rows_seen, returned_count, noun,
             paged.reason, paged.rows_seen, paged.expected_rows,
         )
+
+
+def _first_row_per_uuid(rows: list[list], *, reader: str) -> list[list]:
+    """Keep the first row for each column-0 uuid, in order.
+
+    Paging introduces duplicates a single query never could.  Each page is a
+    separate query against a graph under concurrent write, so a row inserted
+    with a uuid sorting BEFORE the current offset shifts every later row up by
+    one, and the next page's SKIP re-returns the previous page's last row.  A
+    consumer of an unpaginated read was entitled to assume a uuid never
+    repeats; every paged reader restores that guarantee here.  Rows dropped
+    are counted at DEBUG under ``reader``, the calling method's name.
+    """
+    seen: set = set()
+    unique: list[list] = []
+    for row in rows:
+        if row[0] in seen:
+            continue
+        seen.add(row[0])
+        unique.append(row)
+    if len(unique) < len(rows):
+        logger.debug(
+            '%s: %d row(s) repeated a uuid already seen, most likely re-emitted '
+            'across a SKIP/LIMIT boundary by a concurrent insert; kept the '
+            'first-seen row for each',
+            reader, len(rows) - len(unique),
+        )
+    return unique
+
+
+def _embedding_dim(raw) -> int:
+    """Dimension of a raw vector property, parsed from its ``<v1, v2, ...>`` text.
+
+    FalkorDB's ``size()`` does not work on Vectorf32, so the dimension is
+    counted client-side.
+    """
+    if isinstance(raw, bytes):
+        raw = raw.decode('utf-8', errors='replace')
+    return len(str(raw).strip('<>').split(', '))
 
 
 def _as_sortable_utc(created_at: datetime | None) -> datetime:
@@ -1691,25 +1668,23 @@ class GraphitiBackend:
         """Retrieve recent episodes by group, ordered by created_at (most recent first) and truncated to last_n.
 
         EpisodicNode.get_by_group_ids truncates via ``ORDER BY uuid DESC LIMIT``,
-        which is unrelated to recency, so we fetch the group's full episode set
-        (limit=None) and sort/truncate by created_at ourselves.
+        which is unrelated to recency, so we read the group's full episode set
+        in keyset pages (``_read_all_group_episodes``, task 4869) and
+        sort/truncate by created_at ourselves.
+
+        Raises:
+            IncompleteEnumerationError: The keyset read ran out of page budget.
         """
         driver = self._driver_for(group_ids[0]) if group_ids else self._require_driver()
         try:
-            # Tradeoff: limit=None fetches the group's ENTIRE episode set on every
-            # call (no Cypher LIMIT), then we sort/truncate in Python. This is what
-            # makes the created_at ordering correct given that get_by_group_ids'
-            # own ORDER BY uuid DESC LIMIT truncates on the wrong key before we'd
-            # ever see the data. Acceptable today because episode reads are a cold
-            # path and per-project episode counts are bounded (reconciliation GC;
-            # last_n is separately capped at 1000 in tools.py). If per-group episode
-            # volume grows large, revisit with a created_at-indexed Cypher query
-            # (``ORDER BY e.created_at DESC LIMIT $limit``) to push the bound into
-            # the DB instead of transferring+sorting the full set here.
+            # The full set is still read, now in keyset pages, because the
+            # created_at sort must see every episode: a cap-truncated set would
+            # silently select the wrong episodes, not merely fewer of them. The
+            # cheaper bounded read (ORDER BY created_at ... LIMIT last_n) was
+            # declined; its cost and reasons are in
+            # plans/falkordb-resultset-cap-audit.md.
             episodes = await asyncio.wait_for(
-                EpisodicNode.get_by_group_ids(
-                    driver, group_ids, limit=None
-                ),
+                _read_all_group_episodes(driver, group_ids),
                 timeout=self._read_timeout,
             )
             episodes = sorted(
@@ -2204,23 +2179,23 @@ class GraphitiBackend:
         FalkorDB's ``size()`` does not work on Vectorf32 properties, so we
         return all nodes with embeddings and filter client-side by parsing the
         raw vector text representation (``<v1, v2, ...>``).
+
+        PAGINATED (task 4869) through ``_paged_ro_query``, because the embedded
+        population exceeds the server's result-set cap; incompleteness follows
+        the shared ``_apply_incompleteness_policy``.  Measured counts are in
+        plans/falkordb-resultset-cap-audit.md.
+
+        Raises:
+            IncompleteEnumerationError: The read was structurally incomplete.
         """
-        graph = self._graph_for(group_id)
-        cypher = (
-            'MATCH (n:Entity) '
-            'WHERE n.name_embedding IS NOT NULL '
-            'RETURN n.uuid, n.name, n.name_embedding'
+        return await self._query_stale_embeddings(
+            expected_dim,
+            group_id=group_id,
+            page_template=_EMBEDDED_ENTITY_NODES_PAGE_TEMPLATE,
+            census_cypher=_EMBEDDED_ENTITY_NODES_CENSUS,
+            method='query_stale_node_embeddings',
+            noun='stale node embeddings',
         )
-        result = await graph.ro_query(cypher)
-        stale: list[tuple[str, str, int]] = []
-        for row in result.result_set or []:
-            raw = row[2]
-            if isinstance(raw, bytes):
-                raw = raw.decode('utf-8', errors='replace')
-            dim = len(str(raw).strip('<>').split(', '))
-            if dim != expected_dim:
-                stale.append((row[0], row[1], dim))
-        return stale
 
     @_canonicalize_group_args
     async def query_stale_edge_embeddings(
@@ -2228,23 +2203,55 @@ class GraphitiBackend:
     ) -> list[tuple[str, str, int]]:
         """Return (uuid, name, dim) for RELATES_TO edges whose embedding dim != expected_dim.
 
-        See ``query_stale_node_embeddings`` for why client-side filtering is needed.
+        See ``query_stale_node_embeddings`` for why client-side filtering is
+        needed, and for the pagination (task 4869) this read shares.
+
+        Raises:
+            IncompleteEnumerationError: The read was structurally incomplete.
+        """
+        return await self._query_stale_embeddings(
+            expected_dim,
+            group_id=group_id,
+            page_template=_EMBEDDED_EDGES_PAGE_TEMPLATE,
+            census_cypher=_EMBEDDED_EDGES_CENSUS,
+            method='query_stale_edge_embeddings',
+            noun='stale edge embeddings',
+        )
+
+    async def _query_stale_embeddings(
+        self,
+        expected_dim: int,
+        *,
+        group_id: str,
+        page_template: str,
+        census_cypher: str,
+        method: str,
+        noun: str,
+    ) -> list[tuple[str, str, int]]:
+        """Page (uuid, name, vector) rows; return those whose dim != expected_dim.
+
+        The one body of the two stale-embedding reads, which differ only in the
+        population paged (``page_template``/``census_cypher``, as for
+        ``_paged_ro_query``) and the ``method``/``noun`` they report under.
         """
         graph = self._graph_for(group_id)
-        cypher = (
-            'MATCH (n)-[e:RELATES_TO]->(m) '
-            'WHERE e.fact_embedding IS NOT NULL '
-            'RETURN e.uuid, e.name, e.fact_embedding'
+        paged = await _paged_ro_query(graph, page_template, census_cypher)
+        stale = [
+            (row[0], row[1], dim)
+            for row in _first_row_per_uuid(paged.rows, reader=method)
+            if (dim := _embedding_dim(row[2])) != expected_dim
+        ]
+        _apply_incompleteness_policy(
+            paged,
+            method=method,
+            group_id=group_id,
+            returned_count=len(stale),
+            noun=noun,
+            consequence=(
+                'must not be taken as the full stale set, because a reindex '
+                'driven by it would look finished when it is not'
+            ),
         )
-        result = await graph.ro_query(cypher)
-        stale: list[tuple[str, str, int]] = []
-        for row in result.result_set or []:
-            raw = row[2]
-            if isinstance(raw, bytes):
-                raw = raw.decode('utf-8', errors='replace')
-            dim = len(str(raw).strip('<>').split(', '))
-            if dim != expected_dim:
-                stale.append((row[0], row[1], dim))
         return stale
 
     @_canonicalize_group_args
@@ -2255,6 +2262,12 @@ class GraphitiBackend:
 
         Uses ro_query since no writes are performed.
 
+        PAGINATED (task 4869) through ``_paged_ro_query``, because a window
+        spanning more edges than the server's result-set cap was silently
+        truncated; incompleteness follows the shared
+        ``_apply_incompleteness_policy``.  See
+        plans/falkordb-resultset-cap-audit.md.
+
         Args:
             start: ISO 8601 string for the lower bound (inclusive).
             end: ISO 8601 string for the upper bound (inclusive).
@@ -2262,15 +2275,19 @@ class GraphitiBackend:
 
         Returns:
             List of dicts with keys: uuid, fact, name, valid_at, invalid_at.
+
+        Raises:
+            IncompleteEnumerationError: The read was structurally incomplete.
         """
         graph = self._graph_for(group_id)
-        cypher = (
-            'MATCH ()-[e:RELATES_TO]->() '
-            'WHERE e.valid_at >= $start AND e.valid_at <= $end '
-            'RETURN e.uuid, e.fact, e.name, e.valid_at, e.invalid_at'
+        params = {'start': start, 'end': end}
+        paged = await _paged_ro_query(
+            graph,
+            _EDGES_IN_VALID_AT_WINDOW_PAGE_TEMPLATE,
+            _EDGES_IN_VALID_AT_WINDOW_CENSUS,
+            params=params,
         )
-        result = await graph.ro_query(cypher, {'start': start, 'end': end})
-        return [
+        edges = [
             {
                 'uuid': row[0],
                 'fact': row[1],
@@ -2278,8 +2295,17 @@ class GraphitiBackend:
                 'valid_at': row[3],
                 'invalid_at': row[4],
             }
-            for row in (result.result_set or [])
+            for row in _first_row_per_uuid(paged.rows, reader='query_edges_by_time_range')
         ]
+        _apply_incompleteness_policy(
+            paged,
+            method='query_edges_by_time_range',
+            group_id=group_id,
+            returned_count=len(edges),
+            noun='edges',
+            consequence=f'must not be treated as every edge in [{start}, {end}]',
+        )
+        return edges
 
     @_canonicalize_group_args
     async def get_valid_edges_for_node(self, node_uuid: str, *, group_id: str) -> list[EdgeDict]:
@@ -2558,10 +2584,10 @@ class GraphitiBackend:
         — about HALF the valid-edge population was invisible to every caller,
         with no error and no marker.  Do not "simplify" it back to one query.
         The measured row counts, the paging cost, and the per-query audit that
-        found this live in the RESULT-SET CAP AUDIT block at the top of this
-        module (the single place they are recorded, so a re-measurement is a
-        one-block edit); the ORDER BY and completeness rules that make paging
-        safe are in _paged_ro_query.
+        found this live in plans/falkordb-resultset-cap-audit.md (the single
+        place they are recorded, so a re-measurement is a one-file edit); the
+        ORDER BY and completeness rules that make paging safe are in
+        _paged_ro_query.
 
         Incompleteness is handled by the shared _apply_incompleteness_policy:
         STRUCTURAL kinds raise IncompleteEnumerationError, EMPIRICAL ones warn
@@ -4312,9 +4338,9 @@ class GraphitiBackend:
             page_size: Rows per page. Must stay strictly below the server's
                 result-set cap — see _paged_ro_query.
 
-        Rows are deduplicated on ``n.uuid`` across ALL pages — see the loop
-        body for why paging makes that necessary where a single query never
-        did.
+        Rows are deduplicated on ``n.uuid`` across ALL pages — see
+        ``_first_row_per_uuid`` for why paging makes that necessary where a
+        single query never did.
 
         Returns:
             (nodes, paged) where *nodes* is the same list list_entity_nodes
@@ -4330,38 +4356,14 @@ class GraphitiBackend:
             _ENTITY_NODES_CENSUS,
             page_size=page_size,
         )
-        # Dedup on n.uuid, built ONCE across every page — mirroring the
-        # (n.uuid, e.uuid) map in enumerate_all_valid_edges, and necessary for
-        # the same reason: this is a hazard PAGING INTRODUCED, not one it
-        # inherited.  Each page is a separate query against a graph under
-        # concurrent write, so an Entity inserted with a uuid sorting BEFORE
-        # the current offset shifts every later row up by one and the next
-        # page's SKIP re-returns the previous page's last row.  A single
-        # unpaginated query could never return a uuid twice, so every consumer
-        # is entitled to assume it cannot happen — and the ones downstream do:
-        # detect_stale_with_edges reports one stale entry per element and uses
-        # len(entities) as its total_count denominator, and
-        # rebuild_entity_summaries would schedule two concurrent writers for
-        # the repeated node.
-        seen: set[str] = set()
-        nodes: list[dict] = []
-        for row in paged.rows:
-            uuid = row[0]
-            if uuid in seen:
-                logger.debug(
-                    'enumerate_entity_nodes: node uuid %r seen on more than '
-                    'one page — most likely a row re-emitted across a '
-                    'SKIP/LIMIT boundary by a concurrent insert; keeping '
-                    'first-seen row',
-                    uuid,
-                )
-                continue
-            seen.add(uuid)
-            nodes.append({
-                'uuid': uuid,
-                'name': row[1] or '',
-                'summary': row[2] or '',
-            })
+        # The consumers downstream rely on the dedup: detect_stale_with_edges
+        # reports one stale entry per element and uses len(entities) as its
+        # total_count denominator, and rebuild_entity_summaries would schedule
+        # two concurrent writers for a repeated node.
+        nodes = [
+            {'uuid': row[0], 'name': row[1] or '', 'summary': row[2] or ''}
+            for row in _first_row_per_uuid(paged.rows, reader='enumerate_entity_nodes')
+        ]
         return nodes, paged
 
     @_canonicalize_group_args
@@ -4373,8 +4375,8 @@ class GraphitiBackend:
         no writes are performed.
 
         PAGINATED (task 4340).  This read was truncated at the same server-wide
-        RESULTSET_SIZE ceiling as get_all_valid_edges — measured counts in the
-        RESULT-SET CAP AUDIT block at the top of this module.
+        RESULTSET_SIZE ceiling as get_all_valid_edges — measured counts in
+        plans/falkordb-resultset-cap-audit.md.
 
         THE COMPOUNDING HAZARD, and the reason this method is in scope for a
         task nominally about edges: ``detect_stale_with_edges`` calls this

@@ -14,11 +14,12 @@
 # WHY THE RATCHET AUDIT IS UNIVERSAL. A ratchet raise is INTRODUCED by a
 # commit on a task branch and reaches main by MERGE -- exactly like the
 # .task/ contamination the neighbouring universal guard in hooks/pre-commit
-# exists to stop. Merge commits run pre-merge-commit rather than pre-commit,
-# and the merge worker advances main with `git update-ref`, which runs no
-# hooks at all, so a main-only audit would never see the two raises that
-# actually landed (0b04534c7b, 52d98220ad -- both merge commits). Catching a
-# raise where it is introduced is the only placement that bites.
+# exists to stop. A CLEAN merge runs pre-merge-commit rather than pre-commit
+# (a conflicted one finished with `git commit` does run pre-commit), and the
+# merge worker advances main with `git update-ref`, which runs no hooks at
+# all, so a main-only audit would never see the two raises that actually
+# landed (0b04534c7b, 52d98220ad -- both merge commits). Catching a raise
+# where it is introduced is the only placement that bites.
 #
 # $2 DEFAULTS TO main, not to a `rev-parse` of the working tree, and that is
 # measured rather than stylistic. Before the branch was passed down this
@@ -48,20 +49,38 @@ BRANCH="${2:-main}"
 # a baseline it can READ first; what it cannot see is that baseline deleted
 # before the write, or rendered elsewhere and copied over. The auditor below
 # asks the other question -- does this COMMIT raise anything -- by comparing
-# the staged baseline against HEAD's blob, so every route to a widened
+# the staged baseline against HEAD's blob, or, finishing a conflicted merge,
+# against what merging both parents may hold, so every route to a widened
 # baseline lands in front of one comparison.
 #
 # NO `|| true` on this filter, unlike the grep-terminated ones below: an empty
 # listing must mean "nothing staged", never "git could not answer". A corrupt
 # or locked index would otherwise disarm the audit in silence -- the very shape
 # this gate exists to close, reproduced one layer out (INV-11).
+ratchet_artifacts=(
+    orchestrator/tests/merge_lane_ratchet_baseline.json
+    orchestrator/tests/merge_lane_ratchet_authorized_raises.json
+)
 staged_ratchet="$(cd "$ROOT" && git diff --cached --name-only --diff-filter=ACMRD -- \
-    orchestrator/tests/merge_lane_ratchet_baseline.json \
-    orchestrator/tests/merge_lane_ratchet_authorized_raises.json)" || {
+    "${ratchet_artifacts[@]}")" || {
     echo "pre-commit: could not list staged ratchet artifacts (git rc=$?);"
     echo "  refusing the commit rather than skipping the audit."
     exit 1
 }
+# FINISHING A MERGE, the listing runs against MERGE_HEAD too: a resolution
+# that keeps HEAD's artifacts byte-for-byte while dropping MERGE_HEAD's moves
+# or entries differs from MERGE_HEAD alone, and it is exactly the one that
+# breaks a merge's invariant. Still PRECISE rather than "audit every merge":
+# a merge that never touches the artifacts must spawn no python, or an
+# environment that cannot import `shared` would refuse an unrelated merge.
+if merge_head="$(cd "$ROOT" && git rev-parse -q --verify MERGE_HEAD)"; then
+    staged_ratchet+="$(cd "$ROOT" && git diff --cached --name-only --diff-filter=ACMRD \
+        "$merge_head" -- "${ratchet_artifacts[@]}")" || {
+        echo "pre-commit: could not list ratchet artifacts staged against MERGE_HEAD (git rc=$?);"
+        echo "  refusing the commit rather than skipping the audit."
+        exit 1
+    }
+fi
 if [ -n "$staged_ratchet" ]; then
     echo "pre-commit: merge-lane ratchet audit (staged)..."
     # Plain python3, matching the three staged-file checks below: no uv

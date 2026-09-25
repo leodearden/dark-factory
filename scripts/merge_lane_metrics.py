@@ -82,6 +82,7 @@ import tokenize
 from collections.abc import Sequence
 from io import StringIO
 from pathlib import Path
+from typing import Any
 
 from shared import safe_io
 
@@ -1115,9 +1116,11 @@ RAISE_REMEDY = (
     'REFUSES to absorb a raise over an EXISTING baseline, so regenerating in '
     'place cannot widen the ratchet. Nor can going around it: '
     f'{COMMIT_GATE_RELPATH} runs in pre-commit on EVERY branch '
-    'and compares the STAGED baseline against the one in git HEAD, so a '
-    'baseline deleted first, written elsewhere and copied over, or hand-edited '
-    'is refused on the same terms as a regeneration -- and so is a commit that '
+    'and compares the STAGED baseline against the one in git HEAD -- or, '
+    'finishing a conflicted merge, against what merging both parents may '
+    'hold -- so a baseline deleted first, written elsewhere and copied over, '
+    'or hand-edited is refused on the same terms as a regeneration -- and so '
+    'is a commit that '
     'drops or rewrites a recorded entry in the ledger. The one thing it lets '
     'through deliberately is UNDOING THE LAST CHANGE to the baseline: staging '
     'the value this path held one commit ago, and nothing further back. That '
@@ -1126,8 +1129,8 @@ RAISE_REMEDY = (
     'honest move the expensive one. Reaching FURTHER back is refused, because '
     'every image in between is a value the ratchet moved through and returning '
     'behind them re-absorbs every measure they lowered.\n'
-    'RESIDUAL, so you do not trust more than is true: `git rebase` and merge '
-    'commits do not run pre-commit at all, and the merge worker advances main '
+    'RESIDUAL, so you do not trust more than is true: `git rebase` and a CLEAN '
+    'merge do not run pre-commit at all, and the merge worker advances main '
     'with `git update-ref`, which runs no hooks. A raise introduced before this '
     'guard existed and replayed across its introduction still reaches main '
     'unexamined. Closing that needs a merge-lane or reference-transaction gate, '
@@ -1653,8 +1656,8 @@ def _common_prefix_length(previous: list, current: list) -> int:
     return next(
         (
             index
-            # strict=False deliberately: the two lists have DIFFERENT
-            # lengths in every case this is asked about.
+            # strict=False deliberately: the recorded history and the staged
+            # list may differ in length.
             for index, (was, now) in enumerate(
                 zip(previous, current, strict=False)
             )
@@ -1695,6 +1698,69 @@ def ledger_appended_entries(previous: dict, current: dict) -> list[dict]:
             'instead of touching a recorded one.'
         )
     return current_raises[len(previous_raises) :]
+
+
+def _merged_history_length(ours: list, theirs: list, current: list) -> int | None:
+    """How many leading entries of *current* hold both parents' histories.
+
+    One read position per parent. An entry advances every parent whose next
+    unread entry it equals -- both at once for shared history, or for an
+    identical addition git's text merge coalesced into one copy. An entry that
+    is neither parent's next is a drop, a rewrite, a reorder or a foreign
+    insertion, and so is running out before both parents are read: None.
+    """
+    read_ours = read_theirs = position = 0
+    while read_ours < len(ours) or read_theirs < len(theirs):
+        if position == len(current):
+            return None
+        entry = current[position]
+        advances_ours = read_ours < len(ours) and ours[read_ours] == entry
+        advances_theirs = read_theirs < len(theirs) and theirs[read_theirs] == entry
+        if not (advances_ours or advances_theirs):
+            return None
+        read_ours += advances_ours
+        read_theirs += advances_theirs
+        position += 1
+    return position
+
+
+def ledger_merged_entries(ours: dict, theirs: dict, current: dict) -> list[dict]:
+    """The entries a MERGE commit adds beyond BOTH parents' histories.
+
+    The reader half of ``append_authorization``'s promise for a merge commit,
+    as ``ledger_appended_entries`` is for an ordinary one. Every entry each
+    parent recorded must survive unchanged and in that parent's own order. The
+    two histories may interleave, as git's merge of the text interleaves them,
+    but nothing else may sit among them; anything else is the same
+    ``AppendOnlyViolation``.
+
+    No merge base is taken: every base entry a parent still carries must
+    survive already, so the base would add a constraint only for an entry BOTH
+    parents dropped -- and demanding that one back would refuse a merge for
+    something neither parent holds.
+
+    A parent's entries are HISTORY, never this merge's own: LEDGER_README
+    promises that nothing in the file grants a future raise, so only entries
+    after both histories that equal no parent's entry may cover a raise the
+    merge makes.
+    """
+    ours_raises = list(ours.get('raises', ()))
+    theirs_raises = list(theirs.get('raises', ()))
+    current_raises = list(current.get('raises', ()))
+    history_length = _merged_history_length(ours_raises, theirs_raises, current_raises)
+    if history_length is None:
+        raise AppendOnlyViolation(
+            'the authorized-raise ledger is append-only, and this merge rewrites '
+            'its history: every entry each parent recorded must stay unchanged '
+            "and in that parent's order. The two histories may interleave, as "
+            "git's merge of the text interleaves them, but nothing else may sit "
+            "among them, and the merge's own entries go after both. Ours "
+            f'records {len(ours_raises)} entr(ies), theirs {len(theirs_raises)}, '
+            f'and the staged file holds {len(current_raises)}. Append a new '
+            'entry with --authorize-raise instead of touching a recorded one.'
+        )
+    recorded = [*ours_raises, *theirs_raises]
+    return [entry for entry in current_raises[history_length:] if entry not in recorded]
 
 
 # ---------------------------------------------------------------------------
@@ -2013,6 +2079,75 @@ def compare_baseline_files(previous: Path, current: Path) -> list[Violation]:
     one workflow ``resolve_cluster_paths`` prescribes.
     """
     return _measure_raises(load_baseline(Path(current)), load_baseline(Path(previous)))
+
+
+def _magnitude(value: Any) -> int:
+    """One measure's size: a name list by its DISTINCT names, as ``_check_tests`` counts."""
+    return len(set(value)) if isinstance(value, list) else int(value)
+
+
+def _merged_value(base: Any, ours: Any, theirs: Any) -> Any:
+    """What a 3-way merge of one measure may hold, where None means absent.
+
+    Each side's own move stands, up or down, and a deletion stands unless the
+    other side moved the entry (a modify/delete keeps the modification). Where
+    both sides moved one measure, the higher side bounds it.
+    """
+    if ours == base:
+        return theirs
+    if theirs in (base, ours):
+        return ours
+    if ours is None or theirs is None:
+        return theirs if ours is None else ours
+    if isinstance(ours, dict) and isinstance(theirs, dict):
+        return _merged_mapping(base if isinstance(base, dict) else {}, ours, theirs)
+    return max(ours, theirs, key=_magnitude)
+
+
+def _merged_mapping(base: dict, ours: dict, theirs: dict) -> dict:
+    """:func:`_merged_value` key by key, dropping every key the merge leaves absent."""
+    merged = {
+        key: _merged_value(base.get(key), ours.get(key), theirs.get(key))
+        for key in base.keys() | ours.keys() | theirs.keys()
+    }
+    return {key: value for key, value in merged.items() if value is not None}
+
+
+def _merge_bound(base: dict, ours: dict, theirs: dict) -> dict:
+    """The per-path sections a merge of *ours* and *theirs* over *base* may hold."""
+    return {
+        name: _merged_mapping(
+            _section(base, name), _section(ours, name), _section(theirs, name)
+        )
+        for name in _PER_PATH_SECTIONS
+    }
+
+
+def compare_merged_baseline_files(
+    *, base: Path | None, ours: Path | None, theirs: Path | None, current: Path
+) -> list[Violation]:
+    """Every raise a MERGE commit's *current* baseline makes over its parents' bound.
+
+    The bound is what git does to the file text, applied per measure against the
+    merge *base*: a measure only one side moved stands at that side's value, up
+    or down, and one both sides moved is bounded by the higher side. An absent
+    *base* is the empty image git merges unrelated histories against, and an
+    absent parent moved nothing, so it stands in as the base.
+
+    NOT "clean against either parent": that admits keeping one side's stale
+    value over the other side's lowering, which is an unrecorded widening on
+    whichever branch the merge lands on.
+
+    KEYWORD-ONLY: four same-typed paths make a crossed call -- one that reads
+    CLEAN -- the hazard ``test_the_argument_order_cannot_read_clean_when_crossed``
+    pins for two.
+    """
+    base_image = load_baseline(Path(base)) if base is not None else {}
+    ours_image = load_baseline(Path(ours)) if ours is not None else base_image
+    theirs_image = load_baseline(Path(theirs)) if theirs is not None else base_image
+    return _measure_raises(
+        load_baseline(Path(current)), _merge_bound(base_image, ours_image, theirs_image)
+    )
 
 
 

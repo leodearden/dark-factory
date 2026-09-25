@@ -19,6 +19,7 @@ from dashboard.data.active_tasks import (
     _minutes_since,
     collect_active_tasks,
     collect_tasks_with_counts,
+    shape_terminal_rows,
 )
 from dashboard.data.census import TaskCensus
 from dashboard.data.datum import DatumState
@@ -574,7 +575,7 @@ async def test_collect_active_tasks_handles_missing_worktree_metadata(tmp_path, 
     active, _ = await collect_active_tasks(client=dummy_client, config=cfg)
     assert active == [{
         'id': 'solo/T-1', 'project': 'solo', 'title': 'lonely',
-        'description': '', 'details': '', 'status': 'pending', 'agent': None,
+        'status': 'pending', 'agent': None,
         'started': 0, 'loops': 0, 'attempts': 0, 'deps': [],
         'meta_files': [], 'train': None, 'external_deps': [], 'prd': None,
         'lane': None, 'phase': None, 'lane_state': None, 'runtime_offline': False,
@@ -583,6 +584,53 @@ async def test_collect_active_tasks_handles_missing_worktree_metadata(tmp_path, 
         # is never stranded — the shared predicate gates on 'in-progress'.
         'claimant_run_id': None, 'heartbeat_at': None, 'stranded': False,
     }]
+
+
+@pytest.mark.asyncio
+async def test_no_task_row_carries_description_or_details(tmp_path, monkeypatch, dummy_client):
+    """ACCEPTANCE (task 5815): no row either builder shapes ships a task's prose.
+
+    The Task Detail pane fetches description/details for the ONE selected task
+    (dashboard/src/dashboard/api/task_prose.py::api_task_prose); shipping them
+    on every row was ~84% of the /tasks payload. Every raw row here carries
+    NON-EMPTY prose, so a missing key is a real omission, not an empty field.
+
+    Since task 5587 there are TWO row builders: the collector's active rows,
+    which are the same objects ``TASKS_SNAPSHOT[p].rows`` carries, and
+    ``shape_terminal_rows`` for the on-demand ``?terminal=`` window.
+    """
+    root, shaped = _make_project(
+        tmp_path, project_dir='prose',
+        tasks=[
+            {'id': task_id, 'title': status, 'status': status, 'dependencies': [],
+             'description': f'why {task_id}', 'details': f'how {task_id}',
+             'updated_at': '2026-09-24T00:00:00+00:00'}
+            for task_id, status in enumerate(
+                ['in-progress', 'pending', 'blocked', 'done', 'cancelled'], start=1,
+            )
+        ],
+    )
+
+    async def _fake_fetch_tasks(client, config, project_root):
+        return list(shaped)
+
+    _register_fetch_tasks(monkeypatch, _fake_fetch_tasks)
+    _register_runtime(monkeypatch, {'prose': []})
+    cfg = DashboardConfig(project_root=root)
+
+    active, snapshots = await collect_tasks_with_counts(client=dummy_client, config=cfg)
+    terminal = shape_terminal_rows(
+        root,
+        [task for task in shaped if task['status'] in ('done', 'cancelled')],
+        now=datetime.now(UTC),
+    )
+
+    # NON-VACUITY: both builders must have shaped rows.
+    assert {row['status'] for row in active} == {'in-progress', 'pending', 'blocked'}
+    assert {row['status'] for row in terminal} == {'done', 'cancelled'}
+    rows = [*active, *(snapshots['prose'].rows.value or []), *terminal]
+    carrying = [row['id'] for row in rows if 'description' in row or 'details' in row]
+    assert carrying == [], f'these task rows still ship prose: {carrying}'
 
 
 @pytest.mark.asyncio
@@ -3047,7 +3095,7 @@ class TestCollectTasksWithCountsConcurrency:
         ``_project_label`` is the directory BASENAME, so two configured roots
         can share one (``/a/proj`` and ``/b/proj``). Keying the gathered
         results by label collapses them: the survivor's rows are extended into
-        ``all_active`` TWICE — duplicate ``_task_uid``s, which the React tab
+        ``all_active`` TWICE — duplicate ``task_uid``s, which the React tab
         uses as its map key — and the other root's rows vanish with no
         offline or degraded marker naming them. That is silent DATA LOSS, and
         it is the invisible-failure class this whole task exists to close.

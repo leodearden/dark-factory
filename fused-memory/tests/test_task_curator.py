@@ -5663,6 +5663,118 @@ class TestCuratorBlocklistDisabledOrMissing:
         assert len(blocklist_warns) == 0, f"Expected no blocklist warnings for empty YAML, got: {blocklist_warns}"
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# task-5007 RED: TestBlocklistLazyLoadRunsOffEventLoop
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestBlocklistLazyLoadRunsOffEventLoop:
+    """Site-specific coverage for _maybe_blocklist_drop's lazy registry load:
+    fail-open behaviour on a loader raise, and the relative-path-without-cwd
+    warning. Both pin the "blocklist" label / cancelled_premise_blocklist_path
+    config-key wiring that is unique to this call site.
+
+    The off-loop thread-identity and concurrent-first-call properties are
+    generic _LazyRegistry.entries behaviour and are pinned once, canonically,
+    by TestPremiseGuardRunsOffEventLoop (task 4201) — duplicating them here
+    would assert the same ~40 lines of _LazyRegistry.entries a third time
+    over (docs/code-quality.md heuristic 11, SPOT).
+    """
+
+    async def test_blocklist_load_error_fails_open_and_is_attempted_once(
+        self, tmp_path, caplog,
+    ):
+        """RED: a blocklist load that RAISES must fail OPEN, not escape, and
+        must not latch into a permanent failure.
+
+        Pins the invariant _LazyRegistry.entries enforces: a loader raise —
+        including one originating in asyncio.to_thread itself, not just one
+        load_blocklist's own except clauses catch — must be swallowed into a
+        fail-open None, must log exactly one WARNING naming this guard's
+        "blocklist" label, and must still latch the one-shot contract so no
+        retry storm follows a failed load.
+
+        Injects the raise directly via side_effect (a counting wrapper that
+        raises) rather than a non-UTF-8 file — this targets
+        asyncio.to_thread's own raise path, which no loader-internal except
+        can ever cover, and stays valid regardless of what exception types
+        load_blocklist itself later learns to catch (see the task-4483
+        collision-risk note in plan.json).
+        """
+        blocklist = _make_blocklist_yaml(
+            tmp_path,
+            title_subs=["search-then-delete", "fix c"],
+            desc_subs=["fixc_flags_deleted_not_found"],
+        )
+        config = _make_config_with_blocklist(str(blocklist))
+        curator = TaskCurator(config=config, taskmaster=None)
+
+        candidate = CandidateTask(
+            title="Convert FIX C relay-flag deletion: search-then-delete",
+            description="Metric fixc_flags_deleted_not_found is not tracked.",
+        )
+
+        load_calls = 0
+
+        def counting_raise(path):
+            nonlocal load_calls
+            load_calls += 1
+            raise RuntimeError("boom")
+
+        with patch(
+            "fused_memory.middleware.cancelled_premise_blocklist.load_blocklist",
+            side_effect=counting_raise,
+        ), caplog.at_level(logging.WARNING):
+            decision1 = await curator._maybe_blocklist_drop(
+                candidate, candidate.payload_hash(),
+            )
+            decision2 = await curator._maybe_blocklist_drop(
+                candidate, candidate.payload_hash(),
+            )
+
+        assert decision1 is None
+        assert decision2 is None
+        assert load_calls == 1  # one-shot contract survives a failed load
+        # "blocklist" + "failing open" is the exact text the shared load
+        # helper's except block emits — narrower than "failing" appearing
+        # somewhere, which would stay green even if this WARNING were
+        # deleted and some unrelated warning fired instead.
+        fail_open_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and "failing open" in r.getMessage()
+            and "blocklist" in r.getMessage()
+        ]
+        assert len(fail_open_records) == 1
+
+    async def test_relative_path_without_cwd_warns_naming_config_key(self, caplog):
+        """Behaviour-preservation pin: a relative
+        cancelled_premise_blocklist_path with no cwd resolves against the
+        process CWD and logs a WARNING naming the config key so an operator
+        can identify which field to make absolute. Green today
+        (task_curator.py _maybe_blocklist_drop's lazy-load block); must stay
+        green once this branch moves into the shared _LazyRegistry._resolve.
+        """
+        config = FusedMemoryConfig()
+        config.curator = CuratorConfig(cancelled_premise_blocklist_path="relative/blocklist.yaml")
+        curator = TaskCurator(config=config, taskmaster=None, cwd=None)
+
+        candidate = CandidateTask(title="Normal task", description="Normal description")
+
+        with caplog.at_level(logging.WARNING):
+            decision = await curator._maybe_blocklist_drop(
+                candidate, candidate.payload_hash(),
+            )
+
+        assert decision is None
+        assert any(
+            "cancelled_premise_blocklist_path" in r.getMessage()
+            for r in caplog.records
+            if r.levelno >= logging.WARNING
+        )
+
+
 # step-13 RED: TestCancelledPremiseBlocklistPinsFixCRegression
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -7567,6 +7679,127 @@ class TestCuratorMaybeRouteDeterministic:
         )
 
         assert decision is None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# task-5007 RED: TestOperationalRegistryLazyLoadRunsOffEventLoop
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestOperationalRegistryLazyLoadRunsOffEventLoop:
+    """Site-specific coverage for _maybe_route_deterministic's lazy registry
+    load: fail-open behaviour on a loader raise, and the
+    relative-path-without-cwd warning. Both pin the "operational-ask" label /
+    operational_ask_registry_path config-key wiring that is unique to this
+    call site.
+
+    The off-loop thread-identity and concurrent-first-call properties are
+    generic _LazyRegistry.entries behaviour and are pinned once, canonically,
+    by TestPremiseGuardRunsOffEventLoop (task 4201) — see
+    TestBlocklistLazyLoadRunsOffEventLoop's docstring for the same
+    reasoning; duplicating them here a third time would be a SPOT violation
+    (docs/code-quality.md heuristic 11).
+
+    Candidates here are deliberately UNTAGGED (no execution_class) so they
+    match via the title/description substring fallback — a tagged
+    'operational'/'decision' candidate is skipped by match_candidate
+    entirely (task delta demotion; see TestCuratorMaybeRouteDeterministic
+    above) and would make these tests vacuous.
+    """
+
+    async def test_operational_registry_load_error_fails_open_and_is_attempted_once(
+        self, tmp_path, caplog,
+    ):
+        """RED: a registry load that RAISES must fail OPEN, not escape, and
+        must not latch into a permanent failure.
+
+        Pins the invariant _LazyRegistry.entries enforces: a loader raise —
+        including one originating in asyncio.to_thread itself, not just one
+        load_operational_registry's own except clauses catch — must be
+        swallowed into a fail-open None, must log exactly one WARNING naming
+        this guard's "operational-ask" label, and must still latch the
+        one-shot contract so no retry storm follows a failed load.
+
+        Injects the raise directly via side_effect rather than a non-UTF-8
+        file — see the equivalent blocklist test's rationale (task-4483
+        collision-risk note in plan.json): this targets asyncio.to_thread's
+        own raise path, which no loader-internal except can ever cover.
+        """
+        registry = _make_operational_registry_yaml(
+            tmp_path,
+            title_subs=["prune_recon_cycle_summaries"],
+            desc_subs=["--apply"],
+        )
+        config = _make_config_with_operational_registry(str(registry))
+        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+
+        candidate = CandidateTask(
+            title="Run prune_recon_cycle_summaries --apply against live Mem0",
+            description="Operational --apply run to collapse pre-existing piles.",
+        )
+
+        load_calls = 0
+
+        def counting_raise(path):
+            nonlocal load_calls
+            load_calls += 1
+            raise RuntimeError("boom")
+
+        with patch(
+            "fused_memory.middleware.operational_ask_registry.load_operational_registry",
+            side_effect=counting_raise,
+        ), caplog.at_level(logging.WARNING):
+            decision1 = await curator._maybe_route_deterministic(
+                candidate, candidate.payload_hash(),
+            )
+            decision2 = await curator._maybe_route_deterministic(
+                candidate, candidate.payload_hash(),
+            )
+
+        assert decision1 is None
+        assert decision2 is None
+        assert load_calls == 1  # one-shot contract survives a failed load
+        # "operational-ask" + "failing open" is the exact text the shared
+        # load helper's except block emits — narrower than "failing"
+        # appearing somewhere, which would stay green even if this WARNING
+        # were deleted and some unrelated warning fired instead.
+        fail_open_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and "failing open" in r.getMessage()
+            and "operational-ask" in r.getMessage()
+        ]
+        assert len(fail_open_records) == 1
+
+    async def test_relative_path_without_cwd_warns_naming_config_key(self, caplog):
+        """Behaviour-preservation pin: a relative operational_ask_registry_path
+        with no cwd resolves against the process CWD and logs a WARNING
+        naming the config key so an operator can identify which field to
+        make absolute. Green today (task_curator.py
+        _maybe_route_deterministic's lazy-load block); must stay green once
+        this branch moves into the shared _LazyRegistry._resolve.
+        """
+        config = FusedMemoryConfig()
+        config.curator = CuratorConfig(operational_ask_registry_path="relative/registry.yaml")
+        curator = TaskCurator(config=config, taskmaster=None, cwd=None)
+
+        candidate = CandidateTask(
+            title="Run prune_recon_cycle_summaries --apply against live Mem0",
+            description="Operational --apply run to collapse pre-existing piles.",
+        )
+
+        with caplog.at_level(logging.WARNING):
+            decision = await curator._maybe_route_deterministic(
+                candidate, candidate.payload_hash(),
+            )
+
+        assert decision is None
+        assert any(
+            "operational_ask_registry_path" in r.getMessage()
+            for r in caplog.records
+            if r.levelno >= logging.WARNING
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────

@@ -3,6 +3,9 @@
 const { ProjectGroup: PG_T, Segmented: SEG_T } = window.DF_SHELL;
 const { PALETTE: CP_T } = window.DF_CHARTS;
 const DF_T = window.DF_DATA;
+// One namespace alias, never destructured: data.js's top-level consts share this
+// file's global scope (see test_tab_tasks_prose.py's load-safety pin).
+const DF_LOADER_T = window.DF_DATA_LOADER;
 const { useState: uS_T, useEffect: uE_T, useRef: uR_T, useLayoutEffect: uLE_T, useMemo: uM_T } = React;
 const { computeTiers, partitionComponents, orderRows, computeNeighborhood, focusGroupView } = window.DF_GRAPH_LAYOUT;
 const { prdTitle, aggregatePrdStatus, summarizePrdMembers, groupTasksByPrd, orderPrdGroups } = window.DF_PRD_GROUPING;
@@ -510,6 +513,41 @@ function MarkdownText({ text, className, empty }) {
   return <div className={className} dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
+// The selected task's description/details, which the list rows do not carry.
+// A child of TaskDetail so that TaskDetail's early `if (!task)` return cannot
+// change the hook order.
+function TaskProse({ uid }) {
+  const [outcome, setOutcome] = uS_T(null);
+  uE_T(() => {
+    let current = true;
+    setOutcome(null);
+    DF_LOADER_T.requestOnDemand('taskProse', uid).then(o => { if (current) setOutcome(o); });
+    return () => { current = false; };
+  }, [uid]);
+  const prose = DF_T[DF_LOADER_T.ON_DEMAND_KEYS.taskProse.key(uid)];
+  switch (DF_LOADER_T.onDemandView(prose, outcome)) {
+    case DF_LOADER_T.ON_DEMAND_VIEWS.ready:
+      return (<>
+        <div className="section-lbl">Description</div>
+        <MarkdownText text={prose.description} className="desc" empty="—" />
+        {prose.details && (<>
+          <div className="section-lbl">Details</div>
+          <MarkdownText text={prose.details} className="desc" />
+        </>)}
+      </>);
+    case DF_LOADER_T.ON_DEMAND_VIEWS.loading:
+      return (<>
+        <div className="section-lbl">Description</div>
+        <div className="desc" style={{ color: 'var(--fg-3)' }}>loading…</div>
+      </>);
+    default:
+      return (<>
+        <div className="section-lbl">Description</div>
+        <div className="desc" style={{ color: 'var(--warn)' }}>The description and details could not be fetched.</div>
+      </>);
+  }
+}
+
 function TaskDetail({ task, allTasks }) {
   if (!task) {
     return <div className="placeholder">Click a task in the graph to see its full description, dependencies, and locks.</div>;
@@ -551,13 +589,7 @@ function TaskDetail({ task, allTasks }) {
         )}
       </div>
 
-      <div className="section-lbl">Description</div>
-      <MarkdownText text={task.description} className="desc" empty="—" />
-
-      {task.details && (<>
-        <div className="section-lbl">Details</div>
-        <MarkdownText text={task.details} className="desc" />
-      </>)}
+      <TaskProse uid={task.id} />
 
       <div className="section-lbl">Depends on ({deps.length})</div>
       {deps.length === 0

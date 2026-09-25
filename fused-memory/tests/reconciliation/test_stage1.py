@@ -2428,7 +2428,7 @@ class TestStage1PayloadLiveWorkflowSignalsSection:
         live_task = {'id': int(live_task_id), 'title': 'Live task', 'status': 'in-progress'}
         other_task = {'id': int(not_live_task_id), 'title': 'Other task', 'status': 'blocked'}
 
-        def _fake_detect(task_id, project_root, **kwargs):
+        async def _fake_detect(task_id, project_root, **kwargs):
             if str(task_id) == live_task_id:
                 return WorkflowLiveness(
                     is_live=True,
@@ -2470,7 +2470,7 @@ class TestStage1PayloadLiveWorkflowSignalsSection:
         import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
         from fused_memory.services.live_workflow_detector import WorkflowLiveness
 
-        def _fake_detect(task_id, project_root, **kwargs):
+        async def _fake_detect(task_id, project_root, **kwargs):
             return WorkflowLiveness(
                 is_live=False,
                 worktree_registered=False,
@@ -2507,7 +2507,7 @@ class TestStage1PayloadLiveWorkflowSignalsSection:
         import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
         from fused_memory.services.live_workflow_detector import WorkflowLiveness
 
-        def _fake_detect(task_id, project_root, **kwargs):
+        async def _fake_detect(task_id, project_root, **kwargs):
             return WorkflowLiveness(
                 is_live=True,
                 worktree_registered=True,
@@ -2547,7 +2547,7 @@ class TestStage1PayloadLiveWorkflowSignalsSection:
 
         live_task_id = '4321'
 
-        def _fake_detect(task_id, project_root, **kwargs):
+        async def _fake_detect(task_id, project_root, **kwargs):
             return WorkflowLiveness(
                 is_live=True,
                 worktree_registered=True,
@@ -2634,7 +2634,7 @@ class TestStage1RemediationPayloadLiveWorkflowSection:
         live_task = {'id': int(live_task_id), 'title': 'Live task', 'status': 'in-progress'}
         other_task = {'id': int(not_live_task_id), 'title': 'Other task', 'status': 'blocked'}
 
-        def _fake_detect(task_id, project_root, **kwargs):
+        async def _fake_detect(task_id, project_root, **kwargs):
             if str(task_id) == live_task_id:
                 return WorkflowLiveness(
                     is_live=True,
@@ -2677,7 +2677,7 @@ class TestStage1RemediationPayloadLiveWorkflowSection:
         import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
         from fused_memory.services.live_workflow_detector import WorkflowLiveness
 
-        def _fake_detect(task_id, project_root, **kwargs):
+        async def _fake_detect(task_id, project_root, **kwargs):
             return WorkflowLiveness(
                 is_live=False,
                 worktree_registered=False,
@@ -2711,7 +2711,7 @@ class TestStage1RemediationPayloadLiveWorkflowSection:
         import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
         from fused_memory.services.live_workflow_detector import WorkflowLiveness
 
-        def _fake_detect(task_id, project_root, **kwargs):
+        async def _fake_detect(task_id, project_root, **kwargs):
             return WorkflowLiveness(
                 is_live=True,
                 worktree_registered=True,

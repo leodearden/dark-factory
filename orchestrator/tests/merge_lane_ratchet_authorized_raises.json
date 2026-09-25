@@ -127,6 +127,66 @@
           "current": 31439
         }
       ]
+    },
+    {
+      "task_id": "5082",
+      "reason": "Task 5082 facet 1 adds five required regression tests of verify._is_bare_xdist_worker_crash's new crash-attribution clause (crash-attributed FAILED line accepted; plus unrelated FAILED, plus INTERNALERROR, already-failed-then-crashed, and no-crash-notice all rejected). Net-additive guard coverage against the same private helper the file already tests 14 times; no refactor regressed.",
+      "measures": [
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_verify_env_transient.py",
+          "baseline": 31,
+          "current": 36
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6528,
+          "current": 6533
+        }
+      ]
+    },
+    {
+      "task_id": "5811",
+      "reason": "Net-additive safety net: conftest gains _drain_leaked_tasks, a bounded first cancel of every leftover task before pytest-asyncio's loop close delivers the second, which is the fix for the deep-family xdist worker deaths (a task cancelled mid-subprocess-spawn survives one cancel). The 1907 reaper now depends on it so it tears down last.",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/tests/conftest.py",
+          "baseline": 42,
+          "current": 47
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/tests/conftest.py",
+          "baseline": 1187,
+          "current": 1201
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/tests/conftest.py",
+          "baseline": 770,
+          "current": 773
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4724,
+          "current": 4729
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 56042,
+          "current": 56056
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31439,
+          "current": 31442
+        }
+      ]
     }
   ]
 }

@@ -547,7 +547,7 @@ def test_a_terminal_window_that_breaks_the_envelope_is_unknown_not_a_500(client,
 
 
 _TASK_ROW_KEYS = frozenset({
-    'id', 'project', 'title', 'description', 'details', 'status', 'agent',
+    'id', 'project', 'title', 'status', 'agent',
     'loops', 'attempts', 'lane', 'phase', 'lane_state', 'runtime_offline',
     'runtime_status', 'claimant_run_id', 'heartbeat_at', 'stranded',
     'meta_files', 'train', 'external_deps', 'prd', 'started', 'deps',
@@ -558,7 +558,9 @@ A literal rather than a derivation, so that adding a field to the wire is a
 deliberate edit here.
 """
 
-_RAW_ONLY_KEYS = frozenset({'priority', 'dependencies', 'metadata', 'updated_at'})
+_RAW_ONLY_KEYS = frozenset({
+    'description', 'priority', 'dependencies', 'metadata', 'updated_at',
+})
 """The raw ``_shape_task`` fields the shaper narrows away, ``metadata`` the heaviest."""
 
 

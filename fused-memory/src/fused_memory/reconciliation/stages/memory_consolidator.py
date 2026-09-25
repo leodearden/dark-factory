@@ -1388,7 +1388,7 @@ class MemoryConsolidator(BaseStage):
 
         # Remediation mode: return focused payload with findings only
         if self.remediation_findings is not None:
-            return self._assemble_remediation_payload()
+            return await self._assemble_remediation_payload()
 
         # 1. Episodes since last reconciliation
         try:
@@ -1517,7 +1517,7 @@ class MemoryConsolidator(BaseStage):
 
 ### Previous Reconciliation
 {_format_watermark(watermark, include_freshness_cutoffs=True)}
-{prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{self._render_required_sections()}
+{prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{await self._render_required_sections()}
 ## Your Task
 Review the above data and perform memory consolidation:
 1. Within Mem0: identify duplicates, contradictions, stale entries. Merge/delete as needed.
@@ -1610,7 +1610,7 @@ Review the above data and perform memory consolidation:
 
 ### Previous Reconciliation
 {_format_watermark(watermark)}
-{prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{self._render_required_sections()}
+{prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{await self._render_required_sections()}
 ## Your Task
 Review the above data and perform memory consolidation:
 1. Within Mem0: identify duplicates, contradictions, stale entries. Merge/delete as needed.
@@ -1621,7 +1621,7 @@ Review the above data and perform memory consolidation:
 
 {_STAGE1_PROJECT_ID_GUIDELINE.format(project_id=self.project_id)}{self._build_project_root_directive()}"""
 
-    def _render_required_sections(self) -> str:
+    async def _render_required_sections(self) -> str:
         """Render every inference-bearing payload section, in registry order.
 
         Every Stage-1 payload builder MUST interpolate this — enforced
@@ -1640,8 +1640,14 @@ Review the above data and perform memory consolidation:
 
         Adding a section is a single :attr:`REQUIRED_SECTIONS` edit rather than
         one edit per builder; that is the whole point of routing through here.
+
+        Every registered renderer is a coroutine method (task 3778: the
+        live-workflow renderer's git probes are async), awaited in registry
+        order.
         """
-        return ''.join(getattr(self, section.renderer)() for section in self.REQUIRED_SECTIONS)
+        return ''.join(
+            [await getattr(self, section.renderer)() for section in self.REQUIRED_SECTIONS]
+        )
 
     def _build_project_root_directive(self) -> str:
         """Return the project_root directive line for payload footers.
@@ -1664,7 +1670,7 @@ Review the above data and perform memory consolidation:
             return ''
         return '\n' + format_filtered_task_tree(self.filtered_task_tree) + '\n'
 
-    def _build_live_workflow_section(self) -> str:
+    async def _build_live_workflow_section(self) -> str:
         """Return the Live-Workflow Signals prompt section, or empty string if inapplicable.
 
         Mirrors Stage 2's guard/source exactly (task 1655): renders over
@@ -1684,7 +1690,7 @@ Review the above data and perform memory consolidation:
         """
         if not (self.filtered_task_tree and self.filtered_task_tree.active_tasks):
             return ''
-        section = _render_live_workflow_section(
+        section = await _render_live_workflow_section(
             self.filtered_task_tree.active_tasks,
             self.scope.project_root,
         )
@@ -1723,7 +1729,7 @@ Review the above data and perform memory consolidation:
             f'Total: {auth_total}, Done: {auth_done}{divergence_note}\n'
         )
 
-    def _assemble_remediation_payload(self) -> str:
+    async def _assemble_remediation_payload(self) -> str:
         """Focused payload for remediation runs — findings only, no full data."""
         self._entity_summary_snapshot_lines_stripped = 0
         findings = self.remediation_findings or []
@@ -1731,7 +1737,7 @@ Review the above data and perform memory consolidation:
 ## Project: {self.project_id}
 
 ### Actionable Findings to Remediate ({len(findings)})
-{_format_findings(findings)}{self._render_required_sections()}
+{_format_findings(findings)}{await self._render_required_sections()}
 
 ## Your Task
 This is a focused remediation run. Address ONLY the specific findings listed above:
