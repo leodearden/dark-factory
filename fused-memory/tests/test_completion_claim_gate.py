@@ -742,6 +742,7 @@ class TestDelegatesToTheSharedHelper:
             'write-path noise in front of work that cannot proceed'
         )
         assert seen['project_root'] == str(tmp_path)
+        assert seen['level'] == 0
 
     def test_two_different_refs_get_two_different_anchors(
         self, tmp_path, monkeypatch,

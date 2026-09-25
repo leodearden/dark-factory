@@ -571,6 +571,8 @@ class _Filer(NamedTuple):
     fire: Callable[[Any, str], object]
     #: The level this filer's package-unavailable arm must be emitted at.
     no_escalation_level: int
+    #: The escalation level the filed record must be born at.
+    escalation_level: int
 
 
 def _storm(module: Any, project_root: str) -> object:
@@ -596,14 +598,15 @@ def _unverified_claim(module: Any, project_root: str) -> object:
     )
 
 
-#: THE SINGLE POINT OF TRUTH (heuristic 11) for the level each migrated filer
-#: emits its package-unavailable arm at: the DEBUG house level, and its ONE
-#: deliberate exception.
+#: THE SINGLE POINT OF TRUTH (heuristic 11) for the two levels each migrated
+#: filer forwards: the log level of its package-unavailable arm, and the
+#: escalation level its record is born at.
 #:
-#: A never-raise alarm path is where a silent level downgrade is most costly —
-#: the only symptom is absence of output — so the levels are fenced here rather
-#: than left implicit in seven call sites. Changing what a filer forwards means
-#: editing this table, which is the point: it cannot land unnoticed.
+#: Both are silent when they drift — a log line that drops below threshold and
+#: a record that waits for the orphan-L0 reaper both look like "nothing to
+#: report" — so they are fenced here rather than left implicit in seven call
+#: sites. Changing what a filer forwards means editing this table, which is the
+#: point: it cannot land unnoticed.
 _MIGRATED_FILERS: tuple[_Filer, ...] = (
     _Filer(
         'write_triage',
@@ -612,18 +615,23 @@ _MIGRATED_FILERS: tuple[_Filer, ...] = (
             root, {'count': 5, 'window_seconds': 60},
         ),
         logging.DEBUG,
+        1,
     ),
     _Filer(
         'markup_tripwire storm',
         'fused_memory.server.markup_tripwire',
         _storm,
         logging.DEBUG,
+        1,
     ),
     _Filer(
         'markup_tripwire residue',
         'fused_memory.server.markup_tripwire',
         _residue,
         logging.DEBUG,
+        # The residue record's own `level`, falling back to L2: it holds a
+        # payload only a human can repair.
+        2,
     ),
     _Filer(
         'candidate_key_escalation',
@@ -634,6 +642,7 @@ _MIGRATED_FILERS: tuple[_Filer, ...] = (
               'count': 2, 'reason': 'mixed_status'}],
         ),
         logging.DEBUG,
+        1,
     ),
     # THE ONE EXCEPTION, and the defect this table exists to fence. A repair
     # storm is a sustained scanner/resolver regression against a measured
@@ -649,12 +658,17 @@ _MIGRATED_FILERS: tuple[_Filer, ...] = (
             repairs=1, records=[],
         ),
         logging.WARNING,
+        1,
     ),
     _Filer(
         'completion_claim_gate',
         'fused_memory.services.completion_claim_gate',
         _unverified_claim,
         logging.DEBUG,
+        # L0, the Escalation model's default, which this filer has always been
+        # born at. Whether an 'info' record under a synthetic anchor should be
+        # born at L1 like its siblings is a design question, not a refactor's.
+        0,
     ),
     _Filer(
         'memory_metadata_census',
@@ -664,17 +678,38 @@ _MIGRATED_FILERS: tuple[_Filer, ...] = (
             keys=['weird_key'],
         ),
         logging.DEBUG,
+        1,
     ),
 )
 
 
-class TestEveryFilerPinsItsUnavailableLevel:
-    """The house level, its one exception, and a fence against a third answer.
+def _forwarded_kwargs(filer: _Filer, tmp_path, monkeypatch) -> dict:
+    """Fire *filer* against a spy and return what it forwarded to the helper."""
+    module = importlib.import_module(filer.module)
+    seen: dict = {}
+
+    def _spy(_project_root, **kwargs):
+        seen.update(kwargs)
+        return 'esc-spied-1'
+
+    monkeypatch.setattr(module, 'file_folded_escalation', _spy)
+    filer.fire(module, str(tmp_path))
+
+    assert seen, f'{filer.label} did not reach file_folded_escalation at all'
+    return seen
+
+
+class TestEveryFilerPinsItsForwardedLevels:
+    """The house levels, their exceptions, and a fence against a new answer.
 
     Deliberately NOT decorated with `_needs_escalation`: the spy replaces
     `file_folded_escalation` outright, so no queue is ever built — and a level
     regression that only fails where the escalation package happens to be
     installed is an alarm switched off exactly where nobody is looking.
+
+    Each forwarded value is read with `.get` and the helper's own default, so
+    a row passes whether the caller omits the keyword or passes it explicitly:
+    the property under test is the EFFECTIVE level, not the call spelling.
     """
 
     @pytest.mark.parametrize(
@@ -683,30 +718,35 @@ class TestEveryFilerPinsItsUnavailableLevel:
     def test_the_forwarded_no_escalation_level_matches_the_table(
         self, filer, tmp_path, monkeypatch,
     ):
-        module = importlib.import_module(filer.module)
-        seen: dict = {}
+        seen = _forwarded_kwargs(filer, tmp_path, monkeypatch)
 
-        def _spy(_project_root, **kwargs):
-            seen.update(kwargs)
-            return 'esc-spied-1'
-
-        monkeypatch.setattr(module, 'file_folded_escalation', _spy)
-        filer.fire(module, str(tmp_path))
-
-        assert seen, f'{filer.label} did not reach file_folded_escalation at all'
-        # `.get` with the helper's own default, so a row reading DEBUG passes
-        # whether the caller omits the keyword or passes it explicitly: the
-        # property under test is the EMITTED level, not the call spelling.
-        assert seen.get('no_escalation_level', logging.DEBUG) == filer.no_escalation_level, (
-            f'{filer.label} forwards no_escalation_level='
-            f'{seen.get("no_escalation_level", logging.DEBUG)!r}, table says '
-            f'{filer.no_escalation_level!r}. If the change is deliberate, edit '
-            'the table and say why in the row; if not, a never-raise alarm '
+        forwarded = seen.get('no_escalation_level', logging.DEBUG)
+        assert forwarded == filer.no_escalation_level, (
+            f'{filer.label} forwards no_escalation_level={forwarded!r}, table '
+            f'says {filer.no_escalation_level!r}. If the change is deliberate, '
+            'edit the table and say why in the row; if not, a never-raise alarm '
             'just changed how loudly it fails, and the only symptom would have '
             'been absence of output.'
         )
 
-    def test_the_table_covers_every_folded_filer_and_names_one_exception(self):
+    @pytest.mark.parametrize(
+        'filer', _MIGRATED_FILERS, ids=[f.label for f in _MIGRATED_FILERS],
+    )
+    def test_the_forwarded_escalation_level_matches_the_table(
+        self, filer, tmp_path, monkeypatch,
+    ):
+        seen = _forwarded_kwargs(filer, tmp_path, monkeypatch)
+
+        forwarded = seen.get('level', 1)
+        assert forwarded == filer.escalation_level, (
+            f'{filer.label} files at level={forwarded!r}, table says '
+            f'{filer.escalation_level!r}. An L0 record under a synthetic anchor '
+            'has no steward and waits for the orphan-L0 reaper; an L1 record '
+            'reaches the escalation watcher at once. If the change is '
+            'deliberate, edit the table and say why in the row.'
+        )
+
+    def test_the_table_covers_every_folded_filer_and_names_its_exceptions(self):
         """Anti-vacuity: a parametrized fence passes trivially for a filer that
         is simply absent from the table, which is how the predecessor
         anchor sweep missed two of them."""
@@ -727,6 +767,17 @@ class TestEveryFilerPinsItsUnavailableLevel:
             'DEBUG is the house level and referent_repair is its ONE deliberate '
             f'exception; {raised!r} says a second answer arrived without the '
             'house-level question being settled'
+        )
+        not_l1 = {
+            f.label: f.escalation_level for f in _MIGRATED_FILERS
+            if f.escalation_level != 1
+        }
+        assert not_l1 == {
+            'markup_tripwire residue': 2, 'completion_claim_gate': 0,
+        }, (
+            'L1 is the house escalation level; residue (L2) and '
+            f'completion_claim_gate (L0) are its exceptions. {not_l1!r} says '
+            'another filer moved'
         )
 
 

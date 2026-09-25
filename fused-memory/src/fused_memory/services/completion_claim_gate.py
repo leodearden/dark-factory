@@ -860,4 +860,5 @@ def emit_unverified_claim_escalation(
         logger=logger,
         log_label='completion_claim_gate',
         context=f'unverified claim about {ref!r}',
+        level=0,
     )
