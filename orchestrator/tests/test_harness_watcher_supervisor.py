@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -1010,6 +1011,80 @@ async def _run_supervisor_with_rotation_durations(
             await h._watcher_supervisor_loop()
 
     return sleep_durations
+
+
+# ---------------------------------------------------------------------------
+# task 5676: the scripted supervisor clock serves only the test's own thread
+# ---------------------------------------------------------------------------
+
+class TestScriptedSupervisorClockIgnoresOtherThreads:
+
+    @pytest.mark.asyncio
+    async def test_background_monotonic_reader_does_not_consume_scripted_timestamps(
+        self, tmp_path: Path,
+    ) -> None:
+        """A foreign thread reading ``time.monotonic()`` mid-loop must not
+        consume the supervisor's exact-length timestamp script.
+
+        The digest hook blocks each iteration until the reader has read the
+        clock inside the patched window, so the steal is forced
+        deterministically rather than left to GIL scheduling.
+        """
+        h = _make_loop_harness(tmp_path)
+        h.config = h.config.model_copy(update={
+            'watcher_max_misconfigured_clean_exits': 99,
+            'watcher_misconfigured_min_rotation_secs': 120.0,
+            'watcher_subprocess_restart_backoff_secs': 1.0,
+            'watcher_crashloop_window_secs': 600,
+            'watcher_max_crashloop_restarts': 99,
+        })
+
+        stop = threading.Event()
+        window_open = threading.Event()
+        read_in_window = threading.Event()
+        reader_errors: list[BaseException] = []
+
+        def read_clock_until_stopped() -> None:
+            while not stop.is_set():
+                in_window = window_open.is_set()
+                try:
+                    time.monotonic()
+                except BaseException as exc:
+                    reader_errors.append(exc)
+                    return
+                if in_window:
+                    read_in_window.set()
+
+        async def digest_hook_forcing_a_foreign_read() -> None:
+            read_in_window.clear()
+            window_open.set()
+            if not read_in_window.wait(timeout=5.0):
+                pytest.fail(
+                    'monotonic-reader thread never read the clock inside the '
+                    'patched window; the regression test cannot prove anything'
+                )
+            window_open.clear()
+
+        h._maybe_write_digest = digest_hook_forcing_a_foreign_read  # type: ignore[method-assign]
+
+        reader = threading.Thread(
+            target=read_clock_until_stopped, name='monotonic-reader', daemon=True,
+        )
+        reader.start()
+        try:
+            sleep_durations = await _run_supervisor_with_rotation_durations(h, [1.0] * 4)
+        finally:
+            stop.set()
+            reader.join(timeout=5.0)
+
+        assert not reader.is_alive(), 'monotonic-reader thread did not stop within 5s'
+        assert reader_errors == [], (
+            f'monotonic-reader thread hit the scripted clock and raised: {reader_errors!r}'
+        )
+        assert sleep_durations == pytest.approx([1.0, 2.0, 4.0, 8.0]), (
+            f'Expected the scripted exponential floor [1.0, 2.0, 4.0, 8.0] with a '
+            f'concurrent foreign clock reader; got {sleep_durations}'
+        )
 
 
 class TestWatcherSupervisorLoopClassification:
