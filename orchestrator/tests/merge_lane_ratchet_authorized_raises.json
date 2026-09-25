@@ -187,6 +187,198 @@
           "current": 31442
         }
       ]
+    },
+    {
+      "task_id": "5352",
+      "reason": "Net-additive: the coalesce one-strike registry becomes restart-durable (guard_state.PersistentSet), adding a TTL constant, the persisted initialiser and corrected prose in merge_queue.py; the private_reads total rises because the new cross-guard suite test_restart_durable_guards.py asserts against the guard attributes, which have no public accessor.",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 21572,
+          "current": 21604
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 12288,
+          "current": 12305
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 55842,
+          "current": 55874
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6724,
+          "current": 6759
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31298,
+          "current": 31315
+        }
+      ]
+    },
+    {
+      "task_id": "5352",
+      "reason": "Net-additive: the offline lane's red-path wiring tests join the cross-guard suite; their private_reads rise because open_fix_tasks / _red_advance_counts / _promoted_blockers have no public accessor and are the subject under test.",
+      "measures": [
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_restart_durable_guards.py",
+          "baseline": 35,
+          "current": 51
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6759,
+          "current": 6775
+        }
+      ]
+    },
+    {
+      "task_id": "5352",
+      "reason": "Net-additive: offline_lane.py's three red-path attributes become restart-durable guard_state facades (TTL constant, three persisted initialisers) and the falsified prose about process-local promotion idempotency is corrected in place.",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/offline_lane.py",
+          "baseline": 1152,
+          "current": 1190
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/offline_lane.py",
+          "baseline": 612,
+          "current": 637
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 55874,
+          "current": 55912
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31315,
+          "current": 31340
+        }
+      ]
+    },
+    {
+      "task_id": "5352",
+      "reason": "Net-additive: the scheduler's resurrection-guard wiring tests join the cross-guard suite; their private_reads rise because _was_non_pending / _pending_anchor / _update_age_anchors / _compute_age have no public accessor and are the subject under test.",
+      "measures": [
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_restart_durable_guards.py",
+          "baseline": 38,
+          "current": 58
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6762,
+          "current": 6782
+        }
+      ]
+    },
+    {
+      "task_id": "5352",
+      "reason": "Net-additive: the offline lane's three red-path guard sidecars were found able to diverge (no joint atomicity across three files keyed by one fingerprint), so _handle_red_run and _maybe_promote_blocker now read the counts with a default instead of indexing, and offline_lane.py records why restarting the count from zero is the intended degrade rather than a KeyError that run() would retry for the whole TTL; the private_reads total rises because the two new wiring pins (the lane surviving divergent guard files, and the steward's four guards being scoped per task) assert against guard attributes that have no public accessor and are the subject under test.",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/offline_lane.py",
+          "baseline": 1190,
+          "current": 1213
+        },
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_restart_durable_guards.py",
+          "baseline": 58,
+          "current": 71
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/offline_lane.py",
+          "baseline": 637,
+          "current": 659
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 55912,
+          "current": 55935
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6782,
+          "current": 6795
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31340,
+          "current": 31362
+        }
+      ]
+    },
+    {
+      "task_id": "5352",
+      "reason": "Re-recorded against current main after recovering 5352 from the coalesce-5352-7d6956da derail (the pre-train branch's own raises conflicted with the append-only ledger). Net-additive: the steward, coalesce, offline-lane and scheduler one-strike guards become restart-durable guard_state facades (TTL constants, persisted initialisers, corrected prose in merge_queue.py and offline_lane.py); private_reads rises because the cross-guard suite test_restart_durable_guards.py asserts against guard attributes that have no public accessor.",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 21614,
+          "current": 21646
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/offline_lane.py",
+          "baseline": 1152,
+          "current": 1213
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 12327,
+          "current": 12344
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/offline_lane.py",
+          "baseline": 612,
+          "current": 659
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 56027,
+          "current": 56120
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6533,
+          "current": 6604
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31428,
+          "current": 31492
+        }
+      ]
     }
   ]
 }
