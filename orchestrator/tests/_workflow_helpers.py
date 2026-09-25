@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _git_fixtures import RepoSeed, seed_repo
 from _orch_helpers import pydantic_spec, wire_scheduler_liveness_mock
 from escalation.queue import EscalationQueue
 from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir
@@ -740,13 +741,11 @@ def _build_harness(config: OrchestratorConfig) -> Harness:
     return harness
 
 
+GIT_REPO_SEED = RepoSeed(files=(('README.md', '# Test\n'),), message='init')
+
+
 async def _init_git_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'init'], cwd=repo)
+    seed_repo(repo, GIT_REPO_SEED)
 
 
 # ---------------------------------------------------------------------------
@@ -793,17 +792,20 @@ def _derive_meta_root_like_production(monkeypatch):
     monkeypatch.setattr(TaskArtifacts, '__init__', _init)
 
 
-async def _init_repo(repo: Path):
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    # Seed with a simple Python file so the repo isn't empty
-    (repo / 'lib.py').write_text('def greet(name: str) -> str:\n    return f"Hello, {name}"\n')
-    (repo / 'test_lib.py').write_text(
-        'from lib import greet\n\ndef test_greet():\n    assert greet("world") == "Hello, world"\n'
-    )
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+E2E_REPO_SEED = RepoSeed(
+    files=(
+        ('lib.py', 'def greet(name: str) -> str:\n    return f"Hello, {name}"\n'),
+        (
+            'test_lib.py',
+            'from lib import greet\n\ndef test_greet():\n    assert greet("world") == "Hello, world"\n',
+        ),
+    ),
+    message='Initial commit',
+)
+
+
+async def _init_repo(repo: Path) -> None:
+    seed_repo(repo, E2E_REPO_SEED)
 
 
 PLAN = {
@@ -1289,6 +1291,11 @@ async def _make_transcript_workflow(config, git_ops, task_assignment):
     return workflow, cwd
 
 
+TRANSCRIPT_REPO_SEED = RepoSeed(
+    files=(('lib.py', 'def greet(name): return name\n'),), message='Initial commit',
+)
+
+
 async def _init_transcript_repo(repo: Path) -> None:
     """Seed a real, committed git repo for the transcript-archival suites.
 
@@ -1300,16 +1307,12 @@ async def _init_transcript_repo(repo: Path) -> None:
     the transcript suites the wrong repo contents — a failure that surfaces as
     a confusing assertion error far from its cause, not an ImportError.
 
-    Folding all three behind a ``seed=`` parameter was rejected: it would
-    touch test_workflow_e2e.py and test_harness_warm_lane_wiring.py, and would
-    trade three legible factories for one branchy one.
+    The three names stay separate, and what separates them is DATA: one
+    ``RepoSeed`` each, all built by ``_git_fixtures.py::build_repo``. An earlier
+    rejection of a ``seed=`` parameter was aimed at one branchy factory; seeds
+    as data have no branches, so that objection no longer applies.
     """
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'lib.py').write_text('def greet(name): return name\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+    seed_repo(repo, TRANSCRIPT_REPO_SEED)
 
 
 def _config_dir(worktree: Path, task_id: str) -> Path:
