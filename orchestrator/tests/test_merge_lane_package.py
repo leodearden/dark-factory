@@ -164,7 +164,10 @@ def git_ops(git_config: GitConfig, tmp_path: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_ops: GitOps, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_ops.project_root, git=git_config)
+    return OrchestratorConfig(
+        project_root=git_ops.project_root, git=git_config,
+        escalate_preexisting_main_break=False,
+    )
 
 
 async def _branch_with_file(git_ops: GitOps, branch: str, filename: str) -> Path:

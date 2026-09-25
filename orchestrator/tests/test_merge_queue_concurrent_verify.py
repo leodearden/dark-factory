@@ -110,7 +110,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
     """Single-host (no verify_runners) OrchestratorConfig."""
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return _make_config_no_runners(git_repo, git_config)
 
 
 async def _make_branch_with_file(
@@ -760,8 +760,14 @@ def _timeout_mark_offenders(
 
 
 def _make_config_no_runners(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    """Single-host OrchestratorConfig (no verify_runners)."""
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    """Single-host OrchestratorConfig (no verify_runners).
+
+    main-health probe off: see _merge_lane_fakes.py::main_health_probe_spawned
+    """
+    return OrchestratorConfig(
+        project_root=git_repo, git=git_config,
+        escalate_preexisting_main_break=False,
+    )
 
 
 def _make_config_with_runner(

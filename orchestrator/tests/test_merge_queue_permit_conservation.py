@@ -458,7 +458,10 @@ class TestCascadeRemergeConservation:
             gate_b_release, gate_b_entered, passed=True, name='pc-cascade-laptop',
         )
 
-        config = OrchestratorConfig(project_root=git_ops.project_root, git=git_config)
+        config = OrchestratorConfig(
+            project_root=git_ops.project_root, git=git_config,
+            escalate_preexisting_main_break=False,
+        )
         wt_a = await _make_branch_with_file(
             git_ops, 'task/pc-cascade-a', 'pc_cascade_a.py', 'a = 1\n',
         )

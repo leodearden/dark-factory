@@ -1931,7 +1931,10 @@ class TestLateArrivalFailCascade:
         )
 
         # ── Build disjoint branches ───────────────────────────────────────────
-        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        config = OrchestratorConfig(
+            project_root=spec_git_repo, git=git_config,
+            escalate_preexisting_main_break=False,
+        )
         wt_a = await _make_branch_with_file(
             git_ops, 'task/late5-a', 'late5_a.py', 'a = 1\n',
         )
