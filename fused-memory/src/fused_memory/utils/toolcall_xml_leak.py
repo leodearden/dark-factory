@@ -126,11 +126,20 @@ from shared.toolcall_markup import PARAMETER_CLOSER_NAMES, PREFILTER_NEEDLES
 __all__ = [
     'LEAK_TAIL',
     'PREFILTER_NEEDLES',
+    'SCANNED_COLUMNS',
     'LeakHit',
     'detect_leak',
     'find_toolcall_xml_leak',
     'has_toolcall_xml_leak',
 ]
+
+# The task-text columns a leak counts in. `metadata` is deliberately excluded:
+# it legitimately stores remediation records (e.g. task 2865's
+# metadata.stage2_description_corruption_fix.stripped_fragment) that quote this
+# exact marker, so counting it would flag already-fixed tasks. Promoted from
+# scripts/scan_task_toolcall_leaks.py (task 4419) so the read-time sweep and the
+# write-time storage gate cannot drift on WHICH columns count.
+SCANNED_COLUMNS = ('title', 'description', 'details', 'test_strategy')
 
 # PREFILTER_NEEDLES — imported above, NOT spelled here. The enumeration is
 # owned by shared.toolcall_markup (INV-5); its VALUE and ORDER are unchanged by

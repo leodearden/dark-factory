@@ -117,12 +117,13 @@ if str(_SHARED_SRC) not in sys.path:
 
 from fused_memory.utils.toolcall_xml_leak import (  # noqa: E402
     LEAK_TAIL,
+    SCANNED_COLUMNS,
     detect_leak,
 )
 
-# LEAK_TAIL and detect_leak are re-exported deliberately: this module's public
-# surface predates the promotion of the detector into fused_memory, and callers
-# (plus the test suite's identity assertions) still reach for them here.
+# LEAK_TAIL, SCANNED_COLUMNS and detect_leak are re-exported deliberately: this
+# module's public surface predates their promotion into fused_memory, and
+# callers (plus the test suite's identity assertions) still reach for them here.
 __all__ = [
     "LEAK_TAIL",
     "LeakMatch",
@@ -133,12 +134,6 @@ __all__ = [
     "main",
     "scan_db",
 ]
-
-# Task text columns scanned for leaks. `metadata` is deliberately excluded —
-# it legitimately stores remediation records (e.g. task 2865's
-# metadata.stage2_description_corruption_fix.stripped_fragment) that contain
-# this exact marker; scanning it would false-positive on already-fixed tasks.
-SCANNED_COLUMNS = ("title", "description", "details", "test_strategy")
 
 
 class LeakMatch(NamedTuple):
