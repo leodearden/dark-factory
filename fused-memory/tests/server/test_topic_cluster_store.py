@@ -12,15 +12,19 @@ Covers:
   load (TestStoreFailsLoudLikeTheConfigPath)
 - ``derive_topic_cluster``'s conservative, abstaining, deterministic phrase
   derivation (TestDeriveTopicCluster)
+- ``seed_topic_cluster``, the one non-raising seed and its outcome vocabulary
+  (TestSeedTopicCluster)
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import random
 import sqlite3
 import uuid
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -30,6 +34,7 @@ from fused_memory.server.topic_cluster_store import (
     TopicClusterStore,
     TopicClusterStoreError,
     derive_topic_cluster,
+    seed_topic_cluster,
 )
 
 _PROJECT = 'dark_factory'
@@ -394,3 +399,93 @@ class TestDeriveTopicCluster:
 
         assert first is not None and second is not None and shuffled is not None
         assert first.phrases == second.phrases == shuffled.phrases
+
+
+_CANONICAL = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+_GENERIC_TEXTS = [
+    'Always run the tests before you commit the change so the reviewer sees green.',
+    'Run the tests before you push the change and tell the reviewer about it.',
+]
+
+
+class _UpsertRaisesStore:
+    def upsert(self, *args: Any, **kwargs: Any) -> None:
+        raise sqlite3.OperationalError('disk I/O error')
+
+
+def _seed(store: Any, **overrides: Any) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        'enabled': True,
+        'texts': _XDIST_TEXTS,
+        'topic': _TOPIC,
+        'canonical_id': _CANONICAL,
+        'project_id': _PROJECT,
+        'category': 'procedural_knowledge',
+        'run_id': 'run-1',
+        'source': 'consolidate_memories',
+    }
+    kwargs.update(overrides)
+    return seed_topic_cluster(store, **kwargs)
+
+
+@pytest.fixture
+def store(db_path: Path):
+    opened = TopicClusterStore(db_path)
+    opened.open()
+    try:
+        yield opened
+    finally:
+        opened.close()
+
+
+class TestSeedTopicCluster:
+    """The ONE non-raising seed; it owns the seeded/skipped/failed/disabled vocabulary."""
+
+    def test_seeded_persists_the_derived_cluster(self, store: TopicClusterStore) -> None:
+        outcome = _seed(store)
+
+        (cluster,) = store.list_clusters(_PROJECT)
+        assert outcome == {'outcome': 'seeded', 'topic_id': _TOPIC, 'phrases': cluster.phrases}
+        assert cluster.phrases
+        assert cluster.topic_id == _TOPIC
+
+    def test_the_hint_names_the_canonical_and_the_escape_hatch(self, store: TopicClusterStore) -> None:
+        _seed(store)
+
+        (cluster,) = store.list_clusters(_PROJECT)
+        assert _CANONICAL in cluster.hint
+        assert 'allow_near_duplicate' in cluster.hint
+
+    def test_skipped_when_the_texts_abstain(self, store: TopicClusterStore) -> None:
+        outcome = _seed(store, texts=_GENERIC_TEXTS)
+
+        assert outcome['outcome'] == 'skipped'
+        assert isinstance(outcome['reason'], str) and outcome['reason']
+        assert store.list_clusters(_PROJECT) == []
+
+    def test_disabled_persists_nothing(self, store: TopicClusterStore) -> None:
+        outcome = _seed(store, enabled=False)
+
+        assert outcome == {'outcome': 'disabled'}
+        assert store.list_clusters(_PROJECT) == []
+
+    def test_a_failing_store_is_disclosed_not_raised(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING, logger='fused_memory.server.topic_cluster_store'):
+            outcome = _seed(_UpsertRaisesStore())
+
+        assert outcome['outcome'] == 'failed'
+        assert outcome['topic_id'] == _TOPIC
+        assert outcome['error'] == 'disk I/O error'
+        assert outcome['error_type'] == 'OperationalError'
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(_TOPIC in r.getMessage() for r in warnings)
+
+    def test_reseeding_a_topic_refreshes_its_canonical(self, store: TopicClusterStore) -> None:
+        second_canonical = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+        _seed(store)
+        _seed(store, canonical_id=second_canonical)
+
+        (cluster,) = store.list_clusters(_PROJECT)
+        assert second_canonical in cluster.hint
+        assert _CANONICAL not in cluster.hint
+        assert _row_count(store.db_path) == 1
