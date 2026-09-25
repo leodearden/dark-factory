@@ -1137,7 +1137,7 @@ def _tmp_literal(value: ast.expr) -> str | None:
     condition, which is not a bound value.  So
     ``tmp_path or Path('/tmp/proj')`` matches.  A fallback literal escapes
     whenever a caller omits the sandboxed argument, so it meets the same bar as
-    a plain one.  Task 5011 removed the only live instance (``_tc_config``).
+    a plain one.
     """
     if isinstance(value, ast.Constant) and isinstance(value.value, str):
         return value.value if value.value.startswith('/tmp') else None
@@ -1262,8 +1262,7 @@ def _absolute_tmp_project_root_literals(tree: ast.Module) -> list[str]:
     * a CALL KEYWORD — an ``ast.keyword`` whose name passes
       ``_names_project_root`` (``**kwargs``, whose name is ``None``, is
       skipped).  A keyword binds a real parameter, so it can carry a real
-      escape.  Task 5011 sandboxed all 14 keyword sites, one of them a measured
-      ``runs.db`` leak, so this arm added no allowlist entry.
+      escape — which is why keyword sites are sandboxed, not allowlisted.
 
     WHAT IT DOES NOT MATCH, by decision — a binding with no ``project_root``
     IDENTIFIER at the site.  A positional argument binds by position to a
@@ -1640,11 +1639,10 @@ class TestAbsoluteTmpProjectRootLiteralsAreCensused:
         ids=['bare-str', 'path-wrapped', 'suffix-name-pathlib-attribute'],
     )
     def test_the_detector_matches_a_call_keyword(self, source, literal) -> None:
-        """A call keyword binds a real parameter, so it can carry a real escape.
-
-        Task 5011 measured one — ``_xcheck_config``'s keyword wrote
-        ``data/orchestrator/runs.db`` outside the sandbox — so the keyword shape
-        is inside the census, under the same name rule as the other shapes.
+        """A call keyword binds a real parameter, so it can carry a real escape:
+        code handed an ``OrchestratorConfig`` writes ``data/orchestrator/runs.db``
+        under its ``project_root``.  The keyword shape is therefore inside the
+        census, under the same name rule as the other shapes.
         """
         tree = ast.parse(source)
 
@@ -1683,7 +1681,7 @@ class TestAbsoluteTmpProjectRootLiteralsAreCensused:
 
         A positional argument binds by position to a callee signature a
         single-module AST walk cannot resolve, and a dict key is a string, not a
-        binding.  Task 5011 measured both shapes at 0 sites in the tree.
+        binding.
         """
         tree = ast.parse(source)
 
