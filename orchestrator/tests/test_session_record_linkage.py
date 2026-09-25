@@ -1099,3 +1099,123 @@ class TestDecisionRecordSlug:
         assert merged.filed_at == '2026-07-07T00:00:00+00:00'
         assert merged.state == sr.DecisionState.DROPPED
         assert merged.manual_boost == 7
+
+
+def _registry(root: Path) -> dict[str, sr.SessionRecord]:
+    records = (sr.read_record(d.name, root=root) for d in sr.sessions_dir(root).iterdir())
+    return {record.session_slug: record for record in records}
+
+
+class TestWriteDecisionRecordSlug:
+    _PID = 4_237_600
+    _RESTARTED_PID = 4_237_700
+    _ID = 'esc-4237-1'
+
+    def _file(
+        self,
+        root: Path,
+        capsys: pytest.CaptureFixture[str],
+        *,
+        queue: str = 'queue-a',
+        session_id: str = f'watcher-df-{_PID}',
+    ) -> tuple[str, sr.DecisionRecord]:
+        capsys.readouterr()
+        rc = sr.main(
+            [
+                'write-decision',
+                '--id', self._ID,
+                '--project', 'dark_factory',
+                '--text', 'Adopt the plan?',
+                '--session-id', session_id,
+                '--escalations-dir', str(root / queue),
+            ]
+        )
+        assert rc == 0
+        path = sr.decision_path_for_id(self._ID, root=root)
+        return capsys.readouterr().out, sr.DecisionRecord.from_json(path.read_text())
+
+    def test_the_filers_own_record_is_stamped_beside_its_session_id(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _link_pid(self._PID, 'watcher-own-record', tmp_path)
+        monkeypatch.setenv('CLAUDE_PID', str(self._PID))
+
+        _, decision = self._file(tmp_path, capsys)
+
+        assert decision.record_slug == 'watcher-own-record'
+        assert decision.session_id == f'watcher-df-{self._PID}'
+
+    @pytest.mark.parametrize('claude_pid', [None, str(_PID)], ids=['unset', 'no-pointer'])
+    def test_an_unresolvable_record_slug_still_files_blank_and_quiet(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
+        claude_pid: str | None,
+    ) -> None:
+        if claude_pid is None:
+            monkeypatch.delenv('CLAUDE_PID', raising=False)
+        else:
+            monkeypatch.setenv('CLAUDE_PID', claude_pid)
+        caplog.set_level(logging.DEBUG)
+
+        out, decision = self._file(tmp_path, capsys)
+
+        assert out == f'{self._ID}\n'
+        assert decision.record_slug == ''
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    def test_a_hand_launched_watchers_decision_links_to_its_registry_record(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        monkeypatch.setattr(sh, '_owning_claude_pid', lambda: self._PID)
+        sh.run_session_start({'session_id': 'sess-watcher', 'cwd': _CWD}, {}, root=tmp_path)
+        monkeypatch.setenv('CLAUDE_PID', str(self._PID))
+
+        _, decision = self._file(tmp_path, capsys, session_id=f'watcher-df-{self._PID}')
+        sessions_by_slug = _registry(tmp_path)
+
+        assert decision.linked_session_slug in sessions_by_slug
+        assert decision.session_id not in sessions_by_slug
+
+    def test_a_cross_queue_filing_fills_a_blank_record_slug(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        monkeypatch.delenv('CLAUDE_PID', raising=False)
+        _, first = self._file(tmp_path, capsys, queue='queue-a')
+        _link_pid(self._PID, 'the-second-filers-record', tmp_path)
+        monkeypatch.setenv('CLAUDE_PID', str(self._PID))
+
+        _, enriched = self._file(tmp_path, capsys, queue='queue-b')
+
+        assert first.record_slug == ''
+        assert enriched.record_slug == 'the-second-filers-record'
+
+    def test_a_same_queue_refile_after_a_restart_links_the_restarted_session(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _link_pid(self._PID, 'the-old-watchers-record', tmp_path)
+        _link_pid(self._RESTARTED_PID, 'the-restarted-watchers-record', tmp_path)
+        monkeypatch.setenv('CLAUDE_PID', str(self._PID))
+        _, first = self._file(tmp_path, capsys)
+        monkeypatch.setenv('CLAUDE_PID', str(self._RESTARTED_PID))
+
+        _, refiled = self._file(
+            tmp_path, capsys, session_id=f'watcher-df-{self._RESTARTED_PID}'
+        )
+
+        assert first.record_slug == 'the-old-watchers-record'
+        assert refiled.record_slug == 'the-restarted-watchers-record'
