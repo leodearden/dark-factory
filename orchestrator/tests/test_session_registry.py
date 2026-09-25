@@ -395,6 +395,7 @@ def _make_decision(**overrides: object) -> sr.DecisionRecord:
         'manual_boost': 2,
         'state': 'answered',
         'severity': 'critical',
+        'record_slug': 'unblock-df-2085-uuid',
     }
     fields.update(overrides)
     return sr.DecisionRecord(**fields)
@@ -6208,8 +6209,8 @@ def test_same_queue_refile_and_enrichment_agree_on_the_custody_field_set() -> No
     field-specific test above still passes.
 
     Arranged so the two halves are separable. *existing* leaves every
-    fill-if-empty field empty (text/task_id/session_id/escalation_id/options/
-    severity), so BOTH helpers take the watcher-owned half from *incoming*
+    fill-if-empty field empty (text/task_id/session_id/record_slug/
+    escalation_id/options/severity), so BOTH helpers take the watcher-owned half from *incoming*
     and the two runs can only differ on custody. The queue axis is
     neutralized (equal normalized ``escalations_dir`` on both), which is also
     the precondition of the same-queue arm.
@@ -6225,6 +6226,7 @@ def test_same_queue_refile_and_enrichment_agree_on_the_custody_field_set() -> No
         text='',
         task_id=None,
         session_id=None,
+        record_slug='',
         escalation_id=None,
         options=None,
         severity='',

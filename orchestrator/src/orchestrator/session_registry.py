@@ -59,7 +59,8 @@ logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 
-SCHEMA_MINOR = 2
+# 3: LeaseHolder.record_slug and DecisionRecord.record_slug (task 4237).
+SCHEMA_MINOR = 3
 """Additive-extension counter for this module's contract (Fleet Cockpit C1,
 plans/fleet-cockpit-prd.md §6.1). A CODE-LEVEL signal only -- never persisted
 per-record. Bump this when a new backward-compatible (optional/defaulted)
@@ -402,7 +403,13 @@ class DecisionRecord:
     project: the project_id this decision concerns.
     text: the decision/question text as filed.
     filed_at: ISO-8601 timestamp of when this decision was filed.
-    session_id: the session that filed this decision, or None.
+    session_id: the filer's provenance label, or None -- in practice a
+        watcher's lease token (``<lease-name>-<pid>``), which is NOT a
+        session-registry record key. Kept as filed; never resolved.
+    record_slug: the filer's session-registry record key (a
+        ``record_path_for_slug`` slug), or '' when it was unresolvable or the
+        record predates this field. Derived by ``write-decision`` from
+        ``$CLAUDE_PID``'s pid pointer, never typed by the filer.
     task_id: the task this decision is scoped to, or None.
     escalation_id: the escalation this decision resolves, or None.
     options: the candidate answers offered, or None.
@@ -484,6 +491,19 @@ class DecisionRecord:
     escalations_dir: str = field(default='', kw_only=True)
     closing_evidence: str = field(default='', kw_only=True)
     closed_at: str = field(default='', kw_only=True)
+    record_slug: str = field(default='', kw_only=True)
+
+    @property
+    def linked_session_slug(self) -> str | None:
+        """The session-registry slug this decision links to, or None.
+
+        THE one home of the decision -> session link policy: ``record_slug``
+        when set, else ``session_id`` (which resolves only when a filer
+        happened to write a real record key there). Every consumer that
+        resolves a decision against the registry reads this, never either
+        field directly.
+        """
+        return self.record_slug or self.session_id or None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -501,6 +521,7 @@ class DecisionRecord:
             'escalations_dir': self.escalations_dir,
             'closing_evidence': self.closing_evidence,
             'closed_at': self.closed_at,
+            'record_slug': self.record_slug,
         }
 
     @classmethod
@@ -525,6 +546,7 @@ class DecisionRecord:
             # Same `or ''` idiom as escalations_dir above, for both custody fields.
             closing_evidence=data.get('closing_evidence') or '',
             closed_at=data.get('closed_at') or '',
+            record_slug=data.get('record_slug') or '',
         )
 
     def to_json(self) -> str:
@@ -1408,10 +1430,10 @@ def merge_decision_enrichment(
       restamp queue age, re-open or close the record (that is
       update_decision_state's job), reset an operator's C5 cockpit boost, or
       erase the evidence a close recorded or when it recorded it.
-    - ``text`` / ``task_id`` / ``session_id`` / ``options`` -- keep
-      *existing* where it is non-empty; take *incoming* ONLY to fill a field
-      the first filer left empty/None. That fill is what makes this
-      enrichment rather than a no-op.
+    - ``text`` / ``task_id`` / ``session_id`` / ``record_slug`` /
+      ``options`` -- keep *existing* where it is non-empty; take *incoming*
+      ONLY to fill a field the first filer left empty/None. That fill is what
+      makes this enrichment rather than a no-op.
     - ``severity``           -- ``_max_decision_severity``: never downgrade.
     - ``escalations_dir`` + ``escalation_id`` -- NOT independent fields, and
       ``escalation_id`` is deliberately NOT a plain fill-if-empty one: the
@@ -1460,6 +1482,7 @@ def merge_decision_enrichment(
         task_id=existing.task_id or incoming.task_id,
         escalation_id=merged_escalation_id,
         session_id=existing.session_id or incoming.session_id,
+        record_slug=existing.record_slug or incoming.record_slug,
         options=existing.options or incoming.options,
         severity=_max_decision_severity(existing.severity, incoming.severity),
         escalations_dir=merged_queue,
@@ -1482,9 +1505,9 @@ def merge_same_queue_refile(
     Field policy:
 
     - ``text`` / ``severity`` / ``task_id`` / ``session_id`` /
-      ``escalation_id`` / ``options`` / ``escalations_dir`` -- from
-      *incoming*, VERBATIM, including a severity DOWNGRADE and a field going
-      EMPTY. The watcher is the sole authority on its own escalation, and
+      ``record_slug`` / ``escalation_id`` / ``options`` / ``escalations_dir``
+      -- from *incoming*, VERBATIM, including a severity DOWNGRADE and a field
+      going EMPTY. The watcher is the sole authority on its own escalation, and
       freezing the first values (enrichment's fill-if-empty +
       _max_decision_severity) would strand stale prose and a stale severity
       in the cockpit queue forever. This is the whole reason the same-queue
