@@ -621,7 +621,7 @@ _CARGO_SCOPE_SAFE_NON_RS_NAMES = frozenset({'Cargo.lock', 'rust-toolchain'})
 
 
 # Pytest-aware cause-hint patterns. Anchored to whole lines so they don't
-# false-match prose. ``_PYTEST_PROGRESS_*`` patterns are used to filter the
+# false-match prose. ``_PYTEST_PROGRESS_BARE_RE``/``_FILE_RE`` filter the
 # fallback (last-non-blank-line) path so a pytest run killed mid-progress
 # doesn't surface "...." dots as the cause hint.
 _PYTEST_FAILED_LINE_RE = re.compile(r'^FAILED .+$', re.MULTILINE)
@@ -664,16 +664,18 @@ _PYTEST_FAILURE_SUMMARY_RE = re.compile(
     re.MULTILINE,
 )
 _PYTEST_TRACEBACK_E_RE = re.compile(r'^E   .+$', re.MULTILINE)
-_PYTEST_PROGRESS_BARE_RE = re.compile(r'^[\.FsxXEPp]+(\s+\[\s*\d+%\])?$')
-_PYTEST_PROGRESS_FILE_RE = re.compile(r'^\S+\.py [\.FsxXEPp]+(\s+\[\s*\d+%\])?$')
-# Unlike the two noise filters above, this CAPTURES a progress line's
-# percentage (for _crashed_session_stop_percent). Status chars are ``*`` since
-# pytest writes the final fill on a fresh line when the last status char hit
-# the line edge; ``[ \t]`` for the newline-spanning reason at
-# _PYTEST_FAILURE_SUMMARY_RE; the optional file prefix keeps the LAST match in
-# an fspath-mode session its true final line, not a stale continuation line.
+_PYTEST_STATUS_CHAR_CLASS = r'[.FsxXEPp]'
+_PYTEST_PERCENT_FIELD = r'\[ *(\d+)%\]'
+_PYTEST_PROGRESS_BARE_RE = re.compile(
+    rf'^{_PYTEST_STATUS_CHAR_CLASS}+(?:\s+{_PYTEST_PERCENT_FIELD})?$',
+)
+_PYTEST_PROGRESS_FILE_RE = re.compile(
+    rf'^\S+\.py {_PYTEST_STATUS_CHAR_CLASS}+(?:\s+{_PYTEST_PERCENT_FIELD})?$',
+)
+# Captures a progress line's percentage for _crashed_session_stop_percent.
 _PYTEST_PROGRESS_PERCENT_RE = re.compile(
-    r'^(?:\S+\.py )?[.FsxXEPp]*[ \t]*\[ *(\d+)%\]$', re.MULTILINE,
+    rf'^(?:\S+\.py )?{_PYTEST_STATUS_CHAR_CLASS}*[ \t]*{_PYTEST_PERCENT_FIELD}$',
+    re.MULTILINE,
 )
 
 
