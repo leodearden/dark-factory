@@ -62,7 +62,13 @@ from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _merge_lane_fakes import FakeVerifier, VerifyScript, fails, passes
+from _merge_lane_fakes import (
+    FakeVerifier,
+    VerifyScript,
+    fails,
+    main_health_probe_spawned,
+    passes,
+)
 from _orch_helpers import wait_responsive
 from test_merge_queue_concurrent_verify import (
     HEAVY_BARRIER_TEST_TIMEOUT,
@@ -2539,6 +2545,7 @@ class TestTwoHostFalseGreenCapstone:
             # (b1) the false-green does NOT land.
             outcome_b = await wait_responsive(req_b.result, label='false-green must not land')
             assert outcome_b.status != 'done', outcome_b
+            assert not main_health_probe_spawned(outcome_b), outcome_b.reason
 
         _, main_files, _ = await _run(
             ['git', 'ls-tree', '-r', '--name-only', 'main'], cwd=host_git_ops.project_root,

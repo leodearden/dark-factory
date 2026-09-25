@@ -33,6 +33,7 @@ from _merge_lane_fakes import (
     FakeVerifier,
     VerifyScript,
     hangs_until,
+    main_health_probe_spawned,
     passes,
     raises,
 )
@@ -2486,6 +2487,7 @@ class TestSpeculativeMergeWorker:
             outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=60)
 
         assert outcome_n.status == 'blocked', f'N should be blocked: {outcome_n}'
+        assert not main_health_probe_spawned(outcome_n), outcome_n.reason
         assert outcome_n1.status == 'done', f'N+1 should succeed after re-merge: {outcome_n1}'
 
         # N+1's file must appear on main (re-merged and advanced)

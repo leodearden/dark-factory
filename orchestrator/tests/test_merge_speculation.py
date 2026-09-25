@@ -51,7 +51,13 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _merge_lane_fakes import FakeVerifier, VerifyScript, hangs_until, passes
+from _merge_lane_fakes import (
+    FakeVerifier,
+    VerifyScript,
+    hangs_until,
+    main_health_probe_spawned,
+    passes,
+)
 from _orch_helpers import (  # noqa: F401
     MERGE_GATE_BARRIER_TIMEOUT,
     MERGE_RESULT_TIMEOUT,
@@ -2006,6 +2012,7 @@ class TestLateArrivalFailCascade:
         assert outcome_a.status != 'done', (
             f'A must NOT land (verify failed); got outcome_a={outcome_a!r}'
         )
+        assert not main_health_probe_spawned(outcome_a), outcome_a.reason
 
         # ── DONE-WHEN 4(a): speculative_merge event for B (B was dispatched
         #    speculatively against A's commit — only present after step-2).

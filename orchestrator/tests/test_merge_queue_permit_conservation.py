@@ -28,7 +28,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from _merge_lane_fakes import FakeVerifier
+from _merge_lane_fakes import FakeVerifier, main_health_probe_spawned
 from _orch_helpers import MERGE_RESULT_TIMEOUT
 from test_merge_queue_concurrent_verify import (
     _fake_verify_result,
@@ -501,6 +501,7 @@ class TestCascadeRemergeConservation:
         outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
 
         assert outcome_a.status != 'done', f'A must NOT land; got {outcome_a!r}'
+        assert not main_health_probe_spawned(outcome_a), outcome_a.reason
         assert outcome_b.status == 'done', (
             f'B must land after cascade + remerge + re-verify; got {outcome_b!r}'
         )

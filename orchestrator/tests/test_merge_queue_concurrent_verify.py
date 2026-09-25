@@ -37,7 +37,14 @@ from typing import Any, Literal, TypeGuard
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _merge_lane_fakes import FakeVerifier, VerifyScript, fails, hangs_until, raises
+from _merge_lane_fakes import (
+    FakeVerifier,
+    VerifyScript,
+    fails,
+    hangs_until,
+    main_health_probe_spawned,
+    raises,
+)
 from _orch_helpers import (
     MERGE_GATE_BARRIER_TIMEOUT,
     MERGE_RESULT_TIMEOUT,
@@ -4810,6 +4817,7 @@ class TestCascadeErrorContainment:
             assert outcome_a.status not in ('done', 'already_merged'), (
                 f'Expected N to fail, got status={outcome_a.status!r}.'
             )
+            assert not main_health_probe_spawned(outcome_a), outcome_a.reason
 
             # Unblock N+1's inner verify coroutine (the cascade already cancelled
             # the outer verify_task; this releases any coroutine still awaiting

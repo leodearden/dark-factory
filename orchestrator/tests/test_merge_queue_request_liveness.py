@@ -53,6 +53,7 @@ from _merge_lane_fakes import (
     hangs_until,
     lane_finalizing,
     lane_state,
+    main_health_probe_spawned,
     make_lane,
     passes,
     raises,
@@ -1652,6 +1653,7 @@ class TestRepeatedDeadVerifyBusyLoopCap:
             f'path, not the busy-loop-capped path — got status={result2.status!r}'
         )
         assert result2.outcome is not None and result2.outcome.status == 'blocked'
+        assert not main_health_probe_spawned(result2.outcome), result2.outcome.reason
         assert worker._inflight_dead_verify_aborts.get(task_id, 0) == 0, (
             'a completed (even failed) verify proves the subprocess was not '
             'hung -- it must clear the counter just like a pass'
@@ -3044,6 +3046,7 @@ class TestContendedLeaseDefers:
             f'a completed-but-failed verify must be handed back as the blocked '
             f'outcome the lane built for it, got {result_b.outcome!r}'
         )
+        assert not main_health_probe_spawned(result_b.outcome), result_b.outcome.reason
         assert 'verify failed: 3 tests' in (result_b.outcome.reason or ''), (
             f'the blocked reason must carry the verify summary, got '
             f'{result_b.outcome.reason!r}'
