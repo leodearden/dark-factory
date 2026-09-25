@@ -392,6 +392,21 @@ directly, not just interactive agents.
   instead of halting the queue, and no operator rescue is needed for this
   case. If the grace still expires, that one merge is blocked per-task (see
   `park_lock_contended` in `OPERATIONS.md`) — the queue keeps running.
+- A direct-to-main commit does **not** need to wait for an idle merge
+  queue. When main moves under a verify that is in flight, a solo merge
+  rebases onto the new main and lands without re-verifying, provided the
+  new commits and the branch touch no files in common
+  (`orchestrator/src/orchestrator/merge_gates.py::_reverify_rebased_tree`).
+  Two cases still cost real time. (1) Your paths overlap the in-flight
+  branch's changed files: that forces a full re-verify (~40 min), even
+  for `*.md`, until task 5293 excludes prose paths. (2) A coalesce train
+  is verifying: *any* move of main makes the train's final compare-and-swap
+  fail, the whole train verify (27–72 min measured) is discarded, and every
+  member re-merges solo (`merge_queue.py::_do_train_merge`, task 5070).
+  `get_merge_queue` does not show a train's verify (task 5245), so check
+  `data/orchestrator/runs.db` for a `train_started` in the last ~2h with no
+  `train_merged`/`train_derailed` for the same `train_id` — a heuristic:
+  restart-orphaned trains leave `train_started` rows that never close.
 - **Never** run `git stash` in **any** dark-factory checkout — `project_root`
   or a `.worktrees/<id>` task worktree. `refs/stash` is a single ref in the
   shared `.git` dir and is *not* per-worktree, so every checkout pushes onto
