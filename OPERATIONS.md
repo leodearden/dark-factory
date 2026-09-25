@@ -1393,6 +1393,39 @@ Classification lives in
 `scripts/orchestrator-watchdog.py::_register_transient_unit`; the state probe
 is `scripts/orchestrator-watchdog.py::_unit_is_active`.
 
+### fused-memory socket activation (port 8002 survives restarts)
+
+`fused-memory.socket` (committed at `scripts/fused-memory.socket`) owns the
+listening socket on `0.0.0.0:8002`; `fused-memory.service` requires it, and
+the server adopts it via
+`shared/src/shared/systemd_listeners.py::take_systemd_listeners`. The port
+therefore stays bound while the service restarts (~50s): clients connecting
+mid-restart wait in the kernel backlog and are served by the new process.
+
+Why: Claude Code's HTTP MCP client (≥2.1.280) treats refused connections as
+terminal, retries 5 times over ~15s, then withdraws the server's tools until
+a manual `/mcp`. Before this, every fused-memory restart (~9/day) did that to
+every connected interactive session. Measured 2026-09-25 on 2.1.282 with a
+45s restart: without the socket the client gave up at +16s; with it, one
+connection reset and nothing else, and tool calls kept working.
+
+What changes for an operator:
+
+| Command | Effect |
+|---|---|
+| `systemctl --user restart fused-memory` | Unchanged — restarts the process; the port never closes. |
+| `systemctl --user stop fused-memory` | Stops the process but **the port stays listening**, and the next connection (any orchestrator, the watchdog's `/alive` probe) starts it again. |
+| `systemctl --user stop fused-memory.socket fused-memory` | Actually takes fused-memory down; stopping the socket stops the service too. |
+
+Installing on a host that predates it: `scripts/setup-host.sh` section 4
+installs and enables the socket. By hand: copy `scripts/fused-memory.socket`
+to `~/.config/systemd/user/`, re-render the service unit (it now carries
+`Requires=`/`After=fused-memory.socket`), `systemctl --user daemon-reload`,
+`systemctl --user enable fused-memory.socket`, then
+`systemctl --user stop fused-memory` **before**
+`systemctl --user start fused-memory.socket fused-memory` — the old process
+binds 8002 itself, so the socket cannot bind until it exits.
+
 ### fused-memory liveness revive
 
 `fused-memory.service` has its own liveness pass —
@@ -1405,8 +1438,10 @@ and a revive rate cap — described below.
 
 **The verdict** comes from
 `scripts/orchestrator-watchdog.py::_fused_memory_liveness_verdict`, which
-classifies fm three ways: `port-down` (the port probe fails — the process
-is gone, or never bound the port), `healthy` (the zero-I/O `/alive` route
+classifies fm three ways: `port-down` (the port probe fails — under socket
+activation the probe sees systemd's socket, so this now means
+`fused-memory.socket` itself is down; a dead process behind a live socket
+is restarted by the next connection instead), `healthy` (the zero-I/O `/alive` route
 answers within 15s), or `wedged` (the port is up but `/alive` does not
 answer — the asyncio loop is hung). `/health` is deliberately not
 consulted for the verdict: it awaits two sequential backing-store

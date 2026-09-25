@@ -277,6 +277,10 @@ else
   fail "  run. Re-run this script once the cause is fixed."
 fi
 
+# The socket unit holds port 8002 across service restarts. It carries no
+# host-local values, so it is copied rather than rendered.
+install -m 0644 "$REPO_ROOT/scripts/fused-memory.socket" "$UNIT_DIR/fused-memory.socket"
+
 # UNCONDITIONAL, exactly as before this task and exactly as in section 8. It is
 # a no-op when nothing changed, and skipping it on a degraded path would leave
 # systemd reading a stale generation of whatever unit IS on disk.
@@ -297,6 +301,7 @@ systemctl --user daemon-reload
 # is what makes that promise true rather than true-only-when-a-unit-was-there.
 if [ -f "$UNIT_DIR/fused-memory.service" ]; then
   systemctl --user enable fused-memory
+  systemctl --user enable fused-memory.socket
 else
   fail "fused-memory NOT enabled: no unit file in $UNIT_DIR."
   fail "  The render above did not happen and this host had no previous copy,"
@@ -315,7 +320,10 @@ fi
 if [ "$_fm_rendered" = "1" ]; then
   # Only start if .env exists (needs secrets)
   if [ -f "$REPO_ROOT/fused-memory/.env" ]; then
-    systemctl --user restart fused-memory
+    # Stop before starting the socket: on the first install the running
+    # process still binds 8002 itself. On later runs this is a plain restart.
+    systemctl --user stop fused-memory
+    systemctl --user start fused-memory.socket fused-memory
     ok "fused-memory unit installed and started (host-local Environment= values preserved — see the [fused_memory_unit_render] lines above)"
   else
     warn "fused-memory unit installed but NOT started (fused-memory/.env missing)"

@@ -150,3 +150,34 @@ class TestWatchdogSecContract:
             "out-of-band by the operator.\n"
             f"Current [Service] directives: {service_directives}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Socket activation — the port survives service restarts
+# ---------------------------------------------------------------------------
+
+_FM_DIR = Path(__file__).resolve().parent.parent
+_SOCKET_UNIT = _FM_DIR.parent / "scripts" / "fused-memory.socket"
+_SERVICE_UNITS = [
+    _FM_DIR / "fused-memory.service.example-systemd-config",
+    _FM_DIR.parent / "scripts" / "fused-memory.service.template",
+]
+
+
+class TestSocketActivation:
+    """fused-memory.socket must hold exactly the port the server is configured for,
+    and every committed service unit must depend on it."""
+
+    def test_socket_listens_on_the_configured_host_and_port(self) -> None:
+        import yaml
+
+        server = yaml.safe_load((_FM_DIR / "config" / "config.yaml").read_text())["server"]
+        listen = _parse_systemd_unit(_SOCKET_UNIT)["Socket"]
+        assert listen == [f"ListenStream={server['host']}:{server['port']}"]
+
+    @pytest.mark.parametrize("unit_path", _SERVICE_UNITS, ids=lambda p: p.name)
+    def test_service_requires_and_orders_after_the_socket(self, unit_path: Path) -> None:
+        unit = _parse_systemd_unit(unit_path)["Unit"]
+        assert "Requires=fused-memory.socket" in unit
+        after = [d for d in unit if d.startswith("After=")]
+        assert any("fused-memory.socket" in d.split("=", 1)[1].split() for d in after)
