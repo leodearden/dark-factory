@@ -671,6 +671,35 @@ def write_session_pointer(pid: int, slug: str, root: Path | str | None = None) -
     return True
 
 
+def resolve_session_slug_for_pid(pid: int, root: Path | str | None = None) -> str | None:
+    """Return the record slug of claude process *pid*'s current record, or None.
+
+    The pointer's slug is returned only when it is a record key AND the
+    record it names still carries ``claude_owner_pid == pid``: the record
+    must vouch for the pointer, so an unowned record, another pid's record,
+    a reaped one and an unreadable one all read as None. None is the
+    caller-visible degradation signal; this function is read-only and never
+    raises.
+
+    Contract limit: a new process that reuses a dead claude's pid can read
+    that session's pointer until its own SessionStart hook overwrites it or
+    ``reap_stale_session_pointers`` removes it.
+    """
+    if pid <= 0:
+        return None
+    try:
+        slug = session_pointer_path_for_pid(pid, root=root).read_text(encoding='utf-8').strip()
+    except (OSError, ValueError):
+        return None
+    if not _is_record_key(slug):
+        return None
+    try:
+        record = read_record(slug, root=root)
+    except (OSError, CorruptSessionRecord):
+        return None
+    return slug if record.claude_owner_pid == pid else None
+
+
 def encode_cwd(cwd: str) -> str:
     """Encode *cwd* to Claude Code's own ``~/.claude/projects/<enc>`` dir name.
 
