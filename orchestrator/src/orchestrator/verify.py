@@ -2574,7 +2574,8 @@ def _archive_merge_verify_logs(
 
     Filename convention mirrors ``_archive_attempt_log``:
         ``attempt-{N}[.{safe_prefix}].{label}-{utc_ts}.log``
-        ``attempt-{N}[.{safe_prefix}].summary-{utc_ts}.json``
+    The summary is written by ``_archive_attempt_summary``, the single owner
+    of its archived name, with the same ``utc_ts`` so a run's logs join it.
 
     Returns the list of paths actually written (both .log and .json).
     Returns ``[]`` when ``archive_root`` is ``None``.
@@ -2606,11 +2607,9 @@ def _archive_merge_verify_logs(
         if path is not None:
             archived.append(path)
 
-    # Write summary.json using the shared payload builder.
-    summary_path = _write_json_artifact(
-        target_dir / f'attempt-{attempt_id}{infix}.summary-{utc_ts}.json',
-        _build_summary_payload(runs, category, cause_hint),
-        '_archive_merge_verify_logs',
+    summary_path = _archive_attempt_summary(
+        runs, archive_root, task_id, attempt_id, category, cause_hint,
+        module_prefix=module_prefix, stamp=utc_ts,
     )
     if summary_path is not None:
         archived.append(summary_path)
