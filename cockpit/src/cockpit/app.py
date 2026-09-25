@@ -146,7 +146,8 @@ def _default_spawn_runner(argv: list[str]) -> None:
         _log.exception('spawn_session: failed to launch %r', argv)
 
 
-# Decision fields that feed the queue's scoring/display -- excludes
+# Decision fields that feed the queue's scoring/display/focus target (session_id
+# and record_slug both feed DecisionRecord.linked_session_slug) -- excludes
 # escalation_id/options (order_queue/format_queue_row never read them), so a
 # change to those never triggers a rebuild. Mirrors registry_reader's
 # _SNAPSHOT_FIELDS convention: keyed for a cheap equality diff, not identity.
@@ -155,6 +156,7 @@ _DECISION_SNAPSHOT_FIELDS = (
     'text',
     'filed_at',
     'session_id',
+    'record_slug',
     'task_id',
     'manual_boost',
     'state',
