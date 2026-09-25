@@ -803,3 +803,90 @@ class TestLeaseShowHolderRecord:
         assert 'state=unreadable' in lines
         assert lines[-1] == 'holder_record=unlinked'
         assert not any(line.startswith('holder_record_slug=') for line in lines)
+
+
+def _link_pid(pid: int, slug: str, root: Path) -> None:
+    sr.write_record(_record(slug, owner_pid=pid), root=root)
+    sr.write_session_pointer(pid, slug, root=root)
+
+
+def _lease_body(root: Path) -> sr.LeaseHolder:
+    return sr.LeaseHolder.from_json(sr.lease_path_for_name(_LEASE, root=root).read_text())
+
+
+class TestLeaseClaimCliRecordSlug:
+    _PID = 4_237_300
+    _OTHER_PID = 4_237_400
+
+    def test_a_bare_claim_links_the_claimants_own_record(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _link_pid(self._PID, 'watcher-own-record', tmp_path)
+        monkeypatch.setenv('CLAUDE_PID', str(self._PID))
+
+        assert sr.main(['lease-claim', '--name', _LEASE]) == 0
+
+        assert _lease_body(tmp_path).record_slug == 'watcher-own-record'
+
+    def test_an_explicit_pid_links_that_pids_record(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _link_pid(self._PID, 'the-env-pids-record', tmp_path)
+        _link_pid(self._OTHER_PID, 'the-body-pids-record', tmp_path)
+        monkeypatch.setenv('CLAUDE_PID', str(self._PID))
+
+        sr.main(['lease-claim', '--name', _LEASE, '--slug', 'X', '--pid', str(self._OTHER_PID)])
+
+        body = _lease_body(tmp_path)
+        assert body.pid == self._OTHER_PID
+        assert body.record_slug == 'the-body-pids-record'
+
+    def test_an_unresolvable_record_slug_is_blank_quiet_and_never_blocks(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        monkeypatch.setenv('CLAUDE_PID', str(self._PID))
+        caplog.set_level(logging.DEBUG)
+
+        assert sr.main(['lease-claim', '--name', _LEASE]) == 0
+
+        assert _lease_body(tmp_path).record_slug == ''
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+        monkeypatch.delenv('CLAUDE_PID')
+        with pytest.raises(SystemExit) as excinfo:
+            sr.main(['lease-claim', '--name', 'another-lease'])
+        assert excinfo.value.code == 2
+
+    @pytest.mark.parametrize(
+        ('argv', 'max_calls'),
+        [
+            (['lease-claim', '--name', _LEASE], 1),
+            (['lease-claim', '--name', _LEASE, '--slug', 'X', '--pid', '4237400'], 0),
+        ],
+        ids=['bare', 'explicit-slug-and-pid'],
+    )
+    def test_the_session_pid_is_resolved_at_most_once_and_only_on_demand(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        argv: list[str],
+        max_calls: int,
+    ) -> None:
+        _link_pid(self._PID, 'watcher-own-record', tmp_path)
+        monkeypatch.setenv('CLAUDE_PID', str(self._PID))
+        calls: list[object] = []
+        real = sr.resolve_session_pid
+
+        def counting(env: object = None) -> int:
+            calls.append(env)
+            return real()
+
+        monkeypatch.setattr(sr, 'resolve_session_pid', counting)
+
+        assert sr.main(argv) == 0
+
+        assert len(calls) <= max_calls
+        assert _lease_body(tmp_path).pid in (self._PID, self._OTHER_PID)
