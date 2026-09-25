@@ -72,6 +72,32 @@ class DuplicateCandidateKeyError(TaskmasterError):
         self.candidate_key = candidate_key
 
 
+class LeakedEnvelopeMarkupError(TaskmasterError):
+    """Raised by ``add_task``/``update_task`` when task text carries a leaked
+    tool-call envelope fragment (task 4419).
+
+    The fragment is positive evidence that a harness parser terminated an
+    argument early and may have swallowed the arguments after it, so the
+    write is refused and its transaction rolled back rather than stored or
+    stripped: stripping would destroy the evidence of which writer leaked.
+    Detection and column scope come from
+    ``fused_memory/backends/task_text_markup_gate.py``.
+
+    Attributes:
+        column: The task-text column whose value carries the fragment.
+        fragment: The leaked fragment, from the stray closing tag onward.
+    """
+
+    def __init__(self, column: str, fragment: str) -> None:
+        super().__init__(
+            'LEAKED_ENVELOPE_MARKUP',
+            f'Refusing to store task text: {column!r} carries a leaked tool-call '
+            f'fragment {fragment!r}, so arguments after it may have been swallowed',
+        )
+        self.column = column
+        self.fragment = fragment
+
+
 class TaskNotFoundError(TaskmasterError):
     """Raised by ``get_task`` when a successful zero-row query proves absence.
 
@@ -261,6 +287,7 @@ __all__ = [
     'TASKMASTER_TOOL_ERROR',
     'TASKMASTER_UNAVAILABLE',
     'DuplicateCandidateKeyError',
+    'LeakedEnvelopeMarkupError',
     'TaskmasterError',
     'TaskNotFoundError',
     'StatusWriteAuthorityError',

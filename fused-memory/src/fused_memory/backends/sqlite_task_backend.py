@@ -49,6 +49,7 @@ from fused_memory.backends.task_backend_types import (
     UpdateTaskResult,
     ValidateDependenciesResult,
 )
+from fused_memory.backends.task_text_markup_gate import refuse_leaked_task_text
 from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.middleware.candidate_key import compute_candidate_key
 from fused_memory.middleware.candidate_key_escalation import (
@@ -3030,6 +3031,9 @@ class SqliteTaskBackend:
 
                 await self._validate_metadata_on_write(
                     metadata, project_root=project_root, tag=tag, task_id=next_id,
+                )
+                refuse_leaked_task_text(
+                    {'title': title, 'description': description, 'details': details},
                 )
 
                 # Index-independent dedup guard (fm-task-dedup self-heal
