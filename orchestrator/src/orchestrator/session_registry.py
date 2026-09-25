@@ -4500,6 +4500,8 @@ def _run_write_decision(
     session_id: str | None,
     severity: str = '',
     escalations_dir: str = '',
+    *,
+    record_slug: str = '',
 ) -> None:
     """Run the ``write-decision`` verb (Fleet Cockpit C8: park-to-registry).
 
@@ -4515,6 +4517,11 @@ def _run_write_decision(
     critical|urgent) onto the record so the cockpit decision queue can
     weight this ask (Fleet Cockpit F7 fix 1); defaults to '' when the
     caller doesn't supply one.
+
+    ``record_slug`` is best-effort enrichment derived from ``$CLAUDE_PID``'s
+    pid pointer (resolve_own_record_slug), never typed by the caller and
+    never a reason to refuse or delay a filing: an unresolvable one is filed
+    as '' and is visible downstream as an unresolved link.
 
     ``project`` is stored NORMALIZED (see normalize_project_token, task
     3807), so ``df``, ``dark-factory`` and ``Dark_Factory`` all persist as
@@ -4688,6 +4695,7 @@ def _run_write_decision(
         session_id=session_id,
         severity=severity,
         escalations_dir=stamp,
+        record_slug=record_slug,
     )
 
     # WHY THIS IS NOT ROUTED THROUGH _mutate_decision, despite sharing its
@@ -5389,6 +5397,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.session_id,
                 args.severity,
                 args.escalations_dir,
+                record_slug=resolve_own_record_slug() or '',
             )
         elif args.verb == 'reap-decisions':
             _run_reap_decisions(args.project, args.escalations_dir)
