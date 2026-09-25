@@ -103,6 +103,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    'RECOVERY_VETO_STREAK_ROLE',
     'RECOVERY_VETO_STREAK_SENTINEL_PREFIX',
     'AgeableRecord',
     'LeaveReason',
@@ -779,7 +780,14 @@ RECOVERY_VETO_STREAK_SENTINEL_PREFIX = '__recovery_veto_streak__'
 _STREAK_CATEGORY = 'risk_identified'
 
 #: agent_role stamped on both the alarm and its resolution.
-_STREAK_ROLE = 'orchestrator-recovery-veto-streak'
+#:
+#: A CROSS-LAYER contract: this string is the only thing that identifies the
+#: alarm class to ``escalation``, a lower layer that must not import
+#: orchestrator.  ``escalation.authority.PROMOTE_SENTINEL_BOUND_ROLES``
+#: duplicates it (lockstep-tested in ``escalation/tests/test_authority.py``)
+#: so ``promote_to_l2`` can refuse to mint a wrapper of these alarms under the
+#: real task id.  Rename both sides together.
+RECOVERY_VETO_STREAK_ROLE = 'orchestrator-recovery-veto-streak'
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -958,7 +966,7 @@ def emit_recovery_veto_streak_escalation(
         esc = Escalation(
             id=escalation_queue.make_id(sentinel),
             task_id=sentinel,
-            agent_role=_STREAK_ROLE,
+            agent_role=RECOVERY_VETO_STREAK_ROLE,
             severity='blocking',
             level=1,
             category=_STREAK_CATEGORY,
@@ -1058,7 +1066,7 @@ def resolve_recovery_veto_streak_escalation(
                     'Auto-resolved by the recovery-emission detector; it will '
                     're-file if the hold recurs.'
                 ),
-                resolved_by=_STREAK_ROLE,
+                resolved_by=RECOVERY_VETO_STREAK_ROLE,
             )
             resolved += 1
     except Exception as exc:  # noqa: BLE001 — fail-open backstop

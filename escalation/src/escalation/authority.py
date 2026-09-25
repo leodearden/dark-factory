@@ -40,6 +40,10 @@ the born-at-L2 human gates (the design_concern / milestone_gate /
 milestone_check_failed / curator_adjudication_missing categories, and the
 ``orchestrator-deterministic`` sentinel role) are never auto-closable even
 when a class predicate would otherwise match.
+
+Task 4541 adds ``PROMOTE_SENTINEL_BOUND_ROLES``, keyed on the agent_role of
+the records being PROMOTED rather than on the caller's identity, so unlike
+the tables above it binds header-less callers too.
 """
 
 from __future__ import annotations
@@ -64,6 +68,19 @@ ROLE_LEVEL_ALLOWLIST: dict[str, frozenset[int]] = {
 # (absent identity) callers are unaffected — this only gates identified
 # callers not in this set.
 PROMOTE_ALLOWED: frozenset[str] = frozenset({_WATCHER_AUTO_IDENTITY})
+
+# MEMBER agent_roles (not caller identities — disjoint from PROMOTE_ALLOWED)
+# whose records live under a SYNTHETIC sentinel task id. An L2 clustering only
+# such records must be minted under one of its members' own task ids: minted
+# under a caller-chosen REAL id, it becomes a record every veto predicate reads
+# on that task, so the alarm about a hold becomes part of the hold
+# (esc-5469-11).
+# Must equal orchestrator.recovery_emission.RECOVERY_VETO_STREAK_ROLE; the full
+# WHY is at orchestrator/src/orchestrator/recovery_emission.py::
+# RECOVERY_VETO_STREAK_SENTINEL_PREFIX. Duplicated (not imported) to preserve
+# the escalation -> orchestrator layer direction; pinned in lockstep by
+# tests/test_authority.py.
+PROMOTE_SENTINEL_BOUND_ROLES: frozenset[str] = frozenset({'orchestrator-recovery-veto-streak'})
 
 
 # ---------------------------------------------------------------------------

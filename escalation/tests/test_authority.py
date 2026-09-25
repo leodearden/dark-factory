@@ -26,6 +26,7 @@ from escalation.authority import (
     L2_AUTO_CLOSE_DENY_CATEGORIES,
     L2_AUTO_CLOSE_DENY_ROLES,
     PROMOTE_ALLOWED,
+    PROMOTE_SENTINEL_BOUND_ROLES,
     ROLE_LEVEL_ALLOWLIST,
     l2_auto_close_class,
 )
@@ -142,8 +143,6 @@ class TestPromoteSentinelBoundRoles:
     """
 
     def test_is_non_empty_frozenset(self) -> None:
-        from escalation.authority import PROMOTE_SENTINEL_BOUND_ROLES
-
         assert isinstance(PROMOTE_SENTINEL_BOUND_ROLES, frozenset)
         assert len(PROMOTE_SENTINEL_BOUND_ROLES) > 0
 
@@ -157,7 +156,6 @@ class TestPromoteSentinelBoundRoles:
         pinned: a rename on either side would otherwise silently re-open the
         esc-5469-11 real-id wrapper while every test stayed green.
         """
-        from escalation.authority import PROMOTE_SENTINEL_BOUND_ROLES
         from orchestrator.recovery_emission import RECOVERY_VETO_STREAK_ROLE
 
         assert RECOVERY_VETO_STREAK_ROLE in PROMOTE_SENTINEL_BOUND_ROLES, (
@@ -166,13 +164,11 @@ class TestPromoteSentinelBoundRoles:
         )
 
     def test_disjoint_from_caller_identities(self) -> None:
-        from escalation.authority import PROMOTE_SENTINEL_BOUND_ROLES
-
         assert 'orchestrator-escalation-watcher-auto' not in PROMOTE_SENTINEL_BOUND_ROLES
         assert PROMOTE_SENTINEL_BOUND_ROLES.isdisjoint(PROMOTE_ALLOWED)
 
     def test_auto_close_role_denylist_is_unchanged(self) -> None:
-        assert L2_AUTO_CLOSE_DENY_ROLES == frozenset({'orchestrator-deterministic'})
+        assert frozenset({'orchestrator-deterministic'}) == L2_AUTO_CLOSE_DENY_ROLES
 
 
 class TestL2AutoCloseClass:
