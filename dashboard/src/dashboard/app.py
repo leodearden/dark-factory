@@ -35,6 +35,7 @@ from dashboard.api import escalations as api_escalations_routes
 from dashboard.api import memory as api_memory_routes
 from dashboard.api import merge_queue as api_merge_queue_routes
 from dashboard.api import orchestrators as api_orchestrators_routes
+from dashboard.api import task_prose as api_task_prose_routes
 from dashboard.api import tasks as api_tasks_routes
 from dashboard.api.window import _parse_window
 from dashboard.config import DashboardConfig
@@ -428,6 +429,7 @@ app.include_router(api_burndown_routes.router)
 app.include_router(api_memory_routes.router)
 app.include_router(api_orchestrators_routes.router)
 app.include_router(api_escalations_routes.router)
+app.include_router(api_task_prose_routes.router)
 
 
 # ---------------------------------------------------------------------------

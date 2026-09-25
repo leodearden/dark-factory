@@ -5249,15 +5249,11 @@ class TestLivenessSubjectFactsFallback:
     carrying no readable assignment, and a clause boundary landing inside a
     quoted value.
 
-    An earlier reading of this class claimed the rescope "can only ADD recall
-    if a subject the clauses say nothing about keeps exactly the key it had
-    BEFORE the rescope". That condition is real but NOT sufficient, and
-    believing it shipped a regression: a subject whose clause named only SOME
-    of the record's fields keyed on a partial fact instead, silently vacating
-    the whole-record bucket it used to share -- an empty-set-only fallback
-    never fires for it. The invariant that actually holds is the unconditional
-    one above; `TestLivenessSubjectFactsIsAdditive` pins the
-    non-empty-but-incomplete half this class does not reach.
+    An empty-set-only fallback is NOT sufficient on its own: a subject whose
+    clause names only SOME of the record's fields keys on a partial fact
+    instead, silently vacating the whole-record bucket it shared -- a shape
+    an empty-set test never reaches. `TestLivenessSubjectFactsIsAdditive` pins
+    that non-empty-but-incomplete half.
 
     Because every pre-rescope bucket membership therefore survives, nothing is
     lost and no new `_LIVENESS_DISCLOSURE_KEYS` counter is warranted -- pinned
@@ -5383,14 +5379,14 @@ class TestLivenessSubjectFactsIsAdditive:
     covers the strictly harder one they do not reach -- clause evidence that
     is non-empty but INCOMPLETE.
 
-    Measured against the shipped module before this class landed: record B
-    below names task 94 in its first clause and puts the other two fields in a
-    second clause naming no task, so the subject keyed on the partial
-    `status=in-progress`, matched nothing, and the whole-record bucket it had
-    shared with A was silently vacated -- `find_liveness_snapshot_recurrences`
-    returned `[]` with an ALL-ZERO disclosure. A fallback that fires only on
-    the empty set cannot catch that; a non-empty-but-incomplete set wins
-    outright.
+    This is the failure mode the unconditional seed closes: record B below
+    names task 94 in its first clause and puts the other two fields in a
+    second clause naming no task, so keying the subject on the partial
+    `status=in-progress` ALONE would match nothing, vacating the whole-record
+    bucket it shares with A and making `find_liveness_snapshot_recurrences`
+    return `[]` with an ALL-ZERO disclosure -- the outcome the unconditional
+    seed prevents, pinned below. A fallback that fires only on the empty set
+    cannot catch that; a non-empty-but-incomplete set wins outright.
 
     The invariant that closes it: every subject buckets under *core_fact*
     unconditionally, with the clause-scoped fact ADDED beside it. Every bucket

@@ -545,12 +545,14 @@ def make_graph_mock():
     person to paginate something rediscovers the same trap.
 
     This fixture deliberately does NOT simulate the server's
-    ``RESULTSET_SIZE`` truncation.  ONE double owns that behaviour —
-    ``test_graph_read_pagination.FakeCappedGraph``, which also carries the
-    stateful query log the truncation tests need — because two doubles that
-    both claim to stand in for the same server drift, and the drift shows up
-    as a test that passes against a fake nothing else agrees with.  A test
-    that needs the cap should use that one.
+    ``RESULTSET_SIZE`` truncation.  ONE ro_query-level double owns that
+    behaviour — ``test_graph_read_pagination.FakeCappedGraph``, which also
+    carries the stateful query log the truncation tests need — because two
+    doubles that both claim to stand in for the same server drift, and the
+    drift shows up as a test that passes against a fake nothing else agrees
+    with.  A test that needs the cap should use that one (or, for episode
+    reads through graphiti-core, its API-level counterpart
+    ``FakeCappedEpisodeStore`` in the same module).
     """
     skip_limit_re = re.compile(r'SKIP\s+(\d+)\s+LIMIT\s+(\d+)', re.IGNORECASE)
     # Deliberately NARROW: only a query whose entire projection is a bare row

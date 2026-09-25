@@ -50,6 +50,51 @@ if TYPE_CHECKING:
 logger = logging.getLogger('orchestrator.merge_queue')
 
 
+#: Bounded FIFO of main-tip SHAs this process's merge queue itself landed —
+#: i.e. the main tips a GREEN gate run has actually been observed on.
+#:
+#: Written at the single clean-landing return of :func:`_finalize_advanced_merge`
+#: (shared by SpeculativeMergeWorker's CAS advance and the train pipeline), read
+#: by :func:`_reverify_rebased_tree` to decide whether footprint-disjointness may
+#: be trusted (see :func:`_disjoint_skip_blockers`).
+#:
+#: Process-global rather than worker-owned on purpose: there is exactly one merge
+#: queue per orchestrator process, both landing paths funnel through
+#: ``_finalize_advanced_merge``, and the alternative (threading a handle through
+#: the module-level finalize/advance helpers and the ``_TrainMergeHost`` protocol)
+#: would fan the same one fact out across four signatures.  Same shape as
+#: ``verify._suppressed_flake_records`` and ``MergeProvenance``'s process-global
+#: facade.
+#:
+#: NOT durable, and deliberately so: after a restart the set is empty, every
+#: rebase-under-drift re-verifies, and the registry refills from the first
+#: landing onward.  Empty means "I have not seen this tip go green", which is
+#: the fail-SAFE answer — the same direction ``_OVERLAP_GIT_ERROR_SENTINEL``
+#: fails.
+_QUEUE_VERIFIED_MAIN_TIPS: list[str] = []
+
+#: Cap on :data:`_QUEUE_VERIFIED_MAIN_TIPS`.  Only the most recent tips can ever
+#: be a rebase target (a rebase is onto CURRENT main), so a short window is
+#: sufficient; the bound exists so a long-lived process cannot grow the list
+#: without limit.
+_QUEUE_VERIFIED_MAIN_TIPS_CAP = 64
+
+
+def note_queue_verified_main_tip(sha: str) -> None:
+    """Record *sha* as a main tip this queue landed after a green gate run."""
+    if not sha:
+        return
+    if sha in _QUEUE_VERIFIED_MAIN_TIPS:
+        return
+    _QUEUE_VERIFIED_MAIN_TIPS.append(sha)
+    del _QUEUE_VERIFIED_MAIN_TIPS[:-_QUEUE_VERIFIED_MAIN_TIPS_CAP]
+
+
+def main_tip_is_queue_verified(sha: str) -> bool:
+    """True iff *sha* is a main tip this queue landed after a green gate run."""
+    return bool(sha) and sha in _QUEUE_VERIFIED_MAIN_TIPS
+
+
 @dataclass
 class DropGuardResult:
     """Structured return value from :func:`_check_plan_targets_in_tree`.
@@ -813,6 +858,14 @@ async def _finalize_advanced_merge(
     # so consecutive tip-advances count is cleared for this branch.
     if chain_ctx is not None:
         chain_ctx.counts.pop(req.branch.bare_id, None)
+    # Main is now at *advanced_sha* and every post-advance gate passed, so this
+    # tip is one a green gate run has been observed on.  Recorded here — the
+    # single clean-landing return shared by the speculative CAS advance and the
+    # train pipeline — so that a LATER request rebased onto it may trust the
+    # disjoint-delta fast path (premise P2 in _disjoint_skip_blockers).  A tip
+    # produced by any other writer (nightly job, direct commit, push) never
+    # reaches this line and is therefore never trusted.
+    note_queue_verified_main_tip(advanced_sha)
     push_status = await git_ops.push_main()
     return MergeOutcome('done', merge_sha=advanced_sha, push_status=push_status)
 
@@ -3011,6 +3064,94 @@ async def _rebase_delta_touched_overlap(
     return sorted(branch_touched & intervening)
 
 
+def _disjoint_skip_blockers(
+    req: MergeRequest,
+    *,
+    rebased_onto: str,
+) -> list[str]:
+    """Reasons footprint-disjointness may NOT be trusted for this rebase.
+
+    Empty list means the disjoint fast path in :func:`_reverify_rebased_tree`
+    is sound and the post-rebase re-verify may be skipped.
+
+    WHY THIS EXISTS (the 2026-09-22 whole-tree-drift incident).  On that day an
+    unattended nightly job committed prose straight onto main at 03:20:36
+    carrying a stale test-path citation.  That reddened a WHOLE-TREE merge gate
+    — one every merge runs regardless of its own diff.  At 03:48:49 a request
+    whose own verify had run against the PRE-drift tip was rebased onto the
+    drift, this function found the two footprints disjoint (``docs/prds/**`` vs
+    ``docs/legibility/**``), skipped re-verification, and the queue advanced —
+    and reported "merged to main successfully" for — a tree no verification had
+    ever seen green.
+
+    The inference "disjoint footprints, therefore still green" rests on two
+    premises, and the overlap probe on its own checks NEITHER:
+
+    P1 (compositionality)
+        The gate's verdict decomposes over disjoint file sets — i.e. every check
+        it runs is diff-scoped.  A whole-tree check violates this by
+        construction: its entire premise is that an unrelated file can fail you.
+        Signal used: ``merge_verify_breadth == 'full'``, the EXISTING per-project
+        declaration that the merge gate runs every registered module's suite
+        rather than just the touched ones.  It is a declaration, not a gate name,
+        so this stays project-agnostic.  It is also only a PARTIAL detector of a
+        non-compositional gate (a project whose own verify script runs whole-tree
+        checks internally reads as 'scoped' here — reify is exactly that), which
+        is why P2 below, not P1, is the arm that actually closes the incident.
+
+    P2 (the drift is itself green)
+        Main at *rebased_onto* passes the gate on its own.  This premise is
+        needed even for a perfectly diff-scoped gate — a merge onto an
+        already-red base is red — and it is the one the incident violated.
+        Signal used: :func:`main_tip_is_queue_verified`, i.e. *rebased_onto* is
+        a tip THIS queue landed after a green gate run.  Drift from any other
+        writer (an unattended job, a direct commit, a push) has unknown health.
+        Generic and observed, not declared: it needs no project config at all.
+
+    FAIL-SAFE DIRECTION.  Both arms answer "distrust" when the answer is
+    unknown — an unrecognised tip, a missing/partial ``req.config`` — matching
+    ``_OVERLAP_GIT_ERROR_SENTINEL``'s fail-CLOSED policy above.  The cost of a
+    false distrust is one extra verify; the cost of a false trust was nine hours
+    of laundered red main.
+
+    WHY THE OPTIMISATION IS NOT REMOVED WHOLESALE.  It is not unsound in all
+    cases: when main drifted because ANOTHER queued merge landed, P2 holds by
+    observation, and for a diff-scoped gate P1 holds too — which is the common
+    case and the case the optimisation was built for.  Only the premises are
+    now checked instead of assumed.
+
+    TRANSITIVITY.  A tip landed via this fast path is itself recorded as
+    queue-verified by :func:`_finalize_advanced_merge`, so trust chains.  That
+    is sound under P1 ∧ P2 by the same argument: those premises make the landed
+    tree green, not merely unverified.  The one exception is the operator
+    kill switch below, which by definition restores the pre-fix (unsound)
+    inference; that is what "restore the previous behaviour" means.
+    """
+    blockers: list[str] = []
+    config = getattr(req, 'config', None)
+
+    # P1 — project-declared whole-tree merge gate.  Deliberately NOT covered by
+    # the kill switch: a project that has declared its merge gate whole-tree has
+    # declared this skip unsound outright, not merely expensive.
+    if getattr(config, 'merge_verify_breadth', None) == 'full':
+        blockers.append('whole-tree merge gate (merge_verify_breadth=full)')
+
+    # P2 — drift provenance.  Guarded by the green-tier kill switch so ops can
+    # trade the extra re-verifies back under load without a fleet restart.
+    requires_verified_drift = getattr(
+        config, 'merge_disjoint_skip_requires_verified_drift', True,
+    )
+    if requires_verified_drift is not False and not main_tip_is_queue_verified(
+        rebased_onto,
+    ):
+        blockers.append(
+            f'intervening main tip {rebased_onto[:8]} was not landed green by '
+            f'this queue (unverified drift)'
+        )
+
+    return blockers
+
+
 async def _reverify_rebased_tree(
     git_ops: GitOps,
     req: MergeRequest,
@@ -3034,9 +3175,14 @@ async def _reverify_rebased_tree(
     ---------
     1. Call ``_rebase_delta_touched_overlap`` to compute the intersection of
        the branch-touched file set and the intervening main delta.
-    2. **Disjoint** (empty intersection): return ``None``.  The caller can
-       advance immediately — the intervening churn cannot interact with the
-       branch's changes.  No extra verify call is made.
+    2. **Disjoint** (empty intersection): consult
+       :func:`_disjoint_skip_blockers`.  With NO blockers, return ``None`` —
+       the caller can advance immediately and no extra verify call is made.
+       With blockers, fall through to the re-verify in step 3 exactly as an
+       overlap would, logging which premise of the disjointness inference could
+       not be established.  Disjointness alone is NOT sufficient: see that
+       function's docstring for the two premises and the incident that proved
+       skipping on the intersection alone unsound.
     3. **Overlapping** (non-empty intersection): log a warning and delegate to
        ``_run_post_merge_verify``, which runs the full post-merge scoped
        verification against the rebased *merge_wt*.
@@ -3072,21 +3218,33 @@ async def _reverify_rebased_tree(
     )
 
     if not overlap:
-        # Disjoint: the intervening main churn does not intersect the branch's
-        # touched files — the rebased tree is safe to advance without re-verify.
-        logger.debug(
-            'Task %s: rebased tree disjoint from intervening delta (%s..%s) '
-            '— skipping re-verify',
+        blockers = _disjoint_skip_blockers(req, rebased_onto=rebased_onto)
+        if not blockers:
+            # Disjoint AND both premises hold: the intervening main churn does
+            # not intersect the branch's touched files, and that churn is itself
+            # a tip this queue landed green.  Safe to advance without re-verify.
+            logger.debug(
+                'Task %s: rebased tree disjoint from intervening delta (%s..%s) '
+                '— skipping re-verify',
+                req.task_id, rebased_from[:8], rebased_onto[:8],
+            )
+            return None
+        logger.warning(
+            'Task %s: rebased tree is disjoint from the intervening delta '
+            '(%s..%s) but disjointness is NOT trustworthy here [%s] — '
+            'triggering re-verify. Footprint-disjointness only licenses a skip '
+            'when the gate is diff-scoped AND the drift is itself known green; '
+            'see _disjoint_skip_blockers.',
             req.task_id, rebased_from[:8], rebased_onto[:8],
+            ', '.join(blockers),
         )
-        return None
-
-    logger.warning(
-        'Task %s: rebased tree overlaps intervening delta (%s..%s) '
-        'on %d file(s) [%s] — triggering re-verify',
-        req.task_id, rebased_from[:8], rebased_onto[:8],
-        len(overlap), ', '.join(overlap[:5]),
-    )
+    else:
+        logger.warning(
+            'Task %s: rebased tree overlaps intervening delta (%s..%s) '
+            'on %d file(s) [%s] — triggering re-verify',
+            req.task_id, rebased_from[:8], rebased_onto[:8],
+            len(overlap), ', '.join(overlap[:5]),
+        )
     return await _run_post_merge_verify(
         git_ops, req, merge_wt,
         timeouts=timeouts,

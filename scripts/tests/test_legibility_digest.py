@@ -25,6 +25,7 @@ import json
 import logging
 import re
 
+import coder as coder_mod
 import digest as mod
 import pytest
 import yaml
@@ -385,6 +386,22 @@ class TestIterUserTurns:
 
         assert [t['text'] for t in turns] == ['first', 'second']
         assert [t['index'] for t in turns] == [0, 3]
+
+    def test_excludes_reingested_content_through_the_shared_predicate(self):
+        """A user turn whose whole text is a coder judgment was NOT observed:
+        no dark-factory transcript on disk on 2026-09-23 carries one. It is
+        pinned so the gold bucket and every scalar detector answer
+        "is this re-ingested?" with ONE predicate. The genuine and briefing
+        turns pin that sharing it neither widens nor narrows the filter."""
+        records = [
+            _user_text(_coder_judgment()),
+            _user_text('please redo the merge'),
+            _user_text(_briefing_text()),
+        ]
+
+        turns = mod.iter_user_turns(records)
+
+        assert [(t['index'], t['text']) for t in turns] == [(1, 'please redo the merge')]
 
 
 # ---------------------------------------------------------------------------
@@ -860,6 +877,46 @@ class TestIterSelfCorrections:
 
         assert mod.iter_self_corrections(records) == []
 
+    def test_ignores_a_whole_block_coder_judgment(self):
+        # The b203a05c record-22 sighting: a prior trickle-coder answer whose
+        # note quotes "that's wrong" from the digest it coded.
+        records = [_assistant(_text(_coder_judgment()))]
+
+        assert mod.iter_self_corrections(records) == []
+
+    def test_ignores_a_json_fenced_coder_judgment(self):
+        records = [_assistant(_text(_json_fenced(_coder_judgment())))]
+
+        assert mod.iter_self_corrections(records) == []
+
+    def test_ignores_a_coder_judgment_quoting_i_was_wrong(self):
+        # The 6a527d51 record-10 marker.
+        records = [_assistant(_text(
+            _coder_judgment(note='I was wrong to keep reporting it as stuck'),
+        ))]
+
+        assert mod.iter_self_corrections(records) == []
+
+    def test_coder_judgment_does_not_mask_a_prose_self_correction(self):
+        records = [
+            _assistant(_text(_coder_judgment())),
+            _assistant(_text('My mistake, the lease check belongs in the watcher.')),
+        ]
+
+        hits = mod.iter_self_corrections(records)
+
+        assert [(h['index'], h['pattern']) for h in hits] == [(1, 'my mistake')]
+
+    def test_prose_quoting_the_schema_inline_still_self_corrects(self):
+        records = [_assistant(_text(
+            'Earlier I said the coder answers {"matches": [], "candidates": []} '
+            "on every run. That's wrong: it answers that only when nothing matches."
+        ))]
+
+        hits = mod.iter_self_corrections(records)
+
+        assert [h['pattern'] for h in hits] == ["that's wrong"]
+
 
 # ---------------------------------------------------------------------------
 # iter_not_found / iter_df_guards / iter_interrupts — secondary scalar
@@ -937,6 +994,159 @@ class TestSecondarySignals:
         records = [_sidechain(_user_text('[Request interrupted by user for tool use]'))]
 
         assert mod.iter_interrupts(records) == []
+
+
+# ---------------------------------------------------------------------------
+# Re-ingested content is excluded from EVERY signal bucket (task 5685), not
+# only the one it was first sighted in. Fixture shapes mirror a 2026-09-23
+# read-only scan of all 35,888 dark-factory transcripts: the harness-injected
+# trickle-coder prompt embeds the digest it codes (901 sessions carried
+# phantom df_guard or interrupt hits from it), and a coder answer quotes that
+# digest back (246 of the 301 sessions it contaminated had df_guard hits).
+# ---------------------------------------------------------------------------
+
+def _trickle_coder_session_records():
+    """A synthetic whole-session reproduction of the b203a05c shape: the
+    harness-injected trickle-coder prompt, embedding the digest it codes, as
+    the one user turn, and the coder's answer as the one assistant text
+    block. Every signal literal in it is re-ingested."""
+    prompt = (
+        f'{_TRICKLE_CODER_PREAMBLE}\n\n=== SESSION DIGEST ===\n'
+        '## Guard Trips\n- (turn 21) blocked:\n'
+    )
+    answer = _coder_judgment(note="that's wrong: its turn 21 reads blocked: twice")
+    return [
+        _with_session_meta(_user_text(prompt)),
+        _with_session_meta(_assistant(_text(answer))),
+    ]
+
+
+class TestReingestedContentIsBucketAgnostic:
+    def test_df_guard_ignores_the_digest_a_coder_prompt_embeds(self):
+        records = [_user_text(f'{_TRICKLE_CODER_PREAMBLE}\n\n- (turn 21) blocked:')]
+
+        assert mod.iter_df_guards(records) == []
+
+    def test_df_guard_ignores_a_coder_judgment_quoting_a_trip(self):
+        records = [_assistant(_text(_coder_judgment(note='its turn 21 reads blocked:')))]
+
+        assert mod.iter_df_guards(records) == []
+
+    @pytest.mark.parametrize(
+        'record',
+        [_user_text('the merge got BLOCKED: again, why?'), _tool_result('tu-1', 'BLOCKED: real block')],
+        ids=['user_turn', 'tool_result'],
+    )
+    def test_df_guard_still_hits_the_same_literal_in_dialogue(self, record):
+        assert [h['pattern'] for h in mod.iter_df_guards([record])] == ['blocked:']
+
+    def test_not_found_ignores_foreign_material_carrying_a_harness_prompt(self):
+        # The measured Read-of-source / transcript-dump shape: a tool_result
+        # holding another session's material, harness marker and all. It is
+        # dropped WHOLE, so a genuine error printed beside the marker would
+        # go too: the accepted trade-off _dialogue_text_sources states.
+        records = [_tool_result(
+            'tu-1', f'{_TRICKLE_CODER_PREAMBLE}\n## Not Found\n- (turn 3) no such file or directory',
+        )]
+
+        assert mod.iter_not_found(records) == []
+
+    def test_not_found_ignores_a_tool_result_that_is_a_coder_judgment(self):
+        records = [_tool_result('tu-1', _coder_judgment(note='cat: x.py: No such file or directory'))]
+
+        assert mod.iter_not_found(records) == []
+
+    def test_not_found_still_hits_the_same_literal_in_an_ordinary_tool_result(self):
+        records = [_tool_result('tu-1', 'cat: x.py: No such file or directory', is_error=True)]
+
+        assert [h['pattern'] for h in mod.iter_not_found(records)] == ['no such file or directory']
+
+    @pytest.mark.parametrize(
+        ('detect', 'record', 'pattern'),
+        [
+            (
+                mod.iter_not_found,
+                _tool_result('tu-1', (
+                    '# Task\n\n'
+                    'Mirror the `# Context` and `## Agent Identity` headings in the new test.\n'
+                    'cat: missing.md: No such file or directory'
+                ), is_error=True),
+                'no such file or directory',
+            ),
+            (
+                mod.iter_self_corrections,
+                _assistant(_text(
+                    'My mistake: `# Context` comes from _get_memory_context, '
+                    'and `## Agent Identity` from _agent_identity.'
+                )),
+                'my mistake',
+            ),
+        ],
+        ids=['tool_result', 'assistant_text'],
+    )
+    def test_a_carrier_merely_naming_harness_headings_keeps_its_signal(self, detect, record, pattern):
+        """The boundary of the whole-carrier drop on NON-user carriers: a
+        carrier is dropped for HOLDING a harness prompt or briefing, never
+        for naming its headings, as this session's own file dump or prose
+        routinely does."""
+        assert [h['pattern'] for h in detect([record])] == [pattern]
+
+    def test_interrupt_ignores_the_digest_a_harness_prompt_embeds(self):
+        records = [_user_text(
+            f'{_TRICKLE_CODER_PREAMBLE}\n\n## Interrupts\n- (turn 7) request interrupted by user',
+        )]
+
+        assert mod.iter_interrupts(records) == []
+
+    def test_a_trickle_coder_session_reports_every_signal_zero(self):
+        counts = mod.signal_counts(_trickle_coder_session_records())
+
+        assert counts == dict.fromkeys(mod.SIGNAL_COUNT_KEYS, 0)
+
+    def test_classify_agent_class_still_reads_the_raw_carriers(self):
+        """Exists to stop _dialogue_text_sources being wired into
+        classify_agent_class, which classifies a session BY its injected
+        markers: reading the filtered layer would delete its own evidence and
+        collapse this orchestrated session to 'interactive'. The first
+        assertion is the premise that makes the second one discriminate."""
+        text = _briefing_text(
+            body_filler='Task ID: 42\nWorktree: /home/leo/src/dark-factory/.worktrees/42',
+        )
+        records = [_user_text(text)]
+
+        assert mod.is_reingested_content(text) is True
+        assert mod.classify_agent_class(records) == 'orchestrated-task'
+
+
+class TestTrickleCoderSessionDigest:
+    """The rendered ARTIFACT a census reads, not just the counters: a
+    trickle-coder session renders no trace of the signals it re-ingested."""
+
+    def test_renders_none_of_the_sections_the_contamination_fed(self):
+        digest = mod.render_digest(_trickle_coder_session_records(), agent_class='interactive')
+
+        frontmatter_yaml, _ = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+        lines = digest.splitlines()
+
+        for key in ('self_corrections', 'user_corrections', 'df_guard'):
+            assert f'## {mod.SECTION_HEADINGS[key]}' not in lines
+        assert meta['signal_counts'] == dict.fromkeys(mod.SIGNAL_COUNT_KEYS, 0)
+        assert meta['n_user_turns'] == 0
+
+    def test_frontmatter_names_a_generation_that_excludes_reingested_content(self):
+        """Generation 3 is the first whose signal_counts exclude re-ingested
+        content, so a census can tell a pre-fix coder-JSON self-correction
+        trace (generation 2) from a live regression -- the discriminator
+        plans/confusion-reduction-prd.md §7.2.2 exists for. A floor, not a
+        freeze: a later legitimate bump must never have to edit a test named
+        for this decision (see §7.2.2's task-4751 note that no test freezes
+        the constant)."""
+        digest = mod.render_digest(_trickle_coder_session_records(), agent_class='interactive')
+
+        frontmatter_yaml, _ = _split_frontmatter(digest)
+
+        assert yaml.safe_load(frontmatter_yaml)['instrument_version'] >= 3
 
 
 # ---------------------------------------------------------------------------
@@ -2298,6 +2508,150 @@ class TestHarnessInjectedTurnFilter:
 
         assert mod.iter_user_turns(records) == []
         assert mod.classify_agent_class(records) == 'orchestrated-task'
+
+
+# ---------------------------------------------------------------------------
+# is_coder_judgment_payload -- the re-ingestion content classifier's
+# machine-answer half (task 5685). A prior trickle-coder answer re-enters a
+# transcript as ONE carrier holding the coder's whole {"matches",
+# "candidates"} object (scripts/legibility/coder.py::build_prompt), and its
+# notes quote the digest being coded, so every signal literal they carry
+# used to fire as this session's own. The classifier PARSES the whole
+# carrier, bare or inside one outer ```json fence; it never substring-matches
+# or brace-slices, so prose that merely quotes the schema stays dialogue.
+# ---------------------------------------------------------------------------
+
+def _coder_judgment(note="that's wrong: the watcher re-armed on a stale lease"):
+    """A trickle-coder answer as it lands in a transcript: the whole
+    judgment on ONE line, shaped after session b203a05c record 22. *note*
+    rides inside a match, where a real coder quotes the digest it codes."""
+    return json.dumps({
+        'matches': [{
+            'entry_id': 'watcher-loop-harness-mismatch',
+            'origin_phase': 'unknown',
+            'manifested_phase': 'recon',
+            'invariant_violated': None,
+            'note': note,
+        }],
+        'candidates': [{
+            'title': 'Recon reaper closes a filed task with its escalation',
+            'cause': 'closure keys off escalation linkage, not task merit',
+            'area': 'recon',
+            'origin_phase': 'unknown',
+            'manifested_phase': 'recon',
+            'evidence_quote': 'Re-filing without an escalation_id.',
+        }],
+    })
+
+
+def _json_fenced(payload):
+    """*payload* inside one outer ```json fence, trailing newline included."""
+    return f'```json\n{payload}\n```\n'
+
+
+class TestCoderJudgmentPayloadClassifier:
+    @pytest.mark.parametrize(
+        'text',
+        [
+            _coder_judgment(),
+            '{"matches": [], "candidates": []}',
+            _json_fenced(_coder_judgment()),
+            f'\n\n  {_coder_judgment()}  \n\n',
+            json.dumps({'matches': [], 'candidates': [], 'rationale': 'nothing fits'}),
+        ],
+        ids=['bare', 'empty_judgment', 'json_fenced', 'surrounding_whitespace', 'extra_key'],
+    )
+    def test_whole_carrier_judgment_is_recognised(self, text):
+        assert mod.is_coder_judgment_payload(text) is True
+
+    def test_the_reply_the_coder_prompt_prescribes_is_recognised_lockstep(self):
+        """LOCKSTEP with scripts/legibility/coder.py::build_prompt, the one
+        copy of the response schema CODER_JUDGMENT_KEYS restates. The reply
+        is read out of the prompt, never hand-built: a hand-built reply stays
+        green when that schema is renamed, and a rename is the drift this
+        pins."""
+        prompt = coder_mod.build_prompt(digest_text='', codebook_index='')
+        [prescribed_reply] = [line for line in prompt.splitlines() if line.startswith('{')]
+
+        assert mod.is_coder_judgment_payload(prescribed_reply) is True
+
+    def test_prose_quoting_the_schema_inline_is_not_a_payload(self):
+        # A genuine self-correction that merely MENTIONS the schema is this
+        # session's own dialogue and must never be suppressed.
+        text = (
+            'The coder answers with {"matches": [], "candidates": []} '
+            "— that's wrong, it should be a single object per session."
+        )
+
+        assert mod.is_coder_judgment_payload(text) is False
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            '{"matches": []}',
+            '{"candidates": []}',
+            '[{"matches": [], "candidates": []}]',
+            '{"results": [{"id": "ccf73ca4", "content": "Task 1470 wired /audit."}]}',
+            'not json at all',
+            '',
+        ],
+        ids=[
+            'matches_only', 'candidates_only', 'top_level_array',
+            'unrelated_object', 'non_json', 'empty',
+        ],
+    )
+    def test_anything_but_a_judgment_object_is_not_a_payload(self, text):
+        assert mod.is_coder_judgment_payload(text) is False
+
+    def test_pathologically_nested_object_answers_false_without_raising(self):
+        # json.loads raises RecursionError, which is not a ValueError, on
+        # this input under CPython 3.13. The predicate runs on every carrier
+        # of arbitrary transcripts, tool_results included, so it must
+        # answer rather than abort the whole digest.
+        text = '{"a":' * 200_000 + '1' + '}' * 200_000
+
+        assert mod.is_coder_judgment_payload(text) is False
+
+
+# ---------------------------------------------------------------------------
+# is_reingested_content -- the ONE predicate every signal bucket consults
+# (task 5685). It answers "is this carrier machine content re-ingested as
+# session material rather than this session's own dialogue?", and its two
+# known members are a prior coder judgment and a harness-injected prompt or
+# briefing.
+# ---------------------------------------------------------------------------
+
+class TestReingestedContentClassifier:
+    @pytest.mark.parametrize(
+        'text', [_coder_judgment(), _json_fenced(_coder_judgment())],
+        ids=['bare', 'json_fenced'],
+    )
+    def test_a_coder_judgment_is_reingested(self, text):
+        assert mod.is_reingested_content(text) is True
+
+    @pytest.mark.parametrize(
+        'text', [_briefing_text(), _CENSUS_MEMORY_CONTEXT_TURN, _TRICKLE_CODER_PREAMBLE],
+        ids=['briefing', 'census_memory_context', 'trickle_coder_prompt'],
+    )
+    def test_a_harness_prompt_or_briefing_is_reingested(self, text):
+        assert mod.is_reingested_content(text) is True
+
+    @pytest.mark.parametrize(
+        'resume_prompt', [CAP_HIT_RESUME_PROMPT, CRASH_RECOVERY_RESUME_PROMPT],
+        ids=['usage_limit', 'crash_recovery'],
+    )
+    def test_resume_prompt_is_reingested_lockstep(self, resume_prompt):
+        # LOCKSTEP, as in test_resume_prompt_is_excluded_lockstep: asserted
+        # against each canonical constant, never a restated literal.
+        assert mod.is_reingested_content(resume_prompt) is True
+
+    @pytest.mark.parametrize(
+        'text',
+        ['please fix the bug in the merge worker', "Actually, that's wrong — use the other branch", ''],
+        ids=['ordinary_turn', 'genuine_self_correction', 'empty'],
+    )
+    def test_dialogue_is_not_reingested(self, text):
+        assert mod.is_reingested_content(text) is False
 
 
 # ---------------------------------------------------------------------------

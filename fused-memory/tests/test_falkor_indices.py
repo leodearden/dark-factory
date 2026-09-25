@@ -61,6 +61,7 @@ from fused_memory.backends.falkor_indices import (
     plan_index_statements,
     range_create_statement,
     resolve_header_positions,
+    unsettled_index_statuses,
     vector_drop_statement,
     vector_index_properties,
 )
@@ -864,6 +865,110 @@ class TestVectorIndexProperties:
         assert 'group_id' in str(excinfo.value)
 
 
+class TestUnsettledIndexStatuses:
+    """The pure settle PREDICATE: which records are not yet OPERATIONAL.
+
+    Consumed by the barrier ``GraphitiBackend.drop_vector_indices`` puts in front
+    of its catalog READ (task 4777); the rebuild window it detects is described
+    in that method's docstring, and why readiness is an exact match on the READY
+    side beside ``falkor_indices.INDEX_STATUS_OPERATIONAL``.
+    """
+
+    def test_all_operational_is_settled(self):
+        records = [
+            {
+                'label': 'Entity',
+                'entity_type': 'NODE',
+                'field': ['name'],
+                'type': {'name': ['RANGE']},
+                'status': 'OPERATIONAL',
+            },
+            {
+                'label': 'RELATES_TO',
+                'entity_type': 'RELATIONSHIP',
+                'field': ['uuid'],
+                'type': {'uuid': ['RANGE']},
+                'status': 'OPERATIONAL',
+            },
+        ]
+        assert unsettled_index_statuses(records) == []
+
+    def test_the_measured_post_drop_window_reports_only_the_unsettled_row(self):
+        """THE window shape, verbatim: a stale OPERATIONAL row beside its replacement.
+
+        The stale row still advertises ``name_embedding: ['VECTOR']`` — an index
+        that is ALREADY GONE — yet it is not the unsettled one; its replacement
+        is.  Acting on the stale row is the reported defect.
+        """
+        stale = {
+            'label': 'Entity',
+            'entity_type': 'NODE',
+            'field': ['name_embedding', 'name'],
+            'type': {'name_embedding': ['VECTOR'], 'name': ['RANGE']},
+            'status': 'OPERATIONAL',
+        }
+        replacement = {
+            'label': 'Entity',
+            'entity_type': 'NODE',
+            'field': ['name'],
+            'type': {'name': ['RANGE']},
+            'status': '[Indexing] 12/50: UNDER CONSTRUCTION',
+        }
+        assert unsettled_index_statuses([stale, replacement]) == [
+            ('Entity', '[Indexing] 12/50: UNDER CONSTRUCTION'),
+        ]
+
+    def test_any_status_but_the_ready_sentinel_is_unsettled_with_its_value(self):
+        """Readiness is EXACT equality with ``INDEX_STATUS_OPERATIONAL``.
+
+        So an unrecognised string, ``None`` and a non-string all block, each
+        reported exactly as found.  A not-ready-side test such as
+        ``'UNDER CONSTRUCTION' in status`` would read the first as READY — fail
+        open on a status FalkorDB spells differently — and crash on the others.
+        """
+        records = [
+            {'label': 'Entity', 'status': '[Populating] 3/50'},
+            {'label': 'RELATES_TO', 'status': None},
+            {'label': 'Episodic', 'status': 0},
+        ]
+        assert unsettled_index_statuses(records) == [
+            ('Entity', '[Populating] 3/50'),
+            ('RELATES_TO', None),
+            ('Episodic', 0),
+        ]
+
+    def test_empty_catalog_is_settled(self):
+        """DELIBERATE divergence from ``_fm_helpers.await_index_operational``,
+        which treats an empty ``result_set`` as NOT ready.
+
+        An index-free graph is a legitimate production steady state, so a drop on
+        one must return at once rather than block its budget and then raise;
+        ``unsettled_index_statuses``' docstring gives the full argument.
+        """
+        assert unsettled_index_statuses([]) == []
+
+    def test_record_with_no_status_key_raises_naming_the_label(self):
+        """Fail closed, not "count it as unsettled".
+
+        A missing key means ``list_indices`` stopped resolving the ``status``
+        column — a FalkorDB shape change, or a caller that dropped it from the
+        ``wanted`` map.  Reporting that as a 30s settle timeout would misdiagnose
+        it; the operator action for "the column is gone" and for "the rebuild is
+        slow" are not the same.
+        """
+        record = {
+            'label': 'Entity',
+            'entity_type': 'NODE',
+            'field': ['name'],
+            'type': {'name': ['RANGE']},
+        }
+        with pytest.raises(IndexRecordShapeError) as excinfo:
+            unsettled_index_statuses([record])
+        message = str(excinfo.value)
+        assert 'Entity' in message
+        assert 'status' in message
+
+
 # --- The MEASURED live CALL db.indexes() shape -----------------------------
 #
 # Measured read-only 2026-08-06 via
@@ -1043,6 +1148,10 @@ class TestListIndicesColumnBinding:
         assert records[0]['field'] == ['uuid']
         assert records[0]['type'] == {'uuid': ['RANGE']}
         assert records[0]['entity_type'] == 'RELATIONSHIP'
+        # `status` sits at position 0 in this reordered header and at 7 in the
+        # live one -- the assertion a positional read cannot pass, and the whole
+        # reason status is resolved through resolve_header_positions (task 4777).
+        assert records[0]['status'] == 'OPERATIONAL'
 
     @pytest.mark.asyncio
     async def test_missing_required_column_raises_naming_it_and_the_header(
@@ -1063,6 +1172,45 @@ class TestListIndicesColumnBinding:
 
         message = str(excinfo.value)
         assert 'entitytype' in message
+        assert 'label' in message  # the header it actually saw is named
+
+    @pytest.mark.asyncio
+    async def test_status_is_exposed_as_a_record_key(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """The readiness column ``drop_vector_indices``' settle barrier reads (task 4777)."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([LIVE_ROW_RELATES_TO], header=LIVE_HEADER)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        records = await backend.list_indices(group_id='test')
+
+        assert records[0]['status'] == 'OPERATIONAL'
+
+    @pytest.mark.asyncio
+    async def test_missing_status_column_raises_naming_it(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """``status`` is now a REQUIRED column, and fails closed like the others.
+
+        A FalkorDB shape change that drops it must fail loudly in
+        ``resolve_header_positions`` — for every ``list_indices`` consumer, not
+        only the drop path — rather than silently disarm the settle barrier.
+        Mirrors ``test_missing_required_column_raises_naming_it_and_the_header``.
+        """
+        header_without_status = [c for c in LIVE_HEADER if c[1] != 'status']
+        row_without_status = [
+            v for i, v in enumerate(LIVE_ROW_RELATES_TO) if LIVE_HEADER[i][1] != 'status'
+        ]
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([row_without_status], header=header_without_status)
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        with pytest.raises(IndexHeaderShapeError) as excinfo:
+            await backend.list_indices(group_id='test')
+
+        message = str(excinfo.value)
+        assert 'status' in message
         assert 'label' in message  # the header it actually saw is named
 
     @pytest.mark.asyncio

@@ -89,6 +89,26 @@ def test_shape_task_returns_none_on_non_numeric_id():
     assert _shape_task({'id': 'abc', 'title': 'bad id', 'status': 'pending'}) is None
 
 
+def test_shape_task_drops_details_but_keeps_description():
+    """Only the Task Detail pane renders ``details``, and it fetches its own.
+
+    ``description`` stays: ``redux_api.shape_escalations`` embeds this whole
+    dict as each escalation row's ``task``, and the Escalations drawer renders
+    ``task.description``.
+    """
+    raw = {
+        'id': '12',
+        'title': 'x',
+        'status': 'pending',
+        'description': 'the escalation drawer shows this',
+        'details': 'implementation notes ' * 500,
+    }
+    shaped = _shape_task(raw)
+    assert shaped is not None
+    assert 'details' not in shaped
+    assert shaped['description'] == 'the escalation drawer shows this'
+
+
 # ---------------------------------------------------------------------------
 # fetch_external_statuses (step-3 / step-4)
 # ---------------------------------------------------------------------------

@@ -45,7 +45,7 @@ _TARGET_MODULES = {
 def _dashboard_get_paths() -> list[str]:
     """Every LITERAL GET route under /api/v2/dashboard/, read off the live app.
 
-    Templated routes (``/api/v2/dashboard/task/{task_id}``) are excluded: this
+    Templated routes (``/api/v2/dashboard/task/{project}/T-{task_id}``) are excluded: this
     sweep requests each path verbatim, so a templated one would be fetched as
     the literal string ``.../{task_id}`` and answer 404/422 — a false failure
     about path construction, reported under a message about hung dependencies,
@@ -203,6 +203,40 @@ def test_every_dashboard_endpoint_survives_a_hung_fetch_tasks(client, hung_mcp):
     )
 
 
+def test_task_prose_route_survives_a_hung_fetch_task_prose(client, monkeypatch):
+    """The templated prose route, probed with REAL parameter values.
+
+    The sweep above cannot request ``/task/{project}/T-{task_id}`` verbatim, so
+    this binds the configured root's own label and a real id, hangs the route
+    module's ``fetch_task_prose`` binding, and requires a bounded answer.
+    """
+    import dashboard.api.task_prose as task_prose
+
+    reached: list[tuple[str, int]] = []
+
+    async def _hang(http_client, config, project_root, task_id):
+        reached.append((str(project_root), task_id))
+        await asyncio.Event().wait()  # nothing ever sets it
+
+    monkeypatch.setattr(task_prose, 'fetch_task_prose', _hang)
+    monkeypatch.setattr(task_prose, '_TASK_PROSE_BUDGET', _TINY_BUDGET)
+    root = client.app.state.config.project_root
+
+    resp = client.get(f'/api/v2/dashboard/task/{root.name}/T-1')
+
+    assert resp.status_code == 504, (
+        f'the prose route returned {resp.status_code} while fetch_task_prose '
+        'was hung — a hung dependency must degrade this endpoint, never wedge '
+        'or 500 it'
+    )
+    # NON-VACUITY: a 504 that never reached the seam proves nothing.
+    assert reached == [(str(root), 1)], (
+        f'the hang was reached as {reached}, not exactly once with the '
+        f'configured root {root} and task id 1 — the probe passed without '
+        'exercising the seam'
+    )
+
+
 def test_templated_dashboard_routes_are_not_silently_unswept():
     """A templated route must be noticed, not quietly dropped from the sweep.
 
@@ -210,15 +244,17 @@ def test_templated_dashboard_routes_are_not_silently_unswept():
     cannot request them verbatim. That filter is the right call — but a silent
     filter is how coverage rots, so this test fails the moment one appears and
     says what to do about it. Extend the expected set below ONLY together with
-    a probe that exercises the new route with real parameter values under the
-    same ``hung_mcp`` fixture.
+    a dedicated probe that exercises the new route with real parameter values
+    against a hung dependency, as
+    :func:`test_task_prose_route_survives_a_hung_fetch_task_prose` does.
     """
     templated = sorted(p for p in _all_dashboard_get_paths() if '{' in p)
 
-    assert templated == [], (
-        f'templated GET route(s) {templated} exist under /api/v2/dashboard/ '
-        'and are NOT covered by the hung-MCP sweep, which requests every path '
-        'verbatim and would fetch the literal brace string. Add a dedicated '
-        'probe that binds real parameter values (reusing the hung_mcp '
-        'fixture), then list the route here.'
+    assert templated == ['/api/v2/dashboard/task/{project}/T-{task_id}'], (
+        f'templated GET route(s) {templated} exist under /api/v2/dashboard/; '
+        'the only one with a dedicated hung-dependency probe is the task-prose '
+        'route (test_task_prose_route_survives_a_hung_fetch_task_prose). The '
+        'sweep requests every path verbatim and would fetch the literal brace '
+        'string, so a new templated route needs its own probe that binds real '
+        'parameter values, listed here together with it.'
     )

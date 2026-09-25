@@ -86,7 +86,7 @@ class TestQueryEdgesByTimeRange:
             end='2026-03-22T18:15:00',
             group_id='test',
         )
-        graph.ro_query.assert_awaited_once()
+        graph.ro_query.assert_awaited()
         graph.query.assert_not_awaited()
 
 

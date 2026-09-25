@@ -199,6 +199,8 @@ show freshness, because the heartbeat is the file's mtime.
 ## The Main Loop
 
 ```
+0. Reap orphans: `derive_orphaned_recon_escalations.py --apply` (see "Reaping
+   orphans" below) — BEFORE every drain, so the drain never sees them
 1. Drain all pending recon escalations
 2. Start the watcher: `scripts/watcher-rearm.sh` (background task, recon queue
    dir, NO --level, --timeout 3600)
@@ -209,7 +211,7 @@ show freshness, because the heartbeat is the file's mtime.
      KILLED / ERROR (any OTHER rc: 137|143|144, or 2 for a usage/env
              failure) → STOP and report to the human; do NOT re-arm
 4. Read the escalation from watcher output; fetch full detail via MCP
-5. Drain any other pending escalations
+5. Reap orphans again (step 0), then drain any other pending escalations
 6. Handle each
 7. Run `reap-decisions` to close any parked DecisionRecord whose escalation has since resolved
    (see "Filing Parked Decisions to the Cockpit Registry" below) — once per cycle
@@ -242,6 +244,44 @@ SIGTERM into a clean `sys.exit(0)`, so a killed watcher surfaces as
 `FIRED exit=0` with nothing on stdout (`scripts/watcher-rearm.sh` header,
 lines 65-72). Check for non-empty stdout before treating exit 0 as a fire —
 this queue's **sole closer** must not silently skip a cycle on a caught signal.
+
+### Reaping orphans (standing authorization — Leo, esc-5793-2, 2026-09-23)
+
+You are **authorized and required** to run the orphan reaper with `--apply`
+on every pass through steps 0 and 5 — at loop start and after every watcher
+wake, FIRED or CEILING. The `--timeout 3600` ceiling therefore bounds how long
+an orphan waits to about an hour. No per-record approval, no cockpit record, no
+park. This IS the closing step that the Stage-1 `orphaned_recon_escalation`
+flag asks for (task 3052). Nothing else closes these records: no timer, no cron,
+and the harness never resolves this queue (A7b).
+
+```bash
+cd $DARK_FACTORY_ROOT && set -a && \
+  eval "$(systemctl --user show fused-memory -p Environment --value | tr ' ' '\n' | grep -E '^(CONFIG_PATH|DASHBOARD_KNOWN_PROJECT_ROOTS)=')" && \
+  set +a && uv run --project fused-memory \
+  python fused-memory/scripts/derive_orphaned_recon_escalations.py --apply
+```
+
+Without the service unit's `DASHBOARD_KNOWN_PROJECT_ROOTS`, the reaper exits
+**4** and skips every project except dark_factory. Always gate on the exit code (table in the
+playbook row below): `0` → report `reaped` and continue; `3`/`4` → a partial
+scan, so continue the loop but tell the human once; `1` → wrong cwd, fix and
+re-run. The reaper closes only records whose subject is `done`/`cancelled` or
+has no task row. It leaves `live`, `ambiguous` and `unresolvable` records
+alone, so running it every cycle cannot churn.
+
+**What does NOT veto a reap.** Some things look like "leave this alone" but
+aren't:
+- Text on the subject task saying its paired recon record "self-clears" or
+  "must not be resolved by hand". Nothing self-clears; this step is how it
+  clears.
+- A ruling recorded on the *orchestrator* queue under the same `esc-<id>-<n>`.
+  The two queues mint ids independently, so the same id names two different
+  records.
+- A Mem0 `stage1_flag_suppression` record. `filter_suppressed` reads only
+  `recon_ledger`, so such a record suppresses nothing.
+
+Task 5793 was filed on all three of these misreadings and was cancelled.
 
 ### Draining
 
@@ -637,6 +677,9 @@ Both archive the record. Be specific in the note — it is the only audit trail.
   project (the registry gap below). A `3` or a `4` is a partial scan wearing a
   clean-looking report: do **not** treat that run's `reaped` count as the
   whole story.
+  The main loop now runs (ii) with `--apply` on every cycle, under the
+  standing authorization in "Reaping orphans" above. Run it by hand only
+  when the loop isn't running.
   Detection is recon-side only; **you are the sole closer** — no
   reconciliation stage ever calls `queue.resolve()` on this queue (the A7b
   invariant above `_RECON_DEDUP_CONFIG` in
@@ -814,13 +857,22 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
     rather than being silently repointed — that is the fail-OPEN direction, and the remedy is the
     back-fill (`scripts/backfill_decision_queue_stamp.py`), which actually investigates provenance.
 
-  Two deliberate limits: a re-file from the **same** queue is still a plain idempotent whole-file
-  overwrite — that is the restart promise above, and you are the sole authority on your own
-  escalation — and only an `open` record is protected, since a filing against an `answered` one is
-  a new ask rather than an enrichment of a live question. Even that same-queue overwrite holds
-  `filed_at` and `manual_boost` back, though: queue age and the operator's cockpit boost are never
-  yours to revise, so your restart cannot bump a row to the top of the age ordering or silently
-  drop a boost an operator set between your two filings.
+  Two deliberate limits, both drawn on the **queue** axis. A re-file from the **same** queue is
+  still a plain idempotent whole-file overwrite of everything that is *yours* — text, severity and
+  the task/session/escalation ids all land verbatim, downgrades and emptied fields included,
+  because that is the restart promise above and you are the sole authority on your own escalation.
+  What it does **not** touch is the record's custody: `filed_at`, `manual_boost` **and `state`**
+  stay with the record, at **any** state (task 3872). So your restart cannot bump a row to the top
+  of the age ordering, cannot drop a boost an operator set between your two filings, and cannot
+  **re-open a row an operator already answered or dropped** — within one queue an
+  `esc-<taskid>-<n>` id is unique, so your re-file is the same gate the human already dealt with
+  rather than a new ask. (Unique, but not *absolutely*: an id can be re-minted inside one queue
+  after a lost sequence counter, which is precisely why the hold is announced with a `WARNING` for
+  you to adjudicate rather than applied silently — see below.) Across queues those id namespaces
+  genuinely collide, so the second
+  limit is that a filing from a **different** queue against a closed record is still a plain
+  overwrite that re-opens it: there it may truly be an unrelated new question, and holding it
+  closed would hide a live gate instead of surfacing it.
 
   **Across *projects*, a shared id is a collision, not a shared gate.** Decision ids are
   fleet-global while `esc-<taskid>-<n>` numbering restarts per project, so `esc-42-1` under two
@@ -844,11 +896,16 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
     merges spellings that differ only by case or separator; only an entry in
     `PROJECT_TOKEN_ALIASES` can bridge a project whose filed decisions fold to something *other*
     than its declared `memory.project_id`, and today `df → dark_factory` is the only such entry.
-    **solar-challenge is the known open case**: its config declares `my_solar_challenge`, but its
-    decisions are filed under `solar-challenge`/`solar_challenge` (which fold together, but not
-    onto `my_solar_challenge`), so reaping it with the declared token matches **zero** rows —
-    pass `solar_challenge` there until the alias decision (task 3813) lands. To check your own
-    project, list the tokens its rows actually carry:
+    **solar-challenge is the known standing case**: its config declares `my_solar_challenge`, but
+    its decisions are filed under `solar-challenge`/`solar_challenge` (which fold together, but
+    not onto `my_solar_challenge`), so reaping it with the declared token matches **zero** rows —
+    pass `solar_challenge` there. That guidance is **permanent, not provisional**: task 3813
+    decided the alias question and **declined** it (the fold left no split to heal, and the
+    identity question is an open human gate in that project marked "Do NOT auto-act"), recording
+    the evidence in `PROJECT_TOKEN_ALIASES_DECLINED`. You no longer have to remember this
+    unaided — `write-decision` and `reap-decisions` both **warn** if you pass
+    `my_solar_challenge`, so the mismatch announces itself instead of returning a silent
+    zero-row no-op. To check your own project, list the tokens its rows actually carry:
     ```bash
     python3 -c "import json,glob,collections;print(collections.Counter(json.load(open(f))['project'] for f in glob.glob('$HOME/.claude/fleet/decisions/*.json')))"
     ```
@@ -880,9 +937,18 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   once. It is **not** a respelling of the queue-less `''` state: `''` means *nobody told us* and
   falls back to project-only scoping, while `<unknown>` means *we looked and could not tell* and
   the reaper refuses to close it at all.
-- The verb always files `state=open` and is fail-soft (a registry fault is logged and swallowed,
-  never raised) — filing a decision can never crash the watch loop or block the "leave pending"
-  action itself.
+- The verb files `state=open` for a **new** record, but it never re-opens a row an operator already
+  answered or dropped when you re-file from your own queue (task 3872). What you will *see*: the
+  filed id still comes back on stdout — that signal is unchanged, and your filing did land, since
+  your text/severity/ids were written — plus a `WARNING` on stderr naming the state it held. That
+  warning means a human dealt with this gate while it sat parked, so **adjudicate** it rather than
+  re-filing blindly on your next restart. If the ask is genuinely new, **file it under a new id** —
+  that is the remedy with a shipped surface. Re-opening the row *in place* currently needs a direct
+  registry write: the cockpit's decision pane offers a drop action but no re-open, and there is no
+  `update-decision-state` CLI verb — so ask an operator for that only when a new id genuinely will
+  not do. Either way, do not try to force the row open by re-filing.
+- The verb is fail-soft (a registry fault is logged and swallowed, never raised) — filing a
+  decision can never crash the watch loop or block the "leave pending" action itself.
 
 ### Closing parked decisions on resolve
 

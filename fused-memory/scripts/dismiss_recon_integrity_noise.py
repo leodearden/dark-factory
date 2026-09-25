@@ -123,16 +123,27 @@ def run(
 
     if apply:
         dismissed = 0
+        vanished = 0
         for esc in targets:
             result = queue.resolve(esc.id, note, dismiss=True, resolved_by=resolved_by)
             if result is None:
                 logger.warning('Escalation %s vanished before resolve; skipping', esc.id)
+                vanished += 1
             else:
                 dismissed += 1
         report['dismissed'] = dismissed
+        report['vanished'] = vanished
         report['pending_after'] = len(queue.get_pending())
 
     return report
+
+
+def resolve_exit_code(report: dict) -> int:
+    """0 on a clean run, 1 when the report's ``vanished`` count is non-zero.
+
+    A missing key counts as 0; a dry-run report never carries it.
+    """
+    return 1 if report.get('vanished', 0) > 0 else 0
 
 
 def main() -> int:
@@ -163,7 +174,7 @@ def main() -> int:
         note=args.note,
     )
     print(json.dumps(report, indent=2, default=str))
-    return 0
+    return resolve_exit_code(report)
 
 
 if __name__ == '__main__':

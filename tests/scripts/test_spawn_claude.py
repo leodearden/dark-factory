@@ -20,7 +20,7 @@ import threading
 import time
 from datetime import UTC, datetime, timedelta
 
-import pytest  # pyright: ignore[reportMissingImports]
+import pytest
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 SPAWN_SCRIPT = REPO_ROOT / "skills" / "spawn" / "spawn-claude.sh"

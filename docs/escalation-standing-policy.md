@@ -2,20 +2,25 @@
 
 ## Status — what is and is not in force
 
-**Every candidate class in this document is SHADOW MODE ONLY. None is adopted.**
-The L2 session's actions are unchanged by anything below: it stamps what it
-*would* have ruled, then handles the record exactly as
-`skills/escalation-watcher/SKILL.md` already says. Nothing here grants any
-authority, and nothing in the task that wrote it changed
+**Every CANDIDATE class in this document is SHADOW MODE ONLY. None is adopted.**
+That covers the first-tranche list and the ratified skeleton it is judged by:
+for those, the L2 session's actions are unchanged — it stamps what it *would*
+have ruled, then handles the record exactly as
+`skills/escalation-watcher/SKILL.md` already says. No candidate class grants any
+authority, and nothing in the task that wrote them changed
 `escalation/src/escalation/authority.py`.
 
-This is *not* the same as saying no standing rule exists. One does, it is live
-today, and it is the next section.
+This is *not* the same as saying nothing here is in force. Two things are, they
+are live today, and they are the next two sections: the standing rule that lets
+the session close a narrow class of `design_concern` itself, and the
+`scope-not-delivered` closure policy, which constrains how one class of record
+may be closed by anyone. Neither is a candidate class and neither is shadowed.
 
 ## The one standing rule already in force
 
 `skills/escalation-watcher/SKILL.md` — "Standing rule: accept verified
-info-level design deviations (Leo, 2026-09-17)", task 5361 — lets the
+info-level design deviations (Leo, 2026-09-17)", landed by docs commit
+`d6f9534f9f` with no task — lets the
 interactive watcher itself `close_only` an info-level `design_concern` that
 ratifies an already-made, evidence-checked deviation, under six stated
 conditions.
@@ -27,6 +32,61 @@ there.
 What it is evidence *for*: the skeleton below generalises the shape that rule
 already demonstrates in production — a reversible action, the deciding evidence
 quoted, a narrow class, and the human retaining the audit.
+
+## The `scope-not-delivered` closure policy, also in force
+
+<!-- scope-not-delivered:begin the leading backticked slug of each bullet below
+     names a permitted closure form; held by
+     tests/scripts/test_shadow_ruling_doc_contract.py. Unlike the three lists
+     further down there is NO code-side vocabulary here: this class is a policy
+     statement, so nothing in escalation/src/escalation/shadow_ruling.py knows
+     it, and the hyphenated spelling is what keeps it unstampable. -->
+
+Ruled by Leo, 2026-09-21, resolving esc-4811-3. In force now, not shadow mode —
+and unlike the standing rule above it grants no autonomy at all. It constrains
+*how* such a record may be closed, by anyone; it gives no one authority to close
+one.
+
+An info-severity `design_concern` that records one item of a task's scope as
+**not deliverable by that task** may be closed only by one of the two forms
+below. Never by a bare accept, and never under the 2026-09-17 "accept verified
+info-level design deviations" standing rule —
+`skills/escalation-watcher/SKILL.md` already excludes esc-4811-3 from that rule
+under its conditions 4 and 6. Those six conditions are not restated here, for
+the reason the section above gives.
+
+- `owned-successor` — the resolution names an owned, **non-terminal** successor
+  task in the correct shape: an agent task when an agent can deliver the item,
+  or a `task_kind='deterministic'` pure gate with `always_escalates` (carrying
+  `metadata.human_curator_gate` when a curation is the deliverable) when only a
+  human can. Those field rules live in `docs/task-authoring.md` and are not
+  re-specified here.
+- `explicit-wont-fix` — the resolution records an explicit won't-fix ruling on
+  the task that carried the acceptance criterion, and says where that ruling
+  lives.
+
+Either way the resolution text names the successor id or the won't-fix
+location. A resolution naming neither has not closed the record.
+
+**Why.** The "record the refusal" arm of an either/or acceptance leaves no owned
+obligation behind. Task 3357 took that arm with no successor (2026-08-03); the
+gap recurred as task 4811 item 4 (2026-08-27), and again as esc-4811-1/-2/-3/-7
+(2026-09-16/17), where a finished, green task sat blocked four days on an info
+record.
+
+**Why here.** INV-12 `exceptions-owned-or-ratified` in
+`docs/legibility/design-invariants.md` is the nearest-looking home, but its own
+family boundary puts task-acceptance outcomes out of scope. This document is the
+home, and that register is deliberately not amended.
+
+**Worked example — esc-4811-3**, closed `close_only` on 2026-09-21. Item 4 of
+task 4811 (expand `write_triage_calibration.jsonl`) was ratified as not
+deliverable *by task 4811*, and closed under `owned-successor` naming task 5547,
+rewritten the same day from a live-sitting assumption into an agent extraction
+task. A bare accept would have left the obligation unowned — the failure this
+class exists to prevent.
+
+<!-- scope-not-delivered:end -->
 
 ## Provenance
 
@@ -155,9 +215,9 @@ measurement exists to judge. None of them may be ruled today.
 
 **How `design_concern_semantic_collision` is scoped against the live rule
 above.** It is the *semantic-collision* class, and a semantic collision is a
-choice about what happens **next**. The 5361 standing rule covers only
+choice about what happens **next**. The 2026-09-17 standing rule covers only
 after-the-fact ratification of a deviation an agent has **already made**. The
-two do not overlap. A record already closable under 5361 must therefore **not**
+two do not overlap. A record already closable under that rule must therefore **not**
 be shadow-stamped: the session is the adjudicator there, so a stamp would be
 measuring the session against itself. See "The integrity rule" below.
 
@@ -177,7 +237,7 @@ interactive connection is never narrowed by that module — its own docstring sa
 so, and that is the esc-2087-2 human-channel guarantee.
 
 So adopting a class for the **interactive** session needs no `authority.py`
-change. Task 5361 is the existence proof: a live rule closing `design_concern`
+change. The 2026-09-17 rule is the existence proof: a live rule closing `design_concern`
 from the interactive session, shipped with no `authority.py` edit at all.
 Extending any class to the **auto-watcher** arm is the case that would need one.
 

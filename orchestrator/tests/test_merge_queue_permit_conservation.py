@@ -31,6 +31,7 @@ import pytest
 from _merge_lane_fakes import FakeVerifier
 from _orch_helpers import MERGE_RESULT_TIMEOUT
 from test_merge_queue_concurrent_verify import (
+    _fake_verify_result,
     _gated_runner,
     _inject_two_host_allocator,
     _make_branch_with_file,
@@ -295,11 +296,7 @@ class TestPrefetchLookaheadAndAttachConservation:
             if call == 0:
                 gate_a_entered.set()
                 await gate_a_release.wait()
-            return MagicMock(
-                passed=True, summary='ok', test_output='ok',
-                lint_output='', type_output='', category='',
-                timed_out=False, verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True)
 
         gate_b_release = asyncio.Event()
         gate_b_entered = asyncio.Event()
@@ -374,11 +371,7 @@ class TestFallbackConservation:
         K = 2
 
         async def _passing_local(*args: Any, **kwargs: Any) -> MagicMock:
-            return MagicMock(
-                passed=True, summary='ok', test_output='ok',
-                lint_output='', type_output='', category='',
-                timed_out=False, verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True)
 
         gate_b_prerelease = asyncio.Event()
         gate_b_prerelease.set()
@@ -453,17 +446,11 @@ class TestCascadeRemergeConservation:
             if call == 0:
                 gate_a_entered.set()
                 await gate_a_release.wait()
-                return MagicMock(
-                    passed=False, summary='tests failed', test_output='FAIL',
-                    lint_output='', type_output='', category='',
-                    timed_out=False, verify_skipped=False,
+                return _fake_verify_result(
+                    passed=False, summary='tests failed', test_output='FAIL', category='',
                 )
             # B's re-verify after the cascade remerges it: passes.
-            return MagicMock(
-                passed=True, summary='ok', test_output='ok',
-                lint_output='', type_output='', category='',
-                timed_out=False, verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True)
 
         gate_b_release = asyncio.Event()
         gate_b_entered = asyncio.Event()
@@ -555,11 +542,7 @@ class TestShutdownRetainedPermitConservation:
             if call == 0:
                 gate_a_entered.set()
                 await gate_a_release.wait()
-            return MagicMock(
-                passed=True, summary='ok', test_output='ok',
-                lint_output='', type_output='', category='',
-                timed_out=False, verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True)
 
         gate_b_prerelease = asyncio.Event()
         gate_b_prerelease.set()
@@ -638,11 +621,7 @@ class TestLedgerLiveEmptiesAfterTransferRelease:
             if call == 0:
                 gate_a_entered.set()
                 await gate_a_release.wait()
-            return MagicMock(
-                passed=True, summary='ok', test_output='ok',
-                lint_output='', type_output='', category='',
-                timed_out=False, verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True)
 
         gate_b_release = asyncio.Event()
         gate_b_entered = asyncio.Event()
@@ -770,11 +749,7 @@ class TestEarlyContinueTerminalTransferClearsSpecBase:
             if call == 0:
                 gate_a_entered.set()
                 await gate_a_release.wait()
-            return MagicMock(
-                passed=True, summary='ok', test_output='ok',
-                lint_output='', type_output='', category='',
-                timed_out=False, verify_skipped=False,
-            )
+            return _fake_verify_result(passed=True)
 
         config = OrchestratorConfig(project_root=git_ops.project_root, git=git_config)
         wt_a = await _make_branch_with_file(

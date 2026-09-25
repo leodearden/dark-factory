@@ -9,6 +9,16 @@ from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
+from _xdist_crash_fixtures import (
+    XDIST_CRASH_ATTRIBUTED_FAILED_LINE,
+    XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT,
+    XDIST_FAILED_THEN_CRASHED_OUTPUT,
+    XDIST_IN_FLIGHT_NODEID,
+    XDIST_MAX_WORKERS_REACHED_OUTPUT,
+    XDIST_SESSION_ABORTED_OUTPUT,
+    XDIST_WORKER_CRASH_OUTPUT,
+    XDIST_WORKER_REPLACED_OUTPUT,
+)
 
 from orchestrator import verify, verify_plan
 from orchestrator.config import ModuleConfig, OrchestratorConfig
@@ -16,6 +26,7 @@ from orchestrator.verify import (
     _CATEGORY_PRIORITY,
     _PRUNE_THROTTLE_SECS,
     SIGNAL_KILL_SUMMARY_MARKER,
+    WORKER_DEATH_SUMMARY_MARKER,
     VerifyResult,
     _aggregate_results,
     _apply_cargo_scope,
@@ -2384,6 +2395,395 @@ class TestExtractCauseHint:
         assert hint == 'FAILED tests/test_x.py::test_first_subproject - AssertionError', (
             f'Unexpected hint: {hint!r}'
         )
+
+    # ---------------------------------------------------------------------
+    # task 5082 step-5: rung 0 — a session TRUNCATED by an xdist worker death.
+    #
+    # Two things go wrong today, and both are reporting defects rather than
+    # detection ones.  (1) The only FAILED line is often the one xdist
+    # FABRICATED for the test the dead worker had in flight
+    # (`dsession.py::handle_crashitem`, `outcome="failed"` / `when="???"`), so
+    # rung 1 names an innocent test that passes in isolation — esc-4292-3's
+    # measured shape.  (2) With no FAILED line at all the ladder falls through
+    # to rung 3 and quotes the tally, which after `triggershutdown()` counts
+    # only the tests that had already run — a PARTIAL count presented as a
+    # complete result.
+    # ---------------------------------------------------------------------
+
+    def test_worker_death_truncated_session_does_not_blame_crashed_test(self):
+        """The crashed worker's in-flight test is never named as the cause.
+
+        esc-4292-3: that FAILED line is xdist's own synthesis, and the test it
+        names passes in isolation.  Naming it sends the debugger after a
+        failure that never happened.
+        """
+        hint = _extract_cause_hint(XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT)
+        assert WORKER_DEATH_SUMMARY_MARKER in hint, f'Unexpected hint: {hint!r}'
+        assert 'test_config.py::TestFoo::test_bar' not in hint, (
+            f'Unexpected hint: {hint!r}'
+        )
+
+    def test_worker_death_hint_does_not_quote_the_partial_tally(self):
+        """Rung 0 pre-empts rung 3, so the PARTIAL tally is never quoted.
+
+        ``1 failed, 728 passed, 1 skipped`` counts only what had already run
+        before `triggershutdown()`; a clean re-run of the identical command
+        reported 19622 passed (esc-4176-6).  Quoting it as a cause reads as a
+        complete result.
+        """
+        hint = _extract_cause_hint(XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT)
+        assert '1 failed, 728 passed' not in hint, f'Unexpected hint: {hint!r}'
+
+    def test_worker_death_hint_still_names_a_surviving_real_failure(self):
+        """Truncation must never MASK a genuine independent failure.
+
+        Both facts are reported: the abort marker AND the FAILED line that is
+        not crash-attributed.  Suppressing every FAILED line on truncation
+        would recreate task 4066's incident (8 real failures hidden);
+        returning only the surviving line would let the ladder quote a partial
+        tally as complete.  Carrying both is the only option that adds
+        information without discarding any.
+        """
+        output = (
+            XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT
+            + 'FAILED orchestrator/tests/test_x.py::test_real - AssertionError\n'
+        )
+        hint = _extract_cause_hint(output)
+        assert WORKER_DEATH_SUMMARY_MARKER in hint, f'Unexpected hint: {hint!r}'
+        assert 'test_x.py::test_real' in hint, f'Unexpected hint: {hint!r}'
+
+    def test_non_truncated_crash_hint_is_unchanged(self):
+        """REGRESSION GUARD: rung 0 is INERT outside a confirmed truncation.
+
+        Same worker crash, but the session RECOVERED (no bailout marker), so
+        the tally is complete and trustworthy and today's rung-1 result must
+        come back byte-identical.
+        """
+        output = (
+            XDIST_WORKER_CRASH_OUTPUT
+            + XDIST_CRASH_ATTRIBUTED_FAILED_LINE
+            + '========== 1 failed, 2 passed in 5.00s ==========\n'
+        )
+        hint = _extract_cause_hint(output)
+        assert hint == f'FAILED {XDIST_IN_FLIGHT_NODEID}', f'Unexpected hint: {hint!r}'
+
+    @pytest.mark.parametrize(
+        'surviving_line',
+        [
+            'INTERNALERROR> Traceback (most recent call last):',
+            'ERROR orchestrator/tests/test_other.py::test_needs_fixture - Exception: setup failed',
+            "ERROR orchestrator/tests/test_broken.py - ImportError: cannot import name 'foo'",
+        ],
+        ids=['internalerror', 'error-nodeid', 'error-file'],
+    )
+    def test_worker_death_hint_names_a_surviving_error_surface(self, surviving_line):
+        """Truncation must not MASK an INTERNALERROR or ERROR line either.
+
+        xdist synthesizes only a FAILED report for the crashed test, so these
+        surfaces are never its artefact: with no surviving FAILED line, the
+        hint names them beside the abort marker instead of quoting only the
+        bailout — the INTERNALERROR rung 2 would have quoted stays visible.
+        """
+        hint = _extract_cause_hint(XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT + surviving_line + '\n')
+        assert WORKER_DEATH_SUMMARY_MARKER in hint, f'Unexpected hint: {hint!r}'
+        assert surviving_line in hint, f'Unexpected hint: {hint!r}'
+
+    def test_worker_death_hint_names_a_test_that_failed_before_its_worker_died(self):
+        """The crashed worker's in-flight test on TWO FAILED lines genuinely failed.
+
+        It failed in its call phase and then its worker died in teardown.
+        xdist synthesizes at most one report per node-id, so the other line is
+        a real verdict and the hint must name the test rather than hide it.
+        """
+        hint = _extract_cause_hint(XDIST_FAILED_THEN_CRASHED_OUTPUT)
+        assert WORKER_DEATH_SUMMARY_MARKER in hint, f'Unexpected hint: {hint!r}'
+        assert XDIST_IN_FLIGHT_NODEID in hint, f'Unexpected hint: {hint!r}'
+
+
+# ---------------------------------------------------------------------------
+# task 5082 step-7: `_summarize_checks` must not assert a COMPLETE verdict for
+# a session xdist truncated.
+#
+# This is the task-3173 CONTRACT — "the summary may never assert a property
+# the gate did not measure" — applied to a SECOND cause of no-verdict.  A leg
+# SIGKILLed before it could emit diagnostics stopped being reported as "lint
+# issues" and now contributes `_killed_leg_note`.  A worker-death-truncated
+# test leg is the identical defect shape: ~97% of the suite never ran
+# (esc-4176-6: 1 failed/728 passed truncated vs 19622 passed on a clean re-run
+# of the identical command), yet the flat literal 'tests failed' claims a
+# complete measured verdict, and `merge_queue` surfaces it verbatim.
+# ---------------------------------------------------------------------------
+
+class TestWorkerDeathLegSummary:
+    """A truncated test leg contributes a worker-death note, not 'tests failed'."""
+
+    @staticmethod
+    def _summarize(test_rc: int, test_out: str) -> str:
+        """The truncated test leg beside CLEAN lint and type legs."""
+        from orchestrator.verify import _summarize_checks
+
+        _, _, _, summary, _ = _summarize_checks(
+            test_rc, test_out, False, 'uv run pytest',
+            0, '', False, 'ruff check',
+            0, '', False, 'pyright',
+            test_duration=209.67,
+        )
+        return summary
+
+    def test_truncated_test_leg_does_not_claim_a_complete_verdict(self):
+        """The facet-2 core: 'tests failed' is a claim the gate cannot make."""
+        summary = self._summarize(1, XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT)
+        assert WORKER_DEATH_SUMMARY_MARKER in summary, f'Unexpected summary: {summary!r}'
+        assert 'tests failed' not in summary, f'Unexpected summary: {summary!r}'
+
+    def test_failures_envelope_is_preserved(self):
+        """Every existing consumer prefix- or substring-matches on this
+        envelope (task 3173's wording for the same requirement)."""
+        summary = self._summarize(1, XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT)
+        assert summary.startswith('Failures: '), f'Unexpected summary: {summary!r}'
+        assert summary != 'Failures: ', f'Unexpected summary: {summary!r}'
+
+    def test_note_is_one_aggregation_fragment(self):
+        """THE WIRE FORMAT, pinned at the producer.
+
+        `_summarize_checks` joins fragments with ', ' and `_aggregate_results`
+        recovers them with `.split(', ')`, keeping only marker-bearing ones.
+        A ', ' inside the note splits it in two and only the marker half
+        survives — the exact silent truncation the carry-through exists to
+        prevent, and the constraint `_killed_leg_note`'s docstring already
+        pins for the signal-kill note.
+        """
+        summary = self._summarize(1, XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT)
+        note_fragment = summary.removeprefix('Failures: ')
+        assert ', ' not in note_fragment, (
+            f'a comma+space in the note splits it across `.split(", ")` in '
+            f'_aggregate_results and only the {WORKER_DEATH_SUMMARY_MARKER!r} '
+            f'half survives; use "; " to separate clauses. Got: {note_fragment!r}'
+        )
+        # Exactly the parse `_aggregate_results` performs: one fragment in,
+        # one fragment out.
+        assert note_fragment.split(', ') == [note_fragment]
+
+    def test_external_kill_still_wins_over_worker_death(self):
+        """ORDERING, pinned: `is_external_kill_rc` is checked FIRST.
+
+        An external kill is the STRONGER no-verdict claim — the process
+        produced no diagnostics at all — so task 3173's wording must not
+        regress just because the (necessarily truncated) output it did capture
+        happens to carry a bailout marker.
+        """
+        summary = self._summarize(-9, XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT)
+        assert SIGNAL_KILL_SUMMARY_MARKER in summary, f'Unexpected summary: {summary!r}'
+        assert 'killed by signal 9' in summary, f'Unexpected summary: {summary!r}'
+        assert WORKER_DEATH_SUMMARY_MARKER not in summary, (
+            f'Unexpected summary: {summary!r}'
+        )
+
+    def test_untruncated_failing_test_leg_is_byte_identical(self):
+        """REGRESSION GUARD: with no bailout marker anywhere, the summary is
+        exactly today's."""
+        summary = self._summarize(1, 'FAILED orchestrator/tests/test_x.py::y\n')
+        assert summary == 'Failures: tests failed', f'Unexpected summary: {summary!r}'
+
+    @pytest.mark.parametrize(
+        'output',
+        [XDIST_SESSION_ABORTED_OUTPUT, XDIST_MAX_WORKERS_REACHED_OUTPUT],
+        ids=['restart-disabled', 'max-crashed-workers-reached'],
+    )
+    def test_either_bailout_spelling_labels_the_leg(self, output):
+        """Both literals xdist prints before `triggershutdown()` mean the rest
+        of the suite was abandoned: a cap of 0, and a non-zero cap exceeded."""
+        summary = self._summarize(1, output)
+        assert WORKER_DEATH_SUMMARY_MARKER in summary, f'Unexpected summary: {summary!r}'
+        assert 'tests failed' not in summary, f'Unexpected summary: {summary!r}'
+
+    def test_a_replaced_worker_run_keeps_its_verdict(self):
+        """THE LOAD-BEARING DISCRIMINATION: xdist replaced the crashed worker
+        and the session ran to COMPLETION, so its verdict is complete.
+
+        The fixture carries the same crash notice as the truncated specimen
+        and no bailout line, so this verdict can only come from keying on the
+        bailout literal rather than on the crash signature — which would
+        relabel every ``--max-worker-restart > 0`` target's complete run.
+        """
+        assert 'crashed while running' in XDIST_WORKER_REPLACED_OUTPUT
+        assert 'xdist:' not in XDIST_WORKER_REPLACED_OUTPUT
+        summary = self._summarize(1, XDIST_WORKER_REPLACED_OUTPUT)
+        assert summary == 'Failures: tests failed', f'Unexpected summary: {summary!r}'
+
+    @pytest.mark.parametrize(
+        'surviving_line',
+        [
+            'FAILED orchestrator/tests/test_x.py::test_real - AssertionError',
+            'INTERNALERROR> Traceback (most recent call last):',
+            'ERROR orchestrator/tests/test_other.py::test_needs_fixture - Exception: setup failed',
+        ],
+        ids=['failed', 'internalerror', 'error'],
+    )
+    def test_a_surviving_failure_is_reported_beside_the_note(self, surviving_line):
+        """BOTH facts, never just one: a truncated leg that still measured a
+        failure the dead worker did not fabricate reports 'tests failed' AND
+        the note — each its own aggregation fragment."""
+        summary = self._summarize(1, XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT + surviving_line + '\n')
+        fragments = summary.removeprefix('Failures: ').split(', ')
+        assert len(fragments) == 2, f'Unexpected summary: {summary!r}'
+        assert fragments[0] == 'tests failed', f'Unexpected summary: {summary!r}'
+        assert WORKER_DEATH_SUMMARY_MARKER in fragments[1], f'Unexpected summary: {summary!r}'
+
+
+def _worker_death_child(*, module: str = 'orchestrator') -> VerifyResult:
+    """A child result whose TEST leg was truncated by an xdist worker death.
+
+    Its summary is produced by `_summarize_checks` itself rather than
+    hand-written, so this test cannot drift from the producer: an edit to
+    `_worker_death_leg_note`'s wording is exercised here automatically.
+    """
+    from orchestrator.verify import _summarize_checks
+
+    _, category, cause_hint, summary, failing_legs = _summarize_checks(
+        1, XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT, False, 'uv run pytest',
+        0, '', False, 'ruff check',
+        0, '', False, 'pyright',
+        test_duration=209.67,
+    )
+    return VerifyResult(
+        passed=False,
+        test_output=XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT,
+        lint_output='',
+        type_output='',
+        summary=summary,
+        category=category,
+        cause_hint=f'{module}: {cause_hint}',
+        failing_leg_categories=failing_legs,
+    )
+
+
+class TestAggregateResultsKeepsWorkerDeathNote:
+    """A worker-death note must survive multi-subproject aggregation verbatim.
+
+    A DIRECT regression guard against the defect task 3173 recorded in
+    `_aggregate_results`: that loop substring-scans child summaries for
+    exactly three hardcoded literals ('tests failed' / 'lint issues' / 'type
+    errors'), so a note matching none of them made a multi-subproject verify
+    degrade to a bare 'Failures: ' with no parts at all — "erasing the one
+    fact that says the run produced no verdict". A second no-verdict note
+    reproduces that bug one edit later unless the carry-through is extended.
+    """
+
+    def test_note_survives_aggregation_beside_a_real_test_failure(self):
+        real_failure = VerifyResult(
+            passed=False, test_output='FAILED tests/x.py::y\n', lint_output='',
+            type_output='', summary='Failures: tests failed',
+            category='test_failure',
+        )
+        agg = _aggregate_results([real_failure, _worker_death_child(module='fused-memory')])
+        assert not agg.passed
+        assert WORKER_DEATH_SUMMARY_MARKER in agg.summary, (
+            f'Unexpected summary: {agg.summary!r}'
+        )
+        assert 'remaining tests never ran' in agg.summary, (
+            f'Unexpected summary: {agg.summary!r}'
+        )
+        # The sibling's genuine verdict is still reported — never masked.
+        assert 'tests failed' in agg.summary, f'Unexpected summary: {agg.summary!r}'
+        # The bug's signature: everything after the envelope dropped away.
+        assert agg.summary != 'Failures: '
+        assert agg.summary.strip() != 'Failures:'
+
+    def test_note_survives_aggregation_with_a_passing_sibling(self):
+        passing = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='',
+            summary='All checks passed', category='passed',
+        )
+        agg = _aggregate_results([passing, _worker_death_child()])
+        assert not agg.passed
+        assert WORKER_DEATH_SUMMARY_MARKER in agg.summary, (
+            f'Unexpected summary: {agg.summary!r}'
+        )
+        assert agg.summary != 'Failures: '
+
+    def test_duplicate_worker_death_notes_are_not_repeated(self):
+        """Two subprojects truncated identically must not stutter the same
+        sentence twice — the de-duplication the signal-kill carry-through
+        already guarantees."""
+        agg = _aggregate_results([
+            _worker_death_child(),
+            _worker_death_child(module='dashboard'),
+        ])
+        assert agg.summary.count(WORKER_DEATH_SUMMARY_MARKER) == 1, (
+            f'Unexpected summary: {agg.summary!r}'
+        )
+
+
+class TestFailureReportNamesTheAbortedSession:
+    """`VerifyResult.failure_report()` must LEAD with the truncation caveat.
+
+    The same shape as the existing `## Verify Timed Out` section: tell the
+    debugger up front that the failure may not be real code, before it reads
+    a cause or a tally.  Without it the report hands over ``1 failed, 728
+    passed, 1 skipped`` with no indication that ~97% of the suite never ran
+    (esc-4176-6), and a ``FAILED`` line that xdist synthesized for the
+    crashed worker's in-flight test with no indication that it is not a
+    verdict (esc-4292-3).
+    """
+
+    HEADING = '## Session Aborted After Worker Death'
+
+    @staticmethod
+    def _result(test_output: str) -> VerifyResult:
+        return VerifyResult(
+            passed=False,
+            test_output=test_output,
+            lint_output='',
+            type_output='',
+            summary='Failures: tests failed',
+            category='test_failure',
+            cause_hint='session aborted after worker death; worker gw3 crashed',
+        )
+
+    def test_report_carries_the_section(self):
+        report = self._result(XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT).failure_report()
+        assert self.HEADING in report, f'Unexpected report: {report!r}'
+
+    def test_section_leads_the_report_ahead_of_the_failure_cause(self):
+        """Placement matches the `## Verify Timed Out` precedent: the caveat
+        comes BEFORE the cause, so it cannot be read as an afterthought."""
+        report = self._result(XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT).failure_report()
+        assert '## Failure Cause' in report, f'Unexpected report: {report!r}'
+        assert report.index(self.HEADING) < report.index('## Failure Cause'), (
+            f'Unexpected report: {report!r}'
+        )
+
+    def test_section_says_the_tally_is_partial(self):
+        """A reader must not mistake ``1 failed, 728 passed`` for complete."""
+        report = self._result(XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT).failure_report()
+        section = report.split(self.HEADING, 1)[1].split('\n## ', 1)[0].lower()
+        assert 'partial' in section, f'Unexpected section: {section!r}'
+        assert 'never ran' in section, f'Unexpected section: {section!r}'
+
+    def test_section_warns_the_failed_line_may_be_a_crash_artefact(self):
+        """esc-4292-3: the FAILED line naming the crashed worker's in-flight
+        test is xdist's own synthesis, not a verdict."""
+        report = self._result(XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT).failure_report()
+        section = report.split(self.HEADING, 1)[1].split('\n## ', 1)[0].lower()
+        assert 'crash' in section, f'Unexpected section: {section!r}'
+
+    def test_a_recovered_worker_crash_gets_no_section(self):
+        """NEGATIVE: a crash signature with NO bailout marker completed
+        normally, so the section must stay inert."""
+        report = self._result(XDIST_WORKER_REPLACED_OUTPUT).failure_report()
+        assert self.HEADING not in report, f'Unexpected report: {report!r}'
+
+    def test_an_ordinary_failure_report_is_byte_identical(self):
+        """REGRESSION GUARD: no crash signature at all -> today's report,
+        unchanged."""
+        ordinary = self._result(
+            'FAILED orchestrator/tests/test_x.py::test_real - AssertionError\n'
+            '========== 1 failed, 2 passed in 5.00s ==========\n'
+        )
+        report = ordinary.failure_report()
+        assert self.HEADING not in report, f'Unexpected report: {report!r}'
+        assert report.startswith('## Failure Cause'), f'Unexpected report: {report!r}'
 
 
 class TestVerifyResultCauseHint:

@@ -1,5 +1,8 @@
 """System prompt for Stage 3: Cross-System Integrity Check."""
 
+from fused_memory.reconciliation.graphiti_degradation_probe import (
+    render_graphiti_degradation_probe_section,
+)
 from fused_memory.reconciliation.policies import (
     CONTAMINATION_CEILING_RETIRED_PROJECTS,
     SNAPSHOT_WRITE_BLOCKED_PROJECTS,
@@ -87,6 +90,8 @@ divergence between stores, or knowledge gaps.
 - Classify severity: minor (cosmetic mismatch), moderate (wrong information), \
 serious (fundamentally contradictory state).
 - {_STAGE3_PROJECT_ID_GUIDELINE}
+
+{render_graphiti_degradation_probe_section(runs_probes=False)}
 
 ## Snapshot Discipline Exception (task-1840)
 

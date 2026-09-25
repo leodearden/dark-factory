@@ -1005,7 +1005,13 @@ class SessionResumeConfig(BaseModel):
             'nothing chained at ANY threshold. 5 sits two above the measured '
             "null's longest run of 3 inside the shipped 24h window, and "
             'reset-on-success rather than the clock is what suppresses false '
-            'alarms.'
+            'alarms. '
+            'ALSO EXCLUDED: the recovered-config-dir ambiguity L1 '
+            '(session_config_dir_ambiguous) does NOT feed this streak — it is '
+            'deduped one-open-at-a-time rather than thresholded, so this knob '
+            'has no effect on it and an ambiguity L1 alone is not evidence of '
+            'a resume storm; see event_store.py::EventType.'
+            'session_config_dir_ambiguous.'
         ),
     )
     storm_window_secs: int = Field(
@@ -3558,6 +3564,41 @@ class OrchestratorConfig(BaseSettings):
     # load-bearing lane.  Flipped 'scoped' → 'full' by the σ capstone and
     # activated by the τ deterministic-deploy fleet restart.
     merge_verify_breadth: Literal['scoped', 'full'] = Field(default='scoped')
+    # Soundness narrowing for the CAS-loop disjoint-delta fast path (the
+    # 2026-09-22 whole-tree-drift incident).  ``merge_gates._reverify_rebased_tree``
+    # skips the post-rebase re-verify when the branch's touched files and the
+    # intervening main delta are DISJOINT.  That inference needs two premises,
+    # and the overlap probe checks neither:
+    #
+    #   P1 (compositionality) — the gate's verdict decomposes over disjoint
+    #       file sets, i.e. every check it runs is diff-scoped.  A WHOLE-TREE
+    #       check (one whose whole premise is that an unrelated file can fail
+    #       you) violates P1 by construction.
+    #   P2 (the drift is itself green) — main at ``rebased_onto`` passes the
+    #       gate on its own.  Even a perfectly diff-scoped gate returns red on
+    #       a merge whose BASE is already red.
+    #
+    # When True (default) the fast path additionally requires P2 to be
+    # positively observed: ``rebased_onto`` must be a SHA this orchestrator's
+    # own merge queue landed, which is exactly the set of main tips a green
+    # gate run has been observed on.  Drift from ANY other writer — an
+    # unattended nightly job, a direct human commit, a push — has unknown
+    # health, so the rebase re-verifies.  Set False to restore the pre-fix
+    # behaviour (disjointness alone clears the gate) if the extra re-verifies
+    # ever have to be traded away under load; the P1 arm keyed on
+    # ``merge_verify_breadth == 'full'`` is NOT covered by this switch,
+    # because a project that has declared a whole-tree gate has declared the
+    # skip unsound outright.
+    #
+    # GREEN TIER (see RELOADABLE_FIELDS below, and OPERATIONS.md
+    # section "Config reload vs restart").  Unlike its restart-only
+    # ``merge_verify_breadth`` neighbour this knob cannot split an in-flight
+    # merge's BREADTH — it only ever decides whether ONE more verify is run
+    # before an advance, is read fresh off ``req.config`` at each gate
+    # evaluation, and is a safety kill switch: a switch you can only pull by
+    # restarting the fleet is not a kill switch (the argument already written
+    # for ``config_key_census.*`` and ``merge_deep.chain_cap``).
+    merge_disjoint_skip_requires_verified_drift: bool = Field(default=True)
     # Fix (b), task 2822 — per-land cross-check of a REMOTE merge-verify green.
     # When True (default), after a remote two-host verify returns a real-suite
     # PASS that would DECIDE a land, the merge worker re-runs the LOCAL
@@ -3905,6 +3946,32 @@ class OrchestratorConfig(BaseSettings):
             'is deferred to let a pre-enqueue MERGE-phase workflow reach the '
             'durable merge journal; bounds the force-fire hold to '
             'force_fire_after_secs + this. 0 disables. 10-min default.'
+        ),
+    )
+    # Max age of the in-flight fleet-redeploy lease (task 4755) before the
+    # orchestrator's own coordinator stops believing it. While
+    # scripts/restart-all-orchestrators.sh is mid-sweep it holds that lease and
+    # the coordinator stands down; the bound is what keeps a lease stranded by
+    # a SIGKILLed sweep (whose EXIT trap cannot run, by construction) from
+    # wedging the fleet. DERIVED, not picked: the worst LEGITIMATE sweep is one
+    # permanently-busy unit burning the whole 4500s drain busy-grace, plus ~6
+    # stale/absent units at 120s each, plus 7 x (verify 30 + grace 120) =
+    # 6270s ~= 1.74h, so 7200 clears it with headroom while staying far below
+    # the 8h orchestrator_restart_min_interval_secs — a leaked lease therefore
+    # delays at most ONE redeploy window. Deliberately NOT in RELOADABLE_FIELDS:
+    # red-tier / restart-only, matching its siblings
+    # orchestrator_restart_merge_phase_grace_secs /
+    # orchestrator_restart_force_fire_after_secs /
+    # orchestrator_restart_min_interval_secs (captured at coordinator
+    # construction).
+    orchestrator_restart_lease_max_age_secs: float = Field(
+        default=7200.0,
+        description=(
+            'Max age of the in-flight fleet-redeploy lease before the '
+            'orchestrator coordinator stops honouring it and redeploys anyway. '
+            'Derived from the worst legitimate --drain sweep (~6270s) and kept '
+            'far below the 8h min-interval, so a lease stranded by a SIGKILLed '
+            'sweep delays at most one window. 2h default.'
         ),
     )
 
@@ -5763,6 +5830,13 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # siblings: it only ever ADDS a second-opinion local verify, so flipping
         # it mid-process cannot split an in-flight merge's breadth.
         'verify_cross_check_remote_green',
+        # Disjoint-delta fast-path soundness gate (2026-09-22 whole-tree-drift
+        # incident) — green-tier for the same reason as its
+        # verify_cross_check_remote_green neighbour directly above: it only
+        # ever ADDS a re-verify before an advance, never changes an in-flight
+        # merge's breadth, and is read fresh off req.config at each gate
+        # evaluation.  A safety kill switch behind a restart is not one.
+        'merge_disjoint_skip_requires_verified_drift',
         # Per-model USD/1M-token price table (task 2459) — green-tier like
         # verify_env above. Threaded into every task-workflow role
         # invocation via the shared TaskWorkflow._invoke chokepoint (task

@@ -185,9 +185,9 @@ rate; do not re-open them:
    Those grounds covered query FILTERS only and were silent about
    server-side TRUNCATION.  Task 4340 measured a FalkorDB
    ``RESULTSET_SIZE`` cap silently truncating that very query to roughly
-   HALF the valid-edge corpus on dark_factory (exact figures: the
-   RESULT-SET CAP AUDIT block in ``backends/graphiti_client.py``, which is
-   the one place they are recorded).  So at the time of the task-2613
+   HALF the valid-edge corpus on dark_factory (exact figures:
+   ``plans/falkordb-resultset-cap-audit.md``, which is the one place they
+   are recorded).  So at the time of the task-2613
    investigation this sweep saw about half the edges, and the miss rate was
    computed against a truncated denominator.  ``get_all_valid_edges`` is
    paginated as of task 4340 and the truncation is gone, but the RATE has
@@ -206,8 +206,8 @@ Why a regex in this module gets a performance test at all:
 ``sweep_stale_status_snapshot_edges`` calls
 ``extract_snapshot_edge_task_ids_by_marker_class`` once per valid edge from
 an UNGUARDED dict comprehension with no per-edge timeout, over the whole
-group's edge set (tens of thousands of edges; current figures in the RESULT-SET CAP
-AUDIT block in ``backends/graphiti_client.py``).  Extractor cost is
+group's edge set (tens of thousands of edges; current figures in
+``plans/falkordb-resultset-cap-audit.md``).  Extractor cost is
 therefore a whole-cycle LIVENESS property — one pathological fact stalls
 the entire reconciliation cycle — not a micro-optimisation. (amendment,
 task 3079)
@@ -221,7 +221,7 @@ cycle, so the per-edge cost this test guards matters more than the
 original number implied, not less.  The read that feeds it was timed
 2026-08-18 at ~3.3 s per full enumeration on dark_factory (~3.7 s on
 reify) — bounded, and roughly +2.6 s per cycle over the old truncated
-read; see the MEASURED COST section of that same audit block, so this
+read; see the MEASURED COST section of that same audit doc, so this
 claim rests on a number rather than on an estimate. (amendment, task 4340)
 
 Adding the second (blocked) pattern family did NOT add a second per-edge

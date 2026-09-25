@@ -134,6 +134,64 @@ Any workspace member works; `shared` is used because it is the one member every
 resolves to its OWN tree, an un-synced one to the main checkout — both are
 correct, and knowing which you are in is the whole point of asking.
 
+### Anchoring ad-hoc paths
+
+The Bash working directory PERSISTS across calls, and any earlier `cd` moved it
+— including one buried in a compound command several turns ago. Your own
+command text does not show where the command will run: in the transcript behind
+`plans/confusion-census-2026-09-20.md` §1.4, two adjacent Bash calls in one
+session carried different tracked cwds.
+
+So a bare or repo-relative path in an ad-hoc probe is a guess, and a wrong guess
+arrives as a bare `FileNotFoundError: [Errno 2] No such file or directory:
+'test_foo.py'`, which names neither the directory you assumed nor the one you
+actually got. Your cwd is **not derivable from your command text**. Ask git;
+never assume you are still where you last were.
+
+<!-- checkout-root-anchor:begin
+     EXECUTED verbatim by
+     tests/scripts/test_checkout_root_anchor_convention.py from a subdirectory
+     of a temp checkout, asserting it answers with the checkout ROOT and not
+     with cwd. Edit it into `pwd` or a hard-coded path and that guard goes
+     red — which is the point. -->
+- **Checkout root**: `git rev-parse --show-toplevel`
+<!-- checkout-root-anchor:end -->
+
+Two measured properties are why this and not `pwd`: it answers the same from
+every directory inside the checkout, and from a directory inside no checkout it
+refuses loudly — exit 128, `fatal: not a git repository`, nothing on stdout —
+rather than handing back a path that is silently wrong.
+
+It answers with the checkout you are STANDING IN, which inside a linked
+worktree is that worktree's own root — the right answer for your task's files,
+and the wrong one when you specifically need the MAIN checkout (`.taskmaster/`,
+`claim_warm_worktree`'s `project_root`). `skills/do/SKILL.md` owns that other
+derivation; take it from there rather than adapting this one.
+
+Knowing the root is not enough on its own: a root printed in some earlier turn
+does not reach inside a heredoc you write in a later one. Carry the anchor WITH
+the probe.
+
+<!-- anchored-probe-idiom:begin
+     Also EXECUTED verbatim by
+     tests/scripts/test_checkout_root_anchor_convention.py, which runs it from
+     a subdirectory holding no CLAUDE.md of its own and then runs it AGAIN with
+     the `cd` prefix stripped — the second run must fail with the
+     FileNotFoundError this subsection exists to stop. -->
+- **Anchor an ad-hoc probe**: `cd "$(git rev-parse --show-toplevel)" && python3 -c 'import pathlib; print(pathlib.Path("CLAUDE.md").read_text().splitlines()[0])'`
+<!-- anchored-probe-idiom:end -->
+
+Prefixing a probe this way puts every path inside it on repo-relative footing
+no matter which directory the call started in — including inside a
+`python3 - <<'PY'` heredoc, which is exactly where the sighting behind this
+subsection failed. The `cd` is scoped to that one command, it does not have to
+be re-derived per path, and it is cheaper than reasoning about where you
+currently are.
+
+Reach for it only when you need a Bash probe at all: the `Read`, `Glob` and
+`Grep` tools take repo-anchored paths and are not affected by the Bash cwd, so
+when they can answer there is nothing to anchor.
+
 ## Memory Usage
 
 ### When to read memory
@@ -304,8 +362,12 @@ Two things that section used to claim, and that measurement disproved on
 passes no arguments, so it restarts mid-merge units ungated), and the two
 tiers **can** both redeploy inside one 8h window — the clock is stamped only
 when a sweep completes, so a long sweep leaves it reading the previous deploy
-throughout. Tasks **4754** and **4755** close this. Until they land, don't
-reason as if a fleet redeploy is at most once per 8h.
+throughout. Tasks **4754** and **4755** have since closed this: a sweep now
+holds an in-flight lease that the backstop, the coordinator and (for its
+`current_unit` only) the liveness probe all honor. Two residuals remain — a
+sweep overrunning `orchestrator_restart_lease_max_age_secs` loses the lease
+and degrades to the old collision, and the fused-memory tier has no lease at
+all — so read `--report`'s `FLEET-LEASE:` line rather than assuming.
 
 ## Working in the main checkout
 
@@ -330,6 +392,21 @@ directly, not just interactive agents.
   instead of halting the queue, and no operator rescue is needed for this
   case. If the grace still expires, that one merge is blocked per-task (see
   `park_lock_contended` in `OPERATIONS.md`) — the queue keeps running.
+- A direct-to-main commit does **not** need to wait for an idle merge
+  queue. When main moves under a verify that is in flight, a solo merge
+  rebases onto the new main and lands without re-verifying, provided the
+  new commits and the branch touch no files in common
+  (`orchestrator/src/orchestrator/merge_gates.py::_reverify_rebased_tree`).
+  Two cases still cost real time. (1) Your paths overlap the in-flight
+  branch's changed files: that forces a full re-verify (~40 min), even
+  for `*.md`, until task 5293 excludes prose paths. (2) A coalesce train
+  is verifying: *any* move of main makes the train's final compare-and-swap
+  fail, the whole train verify (27–72 min measured) is discarded, and every
+  member re-merges solo (`merge_queue.py::_do_train_merge`, task 5070).
+  `get_merge_queue` does not show a train's verify (task 5245), so check
+  `data/orchestrator/runs.db` for a `train_started` in the last ~2h with no
+  `train_merged`/`train_derailed` for the same `train_id` — a heuristic:
+  restart-orphaned trains leave `train_started` rows that never close.
 - **Never** run `git stash` in **any** dark-factory checkout — `project_root`
   or a `.worktrees/<id>` task worktree. `refs/stash` is a single ref in the
   shared `.git` dir and is *not* per-worktree, so every checkout pushes onto

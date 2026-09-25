@@ -10,21 +10,23 @@ do not need to be re-keyed.
 Network errors are caught and surfaced as ``{'offline': True, 'error': ...}``;
 the caller turns that into a per-project skip plus a Tasks-tab banner.
 
-Note: the three failover loops below raise ``ValueError`` from within their
+Note: the four failover loops below raise ``ValueError`` from within their
 ``_call`` closures on a "soft failure" (malformed/errored MCP result), which
 ``mcp_fanout.first_success`` treats the same as a transport error — including
 invalidating that URL's cached session. Previously a soft failure here fell
 through with a bare ``continue`` and no session teardown; see
 ``mcp_fanout``'s module docstring for why this normalization is intentional.
+``fetch_task_prose`` RETURNS one structured error instead of raising it: a
+missing task is a definitive answer, not a soft failure.
 
-Two of those three loops (``fetch_tasks``, ``fetch_statuses``) are
-parameterized by ``project_root``, so they compose their ``log_label``
-through ``mcp_fanout.fanout_label`` to keep each root's failure streak on its
-own throttle key — one fused-memory URL serves every root, so a fixed literal
-label would let a healthy root's success clear a broken root's streak and
-re-arm its opening WARNING every poll cycle. ``fetch_external_statuses`` is
-parameterized by a ``deps`` list rather than a root, so its fixed label is
-already a correct single key.
+Three of those four loops (``fetch_tasks``, ``fetch_statuses``,
+``fetch_task_prose``) are parameterized by ``project_root``, so they compose
+their ``log_label`` through ``mcp_fanout.fanout_label`` to keep each root's
+failure streak on its own throttle key — one fused-memory URL serves every
+root, so a fixed literal label would let a healthy root's success clear a
+broken root's streak and re-arm its opening WARNING every poll cycle.
+``fetch_external_statuses`` is parameterized by a ``deps`` list rather than a
+root, so its fixed label is already a correct single key.
 
 Caching: ``fetch_tasks`` and ``fetch_statuses`` are both cached, at
 deliberately different TTLs (20 s and 5 s). ``fetch_tasks``'s key is a
@@ -35,7 +37,8 @@ served to the others for up to the TTL window. The record is also the single
 source of the WIRE arguments (:meth:`_TasksRead.wire_arguments`), so the key
 and the request it stands for cannot drift apart.
 ``fetch_statuses`` takes no narrowing arguments, so the root alone IS its
-whole key. ``fetch_external_statuses`` is uncached and returns live data.
+whole key. ``fetch_external_statuses`` and ``fetch_task_prose`` are uncached
+and return live data.
 """
 
 from __future__ import annotations
@@ -366,6 +369,11 @@ def _shape_task(task: dict) -> dict | None:
     ``updatedAt`` is preserved as ``updated_at`` — it is the recency key for
     ordering done tasks and the ``completed`` display timestamp.
 
+    ``description`` stays because ``redux_api.shape_escalations`` embeds this
+    whole dict as each escalation row's ``task`` and the Escalations drawer
+    renders it; ``details`` is dropped because only the Task Detail pane
+    renders it, and that pane reads it through :func:`fetch_task_prose`.
+
     ``claimant_run_id`` and ``heartbeat_at`` are carried through for the
     STRANDED projection (task 3543 / PRD ι): they are the two columns
     :func:`task_is_stranded` reads, and dropping them here is what previously
@@ -403,7 +411,6 @@ def _shape_task(task: dict) -> dict | None:
         'id': tid,
         'title': task.get('title') or '',
         'description': task.get('description') or '',
-        'details': task.get('details') or '',
         'status': task.get('status'),
         'priority': task.get('priority'),
         'dependencies': deps,
@@ -766,7 +773,7 @@ async def fetch_task_page(
     window passes ``offset=max(0, n_terminal - window)``, computed from a live
     task count that grows every time a task completes, so a fresh key is
     minted on every completion.  Each retired key held a 400-row list — rows
-    carrying description/details/metadata — plus an ``asyncio.Lock``, forever
+    carrying description/metadata — plus an ``asyncio.Lock``, forever
     (task 3857 review).  Quantizing the offset does NOT fix this and was
     rejected: ``n_terminal`` grows monotonically, so quantized offsets do too
     — that slows the leak by the quantum, it does not bound it.
@@ -1130,3 +1137,79 @@ async def fetch_statuses(
         cache_ok=lambda v: isinstance(v, dict) and not v.get('offline'),
     )
     return dict(result) if isinstance(result, dict) else result
+
+
+@dataclass(frozen=True, slots=True)
+class TaskProse:
+    """One task's description and details, as the Task Detail pane renders them."""
+
+    description: str
+    details: str
+
+    def to_wire(self) -> dict[str, str]:
+        """The pair's JSON spelling; the one place it is written down."""
+        return {'description': self.description, 'details': self.details}
+
+
+@dataclass(frozen=True, slots=True)
+class TaskNotFound:
+    """fused-memory answered definitively: the root holds no task with that id."""
+
+    detail: str
+
+
+@dataclass(frozen=True, slots=True)
+class TaskReadOffline:
+    """No fused-memory URL answered; *detail* names each URL's failure."""
+
+    detail: str
+
+
+TaskProseRead = TaskProse | TaskNotFound | TaskReadOffline
+
+
+async def fetch_task_prose(
+    client: httpx.AsyncClient,
+    config: DashboardConfig,
+    project_root: str | os.PathLike[str],
+    task_id: int,
+    *,
+    timeout: float = DEFAULT_PER_CALL_TIMEOUT,
+) -> TaskProseRead:
+    """Read ONE task's description/details for the Tasks tab's Task Detail pane.
+
+    The ACTIVE_TASKS rows omit both fields; the pane fetches them here for the
+    selected task only. Each outcome is its own type because the route answers
+    each with a different status:
+
+    - :class:`TaskProse`: missing prose normalises to ``''``, as
+      :func:`_shape_task` does for ``description``;
+    - :class:`TaskNotFound`: fused-memory's ``TaskNotFoundError``, matched on
+      its structured ``error_type``. It is RETURNED from the per-URL call, not
+      raised: ``first_success`` would treat a raised ``ValueError`` as a soft
+      failure and ask the next URL, reporting an absent task as an outage;
+    - :class:`TaskReadOffline`: every URL failed. Any other tool error, or an
+      empty result, is such a soft failure.
+
+    *timeout* is per HTTP request; the caller bounds the whole read.
+    Uncached, deliberately: a primary-key lookup fetched only on selection.
+    """
+    root = str(project_root)
+
+    async def _call(url: str) -> TaskProseRead:
+        result = await mcp_tool_call(
+            client, url, 'get_task', {'id': str(task_id), 'project_root': root},
+            timeout=timeout,
+        )
+        if result.get('error_type') == 'TaskNotFoundError':
+            return TaskNotFound(str(result['error']))
+        if 'error' in result or not result:
+            raise ValueError(str(result.get('error', 'empty result')))
+        return TaskProse(result.get('description') or '', result.get('details') or '')
+
+    return await first_success(
+        config.fused_memory_urls,
+        _call,
+        log_label=fanout_label('fetch_task_prose', root),
+        offline_result=lambda errs: TaskReadOffline('; '.join(errs)),
+    )

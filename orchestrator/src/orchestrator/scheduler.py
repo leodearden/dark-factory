@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, overload, runtime_checkable
 
 from shared import safe_io
+from shared.capability_manifest import CHECK_SUBJECT_FIELD
 from shared.cli_invoke import is_server_error_status
 from shared.locking import (
     files_to_modules,
@@ -724,7 +725,9 @@ def _build_delivered_check_escalation(
     site (:meth:`Scheduler._compute_delivered_check_cache`) rather than
     passed in from delta's minimal per-tick ``fail_detail_by_dep`` shape,
     so the escalation can name the pattern/script/args/paths/expect that
-    delta's dispatch-gate cache does not persist.
+    delta's dispatch-gate cache does not persist. The per-kind subject
+    field comes from ``shared.capability_manifest.CHECK_SUBJECT_FIELD``,
+    so a new check kind never renders a field its descriptor lacks.
 
     Pure rendering — no side effects, no scheduler state.
     """
@@ -739,11 +742,16 @@ def _build_delivered_check_escalation(
         f'Delivered check {name!r} (kind={kind}) failed against main@{sha12}.',
         f'Dependency: task {dep_id} (status={dep_status}).',
     ]
+    # Name the field the descriptor ACTUALLY has. The former grep/script
+    # binary emitted a bare `pattern: None` for any third kind, into a body
+    # that routes straight to a human.
+    subject_field = CHECK_SUBJECT_FIELD.get(kind or '', 'pattern')
+    if subject_field != 'paths':
+        # kind='path' is its own subject, and `paths:` is already emitted
+        # unconditionally below — printing it twice would be its own defect.
+        lines.append(f'{subject_field}: {check.get(subject_field)}')
     if kind == 'script':
-        lines.append(f'script: {check.get("script")}')
         lines.append(f'args: {check.get("args", [])}')
-    else:
-        lines.append(f'pattern: {check.get("pattern")}')
     lines.append(f'paths: {check.get("paths", [])}')
     lines.append(f'expect: {check.get("expect")}')
     lines.append('observed: FAILED')
