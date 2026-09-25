@@ -6,7 +6,7 @@ import json
 import logging
 import os
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest  # pyright: ignore[reportMissingImports]
@@ -619,3 +619,104 @@ class TestHolderRecordState:
         assert sr.holder_record_state(legacy, root=tmp_path) != sr.holder_record_state(
             reaped, root=tmp_path
         )
+
+
+_LEASE = 'watcher-df'
+
+
+def _seed_lease(root: Path, body: str | sr.LeaseHolder, *, age_secs: float = 60.0) -> None:
+    path = sr.lease_path_for_name(_LEASE, root=root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body if isinstance(body, str) else body.to_json(), encoding='utf-8')
+    ts = (_T0 - timedelta(seconds=age_secs)).timestamp()
+    os.utime(path, (ts, ts))
+
+
+def _contend(root: Path, *, record_slug: str = '') -> sr.LeaseClaim:
+    contender = _holder(slug='watcher-df-contender', record_slug=record_slug)
+    return sr.claim_lease(_LEASE, holder=contender, root=root, now=_T0)
+
+
+class TestLeaseClaimHolderRecordState:
+    _SLUG = 'role-proj-uuid'
+
+    def test_an_acquired_claim_reports_the_claimants_own_linked_record(
+        self, tmp_path: Path
+    ) -> None:
+        sr.write_record(_record(self._SLUG, owner_pid=os.getpid()), root=tmp_path)
+
+        claim = sr.claim_lease(_LEASE, holder=_holder(record_slug=self._SLUG), root=tmp_path)
+
+        assert claim.acquired is True
+        assert claim.holder_record_state is sr.HolderRecordState.ACTIVE
+
+    def test_an_acquired_unlinked_claim_is_unlinked(self, tmp_path: Path) -> None:
+        claim = sr.claim_lease(_LEASE, holder=_holder(), root=tmp_path)
+
+        assert claim.holder_record_state is sr.HolderRecordState.UNLINKED
+
+    def test_a_contended_claim_reports_the_existing_holders_record(
+        self, tmp_path: Path
+    ) -> None:
+        sr.write_record(
+            _record(self._SLUG, owner_pid=1, status=sr.Status.EXITED), root=tmp_path
+        )
+        _seed_lease(tmp_path, _holder(record_slug=self._SLUG))
+
+        claim = _contend(tmp_path)
+
+        assert claim.acquired is False
+        assert claim.holder_record_state is sr.HolderRecordState.EXITED
+
+    def test_a_legacy_body_is_unlinked(self, tmp_path: Path) -> None:
+        legacy = {'session_slug': 'watcher-df-1', 'pid': os.getpid(), 'start_ts': ''}
+        _seed_lease(tmp_path, json.dumps(legacy))
+
+        assert _contend(tmp_path).holder_record_state is sr.HolderRecordState.UNLINKED
+
+    def test_an_unreadable_body_is_unlinked(self, tmp_path: Path) -> None:
+        _seed_lease(tmp_path, '{not json')
+
+        claim = _contend(tmp_path)
+
+        assert claim.holder is None
+        assert claim.holder_record_state is sr.HolderRecordState.UNLINKED
+
+
+class TestHolderRecordIsAnAdditiveAxis:
+    _SLUG = 'role-proj-uuid'
+
+    @staticmethod
+    def _verdict(claim: sr.LeaseClaim) -> tuple[object, ...]:
+        return (claim.decision, claim.acquired, claim.holder_alive, claim.message)
+
+    @pytest.mark.parametrize('existing', ['live', 'dead', 'unreadable'])
+    def test_the_claim_verdict_ignores_record_slug(self, tmp_path: Path, existing: str) -> None:
+        verdicts = []
+        for record_slug in ('', self._SLUG):
+            root = tmp_path / (record_slug or 'unlinked')
+            sr.write_record(
+                _record(self._SLUG, owner_pid=1, status=sr.Status.EXITED), root=root
+            )
+            if existing == 'unreadable':
+                _seed_lease(root, '{not json')
+            else:
+                pid = os.getpid() if existing == 'live' else _DEAD_PID
+                _seed_lease(root, _holder(pid=pid, record_slug=record_slug))
+            verdicts.append(self._verdict(_contend(root, record_slug=record_slug)))
+
+        assert verdicts[0] == verdicts[1]
+
+    def test_a_dead_holder_whose_record_exited_still_stands_down_on_a_fresh_heartbeat(
+        self, tmp_path: Path
+    ) -> None:
+        sr.write_record(
+            _record(self._SLUG, owner_pid=_DEAD_PID, status=sr.Status.EXITED), root=tmp_path
+        )
+        _seed_lease(tmp_path, _holder(pid=_DEAD_PID, record_slug=self._SLUG))
+
+        claim = _contend(tmp_path)
+
+        assert claim.decision is sr.LeaseDecision.STAND_DOWN
+        assert claim.holder_alive is False
+        assert claim.holder_record_state is sr.HolderRecordState.EXITED
