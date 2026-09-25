@@ -1615,6 +1615,86 @@ class TestEnterFocus:
 
             assert backend.focus_calls == []
 
+    @staticmethod
+    def _watcher_and_its_decision(root, *, record_slug):
+        """A hand-launched watcher's record + the decision it filed (task 4237).
+
+        session_id is the watcher's lease token -- never a registry key -- so
+        only record_slug can link the row to the session.
+        """
+        watcher = _make_record(
+            session_slug='session-dark-factory-sess-watcher',
+            display=sr.Display(kind='wm', wm_title='escalation-watcher df'),
+        )
+        sr.write_record(watcher, root=root)
+        decision = sr.DecisionRecord(
+            id='esc-4237-1',
+            project='df',
+            text='Adopt the plan?',
+            filed_at='2026-07-07T00:00:00+00:00',
+            session_id='watcher-df-1348600',
+            record_slug=record_slug,
+        )
+        assert sr.write_decision(decision, root=root)
+        return watcher, decision
+
+    @pytest.mark.timeout(10)
+    async def test_enter_on_a_watcher_filed_decision_focuses_the_watcher(self, tmp_path):
+        from cockpit.app import CockpitApp
+        from cockpit.backends import DisplayTarget, FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        watcher, _ = self._watcher_and_its_decision(
+            tmp_path, record_slug='session-dark-factory-sess-watcher'
+        )
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=60)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.select_key('decision:esc-4237-1')
+            await pilot.pause()
+
+            await pilot.press('enter')
+            await pilot.pause()
+
+            assert backend.focus_calls == [
+                DisplayTarget(kind='wm', wm_title='escalation-watcher df')
+            ]
+
+    @pytest.mark.timeout(10)
+    async def test_a_record_slug_only_change_rebuilds_the_queues_focus_target(self, tmp_path):
+        """Cross-queue enrichment can fill record_slug while every other
+        queue-relevant field stays the first filer's, so the rebuild trigger
+        itself must see record_slug -- not only resolve_target."""
+        from dataclasses import replace
+
+        from cockpit.app import CockpitApp
+        from cockpit.backends import DisplayTarget, FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+
+        _, unlinked = self._watcher_and_its_decision(tmp_path, record_slug='')
+
+        backend = FakeBackend()
+        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=60)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            linked = replace(unlinked, record_slug='session-dark-factory-sess-watcher')
+            assert sr.write_decision(linked, root=tmp_path)
+            app.refresh_registry()
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.select_key('decision:esc-4237-1')
+            await pilot.pause()
+
+            await pilot.press('enter')
+            await pilot.pause()
+
+            assert backend.focus_calls == [
+                DisplayTarget(kind='wm', wm_title='escalation-watcher df')
+            ]
+
 
 class TestHandlingExpiresWithTheAsk:
     @pytest.mark.timeout(10)
