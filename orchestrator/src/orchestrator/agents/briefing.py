@@ -563,20 +563,11 @@ to start over from nothing.
         The merge gate flagged ``not_touched``: plan-declared files that
         no commit on the branch actually touched.  Give the architect
         ONE bounded chance to reconcile the plan with branch reality.
-
-        THREE actions are on offer, not two.  A two-action menu (drop the
-        entries silently, or confirm the plan unchanged) leaves a real case
-        with no truthful move, and the merge gate names that dilemma verbatim
-        in two places —
+        Option (c), ``drop_plan_file``, gives an over-declared file a
+        truthful exit from the "drop = falsify provenance, confirm = mislabel
+        complete work" dilemma named at
         ``orchestrator/src/orchestrator/merge_gates.py::CROSS_REPO_DELIVERABLE_REASON_PREFIX``
-        and
-        ``orchestrator/src/orchestrator/merge_gates.py::ALREADY_LANDED_REASON_PREFIX``:
-        "drop = falsify provenance, confirm = mislabel complete work".  The
-        third action closes it for the over-declaration shape: a file that was
-        CORRECTLY declared and CORRECTLY needed no change leaves the ``files``
-        list via ``drop_plan_file(path, reason)``, which records WHY in the
-        plan record, so the gate's re-check can pass without the provenance
-        being falsified.
+        and ``::ALREADY_LANDED_REASON_PREFIX``.
 
         Lenient semantics — the architect may keep some flagged entries
         (treating them as genuinely needed; the gate's re-check is then
@@ -660,8 +651,10 @@ let a human triage the scope change.
 
 The plan must also never be narrowed to an empty `files` list — an empty
 list is not a narrowed plan, it is an unchecked one, because the gate has
-nothing left to re-check.  If nothing legitimately remains, that is
-option (b): call `confirm_plan()` and let the escalation triage it.
+nothing left to re-check.  `drop_plan_file` refuses to remove the last
+entry; do not use (a) to empty the list either.  If nothing legitimately
+remains, that is option (b): call `confirm_plan()` and let the escalation
+triage it.
 """
 
     async def build_simple_task_prompt(

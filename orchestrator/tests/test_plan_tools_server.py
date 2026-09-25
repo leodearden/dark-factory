@@ -448,15 +448,7 @@ class TestUpdatePlanMetadata:
 
 
 class TestDropPlanFile:
-    """The honest third exit from the narrowing pass (task 4807).
-
-    ``update_plan_metadata(files=[...])`` can drop a flagged entry, but it
-    records NOTHING about why — which is the falsified provenance
-    ``merge_gates.py::CROSS_REPO_DELIVERABLE_REASON_PREFIX`` objects to.
-    ``_drop_plan_file`` drops the entry AND records the reason atomically, so
-    a correctly-declared file that legitimately needed no edit can leave the
-    ``files`` list without the plan record losing why it was ever in scope.
-    """
+    """``_drop_plan_file``: drop a declared entry and record why, atomically."""
 
     def _three_file_plan(self, artifacts):
         _create_plan(
@@ -1294,13 +1286,7 @@ class TestMarkStepCommitted:
 
 @pytest.mark.asyncio
 class TestDropPlanFileTool:
-    """The REGISTERED ``drop_plan_file`` MCP tool, not only its helper.
-
-    Helper coverage is not enough (see the files-arg boundary guards above):
-    a regression that never wired the @mcp.tool() closure, or wired it with a
-    different parameter spelling, would still pass every ``_drop_plan_file``
-    unit test in ``TestDropPlanFile``.
-    """
+    """The REGISTERED ``drop_plan_file`` MCP tool, not only its helper."""
 
     def _three_file_plan(self, artifacts):
         _create_plan(

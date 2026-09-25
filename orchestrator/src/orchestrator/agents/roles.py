@@ -241,18 +241,8 @@ _PLAN_CREATOR_TOOLS = [
     'mcp__plan-tools__add_reuse_item',
     # Revalidation tools (blast-radius requeue)
     'mcp__plan-tools__update_plan_metadata',
-    # Narrowing-pass tool, not a plan-authoring one: option (c) of
+    # Narrowing-pass option (c); see
     # orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler.build_plan_tightening_prompt
-    # prescribes drop_plan_file(path, reason) for a file that was correctly
-    # declared and correctly needed no change. That prompt is delivered to
-    # ARCHITECT by orchestrator/src/orchestrator/workflow.py::Workflow._try_narrow_plan,
-    # which passes ARCHITECT.allowed_tools to the backend as an allowlist — so
-    # without this grant the architect hits a denial following its own
-    # instructions. The grant also reaches SIMPLE_TASK, which splices this same
-    # list; benign, since that role already holds update_plan_metadata and
-    # drop_plan_file's guards (reason required, path must already be declared,
-    # never narrow to empty) constrain it far more tightly than the bare
-    # files-list rewrite it can already perform.
     'mcp__plan-tools__drop_plan_file',
     'mcp__plan-tools__remove_plan_step',
     'mcp__plan-tools__replace_plan_step',
