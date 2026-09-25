@@ -2519,6 +2519,96 @@ def test_read_direct_children_sees_a_real_fork_including_off_main_thread():
             off_main.wait()
 
 
+def test_read_proc_state_reports_an_unreaped_zombie_as_exited():
+    """A terminated-but-unreaped child reads as EXITED, although signal 0 still answers.
+
+    ``os.waitid(..., WNOWAIT)`` blocks until the child has exited without
+    reaping it, so the zombie is produced by a condition wait, never a sleep.
+    """
+    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])
+    try:
+        child.kill()
+        os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)
+        try:
+            os.kill(child.pid, 0)
+        except ProcessLookupError:
+            pytest.fail(
+                'harness bug: an unreaped zombie must still answer signal 0, or '
+                'this test is not reproducing the state a signal-0 probe counts '
+                'as alive'
+            )
+
+        state = read_proc_state(child.pid)
+        assert state == ProcState(state='Z', ppid=os.getpid())
+        assert state.exited is True
+        assert wait_pids_exited({child.pid}, timeout=0) == {}
+
+        child.wait()
+        assert read_proc_state(child.pid) is None
+    finally:
+        if child.returncode is None:
+            child.kill()
+            child.wait()
+
+
+def test_read_proc_state_reports_a_live_child_as_running():
+    """A live child reads as RUNNING, parented to this process, and survives the wait."""
+    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])
+    try:
+        state = read_proc_state(child.pid)
+        assert state is not None
+        assert state.ppid == os.getpid()
+        assert state.exited is False
+
+        survivors = wait_pids_exited({child.pid}, timeout=0)
+        assert set(survivors) == {child.pid}
+        assert survivors[child.pid].exited is False
+    finally:
+        child.kill()
+        child.wait()
+
+
+def test_wait_pids_exited_decides_on_a_probe_taken_after_its_last_sleep():
+    """A deadline crossed DURING the sleep still gets one fresh probe before the verdict.
+
+    The scripted clock jumps past the deadline while the loop sleeps.  A loop
+    that re-checks the deadline before re-probing returns the stale ``R``
+    observation; the verdict must come from the second probe, which sees ``Z``.
+    """
+    reads: list[int] = []
+
+    def read_state(pid: int) -> ProcState:
+        reads.append(pid)
+        return ProcState('R', 1) if len(reads) == 1 else ProcState('Z', 1)
+
+    ticks = iter([0.0, 0.5])
+
+    survivors = wait_pids_exited(
+        {7}, timeout=1.0, interval=0,
+        _read_state=read_state, _clock=lambda: next(ticks, 99.0),
+    )
+
+    assert survivors == {}
+    assert reads == [7, 7]
+
+
+def test_wait_pids_exited_reports_each_survivor_with_its_last_observed_state():
+    """timeout=0 is exactly one probe; a pid with no /proc entry is not a survivor."""
+    reads: list[int] = []
+
+    def sleeping(pid: int) -> ProcState:
+        reads.append(pid)
+        return ProcState('S', 4242)
+
+    assert wait_pids_exited({7}, timeout=0, _read_state=sleeping) == {7: ProcState('S', 4242)}
+    assert reads == [7]
+
+    states = {7: ProcState('S', 4242), 8: None}
+    assert wait_pids_exited({7, 8}, timeout=0, _read_state=states.__getitem__) == {
+        7: ProcState('S', 4242)
+    }
+
+
 # ---------------------------------------------------------------------------
 # Task 4092 -- deterministic-ish unit coverage for kill_holder_tree, the
 # shared teardown helper that reaps a spawn_verify_merge holder AND every
