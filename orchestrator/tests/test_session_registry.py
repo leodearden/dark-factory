@@ -3984,10 +3984,11 @@ def test_main_lease_claim_on_free_name_acquires_and_prints_decision_token(
     assert lines[0] == 'decision=acquired'
     assert lines[2] == 'holder_liveness=none'
     # Task 4248 appended a `slug=` line after it (pinned in that task's own
-    # section); anchored by INDEX here so this keeps asserting the position of
-    # `holder_liveness`, which is what this test is about, rather than silently
-    # re-aiming at whatever line happens to be last.
-    assert len(lines) == 4
+    # section), and task 4237 a `holder_record=` line after that; anchored by
+    # INDEX here so this keeps asserting the position of `holder_liveness`,
+    # which is what this test is about, rather than silently re-aiming at
+    # whatever line happens to be last.
+    assert len(lines) == 5
     assert sr.lease_path_for_name('watcher-df', root=tmp_path).is_file()
 
 
@@ -4573,7 +4574,9 @@ def test_main_lease_claim_prints_the_derived_slug_last_on_the_acquired_path(
     assert lines[0] == 'decision=acquired'
     assert lines[2] == 'holder_liveness=none'
     assert lines[3] == f'slug=watcher-df-{_DEAD_PID}'
-    assert len(lines) == 4
+    # Task 4237 appended `holder_record=` after it (pinned in
+    # test_session_record_linkage.py); `slug=` keeps its index.
+    assert len(lines) == 5
 
 
 def test_main_lease_claim_slug_line_names_this_caller_not_the_holder(
@@ -4650,7 +4653,7 @@ def test_main_lease_claim_echoes_an_explicit_slug_verbatim(
     assert rc == 0
     # The line reports the slug ACTUALLY claimed with, not the one that would
     # have been derived — otherwise it would misreport the override path.
-    assert capsys.readouterr().out.splitlines()[-1] == 'slug=watcher-df-OPERATOR'
+    assert capsys.readouterr().out.splitlines()[3] == 'slug=watcher-df-OPERATOR'
 
 
 # --- CLI ownership on the mutating verbs (task 3994 defect 1) -------------

@@ -890,3 +890,99 @@ class TestLeaseClaimCliRecordSlug:
 
         assert len(calls) <= max_calls
         assert _lease_body(tmp_path).pid in (self._PID, self._OTHER_PID)
+
+
+def _claim_lines(capsys: pytest.CaptureFixture[str], *extra: str) -> list[str]:
+    capsys.readouterr()
+    assert sr.main(['lease-claim', '--name', _LEASE, *extra]) == 0
+    return capsys.readouterr().out.splitlines()
+
+
+def _seed_fresh_lease(root: Path, holder: sr.LeaseHolder) -> None:
+    path = sr.lease_path_for_name(_LEASE, root=root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(holder.to_json(), encoding='utf-8')
+
+
+class TestLeaseClaimPrintsHolderRecordLast:
+    _PID = 4_237_500
+    _OWN_SLUG = 'watcher-own-record'
+    _HOLDER_SLUG = 'the-holders-record'
+
+    def test_an_acquired_claim_prints_the_claimants_own_state_as_line_five(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _link_pid(self._PID, self._OWN_SLUG, tmp_path)
+        monkeypatch.setenv('CLAUDE_PID', str(self._PID))
+
+        lines = _claim_lines(capsys)
+
+        assert len(lines) == 5
+        assert lines[0] == 'decision=acquired'
+        assert lines[2:] == [
+            'holder_liveness=none',
+            f'slug={_LEASE}-{self._PID}',
+            'holder_record=active',
+        ]
+
+    def test_an_acquired_unlinked_claim_prints_unlinked(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        monkeypatch.setenv('CLAUDE_PID', str(self._PID))
+
+        assert _claim_lines(capsys)[-1] == 'holder_record=unlinked'
+
+    @pytest.mark.parametrize(
+        ('holder_pid', 'liveness'),
+        [(os.getpid(), 'held'), (_DEAD_PID, 'orphaned')],
+        ids=['held', 'orphaned'],
+    )
+    def test_a_contended_claim_prints_the_existing_holders_state_not_the_callers(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        holder_pid: int,
+        liveness: str,
+    ) -> None:
+        sr.write_record(
+            _record(self._HOLDER_SLUG, owner_pid=holder_pid, status=sr.Status.EXITED),
+            root=tmp_path,
+        )
+        _seed_fresh_lease(tmp_path, _holder(pid=holder_pid, record_slug=self._HOLDER_SLUG))
+        _link_pid(self._PID, self._OWN_SLUG, tmp_path)
+        monkeypatch.setenv('CLAUDE_PID', str(self._PID))
+
+        lines = _claim_lines(capsys)
+
+        assert len(lines) == 5
+        assert lines[0] == 'decision=stand-down'
+        assert lines[2:] == [
+            f'holder_liveness={liveness}',
+            f'slug={_LEASE}-{self._PID}',
+            'holder_record=exited',
+        ]
+
+    def test_the_fail_open_path_prints_no_holder_record_line(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _link_pid(self._PID, self._OWN_SLUG, tmp_path)
+        monkeypatch.setenv('CLAUDE_PID', str(self._PID))
+
+        def _boom(*_args: object, **_kwargs: object) -> sr.LeaseClaim:
+            raise OSError('lease substrate on fire')
+
+        monkeypatch.setattr(sr, 'claim_lease', _boom)
+
+        lines = _claim_lines(capsys)
+
+        assert lines[0] == 'decision=proceed'
+        assert lines[2:] == [f'slug={_LEASE}-{self._PID}']
