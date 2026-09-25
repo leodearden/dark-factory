@@ -26,12 +26,16 @@ async def _drain(task: asyncio.Task) -> None:
 
 
 @contextlib.contextmanager
-def _recorded_loop_errors() -> Iterator[list[dict]]:
-    """Record every context the running loop hands its exception handler."""
+def _recorded_loop_errors() -> Iterator[list[tuple[str, BaseException | None]]]:
+    """Record (message, exception) for every report reaching the loop's handler.
+
+    Only those two fields are kept: the full context carries the reporting
+    Task itself, and holding it would resurrect a task mid-finalization.
+    """
     loop = asyncio.get_running_loop()
     previous = loop.get_exception_handler()
-    seen: list[dict] = []
-    loop.set_exception_handler(lambda _loop, context: seen.append(context))
+    seen: list[tuple[str, BaseException | None]] = []
+    loop.set_exception_handler(lambda _loop, context: seen.append((context['message'], context.get('exception'))))
     try:
         yield seen
     finally:
@@ -84,7 +88,7 @@ class TestTrackTask:
             del task
             _collect_and_confirm_gone(task_ref)
 
-        assert any(isinstance(context.get('exception'), _Boom) for context in errors)
+        assert any(isinstance(exception, _Boom) for _message, exception in errors)
 
     async def test_raising_task_exception_is_consumed(self):
         registry: set[asyncio.Task] = set()
