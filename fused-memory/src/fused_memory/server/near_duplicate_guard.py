@@ -13,6 +13,10 @@ is found (see ``server/tools.py``).
 This module intentionally does no I/O — the caller is responsible for
 fetching candidate ``MemoryResult`` objects (typically via
 ``MemoryService.search``) and for fail-open behaviour on search errors.
+
+The topic-cluster list is the config seeds plus the writing project's
+machine-derived rows from ``server/topic_cluster_store.py``, merged by
+:func:`resolve_topic_guard_clusters`.
 """
 
 from __future__ import annotations
@@ -265,21 +269,58 @@ def merge_topic_clusters(config_clusters: list, runtime_clusters: list) -> list:
     return merged
 
 
-def resolve_topic_guard_clusters(memory_service: Any) -> list:
-    """Read the configured topic-guard clusters from *memory_service*'s config.
+def resolve_topic_guard_clusters(
+    memory_service: Any,
+    *,
+    runtime_store: Any = None,
+    project_id: str | None = None,
+) -> list:
+    """Return the live topic-guard clusters: config seeds, then *project_id*'s derived ones.
 
-    Same defensive ``getattr`` navigation as :func:`resolve_near_dup_threshold`
-    (via :func:`_reconciliation_attr`), returning the configured
-    ``procedural_knowledge_topic_guard_clusters`` list iff the leaf is a real
+    THE merge chokepoint for topic clusters (the PRD's "guard/triage read"):
+    a future write-triage topic arm inherits the merge by calling this rather
+    than re-reading config.
+
+    The config half uses the same defensive ``getattr`` navigation as
+    :func:`resolve_near_dup_threshold` (via :func:`_reconciliation_attr`),
+    taking ``procedural_knowledge_topic_guard_clusters`` iff the leaf is a real
     ``list`` — otherwise an empty list. The ``isinstance(value, list)`` guard
     excludes a missing/``None`` config hop and any Mock attribute an unspecced
-    test double might auto-generate, so an empty return reliably means "topic
-    guard inert" (task 2845).
+    test double might auto-generate (task 2845).
+
+    The runtime half (task 3135) is merged by :func:`merge_topic_clusters` only
+    when both *runtime_store* and *project_id* are given and
+    :func:`resolve_topic_cluster_autoseed_enabled` is on, read live per call.
+    Derived rows are project-scoped because their hint names one project's
+    canonical. A store that raises or returns a non-list degrades to the
+    config half with a WARNING: this runs inside ``add_memory``, where an
+    exception would turn a memory write into a tool error.
     """
     value = _reconciliation_attr(memory_service, 'procedural_knowledge_topic_guard_clusters')
-    if isinstance(value, list):
-        return value
-    return []
+    config_clusters = value if isinstance(value, list) else []
+    if (
+        runtime_store is None
+        or project_id is None
+        or not resolve_topic_cluster_autoseed_enabled(memory_service)
+    ):
+        return config_clusters
+    try:
+        runtime = runtime_store.list_clusters(project_id)
+    except Exception:
+        logger.warning(
+            'topic-cluster store read failed for project %r; using config seeds only',
+            project_id,
+            exc_info=True,
+        )
+        return config_clusters
+    if not isinstance(runtime, list):
+        logger.warning(
+            'topic-cluster store returned %s for project %r, not a list; using config seeds only',
+            type(runtime).__name__,
+            project_id,
+        )
+        return config_clusters
+    return merge_topic_clusters(config_clusters, runtime)
 
 
 def _reconciliation_attr(memory_service: Any, attr: str) -> Any:
