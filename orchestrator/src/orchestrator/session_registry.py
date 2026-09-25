@@ -3461,20 +3461,15 @@ class LeaseClaim:
         freshly-acquired lease.
     message: fully-formatted, user-observable line -- callers print this
         verbatim rather than re-deriving it from the other fields.
+    holder_record_state: `holder`'s registry record, via its ``record_slug``
+        (see HolderRecordState) -- a second axis beside ``holder_alive``,
+        which alone still drives ``decision``.
 
-    There is deliberately NO holder_session_state field. Task 3994 added one
-    ('live'/'exited'/'absent'/'unknown', read via
-    ``read_record(holder.session_slug)``) to corroborate the defect-4 orphan
-    signal, and withdrew it on measurement: a lease slug is not a
-    session-registry record key (see LeaseHolder.session_slug), so the field
-    was a CONSTANT 'absent' in production and the orphan predicate
-    ``not holder_alive and state in ('absent', 'exited')`` already
-    degenerated to ``not holder_alive``. A field documented as corroborating
-    evidence that never actually corroborates is worse than no field: it is
-    the false-derivation-left-in-place failure this task exists to break.
-    ``holder_alive`` alone is now the orphan signal, and it is sound because
-    resolve_session_pid records the long-lived ``claude`` pid rather than the
-    old always-dead ``$$``.
+    Task 3994 withdrew an earlier ``holder_session_state`` that read
+    ``read_record(holder.session_slug)``: a lease slug is not a record key,
+    so that field was a structural constant. This one reads
+    ``holder.record_slug``, a real record key, and spells the no-evidence
+    case UNLINKED so it cannot be mistaken for a finding.
     """
 
     name: str
@@ -3484,6 +3479,7 @@ class LeaseClaim:
     holder_alive: bool
     heartbeat_age_secs: float
     message: str
+    holder_record_state: HolderRecordState
 
 
 def _render_contention_message(
@@ -3569,7 +3565,7 @@ def _create_and_write_lease(path: Path, holder: LeaseHolder) -> None:
         os.close(fd)
 
 
-def _acquired_claim(name: str, holder: LeaseHolder) -> LeaseClaim:
+def _acquired_claim(name: str, holder: LeaseHolder, root: Path | str | None) -> LeaseClaim:
     return LeaseClaim(
         name=name,
         decision=LeaseDecision.ACQUIRED,
@@ -3578,6 +3574,7 @@ def _acquired_claim(name: str, holder: LeaseHolder) -> LeaseClaim:
         holder_alive=True,
         heartbeat_age_secs=0.0,
         message=f'lease {name} acquired by {holder.session_slug}',
+        holder_record_state=holder_record_state(holder, root=root),
     )
 
 
@@ -3642,7 +3639,7 @@ def claim_lease(
     except FileExistsError:
         pass
     else:
-        return _acquired_claim(name, holder)
+        return _acquired_claim(name, holder, root)
 
     existing_holder, holder_alive, age_secs = _read_lease_holder_state(path, now=now)
     is_stale = (not holder_alive) and age_secs > LEASE_HEARTBEAT_TTL.total_seconds()
@@ -3690,7 +3687,7 @@ def claim_lease(
                 age_secs,
                 holder.session_slug,
             )
-            return _acquired_claim(name, holder)
+            return _acquired_claim(name, holder, root)
 
     decision = LeaseDecision.STAND_DOWN if policy is LeasePolicy.STAND_DOWN else LeaseDecision.PROCEED
     return LeaseClaim(
@@ -3703,6 +3700,7 @@ def claim_lease(
         message=_render_contention_message(
             existing_holder, holder_alive=holder_alive, age_secs=age_secs, policy=policy
         ),
+        holder_record_state=holder_record_state(existing_holder, root=root),
     )
 
 
