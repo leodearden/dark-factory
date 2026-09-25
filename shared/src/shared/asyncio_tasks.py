@@ -23,26 +23,51 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 
 __all__ = ['track_task']
 
 logger = logging.getLogger(__name__)
 
 
-def track_task(task: asyncio.Task, *registries: set[asyncio.Task]) -> None:
+def track_task(
+    task: asyncio.Task,
+    *registries: set[asyncio.Task],
+    on_done: Callable[[asyncio.Task], None] | None = None,
+) -> None:
     """Keep *task* alive in every set in *registries* until it ends.
 
     One done-callback removes the task from ALL the registries and consumes its
     exception ONCE — a task tracked in two registries does not get two
     callbacks retrieving the same exception twice.
+
+    *on_done* lets a call site add diagnostics (e.g. logging how the task
+    ended) without installing a SECOND done-callback that would retrieve the
+    same exception again. It runs for every outcome, cancellation included,
+    after the release; ``finished.exception()`` still works inside it. If it
+    raises, the failure is logged at WARNING and never propagates.
     """
     for registry in registries:
         registry.add(task)
 
     def _release(finished: asyncio.Task) -> None:
+        # Order is the contract: release first so a raising hook cannot strand
+        # the strong reference; consume before the hook so the "never
+        # retrieved" guarantee does not depend on what the hook does.
         for registry in registries:
             registry.discard(finished)
         if not finished.cancelled():
             finished.exception()
+        if on_done is None:
+            return
+        try:
+            on_done(finished)
+        except Exception:
+            logger.warning(
+                'on_done hook %s raised for task %r',
+                getattr(on_done, '__qualname__', on_done),
+                finished,
+                exc_info=True,
+            )
 
     task.add_done_callback(_release)
