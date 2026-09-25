@@ -3102,11 +3102,9 @@ class GitOps:
                 :attr:`WarmBaseHealth.OK`), CoW-seeds the minted
                 worktree's ``target/`` from the shared warm base via
                 :meth:`_seed_warm_lane` (mode ``'--fresh-checkout'``,
-                ``lane_lock=SeedLaneLock.HELD_BY_CALLER`` since this CM
-                already holds ``<lane_dir>.lock`` for its own lifetime —
-                see the Note below — so seed neither re-takes the lock nor
-                lets the script re-take it) after a successful add and
-                BEFORE the body runs,
+                ``lane_lock=SeedLaneLock.HELD_BY_CALLER``, since this CM
+                holds ``<lane_dir>.lock`` for its lifetime — see the Note
+                below) after a successful add and BEFORE the body runs,
                 turning a cold from-scratch build into a warm incremental
                 one. Any non-zero seed rc (absent script, disk pressure,
                 generic fault) is logged and the CM proceeds COLD — a
@@ -3164,8 +3162,7 @@ class GitOps:
         # for the CM's entire lifetime so gc.sh's `flock -n` orphan-removal
         # contender (gc.sh:564-574) sees a live consumer and preserves this
         # worktree instead of force-removing it out from under a still-
-        # running probe/sweep (task 2507). Derived through lane_lock_path so
-        # the lock held here IS the lock asserted to seed below.
+        # running probe/sweep (task 2507).
         lock_path = lane_lock_path(tmp_path)
 
         _MAX_ADD_RETRIES = 3
@@ -3232,10 +3229,7 @@ class GitOps:
             # main instead of a cold from-scratch recompile. Fail-soft: any
             # non-zero seed rc just logs and proceeds COLD — never raises,
             # never removes the worktree. HELD_BY_CALLER because this CM
-            # already holds <lane_dir>.lock (above) for its entire lifetime:
-            # re-taking it inside _seed_warm_lane would self-deadlock against
-            # the identical path, and leaving it to the script would make a
-            # self-locking script refuse against our own lock (task 4913).
+            # holds <lane_dir>.lock (above) for its entire lifetime.
             #
             # task 2567 amendment: the whole gate is wrapped in a broad
             # except so the never-raise contract is structural rather than
@@ -5267,15 +5261,11 @@ class GitOps:
         docstring note for the full race analysis (now closed).
 
         **``lane_lock``**: who holds ``<lane_dir>.lock`` during the seed —
-        see :class:`SeedLaneLock` for what each mode does.  Only ``TAKE``
-        (the default: ``acquire_warm_lane``, ``create_interactive_worktree``,
-        recycle) builds the OUTER wrapper above; the INNER per-gen-dir
+        see :class:`SeedLaneLock`.  Only ``TAKE`` (the default:
+        ``acquire_warm_lane``, ``create_interactive_worktree``, recycle)
+        builds the OUTER wrapper above; the INNER per-gen-dir
         ``flock -s <gen>.lock`` (symlink branch only; a different path) is
-        taken in every mode.  ``HELD_BY_CALLER`` exists for
-        :meth:`GitOps.ephemeral_worktree`, whose CM-lifetime flock (task
-        2507) already holds the IDENTICAL path: re-acquiring it would
-        self-deadlock against the bounded wait below, and NOT asserting it
-        would let a self-locking script refuse against the CM's own lock.
+        taken in every mode.
 
         **Bounded wait, not unbounded (task 2599 amendment)**: seeding runs
         on the latency-sensitive warm-lane acquisition hot path, so the
@@ -5384,14 +5374,12 @@ class GitOps:
             # same per-lane-vintage reason as the flag above, failing CLOSED to
             # today's rc-75 behaviour.
             #
-            # Deliberately NOT gated on lane_lock, unlike the flag above: that
-            # one is sent only when the lock is already held (TAKE /
-            # HELD_BY_CALLER), whereas the refusal arms this one names are
-            # reachable whenever the SCRIPT self-locks — LEFT_TO_SCRIPT, or any
-            # mode against a self-locking script that cannot be told the lock
-            # is held.  Gating it would make it inert in the cases it exists
-            # for; passing it always is safe because the script accepts it as
-            # inert wherever no refusal is reachable, never as a usage error.
+            # Deliberately NOT gated on lane_lock, unlike the flag above: the
+            # refusal arms it names are reachable whenever the SCRIPT
+            # self-locks (LEFT_TO_SCRIPT, or a script that cannot be told the
+            # lock is held), so gating it would make it inert in the cases it
+            # exists for; passing it always is safe because the script accepts
+            # it as inert wherever no refusal is reachable, never as a usage error.
             if _seed_script_supports_distinct_lock_refusal_rc(script):
                 seed_flags.append(_SEED_DISTINCT_LOCK_REFUSAL_RC_FLAG)
             base_path = self.warm_lane_base_target_path
