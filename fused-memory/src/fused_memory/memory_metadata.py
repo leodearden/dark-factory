@@ -592,7 +592,11 @@ KIND_REGISTRY: frozenset[str] = frozenset({
 #:                     (``services/completion_claim_gate.py::UNVERIFIED_CLAIM_TAG``)
 #:                     flags the write.  Episode-derived facts get it from
 #:                     ``MemoryService._execute_mem0_classify_and_add``, which
-#:                     does not pass through this validator.
+#:                     does not pass through this validator.  Unlike the
+#:                     census, which only stops warning about it, both seams
+#:                     DISCARD a caller-supplied value
+#:                     (``services/memory_service.py::_stamp_unverified_claim``),
+#:                     so a caller can neither forge the tag nor persist False.
 #:
 #: DELIBERATELY ABSENT: ``run_id``.  It *is* server-stamped, by the same
 #: ``_apply_cycle_summary_metadata_tagging`` helper (``memory_service.py:389``)
