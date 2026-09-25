@@ -5027,6 +5027,174 @@ class TestRunVerificationMergeArchival:
         )
 
 
+@pytest.mark.asyncio
+class TestTaskPathSummaryArchival:
+    """Every task-path attempt leaves its summary JSON in the durable archive.
+
+    The task-path counterpart of ``TestRunVerificationMergeArchival``.  The
+    worktree copy under ``.task/verify/`` dies with the worktree, so the
+    record of why an attempt passed or failed must also land under
+    ``<archive_root>/<task_id>/``.  Asserted on the files written, not on
+    the writer.
+    """
+
+    _TASK_ID = '5199'
+
+    def _worktree(self, tmp_path: Path) -> Path:
+        (tmp_path / '.task').mkdir()
+        return tmp_path
+
+    def _make_config(self, worktree: Path) -> OrchestratorConfig:
+        return OrchestratorConfig(
+            project_root=worktree,
+            test_command='cargo test --workspace',
+            lint_command='echo ok',
+            type_check_command='echo ok',
+        )
+
+    async def _verify(self, worktree: Path, archive_root: 'Path | None', attempt_id: int, fake_run_cmd):
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            return await run_verification(
+                worktree, self._make_config(worktree),
+                max_retries=0,
+                attempt_id=attempt_id,
+                task_id=self._TASK_ID,
+                archive_root=archive_root,
+            )
+
+    @staticmethod
+    async def _all_green(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+        return 0, 'ok', False
+
+    def _archived_summaries(self, archive_root: Path, stem: str) -> list[Path]:
+        return sorted((archive_root / self._TASK_ID).glob(f'{stem}.summary-*.json'))
+
+    @staticmethod
+    def _load(path: Path) -> dict:
+        import json  # noqa: PLC0415
+        return json.loads(path.read_text())
+
+    async def test_green_attempt_summary_survives_worktree_teardown(self, tmp_path: Path):
+        import shutil  # noqa: PLC0415
+        worktree = self._worktree(tmp_path)
+        archive_root = tmp_path / 'data' / 'verify-logs'
+
+        result = await self._verify(worktree, archive_root, 3, self._all_green)
+
+        assert result.passed
+        archived = self._archived_summaries(archive_root, 'attempt-3')
+        assert len(archived) == 1, f'expected exactly one archived summary; got {archived}'
+        worktree_copy = worktree / '.task' / 'verify' / 'attempt-3.summary.json'
+        assert self._load(archived[0]) == self._load(worktree_copy), (
+            'the archived summary must be the same record as the worktree copy'
+        )
+        assert self._load(archived[0])['category'] == 'passed'
+
+        shutil.rmtree(worktree / '.task')
+        assert archived[0].is_file(), 'the archived summary must outlive the worktree'
+        assert self._load(archived[0])['category'] == 'passed'
+
+    async def test_summary_archived_even_when_the_logs_are_not(self, tmp_path: Path):
+        worktree = self._worktree(tmp_path)
+        archive_root = tmp_path / 'data' / 'verify-logs'
+
+        async def failing_tests(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if 'cargo test' in cmd:
+                return 1, 'running 3 tests\ntest my::mod::it FAILED\n', False
+            return 0, 'ok', False
+
+        result = await self._verify(worktree, archive_root, 1, failing_tests)
+
+        assert result.category == 'test_failure', (
+            f'precondition: fixture must classify into the log deny-list; got {result.category!r}'
+        )
+        archived = self._archived_summaries(archive_root, 'attempt-1')
+        assert len(archived) == 1, f'expected exactly one archived summary; got {archived}'
+        assert self._load(archived[0])['category'] == 'test_failure'
+        assert list((archive_root / self._TASK_ID).glob('*.log')) == [], (
+            'the per-log category deny-list must be unchanged'
+        )
+        assert result.archive_log_paths == [], (
+            'the summary must not travel through the log-archival path'
+        )
+
+    async def test_attempts_and_module_prefixes_never_overwrite(self, tmp_path: Path):
+        worktree = self._worktree(tmp_path)
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        prefixes = ('cratea', 'crateb')
+        module_configs = [
+            ModuleConfig(
+                prefix=prefix,
+                test_command=f'cargo test -p {prefix}',
+                lint_command=None,
+                type_check_command=None,
+            )
+            for prefix in prefixes
+        ]
+
+        async def module_specific_failures(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            for prefix in prefixes:
+                if prefix in cmd:
+                    return 1, f'{prefix} ERR\nfoo\n', False
+            return 0, 'ok', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=module_specific_failures):
+            for attempt_id in (1, 2):
+                await run_scoped_verification(
+                    worktree, self._make_config(worktree), module_configs,
+                    attempt_id=attempt_id,
+                    task_id=self._TASK_ID,
+                    archive_root=archive_root,
+                )
+
+        for attempt_id in (1, 2):
+            for prefix in prefixes:
+                archived = self._archived_summaries(archive_root, f'attempt-{attempt_id}.{prefix}')
+                assert len(archived) == 1, (
+                    f'expected one archived summary for attempt {attempt_id} / {prefix}; got {archived}'
+                )
+                cmds = [c['cmd'] for c in self._load(archived[0])['commands']]
+                assert cmds, f'archived summary for {prefix} records no commands'
+                assert all(prefix in cmd for cmd in cmds), (
+                    f'archived summary for {prefix} names another module: {cmds}'
+                )
+
+    async def test_rerun_of_the_same_attempt_keeps_both_records(self, tmp_path: Path):
+        """``workflow.py::_run_scoped_verification_with_infra_retry`` reuses the attempt id."""
+        worktree = self._worktree(tmp_path)
+        archive_root = tmp_path / 'data' / 'verify-logs'
+
+        for _ in range(2):
+            await self._verify(worktree, archive_root, 1, self._all_green)
+
+        archived = self._archived_summaries(archive_root, 'attempt-1')
+        assert len(set(archived)) == 2, (
+            f'a re-run of the same attempt must not overwrite the earlier record; got {archived}'
+        )
+
+    async def test_no_archive_tree_without_an_archiving_caller(self, tmp_path: Path):
+        """``archive_root=None`` is how cold-shadow and drift probes opt out."""
+        worktree = self._worktree(tmp_path)
+
+        await self._verify(worktree, None, 1, self._all_green)
+
+        assert (worktree / '.task' / 'verify' / 'attempt-1.summary.json').is_file()
+        assert not (tmp_path / 'data').exists(), (
+            'a non-archiving caller must not create an archive tree'
+        )
+
+    async def test_fresh_summary_survives_an_archive_prune(self, tmp_path: Path):
+        worktree = self._worktree(tmp_path)
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        await self._verify(worktree, archive_root, 3, self._all_green)
+        archived = self._archived_summaries(archive_root, 'attempt-3')
+        assert len(archived) == 1, f'expected exactly one archived summary; got {archived}'
+
+        verify._prune_archive(archive_root)
+
+        assert archived[0].is_file(), 'a default prune pass must not remove a fresh summary'
+
+
 class TestPersistAttemptLogsModulePrefix:
     """Tests for the ``module_prefix`` parameter added to ``_persist_attempt_logs``.
 
