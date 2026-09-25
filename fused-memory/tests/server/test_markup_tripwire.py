@@ -723,8 +723,7 @@ class TestEmitMarkupStormEscalation:
         bare substring would be satisfied by a digit or a fragment inside the
         interpolated ``tmp_path``.
         """
-        if not markup_tripwire.HAS_ESCALATION:
-            pytest.skip('escalation package unavailable in this environment')
+        pytest.importorskip('escalation')
 
         lines = self._filed(tmp_path, self._ATTRIBUTED_STORM)['detail'].splitlines()
 
@@ -743,8 +742,7 @@ class TestEmitMarkupStormEscalation:
         without ``.get`` would turn the shape this record is most needed for
         into a raise.
         """
-        if not markup_tripwire.HAS_ESCALATION:
-            pytest.skip('escalation package unavailable in this environment')
+        pytest.importorskip('escalation')
 
         for storm in ({}, {'count': 9}):
             queue_root = tmp_path / f'root-{len(storm)}'
@@ -768,8 +766,7 @@ class TestEmitMarkupStormEscalation:
         fields carry caller-supplied strings, so an unescaped newline could
         inject a spoofed line and silently disable that warning.
         """
-        if not markup_tripwire.HAS_ESCALATION:
-            pytest.skip('escalation package unavailable in this environment')
+        pytest.importorskip('escalation')
 
         spoof = 'evil\noutcome=' + repr('repaired')
         payload = self._filed(
@@ -798,8 +795,7 @@ class TestEmitMarkupStormEscalation:
         ``markup_guard_storm`` appears across detail+suggested_action, and
         demoting the instruction must not delete the token.
         """
-        if not markup_tripwire.HAS_ESCALATION:
-            pytest.skip('escalation package unavailable in this environment')
+        pytest.importorskip('escalation')
 
         payload = self._filed(tmp_path, self._ATTRIBUTED_STORM)
         action = payload['suggested_action']
@@ -824,8 +820,7 @@ class TestEmitMarkupStormEscalation:
         this field naming no outcome of its own. So the remedy names the KEYS
         to read, never their values — the values live in ``detail``.
         """
-        if not markup_tripwire.HAS_ESCALATION:
-            pytest.skip('escalation package unavailable in this environment')
+        pytest.importorskip('escalation')
 
         attributed = self._filed(tmp_path, self._ATTRIBUTED_STORM)
         degenerate_root = tmp_path / 'degenerate'
