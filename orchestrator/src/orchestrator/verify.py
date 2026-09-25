@@ -737,6 +737,12 @@ def _crashed_session_stop_percent(output: str) -> int | None:
     Returns ``None`` when any fact is missing, including when *output* has no
     percentage progress line at all (``-v``, or the ``count``/``times``
     console styles): the bailout literal is then the only witness.
+
+    Known limitation: a run whose crashed worker xdist REPLACED
+    (``--max-worker-restart > 0``) and that ``-x``/``--maxfail`` then stopped
+    also satisfies all three facts. Its tally is genuinely partial; only the
+    named cause is imprecise (``VerifyResult.failure_report`` says the cap
+    was exceeded).
     """
     if not _XDIST_WORKER_CRASH_RE.search(output):
         return None

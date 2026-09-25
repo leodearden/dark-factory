@@ -10,15 +10,19 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from _xdist_crash_fixtures import (
+    XDIST_BAILOUT_WITH_STOPPED_PROGRESS_OUTPUT,
     XDIST_CRASH_ATTRIBUTED_FAILED_LINE,
     XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT,
     XDIST_FAILED_THEN_CRASHED_OUTPUT,
     XDIST_IN_FLIGHT_NODEID,
     XDIST_MAX_WORKERS_REACHED_OUTPUT,
     XDIST_Q_KILLED_AFTER_RECOVERED_CRASH_OUTPUT,
+    XDIST_Q_MAXFAIL_REAL_FAILED_LINE,
     XDIST_Q_RECOVERED_OUTPUT,
+    XDIST_Q_RECOVERED_THEN_MAXFAIL_STOPPED_OUTPUT,
     XDIST_Q_TRUNCATED_AT_LINE_EDGE_OUTPUT,
     XDIST_Q_TRUNCATED_OUTPUT,
+    XDIST_RESTART_DISABLED_MESSAGE,
     XDIST_SESSION_ABORTED_OUTPUT,
     XDIST_WORKER_CRASH_OUTPUT,
     XDIST_WORKER_REPLACED_OUTPUT,
@@ -2511,6 +2515,21 @@ class TestExtractCauseHint:
             f'{WORKER_DEATH_SUMMARY_MARKER}; worker gw3 crashed and worker restarting disabled'
         ), f'Unexpected hint: {hint!r}'
 
+    def test_bailout_literal_outranks_the_stopped_progress_line(self):
+        """PRECEDENCE, pinned: a default-verbosity bailout prints the literal
+        AND stops pytest's final progress line short, so both witnesses hold.
+        The literal is quoted, keeping every hint it produced before -q
+        detection existed byte-for-byte."""
+        output = XDIST_BAILOUT_WITH_STOPPED_PROGRESS_OUTPUT
+        progress_witness_only = output.replace(XDIST_RESTART_DISABLED_MESSAGE, '')
+        assert _extract_cause_hint(progress_witness_only) == (
+            f'{WORKER_DEATH_SUMMARY_MARKER}; run stopped at 49% of collected tests'
+        ), 'the specimen no longer satisfies the progress witness on its own'
+        hint = _extract_cause_hint(output)
+        assert hint == f'{WORKER_DEATH_SUMMARY_MARKER}; {XDIST_RESTART_DISABLED_MESSAGE}', (
+            f'Unexpected hint: {hint!r}'
+        )
+
 
 # ---------------------------------------------------------------------------
 # task 5082 step-7: `_summarize_checks` must not assert a COMPLETE verdict for
@@ -2892,6 +2911,22 @@ class TestWorkerDeathTruncationWithoutTheBailoutLine:
         assert result.summary == 'Failures: tests failed', (
             f'Unexpected summary: {result.summary!r}'
         )
+
+    def test_a_maxfail_stop_after_a_recovered_crash_is_labelled_without_masking(self):
+        """ACCEPTED RESIDUAL, pinned: once xdist has replaced a crashed worker,
+        a -x/--maxfail stop satisfies all three witness facts, so the leg is
+        labelled. Its tally IS partial; only the named cause is imprecise. The
+        real failure that stopped the run must still be reported beside it."""
+        output = XDIST_Q_RECOVERED_THEN_MAXFAIL_STOPPED_OUTPUT
+        summary = _test_leg_result(output).summary
+        fragments = summary.removeprefix('Failures: ').split(', ')
+        assert fragments[0] == 'tests failed', f'Unexpected summary: {summary!r}'
+        assert WORKER_DEATH_SUMMARY_MARKER in fragments[1], f'Unexpected summary: {summary!r}'
+        hint = _extract_cause_hint(output)
+        assert hint == (
+            f'{WORKER_DEATH_SUMMARY_MARKER}; '
+            f'first surviving failure: {XDIST_Q_MAXFAIL_REAL_FAILED_LINE.strip()}'
+        ), f'Unexpected hint: {hint!r}'
 
     def test_a_run_stopped_short_without_a_worker_crash_is_not_labelled(self):
         """An -x/--maxfail stop: progress below 100% alone is never enough."""
