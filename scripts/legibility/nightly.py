@@ -51,6 +51,7 @@ from legibility import (  # noqa: E402
     inventory,
     sampling,
     trickle_state,
+    unlanded,
 )
 from legibility.config import (  # noqa: E402
     LegibilityConfig,
@@ -866,6 +867,12 @@ class NightlyResult:
     digested nothing despite real signal arriving. Different predicate,
     different window, different remedy prompt."""
 
+    rollback: unlanded.Rollback | None = None
+    """What this run did with a codebook dump whose commit did not land: where
+    the refused dump was quarantined and whether the checkout is back at HEAD.
+    Set only on the commit-failure branch; a structured fact rather than the
+    escalation prose that also carries it."""
+
 
 def _report_sample_outcome(
     cfg: LegibilityConfig,
@@ -1558,13 +1565,19 @@ def run_nightly(
                 message = f'legibility: nightly trickle sightings for {target_date.isoformat()}'
                 commit_result = commit_fn(cfg.project_root, [_CODEBOOK_RELPATH], message)
                 if not commit_result.ok:
-                    # The dump already landed in the working tree; only the
-                    # commit itself failed (e.g. a persistent ref-lock after
-                    # exhausted retries). Fail loud (decision 8) -- the
-                    # escalation + non-zero exit is the signal; the uncommitted
-                    # dump is left in place rather than reverted.
+                    # Fail loud (decision 8), and never leave the refused dump
+                    # in the checkout (reify docs/legibility/landing-contract.md
+                    # R4): left there it blocked the target's redeploy, tripped
+                    # the orchestrator's dirty-tree escalation and was
+                    # re-submitted the next night.
+                    rollback = unlanded.roll_back(
+                        cfg.project_root, [_CODEBOOK_RELPATH],
+                        project_id=cfg.project_id,
+                        label=f'trickle-{target_date.isoformat()}',
+                    )
                     summary = 'legibility trickle codebook commit failed'
-                    escalated = post_escalation(cfg, summary, commit_result.stderr, poster=poster)
+                    detail = f'{commit_result.stderr}\n\n{rollback.describe()}'
+                    escalated = post_escalation(cfg, summary, detail, poster=poster)
                     result = NightlyResult(
                         exit_code=1,
                         applied=applied,
@@ -1572,6 +1585,7 @@ def run_nightly(
                         escalated=escalated or suppression_escalated or deletion_escalated,
                         budget_suppressed=budget_suppressed,
                         reason=summary,
+                        rollback=rollback,
                     )
                     return result
                 commit_made = True
