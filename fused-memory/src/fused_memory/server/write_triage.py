@@ -53,11 +53,11 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from shared.storm_counter import StormCounter
 
+from fused_memory.middleware._folded_escalation import file_folded_escalation
 from fused_memory.models.enums import MEM0_PRIMARY
 from fused_memory.server.grouped_read import (
     CHILD_KINDS,
@@ -82,23 +82,8 @@ from fused_memory.server.near_duplicate_guard import _cosine_of
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
-
     from fused_memory.models.memory import MemoryResult
     from fused_memory.services.memory_service import SearchResults
-
-# Defensive import of the optional ``escalation`` workspace package, copied
-# from markup_tripwire.py (which took it from middleware/candidate_key_
-# escalation.py): when it is missing — minimal CI envs, deployments that never
-# installed it — the storm escalation degrades to a logged no-op. This module
-# sits on the MCP write path, and by the time escalation is attempted the
-# write has ALREADY been stored, so nothing here may change its outcome.
-try:
-    from escalation.models import Escalation  # type: ignore[import-untyped]
-    from escalation.queue import EscalationQueue  # type: ignore[import-untyped,no-redef]
-    HAS_ESCALATION = True
-except ImportError:  # pragma: no cover — exercised only in minimal envs
-    HAS_ESCALATION = False
 
 logger = logging.getLogger(__name__)
 
@@ -936,24 +921,11 @@ def _record_fail_open(
 
 # --- the storm escalation (INV-4) ------------------------------------------
 #
-# Escalation wiring copied shape-for-shape from
-# ``markup_tripwire.emit_markup_storm_escalation``, which took it from
-# ``middleware/candidate_key_escalation.py``.
-#
 # _ANCHOR_TASK_ID is a stable per-project anchor (not a real task id) so the
 # resulting ids form one greppable ``esc-write-triage-fail-open-N`` series and
-# the dedup check has something to key on.
-#
-# It is THIS LEAF'S OWN and is shared with nobody, which is load-bearing rather
-# than tidy. Measured: the L1 escalation watcher files its own cluster records
-# under the ``markup-tripwire`` anchor and SQUATS it — the tripwire filed
-# nothing 2026-08-16..2026-08-19 while 41 rejections occurred, all 17 records
-# sitting at dedupe_count 0. A filer that dedupes against an anchor somebody
-# else keeps open never files again, and the resulting silence is
-# indistinguishable from health. That incident is why
-# ``emit_markup_storm_escalation`` grew its ``anchor_task_id`` parameter, and
-# it is why "simplifying" this into a shared anchor would disable the alarm.
-_QUEUE_DIRNAME: str = 'data/escalations'
+# the dedup check has something to key on. It must be shared with nobody: a
+# filer deduping against an anchor somebody else keeps open never files again
+# — see the ``middleware/_folded_escalation`` module docstring.
 _ANCHOR_TASK_ID: str = 'write-triage-fail-open'
 _AGENT_ROLE: str = 'fused-memory/write-triage'
 _CATEGORY: str = 'write_triage_fail_open_storm'
@@ -985,51 +957,6 @@ def emit_triage_fail_open_storm_escalation(
     window, so those collapse into the single open record until an operator
     resolves it.
     """
-    if project_root is None:
-        logger.debug(
-            'write_triage: no project_root resolved; fail-open storm %r will '
-            'not be escalated',
-            storm,
-        )
-        return None
-    if not HAS_ESCALATION:
-        logger.debug(
-            'write_triage: escalation package unavailable; fail-open storm %r '
-            'in project_root=%r will not be escalated',
-            storm, project_root,
-        )
-        return None
-
-    try:
-        queue = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)
-    except Exception:
-        logger.exception(
-            'write_triage: failed to open the escalation queue for '
-            'project_root=%r; fail-open storm %r not escalated',
-            project_root, storm,
-        )
-        return None
-
-    # Best-effort dedup: a read failure falls THROUGH to filing rather than
-    # bailing out — losing duplicate-suppression is strictly better than losing
-    # the alarm for a degradation that is happening right now.
-    try:
-        existing = queue.get_by_task(_ANCHOR_TASK_ID, status='pending')
-    except Exception:
-        logger.exception(
-            'write_triage: failed to check for an existing open fail-open '
-            'escalation for project_root=%r; proceeding to file a new one',
-            project_root,
-        )
-        existing = []
-    if existing:
-        logger.info(
-            'write_triage: %s already open for project_root=%r (storm %r now); '
-            'not filing a duplicate',
-            existing[0].id, project_root, storm,
-        )
-        return existing[0].id
-
     count = storm.get('count')
     window_seconds = storm.get('window_seconds')
     detail = '\n'.join([
@@ -1076,41 +1003,27 @@ def emit_triage_fail_open_storm_escalation(
         "against that PRD's open leaves.",
     ])
 
-    try:
-        esc = Escalation(  # type: ignore[possibly-unbound]
-            id=queue.make_id(_ANCHOR_TASK_ID),
-            task_id=_ANCHOR_TASK_ID,
-            agent_role=_AGENT_ROLE,
-            severity='blocking',
-            category=_CATEGORY,
-            summary=(
-                f'{count} add_memory write(s) triaged WITHOUT triage in '
-                f'{window_seconds}s — write triage is failing open '
-                f'(see {_PRD_PATH})'
-            ),
-            detail=detail,
-            suggested_action=(
-                'check MemoryService.search / mem0 reachability, then the '
-                "judge; grep the logs for 'write_triage fail-open at stage=' "
-                'for the failing stage. To stop triage deliberately, set '
-                'write_triage.enabled: false (green-tier hot-reloadable)'
-            ),
-            level=1,
-        )
-        esc_id = queue.submit(esc)
-    except Exception:
-        # A queue I/O failure must not propagate: the write has already been
-        # stored, and the WARNING/ERROR log at the fail-open site has already
-        # recorded the burst. The operator simply loses the queued heads-up.
-        logger.exception(
-            'write_triage: failed to submit fail-open storm escalation for '
-            'project_root=%r (storm %r)',
-            project_root, storm,
-        )
-        return None
 
-    logger.warning(
-        'write_triage: queued %s for project_root=%r (fail-open storm %r)',
-        esc_id, project_root, storm,
+    return file_folded_escalation(
+        project_root,
+        anchor_task_id=_ANCHOR_TASK_ID,
+        agent_role=_AGENT_ROLE,
+        category=_CATEGORY,
+        severity='blocking',
+        summary=(
+            f'{count} add_memory write(s) triaged WITHOUT triage in '
+            f'{window_seconds}s — write triage is failing open '
+            f'(see {_PRD_PATH})'
+        ),
+        detail=detail,
+        suggested_action=(
+            'check MemoryService.search / mem0 reachability, then the '
+            "judge; grep the logs for 'write_triage fail-open at stage=' "
+            'for the failing stage. To stop triage deliberately, set '
+            'write_triage.enabled: false (green-tier hot-reloadable)'
+        ),
+        logger=logger,
+        log_label='write_triage',
+        context=f'fail-open storm {storm!r}',
+        level=1,
     )
-    return esc_id

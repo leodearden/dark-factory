@@ -432,11 +432,7 @@ class TestUnknownKeyStormDetectorDelegatesToTheSharedStormCounter:
 
 
 class TestFileUnknownKeyStormEscalation:
-    """Direct port of ``middleware/candidate_key_escalation.py``.
-
-    Same optional-import guard, same stable anchor, same open-escalation
-    dedup, same hard never-raises contract.
-    """
+    """End-to-end against a real queue: what the census actually files."""
 
     def _file(self, tmp_path, *, project_id='dark_factory', agent_id='claude-x',
               keys=('weird_key', 'other_key')):
@@ -448,110 +444,34 @@ class TestFileUnknownKeyStormEscalation:
             str(tmp_path), project_id=project_id, agent_id=agent_id, keys=list(keys)
         )
 
-    def test_files_one_escalation_naming_the_writer_and_the_keys(self, tmp_path, monkeypatch):
-        import fused_memory.services.memory_metadata_census as census
+    @staticmethod
+    def _filed(tmp_path) -> list[dict]:
+        import json
 
-        submitted = []
+        return [
+            json.loads(f.read_text())
+            for f in sorted((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+        ]
 
-        class _Queue:
-            def __init__(self, path):
-                self.path = path
-
-            def get_by_task(self, task_id, status=None):
-                return []
-
-            def make_id(self, task_id):
-                return f'esc-{task_id}-1'
-
-            def submit(self, esc):
-                submitted.append(esc)
-                return esc.id
-
-        monkeypatch.setattr(census, 'HAS_ESCALATION', True)
-        monkeypatch.setattr(census, 'EscalationQueue', _Queue)
+    def test_files_one_escalation_naming_the_writer_and_the_keys(self, tmp_path):
+        pytest.importorskip('escalation')
 
         esc_id = self._file(tmp_path, project_id='dark_factory', agent_id='claude-drifter')
-        assert len(submitted) == 1
-        esc = submitted[0]
-        assert esc_id == esc.id
+
+        filed = self._filed(tmp_path)
+        assert len(filed) == 1
+        esc = filed[0]
+        assert esc_id == esc['id']
         # The summary must identify WHO is drifting — an escalation that
         # only says "a storm happened" leaves the operator to go find the
         # writer by hand, which is the whole job.
-        assert 'dark_factory' in esc.summary
-        assert 'claude-drifter' in esc.summary
-        blob = f'{esc.summary}\n{esc.detail}'
+        assert 'dark_factory' in esc['summary']
+        assert 'claude-drifter' in esc['summary']
+        blob = f"{esc['summary']}\n{esc['detail']}"
         assert 'weird_key' in blob
         assert 'other_key' in blob
 
-    def test_dedups_against_an_already_open_escalation(self, tmp_path, monkeypatch):
-        """A persistent drift must not mint a fresh escalation per restart."""
-        import fused_memory.services.memory_metadata_census as census
-
-        submitted = []
-
-        class _Existing:
-            id = 'esc-memory-metadata-unknown-key-storm-1'
-
-        class _Queue:
-            def __init__(self, path):
-                pass
-
-            def get_by_task(self, task_id, status=None):
-                return [_Existing()]
-
-            def make_id(self, task_id):
-                return 'esc-new-should-not-be-used'
-
-            def submit(self, esc):  # pragma: no cover — must not be reached
-                submitted.append(esc)
-                return esc.id
-
-        monkeypatch.setattr(census, 'HAS_ESCALATION', True)
-        monkeypatch.setattr(census, 'EscalationQueue', _Queue)
-
-        esc_id = self._file(tmp_path)
-        assert submitted == []
-        assert esc_id == _Existing.id
-
-    def test_uses_a_stable_greppable_per_writer_anchor(self, tmp_path, monkeypatch):
-        """One greppable family prefix, scoped down to the writer.
-
-        The three call sites (dedup query / id mint / stored task_id) must
-        agree — a mismatch would make the dedup query look for an anchor
-        nothing is ever filed under, silently disabling it.
-        """
-        import fused_memory.services.memory_metadata_census as census
-
-        seen = {}
-
-        class _Queue:
-            def __init__(self, path):
-                pass
-
-            def get_by_task(self, task_id, status=None):
-                seen['queried'] = task_id
-                return []
-
-            def make_id(self, task_id):
-                seen['minted'] = task_id
-                return f'esc-{task_id}-1'
-
-            def submit(self, esc):
-                seen['task_id'] = esc.task_id
-                return esc.id
-
-        monkeypatch.setattr(census, 'HAS_ESCALATION', True)
-        monkeypatch.setattr(census, 'EscalationQueue', _Queue)
-
-        self._file(tmp_path, project_id='dark_factory', agent_id='claude-x')
-        expected = 'memory-metadata-unknown-key-storm-dark-factory-claude-x'
-        assert seen['queried'] == expected
-        assert seen['minted'] == expected
-        assert seen['task_id'] == expected
-        # The family prefix stays intact, so one grep still finds the series.
-        assert expected.startswith('memory-metadata-unknown-key-storm')
-
-    def test_two_different_writers_get_two_escalations(self, tmp_path, monkeypatch):
+    def test_two_different_writers_get_two_escalations(self, tmp_path):
         """A global anchor would mask every writer after the first.
 
         The escalation's whole job is to name WHICH writer is drifting. With
@@ -559,31 +479,7 @@ class TestFileUnknownKeyStormEscalation:
         B's crossing and B survives only in an INFO log line — the operator
         sees one culprit named and no signal that anyone else crossed.
         """
-        import fused_memory.services.memory_metadata_census as census
-
-        open_by_task = {}
-
-        class _Existing:
-            def __init__(self, esc_id):
-                self.id = esc_id
-
-        class _Queue:
-            def __init__(self, path):
-                pass
-
-            def get_by_task(self, task_id, status=None):
-                found = open_by_task.get(task_id)
-                return [found] if found else []
-
-            def make_id(self, task_id):
-                return f'esc-{task_id}-1'
-
-            def submit(self, esc):
-                open_by_task[esc.task_id] = _Existing(esc.id)
-                return esc.id
-
-        monkeypatch.setattr(census, 'HAS_ESCALATION', True)
-        monkeypatch.setattr(census, 'EscalationQueue', _Queue)
+        pytest.importorskip('escalation')
 
         first = self._file(tmp_path, agent_id='claude-drifter-a')
         second = self._file(tmp_path, agent_id='claude-drifter-b')
@@ -594,14 +490,14 @@ class TestFileUnknownKeyStormEscalation:
         assert first is not None
         assert second is not None
         assert first != second, 'the second writer must not be folded into the first'
-        assert len(open_by_task) == 2
+        assert len(self._filed(tmp_path)) == 2
         assert 'claude-drifter-a' in first
         assert 'claude-drifter-b' in second
 
         # ...while a REPEAT from the same writer still dedups, so one writer
         # cannot flood the queue.
         assert self._file(tmp_path, agent_id='claude-drifter-a') == first
-        assert len(open_by_task) == 2
+        assert len(self._filed(tmp_path)) == 2
 
     def test_anchor_slugs_unsafe_writer_ids(self):
         """The anchor becomes a `.seq` FILENAME via `make_id`.
@@ -625,78 +521,92 @@ class TestFileUnknownKeyStormEscalation:
 
         assert writer_anchor_task_id('p', None).endswith('-unset')
 
-    def test_returns_none_and_never_raises_without_the_escalation_package(
-        self, tmp_path, monkeypatch, caplog
+
+class TestDelegatesToTheSharedHelper:
+    """What the census forwards to `file_folded_escalation` — above all its
+    COMPUTED per-writer anchor, which `writer_anchor_task_id`'s docstring
+    records as load-bearing rather than tidy: a global anchor would fold every
+    later writer's crossing into the first writer's still-open escalation,
+    leaving writers B..N visible only in an INFO line.
+    """
+
+    def _file(self, tmp_path, *, project_id='dark_factory', agent_id='claude-x',
+              keys=('weird_key', 'other_key')):
+        from fused_memory.services.memory_metadata_census import (
+            file_unknown_key_storm_escalation,
+        )
+
+        return file_unknown_key_storm_escalation(
+            str(tmp_path), project_id=project_id, agent_id=agent_id, keys=list(keys)
+        )
+
+    def test_forwards_the_computed_per_writer_anchor_and_this_modules_identity(
+        self, tmp_path, monkeypatch,
     ):
-        """This runs on the LIVE memory write path.
-
-        A raise here would turn a census warning into a lost memory — the
-        write would fail because the *complaint about* the write failed.
-        Asserted by calling inside a try that fails the test on ANY
-        exception, rather than by pytest.raises-style narrowing.
-        """
         import fused_memory.services.memory_metadata_census as census
 
-        caplog.set_level(logging.DEBUG, logger=_CENSUS_LOGGER)
-        monkeypatch.setattr(census, 'HAS_ESCALATION', False)
-        try:
-            result = self._file(tmp_path)
-        except Exception as exc:  # pragma: no cover — the contract being pinned
-            pytest.fail(f'must never raise on the live write path, got {exc!r}')
-        assert result is None
-        assert caplog.records, 'a degraded no-op must still leave a trace'
+        seen: dict = {}
 
-    def test_returns_none_and_never_raises_on_queue_io_failure(self, tmp_path, monkeypatch):
+        def _spy(project_root, **kwargs):
+            seen['project_root'] = project_root
+            seen.update(kwargs)
+            return 'esc-anything-1'
+
+        monkeypatch.setattr(census, 'file_folded_escalation', _spy)
+
+        result = self._file(tmp_path, project_id='dark_factory', agent_id='claude-drifter')
+
+        assert result == 'esc-anything-1'
+        # The COMPUTED anchor, not the series base name: passing the bare
+        # prefix would restore exactly the masking the per-writer keying
+        # exists to remove.
+        assert seen['anchor_task_id'] == (
+            'memory-metadata-unknown-key-storm-dark-factory-claude-drifter'
+        )
+        assert seen['agent_role'] == 'fused-memory/memory-metadata-census'
+        assert seen['category'] == 'memory_metadata_unknown_key_storm'
+        assert seen['severity'] == 'info'
+        assert seen['level'] == 1
+        assert seen['project_root'] == str(tmp_path)
+
+    def test_two_writers_in_one_project_get_two_different_anchors(
+        self, tmp_path, monkeypatch,
+    ):
+        """The census docstring states the per-writer keying exists so a
+        second, different drifting writer is not masked — the anchor-collision
+        hazard in its per-writer form."""
         import fused_memory.services.memory_metadata_census as census
 
-        class _Queue:
-            def __init__(self, path):
-                pass
+        anchors: list = []
 
-            def get_by_task(self, task_id, status=None):
-                return []
+        def _spy(_project_root, **kwargs):
+            anchors.append(kwargs['anchor_task_id'])
+            return 'esc-anything-1'
 
-            def make_id(self, task_id):
-                return 'esc-x-1'
+        monkeypatch.setattr(census, 'file_folded_escalation', _spy)
+        self._file(tmp_path, project_id='dark_factory', agent_id='writer-a')
+        self._file(tmp_path, project_id='dark_factory', agent_id='writer-b')
 
-            def submit(self, esc):
-                raise OSError('disk on fire')
+        assert len(anchors) == 2
+        assert anchors[0] != anchors[1], (
+            f'two writers in one project must not fold together: {anchors!r}'
+        )
+        assert 'writer-a' in anchors[0] and 'writer-b' in anchors[1]
 
-        monkeypatch.setattr(census, 'HAS_ESCALATION', True)
-        monkeypatch.setattr(census, 'EscalationQueue', _Queue)
-
-        try:
-            result = self._file(tmp_path)
-        except Exception as exc:  # pragma: no cover — the contract being pinned
-            pytest.fail(f'queue I/O failure must not propagate, got {exc!r}')
-        assert result is None
-
-    def test_a_dedup_read_failure_falls_through_to_filing(self, tmp_path, monkeypatch):
-        """Best-effort dedup: a read failure must not suppress the escalation.
-
-        Mirrors the precedent — failing closed here would mean a broken
-        queue read silently swallows the storm signal entirely.
-        """
+    def test_forwards_the_key_list_and_detail_it_builds(
+        self, tmp_path, monkeypatch,
+    ):
         import fused_memory.services.memory_metadata_census as census
 
-        submitted = []
+        seen: dict = {}
 
-        class _Queue:
-            def __init__(self, path):
-                pass
+        def _spy(_project_root, **kwargs):
+            seen.update(kwargs)
+            return 'esc-anything-1'
 
-            def get_by_task(self, task_id, status=None):
-                raise OSError('cannot read queue')
+        monkeypatch.setattr(census, 'file_folded_escalation', _spy)
+        self._file(tmp_path, keys=('weird_key', 'other_key'))
 
-            def make_id(self, task_id):
-                return 'esc-x-1'
-
-            def submit(self, esc):
-                submitted.append(esc)
-                return esc.id
-
-        monkeypatch.setattr(census, 'HAS_ESCALATION', True)
-        monkeypatch.setattr(census, 'EscalationQueue', _Queue)
-
-        assert self._file(tmp_path) == 'esc-x-1'
-        assert len(submitted) == 1
+        assert 'weird_key' in seen['detail'] and 'other_key' in seen['detail']
+        assert 'weird_key' in seen['summary']
+        assert 'memory_metadata_census' in seen['log_label']

@@ -259,10 +259,8 @@ class TestEmitMarkupStormEscalation:
     def test_files_one_escalation_routing_at_the_live_owner_and_the_storm_numbers(
         self, tmp_path
     ):
+        pytest.importorskip('escalation')
         esc_id = emit_markup_storm_escalation(str(tmp_path), _STORM)
-        if not markup_tripwire.HAS_ESCALATION:
-            assert esc_id is None
-            return
 
         assert isinstance(esc_id, str)
         queue_dir = tmp_path / 'data' / 'escalations'
@@ -375,10 +373,7 @@ class TestEmitMarkupStormEscalation:
         The stem is applied only to outcomes that do not carry it themselves,
         which is why it is derived from *outcome* rather than hardcoded.
         """
-        if not markup_tripwire.HAS_ESCALATION:
-            storm = {**_REJECTED_STORM, 'outcome': outcome}
-            assert emit_markup_storm_escalation(str(tmp_path), storm) is None
-            return
+        pytest.importorskip('escalation')
 
         payload = self._filed(tmp_path, {**_REJECTED_STORM, 'outcome': outcome})
 
@@ -411,9 +406,7 @@ class TestEmitMarkupStormEscalation:
         summary` is vacuous here, because 'window_seconds=3600.0' and the
         routing text both carry a 3.
         """
-        if not markup_tripwire.HAS_ESCALATION:
-            assert emit_markup_storm_escalation(str(tmp_path), _REJECTED_STORM) is None
-            return
+        pytest.importorskip('escalation')
 
         payload = self._filed(tmp_path, _REJECTED_STORM)
 
@@ -446,8 +439,7 @@ class TestEmitMarkupStormEscalation:
         Keying the dedup on (anchor, outcome) instead would need
         ``markup_guard``'s sink, which this task does not hold.
         """
-        if not markup_tripwire.HAS_ESCALATION:
-            pytest.skip('escalation package unavailable in this environment')
+        pytest.importorskip('escalation')
 
         first = emit_markup_storm_escalation(str(tmp_path), _REPAIRED_STORM)
         with caplog.at_level('ERROR', logger='fused_memory.server.markup_tripwire'):
@@ -508,9 +500,7 @@ class TestEmitMarkupStormEscalation:
         triaged off a summary that answered 'how many' with a number pooled
         across two projects and named no scope at all.
         """
-        if not markup_tripwire.HAS_ESCALATION:
-            assert emit_markup_storm_escalation(str(tmp_path), _REJECTED_STORM) is None
-            return
+        pytest.importorskip('escalation')
 
         summary = self._filed(tmp_path, _REJECTED_STORM)['summary']
 
@@ -548,9 +538,7 @@ class TestEmitMarkupStormEscalation:
         and 'markup_guard_storm' — so the correct text is precedent here, not
         invention.
         """
-        if not markup_tripwire.HAS_ESCALATION:
-            assert emit_markup_storm_escalation(str(tmp_path), _REJECTED_STORM) is None
-            return
+        pytest.importorskip('escalation')
 
         payload = self._filed(tmp_path, _REJECTED_STORM)
         pointers = f'{payload["detail"]}\n{payload["suggested_action"]}'
@@ -580,8 +568,7 @@ class TestEmitMarkupStormEscalation:
         confident claim about something never measured. Trading a false
         'rejected' for either is the same class of defect this task closes.
         """
-        if not markup_tripwire.HAS_ESCALATION:
-            pytest.skip('escalation package unavailable in this environment')
+        pytest.importorskip('escalation')
 
         for storm in ({}, {'count': 9}):
             queue_root = tmp_path / f'root-{len(storm)}'
@@ -649,9 +636,8 @@ class TestEmitMarkupStormEscalation:
 
     def test_escalation_id_is_greppable_via_the_stable_anchor(self, tmp_path):
         """The anchor is stable so ids form one greppable series per project."""
+        pytest.importorskip('escalation')
         esc_id = emit_markup_storm_escalation(str(tmp_path), _STORM)
-        if not markup_tripwire.HAS_ESCALATION:
-            return
         assert esc_id is not None
         assert 'markup-tripwire' in esc_id, f'unexpected id shape: {esc_id!r}'
 
@@ -662,11 +648,9 @@ class TestEmitMarkupStormEscalation:
         for hours would still file an escalation every hour; the anchor dedup
         collapses those into the one open record until it is resolved.
         """
+        pytest.importorskip('escalation')
         first = emit_markup_storm_escalation(str(tmp_path), _STORM)
         second = emit_markup_storm_escalation(str(tmp_path), _STORM)
-        if not markup_tripwire.HAS_ESCALATION:
-            assert first is None and second is None
-            return
 
         assert first is not None
         assert second == first, f'expected dedup; got first={first!r} second={second!r}'
@@ -675,8 +659,7 @@ class TestEmitMarkupStormEscalation:
 
     def test_files_afresh_once_the_prior_escalation_is_resolved(self, tmp_path):
         """Dedup must not silence a NEW incident after the old one was cleared."""
-        if not markup_tripwire.HAS_ESCALATION:
-            return
+        pytest.importorskip('escalation')
         from escalation.queue import EscalationQueue
 
         first = emit_markup_storm_escalation(str(tmp_path), _STORM)
@@ -687,40 +670,6 @@ class TestEmitMarkupStormEscalation:
         assert second is not None
         assert second != first
 
-    def test_a_submit_failure_is_swallowed(self, tmp_path, monkeypatch):
-        """A broken queue must never turn a decided rejection into an exception."""
-        if not markup_tripwire.HAS_ESCALATION:
-            return
-
-        def _boom(self, esc):
-            raise OSError('disk on fire')
-
-        monkeypatch.setattr(markup_tripwire.EscalationQueue, 'submit', _boom)
-        assert emit_markup_storm_escalation(str(tmp_path), _STORM) is None
-
-    def test_a_dedup_read_failure_still_files(self, tmp_path, monkeypatch):
-        """If the dedup check itself fails, fall through and FILE.
-
-        Best-effort dedup: losing a duplicate-suppression is strictly better than
-        losing the alarm for an active leak.
-        """
-        if not markup_tripwire.HAS_ESCALATION:
-            return
-
-        def _boom(self, task_id, status=None):
-            raise OSError('cannot read queue')
-
-        monkeypatch.setattr(markup_tripwire.EscalationQueue, 'get_by_task', _boom)
-        assert emit_markup_storm_escalation(str(tmp_path), _STORM) is not None
-
-    def test_returns_none_when_the_escalation_package_is_unavailable(
-        self, tmp_path, monkeypatch
-    ):
-        """The defensive-import no-op path (minimal envs without escalation)."""
-        monkeypatch.setattr(markup_tripwire, 'HAS_ESCALATION', False)
-        assert emit_markup_storm_escalation(str(tmp_path), _STORM) is None
-        assert not (tmp_path / 'data' / 'escalations').exists()
-
     def test_tolerates_a_storm_dict_missing_keys(self, tmp_path):
         """A degenerate storm shape still files a well-formed, routable record.
 
@@ -729,8 +678,7 @@ class TestEmitMarkupStormEscalation:
         or anchor degraded along with its missing numbers could not be routed or
         deduped, which is exactly when an operator needs it most.
         """
-        if not markup_tripwire.HAS_ESCALATION:
-            pytest.skip('escalation package unavailable in this environment')
+        pytest.importorskip('escalation')
 
         esc_id = emit_markup_storm_escalation(str(tmp_path), {})
 
@@ -775,8 +723,7 @@ class TestEmitMarkupStormEscalation:
         bare substring would be satisfied by a digit or a fragment inside the
         interpolated ``tmp_path``.
         """
-        if not markup_tripwire.HAS_ESCALATION:
-            pytest.skip('escalation package unavailable in this environment')
+        pytest.importorskip('escalation')
 
         lines = self._filed(tmp_path, self._ATTRIBUTED_STORM)['detail'].splitlines()
 
@@ -795,8 +742,7 @@ class TestEmitMarkupStormEscalation:
         without ``.get`` would turn the shape this record is most needed for
         into a raise.
         """
-        if not markup_tripwire.HAS_ESCALATION:
-            pytest.skip('escalation package unavailable in this environment')
+        pytest.importorskip('escalation')
 
         for storm in ({}, {'count': 9}):
             queue_root = tmp_path / f'root-{len(storm)}'
@@ -820,8 +766,7 @@ class TestEmitMarkupStormEscalation:
         fields carry caller-supplied strings, so an unescaped newline could
         inject a spoofed line and silently disable that warning.
         """
-        if not markup_tripwire.HAS_ESCALATION:
-            pytest.skip('escalation package unavailable in this environment')
+        pytest.importorskip('escalation')
 
         spoof = 'evil\noutcome=' + repr('repaired')
         payload = self._filed(
@@ -850,8 +795,7 @@ class TestEmitMarkupStormEscalation:
         ``markup_guard_storm`` appears across detail+suggested_action, and
         demoting the instruction must not delete the token.
         """
-        if not markup_tripwire.HAS_ESCALATION:
-            pytest.skip('escalation package unavailable in this environment')
+        pytest.importorskip('escalation')
 
         payload = self._filed(tmp_path, self._ATTRIBUTED_STORM)
         action = payload['suggested_action']
@@ -876,8 +820,7 @@ class TestEmitMarkupStormEscalation:
         this field naming no outcome of its own. So the remedy names the KEYS
         to read, never their values — the values live in ``detail``.
         """
-        if not markup_tripwire.HAS_ESCALATION:
-            pytest.skip('escalation package unavailable in this environment')
+        pytest.importorskip('escalation')
 
         attributed = self._filed(tmp_path, self._ATTRIBUTED_STORM)
         degenerate_root = tmp_path / 'degenerate'
@@ -895,16 +838,14 @@ class TestEmitMarkupStormEscalation:
         The in-line write-time gate still calls this with two positional
         arguments, so a default drift here would silently re-point its records.
         """
+        pytest.importorskip('escalation')
         esc_id = emit_markup_storm_escalation(str(tmp_path), _STORM)
-        if not markup_tripwire.HAS_ESCALATION:
-            pytest.skip('escalation package unavailable in this environment')
         payload = json.loads(next((tmp_path / 'data' / 'escalations').glob('esc-*.json')).read_text())
         assert payload['task_id'] == 'markup-tripwire'
         assert 'markup-tripwire' in str(esc_id)
 
     def test_an_explicit_anchor_lands_in_both_the_task_id_and_the_id(self, tmp_path):
-        if not markup_tripwire.HAS_ESCALATION:
-            pytest.skip('escalation package unavailable in this environment')
+        pytest.importorskip('escalation')
 
         esc_id = emit_markup_storm_escalation(
             str(tmp_path), _STORM, anchor_task_id='markup-guard'
@@ -932,8 +873,7 @@ class TestEmitMarkupStormEscalation:
         So an explicit anchor must dedupe against ITSELF only: an open record on
         a DIFFERENT anchor must not suppress it.
         """
-        if not markup_tripwire.HAS_ESCALATION:
-            pytest.skip('escalation package unavailable in this environment')
+        pytest.importorskip('escalation')
 
         squatter = emit_markup_storm_escalation(str(tmp_path), _STORM)
         guard = emit_markup_storm_escalation(
@@ -948,8 +888,7 @@ class TestEmitMarkupStormEscalation:
     def test_two_bursts_on_one_explicit_anchor_still_dedupe(self, tmp_path):
         """The dedup itself must survive the parameterisation, or a leak running
         for hours files one record per window forever."""
-        if not markup_tripwire.HAS_ESCALATION:
-            pytest.skip('escalation package unavailable in this environment')
+        pytest.importorskip('escalation')
 
         first = emit_markup_storm_escalation(
             str(tmp_path), _STORM, anchor_task_id='markup-guard'
@@ -1081,3 +1020,144 @@ def test_this_module_spells_no_raw_envelope_literal():
         f'why. Offending needle(s): {hits!r}.'
     )
 
+
+
+# ---------------------------------------------------------------------------
+# What the two filers forward to `file_folded_escalation`.
+#
+# Appended at end of file, per this module's own convention above — a block
+# spliced into the middle of a class silently adopts every method below it.
+# ---------------------------------------------------------------------------
+
+
+class TestDelegatesToTheSharedHelper:
+    """Both filers forward THEIR OWN identity, each under its own anchor."""
+
+    def test_the_storm_filer_forwards_the_anchor_IT_WAS_CALLED_WITH(
+        self, tmp_path, monkeypatch,
+    ):
+        """Not the module default — the whole point of the parameter is that a
+        caller can dedupe against an anchor the L1 watcher does not squat."""
+        seen: dict = {}
+
+        def _spy(project_root, **kwargs):
+            seen['project_root'] = project_root
+            seen.update(kwargs)
+            return 'esc-markup-guard-1'
+
+        monkeypatch.setattr(markup_tripwire, 'file_folded_escalation', _spy)
+
+        result = emit_markup_storm_escalation(
+            str(tmp_path), _REJECTED_STORM, anchor_task_id='markup-guard',
+        )
+
+        assert result == 'esc-markup-guard-1'
+        assert seen['anchor_task_id'] == 'markup-guard', (
+            f'the per-call anchor must reach the helper unmodified: {seen!r}'
+        )
+        assert seen['agent_role'] == 'fused-memory/markup-tripwire'
+        assert seen['category'] == 'mcp_markup_write_storm'
+        assert seen['severity'] == 'blocking'
+        assert seen['level'] == 1
+        assert seen['project_root'] == str(tmp_path)
+
+    def test_the_storm_filer_defaults_to_its_own_module_anchor(
+        self, tmp_path, monkeypatch,
+    ):
+        seen: dict = {}
+
+        def _spy(_project_root, **kwargs):
+            seen.update(kwargs)
+            return 'esc-markup-tripwire-1'
+
+        monkeypatch.setattr(markup_tripwire, 'file_folded_escalation', _spy)
+        emit_markup_storm_escalation(str(tmp_path), _REJECTED_STORM)
+
+        assert seen['anchor_task_id'] == 'markup-tripwire'
+
+    def test_the_storm_filer_dedupes_and_keeps_its_own_fold_logging(
+        self, tmp_path, monkeypatch,
+    ):
+        """`dedupe=True` plus a non-None `on_fold`.
+
+        The hook is not decoration: the outcome-compare ERROR has to be emitted
+        on THIS module's logger, which is what
+        `test_a_second_burst_with_a_different_outcome_folds_in_and_says_so`
+        asserts by filtering caplog on
+        `r.name == 'fused_memory.server.markup_tripwire'`.
+        """
+        seen: dict = {}
+
+        def _spy(_project_root, **kwargs):
+            seen.update(kwargs)
+            return 'esc-markup-tripwire-1'
+
+        monkeypatch.setattr(markup_tripwire, 'file_folded_escalation', _spy)
+        emit_markup_storm_escalation(str(tmp_path), _REJECTED_STORM)
+
+        assert seen.get('dedupe', True) is True
+        assert seen['on_fold'] is not None, (
+            'the outcome-compare must run on the fold path, or a folded burst '
+            'of a different outcome goes unnamed in every channel'
+        )
+        assert seen['logger'] is markup_tripwire.logger
+
+    def test_the_residue_filer_opts_OUT_of_dedupe_and_forwards_the_record(
+        self, tmp_path, monkeypatch,
+    ):
+        """Each residue record is the only surviving copy of a DIFFERENT caller
+        payload, so folding two together would destroy the data the record
+        exists to preserve."""
+        seen: dict = {}
+
+        def _spy(project_root, **kwargs):
+            seen['project_root'] = project_root
+            seen.update(kwargs)
+            return 'esc-markup-residue-1'
+
+        monkeypatch.setattr(markup_tripwire, 'file_folded_escalation', _spy)
+
+        result = markup_tripwire.emit_markup_residue_escalation(
+            str(tmp_path),
+            {
+                'tool': 'add_memory',
+                'field': 'content',
+                'category': 'a_caller_supplied_category',
+                'summary': 'a caller-supplied summary',
+                'suggested_action': 'a caller-supplied remedy',
+                'level': 3,
+                'raw_value': 'payload bytes',
+            },
+        )
+
+        assert result == 'esc-markup-residue-1'
+        assert seen['dedupe'] is False, (
+            f'residue records must never fold into each other: {seen!r}'
+        )
+        assert seen['anchor_task_id'] == 'markup-residue'
+        assert seen['agent_role'] == 'fused-memory/markup-guard'
+        assert seen['category'] == 'a_caller_supplied_category'
+        assert seen['summary'] == 'a caller-supplied summary'
+        assert seen['suggested_action'] == 'a caller-supplied remedy'
+        assert seen['level'] == 3
+        assert seen['severity'] == 'blocking'
+        assert 'payload bytes' in seen['detail'], (
+            'the verbatim payload is the whole reason this record exists'
+        )
+
+    def test_the_residue_filer_falls_back_to_its_own_category_and_level(
+        self, tmp_path, monkeypatch,
+    ):
+        seen: dict = {}
+
+        def _spy(_project_root, **kwargs):
+            seen.update(kwargs)
+            return 'esc-markup-residue-1'
+
+        monkeypatch.setattr(markup_tripwire, 'file_folded_escalation', _spy)
+        markup_tripwire.emit_markup_residue_escalation(
+            str(tmp_path), {'tool': 'add_memory', 'field': 'content'},
+        )
+
+        assert seen['category'] == 'mcp_markup_residue'
+        assert seen['level'] == 2
