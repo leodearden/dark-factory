@@ -2301,7 +2301,9 @@ def _persist_attempt_logs(
       ``commands`` list containing all per-run sub-dicts.
 
     Returns the list of log paths actually written (summary.json excluded
-    so callers can pass the list straight to ``_archive_attempt_log``).
+    so callers can pass the list straight to ``_archive_attempt_log``).  The
+    summary reaches the durable archive separately, via
+    ``verify.py::_archive_attempt_summary`` at the call site.
     """
     task_dir = worktree / '.task'
     if not task_dir.is_dir():
@@ -2512,6 +2514,36 @@ def _persist_verify_plan(
             ),
             plan_dict, '_persist_verify_plan',
         )
+
+
+def _archive_attempt_summary(
+    runs: list[dict],
+    archive_root: 'Path | None',
+    task_id: str,
+    attempt_id: int,
+    category: str,
+    cause_hint: str,
+    *,
+    module_prefix: 'str | None',
+    stamp: str,
+) -> 'Path | None':
+    """Write one attempt's summary, green or red, directly into the durable archive.
+
+    Ungated on category and on ``passed``: the summary is the record of why an
+    attempt passed, failed or ran a narrower scope, and it is small.  *stamp*
+    keeps a re-run of the same attempt and prefix from overwriting the earlier
+    record.  The name is the one ``scripts/verify_budget_census.py::ARCHIVE_GLOB``
+    selects.
+    """
+    if archive_root is None:
+        return None
+    return _write_json_artifact(
+        archive_root / task_id / (
+            f'attempt-{attempt_id}{_make_infix(module_prefix)}.summary-{stamp}.json'
+        ),
+        _build_summary_payload(runs, category, cause_hint),
+        '_archive_attempt_summary',
+    )
 
 
 def _archive_merge_verify_logs(
@@ -6761,8 +6793,9 @@ async def run_verification(
                     'run_verification: merge archival error (non-fatal): %s', exc,
                 )
     elif attempt_id is not None and task_id is not None:
-        # Task path: persist to worktree/.task/verify/ then optionally copy
-        # to the durable archive when category warrants it.
+        # Task path: persist to worktree/.task/verify/, then copy the logs to
+        # the durable archive only when category warrants it; the summary is
+        # archived for every attempt, green or red.
         try:
             wt_paths = _persist_attempt_logs(
                 worktree, attempt_id, runs, category, cause_hint,
@@ -6773,6 +6806,10 @@ async def run_verification(
                 wt_paths, archive_root, task_id, attempt_id, category,
             )
             archive_log_paths = [str(p) for p in arch_paths]
+            _archive_attempt_summary(
+                runs, archive_root, task_id, attempt_id, category, cause_hint,
+                module_prefix=module_prefix, stamp=_archive_stamp(),
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning('run_verification: persistence error (non-fatal): %s', exc)
 
