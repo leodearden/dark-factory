@@ -913,7 +913,7 @@ class TestResolveRecoveryVetoStreakEscalation:
             escalation_queue=queue, task_id='3535', recovered_streak=1,
             threshold=3, filed_at={},
         ) is False
-        assert queue.get_by_task.call_count == 0
+        assert queue.method_calls == [], 'the cheap gate must touch NO queue method'
 
     def test_no_queue_is_a_silent_no_op(self, tmp_path):
         assert _resolve_streak(
@@ -925,9 +925,267 @@ class TestResolveRecoveryVetoStreakEscalation:
 
         queue = MagicMock()
         queue.get_by_task.side_effect = RuntimeError('queue wedged')
+        queue.get_pending.side_effect = RuntimeError('queue wedged')
         assert _resolve_streak(
             escalation_queue=queue, task_id='3535', recovered_streak=9, threshold=3,
         ) is False
+
+
+def _streak_role() -> str:
+    from orchestrator.recovery_emission import RECOVERY_VETO_STREAK_ROLE
+
+    return RECOVERY_VETO_STREAK_ROLE
+
+
+def _file_alarm(queue, task_id: str = '3535'):
+    """File the real streak alarm for *task_id* and return the pending record."""
+    assert _file_streak(**_streak_kwargs(queue, task_id=task_id)) is True
+    (alarm,) = queue.get_by_task(_streak_sentinel(task_id), status='pending')
+    return alarm
+
+
+def _submit(queue, esc_id: str, *, task_id: str, level: int, members=(),
+            agent_role='escalation-watcher-auto', category='risk_identified',
+            pin_declared_by=()):
+    """Submit a real record — an L2 wrapper when *members* is given."""
+    from escalation.models import Escalation
+
+    esc = Escalation(
+        id=esc_id, task_id=task_id, agent_role=agent_role, severity='blocking',
+        category=category, summary=f'{esc_id} summary', level=level,
+        members=list(members), pin_declared_by=list(pin_declared_by),
+    )
+    queue.submit(esc)
+    return esc
+
+
+def _status(queue, esc_id: str) -> str:
+    record = queue.get(esc_id)
+    assert record is not None, f'{esc_id} vanished'
+    return record.status
+
+
+class TestResolveStreakWrappersAndEchoes:
+    """Task 4541 RC#2: the release also discharges wrappers and echoes, under ANY id.
+
+    A wrapper is an L2 whose members are streak alarms.  It is discharged by
+    MEMBERSHIP — never by its category or task_id, both chosen by an LLM — and
+    only when none of its members is still pending, so the LAST recovering
+    member-task closes a shared wrapper and none closes another task's live
+    alarm.
+    """
+
+    def test_a_real_id_wrapper_is_discharged_with_its_alarm(self, tmp_path):
+        """(a) The esc-5469-11 shape: the L2 minted under the REAL task id."""
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        memo: dict[str, int] = {}
+        assert _file_streak(**_streak_kwargs(queue, filed_at=memo)) is True
+        (alarm,) = queue.get_by_task(_streak_sentinel('3535'), status='pending')
+        wrapper = _submit(queue, 'esc-3535-11', task_id='3535', level=2, members=[alarm.id])
+
+        assert _resolve_streak(
+            escalation_queue=queue, task_id='3535', recovered_streak=5,
+            threshold=3, filed_at=memo,
+        ) is True
+
+        assert _status(queue, alarm.id) != 'pending'
+        assert _status(queue, wrapper.id) != 'pending'
+
+    def test_a_sentinel_id_wrapper_is_discharged_whatever_its_category(self, tmp_path):
+        """(b) The 5542 template shape, under a category the LLM might have chosen."""
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        alarm = _file_alarm(queue)
+        wrapper = _submit(
+            queue, 'esc-wrap-1', task_id=_streak_sentinel('3535'), level=2,
+            members=[alarm.id], category='design_concern',
+        )
+
+        assert _resolve_streak(
+            escalation_queue=queue, task_id='3535', recovered_streak=5, threshold=3,
+        ) is True
+
+        assert _status(queue, wrapper.id) != 'pending'
+
+    def test_the_own_alarm_is_resolved_before_its_wrapper(self, tmp_path):
+        """(c) Attribution stays the detector's, not ``l2-cascade:<id>``."""
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        alarm = _file_alarm(queue)
+        wrapper = _submit(queue, 'esc-3535-11', task_id='3535', level=2, members=[alarm.id])
+
+        _resolve_streak(
+            escalation_queue=queue, task_id='3535', recovered_streak=5, threshold=3,
+        )
+
+        assert _status(queue, wrapper.id) != 'pending'
+        resolved_alarm = queue.get(alarm.id)
+        assert resolved_alarm is not None
+        assert resolved_alarm.resolved_by == _streak_role()
+
+    def test_a_wrapper_outliving_its_operator_resolved_member_is_discharged(
+        self, tmp_path,
+    ):
+        """(d) Nothing pending under the sentinel, yet the wrapper still closes."""
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        alarm = _file_alarm(queue)
+        wrapper = _submit(queue, 'esc-3535-11', task_id='3535', level=2, members=[alarm.id])
+        queue.resolve(alarm.id, 'looked at it', resolved_by='interactive')
+        assert queue.get_by_task(_streak_sentinel('3535'), status='pending') == []
+
+        assert _resolve_streak(
+            escalation_queue=queue, task_id='3535', recovered_streak=3, threshold=3,
+        ) is True
+
+        assert _status(queue, wrapper.id) != 'pending'
+
+    def test_a_misfiled_l1_echo_on_the_real_id_is_resolved(self, tmp_path):
+        """(e) An L1 carrying the alarm's role and category, under the REAL id."""
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        echo = _submit(
+            queue, 'esc-3535-12', task_id='3535', level=1, agent_role=_streak_role(),
+        )
+
+        assert _resolve_streak(
+            escalation_queue=queue, task_id='3535', recovered_streak=3, threshold=3,
+        ) is True
+
+        assert _status(queue, echo.id) != 'pending'
+
+    def test_a_cross_task_wrapper_waits_for_its_last_member_task(self, tmp_path):
+        """(f) NEGATIVE then POSITIVE: never close a wrapper holding a live alarm."""
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        mine = _file_alarm(queue, '3535')
+        theirs = _file_alarm(queue, '7000')
+        wrapper = _submit(
+            queue, 'esc-wrap-1', task_id=_streak_sentinel('3535'), level=2,
+            members=[mine.id, theirs.id],
+        )
+
+        _resolve_streak(
+            escalation_queue=queue, task_id='3535', recovered_streak=5, threshold=3,
+        )
+
+        assert _status(queue, wrapper.id) == 'pending'
+        assert queue.get(theirs.id) == theirs, "task 7000's live alarm must be untouched"
+
+        assert _resolve_streak(
+            escalation_queue=queue, task_id='7000', recovered_streak=5, threshold=3,
+        ) is True
+
+        assert _status(queue, wrapper.id) != 'pending'
+
+    def test_a_wrapper_mixing_in_ordinary_work_stays_pending(self, tmp_path):
+        """(g) NEGATIVE: an ordinary member means a human is still deciding something."""
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        alarm = _file_alarm(queue)
+        work = _submit(
+            queue, 'esc-3535-2', task_id='3535', level=1, agent_role='implementer',
+        )
+        wrapper = _submit(
+            queue, 'esc-3535-11', task_id='3535', level=2, members=[alarm.id, work.id],
+        )
+
+        _resolve_streak(
+            escalation_queue=queue, task_id='3535', recovered_streak=5, threshold=3,
+        )
+
+        assert _status(queue, wrapper.id) == 'pending'
+        assert _status(queue, work.id) == 'pending'
+
+    def test_unrelated_records_on_the_real_id_are_never_touched(self, tmp_path):
+        """(h) NEGATIVE: widening onto the real id must not close a human's live work."""
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        _file_alarm(queue)
+        work = _submit(
+            queue, 'esc-3535-2', task_id='3535', level=1, agent_role='implementer',
+        )
+        l2 = _submit(queue, 'esc-3535-3', task_id='3535', level=2, members=[work.id])
+        work_before, l2_before = queue.get(work.id), queue.get(l2.id)
+
+        _resolve_streak(
+            escalation_queue=queue, task_id='3535', recovered_streak=5, threshold=3,
+        )
+
+        assert queue.get(work.id) == work_before
+        assert queue.get(l2.id) == l2_before
+
+    def test_a_wrapper_with_no_readable_alarm_member_stays_pending(self, tmp_path):
+        """(i) NEGATIVE: empty members, or a member that resolves to nothing."""
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        _file_alarm(queue)
+        empty = _submit(
+            queue, 'esc-wrap-empty', task_id=_streak_sentinel('3535'), level=2,
+        )
+        ghost = _submit(
+            queue, 'esc-3535-11', task_id='3535', level=2, members=['esc-ghost-1'],
+        )
+
+        _resolve_streak(
+            escalation_queue=queue, task_id='3535', recovered_streak=5, threshold=3,
+        )
+
+        assert _status(queue, empty.id) == 'pending'
+        assert _status(queue, ghost.id) == 'pending'
+
+    def test_a_wrapper_carrying_a_declared_pin_stays_pending(self, tmp_path):
+        """(j) NEGATIVE: an auto-close never spends a pin someone declared."""
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        alarm = _file_alarm(queue)
+        wrapper = _submit(
+            queue, 'esc-3535-11', task_id='3535', level=2, members=[alarm.id],
+            pin_declared_by=['operator-gate'],
+        )
+
+        _resolve_streak(
+            escalation_queue=queue, task_id='3535', recovered_streak=5, threshold=3,
+        )
+
+        assert _status(queue, wrapper.id) == 'pending'
+
+    def test_a_failing_wrapper_pass_keeps_the_own_alarm_resolve(self, tmp_path):
+        """(k) ISOLATION: a member-read fault must not report real work as nothing."""
+        from escalation.queue import EscalationQueue
+
+        class _MemberReadsFail:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+            def get(self, esc_id):
+                raise RuntimeError('member read failed')
+
+        queue = EscalationQueue(tmp_path)
+        alarm = _file_alarm(queue)
+        wrapper = _submit(queue, 'esc-3535-11', task_id='3535', level=2, members=[alarm.id])
+
+        assert _resolve_streak(
+            escalation_queue=_MemberReadsFail(queue), task_id='3535',
+            recovered_streak=5, threshold=3,
+        ) is True
+
+        assert _status(queue, alarm.id) != 'pending'
+        assert _status(queue, wrapper.id) == 'pending'
 
 
 # ---------------------------------------------------------------------------
