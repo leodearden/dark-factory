@@ -4322,9 +4322,19 @@ def _run_lease_claim(
     # breaking a reader. The line is absent only on the fail-open path above,
     # where a substrate fault means we genuinely know nothing about a holder
     # and must not assert one either way.
+    #
+    # `holder_record=` (task 4237), last of all, is a SECOND, INDEPENDENT orphan
+    # axis: the holder's registry record, per HolderRecordState -- the
+    # claimant's own on an acquired claim, the existing holder's on a contended
+    # one. It deliberately does not change the `orphaned` predicate below: every
+    # lease claimed before LeaseHolder.record_slug existed reads `unlinked`, so
+    # requiring corroboration would silence today's orphan signal for that whole
+    # population. Reading the two lines together is the skills' job; collapsing
+    # them into one verdict is what task 3994 defect 3 forbade.
     if claim.acquired:
         print('holder_liveness=none')
         print(f'slug={slug}')
+        print(f'holder_record={claim.holder_record_state.value}')
         return
     # A SINGLE signal, deliberately: `orphaned` means exactly "the pid
     # recorded in the lease body is not running". This predicate used to
@@ -4354,6 +4364,7 @@ def _run_lease_claim(
     print(f'holder_liveness={"orphaned" if orphaned else "held"}')
     # THIS CALLER's slug, never the holder's -- see the block comment above.
     print(f'slug={slug}')
+    print(f'holder_record={claim.holder_record_state.value}')
 
 
 def _run_lease_mutation(
