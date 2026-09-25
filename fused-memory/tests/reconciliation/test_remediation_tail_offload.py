@@ -66,8 +66,8 @@ TICK_SECONDS = 0.005
 
 #: How long each stubbed blocking primitive sleeps, in the thread it should be
 #: running in — a margin over scheduler jitter, not a timing the code relies on.
-SCAN_BLOCK_SECONDS = 0.25
-PROBE_BLOCK_SECONDS = 0.25
+SCAN_BLOCK_SECONDS = 1.0
+PROBE_BLOCK_SECONDS = 1.0
 
 
 def _max_gap_ceiling(blocked_seconds: float) -> float:
@@ -361,9 +361,15 @@ class TestArchiveScanLeavesTheLoop:
     async def test_loop_keeps_ticking_while_the_archive_is_scanned(
         self, journal, event_buffer, memory_service, tmp_path, monkeypatch,
     ):
-        """250ms of scan must not cost the loop 250ms of silence."""
+        """A second of scan must not cost the loop a second of silence.
+
+        Task 901 reads as live so nothing escalates: `_escalate` still fsyncs
+        on the loop (task 5270), and under load that stall would be measured
+        instead of the scan's.
+        """
         calls: list = []
         _stub_scan(monkeypatch, calls)
+        _stub_probe(monkeypatch, [], live_ids=frozenset({'901'}), block=0.0)
         _, _, run_pass = await _prepare_pass(
             journal=journal, event_buffer=event_buffer, memory_service=memory_service,
             tmp_path=tmp_path, monkeypatch=monkeypatch,
@@ -472,17 +478,19 @@ def _stub_probe(monkeypatch, probed: list, *, live_ids: frozenset[str] = frozens
 class TestLiveWorkflowProbesLeaveTheLoopAndAreMemoised:
     """The git probes must run off-loop, and at most once per DISTINCT task id.
 
-    Today the gate re-probes per finding with no memo, so a pass over three
-    findings citing two tasks between them pays six probes of up to 30s each,
-    all of them on the event loop.
+    Without the memo, a pass over three findings citing two tasks between them
+    would pay six probes of up to 30s each.
     """
 
     @pytest.mark.asyncio
     async def test_loop_keeps_ticking_while_the_git_probes_run(
         self, journal, event_buffer, memory_service, tmp_path, monkeypatch,
     ):
+        """Both cited tasks read as live so nothing escalates: `_escalate` still
+        fsyncs on the loop (task 5270), and under load that stall would be
+        measured instead of the probes'."""
         probed: list[str] = []
-        _stub_probe(monkeypatch, probed)
+        _stub_probe(monkeypatch, probed, live_ids=frozenset({'901', '902'}))
         _, _, run_pass = await _prepare_pass(
             journal=journal, event_buffer=event_buffer, memory_service=memory_service,
             tmp_path=tmp_path, monkeypatch=monkeypatch,
