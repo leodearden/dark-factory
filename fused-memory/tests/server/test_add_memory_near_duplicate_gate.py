@@ -11,6 +11,7 @@ import ast
 import inspect
 import json
 import types
+from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -44,6 +45,7 @@ from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import AddMemoryResponse, MemoryResult
 from fused_memory.models.scope import Scope
 from fused_memory.server.tools import create_mcp_server
+from fused_memory.server.topic_cluster_store import TopicClusterStore, derive_topic_cluster
 from fused_memory.services.memory_service import RRF_K
 
 _PROJECT_ID = 'dark_factory'
@@ -1319,3 +1321,135 @@ class TestConsolidateMemoriesIsNotCaughtByThisGuard:
         assert result.get('canonical_id') == 'canonical-1', (
             f'Expected the canonical write to have landed; got: {result!r}'
         )
+
+
+_SEED_TOPIC = 'task-dir-gitignore-force-add'
+_SEED_CANONICAL = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
+_SEED_TEXTS = (
+    'Never force-add .task/plan.json: the .task/ directory is gitignored and '
+    'git add -f .task/ sweeps task metadata into the commit.',
+    'Gotcha: git add -f .task/ bypasses the gitignore and commits .task/plan.json; '
+    'stage files by name instead.',
+    'Stage by path, not with git add -f, because .task/plan.json lives under the '
+    'gitignored .task/ directory.',
+)
+_SEED_PROBE = 'Reminder: git add -f .task/ is wrong because .task/plan.json is gitignored.'
+_UNRELATED_WRITE = 'Restart the dashboard after editing its config file.'
+
+
+@pytest.fixture
+def derived_cluster_store(tmp_path: Path) -> Iterator[TopicClusterStore]:
+    cluster = derive_topic_cluster(
+        _SEED_TEXTS,
+        topic_id=_SEED_TOPIC,
+        hint=f'Known consolidated topic: amend canonical {_SEED_CANONICAL} instead.',
+    )
+    assert cluster is not None, 'fixture texts must derive a cluster'
+    store = TopicClusterStore(tmp_path / 'topic_clusters.db')
+    store.open()
+    store.upsert(
+        cluster,
+        source='consolidate_memories',
+        project_id=_PROJECT_ID,
+        canonical_id=_SEED_CANONICAL,
+        category='procedural_knowledge',
+    )
+    try:
+        yield store
+    finally:
+        store.close()
+
+
+def _derived_guard_service() -> AsyncMock:
+    mock_service = AsyncMock()
+    _configure_reconciliation(
+        mock_service,
+        procedural_knowledge_near_dup_guard_enabled=True,
+        procedural_knowledge_near_dup_threshold=0.92,
+        procedural_knowledge_topic_guard_clusters=[],
+    )
+    mock_service.search.return_value = []
+    _configure_pass_through_add_memory(mock_service)
+    return mock_service
+
+
+async def _add(server, content: str, **overrides) -> dict:
+    return await server._tool_manager.call_tool(
+        'add_memory',
+        {
+            'content': content,
+            'category': 'procedural_knowledge',
+            'agent_id': 'claude-interactive',
+            'project_id': _PROJECT_ID,
+            **overrides,
+        },
+    )
+
+
+class TestRuntimeSeededClusterBlocksAProbeWrite:
+    """A DERIVED cluster in the runtime store blocks a same-topic write end to end (task 3135).
+
+    The config seeds are empty throughout, so any block here can only come
+    from the store wired into ``create_mcp_server``.
+    """
+
+    def test_the_probe_carries_at_least_two_derived_phrases(self, derived_cluster_store):
+        (cluster,) = derived_cluster_store.list_clusters(_PROJECT_ID)
+        hits = [phrase for phrase in cluster.phrases if phrase in _SEED_PROBE.lower()]
+        assert len(hits) >= 2, (cluster.phrases, hits)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('category', ['procedural_knowledge', 'preferences_and_norms'])
+    async def test_a_same_topic_write_is_blocked_above_the_cosine_search(
+        self, derived_cluster_store, category
+    ):
+        mock_service = _derived_guard_service()
+        server = create_mcp_server(mock_service, topic_cluster_store=derived_cluster_store)
+
+        result = await _add(server, _SEED_PROBE, category=category)
+
+        assert result.get('error_type') == 'ProceduralKnowledgeKnownTopicClusterWriteRejected', result
+        assert result.get('topic_id') == _SEED_TOPIC
+        assert _SEED_CANONICAL in result.get('hint', '')
+        mock_service.add_memory.assert_not_awaited()
+        mock_service.search.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_another_projects_write_is_not_blocked(self, derived_cluster_store):
+        mock_service = _derived_guard_service()
+        server = create_mcp_server(mock_service, topic_cluster_store=derived_cluster_store)
+
+        result = await _add(server, _SEED_PROBE, project_id='reify')
+
+        assert result.get('error_type') != 'ProceduralKnowledgeKnownTopicClusterWriteRejected', result
+        mock_service.add_memory.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_an_unrelated_write_passes_through(self, derived_cluster_store):
+        mock_service = _derived_guard_service()
+        server = create_mcp_server(mock_service, topic_cluster_store=derived_cluster_store)
+
+        result = await _add(server, _UNRELATED_WRITE)
+
+        assert result.get('error_type') is None, result
+        mock_service.add_memory.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_without_a_store_the_probe_is_not_blocked(self):
+        mock_service = _derived_guard_service()
+        server = create_mcp_server(mock_service)
+
+        result = await _add(server, _SEED_PROBE)
+
+        assert result.get('error_type') != 'ProceduralKnowledgeKnownTopicClusterWriteRejected', result
+        mock_service.add_memory.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_allow_near_duplicate_exempts_a_derived_cluster_too(self, derived_cluster_store):
+        mock_service = _derived_guard_service()
+        server = create_mcp_server(mock_service, topic_cluster_store=derived_cluster_store)
+
+        result = await _add(server, _SEED_PROBE, metadata={'allow_near_duplicate': True})
+
+        assert result.get('error_type') != 'ProceduralKnowledgeKnownTopicClusterWriteRejected', result
+        mock_service.add_memory.assert_awaited_once()
