@@ -23,20 +23,27 @@ write-through in-memory cache and does no I/O.
 Cross-process caveat: the cache is hydrated at :meth:`TopicClusterStore.open`.
 Every sanctioned writer runs inside the server process, so a row written by
 another process is not seen until the server restarts.
+
+:func:`derive_topic_cluster` turns a topic's member texts into the cluster
+this store persists. It is pure and trigger-agnostic, so a second trigger
+reuses it unchanged.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
+from collections import Counter
+from collections.abc import Sequence
 from pathlib import Path
 
 from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
 
 from fused_memory.config.schema import ProceduralTopicCluster
 
-__all__ = ['TopicClusterStore', 'TopicClusterStoreError']
+__all__ = ['TopicClusterStore', 'TopicClusterStoreError', 'derive_topic_cluster']
 
 _SCHEMA = """\
 CREATE TABLE IF NOT EXISTS topic_clusters (
@@ -221,3 +228,138 @@ def _invalid_rows_message(db_path: Path, offenders: list[str]) -> str:
         f'row(s) or the file; that loses only derived clusters, which the next '
         f'consolidate_memories of each topic re-seeds.'
     )
+
+
+_MAX_NGRAM_TOKENS = 4
+_MIN_SUPPORTING_TEXTS = 2
+_MIN_DERIVED_PHRASES = 2
+_MAX_DERIVED_PHRASES = 6
+_DERIVED_MIN_PHRASE_HITS = 2
+_IDENTIFIER_PUNCTUATION = frozenset('-_./:')
+_LONG_WORD_CHARS = 10
+_MIN_DISTINCTIVE_TOKEN_CHARS = 3
+_TOKEN_RE = re.compile(r'[\w\-./:]+')
+_SENTENCE_TRAILERS = '.:'
+
+# Tokens whose SHAPE passes the distinctiveness test (identifier punctuation, a
+# digit, or a long word) yet which carry no topic signal, so they must never
+# qualify a phrase on their own.
+_GENERIC_SHAPED_TOKENS = frozenset({
+    'e.g', 'i.e', 'a.k.a', 'and/or', 'n/a', 'w/o',
+    'additionally', 'alternatively', 'automatically', 'consistently',
+    'especially', 'eventually', 'everything', 'furthermore', 'immediately',
+    'information', 'nevertheless', 'particularly', 'previously', 'regardless',
+    'specifically', 'successfully', 'understand',
+})
+
+
+def derive_topic_cluster(
+    texts: Sequence[str], *, topic_id: str, hint: str
+) -> ProceduralTopicCluster | None:
+    """Derive a conservative cluster from a topic's member texts, or ``None`` to abstain.
+
+    Every rule answers the over-blocking MEASURED in the retirement notes on
+    ``config.schema._default_topic_guard_clusters``, where a cluster built
+    from ordinary subsystem vocabulary fired 13 off-topic blocks out of 14:
+
+    * a phrase must occur in at least two DISTINCT texts, so it characterises
+      the cluster rather than one member (a duplicated input adds no support);
+    * a phrase must hold a distinctive token, which keeps generic prose out;
+    * no selected phrase nests inside another, because the matcher counts
+      substring hits and one occurrence of a longer form would score twice;
+    * at most six phrases, ``min_phrase_hits`` 2 and never any
+      ``sufficient_phrases``: promoting a phrase to sufficient is a human
+      judgement the schema reserves for identifier-shaped names;
+    * fewer than two phrases abstains, since such a cluster can never fire.
+
+    Phrases are lowercase, matching the matcher's own ``str.lower`` comparison.
+    Ranking is a total order, so the result does not depend on input order.
+    """
+    corpus = _distinct_normalised_texts(texts)
+    phrases = _select_unnested(_rank(_supported_candidates(corpus)))
+    if len(phrases) < _MIN_DERIVED_PHRASES:
+        return None
+    return ProceduralTopicCluster(
+        topic_id=topic_id,
+        phrases=phrases,
+        min_phrase_hits=_DERIVED_MIN_PHRASE_HITS,
+        sufficient_phrases=[],
+        hint=hint,
+    )
+
+
+def _distinct_normalised_texts(texts: Sequence[str]) -> list[str]:
+    return sorted({' '.join(text.lower().split()) for text in texts} - {''})
+
+
+def _tokenise(text: str) -> list[str]:
+    tokens = (raw.rstrip(_SENTENCE_TRAILERS) for raw in _TOKEN_RE.findall(text))
+    return [token for token in tokens if any(ch.isalnum() for ch in token)]
+
+
+def _ngrams(tokens: list[str]) -> set[str]:
+    return {
+        ' '.join(tokens[start:start + size])
+        for size in range(1, _MAX_NGRAM_TOKENS + 1)
+        for start in range(len(tokens) - size + 1)
+    }
+
+
+def _is_distinctive(token: str) -> bool:
+    if (
+        token in _GENERIC_SHAPED_TOKENS
+        or len(token) < _MIN_DISTINCTIVE_TOKEN_CHARS
+        or not any(ch.isalpha() for ch in token)
+    ):
+        return False
+    return (
+        any(ch in _IDENTIFIER_PUNCTUATION for ch in token)
+        or any(ch.isdigit() for ch in token)
+        or len(token) >= _LONG_WORD_CHARS
+    )
+
+
+def _distinctive_token_count(phrase: str) -> int:
+    return sum(_is_distinctive(token) for token in phrase.split(' '))
+
+
+def _supported_candidates(corpus: list[str]) -> dict[str, int]:
+    """Map each distinctive shared n-gram to the number of texts that literally contain it.
+
+    Sharing is counted on n-grams first (cheap), then confirmed with the
+    matcher's own substring test, which also drops an n-gram that spans a
+    sentence boundary and so never occurs verbatim.
+    """
+    shared = Counter(ngram for text in corpus for ngram in _ngrams(_tokenise(text)))
+    support: dict[str, int] = {}
+    for phrase, sharing_texts in shared.items():
+        if sharing_texts < _MIN_SUPPORTING_TEXTS or not _distinctive_token_count(phrase):
+            continue
+        literal = sum(phrase in text for text in corpus)
+        if literal >= _MIN_SUPPORTING_TEXTS:
+            support[phrase] = literal
+    return support
+
+
+def _rank(support: dict[str, int]) -> list[str]:
+    return sorted(
+        support,
+        key=lambda phrase: (
+            -support[phrase],
+            -_distinctive_token_count(phrase),
+            -len(phrase.split(' ')),
+            -len(phrase),
+            phrase,
+        ),
+    )
+
+
+def _select_unnested(ranked: list[str]) -> list[str]:
+    selected: list[str] = []
+    for phrase in ranked:
+        if any(phrase in kept or kept in phrase for kept in selected):
+            continue
+        selected.append(phrase)
+        if len(selected) == _MAX_DERIVED_PHRASES:
+            break
+    return selected
