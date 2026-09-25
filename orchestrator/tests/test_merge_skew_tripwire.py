@@ -409,6 +409,43 @@ class TestAbandonedOracleRegistry:
         )
 
 
+    def test_abandon_oracle_routes_through_the_shared_helper(self) -> None:
+        """Task 4530: cancel + track is the shared helper, not a local copy."""
+        import shared.asyncio_tasks
+
+        from orchestrator import merge_skew_tripwire
+
+        assert merge_skew_tripwire.abandon_task is shared.asyncio_tasks.abandon_task
+
+    @pytest.mark.asyncio
+    async def test_cleanup_hook_only_logs_and_leaves_release_to_the_shared_helper(
+        self, _drained_oracle_registry,
+    ) -> None:
+        """Releasing the strong reference is the shared done-callback's job;
+        the oracle hook releasing it too is the duplication task 4530 removed.
+        """
+        from orchestrator import merge_skew_tripwire
+
+        registry = _drained_oracle_registry
+        task = asyncio.ensure_future(asyncio.sleep(0))
+        await task
+        registry.add(task)
+        try:
+            merge_skew_tripwire._log_abandoned_oracle_cleanup(task)
+
+            assert task in registry
+        finally:
+            registry.discard(task)
+
+    def test_registry_and_backlog_threshold_stay_module_local(self) -> None:
+        """Only the helper is shared: the oracle backlog gauge must count
+        oracle tasks alone, never unrelated tasks another package tracks."""
+        from orchestrator import merge_skew_tripwire
+
+        assert isinstance(merge_skew_tripwire._ABANDONED_ORACLES, set)
+        assert isinstance(merge_skew_tripwire._ABANDONED_ORACLES_WARN_THRESHOLD, int)
+
+
 class TestComputeTripwireOverlap:
     """Unit tests for the pure ``compute_tripwire_overlap(landing_changed_files,
     inflight_diffs)``.
