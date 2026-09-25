@@ -2571,14 +2571,15 @@ def test_run_nightly_fail_loud_on_commit_failure(tmp_path):
     ).stdout.splitlines()
     assert after_log == before_log
 
-    _assert_refused_dump_rolled_back(repo, head_bytes, result)
+    quarantine_dir = _assert_refused_dump_rolled_back(repo, head_bytes, result)
     assert 'cannot lock ref (simulated)' in arguments['detail']
-    assert str(result.rollback.quarantine_dir) in arguments['detail']
+    assert str(quarantine_dir) in arguments['detail']
 
 
-def _assert_refused_dump_rolled_back(repo: Path, head_bytes: bytes, result) -> None:
+def _assert_refused_dump_rolled_back(repo: Path, head_bytes: bytes, result) -> Path:
     """The checkout is back at HEAD and the refused dump -- with the night's
-    one 'known-cause' sighting -- survives only in the quarantine."""
+    one 'known-cause' sighting -- survives only in the quarantine, whose
+    directory is returned."""
     status = subprocess.run(
         ['git', 'status', '--porcelain'], cwd=repo, check=True, capture_output=True, text=True,
     ).stdout
@@ -2594,6 +2595,7 @@ def _assert_refused_dump_rolled_back(repo: Path, head_bytes: bytes, result) -> N
     )
     entry = next(e for e in quarantined['entries'] if e['id'] == 'known-cause')
     assert [s['session'] for s in entry['sightings']] == ['session-1']
+    return rollback.quarantine_dir
 
 
 def test_run_nightly_commit_refused_by_pre_commit_hook_restores_the_checkout(tmp_path):
@@ -2645,11 +2647,11 @@ def test_run_nightly_commit_refused_by_pre_commit_hook_restores_the_checkout(tmp
         ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
     ).stdout.splitlines()
     assert after_log == before_log
-    _assert_refused_dump_rolled_back(repo, head_bytes, result)
+    quarantine_dir = _assert_refused_dump_rolled_back(repo, head_bytes, result)
     assert len(escalation_calls) == 1
     detail = escalation_calls[0][1]['params']['arguments']['detail']
     assert 'cited-test-path gate' in detail
-    assert str(result.rollback.quarantine_dir) in detail
+    assert str(quarantine_dir) in detail
 
     # The next night starts from HEAD, not from the refused dump.
     hook.unlink()
