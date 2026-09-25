@@ -8313,6 +8313,23 @@ class TestArchiveMergeVerifyLogs:
                 f'Expected attempt-5 in filename, got: {Path(p).name!r}'
             )
 
+    def test_summary_and_logs_of_one_run_share_one_stamp(self, tmp_path: Path):
+        """A reader joins a merge run's logs to its summary by the shared stamp."""
+        runs = _make_runs(test_rc=1, include_lint=True)
+        archive_root = tmp_path / 'data' / 'verify-logs'
+        self._archive(runs, archive_root, '1768', 1, 'test_failure', module_prefix='pkg')
+
+        task_dir = archive_root / '1768'
+        summaries = list(task_dir.glob('attempt-1.pkg.summary-*.json'))
+        assert len(summaries) == 1, f'Expected exactly one summary, got {summaries}'
+        stamp = summaries[0].name.split('summary-', 1)[1].removesuffix('.json')
+        logs = list(task_dir.glob('*.log'))
+        assert logs, f'Expected archived logs in {task_dir}'
+        for log in logs:
+            assert log.name.endswith(f'-{stamp}.log'), (
+                f'log {log.name!r} does not carry the summary stamp {stamp!r}'
+            )
+
 
 # ---------------------------------------------------------------------------
 # Shared helpers for TestVerifyPipelineGuard / TestMergeGuard* test classes
