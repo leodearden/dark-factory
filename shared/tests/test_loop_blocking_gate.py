@@ -1203,7 +1203,7 @@ class TestScanHelperStaysInGateScope:
         Same falsifiable property as the 4201 floor above: a site an in-flight
         task owns must keep a row saying so, rather than being re-blessed as
         ``accepted`` -- a permanent waiver for a defect somebody is fixing.
-        Task 5550 BOUNDED these to one archive walk per run but left them
+        Task 5550 memoised their archive walk per run but left every miss
         blocking, so they stay ``filed`` and stay 5270's.
         """
         filed_keys = {

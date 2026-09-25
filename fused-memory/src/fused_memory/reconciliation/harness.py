@@ -273,11 +273,6 @@ _MAX_BACKLOG_REMEDIATION_DEFERRALS = _INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 3
 # robustly inside/outside any reasonable 24h window).
 _RESOLVED_RECURRENCE_WINDOW_SECONDS = 86400  # 24h
 
-# Task 5550: the same policy as a timedelta, derived once.  Both accessors of
-# the escalation-archive scan — the async `_recently_resolved_fingerprints` and
-# its sync twin — pass this, so the window they enforce cannot drift apart.
-_RESOLVED_RECURRENCE_WINDOW = timedelta(seconds=_RESOLVED_RECURRENCE_WINDOW_SECONDS)
-
 # Task 1970 amendment (reviewer_comprehensive): coarse safety net for a
 # runaway Stage 3 that stops citing anything — i.e. a finding that was NEVER
 # cited at all.  Task 4781 gave the other referenceless cause (a finding that
@@ -916,101 +911,44 @@ class ReconciliationHarness:
         # still be re-filed.  Cleared when a graph recovers, so a later re-drift
         # is loud again.
         self._last_missing_indices: dict[str, tuple] = {}
-        # Task 5550: the single-slot cache behind both accessors of the
-        # escalation-archive scan, holding `(scan_key, str(queue_dir),
-        # fingerprints)`.  ONE slot, not a dict: a new scan_key evicts the old
-        # one, so the state is O(1) and self-evicting — nothing grows and
-        # nothing needs sweeping.
-        #
-        # SEMANTICS, because they are what a reader cannot infer: the scan
-        # happens at most ONCE PER scan_key, which callers set to the run_id.
-        # That is exactly the per-pass snapshot semantics `resolved_fps` has had
-        # since task 1669 ("built once per remediation pass, used for every
-        # finding") — reused verbatim rather than invented alongside it.  The
-        # residual staleness is real and bounded: an escalation resolved
-        # mid-run is not seen until the next run, which costs at most one extra
-        # escalation — the same fail-open direction every other arm of this
-        # check already takes.  queue_dir is part of the key because tests
-        # reassign `self._escalation_queue`, and a slot keyed on run_id alone
-        # would serve one queue's answer for another's.
+        # Task 5550: one-slot memo for `_memoised_resolved_fingerprints`,
+        # `(scan_key, str(queue_dir), fingerprints)`.  Calls under the same
+        # scan_key (a run_id) share one archive walk; a call under any other key
+        # evicts the slot, so runs whose `_escalate`s interleave each walk again.
+        # A record resolved mid-run is unseen until the next run — at most one
+        # extra escalation, the fail-open direction.
         self._resolved_fps_memo: tuple[str, str, frozenset[str]] | None = None
 
     def _scan_resolved_fingerprints(self, *, now: datetime) -> frozenset[str]:
-        """The archive scan, with this harness's window and category policy.
+        """The archive scan under this harness's window and category policy.
 
-        SPOT for the three arms that need it — the async accessor and the sync
-        twin's two — so the window and category gate they enforce cannot drift
-        apart.  SYNCHRONOUS AND UNBOUNDED: see the module docstring of
-        ``reconciliation/escalation_archive.py``.  Only reachable from a
-        coroutine through ``asyncio.to_thread``.
+        Synchronous and unbounded (see ``reconciliation/escalation_archive.py``):
+        a coroutine may reach it only through ``asyncio.to_thread``.
         """
         return scan_recently_resolved_fingerprints(
             self._escalation_queue.queue_dir,  # type: ignore[union-attr]
             now=now,
-            window=_RESOLVED_RECURRENCE_WINDOW,
+            window=timedelta(seconds=_RESOLVED_RECURRENCE_WINDOW_SECONDS),
             categories=_RECON_DEDUP_CONFIG.infra_dedupe_categories,  # type: ignore[union-attr]
         )
 
-    def _resolved_fps_slot(self, scan_key: str) -> frozenset[str] | None:
-        """The memo's fingerprints when its slot matches *scan_key*, else None."""
-        memo = self._resolved_fps_memo
-        if memo is None or memo[0] != scan_key:
-            return None
-        if memo[1] != str(self._escalation_queue.queue_dir):  # type: ignore[union-attr]
-            return None
-        return memo[2]
-
-    async def _recently_resolved_fingerprints(
-        self, scan_key: str, *, now: datetime,
-    ) -> frozenset[str]:
-        """In-window resolved/dismissed fingerprints, scanned at most once per *scan_key*.
-
-        THE `asyncio.to_thread` HOP IS LOAD-BEARING.  The scan globs the queue
-        root and rglobs a dated archive shared across 7+ projects, reading and
-        parsing every hit — unbounded synchronous I/O.  Called inline from a
-        coroutine it holds the event loop for the whole walk, and the
-        fused-memory process serves the `/alive` route the orchestrator
-        watchdog probes from that same loop, so a long scan reads as a dead
-        process (task 5550).
-
-        This is the ONLY async entry to that scan;
-        `_recently_resolved_fingerprints_blocking` is its sync twin for the
-        already-synchronous `_escalate` path, and the two share the memo slot —
-        so a pass that warms it here spares every `_escalate` in that pass a
-        second walk.
-        """
-        cached = self._resolved_fps_slot(scan_key)
-        if cached is not None:
-            return cached
-        fingerprints = await asyncio.to_thread(self._scan_resolved_fingerprints, now=now)
-        self._resolved_fps_memo = (
-            scan_key, str(self._escalation_queue.queue_dir), fingerprints,  # type: ignore[union-attr]
-        )
-        return fingerprints
-
-    def _recently_resolved_fingerprints_blocking(
+    def _memoised_resolved_fingerprints(
         self, scan_key: str | None, *, now: datetime,
     ) -> frozenset[str]:
-        """The sync twin of :meth:`_recently_resolved_fingerprints`.
+        """:meth:`_scan_resolved_fingerprints`, walked once per consecutive *scan_key*.
 
-        BLOCKS ITS CALLER for the full archive walk whenever the memo slot
-        misses, so its only caller is the already-synchronous `_escalate` path.
-        A coroutine must use the async accessor instead.
-
-        `scan_key=None` scans on every call and neither reads nor writes the
-        slot — the direct / unit-test path `_finding_recently_resolved`'s
-        docstring documents, preserved here verbatim so callers that rely on it
-        see no behaviour change.
+        Blocks its caller for the walk on a miss, so only the already-sync
+        `_escalate` path calls it.  ``scan_key=None`` scans on every call and
+        leaves the memo untouched.
         """
         if scan_key is None:
             return self._scan_resolved_fingerprints(now=now)
-        cached = self._resolved_fps_slot(scan_key)
-        if cached is not None:
-            return cached
+        queue_dir = str(self._escalation_queue.queue_dir)  # type: ignore[union-attr]
+        memo = self._resolved_fps_memo
+        if memo is not None and memo[:2] == (scan_key, queue_dir):
+            return memo[2]
         fingerprints = self._scan_resolved_fingerprints(now=now)
-        self._resolved_fps_memo = (
-            scan_key, str(self._escalation_queue.queue_dir), fingerprints,  # type: ignore[union-attr]
-        )
+        self._resolved_fps_memo = (scan_key, queue_dir, fingerprints)
         return fingerprints
 
     async def _notify_judge_halt(self, project_id: str, reason: str) -> None:
@@ -5068,16 +5006,10 @@ class ReconciliationHarness:
         O(1) set membership test — no archive scan.  Pass None to fall back to the full
         archive scan (direct / unit-test use).
 
-        scan_key: memo key for that fallback scan, which callers set to the run_id
-        (task 5550).  ONE scan per run_id, matching the per-pass snapshot semantics
-        resolved_fps has had since task 1669 rather than inventing a second, weaker
-        one.  _run_remediation_pass warms the same slot under its own run_id before
-        any finding is escalated, so an _escalate inside a pass reads the slot instead
-        of walking the archive.  The residual staleness is bounded and deliberate: an
-        escalation resolved mid-run is not seen until the next run, which costs at
-        most one extra escalation — the same fail-open direction as every other arm
-        here.  scan_key=None scans per call and touches no memo state, preserving the
-        direct / unit-test path above exactly.
+        scan_key: memo key for that fallback scan (task 5550).  _escalate passes its
+        run_id, so consecutive fallback checks in one run share one archive walk —
+        see _memoised_resolved_fingerprints.  None scans per call and touches no memo
+        state (the direct / unit-test path above).
 
         Gate: only covers categories in _RECON_DEDUP_CONFIG.infra_dedupe_categories,
         matching the category gate used by submit_or_dedupe.
@@ -5108,9 +5040,7 @@ class ReconciliationHarness:
             # set-shaped one is already the production semantics, since every
             # per-finding _escalate in a remediation pass has taken the
             # category-blind resolved_fps path since task 1669.
-            fps = self._recently_resolved_fingerprints_blocking(
-                scan_key, now=effective_now,
-            )
+            fps = self._memoised_resolved_fingerprints(scan_key, now=effective_now)
             return fingerprint in fps
         except Exception as e:
             logger.warning(
@@ -5865,18 +5795,8 @@ class ReconciliationHarness:
                 # suppressions) and proceed with full escalation — same philosophy
                 # as the pending_fps build in _maybe_remediate.
                 #
-                # Task 5550: the scan itself now runs in a worker thread (see
-                # _recently_resolved_fingerprints) instead of holding the event
-                # loop for an unbounded archive walk.  This call is ALSO the
-                # warm-up that primes the run-scoped memo slot under `run_id`:
-                # every _escalate fired later in this pass reads that slot
-                # instead of walking the archive again.
-                #
-                # The try/except stays despite the helper's own per-record
-                # excepts, because `asyncio.to_thread` is a raise path the
-                # helper cannot cover (thread-pool failure or interpreter
-                # shutdown) — the same reasoning recorded at
-                # middleware/task_curator.py's to_thread sites.
+                # Task 5550: the walk is unbounded, so it runs in a worker thread;
+                # to_thread can itself raise, hence the try/except.
                 resolved_fps: frozenset[str] = frozenset()
                 if (
                     HAS_ESCALATION
@@ -5884,8 +5804,8 @@ class ReconciliationHarness:
                     and _RECON_DEDUP_CONFIG is not None
                 ):
                     try:
-                        resolved_fps = await self._recently_resolved_fingerprints(
-                            run_id, now=datetime.now(UTC),
+                        resolved_fps = await asyncio.to_thread(
+                            self._scan_resolved_fingerprints, now=datetime.now(UTC),
                         )
                     except Exception as _rfps_err:
                         logger.warning(

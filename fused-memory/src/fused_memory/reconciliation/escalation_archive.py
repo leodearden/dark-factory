@@ -10,8 +10,8 @@ is, and each one is an ``open`` + ``read`` + ``json.loads``.  Called inline from
 a coroutine it wedges the event loop for the whole walk, which is the defect
 task 5550 exists to remove: the reconciliation harness and the ``/alive`` route
 the orchestrator watchdog probes share one loop, so a long scan here reads to
-the watchdog as a dead process.  ``ReconciliationHarness._recently_resolved_fingerprints``
-is the async entry point; do not add a second one that forgets the hop.
+the watchdog as a dead process.  ``ReconciliationHarness._run_remediation_pass``
+is its one coroutine caller, and takes that hop.
 
 (2) THIS MODULE LIVES UNDER ``fused-memory/src/`` DELIBERATELY, not in the
 ``escalation`` package beside ``iter_all_escalation_paths`` where it would

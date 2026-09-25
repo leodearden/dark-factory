@@ -686,9 +686,9 @@ def escalating_harness(journal, event_buffer, memory_service, tmp_path):
 class TestFallbackArmIsBoundedToOneScanPerRun:
     """`_escalate` stays synchronous, so its archive scan is BOUNDED, not gone.
 
-    Task 5270 owns the full offload of `_escalate`; this task removes the
-    unbounded repetition by routing the fallback arm through a run-scoped memo,
-    so a run pays for at most one archive walk instead of one per call.
+    Task 5270 owns the full offload of `_escalate`; this task routes the
+    fallback arm through a run-scoped memo, so consecutive calls within one run
+    share one archive walk instead of paying one each.
     """
 
     def test_three_escalates_sharing_a_run_id_scan_once(
@@ -790,23 +790,20 @@ class TestFallbackArmIsBoundedToOneScanPerRun:
         )
 
     @pytest.mark.asyncio
-    async def test_the_pass_warm_up_primes_every_escalate_in_that_run(
+    async def test_a_pass_filing_every_finding_walks_the_archive_once(
         self, journal, event_buffer, memory_service, tmp_path, monkeypatch,
     ):
-        """(e) THE PROPERTY THAT MOVES SITE 3 OFF THE LOOP.
+        """(e) The pass's per-finding escalations never reach the fallback arm.
 
-        Site 1's warm-up stores the slot under the pass's run_id before any
-        finding is escalated, so the whole pass costs ONE scan however many
-        findings it files — and a later `_escalate` carrying that same run_id
-        is served from the warm slot rather than walking the archive on the
-        loop thread.
+        Each takes the pass's prebuilt set (task 1669), so filing N findings
+        costs the pass's one walk and no more.
         """
         calls: list = []
         _count_scans(monkeypatch, calls)
         _stub_probe(monkeypatch, [], block=0.0)
         findings = [_finding_citing('901'), _finding_citing('902'),
                     _finding_citing('903')]
-        harness, esc_queue, run_pass = await _prepare_pass(
+        _, esc_queue, run_pass = await _prepare_pass(
             journal=journal, event_buffer=event_buffer, memory_service=memory_service,
             tmp_path=tmp_path, monkeypatch=monkeypatch,
             findings=findings,
@@ -814,38 +811,18 @@ class TestFallbackArmIsBoundedToOneScanPerRun:
                          _in_progress_task('903')],
         )
 
-        # Record the run_id the pass escalates under, without reaching into
-        # harness state — the argument is observable at the call.
-        pass_run_ids: list[str] = []
-        real_escalate = harness._escalate
-
-        def _spy(category, run_id, *args, **kwargs):
-            pass_run_ids.append(run_id)
-            return real_escalate(category, run_id, *args, **kwargs)
-
-        harness._escalate = _spy
-
         with caplog_silent():
             await run_pass()
 
-        assert len(esc_queue.get_pending()) >= len(findings), (
-            'the pass must actually file escalations, or this bound is vacuous'
+        stranded = [
+            e for e in esc_queue.get_pending() if 'Persistently unresolved' in e.summary
+        ]
+        assert len(stranded) == len(findings), (
+            'the pass must file every finding, or this bound is vacuous'
         )
         assert len(calls) == 1, (
-            f'a {len(findings)}-finding pass must cost exactly one archive scan, '
+            f'a {len(findings)}-finding pass must cost exactly one archive walk, '
             f'got {len(calls)}'
-        )
-
-        # An _escalate inside that run, with NO prebuilt set, reads the warm slot.
-        real_escalate(
-            'recon_integrity_issue', pass_run_ids[0],
-            'Persistently unresolved: a later finding in the same run',
-            finding=_finding_citing('904', description='later finding'),
-        )
-
-        assert len(calls) == 1, (
-            f'an _escalate carrying the pass run_id must hit the warm slot, '
-            f'got {len(calls)} scans'
         )
 
 
