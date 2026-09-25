@@ -1153,6 +1153,132 @@ class TestSchedulerClientServesTheFlakeLedgerSeam:
         assert scheduler.calls[0][1] == expected
 
 
+_DONE_TASK = {
+    'id': '7',
+    'status': 'done',
+    'metadata': {'done_provenance': {'kind': 'merged', 'commit': 'c0ffee' + '0' * 34}},
+}
+
+_NOT_FOUND = {'error': 'No tasks found for ID(s): 7', 'error_type': 'TaskNotFoundError'}
+
+
+class TestSchedulerClientReadsOneTaskLive:
+    """``get_task``: the live single-task read ``flake_ledger.resolve_debt`` stamps a
+    resolution from (task η).
+
+    The ``(task, error)`` pair carries THREE readings, and the ledger acts on each
+    differently, so each is pinned on its own:
+
+    - ``(task, None)``: a task was read, and only this may close a debt cycle;
+    - ``(None, None)``: a CORROBORATED ABSENCE, the server's structured
+      ``TaskNotFoundError``;
+    - ``(None, exc)``: nothing was read.
+
+    Same construct-don't-raise convention as ``get_statuses``, for the same reason: a
+    failure swallowed into ``None`` would be byte-identical to an absence.
+    """
+
+    async def _client(self, return_value, raises=None):
+        from orchestrator.chronic_flake import SchedulerChronicFlakeTaskClient
+        scheduler = _StubScheduler(return_value, raises)
+        return scheduler, SchedulerChronicFlakeTaskClient(scheduler, '/proj')
+
+    @pytest.mark.asyncio
+    async def test_dispatches_the_id_and_project_root(self):
+        scheduler, client = await self._client(mcp_tool_envelope(_DONE_TASK))
+        await client.get_task('7')
+        assert [call[:2] for call in scheduler.calls] == [
+            ('get_task', {'id': '7', 'project_root': '/proj'}),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_an_int_id_is_coerced_to_str(self):
+        """The ledger's ``owner_task_id`` column is TEXT, but a caller may hold an
+        int — the same wire coercion ``get_statuses`` applies."""
+        scheduler, client = await self._client(mcp_tool_envelope(_DONE_TASK))
+        # DELIBERATE type violation: the point is coercion at the wire.
+        await client.get_task(7)  # type: ignore[arg-type]
+        assert scheduler.calls[0][1]['id'] == '7'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'envelope',
+        [
+            mcp_tool_envelope(_DONE_TASK),
+            _DONE_TASK,
+            {'data': _DONE_TASK},
+            mcp_tool_envelope({'data': _DONE_TASK}),
+        ],
+        ids=['production_jsonrpc_body', 'bare_task', 'data_wrapper', 'production_data_wrapper'],
+    )
+    async def test_a_read_task_is_returned_with_no_error(self, envelope):
+        """(task, None) across every shape the sibling parsers tolerate, the production
+        JSON-RPC body FIRST because it is the only one the transport emits.  The
+        ``data`` wrapper is the layer ``scheduler.py::Scheduler.get_task`` unwraps."""
+        _, client = await self._client(envelope)
+        assert await client.get_task('7') == (_DONE_TASK, None)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'envelope',
+        [
+            mcp_tool_envelope(_NOT_FOUND),
+            _NOT_FOUND,
+            {'error': 'any wording at all', 'error_type': 'TaskNotFoundError'},
+        ],
+        ids=['production_jsonrpc_body', 'bare', 'reworded_message'],
+    )
+    async def test_task_not_found_is_a_corroborated_absence(self, envelope):
+        """(None, None).  The server raised its DEFINITIVE zero-row ``TaskNotFoundError``
+        (fused-memory ``backends/task_backend_errors.py::TaskNotFoundError``), which
+        ``mcp_tool_errors`` hands back as a structured ``error_type``.  The discriminator
+        is that type, never the message: a reworded message is still an absence."""
+        _, client = await self._client(envelope)
+        assert await client.get_task('7') == (None, None)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'envelope',
+        [
+            mcp_tool_envelope({'error': 'taskmaster unavailable', 'error_type': 'TaskmasterError'}),
+            {'error': 'No tasks found for ID(s): 7', 'error_type': 'TaskmasterError'},
+            {'error': 'No tasks found for ID(s): 7'},
+            {'id': '7', 'title': 'a task shape with no status'},
+            {'data': 'not a dict'},
+            {'unexpected': 'shape'},
+            None,
+            ['not', 'a', 'dict'],
+        ],
+        ids=[
+            'other_error_type',
+            'not_found_wording_without_the_type',
+            'untyped_error',
+            'no_status',
+            'non_dict_data',
+            'unrecognised',
+            'none',
+            'list',
+        ],
+    )
+    async def test_anything_else_is_a_failed_read(self, envelope):
+        """(None, exc).  An error that is not the structured absence, or an answer with
+        no task in it, is not evidence of anything — least of all that a de-flake task
+        finished.  The not-found WORDING under another error type stays a failure, which
+        is what "never on the message text" means."""
+        _, client = await self._client(envelope)
+        task, error = await client.get_task('7')
+        assert task is None
+        assert isinstance(error, Exception)
+
+    @pytest.mark.asyncio
+    async def test_a_raising_dispatch_is_reported_not_raised(self):
+        """The CAUGHT object comes back in the error half, so the ledger's warning can
+        carry the real cause via ``exc_info``."""
+        raised = RuntimeError('mcp down')
+        _, client = await self._client(None, raises=raised)
+        assert await client.get_task('7') == (None, raised)
+
+
 class TestExtractTaskId:
     """``extract_task_id``: self-contained module-level helper (no
     harness/scheduler import) shared by ``SchedulerChronicFlakeTaskClient``

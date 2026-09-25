@@ -1,11 +1,12 @@
 """Tests for the dispatcher-side flake RECORDER (PRD task ε, `plans/flake-ledger-prd.md`).
 
-`flake_recorder.record_merge_flake_suppression` is the one place the four
-side-effects of a merge-gate flake observation happen: the durable
-``flake_occurrence`` ledger row, the ``merge_flake_suppressed`` structured fact,
-the INV-4 storm-streak bump, and — since task ζ — the ``flake_debt`` row whose
-``owner_task_id`` names a freshly-filed de-flake task (§5.9, enforced at WRITE
-TIME rather than audited afterwards).
+`flake_recorder.record_merge_flake_suppression` is the one place the side-effects
+of a merge-gate flake observation happen: the durable ``flake_occurrence`` ledger
+row, the ``merge_flake_suppressed`` structured fact, the INV-4 storm-streak bump,
+— since task ζ — the ``flake_debt`` row whose ``owner_task_id`` names a
+freshly-filed de-flake task (§5.9, enforced at WRITE TIME rather than audited
+afterwards), and — since task η — the born-at-L2 ``regressed_after_resolution``
+escalation when a test re-enters debt after its fix landed.
 
 It lives HERE, on the dispatcher, and not in ``verify.apply_merge_flake_suppression``
 (which runs wherever the WORKTREE is) precisely because the producer's host may be a
@@ -26,6 +27,7 @@ import pytest
 
 from orchestrator import flake_recorder
 from orchestrator.flake_ledger import (
+    NEVER_WIDEN_A_TIMEOUT,
     UNKNOWN_TEST_ID,
     FlakeCallSite,
     FlakeSuppression,
@@ -63,18 +65,32 @@ class _FakeEscalationQueue:
 
     *open_l2* controls the dedup path: when truthy, get_by_task returns it so the
     filer treats an open L2 as already present and does NOT re-submit.
+
+    *pending_from_submitted* answers from what was actually SUBMITTED instead, keyed on
+    ``task_id`` (and the asked-for status and level) the way the real queue's lookup
+    is.  A fixed *open_l2* gives the same answer for every key, so it can only show
+    that the filer ASKS.  Keying on what was filed is what shows a pending escalation
+    under one key leaves every other key free to file.
     """
 
-    def __init__(self, open_l2=None) -> None:
+    def __init__(self, open_l2=None, *, pending_from_submitted: bool = False) -> None:
         self.submitted: list = []
         self.get_by_task_calls: list = []
         self._open_l2 = open_l2
+        self._pending_from_submitted = pending_from_submitted
 
     def make_id(self, task_id: str) -> str:
         return f'esc-{task_id}-1'
 
     def get_by_task(self, task_id, *, status=None, level=None):
         self.get_by_task_calls.append((task_id, status, level))
+        if self._pending_from_submitted:
+            return [
+                esc for esc in self.submitted
+                if esc.task_id == task_id
+                and (status is None or esc.status == status)
+                and (level is None or esc.level == level)
+            ]
         return self._open_l2
 
     def submit(self, esc) -> None:
@@ -109,6 +125,12 @@ class _FakeLedgerTaskClient:
     reports) and *statuses_raises* (a partial/older adapter that raises instead) mirror
     test_flake_ledger.py's ``_FakeTaskClient`` so the two doubles of one Protocol
     degrade identically.
+
+    ``get_task`` (task η) reads the SAME status map, so a task's live status agrees
+    across both reads; a ``done`` task carries ``metadata.done_provenance`` naming its
+    entry in *commits*, when it has one.  An unknown id is a corroborated absence,
+    ``(None, None)``.  :meth:`finish` is the orchestrator completing a task between two
+    observations: the live state changes, and the ledger is never told.
     """
 
     def __init__(
@@ -117,18 +139,21 @@ class _FakeLedgerTaskClient:
         submit_raises: BaseException | None = None,
         status_after_submit: str = 'pending',
         statuses: dict[str, str] | None = None,
+        commits: dict[str, str] | None = None,
         statuses_error: Exception | None = None,
         statuses_raises: BaseException | None = None,
         order: list[str] | None = None,
     ) -> None:
         self.submit_calls: list[dict] = []
         self.statuses_calls: list[list[str]] = []
+        self.task_calls: list[str] = []
         self.commit_calls: list[list[str]] = []
         self.order: list[str] = order if order is not None else []
         self._n = 0
         self._submit_raises = submit_raises
         self._status_after_submit = status_after_submit
         self._statuses: dict[str, str] = dict(statuses or {})
+        self._commits: dict[str, str] = dict(commits or {})
         self._statuses_error = statuses_error
         self._statuses_raises = statuses_raises
 
@@ -155,9 +180,28 @@ class _FakeLedgerTaskClient:
             self._statuses_error,
         )
 
+    async def get_task(self, task_id: str) -> tuple[dict | None, Exception | None]:
+        self.order.append('get_task')
+        self.task_calls.append(task_id)
+        if task_id not in self._statuses:
+            return None, None
+        status = self._statuses[task_id]
+        metadata: dict = {}
+        if status == 'done' and task_id in self._commits:
+            metadata = {
+                'done_provenance': {'kind': 'merged', 'commit': self._commits[task_id]},
+            }
+        return {'id': task_id, 'status': status, 'metadata': metadata}, None
+
     async def commit_planning(self, task_ids: list[str]) -> None:
         self.order.append('commit_planning')
         self.commit_calls.append(list(task_ids))
+
+    def finish(self, task_id: str, *, commit: str | None = None) -> None:
+        """*task_id* goes ``done``, its fix merged at *commit* when one is recorded."""
+        self._statuses[task_id] = 'done'
+        if commit is not None:
+            self._commits[task_id] = commit
 
 
 @pytest.fixture(autouse=True)
@@ -616,7 +660,12 @@ class TestRecordOpensDebt:
         client = _FakeLedgerTaskClient()
         db = ledger_db_path(tmp_path)
         await _record(_result(_suppression(test_ids=(ids[0],))), tmp_path, task_client=client)
-        await resolve_debt(db, _PROJECT_ID, ids[0], resolving_commit='f' * 40)
+        assert await resolve_debt(
+            db, _PROJECT_ID, ids[0],
+            task_client=_FakeLedgerTaskClient(
+                statuses={'deflake-1': 'done'}, commits={'deflake-1': 'f' * 40},
+            ),
+        )
         seeded = read_debt(db, ids[0])
         assert seeded is not None and seeded.resolved_at and seeded.owner_task_id
 
@@ -793,17 +842,17 @@ class TestRecordOpensDebt:
 
         Two suppressions of the SAME test, with the first filing's owner still
         ``pending``, file ONE task and keep ONE debt row (``open_count`` advances
-        instead).  And the second pass really did CORROBORATE — ``get_statuses`` is
-        consulted against the stored id — rather than short-circuiting on a non-NULL
-        column, which is INV-3's whole point.
+        instead).  And the second pass really did CORROBORATE — the stored id is read
+        live, once, by ``get_task`` — rather than short-circuiting on a non-NULL column,
+        which is INV-3's whole point.
 
         The QUIET-LEDGER assertion is what keeps that claim HONEST.  A failed
         corroboration ALSO files nothing, ALSO leaves one row, and ALSO records the same
-        ``statuses_calls`` — the fake logs the call before the caller's unpack fails — so
-        every count assertion below is satisfied identically by the degrade branch.  This
-        test passed vacuously for exactly that reason while the fake's ``get_statuses``
-        returned a bare dict.  Pinning the pass to the live-owner dedup branch needs a
-        signal only the degrade path emits, and that is a WARNING from the ledger.
+        read — the fake logs the call before the caller's unpack fails — so every count
+        assertion below is satisfied identically by the degrade branch.  This test passed
+        vacuously for exactly that reason while the fake's ``get_statuses`` returned a
+        bare dict.  Pinning the pass to the live-owner dedup branch needs a signal only
+        the degrade path emits, and that is a WARNING from the ledger.
 
         Asserted STRUCTURALLY — by level and logger name, not by matching the warning's
         prose.  A negative substring match (``'could not corroborate' not in caplog.text``)
@@ -832,7 +881,8 @@ class TestRecordOpensDebt:
         assert len(rows) == 1, rows
         assert rows[0].open_count == 1, 'a repeat while still open is not a re-open'
         assert len(client.submit_calls) == 1, client.submit_calls
-        assert client.statuses_calls == [[rows[0].owner_task_id]], client.statuses_calls
+        assert client.task_calls == [rows[0].owner_task_id], client.task_calls
+        assert client.statuses_calls == [], client.statuses_calls
 
     async def test_a_raising_open_debt_for_one_test_does_not_cost_the_other(
         self, tmp_path: Path, caplog, monkeypatch,
@@ -1032,3 +1082,195 @@ class TestRecordOpensDebt:
         assert list_open_debt(ledger_db_path(tmp_path)) == []
         assert len(es.emits) == 1
         assert flake_recorder._merge_flake_suppression_streak == 1
+
+
+@pytest.mark.asyncio
+class TestRegressedAfterResolution:
+    """The recorder's FIFTH effect (task η): a test that flakes again after its de-flake
+    fix landed files a born-at-L2 ``regressed_after_resolution`` escalation citing that
+    fix.  ASYNC-ONLY CLASS.
+
+    The LEDGER detects the re-entry — ``open_debt`` closes the cycle whose owner reads
+    back done, then re-opens it — and the recorder turns it into the escalation.  Before
+    η the recurrence was a quiet replacement filing: ``open_count`` stayed 1, and each
+    failed fix was one more link in an invisible chain of de-flake tasks.
+    """
+
+    TEST_ID = 'orchestrator/tests/test_x.py::test_y'
+    OTHER_TEST_ID = 'orchestrator/tests/test_w.py::test_v'
+    COMMIT = 'c0ffee' + 'deadbeef' * 4 + '12'
+
+    async def _observe(self, tmp_path: Path, n: int, *test_ids: str, **kwargs) -> None:
+        """Suppression number *n* of *test_ids* (default: :attr:`TEST_ID`).  Each *n* is
+        a distinct ``observed_at``, so §8.3's occurrence dedup never folds two
+        observations into one."""
+        s = _suppression(
+            test_ids=test_ids or (self.TEST_ID,),
+            observed_at=f'2026-08-22T12:00:{n:02d}+00:00',
+        )
+        await _record(_result(s), tmp_path, **kwargs)
+
+    def _debt_row(self, tmp_path: Path, test_id: str | None = None):
+        row = read_debt(ledger_db_path(tmp_path), test_id or self.TEST_ID)
+        assert row is not None
+        return row
+
+    async def test_a_recurrence_after_a_landed_fix_files_one_l2_citing_the_fix(
+        self, tmp_path: Path,
+    ) -> None:
+        """(a) End to end over two observations: the fix's commit is quoted VERBATIM,
+        so the human can judge whether it was cosmetic before a new de-flake task
+        repeats it (§5.5)."""
+        client, q = _FakeLedgerTaskClient(), _FakeEscalationQueue()
+        await self._observe(tmp_path, 0, task_client=client, escalation_queue=q)
+        client.finish('deflake-1', commit=self.COMMIT)
+
+        await self._observe(tmp_path, 1, task_client=client, escalation_queue=q)
+
+        row = self._debt_row(tmp_path)
+        assert row.open_count == 2, row
+        assert row.prior_resolving_commit == self.COMMIT
+        assert row.owner_task_id == 'deflake-2', 'the new cycle gets its own owner'
+        assert len(q.submitted) == 1, q.submitted
+        esc = q.submitted[0]
+        assert esc.category == flake_recorder.REGRESSED_AFTER_RESOLUTION
+        assert flake_recorder.REGRESSED_AFTER_RESOLUTION == 'regressed_after_resolution'
+        assert (esc.level, esc.severity, esc.agent_role) == (
+            2, 'critical', 'orchestrator-flake-ledger',
+        )
+        assert self.TEST_ID in esc.summary
+        for fact in (
+            self.COMMIT, self.TEST_ID, 'cycle 2', row.prior_resolved_at, row.opened_at,
+            _MERGE_SHA, _TASK_ID, NEVER_WIDEN_A_TIMEOUT,
+        ):
+            assert fact is not None and fact in esc.detail, (fact, esc.detail)
+        assert any(self.COMMIT in entry['ref'] for entry in esc.evidence), esc.evidence
+
+    async def test_each_test_and_cycle_dedups_on_its_own_sentinel(
+        self, tmp_path: Path,
+    ) -> None:
+        """(b) A pending L2 for the same regression is not re-filed; the dedup key is
+        per (test, cycle), because each regression is a DISTINCT failed fix citing a
+        distinct commit.  One global sentinel would let the first pending L2 swallow a
+        second test's regression, or a later cycle's.
+
+        The queue answers from what was really filed, so both halves are shown against
+        pending L2s.  The same (test, cycle) observed again, here through a second
+        ledger, is deduped.  A later cycle of that test, and another test's cycle, each
+        file their own while the first L2 is still pending."""
+        q = _FakeEscalationQueue(pending_from_submitted=True)
+        client = _FakeLedgerTaskClient()
+        wired = {'task_client': client, 'escalation_queue': q}
+        await self._observe(tmp_path, 0, **wired)
+        client.finish('deflake-1', commit=self.COMMIT)
+        await self._observe(tmp_path, 1, **wired)
+
+        replay_root = tmp_path / 'replay'
+        replay_client = _FakeLedgerTaskClient()
+        replay = {'task_client': replay_client, 'escalation_queue': q}
+        await self._observe(replay_root, 0, **replay)
+        replay_client.finish('deflake-1', commit=self.COMMIT)
+        await self._observe(replay_root, 1, **replay)
+
+        client.finish('deflake-2', commit='f' * 40)
+        await self._observe(tmp_path, 2, **wired)
+        await self._observe(tmp_path, 3, self.OTHER_TEST_ID, **wired)
+        client.finish('deflake-4', commit='e' * 40)
+        await self._observe(tmp_path, 4, self.OTHER_TEST_ID, **wired)
+
+        filed = [
+            esc for esc in q.submitted
+            if esc.category == flake_recorder.REGRESSED_AFTER_RESOLUTION
+        ]
+        expected = [
+            (self.TEST_ID, 2, self.COMMIT),
+            (self.TEST_ID, 3, 'f' * 40),
+            (self.OTHER_TEST_ID, 2, 'e' * 40),
+        ]
+        assert len(filed) == len(expected), [esc.summary for esc in filed]
+        for esc, (test_id, cycle, commit) in zip(filed, expected, strict=True):
+            assert test_id in esc.task_id, esc.task_id
+            assert f'(cycle {cycle})' in esc.summary, esc.summary
+            assert commit in esc.evidence[0]['ref'], esc.evidence
+        assert len({esc.task_id for esc in filed}) == 3, [esc.task_id for esc in filed]
+
+        keys = {esc.task_id for esc in filed}
+        lookups = [call for call in q.get_by_task_calls if call[0] in keys]
+        assert [(status, level) for _, status, level in lookups] == [('pending', 2)] * 4
+        assert lookups[1] == lookups[0], 'the replay asked under the SAME key, and was deduped'
+
+    async def test_a_commitless_resolution_is_named_as_such(self, tmp_path: Path) -> None:
+        """(c) The owner finished with no commit on record: the regression is still
+        real, and the escalation says outright that no commit was recorded rather than
+        printing ``None`` where a commit belongs."""
+        client, q = _FakeLedgerTaskClient(), _FakeEscalationQueue()
+        await self._observe(tmp_path, 0, task_client=client, escalation_queue=q)
+        client.finish('deflake-1')
+
+        await self._observe(tmp_path, 1, task_client=client, escalation_queue=q)
+
+        assert len(q.submitted) == 1, q.submitted
+        esc = q.submitted[0]
+        assert 'none recorded' in esc.detail, esc.detail
+        assert 'None' not in esc.detail, esc.detail
+        assert all('None' not in entry['ref'] for entry in esc.evidence), esc.evidence
+
+    async def test_no_queue_still_re_enters_and_is_loud(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        """(d) With nothing to file into, the regression costs only the escalation: the
+        row still re-enters, and the recorder says so, naming the test."""
+        client = _FakeLedgerTaskClient()
+        await self._observe(tmp_path, 0, task_client=client)
+        client.finish('deflake-1', commit=self.COMMIT)
+
+        with caplog.at_level(logging.WARNING):
+            await self._observe(tmp_path, 1, task_client=client)
+
+        assert self._debt_row(tmp_path).open_count == 2
+        warned = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'orchestrator.flake_recorder'
+        ]
+        assert len(warned) == 1, caplog.text
+        assert self.TEST_ID in warned[0]
+        assert flake_recorder.REGRESSED_AFTER_RESOLUTION in warned[0]
+
+    async def test_a_first_suppression_and_a_repeat_file_no_regression(
+        self, tmp_path: Path,
+    ) -> None:
+        """(e) Only a RE-ENTRY is a regression; the queue is not even consulted."""
+        client, q = _FakeLedgerTaskClient(), _FakeEscalationQueue()
+
+        await self._observe(tmp_path, 0, task_client=client, escalation_queue=q)
+        await self._observe(tmp_path, 1, task_client=client, escalation_queue=q)
+
+        assert self._debt_row(tmp_path).open_count == 1
+        assert q.submitted == []
+        assert q.get_by_task_calls == []
+
+    async def test_a_raising_queue_costs_only_the_regression_signal(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        """(f) Every other effect is untouched by the new one, even when it fails: the
+        occurrence rows, the storm streak, the re-entry and the new owner all land."""
+
+        class _RaisingQueue(_FakeEscalationQueue):
+            def submit(self, esc) -> None:
+                raise RuntimeError('escalation queue unavailable')
+
+        client = _FakeLedgerTaskClient()
+        wired = {'task_client': client, 'escalation_queue': _RaisingQueue()}
+        await self._observe(tmp_path, 0, **wired)
+        client.finish('deflake-1', commit=self.COMMIT)
+
+        with caplog.at_level(logging.WARNING):
+            await self._observe(tmp_path, 1, **wired)
+
+        row = self._debt_row(tmp_path)
+        assert row.open_count == 2, row
+        assert row.owner_task_id == 'deflake-2'
+        assert len(client.submit_calls) == 2
+        assert len(_occurrences(tmp_path)) == 2
+        assert flake_recorder._merge_flake_suppression_streak == 2
+        assert 'escalation queue unavailable' in caplog.text, 'the loss must be loud'
