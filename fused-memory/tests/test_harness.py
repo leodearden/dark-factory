@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import sqlite3
 import uuid
 from datetime import UTC, datetime, timedelta
 from unittest.mock import DEFAULT, AsyncMock, MagicMock, patch
@@ -5626,6 +5627,111 @@ async def test_remediation_pass_finally_persists_stage_reports_despite_a_second_
         'update_run_stage_reports so the persisted copy captures whatever '
         'markers either arm stamped", which is hollow while this write '
         'stays unshielded'
+    )
+
+
+# ── Task 5545: remediation cancellation terminalisation and run-failure evidence ──
+
+
+def _sqlite_busy_error() -> sqlite3.OperationalError:
+    """The journal lock error behind the recon RCA, carrying the classification
+    the sqlite3 module stamps on errors it raises itself. A hand-built
+    OperationalError carries neither attribute, so both are assigned here."""
+    err = sqlite3.OperationalError('database is locked')
+    err.sqlite_errorname = 'SQLITE_BUSY'
+    err.sqlite_errorcode = 5
+    return err
+
+
+_RUN_FAILURE_CASES = [
+    pytest.param(
+        _sqlite_busy_error, 'SQLITE_BUSY', 5, 'OperationalError', 'database is locked',
+        id='sqlite_busy',
+    ),
+    pytest.param(
+        lambda: RuntimeError('remediation exploded'), None, None, 'RuntimeError',
+        'remediation exploded',
+        id='non_sqlite',
+    ),
+]
+
+
+def _raising_stage_run(make_error):
+    """A stage.run stand-in that raises a fresh `make_error()` when invoked."""
+
+    async def failing_run(events, watermark, prior_reports, run_id, model=None):
+        raise make_error()
+
+    return failing_run
+
+
+def _remediation_pass_under_test(harness):
+    """The coroutine for one remediation pass over a single actionable finding."""
+    from fused_memory.reconciliation.harness import TierConfig
+
+    return harness._run_remediation_pass(
+        'test-project',
+        'parent-run-id',
+        [_make_s3_findings()[0]],
+        TierConfig(model='sonnet', episode_limit=100, memory_limit=200),
+        scope=_scope('test-project', '/tmp/test-project'),
+    )
+
+
+def _assert_run_failure_record(err, *, error_type, failed_stage, message, errorname, errorcode):
+    """Every key is read by indexing, so a missing sqlite key fails even when
+    the expected value is None."""
+    assert err['error_type'] == error_type
+    assert err['failed_stage'] == failed_stage
+    assert err['traceback'], 'the failure record must carry the traceback'
+    assert error_type in err['traceback']
+    assert message in err['traceback']
+    assert err['sqlite_errorname'] == errorname
+    assert err['sqlite_errorcode'] == errorcode
+
+
+def _assert_one_classified_failure_line(caplog, prefix, *, run_id, errorname, errorcode):
+    lines = [
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.ERROR and r.getMessage().startswith(prefix)
+    ]
+    assert len(lines) == 1, f'expected exactly one {prefix!r} ERROR line, got {lines!r}'
+    assert f'run_id={run_id}' in lines[0]
+    assert f'sqlite_errorname={errorname}' in lines[0]
+    assert f'sqlite_errorcode={errorcode}' in lines[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('make_error', 'errorname', 'errorcode', 'error_type', 'message'), _RUN_FAILURE_CASES,
+)
+async def test_remediation_pass_failure_records_traceback_and_sqlite_classification(
+    journal, event_buffer, mock_memory_service, caplog,
+    make_error, errorname, errorcode, error_type, message,
+):
+    """A remediation pass ended by an exception records the same evidence as a
+    full cycle: the traceback, plus the SQLite classification (None for a
+    non-sqlite error), and names both in its ERROR line so syslog alone can
+    classify the failure."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    _mock_stage_run(harness.stages[0])
+    harness.stages[1].run = _raising_stage_run(make_error)
+    _mock_stage_run(harness.stages[2])
+
+    with caplog.at_level(logging.ERROR):
+        await _remediation_pass_under_test(harness)
+
+    [row] = await journal.get_recent_runs('test-project', limit=1)
+    assert row.run_type == 'remediation'
+    assert row.status == 'failed'
+    _assert_run_failure_record(
+        row.stage_reports['_error'],
+        error_type=error_type, failed_stage='task_knowledge_sync', message=message,
+        errorname=errorname, errorcode=errorcode,
+    )
+    _assert_one_classified_failure_line(
+        caplog, 'Remediation pass failed:',
+        run_id=row.id, errorname=errorname, errorcode=errorcode,
     )
 
 
