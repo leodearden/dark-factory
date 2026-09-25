@@ -153,17 +153,15 @@ class TestFormatTaskIncludeFiles:
         assert '**Files:** orchestrator, shared' in out
 
 
+_FORBIDDEN_SECTION_HEADING = '## Forbidden for this pass'
+
+
 async def _build_tightening_prompt(
     briefing: BriefingAssembler,
     files: list[str] | None = None,
     not_touched: list[str] | None = None,
 ) -> str:
-    """Render the architect narrowing prompt with a stock flagged-file set.
-
-    Module-level rather than a method so ``TestPlanTighteningPromptToolGrants``
-    renders the SAME prompt the wording tests read, without either class
-    reaching into the other.
-    """
+    """Render the architect narrowing prompt with a stock flagged-file set."""
     task = {
         'id': '2656',
         'title': 'Test task',
@@ -188,38 +186,14 @@ class TestBuildPlanTighteningPrompt:
     contains the token names it forbids, so a bare ``not in`` would
     self-conflict.
 
-    Assertions here name TOOLS and STRUCTURE, never prose. A test that
-    asserts on a substring of a prompt's wording exercises no runtime
-    behaviour; it only pins prose, which pressures the wording toward
-    whatever passes the assertion rather than toward what is clearest to
-    the reader (the rationale test_roles_ancestry_check.py's module
-    docstring already states). A reworded but still correct prompt must
-    not be able to turn this suite red. The invariants that prose once
-    stood in for are pinned where they are load-bearing instead:
-    TestPlanTighteningPromptToolGrants pins that every tool this prompt
-    names is actually granted, and the reason-required /
-    must-be-declared / never-narrow-to-empty rules are enforced in code
-    and pinned by TestDropPlanFile's refusal tests in
-    test_plan_tools_server.py, where they gate real state.
+    New assertions should name tools and structure rather than wording, so
+    that a reworded but still-correct prompt cannot turn this suite red.
     """
 
     async def test_mentions_all_three_valid_actions(self, briefing: BriefingAssembler):
         prompt = await _build_tightening_prompt(briefing)
         assert 'update_plan_metadata' in prompt
         assert 'confirm_plan' in prompt
-        assert 'drop_plan_file' in prompt
-
-    async def test_offers_a_third_action_for_correctly_declared_untouched_files(
-        self, briefing: BriefingAssembler,
-    ):
-        """The honest third exit (task 4807).
-
-        With only (a) drop-silently and (b) confirm on offer, a DELIVERED
-        branch carrying a correctly-declared file that legitimately needed no
-        edit has no truthful move: dropping falsifies the provenance,
-        confirming mislabels complete work as incomplete.
-        """
-        prompt = await _build_tightening_prompt(briefing)
         assert 'drop_plan_file' in prompt
 
     async def test_lists_not_touched_entries(self, briefing: BriefingAssembler):
@@ -259,21 +233,13 @@ class TestBuildPlanTighteningPrompt:
 
 @pytest.mark.asyncio
 class TestPlanTighteningPromptToolGrants:
-    """Every plan tool the narrowing prompt prescribes must be granted.
+    """Every plan tool the narrowing prompt prescribes must be granted to ARCHITECT.
 
     ``test_roles_ancestry_check.py::test_role_holds_every_mcp_tool_its_prompt_names``
-    pins this same capability<->prompt coupling, but structurally cannot see
-    this prompt: it scans only ``role.system_prompt``, and the narrowing
-    prompt is assembled at dispatch time by
-    ``orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler.build_plan_tightening_prompt``.
-
-    The registry is the real one — built from
-    ``orchestrator/src/orchestrator/mcp/plan_tools.py::create_server`` — so a
-    tool that is registered but ungranted, or named in the prompt but never
-    registered, is caught without any hand-maintained list of tool names.
+    scans only ``role.system_prompt``, so it cannot see this dispatch-time prompt.
     """
 
-    async def test_every_registered_tool_the_prompt_names_is_granted_to_architect(
+    async def test_every_registered_tool_the_prompt_prescribes_is_granted_to_architect(
         self, briefing: BriefingAssembler, tmp_path: Path,
     ) -> None:
         artifacts = TaskArtifacts(tmp_path / 'wt')
@@ -282,11 +248,16 @@ class TestPlanTighteningPromptToolGrants:
         registry = {tool.name for tool in await server.list_tools()}
 
         prompt = await _build_tightening_prompt(briefing)
+        prescribed, heading, _forbidden = prompt.partition(_FORBIDDEN_SECTION_HEADING)
+        assert heading, (
+            f'The narrowing prompt has no {_FORBIDDEN_SECTION_HEADING!r} section, '
+            'so this test can no longer tell prescribed tools from forbidden ones.'
+        )
 
-        named = {n for n in registry if re.search(rf'\b{re.escape(n)}\b', prompt)}
+        named = {n for n in registry if re.search(rf'\b{re.escape(n)}\b', prescribed)}
         assert named, (
-            'The narrowing prompt names no registered plan tool at all, which '
-            'makes this assertion vacuous — either the prompt stopped '
+            'The narrowing prompt prescribes no registered plan tool at all, '
+            'which makes this assertion vacuous — either the prompt stopped '
             'prescribing tools or create_server stopped registering them.'
         )
 
