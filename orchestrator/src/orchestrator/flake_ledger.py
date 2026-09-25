@@ -938,7 +938,9 @@ class FlakeLedgerTaskClient(Protocol):
 
         :func:`resolve_debt` stamps a resolution ONLY from a task it actually read, so
         an absence and a failure both leave the cycle open; the pair is what lets its
-        log say which of the two happened.
+        log say which of the two happened.  :func:`open_debt`'s owner enforcement acts
+        on the same read, and there the distinction is :meth:`get_statuses`' again: an
+        absence files a replacement owner, a failure files nothing.
         """
         ...
 
@@ -946,6 +948,24 @@ class FlakeLedgerTaskClient(Protocol):
         """Release planning-mode tasks from ``deferred`` to ``pending`` — the second
         phase of the initial filing, without which the task never dispatches."""
         ...
+
+
+@dataclass(frozen=True)
+class _OwnerRead:
+    """One SUCCESSFUL live ``get_task`` read of the owner *owner_task_id*.  *task* is
+    ``None`` when the server answered that no such task exists: a corroborated absence.
+
+    :func:`open_debt` takes it from its lazy close and hands it to ζ's enforcement, so
+    an owner is read ONCE per call.  One live fact then has one source, and the
+    resolution and the owner verdict cannot disagree about it.
+    """
+
+    owner_task_id: str
+    task: dict | None
+
+    @property
+    def status(self) -> str | None:
+        return None if self.task is None else self.task.get('status')
 
 
 def _owner_liveness(status: str | None) -> str:
@@ -968,25 +988,26 @@ def _owner_liveness(status: str | None) -> str:
     ``done`` is split out of ``closed`` (task η) for the same reason: its correct action
     differs.  With a ``task_client`` wired, :func:`open_debt`'s lazy close resolves a
     done owner's cycle and the re-entry upsert discharges that owner, so a done owner on
-    an OPEN row can only mean that resolution did not land: ``get_task`` failed, raised
-    or is missing, or the owner went done between η's read and this one.  Replacing it
-    would overwrite the only pointer to the fix that did not hold, so the cycle would
-    never close, ``prior_resolving_commit`` would never be written, and no
-    ``regressed_after_resolution`` L2 would fire.  ``closed`` therefore means only a
-    non-done terminal status (``cancelled``) or an absent owner.
+    an OPEN row can only mean that resolution did not land: ``get_task`` failed, raised,
+    timed out or is missing and the ``get_statuses`` fallback read the owner done, or
+    the stamp itself failed.  Replacing it would overwrite the only pointer to the fix
+    that did not hold, so the cycle would never close, ``prior_resolving_commit`` would
+    never be written, and no ``regressed_after_resolution`` L2 would fire.  ``closed``
+    therefore means only a non-done terminal status (``cancelled``) or an absent owner.
 
-    Empty/absent is ``closed``: ``get_statuses`` silently OMITS ids it does not know, so
-    a missing entry from a SUCCESSFUL read is a corroborated absence (the task was
-    deleted).  A FAILED read never reaches here — see :func:`_ensure_owner_task`, where
-    an unreadable status is explicitly not treated as evidence of anything.
+    Empty/absent is ``closed``: a SUCCESSFUL read that finds no such task — ``get_task``
+    answering ``TaskNotFoundError``, or ``get_statuses`` silently OMITTING the id — is a
+    corroborated absence (the task was deleted).  A FAILED read never reaches here — see
+    :func:`_ensure_owner_task`, where an unreadable status is explicitly not treated as
+    evidence of anything.
 
-    That last sentence is a GUARANTEE, not an aspiration, and it rests on
-    :class:`FlakeLedgerTaskClient.get_statuses` returning a ``(statuses, error)`` pair:
-    the caller returns early on a non-``None`` error, so only a successful read is
-    classified here.  It was NOT true while the adapter swallowed failures into a bare
-    ``{}`` — that arrived indistinguishable from an absence and was classified
-    ``closed``, filing a replacement task for an owner that was alive and merely
-    unread.
+    That last sentence is a GUARANTEE, not an aspiration, and it rests on both reads
+    reporting failure in band — ``get_task``'s ``(task, error)`` and
+    :class:`FlakeLedgerTaskClient.get_statuses`' ``(statuses, error)`` pair: the caller
+    returns early on a non-``None`` error, so only a successful read is classified here.
+    It was NOT true while the adapter swallowed failures into a bare ``{}`` — that
+    arrived indistinguishable from an absence and was classified ``closed``, filing a
+    replacement task for an owner that was alive and merely unread.
     """
     if not status:
         return 'closed'
@@ -1066,12 +1087,40 @@ def _write_owner_task_id(
         conn.close()
 
 
+async def _owner_status(
+    task_client: FlakeLedgerTaskClient, owner_task_id: str, owner_read: _OwnerRead | None,
+) -> tuple[str | None, Exception | None]:
+    """*owner_task_id*'s LIVE status as a ``(status, error)`` pair, the status ``None``
+    for a corroborated absence.
+
+    It is *owner_read*, the lazy close's read, when that read is of THIS owner, so the
+    owner is not read twice.  Otherwise (that read failed or timed out, or a concurrent
+    lane re-pointed the row since) it is a ``get_statuses`` read, whose failure arrives
+    in TWO shapes that land on ONE path, so the fail-safe direction cannot drift between
+    them.  The real adapter never raises: it reports the failure as the ERROR HALF of
+    its pair, because a failure returned as a bare ``{}`` is byte-identical to a
+    corroborated absence and would be acted on as one.  A partial or older adapter, or
+    one returning a non-tuple that the unpack rejects, raises instead, and that is
+    caught here.
+    """
+    if owner_read is not None and owner_read.owner_task_id == owner_task_id:
+        return owner_read.status, None
+    try:
+        statuses, error = await task_client.get_statuses([owner_task_id])
+    except Exception as exc:
+        return None, exc
+    if error is not None:
+        return None, error
+    return statuses.get(owner_task_id), None
+
+
 async def _ensure_owner_task(
     db_path: Path,
     project_id: str,
     row: DebtRow,
     *,
     task_client: FlakeLedgerTaskClient | None,
+    owner_read: _OwnerRead | None = None,
 ) -> DebtRow:
     """Enforce §5.9's invariant for *row*, returning the row as it stands afterwards.
 
@@ -1089,9 +1138,11 @@ async def _ensure_owner_task(
     task behind it may have gone terminal, been cancelled, or been deleted since it was
     written, so it is re-read against LIVE status every time and NEVER assumed
     still-open.  Short-circuiting on a non-NULL ``owner_task_id`` would satisfy the
-    invariant's letter while pointing stale rows at done tasks forever.  Only a cancelled
-    or absent owner is REPLACED: a done one is kept, because on an open row it means the
-    lazy close did not land and the next suppression retries it (:func:`_owner_liveness`).
+    invariant's letter while pointing stale rows at done tasks forever.  The live read is
+    *owner_read* when :func:`open_debt`'s lazy close made one of this owner, so each call
+    reads its owner once (:func:`_owner_status`).  Only a cancelled or absent owner is
+    REPLACED: a done one is kept, because on an open row it means the lazy close did not
+    land and the next suppression retries it (:func:`_owner_liveness`).
 
     COUPLING RULE, binding (§5.9): the ledger READS task status but never WRITES it,
     except the initial filing.  It never marks a task done, never blocks one, never
@@ -1117,7 +1168,7 @@ async def _ensure_owner_task(
         # INV-3: corroborate BEFORE acting.  The stored id is a snapshot; it is re-read
         # against live status on every suppression and never assumed still-open.
         #
-        # Its OWN guard, and the fail-safe direction is do-NOT-file.  This is the
+        # On a FAILED read the fail-safe direction is do-NOT-file.  This is the
         # opposite of `chronic_flake._has_open_dedup_match`'s fail-open-towards-filing,
         # deliberately: there a duplicate is bounded by `FilingLedger`'s multi-day
         # per-test rate limit, here there is none, so a transient MCP outage during a
@@ -1127,33 +1178,21 @@ async def _ensure_owner_task(
         # next suppression of the same test retries, and θ's age backstop catches a row
         # that stays stuck; a duplicate task tree is not.
         #
-        # A failed read arrives in TWO shapes and both land here, on ONE code path, so
-        # the fail-safe direction cannot drift between them.  The real adapter never
-        # raises: it reports the failure as the ERROR HALF of its ``(statuses, error)``
-        # pair, because a failure returned as a bare ``{}`` is byte-identical to the
-        # corroborated absence below and would be acted on as one.  A partial or older
-        # adapter — or one returning a non-tuple, which the unpack itself rejects with a
-        # TypeError/ValueError — raises instead, which the ``except`` still catches.
-        #
         # It is the TYPED PAIR, not the caller's exception discipline, that now makes
         # `_owner_liveness`'s standing claim ("a FAILED read never reaches here") true
         # through the production composition rather than merely aspirational.
-        statuses_error: Exception | None = None
-        try:
-            statuses, statuses_error = await task_client.get_statuses([row.owner_task_id])
-        except Exception as exc:
-            statuses, statuses_error = {}, exc
-        if statuses_error is not None:
+        status, read_error = await _owner_status(task_client, row.owner_task_id, owner_read)
+        if read_error is not None:
             logger.warning(
                 'flake_ledger: could not corroborate owner %s for test_id=%s — KEEPING '
                 'the stored owner and filing nothing (an unreadable status is not '
                 'evidence the task went terminal)',
                 row.owner_task_id,
                 row.test_id,
-                exc_info=statuses_error,
+                exc_info=read_error,
             )
             return row
-        liveness = _owner_liveness(statuses.get(row.owner_task_id))
+        liveness = _owner_liveness(status)
         if liveness == 'open':
             logger.debug(
                 'flake_ledger: debt for test_id=%s is already owned by live task %s',
@@ -1202,7 +1241,7 @@ async def _ensure_owner_task(
             'exists (status=%r) — filing a replacement',
             row.owner_task_id,
             row.test_id,
-            statuses.get(row.owner_task_id),
+            status,
         )
 
     # The filing gets its OWN guard for the same reason the corroboration does: one
@@ -1475,7 +1514,10 @@ async def open_debt(
     forward) instead of ζ quietly replacing a finished owner.  That makes recurrence
     detection race-free with no sweep at all: ``owner_task_id`` changes only inside this
     function, so the done owner is still on the row when the next suppression arrives,
-    whether or not an eager sweep has run.  The eager sweep is task θ's.
+    whether or not an eager sweep has run.  The eager sweep is task θ's.  The close's
+    live ``get_task`` read of the owner is also the read ζ's enforcement acts on, so one
+    call reads its owner once; ``get_statuses`` is only the fallback when that read
+    failed.
 
     The close's owner read is the only network wait BEFORE the upsert, so it is bounded
     by *resolve_budget_secs*: a slow or hung read fails like any other, costing the
@@ -1540,10 +1582,11 @@ async def open_debt(
         )
         return None
 
+    owner_read: _OwnerRead | None = None
     if task_client is not None:
         # Outside the upsert's guard, and safe there: the close never raises and its
         # read is bounded, so a failed or slow resolution costs only the resolution.
-        await _resolve(
+        _closed, owner_read = await _resolve(
             db_path, project_id, test_id,
             task_client=task_client, now=observed, read_budget_secs=resolve_budget_secs,
         )
@@ -1625,7 +1668,7 @@ async def open_debt(
     # already renders as the §5.9 breach it is -- never to "no row at all".
     try:
         return await _ensure_owner_task(
-            db_path, project_id, debt_row, task_client=task_client
+            db_path, project_id, debt_row, task_client=task_client, owner_read=owner_read
         )
     except Exception:
         logger.warning(
@@ -1639,17 +1682,16 @@ async def open_debt(
         return debt_row
 
 
-async def _read_done_owner(
+async def _read_owner(
     task_client: FlakeLedgerTaskClient, test_id: str, owner_task_id: str, *, budget_secs: float,
-) -> dict | None:
-    """*owner_task_id*'s task, read LIVE, if and only if it reads back ``done``;
-    ``None`` otherwise, each reason logged at the level it deserves.
+) -> _OwnerRead | None:
+    """*owner_task_id*'s task, read LIVE; ``None`` when the read FAILED, which is logged
+    and is evidence of nothing.
 
-    Its own guard, like ``_ensure_owner_task``'s ``get_statuses`` read: a raising or
-    partial adapter (no ``get_task`` at all, hence ``AttributeError``) lands on the SAME
-    path as the real adapter's in-band error, so the two failure shapes cannot drift.
-    So does a read that outlives *budget_secs* (``TimeoutError``): see
-    :data:`_RESOLVE_BUDGET_SECS`.
+    Its own guard, like :func:`_owner_status`'s fallback read: a raising or partial
+    adapter (no ``get_task`` at all, hence ``AttributeError``) lands on the SAME path as
+    the real adapter's in-band error, so the two failure shapes cannot drift.  So does a
+    read that outlives *budget_secs* (``TimeoutError``): see :data:`_RESOLVE_BUDGET_SECS`.
     """
     try:
         task, error = await asyncio.wait_for(
@@ -1666,22 +1708,28 @@ async def _read_done_owner(
             exc_info=error,
         )
         return None
-    if task is None:
+    return _OwnerRead(owner_task_id, task)
+
+
+def _finished_task(owner: _OwnerRead, test_id: str) -> dict | None:
+    """*owner*'s task if and only if it reads back ``done``, the one status that closes
+    a cycle; ``None`` otherwise, the reason logged at the level it deserves."""
+    if owner.task is None:
         logger.info(
             'flake_ledger: owner %s of test_id=%s no longer exists — the cycle stays open',
-            owner_task_id,
+            owner.owner_task_id,
             test_id,
         )
         return None
-    if task.get('status') != 'done':
+    if owner.status != 'done':
         logger.debug(
             'flake_ledger: owner %s of test_id=%s is %r, not done — the cycle stays open',
-            owner_task_id,
+            owner.owner_task_id,
             test_id,
-            task.get('status'),
+            owner.status,
         )
         return None
-    return task
+    return owner.task
 
 
 def _resolving_commit(task: dict) -> str | None:
@@ -1779,10 +1827,11 @@ async def resolve_debt(
     that outlives it is a failed read.  Never raises (B12): a failure logs with
     ``exc_info`` and returns ``False``.
     """
-    return await _resolve(
+    closed, _owner_read = await _resolve(
         db_path, project_id, test_id,
         task_client=task_client, now=now, read_budget_secs=_RESOLVE_BUDGET_SECS,
     )
+    return closed
 
 
 async def _resolve(
@@ -1793,14 +1842,16 @@ async def _resolve(
     task_client: FlakeLedgerTaskClient,
     now: datetime | None,
     read_budget_secs: float,
-) -> bool:
-    """:func:`resolve_debt`'s body, with the owner read's bound left to the caller:
-    :func:`open_debt` passes its own ``resolve_budget_secs``."""
+) -> tuple[bool, _OwnerRead | None]:
+    """:func:`resolve_debt`'s body: whether this call closed the cycle, and the live
+    owner read it made when one SUCCEEDED, so :func:`open_debt` acts on that read rather
+    than repeating it.  The read's bound is the caller's: :func:`open_debt` passes its
+    own ``resolve_budget_secs``."""
     try:
         stamp = _canonicalize_utc(now or datetime.now(UTC), origin='resolve_debt')
         row = read_debt(db_path, test_id)
         if row is None or row.resolved_at is not None:
-            return False
+            return False, None
         owner_task_id = row.owner_task_id
         if not owner_task_id:
             logger.info(
@@ -1808,12 +1859,13 @@ async def _resolve(
                 'close it',
                 test_id,
             )
-            return False
-        task = await _read_done_owner(
+            return False, None
+        owner = await _read_owner(
             task_client, test_id, owner_task_id, budget_secs=read_budget_secs,
         )
+        task = None if owner is None else _finished_task(owner, test_id)
         if task is None:
-            return False
+            return False, owner
         commit = _resolving_commit(task)
         if not _stamp_resolution(
             db_path, test_id, owner_task_id=owner_task_id, resolving_commit=commit, stamp=stamp,
@@ -1824,7 +1876,7 @@ async def _resolve(
                 test_id,
                 owner_task_id,
             )
-            return False
+            return False, owner
         logger.info(
             'flake_ledger: resolved debt for test_id=%s (project_id=%s): owner %s is done, '
             'resolving commit %s',
@@ -1833,7 +1885,7 @@ async def _resolve(
             owner_task_id,
             commit or '(none recorded)',
         )
-        return True
+        return True, owner
     except Exception:
         logger.warning(
             'flake_ledger: failed to resolve debt for test_id=%s (project_id=%s)',
@@ -1841,7 +1893,7 @@ async def _resolve(
             project_id,
             exc_info=True,
         )
-        return False
+        return False, None
 
 
 def list_open_debt(db_path: Path) -> list[DebtRow]:

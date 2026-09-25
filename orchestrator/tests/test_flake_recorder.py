@@ -828,17 +828,17 @@ class TestRecordOpensDebt:
 
         Two suppressions of the SAME test, with the first filing's owner still
         ``pending``, file ONE task and keep ONE debt row (``open_count`` advances
-        instead).  And the second pass really did CORROBORATE — ``get_statuses`` is
-        consulted against the stored id — rather than short-circuiting on a non-NULL
-        column, which is INV-3's whole point.
+        instead).  And the second pass really did CORROBORATE — the stored id is read
+        live, once, by ``get_task`` — rather than short-circuiting on a non-NULL column,
+        which is INV-3's whole point.
 
         The QUIET-LEDGER assertion is what keeps that claim HONEST.  A failed
         corroboration ALSO files nothing, ALSO leaves one row, and ALSO records the same
-        ``statuses_calls`` — the fake logs the call before the caller's unpack fails — so
-        every count assertion below is satisfied identically by the degrade branch.  This
-        test passed vacuously for exactly that reason while the fake's ``get_statuses``
-        returned a bare dict.  Pinning the pass to the live-owner dedup branch needs a
-        signal only the degrade path emits, and that is a WARNING from the ledger.
+        read — the fake logs the call before the caller's unpack fails — so every count
+        assertion below is satisfied identically by the degrade branch.  This test passed
+        vacuously for exactly that reason while the fake's ``get_statuses`` returned a
+        bare dict.  Pinning the pass to the live-owner dedup branch needs a signal only
+        the degrade path emits, and that is a WARNING from the ledger.
 
         Asserted STRUCTURALLY — by level and logger name, not by matching the warning's
         prose.  A negative substring match (``'could not corroborate' not in caplog.text``)
@@ -867,7 +867,8 @@ class TestRecordOpensDebt:
         assert len(rows) == 1, rows
         assert rows[0].open_count == 1, 'a repeat while still open is not a re-open'
         assert len(client.submit_calls) == 1, client.submit_calls
-        assert client.statuses_calls == [[rows[0].owner_task_id]], client.statuses_calls
+        assert client.task_calls == [rows[0].owner_task_id], client.task_calls
+        assert client.statuses_calls == [], client.statuses_calls
 
     async def test_a_raising_open_debt_for_one_test_does_not_cost_the_other(
         self, tmp_path: Path, caplog, monkeypatch,
