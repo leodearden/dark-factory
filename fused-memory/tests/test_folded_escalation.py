@@ -801,6 +801,9 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
     from fused_memory.middleware.candidate_key_escalation import (  # noqa: PLC0415
         _ANCHOR_TASK_ID as CANDIDATE_KEY_ANCHOR,
     )
+    from fused_memory.middleware.entity_mint_storm_escalator import (  # noqa: PLC0415
+        _ANCHOR_TASK_ID as ENTITY_MINT_ANCHOR,
+    )
     from fused_memory.middleware.mem0_update_storm_escalator import (  # noqa: PLC0415
         _ANCHOR_TASK_ID as MEM0_UPDATE_ANCHOR,
     )
@@ -862,6 +865,7 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
         #    migrating — but they write to the SAME queue, so they can still
         #    squat an anchor and must be in this sweep. ---------------------
         'mem0_update_storm_escalator': MEM0_UPDATE_ANCHOR,
+        'entity_mint_storm_escalator': ENTITY_MINT_ANCHOR,
         'scope_violation_escalator': SCOPE_VIOLATION_ANCHOR,
         'scope_violation_escalator override': SCOPE_OVERRIDE_ANCHOR,
         'scope_violation_escalator budget-misconfig': SCOPE_BUDGET_ANCHOR,
@@ -934,7 +938,7 @@ class TestNoTwoFilersShareAnAnchor:
                 f'stay equal: got {anchors[label_a]!r} and {anchors[label_b]!r}'
             )
 
-    def test_the_sweep_covers_every_filer_this_task_folded_in(self) -> None:
+    def test_the_sweep_covers_every_filer_on_the_queue(self) -> None:
         """Anti-vacuity: a pairwise sweep passes trivially if a filer is left
         out, which is exactly how the predecessor missed two of them."""
         anchors = _anchors_read_from_their_own_homes()
@@ -947,12 +951,15 @@ class TestNoTwoFilersShareAnAnchor:
             'referent_repair_storm_escalator',
             'completion_claim_gate prefix',
             'memory_metadata_census base',
+            'mem0_update_storm_escalator',
+            'entity_mint_storm_escalator',
+            'scope_violation_escalator',
         ):
             assert required in anchors, (
-                f'{required!r} files through `file_folded_escalation` but is '
-                'absent from the anchor sweep'
+                f'{required!r} files into the same queue but is absent from '
+                'the anchor sweep'
             )
-        assert len(anchors) >= 14, (
+        assert len(anchors) >= 15, (
             f'the sweep shrank to {len(anchors)} entries; a filer was dropped '
             'rather than renamed'
         )
