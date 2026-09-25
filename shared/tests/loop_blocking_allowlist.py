@@ -82,7 +82,9 @@ blindness that produced the misses above.
 ROW PER SITE, TRIAGE PER CAUSE.  Where a cluster shares one root cause -- the
 22 MCP handlers reaching the cached ``resolve_main_checkout``, every async
 caller of ``ReconciliationHarness._escalate`` -- every row carries the SAME
-justification naming that shared cause and its single follow-up.  The ledger
+justification naming that shared cause and its single follow-up -- held in
+one named constant where a cluster's text has had to change after filing
+(``_ESCALATE_ARCHIVE_SCAN_WHY``), so the next edit lands once.  The ledger
 stays row-per-site so a 23rd handler cannot be added silently under a blessed
 22; the triage stays cluster-per-defect so the follow-ups are one task per
 defect rather than one per line.
@@ -117,6 +119,37 @@ DISPOSITIONS = frozenset({
     'filed',     # an existing task owns it -- justification carries the id
     'to_file',   # confirmed defect; a task 4484 step-9 ticket is named
 })
+
+#: The shared justification of every ``ReconciliationHarness._escalate`` row.
+_ESCALATE_ARCHIVE_SCAN_WHY = (
+    'ROOT CAUSE (one defect, 10 rows): the sync '
+    'ReconciliationHarness._escalate reaches '
+    '_finding_recently_resolved, which read_texts EVERY escalation '
+    'record under the queue root AND its archive -- a fan-out on '
+    'the loop thread whose cost grows with queue history, so this '
+    'trips INV-8\'s fan-out limb as well as its blocking limb. '
+    '10 async callers, one fix (offload _escalate, or pre-fetch '
+    'resolved_fps once per cycle -- the resolved_fps kwarg already '
+    'exists for exactly that). PARTIALLY ADDRESSED BY TASK 5550, '
+    'which took the second route only as far as BOUNDING it: the '
+    'scan moved into reconciliation/escalation_archive.py behind a '
+    'run-scoped memo, so a run now pays at most ONE archive walk '
+    'instead of one per _escalate, and _run_remediation_pass warms '
+    'that slot off-loop before escalating anything. The scan is '
+    'therefore no longer UNBOUNDED, but it is not GONE: _escalate '
+    'is still sync, and an _escalate fired from another coroutine '
+    'with a cold slot still walks the archive inline -- which is '
+    'why these ten rows stay `filed` with their original hashes '
+    'rather than being deleted as fixed. The helper deliberately '
+    'lives under fused-memory/src/ so the scanner can still follow '
+    'that reach; see TestScanHelperStaysInGateScope. STILL OWNED '
+    'BY TASK 5270, which owns the full offload -- do not file '
+    'again: task 4484 step-9\'s ticket '
+    'tkt_0RT7QXR5AXGWVADW9T3S4DPC2M became task 5072, coalesced '
+    'into 5270. 5072\'s text counts 9 callers; the 10th, '
+    '_maybe_remediate\'s phantom-citation storm alarm, landed later '
+    'with task 4781.'
+)
 
 #: ``(relpath, qualname, content_hash, disposition, justification)``.
 AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
@@ -341,264 +374,56 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'ReconciliationHarness._recover_stale_runs',
         '0787c60051a4',
         'filed',
-        'ROOT CAUSE (one defect, 10 rows): the sync '
-        'ReconciliationHarness._escalate reaches '
-        '_finding_recently_resolved, which read_texts EVERY escalation '
-        'record under the queue root AND its archive -- a fan-out on '
-        'the loop thread whose cost grows with queue history, so this '
-        'trips INV-8\'s fan-out limb as well as its blocking limb. '
-        '10 async callers, one fix (offload _escalate, or pre-fetch '
-        'resolved_fps once per cycle -- the resolved_fps kwarg already '
-        'exists for exactly that). PARTIALLY ADDRESSED BY TASK 5550, '
-        'which took the second route only as far as BOUNDING it: the '
-        'scan moved into reconciliation/escalation_archive.py behind a '
-        'run-scoped memo, so a run now pays at most ONE archive walk '
-        'instead of one per _escalate, and _run_remediation_pass warms '
-        'that slot off-loop before escalating anything. The scan is '
-        'therefore no longer UNBOUNDED, but it is not GONE: _escalate '
-        'is still sync, and an _escalate fired from another coroutine '
-        'with a cold slot still walks the archive inline -- which is '
-        'why these ten rows stay `filed` with their original hashes '
-        'rather than being deleted as fixed. The helper deliberately '
-        'lives under fused-memory/src/ so the scanner can still follow '
-        'that reach; see TestScanHelperStaysInGateScope. STILL OWNED '
-        'BY TASK 5270, which owns the full offload -- do not file '
-        'again: task 4484 step-9\'s ticket '
-        'tkt_0RT7QXR5AXGWVADW9T3S4DPC2M became task 5072, coalesced '
-        'into 5270. 5072\'s text counts 9 callers; the 10th, '
-        '_maybe_remediate\'s phantom-citation storm alarm, landed later '
-        'with task 4781.',
+        _ESCALATE_ARCHIVE_SCAN_WHY,
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
         'ReconciliationHarness._recover_stale_runs',
         'cc7999e2d4b6',
         'filed',
-        'ROOT CAUSE (one defect, 10 rows): the sync '
-        'ReconciliationHarness._escalate reaches '
-        '_finding_recently_resolved, which read_texts EVERY escalation '
-        'record under the queue root AND its archive -- a fan-out on '
-        'the loop thread whose cost grows with queue history, so this '
-        'trips INV-8\'s fan-out limb as well as its blocking limb. '
-        '10 async callers, one fix (offload _escalate, or pre-fetch '
-        'resolved_fps once per cycle -- the resolved_fps kwarg already '
-        'exists for exactly that). PARTIALLY ADDRESSED BY TASK 5550, '
-        'which took the second route only as far as BOUNDING it: the '
-        'scan moved into reconciliation/escalation_archive.py behind a '
-        'run-scoped memo, so a run now pays at most ONE archive walk '
-        'instead of one per _escalate, and _run_remediation_pass warms '
-        'that slot off-loop before escalating anything. The scan is '
-        'therefore no longer UNBOUNDED, but it is not GONE: _escalate '
-        'is still sync, and an _escalate fired from another coroutine '
-        'with a cold slot still walks the archive inline -- which is '
-        'why these ten rows stay `filed` with their original hashes '
-        'rather than being deleted as fixed. The helper deliberately '
-        'lives under fused-memory/src/ so the scanner can still follow '
-        'that reach; see TestScanHelperStaysInGateScope. STILL OWNED '
-        'BY TASK 5270, which owns the full offload -- do not file '
-        'again: task 4484 step-9\'s ticket '
-        'tkt_0RT7QXR5AXGWVADW9T3S4DPC2M became task 5072, coalesced '
-        'into 5270. 5072\'s text counts 9 callers; the 10th, '
-        '_maybe_remediate\'s phantom-citation storm alarm, landed later '
-        'with task 4781.',
+        _ESCALATE_ARCHIVE_SCAN_WHY,
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
         'ReconciliationHarness._resume_interrupted_runs',
         'bc3672ec502c',
         'filed',
-        'ROOT CAUSE (one defect, 10 rows): the sync '
-        'ReconciliationHarness._escalate reaches '
-        '_finding_recently_resolved, which read_texts EVERY escalation '
-        'record under the queue root AND its archive -- a fan-out on '
-        'the loop thread whose cost grows with queue history, so this '
-        'trips INV-8\'s fan-out limb as well as its blocking limb. '
-        '10 async callers, one fix (offload _escalate, or pre-fetch '
-        'resolved_fps once per cycle -- the resolved_fps kwarg already '
-        'exists for exactly that). PARTIALLY ADDRESSED BY TASK 5550, '
-        'which took the second route only as far as BOUNDING it: the '
-        'scan moved into reconciliation/escalation_archive.py behind a '
-        'run-scoped memo, so a run now pays at most ONE archive walk '
-        'instead of one per _escalate, and _run_remediation_pass warms '
-        'that slot off-loop before escalating anything. The scan is '
-        'therefore no longer UNBOUNDED, but it is not GONE: _escalate '
-        'is still sync, and an _escalate fired from another coroutine '
-        'with a cold slot still walks the archive inline -- which is '
-        'why these ten rows stay `filed` with their original hashes '
-        'rather than being deleted as fixed. The helper deliberately '
-        'lives under fused-memory/src/ so the scanner can still follow '
-        'that reach; see TestScanHelperStaysInGateScope. STILL OWNED '
-        'BY TASK 5270, which owns the full offload -- do not file '
-        'again: task 4484 step-9\'s ticket '
-        'tkt_0RT7QXR5AXGWVADW9T3S4DPC2M became task 5072, coalesced '
-        'into 5270. 5072\'s text counts 9 callers; the 10th, '
-        '_maybe_remediate\'s phantom-citation storm alarm, landed later '
-        'with task 4781.',
+        _ESCALATE_ARCHIVE_SCAN_WHY,
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
         'ReconciliationHarness.run_full_cycle',
         '6770f1ceabc5',
         'filed',
-        'ROOT CAUSE (one defect, 10 rows): the sync '
-        'ReconciliationHarness._escalate reaches '
-        '_finding_recently_resolved, which read_texts EVERY escalation '
-        'record under the queue root AND its archive -- a fan-out on '
-        'the loop thread whose cost grows with queue history, so this '
-        'trips INV-8\'s fan-out limb as well as its blocking limb. '
-        '10 async callers, one fix (offload _escalate, or pre-fetch '
-        'resolved_fps once per cycle -- the resolved_fps kwarg already '
-        'exists for exactly that). PARTIALLY ADDRESSED BY TASK 5550, '
-        'which took the second route only as far as BOUNDING it: the '
-        'scan moved into reconciliation/escalation_archive.py behind a '
-        'run-scoped memo, so a run now pays at most ONE archive walk '
-        'instead of one per _escalate, and _run_remediation_pass warms '
-        'that slot off-loop before escalating anything. The scan is '
-        'therefore no longer UNBOUNDED, but it is not GONE: _escalate '
-        'is still sync, and an _escalate fired from another coroutine '
-        'with a cold slot still walks the archive inline -- which is '
-        'why these ten rows stay `filed` with their original hashes '
-        'rather than being deleted as fixed. The helper deliberately '
-        'lives under fused-memory/src/ so the scanner can still follow '
-        'that reach; see TestScanHelperStaysInGateScope. STILL OWNED '
-        'BY TASK 5270, which owns the full offload -- do not file '
-        'again: task 4484 step-9\'s ticket '
-        'tkt_0RT7QXR5AXGWVADW9T3S4DPC2M became task 5072, coalesced '
-        'into 5270. 5072\'s text counts 9 callers; the 10th, '
-        '_maybe_remediate\'s phantom-citation storm alarm, landed later '
-        'with task 4781.',
+        _ESCALATE_ARCHIVE_SCAN_WHY,
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
         'ReconciliationHarness._maybe_escalate_stale_task_count_snapshot',
         '560696057da1',
         'filed',
-        'ROOT CAUSE (one defect, 10 rows): the sync '
-        'ReconciliationHarness._escalate reaches '
-        '_finding_recently_resolved, which read_texts EVERY escalation '
-        'record under the queue root AND its archive -- a fan-out on '
-        'the loop thread whose cost grows with queue history, so this '
-        'trips INV-8\'s fan-out limb as well as its blocking limb. '
-        '10 async callers, one fix (offload _escalate, or pre-fetch '
-        'resolved_fps once per cycle -- the resolved_fps kwarg already '
-        'exists for exactly that). PARTIALLY ADDRESSED BY TASK 5550, '
-        'which took the second route only as far as BOUNDING it: the '
-        'scan moved into reconciliation/escalation_archive.py behind a '
-        'run-scoped memo, so a run now pays at most ONE archive walk '
-        'instead of one per _escalate, and _run_remediation_pass warms '
-        'that slot off-loop before escalating anything. The scan is '
-        'therefore no longer UNBOUNDED, but it is not GONE: _escalate '
-        'is still sync, and an _escalate fired from another coroutine '
-        'with a cold slot still walks the archive inline -- which is '
-        'why these ten rows stay `filed` with their original hashes '
-        'rather than being deleted as fixed. The helper deliberately '
-        'lives under fused-memory/src/ so the scanner can still follow '
-        'that reach; see TestScanHelperStaysInGateScope. STILL OWNED '
-        'BY TASK 5270, which owns the full offload -- do not file '
-        'again: task 4484 step-9\'s ticket '
-        'tkt_0RT7QXR5AXGWVADW9T3S4DPC2M became task 5072, coalesced '
-        'into 5270. 5072\'s text counts 9 callers; the 10th, '
-        '_maybe_remediate\'s phantom-citation storm alarm, landed later '
-        'with task 4781.',
+        _ESCALATE_ARCHIVE_SCAN_WHY,
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
         'ReconciliationHarness._maybe_remediate',
         '1fbc50761be3',
         'filed',
-        'ROOT CAUSE (one defect, 10 rows): the sync '
-        'ReconciliationHarness._escalate reaches '
-        '_finding_recently_resolved, which read_texts EVERY escalation '
-        'record under the queue root AND its archive -- a fan-out on '
-        'the loop thread whose cost grows with queue history, so this '
-        'trips INV-8\'s fan-out limb as well as its blocking limb. '
-        '10 async callers, one fix (offload _escalate, or pre-fetch '
-        'resolved_fps once per cycle -- the resolved_fps kwarg already '
-        'exists for exactly that). PARTIALLY ADDRESSED BY TASK 5550, '
-        'which took the second route only as far as BOUNDING it: the '
-        'scan moved into reconciliation/escalation_archive.py behind a '
-        'run-scoped memo, so a run now pays at most ONE archive walk '
-        'instead of one per _escalate, and _run_remediation_pass warms '
-        'that slot off-loop before escalating anything. The scan is '
-        'therefore no longer UNBOUNDED, but it is not GONE: _escalate '
-        'is still sync, and an _escalate fired from another coroutine '
-        'with a cold slot still walks the archive inline -- which is '
-        'why these ten rows stay `filed` with their original hashes '
-        'rather than being deleted as fixed. The helper deliberately '
-        'lives under fused-memory/src/ so the scanner can still follow '
-        'that reach; see TestScanHelperStaysInGateScope. STILL OWNED '
-        'BY TASK 5270, which owns the full offload -- do not file '
-        'again: task 4484 step-9\'s ticket '
-        'tkt_0RT7QXR5AXGWVADW9T3S4DPC2M became task 5072, coalesced '
-        'into 5270. 5072\'s text counts 9 callers; the 10th, '
-        '_maybe_remediate\'s phantom-citation storm alarm, landed later '
-        'with task 4781.',
+        _ESCALATE_ARCHIVE_SCAN_WHY,
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
         'ReconciliationHarness._maybe_remediate',
         '51ec3ffac666',
         'filed',
-        'ROOT CAUSE (one defect, 10 rows): the sync '
-        'ReconciliationHarness._escalate reaches '
-        '_finding_recently_resolved, which read_texts EVERY escalation '
-        'record under the queue root AND its archive -- a fan-out on '
-        'the loop thread whose cost grows with queue history, so this '
-        'trips INV-8\'s fan-out limb as well as its blocking limb. '
-        '10 async callers, one fix (offload _escalate, or pre-fetch '
-        'resolved_fps once per cycle -- the resolved_fps kwarg already '
-        'exists for exactly that). PARTIALLY ADDRESSED BY TASK 5550, '
-        'which took the second route only as far as BOUNDING it: the '
-        'scan moved into reconciliation/escalation_archive.py behind a '
-        'run-scoped memo, so a run now pays at most ONE archive walk '
-        'instead of one per _escalate, and _run_remediation_pass warms '
-        'that slot off-loop before escalating anything. The scan is '
-        'therefore no longer UNBOUNDED, but it is not GONE: _escalate '
-        'is still sync, and an _escalate fired from another coroutine '
-        'with a cold slot still walks the archive inline -- which is '
-        'why these ten rows stay `filed` with their original hashes '
-        'rather than being deleted as fixed. The helper deliberately '
-        'lives under fused-memory/src/ so the scanner can still follow '
-        'that reach; see TestScanHelperStaysInGateScope. STILL OWNED '
-        'BY TASK 5270, which owns the full offload -- do not file '
-        'again: task 4484 step-9\'s ticket '
-        'tkt_0RT7QXR5AXGWVADW9T3S4DPC2M became task 5072, coalesced '
-        'into 5270. 5072\'s text counts 9 callers; the 10th, '
-        '_maybe_remediate\'s phantom-citation storm alarm, landed later '
-        'with task 4781.',
+        _ESCALATE_ARCHIVE_SCAN_WHY,
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
         'ReconciliationHarness._maybe_remediate',
         '82d9ae32fa2a',
         'filed',
-        'ROOT CAUSE (one defect, 10 rows): the sync '
-        'ReconciliationHarness._escalate reaches '
-        '_finding_recently_resolved, which read_texts EVERY escalation '
-        'record under the queue root AND its archive -- a fan-out on '
-        'the loop thread whose cost grows with queue history, so this '
-        'trips INV-8\'s fan-out limb as well as its blocking limb. '
-        '10 async callers, one fix (offload _escalate, or pre-fetch '
-        'resolved_fps once per cycle -- the resolved_fps kwarg already '
-        'exists for exactly that). PARTIALLY ADDRESSED BY TASK 5550, '
-        'which took the second route only as far as BOUNDING it: the '
-        'scan moved into reconciliation/escalation_archive.py behind a '
-        'run-scoped memo, so a run now pays at most ONE archive walk '
-        'instead of one per _escalate, and _run_remediation_pass warms '
-        'that slot off-loop before escalating anything. The scan is '
-        'therefore no longer UNBOUNDED, but it is not GONE: _escalate '
-        'is still sync, and an _escalate fired from another coroutine '
-        'with a cold slot still walks the archive inline -- which is '
-        'why these ten rows stay `filed` with their original hashes '
-        'rather than being deleted as fixed. The helper deliberately '
-        'lives under fused-memory/src/ so the scanner can still follow '
-        'that reach; see TestScanHelperStaysInGateScope. STILL OWNED '
-        'BY TASK 5270, which owns the full offload -- do not file '
-        'again: task 4484 step-9\'s ticket '
-        'tkt_0RT7QXR5AXGWVADW9T3S4DPC2M became task 5072, coalesced '
-        'into 5270. 5072\'s text counts 9 callers; the 10th, '
-        '_maybe_remediate\'s phantom-citation storm alarm, landed later '
-        'with task 4781.',
+        _ESCALATE_ARCHIVE_SCAN_WHY,
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
@@ -661,66 +486,14 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'ReconciliationHarness._run_remediation_pass',
         'dbf8ae2eb1dc',
         'filed',
-        'ROOT CAUSE (one defect, 10 rows): the sync '
-        'ReconciliationHarness._escalate reaches '
-        '_finding_recently_resolved, which read_texts EVERY escalation '
-        'record under the queue root AND its archive -- a fan-out on '
-        'the loop thread whose cost grows with queue history, so this '
-        'trips INV-8\'s fan-out limb as well as its blocking limb. '
-        '10 async callers, one fix (offload _escalate, or pre-fetch '
-        'resolved_fps once per cycle -- the resolved_fps kwarg already '
-        'exists for exactly that). PARTIALLY ADDRESSED BY TASK 5550, '
-        'which took the second route only as far as BOUNDING it: the '
-        'scan moved into reconciliation/escalation_archive.py behind a '
-        'run-scoped memo, so a run now pays at most ONE archive walk '
-        'instead of one per _escalate, and _run_remediation_pass warms '
-        'that slot off-loop before escalating anything. The scan is '
-        'therefore no longer UNBOUNDED, but it is not GONE: _escalate '
-        'is still sync, and an _escalate fired from another coroutine '
-        'with a cold slot still walks the archive inline -- which is '
-        'why these ten rows stay `filed` with their original hashes '
-        'rather than being deleted as fixed. The helper deliberately '
-        'lives under fused-memory/src/ so the scanner can still follow '
-        'that reach; see TestScanHelperStaysInGateScope. STILL OWNED '
-        'BY TASK 5270, which owns the full offload -- do not file '
-        'again: task 4484 step-9\'s ticket '
-        'tkt_0RT7QXR5AXGWVADW9T3S4DPC2M became task 5072, coalesced '
-        'into 5270. 5072\'s text counts 9 callers; the 10th, '
-        '_maybe_remediate\'s phantom-citation storm alarm, landed later '
-        'with task 4781.',
+        _ESCALATE_ARCHIVE_SCAN_WHY,
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
         'ReconciliationHarness._run_remediation_pass',
         '1812aa52aaca',
         'filed',
-        'ROOT CAUSE (one defect, 10 rows): the sync '
-        'ReconciliationHarness._escalate reaches '
-        '_finding_recently_resolved, which read_texts EVERY escalation '
-        'record under the queue root AND its archive -- a fan-out on '
-        'the loop thread whose cost grows with queue history, so this '
-        'trips INV-8\'s fan-out limb as well as its blocking limb. '
-        '10 async callers, one fix (offload _escalate, or pre-fetch '
-        'resolved_fps once per cycle -- the resolved_fps kwarg already '
-        'exists for exactly that). PARTIALLY ADDRESSED BY TASK 5550, '
-        'which took the second route only as far as BOUNDING it: the '
-        'scan moved into reconciliation/escalation_archive.py behind a '
-        'run-scoped memo, so a run now pays at most ONE archive walk '
-        'instead of one per _escalate, and _run_remediation_pass warms '
-        'that slot off-loop before escalating anything. The scan is '
-        'therefore no longer UNBOUNDED, but it is not GONE: _escalate '
-        'is still sync, and an _escalate fired from another coroutine '
-        'with a cold slot still walks the archive inline -- which is '
-        'why these ten rows stay `filed` with their original hashes '
-        'rather than being deleted as fixed. The helper deliberately '
-        'lives under fused-memory/src/ so the scanner can still follow '
-        'that reach; see TestScanHelperStaysInGateScope. STILL OWNED '
-        'BY TASK 5270, which owns the full offload -- do not file '
-        'again: task 4484 step-9\'s ticket '
-        'tkt_0RT7QXR5AXGWVADW9T3S4DPC2M became task 5072, coalesced '
-        'into 5270. 5072\'s text counts 9 callers; the 10th, '
-        '_maybe_remediate\'s phantom-citation storm alarm, landed later '
-        'with task 4781.',
+        _ESCALATE_ARCHIVE_SCAN_WHY,
     ),
 
     # ---- reconciliation/stages/task_knowledge_sync.py ----
