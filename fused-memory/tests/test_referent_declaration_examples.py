@@ -2,7 +2,7 @@
 
 Task 3675 (PRD ``plans/memory-referent-fidelity-prd.md`` leaf kappa). Several
 sites teach agents to declare a write's referents: the markdown guides, the
-review-checkpoint reflection template and the recon prompt fragment. Each one
+review-checkpoint reflection guidance and the recon prompt fragment. Each one
 carries a hand-transcribed ``entities=`` example that must agree with the live
 ``add_memory`` signature and gate. That is the INV-5 lockstep shape, and this
 repo has already seen hand-transcribed prompt text drift twice in one file. So
@@ -19,12 +19,12 @@ parameter fails here too.
 
 WHY THIS SUITE. ``fused-memory/pyproject.toml`` sets
 ``pythonpath = ["src", "../orchestrator/src"]``, so both the gate and the
-orchestrator template are declared imports here. ``tests/scripts/`` runs under
-``uv run --project shared``, and that project's declared closure has no
-fused_memory: it raises ModuleNotFoundError under ``--isolated``. It is present
-only incidentally, in a venv provisioned with ``--all-packages``.
-``tests/scripts/test_check_fused_memory_unit_parity.py`` records the same
-finding.
+orchestrator's reflection renderer are declared imports here.
+``tests/scripts/`` runs under ``uv run --project shared``, and that project's
+declared closure has no fused_memory: it raises ModuleNotFoundError under
+``--isolated``. It is present only incidentally, in a venv provisioned with
+``--all-packages``. ``tests/scripts/test_check_fused_memory_unit_parity.py``
+records the same finding.
 
 KNOWN LIMITATION. A task-role diff that touches only ``.md`` files does not run
 this file, because ``orchestrator/src/orchestrator/verify.py::_has_source_files``
@@ -34,7 +34,7 @@ checkpoints still run it.
 Sibling guards on the same contract: ``test_referent_guidance_prompt_drift.py``
 checks that the rendered fragment reaches every recon prompt that writes, and
 ``orchestrator/tests/test_review_checkpoint_reflection_splice.py`` checks that
-the reflection template reaches the review prompt.
+the reflection guidance reaches the review prompt.
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
-from orchestrator.review_checkpoint import REFLECTION_INSTRUCTIONS
+from orchestrator.review_checkpoint import render_reflection_instructions
 
 from fused_memory.server.entities_gate import entities_gate
 from fused_memory.server.tools import create_mcp_server
@@ -208,17 +208,15 @@ def _read_repo_doc(relative: str) -> str:
     return path.read_text()
 
 
-def _review_reflection_instructions() -> str:
-    # Formatting is part of the check: a literal brace left unescaped raises here.
-    return REFLECTION_INSTRUCTIONS.format(project_id=_GROUP_ID, review_id='REV-TEST')
-
-
 _GUARDED_DOCS = ('CLAUDE.md', '.claude/commands/memory.md', 'skills/reflect/SKILL.md')
 
 _GUARDED_SITES = (
     ('recon-prompt-fragment', render_referent_declaration_guidance),
     *((doc, partial(_read_repo_doc, doc)) for doc in _GUARDED_DOCS),
-    ('review-checkpoint-reflection', _review_reflection_instructions),
+    (
+        'review-checkpoint-reflection',
+        partial(render_reflection_instructions, project_id=_GROUP_ID, review_id='REV-TEST'),
+    ),
 )
 
 

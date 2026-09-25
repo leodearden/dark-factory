@@ -29,11 +29,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Step 4 of the deep-review prompt. Public because the fused-memory suite imports it to
-# certify its add_memory example against the live entities_gate. A .format() template
-# whose only fields are {project_id} and {review_id}: any literal brace must be written
-# {{ or }}, the hazard roles.py's MANDATED_STAGING_COMMAND note records.
-REFLECTION_INSTRUCTIONS = """\
+
+def render_reflection_instructions(*, project_id: str, review_id: str) -> str:
+    """Step 4 of the deep-review prompt: preserve the review's insights as memories.
+
+    Public because ``fused-memory/tests/test_referent_declaration_examples.py``
+    runs its ``add_memory`` example through the live entities_gate.
+    """
+    return f"""\
 4. **Reflect on your findings** — write separate memories for each insight worth preserving:
    - **Patterns and surprises** — recurring issues, unexpected gaps, systemic weaknesses
      (`category="observations_and_summaries"`)
@@ -434,7 +437,7 @@ class ReviewCheckpoint:
         project_root = str(self.config.project_root)
         project_id = self.config.fused_memory.project_id
 
-        reflection_block = REFLECTION_INSTRUCTIONS.format(
+        reflection_block = render_reflection_instructions(
             project_id=project_id, review_id=review_id
         )
         submit_resolve_block = submit_only_instructions(
