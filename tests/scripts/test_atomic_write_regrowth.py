@@ -250,13 +250,6 @@ _ALLOWED_RENAMERS = {
         'disjoint-path discipline, so two writers can never share a temp path '
         'even if they bypass _persist_lock), and the asyncio.to_thread offload '
         'that keeps the blocking I/O off the event loop under burst load.',
-    ('fused-memory/src/fused_memory/reconciliation/backlog_policy.py', 'BacklogPolicy._restore_policy_keys'):
-        'Out of task 3223 enumerated scope; left alone deliberately. Re-merges '
-        'the policy-only keys that closing a halt strips (project_id, '
-        'error_type, backlog, threshold) back onto the persisted record via '
-        'tmp.write_text + tmp.replace. Best-effort by construction — every '
-        'failure is logged and swallowed so a record that IS closed but lost '
-        'its forensic keys is never misreported as un-closed.',
     ('fused-memory/src/fused_memory/reconciliation/event_queue.py', 'EventQueue._rotate_dead_letter'):
         'MOVES existing files: cascade-rotates dead_letter.jsonl -> .1 -> .2 '
         '-> ... There is no content string, only os.replace(src, dst) per '
@@ -305,11 +298,6 @@ _ALLOWED_RENAMERS = {
         'own docstring says the mechanism is copied \'(β does the same)\' — '
         'same shared artifact root, same mkstemp + os.replace, same candidacy. '
         'Migrate the two together or the copy-from-a-neighbour habit survives.',
-    ('scripts/consume_redispatch_requests.py', 'archive_request'):
-        'MOVES an existing file: os.replace of an APPLIED request into the '
-        '``consumed/`` subdirectory, to keep an audit trail of what was '
-        'actioned that the snapshot directory cannot provide. Same class as '
-        'escalation sweep._atomic_move / queue._archive_resolved.',
     ('scripts/dashboard-watchdog.py', 'save_state'):
         'STDLIB-ONLY STANDALONE ENTRYPOINT — the same constraint already '
         'recorded above for session_registry._atomic_write_text, so that '
@@ -377,7 +365,7 @@ _ALLOWED_RENAMERS = {
     # scope" boilerplate, and none was migrated here — a source migration
     # folded into a merge resolution is an unreviewed change arriving on the
     # one path nobody diffs, which is the opposite of what this guard is for.
-    ('scripts/render_dashboard_unit.py', 'main'):
+    ('scripts/render_systemd_unit.py', 'main'):
         'STDLIB-ONLY STANDALONE ENTRYPOINT — the class of dashboard-watchdog.'
         'save_state and orchestrator-watchdog._atomic_write_json above, and of '
         'session_registry._atomic_write_text before them, but under a HARDER '

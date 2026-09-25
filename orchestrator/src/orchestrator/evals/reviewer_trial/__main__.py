@@ -112,6 +112,17 @@ def _select_original_corpus(manifest: CorpusManifest) -> CorpusManifest:
     )
 
 
+def _select_split(manifest: CorpusManifest, split: str) -> CorpusManifest:
+    """Return a manifest holding only the diffs assigned to *split*."""
+    from .corpus import CorpusManifest
+
+    return CorpusManifest(
+        diffs=[d for d in manifest.diffs if d.split == split],
+        version=manifest.version,
+        split_seed=manifest.split_seed,
+    )
+
+
 # ---------------------------------------------------------------------------
 # CLI group
 # ---------------------------------------------------------------------------
@@ -1080,6 +1091,116 @@ def refresh_trial(max_parallel: int, stagger: float, report_dir: Path | None) ->
 
         total_cost = sum(r.total_cost_usd for r in results)
         click.echo(f'Total panel cost: ${total_cost:.2f}')
+        return 0
+
+    try:
+        sys.exit(asyncio.run(_run()))
+    except KeyboardInterrupt:
+        click.echo('\nInterrupted.')
+        sys.exit(130)
+
+
+# ---------------------------------------------------------------------------
+# Fable admission evidence campaign (ruling D5, 2026-09-10): every arm over
+# the same fixtures for N trials, scored, reduced by campaign.py.
+# ---------------------------------------------------------------------------
+
+_CAMPAIGN_DEFAULT_CONFIG = Path('/home/leo/src/dark-factory/dark-factory-orchestrator.yaml')
+
+
+@cli.command('campaign')
+@click.option('--results-dir', required=True, type=click.Path(path_type=Path),
+              help='Campaign root; per-trial panel results and scores checkpoint under it')
+@click.option('--trials', default=3, type=int, help='Independent repeats per arm (replication by fixture)')
+@click.option('--split', default='test', help='Corpus split to run (train|selection|test|all)')
+@click.option('--arms', default=None, help='Comma-separated variant names (default: FABLE_EVIDENCE_VARIANTS)')
+@click.option('--diff-cap', default=None, type=int,
+              help='Diff truncation in chars (default: runner.DIFF_CAP_CHARS; 0 lifts the cap)')
+@click.option('--max-parallel', default=3, type=int, help='Max concurrent panel runs')
+@click.option('--pool/--no-pool', default=True,
+              help='Draw on the shared OAuth account pool via a UsageGate (default) or the CLI default login')
+@click.option('--config', 'config_path', default=str(_CAMPAIGN_DEFAULT_CONFIG),
+              type=click.Path(path_type=Path), help='Orchestrator config supplying usage_cap accounts')
+def campaign(
+    results_dir: Path, trials: int, split: str, arms: str | None, diff_cap: int | None,
+    max_parallel: int, pool: bool, config_path: Path,
+) -> None:
+    """Run the Fable evidence campaign: every arm x every fixture x N trials.
+
+    Panel results checkpoint to ``<results-dir>/trial-<n>/`` and scores to
+    ``<results-dir>/trial-<n>/scores/``, so a killed campaign resumes
+    without re-spending. Re-running with the same arguments only reduces.
+    """
+
+    async def _run() -> int:
+        from orchestrator.config import default_price_table, load_config
+
+        from . import campaign as reduce
+        from .runner import DIFF_CAP_CHARS, run_trial
+        from .scorer import score_panel_run
+        from .variants import FABLE_EVIDENCE_VARIANTS
+
+        manifest = _load_corpus()
+        corpus = manifest if split == 'all' else _select_split(manifest, split)
+        by_name = {v.name: v for v in FABLE_EVIDENCE_VARIANTS}
+        variants = (
+            [by_name[a.strip()] for a in arms.split(',') if a.strip()]
+            if arms else list(FABLE_EVIDENCE_VARIANTS)
+        )
+        incumbent = variants[0].name
+        cap = DIFF_CAP_CHARS if diff_cap is None else diff_cap
+        prices = default_price_table()
+
+        usage_gate = None
+        if pool:
+            from shared.usage_gate import UsageGate
+
+            usage_gate = UsageGate(load_config(config_path).usage_cap)
+            await usage_gate.check_at_startup()
+
+        click.echo(click.style(
+            f'Campaign: {len(variants)} arms x {len(corpus.diffs)} diffs ({split}) x {trials} trials, '
+            f'diff cap {cap or "lifted"}, pool={"on" if usage_gate else "off"}',
+            bold=True,
+        ))
+        blocking_gt = {d.diff_id: {g.id for g in d.blocking_issues()} for d in corpus.diffs}
+        records: list[dict] = []
+        for trial in range(1, trials + 1):
+            trial_dir = results_dir / f'trial-{trial}'
+            score_dir = trial_dir / 'scores'
+            score_dir.mkdir(parents=True, exist_ok=True)
+            click.echo(f'\n== trial {trial}/{trials}')
+            results = await run_trial(
+                variants, corpus, max_parallel_panels=max_parallel, prices=prices,
+                results_dir=trial_dir, usage_gate=usage_gate, diff_cap_chars=cap,
+            )
+            for result in results:
+                diff = corpus.get_diff(result.diff_id)
+                if diff is None:
+                    continue
+                score_path = score_dir / f'{result.variant_name}__{result.diff_id}.json'
+                if score_path.exists():
+                    rec = json.loads(score_path.read_text())
+                else:
+                    rec = asdict(await score_panel_run(result, diff))
+                    score_path.write_text(json.dumps(rec, indent=2))
+                rec['trial'] = trial
+                records.append(rec)
+                click.echo(
+                    f'  {result.variant_name:22s} x {result.diff_id:<28s} '
+                    f'F1={rec["f1"]:.3f} BR={rec["blocking_recall"]:.3f} ${rec["cost_usd"]:.2f}'
+                )
+
+        arms_out, decisions = reduce.summarize_campaign(records, incumbent, blocking_gt)
+        md = reduce.format_markdown(arms_out, decisions)
+        (results_dir / 'campaign_report.md').write_text(md + '\n')
+        (results_dir / 'campaign_report.json').write_text(
+            json.dumps(reduce.to_json(arms_out, decisions), indent=2),
+        )
+        click.echo()
+        click.echo(md)
+        click.echo(f'\nTotal campaign cost (panels + matcher): ${sum(a.total_cost_usd for a in arms_out):.2f}')
+        click.echo(f'Report saved to: {results_dir / "campaign_report.md"}')
         return 0
 
     try:

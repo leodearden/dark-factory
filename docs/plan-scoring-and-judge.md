@@ -1026,15 +1026,35 @@ population exactly.
 
 **planRate is DELIBERATELY unchanged.** `produced_a_plan` is still
 `plan_steps > 0`, `_plan_rate` still reduces the same two numbers, and
-`is_scorable_plan` / `score_plan_structure` / `cap_tainted` / `band_for_cell` are
-untouched — so every campaign artifact already committed stays comparable. The
-split is reported ALONGSIDE it, by
+`is_scorable_plan` / `score_plan_structure` / `cap_tainted` are untouched — so
+every campaign artifact already committed stays comparable. The split is
+reported ALONGSIDE it, by
 `report.py::build_plan_quality_report` (`declined`, `declined_by_kind`,
 `no_plan_declined`, `terminal_kind_unmeasured`, over the SAME admitted pool `n`)
 and surfaced verbatim by `scripts/run_fable_trial_v2_campaign.py`. **The number
 to read beside `plan_rate` is `no_plan_declined`**: when it equals `no_plan`,
 that candidate emitted no plan *only* where it explicitly refused, which is a
 positive reliability result.
+
+**Banding reads the split too, since task 4766.**
+`scripts/run_fable_trial_v2_campaign.py::band_for_cell` was on that untouched
+list when the counts above first landed, and is not any more: its no-plan rung
+now splits into `no_plan` (this cell emitted no plan and said nothing about why)
+and `declined` (it took one of the five explicit plan-tools decline exits), read
+through the same `metrics.py::terminal_kind_of` accessor the report layer uses.
+What did NOT change is the thing the sentence above was protecting.
+**Both bands are RETAINED** — PRD D6 discards only the unambiguous ceiling band
+— and `declined` sits immediately after `no_plan` in the fixture-level
+precedence, which makes the split a pure label REFINEMENT: over every
+one-to-three-cell fixture shape, each fixture keeps its old label or gains
+`declined` exactly where the old label was `no_plan`, and none moves between
+`retained` and `discarded`. That is enumerated exhaustively by
+`test_the_split_cannot_re_select_the_pool`, so already-committed campaign
+artifacts stay comparable in the partition as well as in `planRate`.
+
+The split lives strictly inside the no-plan rung, so the worked example above is
+untouched: `reify_task_4026` planned before it declined, never reaches that rung,
+and still bands on its plan's merits — both facts still survive.
 
 **The provenance.** Tranche 1 recorded `plan_steps = 0` on 47 of 53 architect
 cells and the readout reported it as an ~89% planning failure. All 47 were

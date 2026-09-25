@@ -17,5 +17,38 @@
       "description": "The diagnostic for duplicate template names reports the indices but not the file/line where each template was defined. Adding span information would help users locate and fix the duplicates.",
       "mutation_type": "real_world"
     }
-  ]
+  ],
+  "context": {
+    "task": {
+      "title": "Report duplicate template names in the recursion-detection pass",
+      "description": "`detect_recursive_structures` in `crates/reify-compiler/src/scc.rs` builds a `name -> index` map over the `TopologyTemplate` set before running Tarjan's SCC search, and a model declaring two templates under the same name is currently compiled without complaint. Make the pass surface the collision: push an error `Diagnostic` naming the duplicated template into the same `diagnostics` sink the pass already writes its cycle warnings to. Fix and document which of the colliding templates the name index resolves to, so the adjacency built from `sub_components` and the `is_recursive` tagging that follows stay deterministic regardless of template order. Observable outcome: compiling a model with two same-named templates yields a duplicate-name error diagnostic, and the recursion analysis over the rest of the model is unchanged.",
+      "test_strategy": "Add a unit test in the `scc.rs` test module that runs `detect_recursive_structures` over two minimal templates sharing a name and asserts an error-severity diagnostic mentioning the duplicate is emitted. Keep the existing cycle-detection tests green \u2014 single-node self-edge, multi-node cycle, and the duplicate-sub-ref dedup case \u2014 so the added bookkeeping does not change cycle warnings for well-formed models. `cargo test -p reify-compiler`.",
+      "details": "",
+      "authored": true,
+      "id": null,
+      "record_source": {
+        "kind": "authored",
+        "authored_at": "2026-09-11",
+        "method": "reconstructed from the diff and the annotation description by an opus agent; states intent without naming the planted defect"
+      }
+    },
+    "changed_files": [
+      "crates/reify-compiler/src/scc.rs"
+    ],
+    "base_sha": "f33e9ae320ceb39feaa848260a542491ffc1d18f",
+    "branch_sha": null,
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "hand-authored fixture: no orchestrator run produced it, so no plan ever existed",
+    "verification": {
+      "method": "git apply --cached --check against a temporary index (validated via the reconstructed real commit diff, since the fixture itself is not git-apply-parseable)",
+      "applies_cleanly": true,
+      "tolerance_flags": [
+        "fixture is a custom pretty-printed diff format, not a parseable unified diff; validated indirectly via the matching real commit ca020e160e9b613e4e0f9514bf3960059f6c75ae's actual diff rather than the fixture text itself"
+      ],
+      "candidates_tested": 1,
+      "reason": "The fixture is NOT a valid unified diff -- it uses a custom pretty-printed header ('\u2500\u2500 crates/reify-compiler/src/scc.rs (modified) \u2500\u2500') with no `diff --git`/`index`/`---`/`+++` lines and no `@@ ... @@` hunk markers, so `git apply --cached --check` cannot parse it directly against any candidate. Found the real commit by `git log --all --format='%H %cI %s' -S'duplicate template name' -- crates/reify-compiler/src/scc.rs`, which returns exactly one hit on main: ca020e160e9b613e4e0f9514bf3960059f6c75ae, 'fix(scc): detect duplicate template names instead of silently overwriting' (2026-04-04T21:09:58+01:00). That commit's actual diff is content-identical to the fixture's changed lines (same removed .collect()-based index build, same added explicit-insertion loop with the same diagnostic message text and same comment wording) -- the fixture simply shows more surrounding unchanged context (the whole rest of the function) than git's default -U3 hunk would, consistent with a code-review tool's 'full modified function' rendering rather than raw `git diff` output. base_sha is that commit's PARENT, f33e9ae320ceb39feaa848260a542491ffc1d18f ('test(scc): failing test for duplicate template name diagnostic', 2026-04-04T21:09:58+01:00) -- the pre-fix state. Verified by reconstructing the real commit's actual `git show` diff and running `git apply --cached --check` against a temporary index built from this parent's tree: exit code 0, and the parent's crates/reify-compiler/src/scc.rs matches the fixture's pre-image (the .collect()-based name_to_idx build) byte-for-byte.",
+      "verified_at": "2026-09-11"
+    }
+  }
 }

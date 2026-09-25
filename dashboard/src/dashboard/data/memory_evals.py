@@ -272,21 +272,53 @@ _LIMITS_PROVENANCE_KEYS = (
 # The invariant this enforces: no raw `!r` on an artifact-derived value in
 # an `_issue` detail, at any of the fifteen interpolations this task swept
 # — held by the closure test
-# `tests/test_memory_evals_data.py::TestAllIssueDetailsAreBounded` for the
-# twelve issue kinds its hostile tree exercises (see `required_kinds`
+# `tests/test_memory_evals_data.py::TestAllIssueFieldsAreBounded` for the
+# fourteen issue kinds its hostile tree exercises (see `required_kinds`
 # there), so an edit that reintroduces a raw `!r` at one of THOSE sites
 # fails loudly instead of silently reopening this exposure.  That test
 # does not enumerate the module's full issue-kind vocabulary: a brand-new
 # `_issue` call, or one for a kind its hostile tree does not already
 # trigger, is not covered by it and needs its own per-site bound and
-# test.  Two further deliberate exceptions stay uncapped: the
+# test.  One further deliberate exception stays uncapped: the
 # `seen_kinds` dedup key below (an internal `repr`, never emitted —
 # capping it would collide two distinct oversized kinds on their shared
-# prefix and silently swallow a real second issue), and `_issue`'s
-# structured `eval_id=` / `path=` kwargs (identity/locator fields the UI
-# groups and links on, where truncation would corrupt identity rather
-# than trim prose).
+# prefix and silently swallow a real second issue).
+#
+# `_issue`'s structured `eval_id=` kwarg is handled by rejection at the
+# read boundary instead of a cap; see `_MAX_EVAL_ID_LENGTH` below for why.
+#
+# `_issue`'s structured `path=` kwarg needs no cap at all: every `path=`
+# argument in this module is filesystem-derived — a `Path` built from the
+# artifact-tree walk, or the `str(Path)` that
+# dashboard/src/dashboard/data/escalations.py::load_queue_escalations
+# returns at its skips projection — never artifact-derived, hence bounded
+# by construction rather than by any knob here.
 _MAX_DISCARDED_VALUE_REPR = 120
+
+# `_issue`'s structured `eval_id=` kwarg is an IDENTITY field — the
+# dashboard groups and links issue rows by it — so `_short_repr` above is
+# the wrong tool for it: a truncated identity reads as a real, distinct
+# eval_id and is silently WRONG, which is worse than the size exposure it
+# would fix.  The remedy is instead rejection at the read boundary, in
+# `_read_verdicts` below.
+#
+# Rejection is lossless: the only `eval_id` that can ever link a row is an
+# eval directory's own `name` (`_build_eval` assigns `eval_id =
+# eval_dir.name`, and `consumed` is keyed on it), and a single path
+# component is bounded by POSIX `NAME_MAX` on every filesystem this runs
+# on.  An `eval_id` longer than that was therefore already unmatchable by
+# construction — indexing it could only ever carry the artifact's own
+# unbounded bytes into every poll's payload, never link a real row.
+#
+# The comparison is in CHARACTERS, not encoded bytes: UTF-8 is at least
+# one byte per character, so `len(s) > _MAX_EVAL_ID_LENGTH` implies
+# `len(s.encode()) > _MAX_EVAL_ID_LENGTH` too — conservative in the safe
+# direction — and it never allocates an encoded copy of the hostile
+# multi-megabyte string this guard exists to contain.
+#
+# Held by `tests/test_memory_evals_data.py::TestVerdictEvalIdLengthIsBounded`
+# and `tests/test_memory_evals_data.py::TestAllIssueFieldsAreBounded`.
+_MAX_EVAL_ID_LENGTH = 255
 
 
 def _load_json(path: Path) -> Any:
@@ -625,6 +657,7 @@ def _read_verdicts(
 
     index: dict[tuple[str, str], dict[str, Any]] = {}
     unkeyable = 0
+    overlong_eval_id = 0
     for entry in entries:
         if not isinstance(entry, dict):
             # A non-object element cannot carry an (eval_id, metric_id) key, so
@@ -637,13 +670,25 @@ def _read_verdicts(
             continue
         eval_id = entry.get('eval_id')
         metric_id = entry.get('metric_id')
-        if not isinstance(eval_id, str) or not isinstance(metric_id, str) or not eval_id or not metric_id:
+        eval_id_overlong = isinstance(eval_id, str) and len(eval_id) > _MAX_EVAL_ID_LENGTH
+        if (
+            not isinstance(eval_id, str) or not isinstance(metric_id, str)
+            or not eval_id or not metric_id
+            or eval_id_overlong
+        ):
             # An object, but one that can never be keyed onto a row.  Dropping
             # it silently leaves that row's verdict absent — indistinguishable
             # from "no entry was ever written for it", which is the same
             # confusion the artifact-level guards above exist to prevent, just
-            # one row at a time instead of the whole tree.
-            unkeyable += 1
+            # one row at a time instead of the whole tree.  Split into two
+            # counters below — not a second gate, this entry is unkeyable
+            # either way — because the operator's next step differs: a
+            # missing/malformed key points at the producer's record shape, an
+            # over-length one at a specific runaway `eval_id`.
+            if eval_id_overlong:
+                overlong_eval_id += 1
+            else:
+                unkeyable += 1
         else:
             key = (eval_id, metric_id)
             if key in index:
@@ -656,7 +701,7 @@ def _read_verdicts(
                 )
                 continue
             index[key] = entry
-    if unkeyable:
+    if unkeyable or overlong_eval_id:
         # Counted once per file rather than one issue apiece, mirroring
         # `_by_metric_id`: a systematically broken artifact should cost one row
         # of the issues list, not flood it into uselessness.
@@ -664,7 +709,8 @@ def _read_verdicts(
             issues, 'unidentified_verdicts', path=path,
             detail=(
                 f'{unkeyable} verdict entr(ies) carry no usable "eval_id"/"metric_id" pair '
-                'and cannot be matched to a metric row'
+                f'(absent, empty, or not a string) and {overlong_eval_id} carry an "eval_id" '
+                f'longer than {_MAX_EVAL_ID_LENGTH} characters; none can be matched to a metric row'
             ),
         )
 

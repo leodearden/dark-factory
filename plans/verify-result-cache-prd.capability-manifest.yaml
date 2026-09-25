@@ -1,0 +1,213 @@
+prd: plans/verify-result-cache-prd.md
+schema_version: 1
+tasks:
+- label: α
+  task_id: 5651
+  title: Verify events carry the plan hash, per-unit outcomes, and task-leg duration
+  capabilities:
+  - name: plan-hash-and-units-on-merge-verify
+    binding: capability→producer (wired) — verify_runner.py builds the merge_verify
+      payload from VerifyResult, which already carries `plan`
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: plan_hash
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: workflow-verify-duration
+    binding: capability→producer (wired) — workflow.py emits workflow_verify as a
+      dict literal; α adds duration_ms
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: workflow_verify[\s\S]{0,400}duration_ms
+      paths:
+      - orchestrator/src/orchestrator/workflow.py
+      expect: present
+- label: β
+  task_id: 5652
+  title: verify_cache package — registry, unit keys, policy, toolchain fingerprint,
+    status CLI
+  capabilities:
+  - name: registry-package-exists
+    binding: built by β
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class Registry
+      paths:
+      - orchestrator/src/orchestrator/verify_cache/
+      expect: present
+  - name: mode-knob-hot-reloadable
+    binding: capability→producer (wired) — config.py::RELOADABLE_FIELDS is a frozenset
+      β extends
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: verify_cache
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+- label: γ
+  task_id: 5653
+  title: Per-module and tree-tier cache decision at the verify fan-out seam, log mode,
+    unscoped-typecheck consult
+  capabilities:
+  - name: decision-at-fanout-seam
+    binding: capability→producer (wired) — verify.py::run_full_verification semaphore
+      site; run_scoped_verification for the task role
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: cache_hit
+      paths:
+      - orchestrator/src/orchestrator/verify.py
+      expect: present
+  - name: log-mode-would-hit
+    binding: built by γ; α's units field carries it
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: would_hit
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: unscoped-typecheck-consults-executed-plan
+    binding: capability→producer (wired) — merge_queue.py::_run_unscoped_typechecks
+      (task 5294 absorbed)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: behavioural; pinned by γ's own test in test_merge_boundary_effective_module_configs.py
+  - name: all-hit-gate-under-ten-minutes
+    binding: floor stated — no pytest/pyright executes when every unit replays; judged
+      by η row 2 timing
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: timing; proved by η's integration gate on the fixture repo
+- label: δ
+  task_id: 5654
+  title: Repo-wide guard module — move whole-tree tests out of shared, scripts and
+    tests/scripts into a never-cached module
+  capabilities:
+  - name: never-cached-module-registered
+    binding: capability→producer — β adds the ModuleConfig field; δ registers the
+      module
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: verify_cache:\s*never
+      paths:
+      - tests/repo_guards/
+      expect: present
+  - name: manifest-corpus-guard-moved
+    binding: measured escape 09-16 — shared/tests/test_capability_manifest.py reads
+      plans/
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: TestCheckedInManifestCorpus
+      paths:
+      - shared/tests/
+      expect: absent
+- label: ε
+  task_id: 5655
+  title: Verify-cache audit on the offline lane — attribution, eviction, streak kill
+    switch, L2 blocker
+  capabilities:
+  - name: audit-lane-command-configured
+    binding: capability→producer (wired) — config.py::LaneCommand, git.offline_lane_commands
+      hot-reloadable
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: verify-cache-audit
+      paths:
+      - dark-factory-orchestrator.yaml
+      expect: present
+  - name: attribution-module
+    binding: built by ε
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def attribute
+      paths:
+      - orchestrator/src/orchestrator/verify_cache/audit.py
+      expect: present
+  - name: red-path-hook
+    binding: capability→producer (wired) — offline_lane.py::OfflineLaneWorker._handle_red_run;
+      parse fix is task 4226 (upstream dep)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: behavioural; proved by η rows 12-14
+- label: ζ1
+  task_id: 5656
+  title: Per-test recorder — coverage contexts, read observer, repo_state marker enforcement,
+    recordings from the audit lane
+  capabilities:
+  - name: plugin-module-beside-isolation-plugin
+    binding: built by ζ1; sibling of df_pytest_isolation.py
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: repo_state
+      paths:
+      - df_verify_cache_plugin.py
+      expect: present
+  - name: coverage-c-tracer-for-contexts
+    binding: coverage 7.13.5 / pytest-cov 7.1.0 present; sysmon core lacks dynamic
+      contexts
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: tooling presence verified 2026-09-19 in the workspace venv
+- label: ζ2
+  task_id: 5657
+  title: Per-test replay — collection-time deselection, verdict merge, task-role wiring
+  capabilities:
+  - name: collection-time-deselection
+    binding: pytest hook pytest_collection_modifyitems
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: pytest_collection_modifyitems
+      paths:
+      - df_verify_cache_plugin.py
+      expect: present
+  - name: post-rebase-replay-observable
+    binding: capability→producer (wired) — event_store.py::EventType.rebase_verify_cost;
+      workflow_verify units (α)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: behavioural; proved by η row 15 and the live rebase_verify_cost series
+- label: η
+  task_id: 5658
+  title: Verify-cache integration gate — boundary rows 1–19 on a fixture workspace
+  capabilities:
+  - name: integration-gate-test-present
+    binding: built by η; template orchestrator/tests/test_verify_admission_integration_gate.py
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class Test|def test_
+      paths:
+      - orchestrator/tests/test_verify_cache_integration_gate.py
+      expect: present
+- label: θ
+  task_id: 5659
+  title: Companion docs — OPERATIONS.md verify-cache reference, R-cache-1 pointers,
+    5294 superseded, 5410 note
+  capabilities:
+  - name: operations-reference
+    binding: docs
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: R-cache-1
+      paths:
+      - OPERATIONS.md
+      expect: present

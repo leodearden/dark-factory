@@ -1,8 +1,116 @@
 #!/usr/bin/env bash
 # dark-factory project-specific checks (called from pre-commit).
-# Receives repo root as $1.
+# Receives repo root as $1 and the current branch as $2.
+#
+# TWO TIERS, and the split is deliberate:
+#
+#   UNIVERSAL (every branch) -- the merge-lane ratchet audit below. It is
+#     scoped to what this commit STAGES, so an ordinary commit costs one
+#     `git diff --cached` and spawns nothing.
+#   MAIN ONLY -- ruff, the three staged-file style checks, and pyright.
+#     These sweep whole packages and cost seconds, which is the wrong price
+#     to pay on every commit of every task branch.
+#
+# WHY THE RATCHET AUDIT IS UNIVERSAL. A ratchet raise is INTRODUCED by a
+# commit on a task branch and reaches main by MERGE -- exactly like the
+# .task/ contamination the neighbouring universal guard in hooks/pre-commit
+# exists to stop. A CLEAN merge runs pre-merge-commit rather than pre-commit
+# (a conflicted one finished with `git commit` does run pre-commit), and the
+# merge worker advances main with `git update-ref`, which runs no hooks at
+# all, so a main-only audit would never see the two raises that actually
+# landed (0b04534c7b, 52d98220ad -- both merge commits). Catching a raise
+# where it is introduced is the only placement that bites.
+#
+# $2 DEFAULTS TO main, not to a `rev-parse` of the working tree, and that is
+# measured rather than stylistic. Before the branch was passed down this
+# script had no branch concept at all: invoked directly, it ran every check.
+# orchestrator/tests/test_project_checks_pyright_scope.py invokes it exactly
+# that way against a throwaway repo -- whose branch is whatever
+# init.defaultBranch happens to be -- so a rev-parse default silently skips
+# the pyright scoping those four tests exist to pin. Defaulting to main keeps
+# a direct invocation byte-identical to its prior behaviour AND points the
+# unspecified case at the STRICTEST set: an omitted argument must never be
+# the reason a check quietly does not run (INV-11).
+#
+# FOR A REPO THAT COPIED hooks/, the honest claim is narrower than "stays
+# valid": a branch-unaware project-checks stays CORRECT, and stops being
+# CHEAP. This repo's pre-commit no longer exits early on a non-main branch,
+# so an older copy paired with it runs its whole main-only tier -- a
+# full-package ruff and up to three pyright sweeps, seconds each -- on every
+# commit on every branch, and blocks those commits on lint that previously
+# gated main alone. Take this file with that pre-commit.
 
 ROOT="${1:?}"
+BRANCH="${2:-main}"
+
+# ── merge-lane ratchet audit (ALL BRANCHES, staged-scoped) ───────────
+#
+# scripts/merge_lane_metrics.py's write gate refuses to absorb a raise into
+# a baseline it can READ first; what it cannot see is that baseline deleted
+# before the write, or rendered elsewhere and copied over. The auditor below
+# asks the other question -- does this COMMIT raise anything -- by comparing
+# the staged baseline against HEAD's blob, or, finishing a conflicted merge,
+# against what merging both parents may hold, so every route to a widened
+# baseline lands in front of one comparison.
+#
+# NO `|| true` on this filter, unlike the grep-terminated ones below: an empty
+# listing must mean "nothing staged", never "git could not answer". A corrupt
+# or locked index would otherwise disarm the audit in silence -- the very shape
+# this gate exists to close, reproduced one layer out (INV-11).
+ratchet_artifacts=(
+    orchestrator/tests/merge_lane_ratchet_baseline.json
+    orchestrator/tests/merge_lane_ratchet_authorized_raises.json
+)
+staged_ratchet="$(cd "$ROOT" && git diff --cached --name-only --diff-filter=ACMRD -- \
+    "${ratchet_artifacts[@]}")" || {
+    echo "pre-commit: could not list staged ratchet artifacts (git rc=$?);"
+    echo "  refusing the commit rather than skipping the audit."
+    exit 1
+}
+# FINISHING A MERGE, the listing runs against MERGE_HEAD too: a resolution
+# that keeps HEAD's artifacts byte-for-byte while dropping MERGE_HEAD's moves
+# or entries differs from MERGE_HEAD alone, and it is exactly the one that
+# breaks a merge's invariant. Still PRECISE rather than "audit every merge":
+# a merge that never touches the artifacts must spawn no python, or an
+# environment that cannot import `shared` would refuse an unrelated merge.
+if merge_head="$(cd "$ROOT" && git rev-parse -q --verify MERGE_HEAD)"; then
+    staged_ratchet+="$(cd "$ROOT" && git diff --cached --name-only --diff-filter=ACMRD \
+        "$merge_head" -- "${ratchet_artifacts[@]}")" || {
+        echo "pre-commit: could not list ratchet artifacts staged against MERGE_HEAD (git rc=$?);"
+        echo "  refusing the commit rather than skipping the audit."
+        exit 1
+    }
+fi
+if [ -n "$staged_ratchet" ]; then
+    echo "pre-commit: merge-lane ratchet audit (staged)..."
+    # Plain python3, matching the three staged-file checks below: no uv
+    # env-resolution overhead. The auditor fails LOUDLY if it cannot import
+    # the instrument; it never skips itself.
+    (cd "$ROOT" && python3 scripts/check_staged_ratchet_raise.py)
+    ratchet_rc=$?
+    # NO DIAGNOSIS IS RESTATED HERE. The auditor has five refusal paths (an
+    # unrecorded raise, a staged baseline deletion, a rewritten ledger history,
+    # an unreadable artifact, an unimportable instrument) and prints its own
+    # named cause plus the ONE copy of RAISE_REMEDY for the paths that remedy
+    # fits. A fixed "--authorize-raise it" line here was wrong for four of the
+    # five and sent the committer hunting the wrong thing. Only the exit ladder
+    # is read: 1 policy, 2 instrument.
+    if [ "$ratchet_rc" -eq 2 ]; then
+        echo "pre-commit: merge-lane ratchet audit could NOT RUN (rc=2); its named cause is above."
+        exit 1
+    elif [ "$ratchet_rc" -ne 0 ]; then
+        echo "pre-commit: merge-lane ratchet audit REFUSED this commit (rc=$ratchet_rc); see above."
+        exit 1
+    fi
+fi
+
+# ── main-only checks from here down ──────────────────────────────────
+
+if [ "$BRANCH" != "main" ]; then
+    echo "pre-commit: all checks passed."
+    exit 0
+fi
+
 echo "pre-commit: linting (main branch)..."
 
 # All first-party packages (for ruff)
@@ -57,6 +165,31 @@ if [ -n "$staged_mm" ]; then
         echo "  Use the mock_orch_config fixture or MagicMock(spec_set=pydantic_spec(...)) instead of bare MagicMock()."
         echo "  See task 1339 (migration) for the canonical fix pattern."
         echo "  To suppress a specific site: add '# noqa: bare-magicmock — <reason>' on the preceding non-blank line."
+        exit 1
+    fi
+fi
+
+# module-local TestClient fixture check — STAGED dashboard test files only.
+# See the notes above: repo-wide enforcement lives in dashboard's verify
+# lint_command (which also runs in merge-queue verify); this gate only inspects
+# the .py files under dashboard/tests that THIS commit stages, so it never
+# blocks an unrelated commit with debt that commit did not introduce.
+#
+# Deliberately scoped to dashboard/tests: conftest.py there owns the shared
+# module-scoped _client fixture, and a second TestClient in a fixture means a
+# second app lifespan per module. Other packages' tests build TestClients for
+# other apps and are none of this rule's business.
+# Script is stdlib-only (ast/argparse/pathlib/re/sys) — invoked via plain python3 to skip uv env-resolution overhead.
+echo "pre-commit: module-local TestClient fixture check (staged)..."
+staged_tc="$(cd "$ROOT" && git diff --cached --name-only --diff-filter=ACMR -- \
+    dashboard/tests \
+    | grep -E '\.py$' || true)"
+if [ -n "$staged_tc" ]; then
+    if ! (cd "$ROOT" && printf '%s\n' "$staged_tc" | xargs python3 fused-memory/scripts/check_module_local_testclient.py); then
+        echo "pre-commit: module-local TestClient fixture check failed."
+        echo "  Request conftest.py's shared module-scoped '_client' fixture instead of building your own."
+        echo "  See task 4485 (guard), task 3571 (the dedup this makes durable)."
+        echo "  To suppress a specific site: add '# noqa: module-local-testclient — <reason>' on the preceding non-blank line."
         exit 1
     fi
 fi

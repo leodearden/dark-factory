@@ -136,6 +136,7 @@ Motivation: `plans/confusion-census-2026-07-31.md:97` (cluster 1.3) found sessio
 
 - **1** — the implicit pre-3610 baseline, **never emitted**. An **absent** `instrument_version` key is the normative "this digest predates task 3610's filter change" marker. There is no sentinel value and no backfill: digests are rendered on demand and cached only in-process, so there is no persisted corpus to migrate.
 - **2** — the relaxed anchor+corroborator briefing filter plus the genuine/designed error split.
+- **3** — the re-ingested-content classifier (`scripts/legibility/digest.py::is_reingested_content`, task 5685), consulted by every text-pattern detector and the gold-turn filter. It bumps under the same-transcript test above: session `b203a05c` now renders `self_correct` 1 → 0, and `6a527d51` renders `self_correct` 1 → 0 and `df_guard` 1 → 0.
 
 This is the pre-fix-trace vs live-regression discriminator that `plans/confusion-census-2026-07-31.md:151` (§6) asked the next census for.
 

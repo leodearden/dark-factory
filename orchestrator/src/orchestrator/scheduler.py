@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, overload, runtime_checkable
 
 from shared import safe_io
+from shared.capability_manifest import CHECK_SUBJECT_FIELD
 from shared.cli_invoke import is_server_error_status
 from shared.locking import (
     files_to_modules,
@@ -60,6 +61,7 @@ from orchestrator.recovery_emission import (
     should_emit_event,
     veto_signature,
 )
+from orchestrator.recovery_pins import records_pin_blocked_recovery
 from orchestrator.streaks import StreakCounter, StreakRegistry
 from orchestrator.task_status import ACTIVE_TASK_STATUSES, TERMINAL_STATUSES
 
@@ -715,7 +717,9 @@ def _build_delivered_check_escalation(
     site (:meth:`Scheduler._compute_delivered_check_cache`) rather than
     passed in from delta's minimal per-tick ``fail_detail_by_dep`` shape,
     so the escalation can name the pattern/script/args/paths/expect that
-    delta's dispatch-gate cache does not persist.
+    delta's dispatch-gate cache does not persist. The per-kind subject
+    field comes from ``shared.capability_manifest.CHECK_SUBJECT_FIELD``,
+    so a new check kind never renders a field its descriptor lacks.
 
     Pure rendering — no side effects, no scheduler state.
     """
@@ -730,11 +734,16 @@ def _build_delivered_check_escalation(
         f'Delivered check {name!r} (kind={kind}) failed against main@{sha12}.',
         f'Dependency: task {dep_id} (status={dep_status}).',
     ]
+    # Name the field the descriptor ACTUALLY has. The former grep/script
+    # binary emitted a bare `pattern: None` for any third kind, into a body
+    # that routes straight to a human.
+    subject_field = CHECK_SUBJECT_FIELD.get(kind or '', 'pattern')
+    if subject_field != 'paths':
+        # kind='path' is its own subject, and `paths:` is already emitted
+        # unconditionally below — printing it twice would be its own defect.
+        lines.append(f'{subject_field}: {check.get(subject_field)}')
     if kind == 'script':
-        lines.append(f'script: {check.get("script")}')
         lines.append(f'args: {check.get("args", [])}')
-    else:
-        lines.append(f'pattern: {check.get("pattern")}')
     lines.append(f'paths: {check.get("paths", [])}')
     lines.append(f'expect: {check.get("expect")}')
     lines.append('observed: FAILED')
@@ -6357,9 +6366,9 @@ class Scheduler:
 
             # Shared with the Harness's twin adapter rather than hand-rolled
             # here: classify_pins is consulted ONLY to bucket the ids for the
-            # payload and never for the veto answer — that stays the caller's
-            # own untouched ``bool(rows)`` predicate (rewiring it is task
-            # 3541).
+            # payload, never for the veto answer.  Since task 3541 the caller
+            # has already decided, via `records_pin_blocked_recovery` — the
+            # same classification, read for the other question.
             pins = pin_buckets(task_id, rows, store_unavailable=store_unavailable)
             buckets = pins.buckets
 
@@ -6479,10 +6488,20 @@ class Scheduler:
         cancelled/parked it and its finally-block teardown may still be
         writing state, mirrors harness Fix #1b gate 4), not within its
         dispatch/requeue cooldown window, genuinely stranded
-        (claimant-liveness), deps resolved, and no open escalation (mirrors
-        Fix #1b gate 5 — protects a non-deterministic human ``/unblock``
-        park, whose null claimant is otherwise indistinguishable from a
-        crash-strand).
+        (claimant-liveness), deps resolved, and no open escalation that PINS
+        (mirrors Fix #1b gate 5 — protects a non-deterministic human
+        ``/unblock`` park, whose null claimant is otherwise indistinguishable
+        from a crash-strand).
+
+        "Pins" is ``recovery_pins.records_pin_blocked_recovery``, shared
+        verbatim with the harness blocked arm (task 3541, INV-5).  It
+        discriminates three pin classes and one category relaxation: a
+        QUEUE_HANDOFF (L1/L2, or an L0 whose filer is still live) pins; a
+        DEAD_L0 does not, because its handoff has no consumer left; an
+        ``info`` record never pins at any level; and a record set consisting
+        ENTIRELY of merge-remediable categories does not pin, because those
+        records ASK for the remediation this sweep performs.  The precedence
+        chain itself is documented once, in ``escalation/pins.py``.
 
         Fails safe (never flips) when the sweep is disabled via
         ``config.stranded_blocked_redispatch_enabled``, when
@@ -6610,15 +6629,42 @@ class Scheduler:
                         rows=None,
                     )
                     continue
-                # The veto predicate is `bool(rows)`, VERBATIM.  Task 3541
-                # owns relaxing it to `classify_pins(...).pins` — which would
-                # stop an info-severity record vetoing here, a real
-                # disposition change — and owns the resulting deliberate
-                # difference from the already-landed dispatch gate's
-                # predicate.  Until then classify_pins is consulted inside the
-                # emission adapter for id bucketing only, never for this
-                # answer.
-                if rows:
+                # THE VETO — the SHARED predicate (task 3541, INV-5), not a
+                # local `bool(rows)`.  This sweep and
+                # `Harness._reconcile_one_stranded`'s blocked arm decide the
+                # same question ("do this blocked task's open records pin it
+                # against its sweep-side remediation?") and used to answer it
+                # differently: the harness relaxed on merge-remediable
+                # categories (PRD leaf δ) while this site could not, because
+                # the relaxation was a private `Harness` staticmethod no
+                # scheduler import could reach.  Both now call
+                # `recovery_pins.records_pin_blocked_recovery`, so the
+                # relaxation matches BY CONSTRUCTION rather than by two
+                # maintainers keeping two copies in step.  The two mechanisms
+                # still TAKE different actions — the harness re-files or marks
+                # done, this sweep re-pends; only the predicate is unified.
+                #
+                # Consequences at this site, all deliberate: a lone
+                # `stranded_blocked` record — the reaper's OWN "please re-pend
+                # this task" request, which is exactly what this sweep
+                # performs — no longer vetoes its own remediation; an
+                # info-severity ANNOTATION no longer vetoes (PRD boundary #8);
+                # and a blocking L0 no longer vetoes because its filer is
+                # provably dead.  Every escape hatch against a redispatch loop
+                # is untouched above: the kill switch, the `_dispatched`
+                # membership gate, `workflow_cancel_recent`, the requeue
+                # cooldown, `_deps_satisfied`, and the reblock guard.
+                #
+                # `live_claimant=False` is EXACT, not an assumption:
+                # `is_stranded_blocked(task, ...)` returned True immediately
+                # above, so no incarnation holds this task and `classify_pins`
+                # link 4 reaches its identity-independent branch.
+                #
+                # `rows` is never `None` here — the `except` arm above already
+                # emitted and `continue`d — so the predicate's
+                # always-pin-on-unreadable-store branch is a contract this site
+                # RELIES on but never reaches.
+                if records_pin_blocked_recovery(tid, rows, live_claimant=False):
                     described.add(tid)
                     self._emit_recovery_disposition(
                         tid,

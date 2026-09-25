@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextlib
 import functools
 import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -19,6 +21,12 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
+
+# The one orchestrator symbol imported at module scope (the rest are imported
+# inside each test, as this file has always done): a `parametrize` decorator is
+# evaluated at collection time, so the disposition matrix below cannot name its
+# enum members any other way.
+from orchestrator.deterministic_runner import ProcessTeardown
 
 # ---------------------------------------------------------------------------
 # Task 3286 — the real task-2902 specimen shape.
@@ -363,6 +371,48 @@ _FRESH_UNIT_STATE: dict = {
     'ActiveEnterTimestamp': 'Mon 2026-06-23 10:01:00 UTC',
     'ActiveEnterTimestampMonotonic': 2_000_000,
 }
+
+# The already-exited-script timeout shape (task 4252): the script exits while a
+# child it spawned keeps the merged stdout pipe open, so `_terminate_process
+# _tree`'s pid-recycling guard dispatches NO signal and that child is still
+# alive when the test's assertions run — which is exactly what those tests
+# assert.  Every such test must therefore reap it itself, or leak a live
+# `sleep 30` past pytest exit (measured by the reviewer on the first of them).
+_SURVIVOR_SCRIPT = (
+    '#!/bin/sh\n'
+    'sleep 30 &\n'
+    'echo $! > "$1"\n'
+    'echo started\n'
+    'exit 7\n'
+)
+
+
+def _read_survivor_pid(pidfile: Path) -> int:
+    """The pid ``_SURVIVOR_SCRIPT`` recorded for the child that outlived it.
+
+    Written milliseconds into the run, long before the 1s timeout fires, so it
+    is reliably on disk by the time a caller reads it.
+    """
+    return int(pidfile.read_text().strip())
+
+
+def _is_alive(pid: int) -> bool:
+    """Whether *pid* still exists — the signal-0 existence probe."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _kill_survivor(pidfile: Path) -> None:
+    """SIGKILL the process ``_SURVIVOR_SCRIPT`` left behind, if still there.
+
+    Tolerates every way the pid can already be gone (no file, empty file, the
+    process reaped in the meantime) so it is safe in a ``finally``.
+    """
+    with contextlib.suppress(OSError, ValueError):
+        os.kill(_read_survivor_pid(pidfile), signal.SIGKILL)
 
 
 def _seed_escalation(
@@ -2602,6 +2652,173 @@ class TestBeforeDoneTargetUnitlessDeploy:
         assert 'Baseline inspect failed' in pending[0].summary
         script_runner.assert_not_called()
 
+    async def test_baseline_inspect_spawn_failure_blocks_without_running_deploy(
+        self, tmp_path: Path,
+    ):
+        """Task 4157: an inspector OSError on the PRE-DEPLOY baseline leg must
+        be indistinguishable from a wedged inspect once routed into the
+        sentinel — same BLOCKED, same single infra_issue, same untouched
+        deploy.
+
+        Injected through the documented ``unit_inspector`` seam, so (like the
+        crash-window leg) this is un-GREENable by the source-level guard
+        alone. RED today: the OSError propagates out of
+        ``deterministic_runner.py::DeterministicRunner.run``'s pre-deploy
+        baseline capture, BEFORE the task-2091
+        ``if not baseline.get('ActiveState')`` gate can fire — so the deploy
+        is not attempted, but neither is the escalation filed, and the task is
+        left neither done nor cleanly blocked.
+        """
+        import errno
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='2635', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        unit_inspector = AsyncMock(side_effect=OSError(errno.EMFILE, 'Too many open files'))
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('2635', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        assert pending[0].category == 'infra_issue'
+        assert 'Baseline inspect failed' in pending[0].summary
+        # Reviewer amendment: the sentinel renders identically for EMFILE, a
+        # missing `systemctl` and a hung systemd — three failures needing three
+        # different operator responses — so the detail must NAME the real cause
+        # rather than stranding it in the journal (INV-2
+        # structured-facts-at-failure).
+        detail = pending[0].detail
+        assert 'Cause:' in detail, (
+            f'the escalation must name the underlying inspect failure: {detail!r}'
+        )
+        assert 'Too many open files' in detail, (
+            f'the EMFILE root cause must survive into the escalation the '
+            f'operator reads: {detail!r}'
+        )
+        # before_done_ran_at is already stamped (I1 once-only), so the deploy
+        # must NOT be attempted against a baseline that was never established.
+        script_runner.assert_not_called()
+
+    async def test_verify_inspect_spawn_failure_blames_verify_not_run_fn(
+        self, tmp_path: Path,
+    ):
+        """Task 4157 (reviewer amendment): an inspector OSError on the
+        POST-DEPLOY verify leg must be reported as a verify failure, not as a
+        deploy-script failure.
+
+        The third ``inspect_fn`` call site lives in ``_capturing_inspector``,
+        which ``RestartPlan.execute()`` awaits after a successful deploy.
+        ``run()``'s contract was never at risk there — ``plan.execute()``'s
+        broad ``except Exception`` catches it — but that handler files
+        ``'Deploy run_fn failed (unexpected error)'``, blaming the deploy
+        script for a systemd-inspect failure (INV-2
+        ``block-report-misattribution``). Routing this leg through
+        ``_inspect_unit_guarded`` degrades it to the sentinel, which the verify
+        leg's own ``pid > 0`` check rejects — landing it as VERIFY_FAILED, the
+        SAME disposition the default inspector already produces for this
+        failure (``systemd_inspect`` swallows the OSError into the sentinel
+        before it can ever be raised). With the seam injected, the two paths
+        now agree.
+        """
+        import errno
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        target_unit = 'orchestrator-reify.service'
+        task = _deploy_task(task_id='2636', target_unit=target_unit)
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        # Baseline inspect succeeds; the deploy runs; the VERIFY re-inspect is
+        # the one that fails to spawn.
+        unit_inspector = AsyncMock(side_effect=[
+            _BASELINE_UNIT_STATE,
+            OSError(errno.EMFILE, 'Too many open files'),
+        ])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('2636', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.category == 'infra_issue'
+        assert esc.summary == f'Deploy verify failed: {target_unit}', (
+            f'an inspect failure must not be misattributed to the deploy '
+            f'script ("Deploy run_fn failed (unexpected error)"): {esc.summary!r}'
+        )
+        assert 'Cause:' in esc.detail, (
+            f'the escalation must name the underlying inspect failure: {esc.detail!r}'
+        )
+        assert 'Too many open files' in esc.detail, (
+            f'the EMFILE root cause must survive into the escalation the '
+            f'operator reads: {esc.detail!r}'
+        )
+        done_calls = [c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'done']
+        assert not done_calls, 'an unverified deploy must NOT drive to done'
+
+    async def test_verify_inspect_non_oserror_still_reaches_the_catch_all(
+        self, tmp_path: Path,
+    ):
+        """Pins the narrowness of the verify-leg guard.
+
+        Only ``OSError`` degrades to the sentinel; anything else still
+        propagates out of ``_capturing_inspector`` into ``plan.execute()``'s
+        pre-existing broad handler, so the guard cannot quietly become a
+        blanket ``except Exception`` on this leg either. ``run()`` still
+        returns BLOCKED (that handler is fail-closed) — the point is that the
+        exception was NOT swallowed into a sentinel.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        target_unit = 'orchestrator-reify.service'
+        task = _deploy_task(task_id='2637', target_unit=target_unit)
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        unit_inspector = AsyncMock(side_effect=[
+            _BASELINE_UNIT_STATE,
+            RuntimeError('not an OSError — must stay loud'),
+        ])
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('2637', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        assert 'not an OSError' in pending[0].detail, (
+            f'a non-OSError must reach the catch-all with its own repr intact, '
+            f'not be degraded to the sentinel: {pending[0].detail!r}'
+        )
+
     async def test_named_target_happy_path_still_double_inspects_and_drives_done(
         self, tmp_path: Path,
     ):
@@ -2637,29 +2854,29 @@ class TestBeforeDoneTargetUnitlessDeploy:
 
 
 # ---------------------------------------------------------------------------
-# Task 4065 — DEPLOY-path parity pin for the default runner's INNER timeout.
+# Task 4252 — DEPLOY-path HONESTY pin for the default runner's INNER timeout.
 #
 # `_default_run_script`'s own per-subprocess `asyncio.wait_for` fires strictly
 # BEFORE the outer wall-clock guard (`timeout_secs + run_timeout_grace_secs`),
 # so on the production path (script_runner=None) the inner timeout is what the
-# deploy classifier actually sees.  Task 4065 changes how the PREDICATE path
-# classifies that event; the deploy path's handling must not move.
+# deploy classifier actually sees.  Task 4065 made that event a `ScriptTimeout`
+# and restored a synthetic (1, '<script timed out after Ns>') pair for the
+# deploy classifiers; task 4252 removes the restore so each branch reports the
+# SIGKILL for what it was.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-class TestDefaultRunnerInnerTimeoutDeployParity:
-    """DeterministicRunner — the REAL default runner's inner timeout on the
-    deploy path stays classified exactly as it is today (task 4065).
+class TestDefaultRunnerInnerTimeoutDeployHonesty:
+    """DeterministicRunner — each deploy branch reports the REAL default
+    runner's inner per-script timeout honestly (task 4252).
 
-    Deliberate CHARACTERIZATION PIN, not a RED test: it is GREEN on arrival
-    and must stay green across task 4065's refactor.  Unlike the predicate
-    path — where a non-zero rc is a milestone VERDICT and the inner timeout
-    was therefore misclassified — the deploy classifiers have no verdict
-    semantics at all: every non-zero rc there already routes to
-    ``_file_infra_issue_and_block``.  So the legacy ``(1, '<script timed out
-    after Ns>')`` pair must still reach the deploy classifier byte-for-byte
-    after the fix, and this test is what proves the refactor did not disturb
-    it.
+    This class no longer pins the pre-4065 ``(rc=1, '<script timed out after
+    Ns>')`` characterization.  It pins that a script SIGKILLed by its own
+    per-script timeout is reported as what it was — a process group killed
+    mid-read, carrying an exit code ONLY when the script actually produced
+    one — and that each deploy branch reaches its OWN dedicated
+    ``except ScriptTimeout`` arm rather than degrading into ``run()``'s
+    'unexpected error' catch-all.
 
     Drives the REAL ``_default_run_script`` (``script_runner=None``) — the
     existing hung-seam coverage all injects a custom ``script_runner`` and so
@@ -2668,9 +2885,28 @@ class TestDefaultRunnerInnerTimeoutDeployParity:
     BOTH deploy branches are pinned — target_unit-less
     (``_run_deploy_script_guarded``) and named-target (``_RunFnProcShim`` ->
     ``RestartPlan.execute()``).  They share ONE
-    ``_invoke_run_fn_translating_timeout``, so a drift that pushed the
-    ``ScriptTimeout`` restore down into either call site would degrade only
-    the other one — a single-branch pin would not catch it.
+    ``_invoke_run_fn_translating_timeout``, which no longer catches
+    ``ScriptTimeout`` at all, so each branch's own arm is the only thing
+    standing between the timeout and a worse-diagnosed catch-all — and a
+    single-branch pin would not catch one of them losing its arm.
+
+    The third test covers the case the first two cannot reach: a script that
+    EXITS while a child it spawned keeps the merged output pipe open, so
+    ``communicate()`` times out with the script's REAL exit code already in
+    hand.  That is the very shape Layer A (task 2087/2090) exists for, and
+    reporting "no exit code was produced" there would swap a fabricated rc
+    for an affirmative falsehood (reviewer amendment).  It is also the shape
+    in which the teardown dispatches NO signal, so it pins the escalation
+    against claiming a kill and against losing the surviving process.
+
+    The matrix test then drives every {exit code} x {teardown disposition}
+    cell through the seam, pinning that the kill claim keys on the MEASURED
+    disposition rather than on the exit code — which is not a sound proxy in
+    either direction, and whose exit-during-teardown cell no end-to-end test
+    can reach.
+
+    A green-on-arrival companion closes the class: only the TIMEOUT wording
+    moved, and a genuine non-zero exit code is still reported verbatim.
     """
 
     async def test_targetless_deploy_default_runner_inner_timeout_files_infra_issue(
@@ -2678,8 +2914,8 @@ class TestDefaultRunnerInnerTimeoutDeployParity:
     ):
         """A real deploy script that overruns ``before_done['timeout_secs']``
         under the default runner must file exactly one born-at-L2
-        ``infra_issue`` whose detail still carries the legacy ``rc=1`` +
-        ``<script timed out after 1s>`` pair.
+        ``infra_issue`` naming the inner guard and the SIGKILL — and must NOT
+        report any exit code, because the process never exited.
 
         ``timeout_secs=1`` against a 30s sleep leaves the outer guard at
         ``1 + 30 = 31s``, so the INNER timeout provably wins (the 20s
@@ -2727,14 +2963,36 @@ class TestDefaultRunnerInnerTimeoutDeployParity:
         assert esc.agent_role == 'orchestrator-deterministic'
         assert esc.category == 'infra_issue', (
             f'the deploy path classifies a timed-out script as an infra fault; '
-            f'task 4065 must not change that: {esc.category!r}'
+            f'task 4252 changes the WORDING only, never the category: {esc.category!r}'
         )
-        assert 'rc=1' in esc.detail, (
-            f'the legacy rc=1 must still reach the deploy classifier: {esc.detail!r}'
+        assert esc.summary == 'Deploy script timed out (no exit code, no target_unit)', (
+            f'the target_unit-less branch must reach its own dedicated '
+            f'ScriptTimeout arm, not the rc≠0 ladder or the catch-all: '
+            f'{esc.summary!r}'
         )
-        assert '<script timed out after 1s>' in esc.detail, (
-            f'the legacy timed-out tail marker must still reach the deploy '
-            f'classifier verbatim: {esc.detail!r}'
+        assert 'per-script timeout (1s' in esc.detail, (
+            f'the detail must name the guard that fired and the budget it '
+            f'overran: {esc.detail!r}'
+        )
+        assert 'SIGKILLed' in esc.detail, (
+            f'the detail must say the script was killed mid-flight — that is '
+            f'what tells an operator the effect may be half-applied: '
+            f'{esc.detail!r}'
+        )
+        assert 'No exit code was produced' in esc.detail, (
+            f'the detail must state the fact the old rc=1 hid: {esc.detail!r}'
+        )
+        assert 'rc=' not in esc.detail, (
+            f'HONESTY PIN: this script was still running when the kill fired, '
+            f'so there is NO exit code to report on THIS branch and any rc '
+            f'would be fabricated. The exited-script branch is pinned '
+            f'separately below, and does report the code it measured: '
+            f'{esc.detail!r}'
+        )
+        assert '<script timed out after 1s>' not in esc.detail, (
+            f'HONESTY PIN: no output was captured (communicate() was cancelled '
+            f'by the timeout), so this marker was a placeholder printed where '
+            f'script output belongs: {esc.detail!r}'
         )
 
         done_calls = [
@@ -2744,22 +3002,17 @@ class TestDefaultRunnerInnerTimeoutDeployParity:
         assert done_calls == [], 'set_task_status must NOT be called with done on timeout'
         unit_inspector.assert_not_awaited()
 
-    async def test_named_target_deploy_default_runner_inner_timeout_is_restart_failed(
+    async def test_named_target_deploy_default_runner_inner_timeout_reports_no_exit_code(
         self, tmp_path: Path,
     ):
-        """Same parity pin for the OTHER deploy branch: a named ``target_unit``
-        routes the ``(rc, tail)`` pair through ``_RunFnProcShim`` into
-        ``RestartPlan.execute()``, which must classify it as
-        ``RESTART_FAILED`` -> the ``Deploy failed: <unit>`` infra_issue.
+        """Same honesty pin for the OTHER deploy branch.
 
-        This is the half of ``_invoke_run_fn_translating_timeout``'s anti-drift
-        claim the target_unit-less case cannot cover.  Both deploy branches go
-        through that ONE shared wrapper; if the ``ScriptTimeout`` catch were
-        ever moved down into ``_run_deploy_script_guarded``, THIS branch would
-        silently degrade — ``ScriptTimeout`` would escape ``plan.execute()``
-        into ``run()``'s catch-all and be reported as 'Deploy run_fn raised an
-        unexpected error', i.e. the same category with materially worse
-        diagnostics.
+        With the restore gone, a ``ScriptTimeout`` raised inside
+        ``_shim_runner`` propagates out of ``plan.execute()`` untouched, so
+        ``run()``'s own dedicated arm — placed BEFORE its ``except Exception``
+        — is the only thing keeping it out of the catch-all.  That ordering is
+        invisible in a diff review, which is why the summary is pinned against
+        the catch-all's wording as well as the old RESTART_FAILED one.
         """
         import asyncio
 
@@ -2781,8 +3034,8 @@ class TestDefaultRunnerInnerTimeoutDeployParity:
         assignment = _make_assignment(task)
         queue = EscalationQueue(tmp_path)
         scheduler = _mock_scheduler(task)
-        # Baseline inspect only: the script "fails" (rc=1), so execute() skips
-        # the post-deploy verify re-inspect entirely.
+        # Baseline inspect only: the script is killed mid-flight, so the
+        # post-deploy fresh-PID verify leg never runs.
         unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
 
         runner = DeterministicRunner(
@@ -2805,30 +3058,301 @@ class TestDefaultRunnerInnerTimeoutDeployParity:
         assert esc.severity == 'critical'
         assert esc.agent_role == 'orchestrator-deterministic'
         assert esc.category == 'infra_issue'
-        assert esc.summary == f'Deploy failed: {target_unit}', (
-            f'the restored (rc, tail) pair must reach RestartPlan.execute() and '
-            f'come back as RESTART_FAILED — NOT escape as a raw ScriptTimeout '
-            f"into run()'s catch-all ('Deploy run_fn failed (unexpected error): "
-            f"{target_unit}'): {esc.summary!r}"
+        assert esc.summary == f'Deploy script timed out (no exit code): {target_unit}', (
+            f'the named-target branch must reach its OWN dedicated ScriptTimeout '
+            f'arm — NOT the old RESTART_FAILED wording '
+            f"('Deploy failed: {target_unit}', which required a fabricated rc to "
+            f'exist) and NOT the catch-all '
+            f"('Deploy run_fn failed (unexpected error): {target_unit}', the real "
+            f'degradation risk now that ScriptTimeout escapes plan.execute()): '
+            f'{esc.summary!r}'
         )
-        assert 'rc=1' in esc.detail, (
-            f'the legacy rc=1 must still reach the named-target classifier: '
+        assert 'per-script timeout (1s' in esc.detail, (
+            f'the detail must name the guard that fired and the budget it '
+            f'overran: {esc.detail!r}'
+        )
+        assert 'SIGKILLed' in esc.detail, (
+            f'the detail must say the script was killed mid-flight — that is '
+            f'what tells an operator the effect may be half-applied: '
             f'{esc.detail!r}'
         )
-        assert '<script timed out after 1s>' in esc.detail, (
-            f'the legacy timed-out tail marker must survive the _RunFnProcShim '
-            f'round-trip verbatim: {esc.detail!r}'
+        assert 'No exit code was produced' in esc.detail, (
+            f'the detail must state the fact the old rc=1 hid: {esc.detail!r}'
+        )
+        assert 'rc=' not in esc.detail, (
+            f'HONESTY PIN: this script was still running when the kill fired, '
+            f'so there is NO exit code to report on THIS branch — which also '
+            f'proves proc_supervision\'s "script exit code rc=1" string was '
+            f'never built: {esc.detail!r}'
+        )
+        assert '<script timed out after 1s>' not in esc.detail, (
+            f'HONESTY PIN: no output was captured (communicate() was cancelled '
+            f'by the timeout), so this marker was a placeholder printed where '
+            f'script output belongs: {esc.detail!r}'
         )
 
         assert unit_inspector.await_count == 1, (
-            f'baseline inspect only — a failed script skips the verify '
-            f're-inspect: {unit_inspector.await_count}'
+            f'baseline inspect only — the post-deploy verify leg never runs '
+            f'after the script is killed: {unit_inspector.await_count}'
         )
         done_calls = [
             c for c in scheduler.set_task_status.call_args_list
             if c.args[1] == 'done'
         ]
         assert done_calls == [], 'set_task_status must NOT be called with done on timeout'
+
+    async def test_targetless_deploy_script_that_exited_reports_its_real_exit_code(
+        self, tmp_path: Path,
+    ):
+        """The reviewer-measured case: the SCRIPT exits, a child it spawned
+        keeps the merged output pipe open, and ``communicate()`` times out
+        anyway — with the script's real exit code already populated by the
+        child watcher.
+
+        This is exactly the shape Layer A (task 2087/2090) exists for:
+        ``restart-fused-memory.sh --drain`` forks grandchildren that inherit
+        the merged stdout pipe's write end.  The runner HAS an honest exit
+        code in hand here, so it must report that code rather than assert
+        "no exit code was produced" — which would replace the fabricated rc
+        this task removed with an affirmative falsehood about a script that
+        ran to completion.
+
+        And because the script was already reaped when the teardown ran, the
+        pid-recycling guard dispatched NO signal: the child holding the pipe
+        open is STILL RUNNING while this escalation is read.  So this test
+        also pins the escalation against claiming a kill — the most
+        operationally costly direction of the defect, since it tells an
+        operator a surviving process is gone when it is not.
+        """
+        import asyncio
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        script = tmp_path / 'exits-but-child-lives.sh'
+        pidfile = tmp_path / 'survivor.pid'
+        script.write_text(_SURVIVOR_SCRIPT)
+        script.chmod(0o755)
+
+        task = _deploy_task(
+            task_id='4252d',
+            target_unit=None,
+            script=str(script),
+            args=[str(pidfile)],
+            cwd=str(tmp_path),
+            timeout_secs=1,
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=None,
+        )
+
+        try:
+            outcome = await asyncio.wait_for(runner.run(assignment), timeout=20)
+
+            assert outcome == WorkflowOutcome.BLOCKED
+
+            pending = queue.get_by_task('4252d', status='pending')
+            assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+            esc = pending[0]
+            assert esc.level == 2
+            assert esc.severity == 'critical'
+            assert esc.agent_role == 'orchestrator-deterministic'
+            assert esc.category == 'infra_issue'
+            assert esc.summary == (
+                'Deploy script timed out (script exited rc=7, output pipe held '
+                'open, no target_unit)'
+            ), (
+                f'the HEADLINE must not claim "no exit code" for a script that '
+                f'produced one — and must still be the timeout arm, not the rc\u22600 '
+                f'ladder (the exit code never reached the classifier): {esc.summary!r}'
+            )
+            assert 'per-script timeout (1s' in esc.detail, (
+                f'the detail must still name the guard that fired and the budget '
+                f'it overran: {esc.detail!r}'
+            )
+            assert 'already exited with code 7' in esc.detail, (
+                f'the honest exit code is in hand at the raise site and must be '
+                f'reported, not discarded: {esc.detail!r}'
+            )
+            assert 'No exit code was produced' not in esc.detail, (
+                f'HONESTY PIN: the script DID exit and produced code 7, so this '
+                f'sentence would be an affirmative falsehood — the failure mode '
+                f'that replaces one lie with another: {esc.detail!r}'
+            )
+            assert '<script timed out after 1s>' not in esc.detail, (
+                f'still no stand-in output: the read was in flight when the kill '
+                f'fired, so nothing was captured either way: {esc.detail!r}'
+            )
+
+            survivor_pid = _read_survivor_pid(pidfile)
+            assert _is_alive(survivor_pid), (
+                f'THE MEASUREMENT the assertions below are about: survivor pid '
+                f'{survivor_pid} is still RUNNING, because the teardown dispatched '
+                f'no signal to it at all'
+            )
+            assert 'SIGKILLed' not in esc.detail, (
+                f'HONESTY PIN (task 4252 reviewer finding): in this shape '
+                f"_terminate_process_tree's pid-recycling guard dispatched NO "
+                f'signal, so claiming a kill tells the operator that surviving '
+                f'process (pid {survivor_pid}, alive as this runs) is gone when it '
+                f'is not — the most operationally costly direction of the defect: '
+                f'{esc.detail!r}'
+            )
+            assert 'nothing was signalled at all' in esc.detail, (
+                f'the detail must state that the process group was deliberately NOT '
+                f'signalled: {esc.detail!r}'
+            )
+            assert 'recycled pid' in esc.detail, (
+                f'...and WHY: the script had already been reaped, so signalling its '
+                f'pid could hit an unrelated group (task 845): {esc.detail!r}'
+            )
+            assert 'located and killed out-of-band' in esc.detail, (
+                f'nothing else will clean the survivor up, so the detail must tell '
+                f'the operator to find and kill it before resolving: {esc.detail!r}'
+            )
+            assert str(script) in esc.detail, (
+                f'...and must name the script path as the thing to search BY — the '
+                f'raw pid is deliberately not offered, since the runner refused to '
+                f'signal it precisely because it may now belong to an unrelated '
+                f'group: {esc.detail!r}'
+            )
+
+            done_calls = [
+                c for c in scheduler.set_task_status.call_args_list
+                if c.args[1] == 'done'
+            ]
+            assert done_calls == [], (
+                'a timed-out deploy is never done, even when the script itself '
+                'exited 0 — its result never reached the classifier'
+            )
+            unit_inspector.assert_not_awaited()
+        finally:
+            _kill_survivor(pidfile)
+
+    @pytest.mark.parametrize('exit_code', [None, 7], ids=['no_exit_code', 'exited_rc7'])
+    @pytest.mark.parametrize(
+        'teardown',
+        list(ProcessTeardown),
+        ids=lambda member: member.name,
+    )
+    async def test_deploy_timeout_text_tracks_the_measured_teardown(
+        self, tmp_path: Path, exit_code: int | None, teardown: ProcessTeardown,
+    ):
+        """The kill claim keys on the MEASURED disposition, not on ``exit_code``.
+
+        Two invariants across the whole {exit_code} x {disposition} matrix:
+        the detail claims a whole-group SIGKILL IFF the teardown dispatched
+        one, and it tells the operator a process SURVIVED and must be killed
+        out-of-band IFF it did not.
+
+        ``exit_code`` is not a sound proxy for either, in either direction —
+        the common exited-script shape short-circuits the killpg entirely,
+        while a script that exits in the window between the timeout firing and
+        the killpg gets both a code AND a real group kill.  That second cell is
+        a race no end-to-end test can drive, which is why the matrix is driven
+        through the seam.
+
+        Raising ``ScriptTimeout`` from an INJECTED ``script_runner`` is a
+        deliberate test seam for reaching a specific measured shape.  It is not
+        a contract change: a production custom runner still returns the plain
+        ``(rc, tail)`` pair, and only the default runner raises this (see the
+        ``ScriptTimeout`` docstring).
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner, ScriptTimeout
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='4252e', target_unit=None)
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(),
+            script_runner=AsyncMock(
+                side_effect=ScriptTimeout(1, exit_code=exit_code, teardown=teardown),
+            ),
+        )
+
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('4252e', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.category == 'infra_issue'
+        assert esc.summary.startswith('Deploy script timed out'), (
+            f'every cell must reach the dedicated ScriptTimeout arm, not the '
+            f'catch-all: {esc.summary!r}'
+        )
+
+        group_killed = teardown is ProcessTeardown.GROUP_KILLED
+        claims_group_kill = 'SIGKILLed' in esc.detail
+        warns_of_survivor = 'located and killed out-of-band' in esc.detail
+
+        assert claims_group_kill == group_killed, (
+            f'the kill claim must track the MEASURED disposition '
+            f'({teardown.name}), never the exit code ({exit_code!r}) and never '
+            f'the mere fact that a timeout fired: {esc.detail!r}'
+        )
+        assert warns_of_survivor == (not group_killed), (
+            f'{teardown.name} left processes the script spawned alive, so the '
+            f'detail must send the operator to find and kill them — and must '
+            f'NOT say so when the group really was killed: {esc.detail!r}'
+        )
+
+    async def test_targetless_deploy_injected_runner_nonzero_rc_still_reports_rc(
+        self, tmp_path: Path,
+    ):
+        """Green-on-arrival companion pin: only the TIMEOUT wording moved.
+
+        An injected ``script_runner`` keeps the plain ``(rc, tail)`` contract,
+        so a genuine non-zero exit code is still reported VERBATIM as ``rc=N``
+        on the target_unit-less branch.  The named-target counterpart already
+        exists as
+        ``test_restart_failed_disposition_files_deploy_failed_infra_issue``;
+        this is the missing target_unit-less half, so both branches guard that
+        the new timeout arms did not hijack honest exit-code reporting.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='4252c', target_unit=None)
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=AsyncMock(return_value=(3, 'boom')),
+        )
+
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('4252c', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.category == 'infra_issue'
+        assert esc.summary == 'Deploy failed (no target_unit) (rc=3)', (
+            f'a genuine exit code is still reported verbatim: {esc.summary!r}'
+        )
+        assert 'Deploy script exit code: rc=3' in esc.detail, esc.detail
+        assert 'boom' in esc.detail, esc.detail
+        unit_inspector.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -3910,26 +4434,47 @@ class TestBeforeDoneSubprocessTimeoutHardening:
     of the merged stdout pipe.  Killing only the direct child (pre-2090
     behavior) leaves the tree alive and the pipe open forever.
 
-    Task 4065 amendment: the timeout branch now RAISES ``ScriptTimeout``
+    Task 4065 / 4252 amendment: the timeout branch RAISES ``ScriptTimeout``
     instead of returning ``(1, '<script timed out after Ns>')`` — see that
-    class's docstring for why.  The Layer-A teardown below is unchanged and
+    class's docstring for why — and that exception carries only MEASURED
+    data: the overrun budget it blew, the script's own exit code when the
+    teardown found it already exited, and WHICH SIGNAL that teardown actually
+    dispatched (``ProcessTeardown``).  No fabricated exit code, no stand-in
+    output, and no inferred kill.  The Layer-A teardown below is unchanged and
     must still happen BEFORE the raise, so the grandchild-is-dead assertion
     stays exactly as it was.
+
+    The teardown disposition is asserted in BOTH directions here, because the
+    two shapes are what the escalation text has to tell apart: a script still
+    running at teardown entry gets a real whole-group SIGKILL (and the
+    grandchild-is-dead assertion corroborates it), while a script that already
+    exited gets NO signal at all — its pid may have been recycled — so the
+    child it spawned is still running when the escalation is filed.  Each of
+    the four ``_terminate_process_tree`` branch tests below therefore also
+    pins the value it RETURNS, since those are the tests that independently
+    prove which branch ran.
     """
 
     async def test_timeout_kills_whole_process_group(self, tmp_path: Path):
         """On timeout, a backgrounded grandchild must be killed too, not just
         the direct child — and the timeout must surface as ``ScriptTimeout``.
 
-        The raise carries the legacy ``rc``/``tail`` pair as structured data
-        so ``_invoke_run_fn_translating_timeout`` can hand the deploy
-        classifiers exactly what they saw before (task 4065).
+        The raise carries only MEASURED structured data (task 4252): the
+        overrun budget, and an ``exit_code`` that is ``None`` here because
+        this script's own process was still running when the kill fired.
+        (The exited-script case, where a surviving child holds the pipe open
+        and a real exit code IS in hand, is pinned by
+        ``TestDefaultRunnerInnerTimeoutDeployHonesty``.)
         """
         import asyncio
         import os
         import time
 
-        from orchestrator.deterministic_runner import DeterministicRunner, ScriptTimeout
+        from orchestrator.deterministic_runner import (
+            DeterministicRunner,
+            ProcessTeardown,
+            ScriptTimeout,
+        )
 
         script = tmp_path / 'hang.sh'
         pidfile = tmp_path / 'grandchild.pid'
@@ -3963,9 +4508,36 @@ class TestBeforeDoneSubprocessTimeoutHardening:
         assert exc.timeout_secs == 1, (
             f'ScriptTimeout must carry the budget it overran, got {exc.timeout_secs!r}'
         )
-        assert exc.rc == 1, f'expected the legacy rc=1 on the exception, got {exc.rc}'
-        assert '<script timed out after 1s>' in exc.tail, (
-            f'expected the legacy timed-out marker on the exception, got {exc.tail!r}'
+        assert exc.exit_code is None, (
+            f'the direct child was still running when the timeout fired, so '
+            f'it produced no exit code — the teardown signal that killed it '
+            f'(a negative returncode) is not one, and must normalize to None: '
+            f'{exc.exit_code!r}'
+        )
+        assert exc.teardown is ProcessTeardown.GROUP_KILLED, (
+            f'the script was alive at teardown entry, so the whole-group '
+            f'SIGKILL really was dispatched — and the grandchild-is-dead '
+            f'assertion below is the INDEPENDENT corroboration that this '
+            f'disposition is honest, so the two agree by construction rather '
+            f'than by assumption (task 4252): {exc.teardown!r}'
+        )
+        assert not hasattr(exc, 'rc'), (
+            f'a SIGKILLed script produced NO exit code, so the exception must '
+            f'not carry a fabricated one for a caller to re-report to a human '
+            f'(task 4252), got rc={getattr(exc, "rc", None)!r}'
+        )
+        assert not hasattr(exc, 'tail'), (
+            f'no output was captured either — communicate() was cancelled by '
+            f'the timeout — so the old marker string was a placeholder, not '
+            f'script output (task 4252), got tail='
+            f'{getattr(exc, "tail", None)!r}'
+        )
+        assert 'no exit code' in str(exc), (
+            f'the message must still say what did NOT happen, so a log line '
+            f'carrying only str(exc) is readable: {str(exc)!r}'
+        )
+        assert '1s' in str(exc), (
+            f'the message must still name the budget it overran: {str(exc)!r}'
         )
 
         grandchild_pid = int(pidfile.read_text().strip())
@@ -3983,6 +4555,77 @@ class TestBeforeDoneSubprocessTimeoutHardening:
             f'WHOLE process group must be killed, not just the direct child'
         )
 
+    async def test_timeout_of_already_exited_script_does_not_signal_the_group(
+        self, tmp_path: Path,
+    ):
+        """The other half of Layer A, measured: when the SCRIPT has already
+        exited, the teardown dispatches NO signal and the child it spawned
+        SURVIVES — so "exited" and "group killed" are independent facts.
+
+        Mechanism: ``communicate()`` waits for the merged stdout/stderr pipe to
+        CLOSE, and the child holding its write end keeps it open past the
+        script's own exit, while asyncio's child watcher populates
+        ``Process.returncode`` independently.  So ``returncode`` is ALREADY set
+        at teardown entry, and ``_terminate_process_tree``'s pid-recycling
+        short-circuit (task 845/3884) fires: refusing to signal a possibly
+        recycled pid beats reaping an orphan.
+
+        All three facts are asserted together because the escalation text is
+        built from them, and the defect this pins is text that infers a kill
+        from a timeout rather than reporting what was measured (task 4252
+        reviewer finding).
+        """
+        import asyncio
+
+        from orchestrator.deterministic_runner import (
+            DeterministicRunner,
+            ProcessTeardown,
+            ScriptTimeout,
+        )
+
+        script = tmp_path / 'exits-but-child-lives.sh'
+        pidfile = tmp_path / 'survivor.pid'
+        script.write_text(_SURVIVOR_SCRIPT)
+        script.chmod(0o755)
+
+        queue = EscalationQueue(tmp_path)
+        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+
+        before_done = {
+            'script': str(script),
+            'args': [str(pidfile)],
+            'cwd': str(tmp_path),
+            'timeout_secs': 1,
+            'target_unit': 'orchestrator-reify.service',
+        }
+
+        try:
+            # Hang tripwire, as in the sibling test above.
+            with pytest.raises(ScriptTimeout) as excinfo:
+                await asyncio.wait_for(
+                    runner._default_run_script(before_done), timeout=10,
+                )
+
+            exc = excinfo.value
+            assert exc.exit_code == 7, (
+                f'the script really did run to completion, and its exit code is '
+                f'in hand at the raise site: {exc.exit_code!r}'
+            )
+            assert exc.teardown is ProcessTeardown.NOT_SIGNALLED, (
+                f'the direct child was already reaped at teardown entry, so the '
+                f'pid-recycling guard dispatched NOTHING — not a group kill, not '
+                f'even a direct kill: {exc.teardown!r}'
+            )
+            survivor_pid = _read_survivor_pid(pidfile)
+            assert _is_alive(survivor_pid), (
+                f'survivor pid {survivor_pid} must still be RUNNING — nothing '
+                f'signalled it, and this is the fact the escalation text has to '
+                f'report: the process holding the deploy output pipe open is '
+                f'still there for an operator to find and kill'
+            )
+        finally:
+            _kill_survivor(pidfile)
+
     async def test_terminate_process_tree_swallows_process_lookup_error(
         self, tmp_path: Path,
     ):
@@ -3999,7 +4642,7 @@ class TestBeforeDoneSubprocessTimeoutHardening:
         import signal
         from unittest.mock import patch
 
-        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.deterministic_runner import DeterministicRunner, ProcessTeardown
 
         queue = EscalationQueue(tmp_path)
         runner = DeterministicRunner(
@@ -4023,10 +4666,16 @@ class TestBeforeDoneSubprocessTimeoutHardening:
         with patch(
             'os.killpg', side_effect=ProcessLookupError('no such process'),
         ) as mock_killpg:
-            await runner._terminate_process_tree(mock_proc, pgid)
+            result = await runner._terminate_process_tree(mock_proc, pgid)
 
         mock_killpg.assert_called_once_with(pgid, signal.SIGKILL)
         mock_proc.kill.assert_called_once()
+        assert result is ProcessTeardown.DIRECT_KILLED, (
+            f'the killpg raised, so only the DIRECT child was signalled and '
+            f'anything it spawned survives — the caller writes operator-facing '
+            f'text about what was killed, so it must be able to learn that '
+            f'(task 4252 reviewer finding): {result!r}'
+        )
 
     async def test_terminate_process_tree_bounds_reap_when_proc_never_exits(
         self, tmp_path: Path,
@@ -4045,7 +4694,7 @@ class TestBeforeDoneSubprocessTimeoutHardening:
         import asyncio
         from unittest.mock import patch
 
-        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.deterministic_runner import DeterministicRunner, ProcessTeardown
 
         queue = EscalationQueue(tmp_path)
         runner = DeterministicRunner(
@@ -4070,11 +4719,17 @@ class TestBeforeDoneSubprocessTimeoutHardening:
         with patch('os.killpg') as mock_killpg:
             # Hang tripwire: if reap_grace_secs stops bounding the wait, fail
             # loudly instead of stalling the suite.
-            await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 runner._terminate_process_tree(mock_proc, pgid), timeout=5,
             )
 
         mock_killpg.assert_called_once()
+        assert result is ProcessTeardown.GROUP_KILLED, (
+            f'the abandoned reap must NOT downgrade the disposition: a whole-group '
+            f'signal WAS dispatched, and what the reap proves (or fails to prove) '
+            f'is whether anything actually DIED — a separate fact the caller is '
+            f'told not to conclude from this value: {result!r}'
+        )
 
     async def test_no_killpg_after_proc_reaped(self, tmp_path: Path):
         """A reaped proc must receive NO killpg — its pid may already be recycled.
@@ -4089,7 +4744,7 @@ class TestBeforeDoneSubprocessTimeoutHardening:
         """
         from unittest.mock import patch
 
-        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.deterministic_runner import DeterministicRunner, ProcessTeardown
 
         runner = DeterministicRunner(
             scheduler=MagicMock(),
@@ -4107,10 +4762,16 @@ class TestBeforeDoneSubprocessTimeoutHardening:
             patch('os.killpg', side_effect=lambda pgid, sig: killpg_calls.append((pgid, sig))),
             patch('os.getpgid', side_effect=lambda pid: getpgid_calls.append(pid) or 999),
         ):
-            await runner._terminate_process_tree(mock_proc, 12345)
+            result = await runner._terminate_process_tree(mock_proc, 12345)
         assert killpg_calls == [], f'must not killpg a reaped proc (task 845); got {killpg_calls}'
         assert getpgid_calls == [], f'must never re-derive the pgid at kill time; got {getpgid_calls}'
         mock_proc.kill.assert_not_called()
+        assert result is ProcessTeardown.NOT_SIGNALLED, (
+            f'the caller builds operator-facing text claiming a kill, so it must '
+            f'be able to learn that NOTHING was signalled (task 4252 reviewer '
+            f'finding) — the three assertions above are the independent proof '
+            f'that this disposition is the TRUE one: {result!r}'
+        )
 
     @pytest.mark.parametrize('scenario', ['own_process_group', 'pid_mismatch'])
     async def test_refuses_to_killpg_an_unsafe_pgid(
@@ -4136,7 +4797,7 @@ class TestBeforeDoneSubprocessTimeoutHardening:
         """
         from unittest.mock import patch
 
-        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.deterministic_runner import DeterministicRunner, ProcessTeardown
 
         runner = DeterministicRunner(
             scheduler=MagicMock(),
@@ -4157,13 +4818,19 @@ class TestBeforeDoneSubprocessTimeoutHardening:
 
         killpg_calls: list[tuple[int, int]] = []
         with patch('os.killpg', side_effect=lambda p, s: killpg_calls.append((p, s))):
-            await runner._terminate_process_tree(mock_proc, pgid)
+            result = await runner._terminate_process_tree(mock_proc, pgid)
 
         assert killpg_calls == [], (
             f'{scenario}: refused pgid must never be signalled -- killpg on our '
             f'own group is the task-845 login-session kill; got {killpg_calls}'
         )
         mock_proc.kill.assert_called_once()
+        assert result is ProcessTeardown.DIRECT_KILLED, (
+            f'{scenario}: only the direct child was signalled, so anything it '
+            f'spawned SURVIVES — the caller must be able to learn that instead '
+            f'of telling an operator the whole group is gone (task 4252 reviewer '
+            f'finding): {result!r}'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -4370,6 +5037,54 @@ class TestInspectUnitTimeoutHardening:
             'the verify-leg inspect is ever invoked'
         )
 
+    async def test_spawn_failure_baseline_inspect_blocks_without_running_deploy(
+        self, tmp_path: Path,
+    ):
+        """Task 4157: an inspector SPAWN failure must fail closed exactly like
+        a wedged inspect — end-to-end through the REAL (non-injected) inspector.
+
+        ``unit_inspector`` is deliberately left unset so
+        ``_default_inspect_unit`` -> ``systemd_inspect.inspect_systemd_unit``
+        executes for real; that is what proves the source-level guard reaches
+        production rather than only the constructor seam that the
+        runner-level tests inject through. RED today: the raw ``OSError``
+        propagates straight out of ``run()``, so the task-2091 ActiveState
+        gate never fires and the operator never sees the infra_issue.
+        """
+        import errno
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='4157', target_unit='orchestrator-reify.service')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            script_runner=script_runner,
+        )
+
+        with patch(
+            'asyncio.create_subprocess_exec',
+            AsyncMock(side_effect=OSError(errno.EMFILE, 'Too many open files')),
+        ):
+            # Hang tripwire: fail loudly rather than stalling the suite.
+            outcome = await asyncio.wait_for(runner.run(assignment), timeout=5)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('4157', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        assert pending[0].category == 'infra_issue'
+        assert 'Baseline inspect failed' in pending[0].summary
+        # The deploy must NOT be attempted on an untrusted baseline
+        # (before_done_ran_at is already stamped; I1 once-only).
+        script_runner.assert_not_called()
+
     async def test_baseline_inspect_fail_advances_deploy_state_phase_ran_to_escalated(
         self, tmp_path: Path,
     ):
@@ -4451,8 +5166,27 @@ class TestDefaultInspectUnitDelegatesToModule:
             result = await runner._default_inspect_unit('orchestrator-reify.service')
 
         assert result == {'MainPID': 999, 'ActiveState': 'active'}
+        # Task 4157 (reviewer amendment): the delegate now forwards a THIRD
+        # seam — the optional `degradation_sink` out-dict that lets the caller
+        # recover WHICH degradation produced the (byte-identical) sentinel.
+        # Absent one, it forwards None, so the pre-4157 behaviour is unchanged.
         mock_inspect.assert_awaited_once_with(
             'orchestrator-reify.service', timeout_secs=7.0, reap_grace_secs=3.0,
+            degradation_sink=None,
+        )
+
+        # ...and a supplied sink must reach the module function itself, not be
+        # dropped by the delegate — the whole cause-reporting chain hangs off
+        # this one hop.
+        sink: dict = {}
+        mock_inspect.reset_mock()
+        with patch('orchestrator.deterministic_runner.inspect_systemd_unit', mock_inspect):
+            await runner._default_inspect_unit(
+                'orchestrator-reify.service', degradation_sink=sink,
+            )
+        mock_inspect.assert_awaited_once_with(
+            'orchestrator-reify.service', timeout_secs=7.0, reap_grace_secs=3.0,
+            degradation_sink=sink,
         )
 
 
@@ -5107,6 +5841,215 @@ class TestFileInfraIssueSkipsRedundantEscalatedAdvance:
         ]
         assert deploy_state_calls == []
         assert task['metadata']['deploy_state']['phase'] == seeded_phase
+
+
+# ---------------------------------------------------------------------------
+# Task 4048 (recovered task-2240 review suggestion): pairs with
+# TestFileInfraIssueSkipsRedundantEscalatedAdvance above — see
+# _file_milestone_gate_and_block's docstring for the full rationale.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestFileMilestoneGateSkipsRedundantEscalatedAdvance:
+    """On the rare crash-resume edge where deploy_state.phase is already
+    ESCALATED (or DONE) but a re-entrant always_escalates=True call site
+    reaches _file_milestone_gate_and_block again, the best-effort advance
+    must skip the illegal self-loop — while still stamping gate_escalated_at
+    so the task is not permanently denied the section-1 resume fork."""
+
+    @pytest.mark.parametrize('seeded_phase', ['escalated', 'done'])
+    async def test_no_illegal_transition_escalation_when_already_at_target(
+        self, tmp_path: Path, seeded_phase: str,
+    ) -> None:
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='4048', phase=seeded_phase)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+
+        outcome = await runner._file_milestone_gate_and_block(
+            '4048', task, task['metadata'],
+        )
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        # The milestone_gate itself is still filed — the skip only affects the
+        # redundant phase advance, not the loud gate signal.
+        gate_escs = [e for e in queue.get_by_task('4048') if e.category == 'milestone_gate']
+        assert len(gate_escs) == 1
+        # No spurious illegal_deploy_transition escalation was filed.
+        illegal_escs = [
+            e for e in queue.get_by_task('4048')
+            if e.category == 'illegal_deploy_transition'
+        ]
+        assert illegal_escs == []
+        # No redundant deploy_state write was even attempted.
+        deploy_state_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and (c.args[1].get('deploy_state') or {}).get('phase')
+        ]
+        assert deploy_state_calls == []
+        assert task['metadata']['deploy_state']['phase'] == seeded_phase
+        # gate_escalated_at is still stamped — a stamp-only fallback, not a
+        # full skip — so the next resume still routes through section-1
+        # quiescence instead of being permanently denied it.
+        stamp_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1
+            and c.args[1].get('gate_escalated_at')
+            and 'deploy_state' not in c.args[1]
+        ]
+        assert len(stamp_calls) == 1
+        assert stamp_calls[0].kwargs.get('metadata_mode') == 'merge'
+        assert scheduler.update_task.call_count == 1
+        scheduler.set_task_status.assert_awaited_once_with('4048', 'blocked')
+
+    async def test_legal_edge_still_advances_and_stamps(self, tmp_path: Path) -> None:
+        """Parity fence (GREEN before AND after the step-2 fix): a legal
+        RAN->ESCALATED edge must still take the full advance, unaffected by
+        the new guard."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='4048', phase='ran')
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+
+        outcome = await runner._file_milestone_gate_and_block(
+            '4048', task, task['metadata'],
+        )
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert scheduler.update_task.call_count == 1
+        payload = scheduler.update_task.call_args.args[1]
+        assert payload['deploy_state']['phase'] == 'escalated'
+        assert payload.get('gate_escalated_at')
+        assert task['metadata']['deploy_state']['phase'] == 'escalated'
+        illegal_escs = [
+            e for e in queue.get_by_task('4048')
+            if e.category == 'illegal_deploy_transition'
+        ]
+        assert illegal_escs == []
+
+    async def test_pure_gate_path_unchanged(self, tmp_path: Path) -> None:
+        """Parity fence (GREEN before AND after the step-2 fix): the pure-gate
+        (before_done=None) branch is byte-unchanged by this task's guard,
+        which is confined to the before_done-is-not-None deploy path."""
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _gate_task(task_id='4048')
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+
+        outcome = await runner._file_milestone_gate_and_block(
+            '4048', task, task['metadata'],
+        )
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        assert scheduler.update_task.call_count == 1
+        call = scheduler.update_task.call_args
+        assert call.args[0] == '4048'
+        assert set(call.args[1].keys()) == {'gate_escalated_at'}
+        assert call.args[1]['gate_escalated_at']
+        assert call.kwargs.get('metadata_mode') == 'merge'
+
+
+# ---------------------------------------------------------------------------
+# Task 4048 (recovered task-2240 review suggestion, part 2): the deploy-path
+# write in _file_milestone_gate_and_block — both the step-2 stamp-only skip
+# arm and the legal-edge full advance — must be best-effort, mirroring
+# _file_infra_issue_and_block's try/except around its own advance. A
+# transient failure (e.g. a severed fused-memory connection) must not
+# propagate out of run() as a raw exception (the "run() always returns
+# BLOCKED, never a raw exception" contract, deterministic_runner.py::
+# DeterministicRunner._file_infra_issue_and_block docstring).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestFileMilestoneGateAdvanceIsBestEffort:
+    """A transient failure inside the deploy-path write (either arm of the
+    step-2 fork) must not propagate out of _file_milestone_gate_and_block —
+    the milestone_gate escalation filed above is already durable regardless."""
+
+    async def test_transient_advance_failure_on_legal_edge_does_not_propagate(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        """Legal RAN->ESCALATED edge: the full _advance_deploy_phase arm is
+        taken and its update_task fails."""
+        import logging
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='4048', phase='ran')
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        scheduler.update_task = AsyncMock(side_effect=RuntimeError('connection severed'))
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.deterministic_runner'):
+            outcome = await runner._file_milestone_gate_and_block(
+                '4048', task, task['metadata'],
+            )
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        gate_escs = [e for e in queue.get_by_task('4048') if e.category == 'milestone_gate']
+        assert len(gate_escs) == 1
+        illegal_escs = [
+            e for e in queue.get_by_task('4048')
+            if e.category == 'illegal_deploy_transition'
+        ]
+        assert illegal_escs == []
+        scheduler.set_task_status.assert_awaited_once_with('4048', 'blocked')
+        warned = '\n'.join(
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        )
+        # Task 4048 amendment: message differentiated per arm (reviewer
+        # suggestion) — this is the full-advance arm's wording.
+        assert 'milestone_gate deploy_state ESCALATED advance failed' in warned
+
+    @pytest.mark.parametrize('seeded_phase', ['escalated', 'done'])
+    async def test_transient_stamp_failure_on_skip_path_does_not_propagate(
+        self, tmp_path: Path, seeded_phase: str, caplog,
+    ) -> None:
+        """Already-at-target phase: the step-2 stamp-only fallback arm is
+        taken and its update_task fails."""
+        import logging
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='4048', phase=seeded_phase)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        scheduler.update_task = AsyncMock(side_effect=RuntimeError('connection severed'))
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.deterministic_runner'):
+            outcome = await runner._file_milestone_gate_and_block(
+                '4048', task, task['metadata'],
+            )
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        gate_escs = [e for e in queue.get_by_task('4048') if e.category == 'milestone_gate']
+        assert len(gate_escs) == 1
+        illegal_escs = [
+            e for e in queue.get_by_task('4048')
+            if e.category == 'illegal_deploy_transition'
+        ]
+        assert illegal_escs == []
+        scheduler.set_task_status.assert_awaited_once_with('4048', 'blocked')
+        # Task 4048 amendment (reviewer suggestion): the skip arm must also
+        # be observably logged, not silently swallowed — and its wording
+        # must be distinguishable from the full-advance arm's above.
+        warned = '\n'.join(
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        )
+        assert 'milestone_gate gate_escalated_at stamp-only write failed' in warned
 
 
 # ---------------------------------------------------------------------------
@@ -5998,6 +6941,113 @@ class TestCrashWindowReverify:
         assert 'MainPID' in detail, (
             f'detail must record the re-inspected live unit state: {detail!r}'
         )
+
+    async def test_reverify_inspect_spawn_failure_escalates_instead_of_raising(
+        self, tmp_path: Path,
+    ):
+        """Task 4157: an inspector OSError on the crash-window re-verify leg
+        must route into the crash-window escalation, not escape ``run()``.
+
+        Injected through the DOCUMENTED constructor seam — ``inspect_fn``
+        resolves to ``self._unit_inspector or self._default_inspect_unit``, so
+        the source-level guard in ``systemd_inspect`` (which the injected mock
+        never reaches) cannot discharge ``run()``'s own "always returns
+        BLOCKED, never a raw exception" contract. RED today: the OSError
+        propagates straight out of
+        ``deterministic_runner.py::DeterministicRunner.run``'s crash-window
+        re-verify leg, bypassing the escalation entirely.
+        """
+        import errno
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(
+            task_id='904',
+            before_done_ran_at='2026-06-23T10:00:00+00:00',
+            phase='ran',
+            verify_baseline={'main_pid': 100, 'active_enter_timestamp_monotonic': 1_000_000},
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)  # empty — no prior escalation
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=OSError(errno.EMFILE, 'Too many open files'))
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        pending = queue.get_by_task('904', status='pending')
+        assert len(pending) == 1, (
+            f'a failed re-verify must still escalate exactly once, got {len(pending)}'
+        )
+        assert pending[0].category == 'infra_issue'
+        done_calls = [c for c in scheduler.set_task_status.call_args_list if c.args[1] == 'done']
+        assert not done_calls, 'a failed re-verify must NOT drive to done'
+        script_runner.assert_not_awaited()
+        # The failure must route THROUGH the sentinel into
+        # _deterministic_deploy_health_verdict (which returns 'unconfirmed'
+        # for it) rather than skipping the re-verify branch — the enriched
+        # reverify_note is the observable proof it did.
+        detail = pending[0].detail
+        assert 'unconfirmed' in detail, (
+            f'detail must record that the re-verify came back unconfirmed: {detail!r}'
+        )
+        assert 'MainPID' in detail, (
+            f'detail must record the observed (sentinel) unit state: {detail!r}'
+        )
+        # Reviewer amendment: that observed state IS the sentinel, which is
+        # identical for every degradation mode — the real cause must travel
+        # with it instead of being left in the journal (INV-2).
+        assert 'Cause:' in detail, (
+            f'the escalation must name the underlying inspect failure: {detail!r}'
+        )
+        assert 'Too many open files' in detail, (
+            f'the EMFILE root cause must survive into the escalation the '
+            f'operator reads: {detail!r}'
+        )
+
+    async def test_reverify_inspect_non_oserror_still_propagates(self, tmp_path: Path):
+        """Pins the NARROWNESS of the step-4 call-site guard.
+
+        ``run()`` deliberately raises ``ValueError`` (the only entry in its
+        documented ``Raises:`` section) and ``NotImplementedError`` (the "gate
+        resolved but before_done_ran_at is not set" operator guard). A guard
+        widened to a bare ``except Exception`` would swallow those into a
+        silent BLOCKED escalation — inverting this repo's
+        loud-over-silent-degradation norm — so a non-OSError inspector failure
+        must keep propagating.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _deploy_task(
+            task_id='905',
+            before_done_ran_at='2026-06-23T10:00:00+00:00',
+            phase='ran',
+            verify_baseline={'main_pid': 100, 'active_enter_timestamp_monotonic': 1_000_000},
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        unit_inspector = AsyncMock(side_effect=RuntimeError('not an OSError — must stay loud'))
+        script_runner = AsyncMock(return_value=(0, 'ok'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        with pytest.raises(RuntimeError, match='must stay loud'):
+            await runner.run(assignment)
 
     async def test_no_baseline_crash_window_does_not_reinspect(self, tmp_path: Path):
         """Pre-ζ shape (no deploy_state at all): the persisted-baseline gate

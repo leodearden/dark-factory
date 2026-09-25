@@ -5,6 +5,7 @@ uniquely-named sibling module — so they can be imported from test files
 without conflicting with sibling subprojects' conftests under
 `sys.modules['conftest']`.
 """
+import asyncio
 import itertools
 import json
 import os
@@ -93,32 +94,45 @@ merge_queue._DEBUG_ASSERTS = True
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def _reap_leaked_merge_workers():
+async def _drain_leaked_tasks():
+    """Cancel every task a test left pending, then wait, before its loop closes.
+
+    A task cancelled between spawning a subprocess and connecting its pipes
+    survives ONE cancel: asyncio then awaits a transport exit that an
+    unconnected pipe can never signal. pytest-asyncio's ``Runner.close``
+    delivers exactly one, and hung on it. This cancel is the first of the two
+    such a task needs, and the bounded wait lets it land before ``Runner.close``
+    throws the second. Pinned end to end by test_leaked_task_drain.py.
+    """
+    yield
+    own = asyncio.current_task()
+    pending = [t for t in asyncio.all_tasks() if t is not own and not t.done()]
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.wait(pending, timeout=5.0)
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _reap_leaked_merge_workers(_drain_leaked_tasks):
     """Gracefully stop any MergeWorker orphaned onto the test event loop (task 1907).
 
-    A merge-queue test that raises before its own ``await worker.stop()`` (e.g. an
-    assertion fails partway through) leaks the worker's ``run()`` task and its
-    four background loops, which do real ``git`` subprocess work. If
-    pytest-asyncio's per-test loop teardown (``asyncio.runners._cancel_all_tasks``)
-    then cancels a loop caught mid-subprocess-spawn
-    (``BaseSubprocessTransport._connect_pipes``), the cancellation ``gather``
-    deadlocks and the whole ``pytest tests/`` process HANGS forever at teardown
-    (this is the remaining full-suite teardown stall once the worker-kill hang is
-    fixed; there are 100+ ``create_task(worker.run())`` sites with inline-only
-    cleanup, so per-test ``try/finally`` is not tractable).
-
-    Reaping here — in the test's own loop, before it is closed — via the graceful
-    ``worker.stop()`` (sets ``_running=False`` + sends sentinels + bounded drain)
-    lets each loop FINISH its in-flight subprocess and exit cleanly, instead of
-    being abruptly cancelled mid-spawn. Best-effort and bounded: it never fails a
-    test and is a cheap no-op for the (vast majority of) tests that leak nothing.
+    A merge-queue test that raises before its own ``await worker.stop()`` leaks
+    the worker's ``run()`` task and its background loops, which do real ``git``
+    subprocess work. The graceful ``worker.stop()`` (sets ``_running=False`` +
+    sends sentinels + bounded drain) lets each loop FINISH its in-flight
+    subprocess and exit cleanly; the abrupt cancel that loop teardown would
+    apply instead can wedge. Requesting ``_drain_leaked_tasks`` keeps that net
+    tearing down AFTER this one even if fixture names change. There are 100+
+    ``create_task(worker.run())`` sites with inline-only cleanup, so per-test
+    ``try/finally`` is not tractable. Best-effort and bounded: it never fails a
+    test and is a cheap no-op for tests that leak nothing.
 
     Works for sync and async tests alike: pytest-asyncio (strict mode) provides a
     loop for this async fixture even under a sync test, where ``all_tasks()`` is
     simply empty.
     """
     yield
-    import asyncio
     import contextlib
 
     for task in list(asyncio.all_tasks()):

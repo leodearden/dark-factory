@@ -15,10 +15,12 @@ its rendered sections at a later task (ξ). Those prompts currently import
 nothing from harness.py/flag_dedup.py/recon_ledger.py, so — to stay safely
 importable from the prompt-import path without pulling in aiosqlite
 (recon_ledger's dependency) or other reconciliation internals — this module
-imports ONLY reconciliation.recon_pool_map and
-reconciliation.standing_decision_constants (both pure leaves — see those
-modules' docstrings; standing_decision_constants imports only
-`from __future__ import annotations`, so it pulls no reconciliation
+imports ONLY reconciliation.recon_pool_map,
+reconciliation.standing_decision_constants and
+reconciliation.graphiti_degradation_probe (all pure leaves — see those
+modules' docstrings; standing_decision_constants and
+graphiti_degradation_probe import only
+`from __future__ import annotations`, so they pull no reconciliation
 internals onto the prompt-import path) plus stdlib. Consistency with
 recon_ledger.MARKER_KINDS,
 harness._derive_affected_ids, and flag_dedup's content-fingerprint fallback
@@ -46,8 +48,12 @@ transcription, not yet a verified single source of truth.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 
+from fused_memory.reconciliation.graphiti_degradation_probe import (
+    NEGATIVE_SET_VERDICT,
+)
 from fused_memory.reconciliation.recon_pool_map import (
     CYCLE_SUMMARY_STAGE_TO_RECON_POOL,
     STAGE1_CYCLE_SUMMARY_RECON_POOL,
@@ -309,7 +315,14 @@ MCP_CALL_SIGNATURES: dict[str, str] = {
     ),
     'add_finding': (
         'add_finding(severity, category, flag_type, actionable, description, '
-        "suggested_action, task_id) -> {'finding_id': ...}  "
+        "suggested_action, task_id, supersedes) -> {'finding_id': ...}  "
+        '# supersedes (task-4653) = the finding_id of an earlier finding in '
+        'this run that this one makes historical — file it when your finding '
+        'RESOLVES an earlier claim rather than restating it. The dedup key '
+        'below cannot relate a claim to its resolution (the resolving '
+        'finding carries a different flag_type), so the relation must be '
+        'asserted explicitly or both stay live and a reader acts on the '
+        'first. The target is stamped and stays readable, not retracted. '
         '# actionable is a COMPUTED default (task-2432): when omitted, it '
         "resolves to False if task_id is None or category starts with "
         "'cross_project', else True; an explicit True/False from the caller "
@@ -658,12 +671,42 @@ def render_source_completion_section(*, can_file_tasks: bool) -> str:
     does NOT hold it, and must relay the residual to Stage 2 via
     flag_for_stage2 / flagged_items. Never instruct Stage 1 to call a tool it
     does not hold (loud-over-silent).
+
+    ## Why ``metadata.gate_subject`` is declared here (task 3588)
+
+    This section is the AUTHORITY on how a residual gate is filed, so it is
+    where the gate's dedupe key belongs. Before task 3588 there was no
+    canonical spelling and each filing invented its own: reify carriers used
+    ``stranded_task_id``, dark-factory task 3463 used ``related_task_id``.
+    With no agreed key, no deterministic consumer could join a carrier to its
+    subject — so nothing could tell that a gate had ALREADY been filed for
+    the same thing, and subject 5879 accumulated carriers 5902 -> 5916 ->
+    5929 (5929 even carried ``prior_escalation_tasks=[5916, 5902]`` and filed
+    anyway). ``middleware/recurring_gate_guard.py`` enforces the resulting
+    invariant at the ``submit_task`` boundary; this text is what tells the
+    filing agent the key exists and what happens if it is reused.
     """
     if can_file_tasks:
         residual_clause = (
             'You hold `submit_task` in this stage, so file it yourself: call '
             "`submit_task` declaring `metadata.operational_mode='gate'` "
             "alongside `metadata.execution_class='operational'`."
+        )
+        dedupe_clause = (
+            'A second gate for a `gate_subject` that already has a '
+            'NON-TERMINAL carrier is REJECTED at the `submit_task` boundary — '
+            'a hard rejection invariant, not a lint warning. The rejection '
+            'names the open carrier. When you hit it, AMEND that carrier with '
+            '`update_task` (refresh its evidence, bump '
+            '`metadata.recurrence_count`) instead of filing again; do not work '
+            'around it by rewording the title. Once the carrier is `done` or '
+            '`cancelled` it no longer blocks, so a condition that genuinely '
+            'recurs after closure can be filed afresh. `stranded_task_id` and '
+            '`related_task_id` are accepted as read-side ALIASES so carriers '
+            'already filed under those older, invented spellings are still '
+            'matched. They are read-side only: never use either for a NEW '
+            "filing, and never rewrite an existing carrier's metadata to "
+            'canonicalise it.'
         )
     else:
         residual_clause = (
@@ -672,6 +715,14 @@ def render_source_completion_section(*, can_file_tasks: bool) -> str:
             'residual in this stage. Relay it to Stage 2 via the '
             '`flag_for_stage2` / `flagged_items` channel, so Stage 2 files it '
             "as an `operational` task with `operational_mode='gate'`."
+        )
+        dedupe_clause = (
+            'A second gate for a `gate_subject` that already has a '
+            'NON-TERMINAL carrier is REJECTED when it is filed, so relay the '
+            'subject accurately — and say so in what you relay if you believe '
+            'an existing carrier already covers it. The amend-vs-refile '
+            'decision belongs to the stage that holds the task-write tools; '
+            'this stage does not hold them, so do not prescribe one here.'
         )
     return (
         '## Source-Completion\n'
@@ -691,6 +742,13 @@ def render_source_completion_section(*, can_file_tasks: bool) -> str:
         "`metadata.execution_class='operational'` and "
         "`metadata.operational_mode='gate'` (the human-gated routing mode, not "
         "the `'llm'` mode). " + residual_clause + '\n\n'
+        'EVERY gate filing MUST carry `metadata.gate_subject` — the ONE '
+        'canonical spelling for "the task or entity this gate is about". Use '
+        'the task id when the gate is about a task, or the stable '
+        'cluster/topic working key when it is a consolidation gate (the same '
+        'topic slug the "## Consolidation Gate" section already requires — '
+        'that is the natural cluster value, not a second key to invent).\n\n'
+        + dedupe_clause + '\n\n'
         'The "## Consolidation Gate" section is the AUTHORITY for what that '
         'gate must contain — its target end state, its topic working key, and '
         'the closure check that refuses to let it close over a malformed '
@@ -715,9 +773,16 @@ def render_task_creation_accounting_section() -> str:
     proactive/cross-project sample-review surface yet Stage 2 self-reported
     `tasks_created: 0` — exactly the gap this section closes, by stating the
     counter is path-agnostic and by giving the framework an action-record
-    ground truth (`task_created_records`) it can repair from, modeled
-    directly on `flag_deleted_records`' established convention (see
+    list (`task_created_records`) it can repair from, modeled directly on
+    `flag_deleted_records`' established convention (see
     `## Per-Cycle Counter Schema` in prompts/stage2.py).
+
+    That list is NOT taken as ground truth (task 3051): it is itself LLM
+    self-report, so the framework corroborates each record via `get_task`
+    against the record's own `project_id` before letting it raise the
+    counter. The closing paragraph says so, because a prompt that overstates
+    the framework's safety net lowers agent care on a counter nothing else
+    checks.
 
     Rendered once, as a shared renderer (INV-5) — not restated in
     `assemble_payload`'s "Your Task" block, where the Proactive Task Sample /
@@ -756,10 +821,15 @@ def render_task_creation_accounting_section() -> str:
         '"status": "created"|"combined", "project_id": <project the task '
         'was filed into>, "source_path": <short label of the surface that '
         'produced it>}`\n\n'
-        'The framework treats this list as ground truth and REPAIRS '
-        '`tasks_created` upward when the two disagree (recording the '
-        'pre-repair value under `tasks_created_reported`), so a missed '
-        'increment is recovered rather than lost.'
+        'The framework CORROBORATES every record before it counts for '
+        'anything: it looks each `task_id` up via `get_task` against the '
+        "root of that record's own `project_id`, and REPAIRS "
+        '`tasks_created` upward to the number of records whose task is '
+        'confirmed to EXIST (recording the pre-repair value under '
+        '`tasks_created_reported`), so a missed increment is recovered '
+        'rather than lost. A record naming a task that cannot be confirmed '
+        'to exist will NOT raise the counter — record only creations you '
+        'actually made, with the `project_id` you actually filed into.'
     )
 
 
@@ -787,6 +857,24 @@ def markers_deleted_only_by_gc() -> bool:
     Guards against the false-premise batch (tasks 2083/2092/2093) that
     mis-modeled stage1_flag_marker deletion as something Stage 3/remediation
     performs.
+    """
+    return True
+
+
+def negative_probe_set_does_not_clear_intermittent_fault() -> bool:
+    """Invariant: a negative mixed-store probe set never clears the Graphiti
+    degradation — it supports "0 of N reproduced" and nothing stronger.
+
+    The fault is intermittent and load-dependent, and ``search`` reports
+    ``degraded``/``failed_stores`` only WHEN a store has already failed, so a
+    clean probe yields no evidence of health at all. A negative set is an
+    absence of evidence by construction.
+
+    Guards against run cd53b227, whose Stage 2 promoted ONE negative probe
+    (limit=3) to "did not reproduce" and "no persistent Graphiti problem" —
+    which Stage 3 of the same cycle falsified at limit=8. Raising N does not
+    change this: run 45b9a919 ran three probes, one replaying the exact query
+    and limit that HAD fired, and 0 of 3 reproduced.
     """
     return True
 
@@ -829,12 +917,161 @@ class Violation:
 #       matches confined to a single clause.
 _GAP_NO_NEGATION = r"(?:(?!\bnot\b|\bnever\b|n['’]t\b|[.;]).)*"
 
-# Module-level rule table for premise_lint: (compiled case-insensitive
-# regex, invariant_name, detail). Each rule encodes one known-false premise
-# from the 2083/2092/2093 false-premise batch, which mis-modeled run_id and
-# stage1_flag_marker lifecycle. Extend this table as new false premises (or
-# new paraphrasings of an existing one) are discovered; premise_lint returns
-# one Violation per matching rule.
+# What a clearance claim must be ABOUT for the probe rules below to fire.
+# Without it, an unrelated task reporting "the flaky test did not reproduce"
+# would be rejected under an invariant that says nothing about it.
+_PROBE_SUBJECT = r'(?:graphiti|falkordb|mixed[- ]store|degradation)'
+
+_NOT_REPRODUCED = (
+    r"\b(?:did|does|do|was|were|is|are|has|have|had|could|would)"
+    r"(?:\s+not|n['\u2019]t)\s+(?:be\s+)?reproduc\w*"
+)
+
+# At most a couple of determiners may sit between a negated `reproduce` and
+# the fault it is about. Anything wordier is a DIFFERENT subject wearing the
+# same words — "the stage1 stall bug did not reproduce after the Graphiti
+# degradation was fixed" asserts nothing this invariant forbids.
+_DETERMINER_GAP = r'(?:\s+(?:the|this|that|a|an|any|its|such)){0,2}\s+'
+
+# "<fault> did not reproduce" or "did not reproduce the <fault>": on its own,
+# a truthful report of what a probe saw.
+_NEGATED_REPRODUCTION = re.compile(
+    rf'{_PROBE_SUBJECT}\s+{_NOT_REPRODUCED}'
+    rf'|{_NOT_REPRODUCED}{_DETERMINER_GAP}{_PROBE_SUBJECT}',
+    re.IGNORECASE,
+)
+
+# What turns that report into a CLEARANCE CLAIM when it follows the report in
+# the same clause. A state word says the fault itself is over. A window word
+# widens the negative from one probe to the whole cycle — unless the clause
+# also names a probe's `limit`, which scopes it back to that probe: "did not
+# reproduce this cycle at limit=3" is a per-probe report. Without either,
+# "did not reproduce" is precisely the fine-grained reporting the Stage 2
+# probe protocol asks for, and rejecting it would make the rule reject the
+# protocol's own output.
+_STATE_QUALIFIER = re.compile(
+    r'\b(?:no\s+longer|any\s?more|cleared|clear|resolved|gone|absent|healthy)\b',
+    re.IGNORECASE,
+)
+_WINDOW_QUALIFIER = re.compile(r'\bthis\s+(?:cycle|run)\b', re.IGNORECASE)
+_PROBE_LIMIT = re.compile(r'\blimits?\s*[=:-]?\s*\d', re.IGNORECASE)
+
+# "<fault> no longer reproduces" qualifies itself, and carries no negated
+# auxiliary for _NEGATED_REPRODUCTION to hang on.
+_NO_LONGER_REPRODUCES = re.compile(
+    rf'{_PROBE_SUBJECT}\s+no\s+longer\s+(?:be\s+)?reproduc\w*', re.IGNORECASE
+)
+
+# A clause that also names a POSITIVE sighting is a mixed-outcome report —
+# "did not reproduce at limit=3, but fired at limit=8 this cycle" — and the
+# qualifier there scopes the sighting, not a clearance. Only an un-negated
+# verb counts: "did not reproduce this cycle and did not reproduce last cycle
+# either" is still a clearance claim.
+_SIGHTING_VERB = r'\b(?:reproduc(?:e|es|ed|ing)|fired|fires|recurred|recurs)\b'
+# A zero count negates its verb through its subject instead ("0 of 3 probes
+# reproduced", "none of them fired", "no probe reproduced"). It is the
+# protocol's own permitted wording: read as a sighting, it would wave through
+# any claim it is appended to.
+_ZERO_COUNT_REPORT = (
+    r'\b(?:0|zero|none|no|neither|not\s+(?:a\s+single|one))\b(?:/\d+)?(?:\s+of)?'
+    r'(?:\s+(?:the|these|those|them))?(?:\s+\d+)?'
+    r'(?:\s+(?:[\w-]+\s+)?probes?)?(?:\s+(?:has|have|had))?\s+'
+    + _SIGHTING_VERB
+)
+# Scanned left to right, so a zero count or a negation consumes the verb it
+# governs before the last alternative can read that verb as a sighting.
+_SIGHTING_SCAN = re.compile(
+    rf'{_ZERO_COUNT_REPORT}'
+    rf"|(?:\bnot|n['\u2019]t|\bnever|\bbe|\blonger)\s+{_SIGHTING_VERB}"
+    rf'|(?P<sighting>{_SIGHTING_VERB})',
+    re.IGNORECASE,
+)
+
+# The other shape a clearance claim takes: asserting the fault's absence
+# outright. The scope word must GOVERN the fault noun — "no current Graphiti
+# failure" is a clearance claim, "no current owner for the ... degradation
+# problem" is a statement about ownership — so at most the probe subject may
+# sit between them. The fault must also be named somewhere after the `no`, so
+# the rule fires only on sentences about THIS fault.
+_FAULT_SCOPE = (
+    r'(?:persistent|persisting|ongoing|active|current|systemic|underlying)'
+)
+_FAULT_NOUN = r'\b(?:problem|issue|degradation|fault|defect|failure)s?\b'
+_SCOPED_ABSENCE = re.compile(
+    rf'\bno\s+{_FAULT_SCOPE}\b(?:\s+{_PROBE_SUBJECT})?\s+{_FAULT_NOUN}',
+    re.IGNORECASE,
+)
+_NAMES_THE_FAULT = re.compile(_PROBE_SUBJECT, re.IGNORECASE)
+
+# Both probe rules judge one clause at a time with a fixed number of single
+# passes over it, so a lint stays linear in the length of the text — it runs
+# synchronously on the submit_task path. One pattern that found each candidate
+# claim and then re-scanned the rest of its clause cost time quadratic in the
+# length of a clause with no terminator.
+_CLAUSE_BREAK = re.compile(r'[.;]')
+
+
+def _names_positive_sighting(clause: str) -> bool:
+    return any(match['sighting'] for match in _SIGHTING_SCAN.finditer(clause))
+
+
+def _clause_reports_non_reproduction_as_clearance(clause: str) -> bool:
+    if _names_positive_sighting(clause):
+        return False
+    if _NO_LONGER_REPRODUCES.search(clause):
+        return True
+    # Only the first report needs testing: a qualifier that follows any later
+    # report follows this one too.
+    report = _NEGATED_REPRODUCTION.search(clause)
+    if report is None:
+        return False
+    if _STATE_QUALIFIER.search(clause, report.end()):
+        return True
+    return (
+        _WINDOW_QUALIFIER.search(clause, report.end()) is not None
+        and _PROBE_LIMIT.search(clause) is None
+    )
+
+
+def _clause_asserts_fault_absence(clause: str) -> bool:
+    absence = _SCOPED_ABSENCE.search(clause)
+    return (
+        absence is not None
+        and _NAMES_THE_FAULT.search(clause, absence.start()) is not None
+    )
+
+
+def _reports_non_reproduction_as_clearance(text: str) -> bool:
+    return any(
+        map(_clause_reports_non_reproduction_as_clearance, _CLAUSE_BREAK.split(text))
+    )
+
+
+def _asserts_fault_absence(text: str) -> bool:
+    return any(map(_clause_asserts_fault_absence, _CLAUSE_BREAK.split(text)))
+
+
+# Quotes the verdict the stage prompts show, so a rejected caller is told the
+# exact permitted wording and the two can never disagree.
+_NEGATIVE_PROBE_SET_DETAIL = (
+    'The Graphiti mixed-store degradation is intermittent and load-dependent, '
+    'and `search` reports store failure only WHEN a store has already failed — '
+    'so a clean probe is no evidence of health, and a negative probe set is an '
+    'absence of evidence rather than evidence of absence. Report the count, not '
+    'a verdict: "' + NEGATIVE_SET_VERDICT + '"'
+)
+
+# Module-level rule table for premise_lint: (matcher, invariant_name,
+# detail). A matcher is truthy when its text asserts the premise: a compiled
+# pattern's `search` where a fixed phrasing is enough, or a clause-level
+# predicate where the rest of the clause decides whether a phrase is the
+# claim. Each rule encodes one known-false premise recon has written into a
+# task: the run_id and marker rules come from the 2083/2092/2093 batch, which
+# mis-modeled run_id and the stage1_flag_marker lifecycle; the two probe rules
+# from run cd53b227, which promoted a negative probe set to a clearance claim
+# (task 4644). Extend this table as new false premises (or new paraphrasings
+# of an existing one) are discovered; premise_lint returns one Violation per
+# matching rule.
 #
 # BEST-EFFORT DENYLIST, NOT EXHAUSTIVE VALIDATION: premise_lint is a regex
 # lint over a fixed, small set of known-false phrasings — it does not
@@ -844,13 +1081,13 @@ _GAP_NO_NEGATION = r"(?:(?!\bnot\b|\bnever\b|n['’]t\b|[.;]).)*"
 # matched, not that the description is otherwise correct. Treat a clean
 # lint result accordingly and keep extending this table as new paraphrases
 # surface, rather than over-trusting its coverage.
-_PREMISE_RULES: tuple[tuple[re.Pattern[str], str, str], ...] = (
+_PREMISE_RULES: tuple[tuple[Callable[[str], object], str, str], ...] = (
     (
         re.compile(
             r'run_id\s+(?:persists?|is\s+persist(?:ed|ent)|stable|the\s+same|'
             r'carr(?:y|ies)\s+over)\s+(?:across|between)\s+(?:cycles|runs)',
             re.IGNORECASE,
-        ),
+        ).search,
         'run_id_is_fresh_per_run',
         (
             'run_id is minted fresh per run and is never persisted across '
@@ -863,7 +1100,7 @@ _PREMISE_RULES: tuple[tuple[re.Pattern[str], str, str], ...] = (
             r'reuse\s+(?:the\s+)?run_id\s+from\s+(?:the\s+)?'
             r'(?:previous|prior|last)\s+(?:cycle|run)',
             re.IGNORECASE,
-        ),
+        ).search,
         'run_id_is_fresh_per_run',
         (
             'run_id is minted fresh per run and must never be reused from a '
@@ -878,13 +1115,23 @@ _PREMISE_RULES: tuple[tuple[re.Pattern[str], str, str], ...] = (
             + _GAP_NO_NEGATION + r'\b(?:flag_for_stage2|flag\s+marker|'
             r'stage1_flag_marker|marker)\b',
             re.IGNORECASE,
-        ),
+        ).search,
         'markers_deleted_only_by_gc',
         (
             'Per-task markers (stage1_flag_marker, flag_for_stage2, '
             'stage2_persistence_marker) are deleted only by GC on terminal '
             'task (or TTL) — never by Stage 3 remediation or the LLM.'
         ),
+    ),
+    (
+        _reports_non_reproduction_as_clearance,
+        'negative_probe_set_does_not_clear_intermittent_fault',
+        _NEGATIVE_PROBE_SET_DETAIL,
+    ),
+    (
+        _asserts_fault_absence,
+        'negative_probe_set_does_not_clear_intermittent_fault',
+        _NEGATIVE_PROBE_SET_DETAIL,
     ),
 )
 
@@ -898,8 +1145,8 @@ def premise_lint(task_description: str) -> list[Violation]:
     description is otherwise correct.
     """
     violations: list[Violation] = []
-    for pattern, invariant, detail in _PREMISE_RULES:
-        if pattern.search(task_description):
+    for matches, invariant, detail in _PREMISE_RULES:
+        if matches(task_description):
             violations.append(
                 Violation(premise=task_description, invariant=invariant, detail=detail)
             )

@@ -1,0 +1,268 @@
+prd: plans/plan-deviation-recording-prd.md
+schema_version: 1
+tasks:
+- label: α
+  task_id: 5751
+  title: Note-to-file escalation class + resolve_escalation_shas tool + auto-watcher
+    routing row
+  capabilities:
+  - name: note-to-file-flag-on-escalate-info
+    binding: capability→producer (wired) — escalation/src/escalation/server.py::escalate_info
+      gains note_to_file, evaluated inside _chokepoint_or_submit after the identity
+      stamp, routed to queue.submit_resolved with resolution_action='close_only'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: note_to_file
+      paths:
+      - escalation/src/escalation/server.py
+      expect: present
+  - name: resolution-class-note-to-file
+    binding: capability→producer — escalation/src/escalation/models.py::RESOLUTION_CLASSES
+      gains 'note-to-file' (two-site edit with escalation/tests/test_models.py set-equality
+      test; lands after task 5221's four classes)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '''note-to-file'''
+      paths:
+      - escalation/src/escalation/models.py
+      expect: present
+  - name: resolve-escalation-shas-tool
+    binding: capability→producer (wired) — new async server tool resolve_escalation_shas
+      backed by git_ops.py::GitOps.resolve_rebased_citation (patch-id over merge-base..main,
+      exact-subject fallback); sync read tools untouched
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def resolve_escalation_shas
+      paths:
+      - escalation/src/escalation/server.py
+      expect: present
+  - name: resolve-rebased-citation-gitops
+    binding: capability→producer (wired) — orchestrator/src/orchestrator/git_ops.py::GitOps.resolve_rebased_citation;
+      find_equivalent_commit's patch-id shape imitated, not reused (needs a worktree
+      + base_sha a record lacks)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def resolve_rebased_citation
+      paths:
+      - orchestrator/src/orchestrator/git_ops.py
+      expect: present
+  - name: auto-watcher-routing-row
+    binding: capability→producer — skills/escalation-watcher-auto/SKILL.md documents
+      the never-arriving class beside task 5222's info-only-cluster rung
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: note-to-file
+      paths:
+      - skills/escalation-watcher-auto/SKILL.md
+      expect: present
+  - name: note-to-file-severity-guard-and-no-task-effect
+    binding: rejection-mechanism — built+bound by α; tests observe the structured
+      error with no file written, and a wired resolve callback observing no task-status
+      effect
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: rejection and the close_only no-effect are observed by α's own boundary
+        tests, not greppable
+- label: β
+  task_id: 5752
+  title: Per-step disposition record + DEVIATION_KINDS in shared + step_type validation
+    + _replan prompt + _finalized_at docs
+  capabilities:
+  - name: deviation-kinds-vocabulary-in-shared
+    binding: capability→producer — shared/src/shared/plan_deviation.py::DEVIATION_KINDS,
+      the one home three packages import (INV-1 checked at the tool boundary)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: DEVIATION_KINDS
+      paths:
+      - shared/src/shared/plan_deviation.py
+      expect: present
+  - name: record-step-deviation-tool
+    binding: capability→producer (wired) — orchestrator/src/orchestrator/mcp/plan_tools.py
+      registers record_step_deviation beside mark_step_done
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def record_step_deviation
+      paths:
+      - orchestrator/src/orchestrator/mcp/plan_tools.py
+      expect: present
+  - name: append-step-deviation-artifacts-method
+    binding: capability→producer (wired) — artifacts.py::TaskArtifacts.append_step_deviation
+      beside update_step_status (well-defined purpose for each entity)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def append_step_deviation
+      paths:
+      - orchestrator/src/orchestrator/artifacts.py
+      expect: present
+  - name: step-type-vocabulary-checked
+    binding: rejection-mechanism — plan_tools.py::STEP_TYPES; _add_plan_step/_replace_plan_step
+      refuse other values (task 5520 symptom; no validation exists on main today)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: STEP_TYPES
+      paths:
+      - orchestrator/src/orchestrator/mcp/plan_tools.py
+      expect: present
+  - name: replan-prompt-no-longer-says-write-plan-json
+    binding: capability→producer — workflow.py::TaskWorkflow._replan inline prompt
+      corrected; no third copy of the recipe (task 5532)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: Write the updated plan to
+      paths:
+      - orchestrator/src/orchestrator/workflow.py
+      expect: absent
+- label: γ
+  task_id: 5753
+  title: Implementer deviation doctrine inline + parity guard + one escalate_info
+    contract + architect duties
+  capabilities:
+  - name: doctrine-constant-is-the-home
+    binding: 'capability→producer (wired) — roles.py::IMPLEMENTER_DEVIATION_DOCTRINE
+      spliced into IMPLEMENTER, rendered from shared.plan_deviation.DEVIATION_KINDS
+      (INV-9: code is the home; memory carries a dated pointer)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: IMPLEMENTER_DEVIATION_DOCTRINE
+      paths:
+      - orchestrator/src/orchestrator/agents/roles.py
+      expect: present
+  - name: retired-note-it-and-stop-sentence-absent
+    binding: capability→producer — the contradicting sentence is gone from roles.py
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: note it and stop\. Do NOT modify the plan
+      paths:
+      - orchestrator/src/orchestrator/agents/roles.py
+      expect: absent
+  - name: parity-guard-against-live-constants
+    binding: 'capability→producer (wired) — orchestrator/tests/test_roles_deviation_doctrine.py:
+      splice-once, retired sentence absent, every DEVIATION_KINDS member and every
+      _PLAN_DEVIATION_TOOLS bare name contained (no prose matcher)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: IMPLEMENTER_DEVIATION_DOCTRINE
+      paths:
+      - orchestrator/tests/test_roles_deviation_doctrine.py
+      expect: present
+  - name: one-escalate-info-contract
+    binding: capability→producer (wired) — roles.py::ESCALATE_INFO_CONTRACT rendered
+      once into ESCALATION_LADDER_CORE; DEEP_REVIEWER and _FOLLOWUP_FILING_INSTRUCTIONS
+      carry pointers (INV-5)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ESCALATE_INFO_CONTRACT
+      paths:
+      - orchestrator/src/orchestrator/agents/roles.py
+      expect: present
+  - name: implementer-holds-record-step-deviation
+    binding: DAG-direction — β upstream registers the tool; γ adds roles.py::_PLAN_DEVIATION_TOOLS
+      to IMPLEMENTER and DEBUGGER only (not _PLAN_STATUS_TOOLS, which SIMPLE_TASK
+      also holds)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _PLAN_DEVIATION_TOOLS
+      paths:
+      - orchestrator/src/orchestrator/agents/roles.py
+      expect: present
+  - name: immutable-claim-replaced
+    binding: capability→producer — ARCHITECT no longer says the plan structure is
+      IMMUTABLE after creation (D13)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: IMMUTABLE after creation
+      paths:
+      - orchestrator/src/orchestrator/agents/roles.py
+      expect: absent
+  - name: memory-canonical-carries-dated-pointer
+    binding: capability→producer — amendment under topic amendment-pass-precedent-ladder
+      naming roles.py::IMPLEMENTER_DEVIATION_DOCTRINE + commit (roles.py::_MEMORY_TOOLS
+      holds add_memory)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a fused-memory write is not greppable in the tree; verified by get_memories_by_metadata
+        on the topic
+- label: δ
+  task_id: 5754
+  title: 'Plan-deviation census: sibling module in the nightly trickle + watcher count
+    retirement'
+  capabilities:
+  - name: census-module-exists
+    binding: capability→producer (wired) — scripts/legibility/plan_deviation_census.py::evaluate
+      (pure) + run
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def evaluate
+      paths:
+      - scripts/legibility/plan_deviation_census.py
+      expect: present
+  - name: nightly-finally-hook-wired
+    binding: capability→producer (wired) — nightly.py::run_nightly calls the census
+      from its finally block beside _record_trickle_progress, the one recording point
+      every return path passes
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: plan_deviation_census
+      paths:
+      - scripts/legibility/nightly.py
+      expect: present
+  - name: config-block-with-own-validation
+    binding: capability→producer (wired) — config.py::PlanDeviationCensus block +
+      docs/legibility/legibility.yaml entry; validated-never-coerced by the module's
+      own from_mapping (config models are extra='allow')
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: plan_deviation_census
+      paths:
+      - scripts/legibility/config.py
+      - docs/legibility/legibility.yaml
+      expect: present
+  - name: watcher-per-day-count-retired
+    binding: capability→producer — skills/escalation-watcher/SKILL.md Limits no longer
+      counts per day (ruling 8)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: more than 3 qualifying in one day
+      paths:
+      - skills/escalation-watcher/SKILL.md
+      expect: absent
+  - name: watcher-per-task-limit-kept
+    binding: capability→producer — the per-task 'second such escalation' limit survives
+      (ruling 8)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: second such escalation on the same task
+      paths:
+      - skills/escalation-watcher/SKILL.md
+      expect: present
+  - name: rate-rise-fires-flat-does-not
+    binding: rejection-mechanism — positive and negative control fixtures observe
+      exactly one blocking escalate_info on the synthetic task id vs none
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: behavioural property proven by δ's own fixtures, not greppable

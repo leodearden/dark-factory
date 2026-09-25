@@ -1,0 +1,53 @@
+{
+  "role": "reviewer_comprehensive",
+  "schema_version": 1,
+  "session_id": "",
+  "emitted_at": "2026-07-31T05:43:27.733141+00:00",
+  "verdict": {
+    "reviewer": "reviewer_comprehensive",
+    "verdict": "ISSUES_FOUND",
+    "issues": [
+      {
+        "category": "correctness",
+        "severity": "high",
+        "file": "fused-memory/src/fused_memory/reconciliation/mem0_tombstone.py",
+        "line": 4,
+        "verdict": "CONFIRMED",
+        "short_summary": "Tombstone coverage overclaimed as \"every recon path\"",
+        "summary": "Three agent-facing/canonical texts claim that EVERY (or ANY) recon-initiated Mem0 deletion now leaves a tombstone, but only two of the six recon delete paths were wired; four write no tombstone at all.",
+        "failure_scenario": "Verified call sites of `memory_service.delete_memory(store='mem0')` under `src/fused_memory/reconciliation/`: only `stages/task_knowledge_sync.py:1147` (`_sweep_stale_mem0_pool`) and `summary_pool.py:397` (`enforce_summary_pool_cap`) call `record_mem0_deletion_tombstones`. Four others do not: `harness.py:1254` (`_delete_status_correction_memories`), `scope_freshness.py:344`, `targeted.py:794` (stale targeted-recon deletes), and `stages/task_knowledge_sync.py:2027` (task-count snapshot prune, `_TASK_COUNT_SNAPSHOT_PRUNE_SOURCE`). The overclaims are: `mem0_tombstone.py:4` (\"both consumed by every recon path that deletes a Mem0 record\"); `recon_self_model.py:503` (\"Any recon-initiated Mem0 deletion now leaves a TOMBSTONE ... Before reporting a missing memory as silent loss, consult it\"); and `server/tools.py:1836`, whose live MCP tool description hedges tombstone absence ONLY with the TTL reason. Concrete failure: an auditor agent (or the recon gate) queries `get_memory_by_id` for a record that `harness.py:1254` deleted, gets `found:false` with no `tombstone` key, and \u2014 following the prompt's stated rule that any deliberate reap leaves one \u2014 concludes the record was NOT deliberately deleted and reports silent data loss. That is the recon-gate-165 false finding this task exists to prevent, inverted. Mitigating: `render_cycle_summary_section` is not yet imported by any prompt file (task \u03be cutover pending), so the strongest claim is not live yet \u2014 but `server/tools.py`'s docstring IS the live FastMCP tool description. Fix: either wire the remaining four paths, or state the coverage boundary explicitly in all three texts (\"marker-GC sweeps and the cycle_summary pool trim only; other recon deletes leave no tombstone\")."
+      },
+      {
+        "category": "architectural-coherence",
+        "severity": "medium",
+        "file": "fused-memory/src/fused_memory/reconciliation/summary_pool.py",
+        "line": 365,
+        "verdict": "PLAUSIBLE",
+        "short_summary": "New eviction order makes narrative reconstructions single-trim transient",
+        "summary": "The new `(is_ledger_stamp, ...)` eviction key evicts every `record_type='narrative'` record ahead of every `ledger_stamp` regardless of recency, but `prompts/stage2.py` (unchanged) still directs the LLM to write exactly such a record as the durable resolution of a `missing_stage2_summary` carry-forward finding.",
+        "failure_scenario": "`prompts/stage2.py:355-370` instructs Stage 2 to reconstruct a missing prior-run summary via `add_memory(metadata={'kind':'cycle_summary', 'record_type':'narrative', 'recon_pool':'stage2_cycle_summary', ...})`, and tells the model the write is \"deterministically findable by metadata-keyed lookup and subject to the stage2_cycle_summary pool cap\". `write_cycle_summary` holds the pool at cap=2 every cycle and writes one ledger_stamp per cycle, so the pool is permanently at cap. Sequence: cycle N pool = [LS(t1), LS(t2)]; Stage 2 reconstructs run X -> NARR(t3), pool = 3; cycle N+1 writes LS(t4) -> pool = 4, trim deletes 2. Old key (created_at only) evicted LS(t1), LS(t2) and KEPT NARR(t3) \u2014 it survived two trims. New key sorts NARR first (False < True), so it is evicted by the FIRST trim after it is written, together with LS(t1). If the authoritative ledger row for run X is genuinely absent (the `present: false` branch that triggers reconstruction in the first place), the narrative was the only surviving artifact, and the finding re-fires next cycle -> reconstruct -> evict -> re-flag, one cycle tighter than before. The retention contract in `enforce_summary_pool_cap`'s docstring justifies preferring ledger_stamps but does not address that it makes the Stage-2 reconstruction path effectively write-only, and no prompt text was updated. Marked PLAUSIBLE because whether the loop actually tightens depends on intra-cycle stage ordering (whether Stage 1/3's check runs before or after `write_cycle_summary`'s trim), which I did not trace \u2014 but the eviction-order change itself and the unchanged prompt are both verified."
+      },
+      {
+        "category": "correctness",
+        "severity": "low",
+        "file": "fused-memory/src/fused_memory/reconciliation/summary_pool.py",
+        "line": 180,
+        "verdict": "CONFIRMED",
+        "short_summary": "Residue warning reports a false count at the scroll limit",
+        "summary": "`_warn_on_untrimmable_pool_residue` computes `residue = total - trimmable` where `trimmable = len(members)` is capped at `SUMMARY_POOL_SCROLL_LIMIT`, so at the limit it attributes the truncation to mis-tagging and emits a factually wrong WARNING.",
+        "failure_scenario": "`count_memories_by_metadata({'recon_pool': X})` is an exact Qdrant count with no limit, while `members` comes from `get_memories_by_metadata(..., limit=SUMMARY_POOL_SCROLL_LIMIT)` and saturates at 1000. With a runaway pool of, say, 1500 records all correctly tagged `kind='cycle_summary'`, `total=1500`, `trimmable=1000`, `residue=500`, and `summary_pool.py:184` logs \"500 record(s) tagged recon_pool=X are NOT kind=cycle_summary ... they are invisible to this trim and no other collector reaps them\" \u2014 none of which is true; all 1500 are trimmable, the enumeration was merely truncated. Worse, this fires at line 330 BEFORE the accurate scroll-limit WARNING at line 338, so the operator reads the wrong diagnosis first, in exactly the runaway-pool scenario where the diagnostics matter most. Fix: skip the residue computation (or label it as indeterminate) when `len(members) >= SUMMARY_POOL_SCROLL_LIMIT`."
+      },
+      {
+        "category": "simplification",
+        "severity": "low",
+        "file": "fused-memory/src/fused_memory/reconciliation/mem0_tombstone.py",
+        "line": 230,
+        "verdict": "CONFIRMED",
+        "short_summary": "Singular record_mem0_deletion_tombstone has no production caller",
+        "summary": "`record_mem0_deletion_tombstone` (singular) is exported in `__all__` with ~90 lines of docstring and 9 dedicated tests, but no production code calls it \u2014 both delete paths use the batch form \u2014 and the LLM-facing lifecycle text still names the singular as the writer.",
+        "failure_scenario": "`grep -rn 'record_mem0_deletion_tombstone\\b'` over `src/` returns only its own definition, `__all__`, and docstring cross-references; the two real call sites (`stages/task_knowledge_sync.py:1178` and `summary_pool.py:447`) both call `record_mem0_deletion_tombstones`. The amendment pass that introduced the batch form left the singular behind as public API. Consequences: (a) YAGNI surface \u2014 a future caller can pick the singular and silently reintroduce the per-row fsync cost the amendment removed, since nothing marks it as the non-preferred path; (b) `recon_self_model.py:196` states the tombstone writer is \"Python, from mem0_tombstone.record_mem0_deletion_tombstone\", which is now inaccurate canonical/LLM-facing prose about a function that never runs in production. Either delete the singular (folding its tests onto the batch form, which already handles the single-victim case) or demote it out of `__all__` and correct the lifecycle text."
+      }
+    ],
+    "summary": "Reviewed the full task-3041 branch (6 source modules + 6 test files, ~3.7k lines). The core mechanism is sound and well built: the tombstone row shape is single-sourced through `_build_tombstone_record`, `RECORD_KIND_MEM0_TOMBSTONE` is correctly kept out of both `MARKER_KINDS` tuples (its `task_id` holds a Mem0 uuid, not a task id) while still being reaped by `gc()`'s kind-agnostic `expires_at` arm, `upsert`/`upsert_many` share one hoisted `_UPSERT_SQL` so conflict semantics cannot drift, both writers are called only from the delete-success branch, and every layer (writer, `get_mem0_deletion_tombstone`, the MCP boundary) is fail-safe with loud-on-fault / silent-on-ordinary-state logging. `is_protected_mirror_record` reads `member['metadata']`, which I verified matches `scroll_by_metadata`'s documented `{'id','created_at','metadata'}` shape, so the guard is really live. The recon_pool_map leaf-import probe is a genuine improvement over the source-grep guard it replaces. `170 + 857` tests pass, ruff clean, pyright clean on the changed modules. Four issues found, none blocking correctness of the happy path. The most significant is a coverage overclaim: three texts \u2014 including the live `get_memory_by_id` MCP tool description \u2014 state that every/any recon-initiated Mem0 deletion now leaves a tombstone, but four of the six recon `delete_memory` call sites (`harness.py:1254`, `scope_freshness.py:344`, `targeted.py:794`, `task_knowledge_sync.py:2027`) were not wired, so an auditor can read tombstone-absence as proof of non-deliberate deletion \u2014 the gate-165 false finding inverted. Also flagged: the new narrative-before-ledger_stamp eviction order makes Stage-2's reconstruction write single-trim transient while `prompts/stage2.py` still presents it as durable (plausible, depends on intra-cycle stage ordering I did not trace); the residue backstop's `total - trimmable` arithmetic reports a false mis-tagging count when the enumeration saturates the scroll limit; and the singular `record_mem0_deletion_tombstone` is now dead in production yet still public API and still named as the writer in `recon_self_model`'s lifecycle prose."
+  }
+}

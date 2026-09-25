@@ -22,7 +22,6 @@ The companion source-level sweep at the bottom forbids the construct itself.
 from __future__ import annotations
 
 import os
-import re
 
 from setup_host_sections import (
     run_section,
@@ -32,28 +31,11 @@ from setup_host_sections import (
     stub_bin_dir,
     write_stub,
 )
-
-# Trailing bytes a producer writes AFTER the matching line, to provoke (b).
-#
-# MEASURED, not chosen for roundness. Reproduction rate of the misread, 30
-# trials per size against this exact stub shape:
-#
-#     65536 -> 26/30      131072 -> 30/30      262144 -> 30/30      1MiB -> 30/30
-#
-# Whether the producer is scheduled to write again BEFORE grep closes the read
-# end is a race, so near the 64KiB pipe buffer the defect is intermittent — at
-# 65536 the reply is small enough to sometimes land whole. 262144 is the first
-# round size measured deterministic with margin. Do NOT lower this: a value in
-# the flaky band leaves the SIGPIPE tests only probabilistically able to catch a
-# reintroduced pipeline, and one below the buffer cannot catch it at all.
-# (Consistent with the ~82KB flip point recorded at setup-host.sh's
-# orchestrator gate — that gate's producer writes in one burst, this one does
-# not, so the two thresholds are close but not the same number.)
-#
-# Note this only affects how reliably the tests are RED against the OLD form:
-# the fixed form drains the producer through a command substitution, where
-# there is no pipe to signal, so the tests below are deterministic once fixed.
-BULK_BYTES = 262144
+from shell_sections import (
+    SIGPIPE_BULK_BYTES,
+    dispatch_stub_body,
+    grep_q_offenders,
+)
 
 # --- section 2: the FalkorDB "wait for healthy" loop -----------------------
 # Both anchors are CODE (not comment prose), are unique in the file, and
@@ -74,19 +56,6 @@ def _stub_bin(tmp_path):
     stub_bin = stub_bin_dir(tmp_path)
     write_stub(stub_bin, "sleep", "exit 0\n")
     return stub_bin
-
-
-def _dispatch_stub_body(branches):
-    """A `case "$*"` body running one of *branches* — (glob, text) pairs.
-
-    `case` is the stub's LAST command, so the taken branch's own status becomes
-    the stub's exit status. That is deliberate and load-bearing: the producer's
-    status IS the thing these tests are about, and a trailing `exit 0` here
-    would swallow it and make every test below vacuously green. The catch-all
-    exits 0 so the invocations that are not under test stay silent.
-    """
-    arms = "".join(f"  {glob})\n{text}    ;;\n" for glob, text in branches)
-    return 'case "$*" in\n' + arms + "  *)\n    exit 0\n    ;;\nesac\n"
 
 
 def _run_probe(
@@ -110,7 +79,7 @@ def _run_probe(
     asserted rather than defaulted to "": an empty default would quietly
     install a stub that runs nothing and exits 0, which is a PASSING probe
     for a producer that was never scripted, i.e. exactly the vacuous green
-    `_dispatch_stub_body` is written to avoid.
+    `dispatch_stub_body` is written to avoid.
     """
     stub_bin = _stub_bin(tmp_path)
     if stub_name is not None:
@@ -138,7 +107,7 @@ def _compose_env(tmp_path):
 
 # Scenario bodies for the docker exec branch. Indented to sit inside `case`.
 _REPLY_THEN_NONZERO = "    printf 'PONG\\n'\n    exit 1\n"
-_REPLY_THEN_BULK = f"    printf 'PONG\\n'\n    head -c {BULK_BYTES} /dev/zero | tr '\\0' x\n"
+_REPLY_THEN_BULK = f"    printf 'PONG\\n'\n    head -c {SIGPIPE_BULK_BYTES} /dev/zero | tr '\\0' x\n"
 _SILENT_FAILURE = "    exit 1\n"
 _CLEAN_REPLY = "    printf 'PONG\\n'\n    exit 0\n"
 
@@ -149,7 +118,7 @@ def _docker_stub_body(exec_body):
     The `up -d` invocation falls to the catch-all and exits 0 silently; only
     the exec branch is under test.
     """
-    return _dispatch_stub_body((('*" exec "*', exec_body),))
+    return dispatch_stub_body((('*" exec "*', exec_body),))
 
 
 def _falkordb_probe(start, end):
@@ -253,7 +222,7 @@ _LISTING_NAMES_IT_THEN_NONZERO = (
 )
 _LISTING_NAMES_IT_THEN_BULK = (
     "    printf 'jcodemunch: uvx jcodemunch-mcp - Connected\\n'\n"
-    f"    head -c {BULK_BYTES} /dev/zero | tr '\\0' x\n"
+    f"    head -c {SIGPIPE_BULK_BYTES} /dev/zero | tr '\\0' x\n"
 )
 _LISTING_WITHOUT_IT = "    printf 'some-other-server: uvx other - Connected\\n'\n    exit 0\n"
 _LISTING_UNREADABLE = "    exit 1\n"
@@ -265,7 +234,7 @@ def _run_jcodemunch(tmp_path, list_body):
         tmp_path,
         slice_section(_JCODEMUNCH_START, _JCODEMUNCH_END),
         stub_name="claude",
-        stub_body=_dispatch_stub_body(
+        stub_body=dispatch_stub_body(
             (
                 ('*"mcp add"*', f"    printf '{_ADD_SENTINEL}\\n'\n    exit 0\n"),
                 ('*"mcp list"*', list_body),
@@ -423,37 +392,11 @@ def test_section_12_reports_not_responding_when_the_producer_says_nothing(tmp_pa
 
 
 # --- the file-scoped contract ----------------------------------------------
-# A grep on the receiving end of a pipe, plus its arguments up to the end of
-# THAT command: `[^|;&)]*` stops at the next pipeline stage, at a `;` or `&&`,
-# and at the close of a command substitution, so a `-q` belonging to some later
-# command on the same line is never read as this grep's.
-_GREP_PIPE = re.compile(r"\|\s*grep\s+(?P<args>[^|;&)]*)")
-
-# Every spelling of "exit on the first match and close the read end": the short
-# clusters (`-q`, `-qF`, `-Fq`, `-iq`) and GNU's long forms. Matched against
-# whole TOKENS rather than positionally, which is what lets a flag taking an
-# argument sit in between — `grep -e PONG --quiet` is the same defect as
-# `grep -q PONG` and the sweep must see both. Deliberately does NOT match a
-# bare `| grep -F`, which reads its input to the end and cannot SIGPIPE the
-# producer.
-_QUIET_FLAG = re.compile(r"-[A-Za-z]*q[A-Za-z]*|--quiet|--silent")
-
-
-def _pipes_into_quiet_grep(line):
-    """True when *line* feeds a producer into a grep that exits on first match."""
-    return any(
-        any(_QUIET_FLAG.fullmatch(token) for token in match.group("args").split())
-        for match in _GREP_PIPE.finditer(line)
-    )
-
-
-def _grep_q_offenders(source):
-    """Every non-comment line of *source* piping a producer into a quiet grep."""
-    return [
-        (n, line)
-        for n, line in enumerate(source.splitlines(), start=1)
-        if not line.strip().startswith("#") and _pipes_into_quiet_grep(line)
-    ]
+# The DETECTOR itself lives in tests/scripts/shell_sections.py, shared with
+# test_script_probe_pipelines.py's sweep over export-data.sh / import-data.sh /
+# deploy-w5-recon-reliability.sh, so its three regexes exist once. The
+# guard-the-guard below stays HERE and now pins the copy BOTH suites use, which
+# is strictly stronger than guarding a private copy.
 
 
 def test_setup_host_never_pipes_a_producer_into_grep_q():
@@ -481,7 +424,7 @@ def test_setup_host_never_pipes_a_producer_into_grep_q():
 
     assert "set -euo pipefail" in source
 
-    offenders = _grep_q_offenders(source)
+    offenders = grep_q_offenders(source)
     assert not offenders, "producer piped into `grep -q`:\n" + "\n".join(
         f"  line {n}: {line.strip()}" for n, line in offenders
     )
@@ -493,6 +436,11 @@ def test_the_grep_q_sweep_detects_a_planted_pipeline():
     Same discipline tests/scripts/test_check_dashboard_unit_parity.py::
     test_the_sweep_finds_every_known_parity_call_site applies to its own sweep.
     Passes on arrival — it pins the mechanism, not the product behaviour.
+
+    Guards the SHARED detector in tests/scripts/shell_sections.py, so it covers
+    this file's sweep and test_script_probe_pipelines.py's alike. One detector
+    deserves one guard: a second copy of this case set would be the same drift
+    this extraction removed.
     """
     planted = (
         "if foo | grep -q BAR; then\n"
@@ -507,13 +455,19 @@ def test_the_grep_q_sweep_detects_a_planted_pipeline():
         # A flag carrying an argument in between must not hide the quiet one.
         "if foo | grep -e BAR --quiet; then\n"
     )
-    assert len(_grep_q_offenders(planted)) == 7, _grep_q_offenders(planted)
+    assert len(grep_q_offenders(planted)) == 7, grep_q_offenders(planted)
 
     # A comment describing the construct is not the construct.
-    assert _grep_q_offenders("  # never write `foo | grep -q BAR` here\n") == []
+    assert grep_q_offenders("  # never write `foo | grep -q BAR` here\n") == []
     # Nor is a non-quiet grep, which drains its input instead of closing it.
-    assert _grep_q_offenders("out=\"$(foo | grep -F 'tag' || true)\"\n") == []
+    assert grep_q_offenders("out=\"$(foo | grep -F 'tag' || true)\"\n") == []
     # Nor is a `grep -q` over a FILE: no producer upstream, nothing to conflate.
-    assert _grep_q_offenders("if grep -q '^\\[Install\\]' \"$unit\"; then\n") == []
+    assert grep_q_offenders("if grep -q '^\\[Install\\]' \"$unit\"; then\n") == []
     # And a `-q` belonging to a LATER command on the line is not this grep's.
-    assert _grep_q_offenders("if foo | grep -F BAR; then bar -q; fi\n") == []
+    assert grep_q_offenders("if foo | grep -F BAR; then bar -q; fi\n") == []
+    # Nor is the trailing bar of an OR operator a pipe. `cmd || grep -q pat f`
+    # runs grep over a FILE only when cmd failed: no pipeline, no producer, and
+    # nothing for `pipefail` to conflate. None of the swept scripts writes this
+    # today, so without a case here the false positive stays invisible until it
+    # fails a future author's legitimate line.
+    assert grep_q_offenders('cmd || grep -q pat "$f"\n') == []

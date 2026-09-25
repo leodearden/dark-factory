@@ -16,6 +16,7 @@ import json
 import os
 import pathlib
 import re
+import subprocess
 import sys
 import types
 import uuid
@@ -154,11 +155,21 @@ class MockAddEpisodeResult:
     'nodes' mirrors AddEpisodeResults.nodes (graphiti_core/graphiti.py:111) —
     the entity nodes this episode touched — consumed by the post-write
     node-dedup sweep (MemoryService._dedup_episode_nodes).
+
+    'episode' mirrors AddEpisodeResults.episode — the EpisodicNode that
+    graphiti_core actually minted and persisted (task 3561). It is the ONLY
+    place the real episode uuid is observable: the uuid the caller passes in
+    means "LOAD this existing episode", never "create under this uuid", so
+    MemoryService._execute_graphiti_write reads registration identity off
+    ``result.episode.uuid``. Defaults to None so the ~10 pre-existing users of
+    this dataclass are unaffected; tests that care about episode identity set
+    it to e.g. ``SimpleNamespace(uuid='real-uuid')``.
     """
 
     entity_edges: list[MockEdge] = field(default_factory=list)
     edges: list[MockEdge] = field(default_factory=list)
     nodes: list[MockNode] = field(default_factory=list)
+    episode: Any = None
 
     def __post_init__(self) -> None:
         if self.edges == [] and self.entity_edges:
@@ -1707,9 +1718,11 @@ def _warn_if_drain_closed_a_foreign_client(preexisting: weakref.WeakSet) -> None
 
 
 # ---------------------------------------------------------------------------
-# Non-package script loading — shared by test_sweep_toolcall_xml_leak.py and
-# test_toolcall_xml_leak_sweep_artifacts.py (task 3738; originally two
-# independent copies of the same loader).
+# Non-package script loading — the single loader for every test module that
+# imports a script by file path. Task 3738 hoisted it here out of two
+# independent copies; task 3895 migrated the 42 further copies that had
+# accumulated since, and tests/test_script_loader_routing_guard.py holds that
+# population at zero.
 # ---------------------------------------------------------------------------
 
 # sys.modules keys this helper itself installed. Only these may be REPLACED by
@@ -1776,6 +1789,63 @@ def load_script_module(
     return module
 
 
+def as_async_run_git(side_effect):
+    """Adapt a `subprocess.run` side_effect to a `shared.git_async.run_git` fake.
+
+    Task 3778 moved the detector's three git probes off blocking
+    `subprocess.run` and onto the async `run_git` helper, which invalidated the
+    `patch('subprocess.run', ...)` seam this suite was built on. Rather than
+    hand-rewrite ~90 canned git responses, every existing side_effect is passed
+    through this one adapter, so the *responses* stay byte-for-byte what they
+    were and only the seam changes.
+
+    It faithfully reproduces `run_git`'s contract, which differs from
+    `subprocess.run`'s in exactly two ways that matter here:
+
+    - stdout/stderr are `.strip()`ed by `run_git` itself, so the adapter strips
+      too (a fake that did not would let a test pass against behaviour the real
+      helper cannot produce).
+    - a TIMEOUT is RETURNED as `timed_out=True` with a non-zero returncode, not
+      raised. `subprocess.run` raises `TimeoutExpired`, so any side_effect that
+      raises it is converted here. Every other exception (notably `OSError`)
+      propagates, because `run_git` propagates it too.
+
+    Accepts the two shapes `unittest.mock` accepts for `side_effect`: a
+    callable, or an exception instance/class to raise.
+    """
+    from shared.git_async import TIMEOUT_RETURNCODE, GitResult
+
+    def _timed_out(timeout) -> GitResult:
+        return GitResult(
+            returncode=TIMEOUT_RETURNCODE,
+            stdout='',
+            stderr=f'timed out after {timeout}s',
+            timed_out=True,
+        )
+
+    async def fake_run_git(cmd, cwd=None, *, input_text=None, timeout=None):
+        # mock's own semantics: a bare exception instance/class means "raise".
+        if isinstance(side_effect, BaseException) or (
+            isinstance(side_effect, type) and issubclass(side_effect, BaseException)
+        ):
+            if isinstance(side_effect, subprocess.TimeoutExpired) or (
+                side_effect is subprocess.TimeoutExpired
+            ):
+                return _timed_out(timeout)
+            raise side_effect
+
+        try:
+            completed = side_effect(list(cmd), timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return _timed_out(timeout)
+
+        return GitResult(
+            returncode=completed.returncode,
+            stdout=(completed.stdout or '').strip(),
+            stderr=(completed.stderr or '').strip(),
+        )
+
+    return fake_run_git
 # ---------------------------------------------------------------------------
 # Cross-run citation repair fixtures (task 3065)
 #

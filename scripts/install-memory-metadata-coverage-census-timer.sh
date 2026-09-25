@@ -2,7 +2,7 @@
 # install-memory-metadata-coverage-census-timer.sh -- install (or re-install,
 # idempotently) the nightly canonical/topic stamping COVERAGE census +
 # retro-stamp rehearsal systemd user timer (task 4006). Mirrors
-# scripts/install-reify-closure-staleness-sweep-timer.sh.
+# scripts/install-reclaim-orphaned-worktrees-timer.sh.
 #
 # Usage: install-memory-metadata-coverage-census-timer.sh
 #
@@ -11,9 +11,9 @@
 # daemon, and enables+starts the timer (arming the nightly 05:00 recurrence).
 # Idempotent: safe to re-run.
 #
-# DELIBERATELY DOES NOT KICK AN IMMEDIATE RUN, like the reify sweep installer
-# and unlike the flag-marker and reclaim ones. Those drain a backlog that is
-# safe to drain now. This job is a paginated full scroll of both live Qdrant
+# DELIBERATELY DOES NOT KICK AN IMMEDIATE RUN -- unlike the flag-marker and
+# reclaim installers, which do. Those drain a backlog that is safe to drain
+# now. This job is a paginated full scroll of both live Qdrant
 # collections that APPENDS a row to the committed trend history -- so an
 # install-time firing would put an unreviewed, off-cadence row into the series
 # the nightly timer owns, and would do it while an operator is watching the

@@ -698,7 +698,7 @@ def _assert_capped(detail: str, *, values: int = 1) -> None:
 
     Shared by every per-site capping test below plus the escalation-join
     test, so all of them stay coupled to `_MAX_DISCARDED_VALUE_REPR` --
-    the way ``TestAllIssueDetailsAreBounded`` already is -- instead of
+    the way ``TestAllIssueFieldsAreBounded`` already is -- instead of
     each carrying its own ``len(detail) < 500`` literal that a retuned
     knob could silently outgrow (raising the knob to 250 alone pushes the
     two-value details past 500 and fails eight tests for a reason that
@@ -995,16 +995,21 @@ class TestVerdicts:
     def test_orphan_verdict_metric_id_and_eval_id_are_capped(self, tmp_path: Path) -> None:
         """Both interpolations in this ONE detail are unvalidated JSON.
 
-        ``eval_id`` and ``metric_id`` are ``isinstance(..., str)``-guarded at
-        the verdicts read boundary (memory_evals.py::_read_verdicts) but never length-guarded — the
-        same size exposure as the duplicate-index details, one field over.
+        ``metric_id`` is ``isinstance(..., str)``-guarded at the verdicts
+        read boundary (memory_evals.py::_read_verdicts) but never
+        length-guarded — the same size exposure as the duplicate-index
+        details, one field over.  ``eval_id`` IS now length-guarded there
+        (task 4922, ``_MAX_EVAL_ID_LENGTH``): a value long enough to still
+        need capping in this detail's prose, but at the accepted limit, so
+        this exercises an ``eval_id`` that legitimately survives the read
+        boundary rather than one the new guard rejects.
         """
-        from dashboard.data.memory_evals import build_memory_evals
+        from dashboard.data.memory_evals import _MAX_EVAL_ID_LENGTH, build_memory_evals
 
         huge_metric_id = 'p' * 5000
-        huge_eval_id = 'q' * 5000
+        long_eval_id = 'q' * _MAX_EVAL_ID_LENGTH
         root, esc_dir = _verdicts_tree(tmp_path, entries=[
-            _verdict(huge_eval_id, huge_metric_id, 'alarm', fingerprint='fp-orphan-huge'),
+            _verdict(long_eval_id, huge_metric_id, 'alarm', fingerprint='fp-orphan-huge'),
         ])
 
         payload = build_memory_evals(root, esc_dir)
@@ -1017,11 +1022,12 @@ class TestVerdicts:
         _assert_capped(issue['detail'], values=2)
         assert 'matches no metric row in eval' in issue['detail']
         # The structured `eval_id=` kwarg is an identity field, not prose —
-        # it stays the untruncated original (design decision: truncating it
-        # would corrupt the UI's grouping/linking rather than just trim a
-        # detail).  A future over-eager sweep that routed it through
-        # `_short_repr` too would break that and nothing above would notice.
-        assert issue['eval_id'] == huge_eval_id
+        # it stays the untruncated original for any eval_id that survives
+        # the read boundary (design decision: truncating it would corrupt
+        # the UI's grouping/linking rather than just trim a detail).  A
+        # future over-eager sweep that routed it through `_short_repr` too
+        # would break that and nothing above would notice.
+        assert issue['eval_id'] == long_eval_id
 
     def test_missing_root_verdicts_is_named(self, tmp_path: Path) -> None:
         """Trends with a blank verdict column would otherwise look healthy."""
@@ -3343,34 +3349,105 @@ class TestStalenessAndDegradedStates:
         assert payload['issue_count'] == 0
 
 
+class TestVerdictEvalIdLengthIsBounded:
+    """An ``eval_id`` too long to ever name a real eval directory is rejected at read.
+
+    ``dashboard/src/dashboard/data/memory_evals.py::_read_verdicts`` keys
+    each verdict entry on ``(eval_id, metric_id)`` and hands ``eval_id``
+    straight to ``_issue``'s structured ``eval_id=`` kwarg — an identity
+    field the dashboard groups and links issue rows by.  A verdict can only
+    ever link a real row when its ``eval_id`` equals an eval directory's
+    ``name`` (``_build_eval``'s ``eval_id = eval_dir.name``), and a single
+    path component is bounded by POSIX ``NAME_MAX``, so an over-length
+    ``eval_id`` was already unmatchable by construction.  Folding it into
+    the existing ``unidentified_verdicts`` count therefore discards nothing
+    usable.
+    """
+
+    def test_over_length_eval_id_is_rejected_and_at_limit_eval_id_survives(
+        self, tmp_path: Path,
+    ) -> None:
+        from dashboard.data.memory_evals import _MAX_EVAL_ID_LENGTH, build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path)
+        good = _verdict('eval-a', 'dangling-pointers', 'alarm', fingerprint='opaque-fp-1')
+        huge_eval = 'z' * 5000
+        over_limit_eval = 'w' * (_MAX_EVAL_ID_LENGTH + 1)
+        at_limit_eval = 'y' * _MAX_EVAL_ID_LENGTH
+        _write_verdicts(root, [
+            good,
+            _verdict(huge_eval, 'dangling-pointers', 'alarm', fingerprint='fp-huge-1'),
+            _verdict(huge_eval, 'dangling-pointers', 'no_alarm', fingerprint='fp-huge-2'),
+            _verdict(over_limit_eval, 'dangling-pointers', 'alarm', fingerprint='fp-over'),
+            _verdict(at_limit_eval, 'dangling-pointers', 'alarm', fingerprint='fp-at-limit'),
+        ])
+
+        payload = build_memory_evals(root, esc_dir)
+
+        # No issue carries an oversized structured identity.
+        too_long = {
+            issue['kind']: len(issue['eval_id'])
+            for issue in payload['issues']
+            if issue['eval_id'] is not None and len(issue['eval_id']) > _MAX_EVAL_ID_LENGTH
+        }
+        assert not too_long, too_long
+
+        # The two huge entries plus the one-over-limit entry: three
+        # over-length records, counted once rather than flooding the issues
+        # list, and counted separately from the (here, zero) absent/malformed
+        # ones since an operator's next step differs between the two causes.
+        unidentified = [i for i in payload['issues'] if i['kind'] == 'unidentified_verdicts']
+        assert len(unidentified) == 1, [i['kind'] for i in payload['issues']]
+        assert unidentified[0]['detail'].startswith('0 ')
+        assert f'3 carry an "eval_id" longer than {_MAX_EVAL_ID_LENGTH}' in unidentified[0]['detail']
+
+        # The rejected pair never reaches the duplicate-detection branch.
+        assert not [i for i in payload['issues'] if i['kind'] == 'duplicate_verdict_entry']
+
+        # A long-but-legal eval_id (exactly at the limit) is still indexed —
+        # observable as an orphan (it names no real eval dir) rather than a
+        # silent drop.  Off-by-one guard against a `>=` mis-spelling.
+        orphans = [i for i in payload['issues'] if i['kind'] == 'orphan_verdict']
+        assert [i['eval_id'] for i in orphans] == [at_limit_eval]
+
+        # Bad records cost only themselves.
+        assert _only(payload['evals'][0]['metrics'], 'dangling-pointers')['verdict'] == 'alarm'
+        assert payload['issue_count'] == len(payload['issues'])
+
+
 # ---------------------------------------------------------------------------
 # task 4261 — the module-wide closure guard
 # ---------------------------------------------------------------------------
 
 
-class TestAllIssueDetailsAreBounded:
-    """The twelve issue kinds in ``required_kinds`` below cannot be silently re-broken.
+class TestAllIssueFieldsAreBounded:
+    """The fourteen issue kinds in ``required_kinds`` below cannot be silently re-broken.
 
     Every per-site test above protects only the exact assertion it wrote.
     This property test raises that to: re-introducing an unbounded value at
-    any of the sites that feed these twelve kinds cannot happen silently —
+    any of the sites that feed these fourteen kinds cannot happen silently —
     build one tree hostile in every dimension THOSE sites read unvalidated
-    JSON from, then assert every resulting issue detail is bounded AND that
-    the observed issue-kind set still covers all twelve, so a hostile tree
+    JSON from, then assert every resulting issue's ``detail`` AND its
+    structured ``eval_id``/``path`` fields are bounded, and that the
+    observed issue-kind set still covers all fourteen, so a hostile tree
     that quietly stopped triggering half its sites cannot pass by accident.
 
     What this does NOT hold: it does not prove the module overall "cannot
-    emit an unbounded detail".  A `_issue` call for a kind outside
+    emit an unbounded detail or field".  A `_issue` call for a kind outside
     ``required_kinds`` — a new kind, or one of the module's other existing
     kinds this hostile tree never triggers — is not exercised here and
-    needs its own per-site bound and test, the same way the twelve below
+    needs its own per-site bound and test, the same way the fourteen below
     got theirs.
     """
 
     def test_every_issue_detail_is_bounded_and_every_kind_is_covered(
         self, tmp_path: Path,
     ) -> None:
-        from dashboard.data.memory_evals import _MAX_DISCARDED_VALUE_REPR, build_memory_evals
+        from dashboard.data.memory_evals import (
+            _MAX_DISCARDED_VALUE_REPR,
+            _MAX_EVAL_ID_LENGTH,
+            build_memory_evals,
+        )
 
         huge_dup_metric = 'a' * 5000
         huge_missing_kind_metric = 'b' * 5000
@@ -3381,6 +3458,9 @@ class TestAllIssueDetailsAreBounded:
         huge_orphan_eval = 'f' * 5000
         huge_run_stamp = '9' * 5000
         huge_escalation_id = 'h' * 5000
+        huge_dup_eval = 'k' * 5000
+        oversized_eval_dup_metric = 'oversized-eval-dup-metric'
+        short_orphan_eval = 'eval-orphan'
 
         root = tmp_path / 'memory-evals'
         esc_dir = tmp_path / 'escalations'
@@ -3410,11 +3490,18 @@ class TestAllIssueDetailsAreBounded:
                 'run_stamp': '20260701T031500Z',
             },
             _verdict(huge_orphan_eval, huge_orphan_metric, 'alarm', fingerprint='fp-orphan'),
+            _verdict(short_orphan_eval, huge_orphan_metric, 'alarm', fingerprint='fp-orphan-short'),
+            _verdict(huge_dup_eval, oversized_eval_dup_metric, 'alarm', fingerprint='fp-dup-eval-a'),
+            _verdict(huge_dup_eval, oversized_eval_dup_metric, 'no_alarm', fingerprint='fp-dup-eval-b'),
         ], run_stamp='20260701T031500Z')
 
-        # A malformed (non-object) queue record, oversized, plus three
-        # escalation records hitting the remaining named-not-dropped kinds.
+        # A malformed (non-object) queue record, oversized, an unreadable
+        # queue file (the one `path=` site that is not a `Path` this module
+        # builds directly — see `unreadable_escalation_file` in
+        # `required_kinds` below), plus three escalation records hitting the
+        # remaining named-not-dropped kinds.
         _dump(esc_dir / 'esc-malformed.json', ['x'] * 2000)
+        _corrupt(_write_escalation(esc_dir, 'esc-corrupt'))
         _write_escalation(
             esc_dir, 'esc-bad-status', status='quarantined', id=huge_escalation_id,
         )
@@ -3435,11 +3522,28 @@ class TestAllIssueDetailsAreBounded:
             'unknown_escalation_status', 'unfingerprinted_escalation',
             'duplicate_escalation_fingerprint', 'unparseable_run_stamp', 'missing_kind',
             'unknown_kind', 'unknown_verdict', 'orphan_verdict', 'malformed_escalation_record',
+            'unidentified_verdicts', 'unreadable_escalation_file',
         }
         observed_kinds = {issue['kind'] for issue in payload['issues']}
         # Anti-vacuity: without this, the bound below would pass trivially
         # on a hostile tree that quietly stopped triggering half its sites.
         assert required_kinds <= observed_kinds
+
+        too_long_ids = {
+            issue['kind']: len(issue['eval_id'])
+            for issue in payload['issues']
+            if issue['eval_id'] is not None and len(issue['eval_id']) > _MAX_EVAL_ID_LENGTH
+        }
+        assert not too_long_ids, too_long_ids
+
+        # The locator field needs no length cap because it is filesystem-
+        # derived by construction — asserted directly rather than via a
+        # magic length number.
+        bad_paths = [
+            issue for issue in payload['issues']
+            if issue['path'] is not None and not issue['path'].startswith(str(tmp_path))
+        ]
+        assert not bad_paths, bad_paths
 
         # The bound itself, DERIVED from `_MAX_DISCARDED_VALUE_REPR` rather
         # than a bare literal, so retuning the knob cannot leave this

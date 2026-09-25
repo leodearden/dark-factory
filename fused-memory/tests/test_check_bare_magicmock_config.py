@@ -9,31 +9,20 @@ See task 1372 (lint guard) and task 1339/1313/1064 (migration).
 from __future__ import annotations
 
 import ast
-import importlib.util
 import shutil
 import subprocess
 import sys
-import types
 from pathlib import Path
 
 import pytest
+from _fm_helpers import load_script_module
 
 # Load the checker script via importlib to avoid sys.path pollution.
 # fused-memory/scripts/ is not on PYTHONPATH per pyproject.toml (pythonpath=['src']).
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'check_bare_magicmock_config.py'
 
 
-def _load_checker() -> types.ModuleType:
-    """Load the checker module from its script path."""
-    spec = importlib.util.spec_from_file_location('check_bare_magicmock_config', SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)  # type: ignore[union-attr]
-    return module
-
-
-_checker = _load_checker()
+_checker = load_script_module(SCRIPT_PATH, mod_name='check_bare_magicmock_config')
 find_violations = _checker.find_violations
 
 
@@ -1150,194 +1139,70 @@ class TestDataclassDoubleExemption:
         )
 
 
-# The 11 files carrying pre-existing Rule B debt, from the AST census over all seven
-# scanned tests/ directories (95 sites total). test_merge_speculation.py is
-# deliberately ABSENT: its single deliberate double gets a per-site pragma instead,
-# so task 3980's freshly-cleaned module stays fully covered.
-_EXPECTED_DEBT_PATHS = frozenset({
-    'orchestrator/tests/test_merge_queue.py',
-    'orchestrator/tests/test_concurrent_verify_boundary.py',
-    'orchestrator/tests/test_merge_queue_permit_conservation.py',
-    'orchestrator/tests/test_merge_queue_resolve_release.py',
-    'orchestrator/tests/test_merge_queue_request_liveness.py',
-    'orchestrator/tests/test_coalesce_integration_gate.py',
-    'orchestrator/tests/test_merge_item_union.py',
-    'orchestrator/tests/test_merge_queue_equivalence.py',
-    'orchestrator/tests/test_merge_queue_lifecycle_registry.py',
-    'orchestrator/tests/test_merge_queue_metrics.py',
-    'orchestrator/tests/test_merge_queue_single_writer_asserts.py',
-})
-
 _REPO_ROOT = Path(__file__).parent.parent.parent
 
 
-class TestDataclassDoubleDebtBaseline:
-    """The shrink-only per-file debt baseline that lets Rule B ship default-ON.
+class TestRuleBIsUnconditional:
+    """Rule B has no suppression channel but the per-site pragma (task 4354).
 
-    96 pre-existing sites across 12 files mean a hot default-on rule would turn
-    orchestrator/tests' lint_command red immediately and stall the merge lane
-    repo-wide. The baseline is per-FILE (line numbers churn on every edit above
-    them) and opt-OUT (a brand-new offending file must be covered by default —
-    an opt-in list would exempt exactly the third file this task exists to catch).
+    Rule B shipped behind a shrink-only per-file debt baseline because 95 pre-existing
+    sites across 11 files would otherwise have turned orchestrator/tests' lint_command
+    red on day one and stalled the merge lane repo-wide.  All 95 are migrated, and the
+    baseline is gone.  What this class prevents is its RETURN: a per-file budget is
+    invisible at the offending site, so re-grandfathering a path would silently
+    re-cover doubles no reader of that file could tell were covered.
     """
 
-    def test_debt_baseline_holds_exactly_the_eleven_measured_paths(self):
-        """_DATACLASS_DOUBLE_DEBT == the 11 census paths — no more, no less."""
-        debt = _checker._DATACLASS_DOUBLE_DEBT
-        assert set(debt) == _EXPECTED_DEBT_PATHS, (
-            'Debt baseline drifted from the measured census.\n'
-            f'  unexpected additions: {sorted(set(debt) - _EXPECTED_DEBT_PATHS)}\n'
-            f'  missing entries:      {sorted(_EXPECTED_DEBT_PATHS - set(debt))}\n'
-            'The list is SHRINK-ONLY: entries may be removed as files are migrated, '
-            'never added.'
-        )
+    # The eleven paths that carried the retired baseline.  Literals on purpose: there
+    # is no source constant left to mirror, and these are precisely the paths a
+    # re-grandfathering would reach for.
+    _FORMERLY_GRANDFATHERED_PATHS = (
+        'orchestrator/tests/test_merge_queue.py',
+        'orchestrator/tests/test_merge_item_union.py',
+        'orchestrator/tests/test_concurrent_verify_boundary.py',
+        'orchestrator/tests/test_merge_queue_permit_conservation.py',
+        'orchestrator/tests/test_merge_queue_resolve_release.py',
+        'orchestrator/tests/test_merge_queue_request_liveness.py',
+        'orchestrator/tests/test_coalesce_integration_gate.py',
+        'orchestrator/tests/test_merge_queue_equivalence.py',
+        'orchestrator/tests/test_merge_queue_lifecycle_registry.py',
+        'orchestrator/tests/test_merge_queue_metrics.py',
+        'orchestrator/tests/test_merge_queue_single_writer_asserts.py',
+    )
 
-    def test_test_merge_speculation_is_not_grandfathered(self):
-        """test_merge_speculation.py must NOT be on the baseline.
+    @staticmethod
+    def _assert_reports_three_plain_hits(path: str, why: str) -> None:
+        """Three offending sites at *path* must yield three PLAIN Rule B hits.
 
-        Blanket-suppressing Rule B there would silently un-cover the eleven other
-        doubles task 3980 just removed, the moment anyone reintroduced one.
+        Three rather than one because a residual budget of 1 or 2 would still let a
+        single site through: only a count that exceeds any plausible leftover budget
+        distinguishes "no suppression" from "suppressed just under the wire".
         """
-        assert 'orchestrator/tests/test_merge_speculation.py' not in _checker._DATACLASS_DOUBLE_DEBT, (
-            'test_merge_speculation.py must stay OFF the debt baseline — its one '
-            'deliberate double carries a per-site pragma so the rest of the module '
-            'stays covered (task 3980 regression)'
+        violations = find_violations(_RULE_B_SOURCE * 3, path)
+        assert len(violations) == 3, (
+            f'{path} must report every Rule B site in full — {why}; got {violations}'
         )
-
-    def test_same_source_opposite_verdicts_by_filename(self):
-        """The identical offending source is suppressed in a debt file and flagged elsewhere."""
-        suppressed = find_violations(_RULE_B_SOURCE, 'orchestrator/tests/test_merge_queue.py')
-        assert suppressed == [], (
-            f'Rule B must be suppressed in a debt-listed file; got {suppressed}'
-        )
-        flagged = find_violations(_RULE_B_SOURCE, 'orchestrator/tests/test_brand_new.py')
-        assert len(flagged) == 1, (
-            'the SAME source in a non-debt file must still flag — otherwise the '
-            f'baseline is not a baseline but a global off switch; got {flagged}'
-        )
-
-    def test_suppression_works_for_absolute_paths(self):
-        """An absolute path ending in the debt components is suppressed too.
-
-        The CLI passes repo-relative paths; pytest passes tmp_path absolutes. Both
-        must reach the same verdict or the baseline would be invisible to one caller.
-        """
-        absolute = str(_REPO_ROOT / 'orchestrator' / 'tests' / 'test_merge_queue.py')
-        assert find_violations(_RULE_B_SOURCE, absolute) == [], (
-            f'an absolute path to a debt file must be suppressed; filename={absolute!r}'
-        )
-
-    def test_matching_is_path_component_aware_not_substring(self):
-        """Trailing-COMPONENT matching: a substring match must not grandfather an unrelated file."""
-        # Real trailing components → suppressed (this is what makes absolute paths work).
-        assert find_violations(_RULE_B_SOURCE, 'evil/orchestrator/tests/test_merge_queue.py') == [], (
-            'a path whose real trailing components are a debt entry is suppressed'
-        )
-        # Substring of a filename, but not a component boundary → NOT suppressed.
-        not_suppressed = find_violations(
-            _RULE_B_SOURCE, 'orchestrator/tests/not_test_merge_queue.py'
-        )
-        assert len(not_suppressed) == 1, (
-            'not_test_merge_queue.py merely CONTAINS a debt filename as a substring; '
-            f'a substring match must not grandfather it. got {not_suppressed}'
-        )
-        # Same basename at a different root → NOT suppressed (fewer components match).
-        bare = find_violations(_RULE_B_SOURCE, 'test_merge_queue.py')
-        assert len(bare) == 1, (
-            'a bare basename at another root shares only ONE trailing component and '
-            f'must not be suppressed. got {bare}'
-        )
-
-    def test_debt_baseline_suppresses_rule_b_only(self):
-        """A Rule A violation in a debt-listed file is still reported.
-
-        The baseline grandfathers dataclass-double debt, not all mock-spec discipline.
-        """
-        violations = find_violations(_RULE_A_SOURCE, 'orchestrator/tests/test_merge_queue.py')
-        assert len(violations) == 1, (
-            'the debt baseline must suppress Rule B ONLY — a bare config MagicMock in '
-            f'a debt-listed file is still a Rule A violation; got {violations}'
-        )
-        assert 'mock_orch_config' in violations[0].message
-
-    def test_every_debt_entry_resolves_to_an_existing_file(self):
-        """A deleted or renamed file must not leave a stale blanket suppression behind."""
-        missing = [
-            entry for entry in _checker._DATACLASS_DOUBLE_DEBT if not (_REPO_ROOT / entry).is_file()
-        ]
-        assert missing == [], (
-            f'Debt baseline entries no longer exist in the repo: {missing}. '
-            'A stale entry silently suppresses Rule B for a path nothing occupies — '
-            'and would grandfather a NEW file created at that path. Remove them.'
-        )
-
-    def test_debt_file_is_silent_at_budget_and_reports_the_overrun_above_it(self):
-        """The budget is what makes 'shrink-only' checked rather than merely commented.
-
-        Without it a debt entry grandfathers its file WHOLESALE, so a brand-new bare
-        double added to test_merge_queue.py (63 sites, an actively-developed hub)
-        would be invisible to the gate forever.
-        """
-        entry = 'orchestrator/tests/test_merge_item_union.py'
-        budget = _checker._DATACLASS_DOUBLE_DEBT[entry]
-        assert budget == 1, f'this test is written against a budget of 1; got {budget}'
-
-        at_budget = find_violations(_RULE_B_SOURCE, entry)
-        assert at_budget == [], (
-            f'a debt file carrying exactly its recorded {budget} site(s) must stay '
-            f'silent — that is the grandfathering the baseline exists for; got {at_budget}'
-        )
-
-        over_budget = find_violations(_RULE_B_SOURCE * 3, entry)
-        assert len(over_budget) == 2, (
-            'a debt file that GROWS past its recorded budget must report exactly the '
-            f'overrun (3 sites - budget {budget} = 2); got {over_budget}'
-        )
-
-    def test_overrun_message_names_the_budget_and_forbids_raising_it(self):
-        """The overrun message must not read as a normal Rule B hit.
-
-        The remedy differs: a normal hit says "spec this double", an overrun says
-        "you added debt to a file that may only shrink". Conflating them invites the
-        reader to fix it by editing the number in the checker.
-        """
-        entry = 'orchestrator/tests/test_merge_item_union.py'
-        message = find_violations(_RULE_B_SOURCE * 2, entry)[0].message
-        for needle in ('debt baseline', 'budget of 1', '2 were found', 'Do NOT raise'):
-            assert needle in message, (
-                f'the overrun message must name {needle!r} so the reader fixes the debt '
-                f'rather than the baseline; got {message!r}'
+        for violation in violations:
+            assert '_fake_verify_result' in violation.message, (
+                f'{path} must report a PLAIN Rule B hit carrying the migration remedy; '
+                f'got {violation.message!r}'
+            )
+            assert 'debt baseline' not in violation.message, (
+                f'{path} reported a debt-baseline OVERRUN, so some budget is still '
+                f'suppressing Rule B there; got {violation.message!r}'
             )
 
-    def test_recorded_budgets_are_not_below_the_live_per_file_census(self):
-        """Every recorded budget still covers what its file actually carries.
-
-        This is the shrink-only invariant measured against the real repo rather than
-        asserted from a literal: it recounts each debt file with the checker's own
-        predicates. A budget that drifted BELOW its file would make that package's
-        lint_command red; one that drifted far above would be silent slack.
-        """
-        overruns = []
-        for entry, budget in _checker._DATACLASS_DOUBLE_DEBT.items():
-            path = _REPO_ROOT / entry
-            if not path.is_file():
-                continue  # covered by test_every_debt_entry_resolves_to_an_existing_file
-            source = path.read_text(encoding='utf-8')
-            lines = source.splitlines()
-            actual = sum(
-                1
-                for node in ast.walk(ast.parse(source, filename=str(path)))
-                if isinstance(node, ast.Call)
-                and _checker._dataclass_double_violation(node, lines, entry) is not None
+    def test_every_formerly_grandfathered_path_reports_rule_b_in_full(self):
+        """No residual suppression survives at any of the eleven migrated paths."""
+        for path in self._FORMERLY_GRANDFATHERED_PATHS:
+            self._assert_reports_three_plain_hits(
+                path, 'its baseline entry was retired by task 4354'
             )
-            if actual > budget:
-                overruns.append(f'{entry}: recorded {budget}, found {actual}')
-        assert overruns == [], (
-            'Debt budgets are below the live census, so these files are RED:\n  '
-            + '\n  '.join(overruns)
-            + '\nThe baseline is shrink-only: migrate the new site(s) onto '
-            '_fake_verify_result / MagicMock(spec=VerifyResult) rather than raising '
-            'the recorded number.'
+
+    def test_a_rule_c_debt_file_reports_rule_b_in_full(self):
+        """Rule C's surviving baseline must not shadow Rule B at its own debt paths."""
+        self._assert_reports_three_plain_hits(
+            _RULE_C_DEBT_FILE, "Rule C's baseline grandfathers wall-clock debt alone"
         )
 
 
@@ -1378,9 +1243,9 @@ class TestAllScannedTestDirsClean:
     stalls the merge lane repo-wide.
 
     This test proves each widening left every one of those callers green.  It is the
-    counterpart to TestDataclassDoubleDebtBaseline and
-    TestWallClockDeadlineDebtBaseline: those classes pin WHAT is grandfathered, this
-    one pins that nothing else was missed.
+    counterpart to TestRuleBIsUnconditional and TestWallClockDeadlineDebtBaseline:
+    those classes pin what may and may not be grandfathered, this one pins that
+    nothing else was missed.
     """
 
     _SCANNED_DIRS = (
@@ -1820,7 +1685,7 @@ class TestWallClockDeadlineCrossCodeIsolation:
 # The Rule C census (task 4246, base 1d75322218): 618 violations across 20 files,
 # every one under orchestrator/tests/.  Counted as VIOLATIONS, not sites — one call
 # can produce two.  test_merge_speculation.py measures ZERO (task 3980 migrated it)
-# and is deliberately ABSENT, exactly as it is absent from Rule B's baseline.
+# and is deliberately ABSENT.
 _EXPECTED_WALL_CLOCK_DEBT_PATHS = frozenset({
     'orchestrator/tests/test_merge_queue.py',
     'orchestrator/tests/test_merge_queue_concurrent_verify.py',
@@ -1839,7 +1704,6 @@ _EXPECTED_WALL_CLOCK_DEBT_PATHS = frozenset({
     'orchestrator/tests/test_merge_guard_pipeline.py',
     'orchestrator/tests/test_merge_queue_supervisor.py',
     'orchestrator/tests/test_merge_queue_verifier_raw_cancel.py',
-    'orchestrator/tests/test_merge_queue_warm_cold_shadow.py',
     'orchestrator/tests/test_merge_worktree_lifecycle_integration_gate.py',
     'orchestrator/tests/test_merge_queue_dispatch_fill_redispatch.py',
 })
@@ -1865,15 +1729,15 @@ class TestWallClockDeadlineDebtBaseline:
     618 pre-existing violations across 20 files mean a hot default-on rule would
     turn orchestrator/tests' lint_command red immediately and stall the merge lane
     repo-wide — the identical situation Rule B faced at 95 sites/11 files, solved
-    the identical way.
+    the identical way and since retired, its debt fully migrated (task 4354).
 
     Opt-OUT rather than opt-in, deliberately: an opt-in list would exempt precisely
     the brand-new file this rule exists to catch, and "which files are covered"
     would become a hand-maintained list — the exact failure mode task 3980's
     amendment pass deleted a class list to escape.
 
-    Mirrors TestDataclassDoubleDebtBaseline, and additionally pins that the
-    now-shared machinery keeps the three baselines strictly independent.
+    Modelled on Rule B's retired baseline class, and additionally pins that the
+    budget machinery suppresses Rule C alone.
 
     NOT one-for-one, in both directions, and the difference is deliberate:
 
@@ -1884,7 +1748,7 @@ class TestWallClockDeadlineDebtBaseline:
         repo — and it taxed the one workflow this whole design exists to enable:
         migrating a single wait under orchestrator/tests then meant editing three
         literals in another package's test file before the suite went green.
-      * The live-census tests themselves have no Rule B counterpart. That IS a
+      * The live-census tests themselves had no Rule B counterpart. That WAS a
         scope escalation over the precedent, kept on purpose: Rule C's baseline is
         a per-file BUDGET rather than Rule B's bare list, so slack above the
         measurement is not inert — it silently licences that many new waits. The
@@ -2021,24 +1885,15 @@ class TestWallClockDeadlineDebtBaseline:
                 f'Rule C overrun message must not offer {foreign!r}: {message!r}'
             )
 
-    def test_rule_b_overrun_message_is_unchanged_by_the_parameterisation(self):
-        """Regression pin: Rule B's wording is pinned by its own tests and must not drift."""
-        entry = 'orchestrator/tests/test_merge_item_union.py'
-        message = find_violations(_RULE_B_SOURCE * 2, entry)[0].message
-        assert message == _checker._debt_overrun_msg(1, 2), (
-            'Rule B must still build its overrun message through _debt_overrun_msg '
-            'with byte-identical text after the debt helpers were parameterised'
-        )
-
     def test_the_overrun_builder_is_required_and_keyword_only(self):
-        """A future Rule D must not be able to inherit Rule B's remedy by omission.
+        """A future Rule D must not be able to inherit another rule's remedy by omission.
 
-        The parameter briefly carried ``= None`` with a ``_debt_overrun_msg``
-        fallback. Both call sites passed it, so the fallback was dead — but a
+        The parameter briefly carried ``= None`` falling back to Rule B's own
+        builder. Both call sites passed it, so the fallback was dead — but a
         fourth rule calling ``_apply_debt_budget(found, budget)`` would have
-        silently prescribed ``_fake_verify_result`` for a wall-clock overrun,
-        with no type error and no failing test. Requiredness is the whole guard,
-        so it is pinned here rather than trusted.
+        silently prescribed a mock-double remedy for a wall-clock overrun, with
+        no type error and no failing test. Requiredness is the whole guard, so it
+        is pinned here rather than trusted.
         """
         # Omitting the builder must fail: no default to fall back on.
         with pytest.raises(TypeError):
@@ -2050,7 +1905,10 @@ class TestWallClockDeadlineDebtBaseline:
 
 
 class TestDebtBaselineIsolation:
-    """The three baselines are independent: no rule's debt entry suppresses another rule."""
+    """Rule C's baseline is Rule C's alone: its debt entries suppress no other rule.
+
+    The Rule B leg is TestRuleBIsUnconditional::test_a_rule_c_debt_file_reports_rule_b_in_full.
+    """
 
     def test_rule_a_is_reported_in_full_in_a_rule_c_debt_file(self):
         """The Rule C baseline grandfathers wall-clock debt, not all test-quality discipline."""
@@ -2060,29 +1918,6 @@ class TestDebtBaselineIsolation:
             f'violation; got {violations}'
         )
         assert 'mock_orch_config' in violations[0].message
-
-    def test_rule_b_is_reported_in_full_in_a_rule_c_only_debt_file(self):
-        """A file on the Rule C baseline but NOT Rule B's still reports Rule B in full."""
-        assert _RULE_C_DEBT_FILE not in _checker._DATACLASS_DOUBLE_DEBT, (
-            'this test needs a file on the Rule C baseline only'
-        )
-        violations = find_violations(_RULE_B_SOURCE, _RULE_C_DEBT_FILE)
-        assert len(violations) == 1, (
-            f'Rule B must be unaffected by a Rule C debt entry; got {violations}'
-        )
-        assert '_fake_verify_result' in violations[0].message
-
-    def test_rule_c_is_reported_in_full_in_a_rule_b_only_debt_file(self):
-        """A file on the Rule B baseline but NOT Rule C's still reports Rule C in full."""
-        entry = 'orchestrator/tests/test_merge_item_union.py'
-        assert entry in _checker._DATACLASS_DOUBLE_DEBT, entry
-        assert entry not in _checker._WALL_CLOCK_DEADLINE_DEBT, (
-            'this test needs a file on the Rule B baseline only'
-        )
-        violations = _rule_c(_RULE_C_SOURCE, entry)
-        assert len(violations) == 2, (
-            f'Rule C must be unaffected by a Rule B debt entry; got {violations!r}'
-        )
 
 
 class TestWallClockDeadlineBaselineIntegrity:
@@ -2334,7 +2169,7 @@ class TestRuleBCoversMergeSpeculation:
         )
 
     def test_the_counter_example_flags_under_that_exact_filename(self):
-        """(b) The module is IN SCOPE, not grandfathered onto _DATACLASS_DOUBLE_DEBT."""
+        """(b) The module is IN SCOPE — and Rule B has no baseline to grandfather it."""
         source = _merge_speculation_source() + _RULE_B_COUNTER_EXAMPLE
         violations = [
             v

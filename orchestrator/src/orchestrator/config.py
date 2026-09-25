@@ -853,6 +853,17 @@ class SessionResumeConfig(BaseModel):
     ``enabled=false`` is the kill switch: no ``--resume`` is ever injected
     (B6), and no ``session_resume_*`` event or streak is produced.
 
+    Since task 3730 (PRD leaf δ) reachability OUTRANKS freshness: a durable
+    transcript archive corroborates a session on its own, so
+    ``freshness_window_secs`` is consulted only when NO archive exists, and
+    ``absolute_resume_age_secs`` is the unconditional backstop that stops that
+    from meaning "no age limit at all". A session past the backstop reports
+    ``aged_out`` — a distinct, by-design reason from ``stale``, because the two
+    are actioned differently: ``stale`` means "old, with no archive to redeem
+    it" (worth asking why the archive is missing) while ``aged_out`` means "old
+    past the point where resuming is safe regardless of reachability" (the
+    backstop working as designed).
+
     ``restore_from_archive=false`` is the NARROWER kill switch (task 3578):
     the ``_invoke`` arm site stops rehydrating a missing transcript from the
     durable archive, but eligibility, corroboration and every
@@ -886,7 +897,16 @@ class SessionResumeConfig(BaseModel):
             'harness guard. With this false, an ineligible resume still '
             'degrades to fresh dispatch and still emits its event, so an '
             'operator can disable restoration without going blind on the '
-            'population it was meant to fix. '
+            'population it was meant to fix — the fallbacks carrying '
+            'archive_available=true, which this switch deliberately does NOT '
+            'suppress. '
+            'Since task 3730 (δ) it also withholds the archive from the '
+            'ELIGIBILITY predicate, so pulling it reverts δ in full: an '
+            'archive-only-reachable session falls back with its pre-δ reasons '
+            'instead of being armed for a resume the arm site would then '
+            'refuse to rehydrate — which would have moved that whole '
+            'population from session_resume_fallback to session_resume and '
+            'made D8\'s ratio read 100% resumed while 0% resumed. '
             'Deliberately does NOT consult transcript_archive.enabled, reusing '
             "Harness._archive_available's recorded argument: with archival off "
             'there is simply nothing on disk to find, and gating on the flag '
@@ -905,9 +925,48 @@ class SessionResumeConfig(BaseModel):
             'its data.reasons list — alongside any OTHER reason the same '
             'session failed, since the reasons are reported as a set rather '
             'than a first match (task 3728). '
-            'Must be >= 1. Default 86400 (1 day) sits at/above the invocation '
+            'Must be >= 1, and STRICTLY BELOW absolute_resume_age_secs '
+            '(enforced by a model_validator, so an inverted pair fails at load '
+            'and a hot reload that would invert it is rolled back). '
+            'Default 86400 (1 day) sits at/above the invocation '
             'absolute cap plus slack, so a sidecar is rejected only once it '
             'clearly outlives any legitimate in-flight invocation.'
+        ),
+    )
+    absolute_resume_age_secs: int = Field(
+        default=432000,
+        ge=1,
+        description=(
+            'ABSOLUTE outer bound on a recovered sidecar\'s age: past this many '
+            'seconds a session is never resumed, and the fallback event carries '
+            '"aged_out" in its data.reasons (task 3730 / PRD leaf δ, D3). '
+            'DISTINCT FROM freshness_window_secs, and the pair is what keeps '
+            '"a durable archive outranks age" from becoming "no age limit at '
+            'all": freshness applies ONLY when no durable archive exists (D2 — '
+            'an archive does not decay with wall-clock, so age is the wrong '
+            'question for a session that is still reachable), while this '
+            'backstop applies UNCONDITIONALLY, archive or not. It must '
+            'therefore sit STRICTLY ABOVE freshness_window_secs — at or below '
+            'it, the backstop fires first on the no-archive path too and '
+            'freshness becomes unreachable config — which a model_validator '
+            'enforces rather than leaving to the shipped defaults. '
+            'A DERIVED bound, not a chosen number. Two MEASURED terms: the '
+            'longest legitimate in-flight invocation, plus the longest '
+            'observed orchestrator downtime — a sidecar\'s started_at is '
+            'stamped per invocation, so its age when the guard evaluates it is '
+            'in-flight-time-at-crash PLUS however long the orchestrator was '
+            'down before re-dispatching, and the sidecar accrues that age while '
+            'nothing runs. The derivation, the safety factor and its '
+            'measurement provenance live in '
+            'orchestrator/resume_age_bound.py::RESUME_AGE_SAFETY_FACTOR; '
+            'orchestrator/tests/test_resume_age_bound.py re-derives it against '
+            'the live runs.db every run and goes red when the fleet outgrows '
+            'it, so this default tracks measured behaviour rather than sitting '
+            'still. Default 432000 (5 days) is the 2026-09-07 requirement '
+            '(355,803s = 4.12 days) rounded up to the next whole day. Must be '
+            '>= 1: a zero or negative bound would reject every recovered '
+            'session and silently disable the feature through a knob that '
+            'reads as a tuning dial.'
         ),
     )
     max_resumes_per_task: int = Field(
@@ -925,54 +984,103 @@ class SessionResumeConfig(BaseModel):
         default=5,
         ge=1,
         description=(
-            'Consecutive UNEXPLAINED session_resume_fallback degradations '
-            'before one L1 escalation is filed (INV-4 storm escape). Only a '
-            'reason OUTSIDE harness.py::_BY_DESIGN_SESSION_RESUME_REASONS '
-            'counts: every by-design outcome — the per-task cap, a lane '
-            'reseed, an out-of-window sidecar, an uncorroborable transcript — '
-            'is excluded by construction, so reaching this threshold means a '
-            'genuinely unexplained failure mode fired repeatedly. A reason '
-            'is genuine BY DEFAULT: a new one feeds this streak unless it is '
-            'added to that constant. The run is chained within '
-            'storm_window_secs (and reset to 0 on any eligible resume) rather '
-            'than accumulating unbounded per boot. Must be >= 1. Default 5 is '
-            'above both the resume cap and ordinary collision noise, so only '
-            'systematic breakage trips it. '
-            'NOT CURRENTLY REACHABLE, by design and only for now: with '
-            "today's reason vocabulary EVERY producible reason is by-design, "
-            'so the streak has no feeder and this threshold cannot fire at '
-            'any value. Tuning it changes nothing until PRD leaf epsilon '
-            '(task 3733) installs the first genuine feeder '
-            '(archive-restore failure); the mechanism is retained unfed so '
-            'that lands on a tested path. Until then, watch the '
-            'session_resume_fallback event rate directly.'
+            'Consecutive ELIGIBLE-BUT-FAILED resumes before one L1 '
+            'escalation is filed (INV-4 storm escape). The feeder (task '
+            '3733) is every armed resume that did not survive: an archive '
+            'restore that faulted, and every CLI rejection of a resume we '
+            'armed. Only outcomes OUTSIDE the two by-design carve-outs count '
+            "— harness.py::_BY_DESIGN_SESSION_RESUME_REASONS for the "
+            'pre-dispatch eligibility predicate and '
+            'harness.py::_BY_DESIGN_RESTORE_OUTCOMES for the archive restore '
+            "('disabled', the kill switch, and 'miss', the archive-coverage "
+            'signal, which belongs on a rate watch rather than a '
+            'consecutive-run detector). A new value in either vocabulary is '
+            'GENUINE BY DEFAULT and feeds this streak unless it is added to '
+            'the constant. The run is chained within storm_window_secs (and '
+            'reset to 0 on any resume that survives) rather than accumulating '
+            'unbounded per boot. Must be >= 1. '
+            'Default 5 STAYS where task 2774 put it, and the re-derivation '
+            'behind the window (see storm_window_secs) is why: the WINDOW, '
+            'not the threshold, was the binding constraint — at the old 3600s '
+            'nothing chained at ANY threshold. 5 sits two above the measured '
+            "null's longest run of 3 inside the shipped 24h window, and "
+            'reset-on-success rather than the clock is what suppresses false '
+            'alarms. '
+            'ALSO EXCLUDED: the recovered-config-dir ambiguity L1 '
+            '(session_config_dir_ambiguous) does NOT feed this streak — it is '
+            'deduped one-open-at-a-time rather than thresholded, so this knob '
+            'has no effect on it and an ambiguity L1 alone is not evidence of '
+            'a resume storm; see event_store.py::EventType.'
+            'session_config_dir_ambiguous.'
         ),
     )
     storm_window_secs: int = Field(
-        default=3600,
+        default=86400,
         ge=1,
         description=(
-            'Maximum gap, in seconds, between two consecutive unexplained '
-            'session-resume fallbacks for them to count as the same storm '
-            'run; a larger gap decays the streak to 0 before the next '
-            'fallback is counted. Without this the streak is cumulative '
-            'rather than consecutive, so a slow drip of isolated failures '
-            'accumulates into a false storm. Must be >= 1. Default 3600 is '
-            'read off the measured signature: real bursts land ~17 fallbacks '
-            'inside one hour, while quiet gaps between isolated failures run '
-            '~7h and ~39h — so a 1h chain window separates burst from drip '
-            'with a wide margin on both sides. Measured on the monotonic '
-            'clock, deliberately: the stale reason is itself PRODUCED by '
-            'clock skew, so a wall-clock decay would be corrupted by the very '
-            'failure mode it must detect. '
-            'Its ESCALATION-driving role is inert for the same reason '
-            'fallback_storm_threshold is (see above) — nothing feeds the '
-            'streak until task 3733 — but the window is still LIVE as the '
-            'expiry clock: it is evaluated on every dispatch carrying a '
-            'recovered session, so shortening it still changes when a run '
-            'is considered over.'
+            'Maximum gap, in seconds, between two consecutive '
+            'eligible-but-FAILED resumes for them to count as the same storm '
+            'run; a larger gap retires the run before the next failure is '
+            'counted. Without this the streak is cumulative rather than '
+            'consecutive, so a slow drip of isolated failures accumulates '
+            'into a false storm. Must be >= 1. Measured on the MONOTONIC '
+            'clock, deliberately: clock skew is one of the failure modes this '
+            'seam must survive, so a wall-clock decay could be corrupted by '
+            'the very thing it detects. '
+            'A DERIVED bound, not a chosen number (task 3733). The previous '
+            '3600s was read off the session_resume_fallback burst signature '
+            '("~17 fallbacks inside one hour") — a population task 3728 '
+            'entirely carved out of the streak, leaving the number a stale '
+            'inheritance describing a feeder that no longer exists, and one '
+            'so narrow the escape could not fire at any threshold. It is '
+            're-derived against the population that actually feeds the streak '
+            '(session_resume_failed), and the bound is TWO-SIDED: the window '
+            'must be at least the smallest observed interval between two such '
+            'failures (below it nothing can ever chain), and small enough '
+            "that the longest run the measured NULL produces stays strictly "
+            'below fallback_storm_threshold. Neither side is a safety factor. '
+            'The derivation, its provenance and the guard that RE-DERIVES it '
+            'against live runs.db on every run live in '
+            'orchestrator/storm_window_bound.py and '
+            'orchestrator/tests/test_storm_window_bound.py — read the numbers '
+            'there rather than trusting this sentence, and re-derive before '
+            'retuning.'
         ),
     )
+
+    @model_validator(mode='after')
+    def _reject_backstop_at_or_below_freshness(self) -> 'SessionResumeConfig':
+        """The two age thresholds must stay ORDERED, at any operator setting.
+
+        ``freshness_window_secs`` is consulted only on the no-archive path,
+        ``absolute_resume_age_secs`` unconditionally (D2/D3), so the backstop
+        firing first would make freshness dead config: an operator could
+        retune it with no observable effect and no error anywhere, while
+        fallbacks silently switched from 'stale' to 'aged_out'. Equality is
+        rejected for the same reason — at equal values 'stale' can never fire
+        without 'aged_out' beside it, so the knob is still unreachable.
+
+        Enforced HERE rather than only on the shipped defaults because both
+        leaves are settable from dark-factory-orchestrator.yaml and both are
+        green-tier hot-reloadable: this is the boundary where the relation can
+        actually be violated. A reload that would invert the pair fails
+        validation and is rolled back whole by ``apply_reload``.
+        """
+        if self.absolute_resume_age_secs <= self.freshness_window_secs:
+            raise ValueError(
+                'SessionResumeConfig.absolute_resume_age_secs '
+                f'({self.absolute_resume_age_secs}s) must be > '
+                f'freshness_window_secs ({self.freshness_window_secs}s); the '
+                'absolute backstop applies unconditionally while freshness '
+                'applies only when no durable archive exists, so a backstop '
+                'at or below the freshness window fires first on the '
+                'no-archive path too and leaves freshness_window_secs '
+                'unreachable config. Raise absolute_resume_age_secs (it is a '
+                'DERIVED bound — see '
+                'orchestrator/resume_age_bound.py::RESUME_AGE_SAFETY_FACTOR) '
+                'or lower freshness_window_secs.'
+            )
+        return self
 
 
 class SpeculationProbeConfig(BaseModel):
@@ -2829,6 +2937,9 @@ _DEFAULT_PRICES: dict[str, dict[str, float]] = {
     # config is threaded in. Kept in lockstep with defaults.yaml's `prices:`
     # block by test_config.py's test_default_price_table_matches_defaults_yaml.
     'gpt-5.4': {'input_per_1m': 2.50, 'output_per_1m': 10.00},
+    # Sticker rate; codex reports no cached-input split, so this prices every
+    # input token at the uncached rate (an upper bound on the true spend).
+    'gpt-6-astra': {'input_per_1m': 10.00, 'output_per_1m': 50.00},
     'o4-mini': {'input_per_1m': 1.10, 'output_per_1m': 4.40},
     'gemini-3.1-pro-preview': {'input_per_1m': 1.25, 'output_per_1m': 5.00},
     'gemini-3-flash': {'input_per_1m': 0.075, 'output_per_1m': 0.30},
@@ -3453,6 +3564,41 @@ class OrchestratorConfig(BaseSettings):
     # load-bearing lane.  Flipped 'scoped' → 'full' by the σ capstone and
     # activated by the τ deterministic-deploy fleet restart.
     merge_verify_breadth: Literal['scoped', 'full'] = Field(default='scoped')
+    # Soundness narrowing for the CAS-loop disjoint-delta fast path (the
+    # 2026-09-22 whole-tree-drift incident).  ``merge_gates._reverify_rebased_tree``
+    # skips the post-rebase re-verify when the branch's touched files and the
+    # intervening main delta are DISJOINT.  That inference needs two premises,
+    # and the overlap probe checks neither:
+    #
+    #   P1 (compositionality) — the gate's verdict decomposes over disjoint
+    #       file sets, i.e. every check it runs is diff-scoped.  A WHOLE-TREE
+    #       check (one whose whole premise is that an unrelated file can fail
+    #       you) violates P1 by construction.
+    #   P2 (the drift is itself green) — main at ``rebased_onto`` passes the
+    #       gate on its own.  Even a perfectly diff-scoped gate returns red on
+    #       a merge whose BASE is already red.
+    #
+    # When True (default) the fast path additionally requires P2 to be
+    # positively observed: ``rebased_onto`` must be a SHA this orchestrator's
+    # own merge queue landed, which is exactly the set of main tips a green
+    # gate run has been observed on.  Drift from ANY other writer — an
+    # unattended nightly job, a direct human commit, a push — has unknown
+    # health, so the rebase re-verifies.  Set False to restore the pre-fix
+    # behaviour (disjointness alone clears the gate) if the extra re-verifies
+    # ever have to be traded away under load; the P1 arm keyed on
+    # ``merge_verify_breadth == 'full'`` is NOT covered by this switch,
+    # because a project that has declared a whole-tree gate has declared the
+    # skip unsound outright.
+    #
+    # GREEN TIER (see RELOADABLE_FIELDS below, and OPERATIONS.md
+    # section "Config reload vs restart").  Unlike its restart-only
+    # ``merge_verify_breadth`` neighbour this knob cannot split an in-flight
+    # merge's BREADTH — it only ever decides whether ONE more verify is run
+    # before an advance, is read fresh off ``req.config`` at each gate
+    # evaluation, and is a safety kill switch: a switch you can only pull by
+    # restarting the fleet is not a kill switch (the argument already written
+    # for ``config_key_census.*`` and ``merge_deep.chain_cap``).
+    merge_disjoint_skip_requires_verified_drift: bool = Field(default=True)
     # Fix (b), task 2822 — per-land cross-check of a REMOTE merge-verify green.
     # When True (default), after a remote two-host verify returns a real-suite
     # PASS that would DECIDE a land, the merge worker re-runs the LOCAL
@@ -3800,6 +3946,32 @@ class OrchestratorConfig(BaseSettings):
             'is deferred to let a pre-enqueue MERGE-phase workflow reach the '
             'durable merge journal; bounds the force-fire hold to '
             'force_fire_after_secs + this. 0 disables. 10-min default.'
+        ),
+    )
+    # Max age of the in-flight fleet-redeploy lease (task 4755) before the
+    # orchestrator's own coordinator stops believing it. While
+    # scripts/restart-all-orchestrators.sh is mid-sweep it holds that lease and
+    # the coordinator stands down; the bound is what keeps a lease stranded by
+    # a SIGKILLed sweep (whose EXIT trap cannot run, by construction) from
+    # wedging the fleet. DERIVED, not picked: the worst LEGITIMATE sweep is one
+    # permanently-busy unit burning the whole 4500s drain busy-grace, plus ~6
+    # stale/absent units at 120s each, plus 7 x (verify 30 + grace 120) =
+    # 6270s ~= 1.74h, so 7200 clears it with headroom while staying far below
+    # the 8h orchestrator_restart_min_interval_secs — a leaked lease therefore
+    # delays at most ONE redeploy window. Deliberately NOT in RELOADABLE_FIELDS:
+    # red-tier / restart-only, matching its siblings
+    # orchestrator_restart_merge_phase_grace_secs /
+    # orchestrator_restart_force_fire_after_secs /
+    # orchestrator_restart_min_interval_secs (captured at coordinator
+    # construction).
+    orchestrator_restart_lease_max_age_secs: float = Field(
+        default=7200.0,
+        description=(
+            'Max age of the in-flight fleet-redeploy lease before the '
+            'orchestrator coordinator stops honouring it and redeploys anyway. '
+            'Derived from the worst legitimate --drain sweep (~6270s) and kept '
+            'far below the 8h min-interval, so a lease stranded by a SIGKILLed '
+            'sweep delays at most one window. 2h default.'
         ),
     )
 
@@ -5541,10 +5713,15 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # whole-submodel-group precedent.
     _submodel_leaf_paths('transcript_archive', TranscriptArchiveConfig),
     # Warm-lane session-resume guard (task γ) — a new dedicated submodel, same
-    # whole-submodel-group idiom as routing/chronic_flake above: the kill switch
-    # and all three ge-bounded knobs (freshness_window_secs / max_resumes_per_task
-    # / fallback_storm_threshold) are green-tier hot-reloadable with no separate
-    # RELOADABLE_FIELDS edit.
+    # whole-submodel-group idiom as routing/chronic_flake above: both kill
+    # switches (enabled / restore_from_archive) and all FIVE ge-bounded knobs
+    # (freshness_window_secs / absolute_resume_age_secs / max_resumes_per_task /
+    # fallback_storm_threshold / storm_window_secs) are green-tier
+    # hot-reloadable with no separate RELOADABLE_FIELDS edit. This comment
+    # undercounted at "all three" until task 3730; the enumeration is
+    # documentation only, since _submodel_leaf_paths reads model_fields, but a
+    # count that drifts reads as a checked claim and is not one — the check is
+    # test_config.py::TestSessionResumeConfig::test_leaves_in_reloadable_fields.
     _submodel_leaf_paths('session_resume', SessionResumeConfig),
     # Unknown-config-key census escape hatch (task 2989) — same whole-submodel
     # idiom.  Green-tier ON PURPOSE: the born-at-L2 this census files tells the
@@ -5653,6 +5830,13 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # siblings: it only ever ADDS a second-opinion local verify, so flipping
         # it mid-process cannot split an in-flight merge's breadth.
         'verify_cross_check_remote_green',
+        # Disjoint-delta fast-path soundness gate (2026-09-22 whole-tree-drift
+        # incident) — green-tier for the same reason as its
+        # verify_cross_check_remote_green neighbour directly above: it only
+        # ever ADDS a re-verify before an advance, never changes an in-flight
+        # merge's breadth, and is read fresh off req.config at each gate
+        # evaluation.  A safety kill switch behind a restart is not one.
+        'merge_disjoint_skip_requires_verified_drift',
         # Per-model USD/1M-token price table (task 2459) — green-tier like
         # verify_env above. Threaded into every task-workflow role
         # invocation via the shared TaskWorkflow._invoke chokepoint (task

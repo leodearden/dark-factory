@@ -1272,6 +1272,120 @@ def merge_decision_enrichment(
     )
 
 
+def merge_same_queue_refile(
+    existing: DecisionRecord,
+    incoming: DecisionRecord,
+) -> DecisionRecord:
+    """Fold the SAME watcher's re-filing of its OWN id into an existing record.
+
+    Deliberate SIBLING of merge_decision_enrichment above -- read the two
+    together. Same custody set, opposite treatment of the watcher-owned half.
+    This is the other axis of _run_write_decision's upsert: not two watchers
+    seeing one gate through two queues (that is enrichment), but ONE watcher
+    re-filing its own stable id across a restart, which both watcher SKILL.md
+    files promise is idempotent.
+
+    Field policy:
+
+    - ``text`` / ``severity`` / ``task_id`` / ``session_id`` /
+      ``escalation_id`` / ``options`` / ``escalations_dir`` -- from
+      *incoming*, VERBATIM, including a severity DOWNGRADE and a field going
+      EMPTY. The watcher is the sole authority on its own escalation, and
+      freezing the first values (enrichment's fill-if-empty +
+      _max_decision_severity) would strand stale prose and a stale severity
+      in the cockpit queue forever. This is the whole reason the same-queue
+      case is not just routed through merge_decision_enrichment.
+    - ``filed_at`` / ``state`` / ``manual_boost`` -- from *existing*
+      (CUSTODY), and it is the SAME set merge_decision_enrichment keeps,
+      because custody does not depend on which queue re-filed. ``filed_at``
+      is queue AGE, which drives the cockpit's ordering, and a restart is not
+      news about it. ``manual_boost`` is the OPERATOR's C5 field, written by
+      set_manual_boost. ``state`` is the operator's / reaper's DISPOSITION,
+      written by update_decision_state.
+    - ``id`` / ``project`` -- not forced here, unlike enrichment (which
+      rebuilds from *existing*): this helper rebuilds from *incoming*, and
+      its caller has already established both are equal -- the id is the
+      on-disk file key, and _run_write_decision reaches this arm only after
+      ``existing.project == project``. Do not widen those preconditions
+      without revisiting this line.
+
+    WHY ``state`` IS SAFE TO HOLD HERE BUT NOT CROSS-QUEUE (task 3872). This
+    helper is scoped by its caller to a SAME-project, SAME-queue re-file, and
+    within ONE queue an ``esc-<taskid>-<n>`` id is unique -- that is the
+    entire premise of task 3528's queue axis. So this is the same gate the
+    human already answered or dropped rather than a new ask, and preserving
+    their disposition is respecting a VERIFIED human act. Across queues the
+    id namespaces genuinely collide (dark_factory runs ``data/escalations``
+    and ``data/reconciliation/escalations`` over one namespace), so a
+    non-open cross-queue filing may be an unrelated NEW ask;
+    _run_write_decision deliberately keeps today's full overwrite there.
+
+    THAT UNIQUENESS IS STRONG BUT NOT ABSOLUTE, and the hole is named here
+    once rather than rounded off, because every other statement of this
+    policy (the caller's comment, both watcher SKILLs) leans on it:
+    EscalationQueue._recover_seq_from_disk (escalation/queue.py) rebuilds a
+    LOST or corrupt per-task seq counter by scanning the queue root and
+    archive, and its own docstring concedes both bounds -- the archive half
+    is bounded by prune_archive retention, and an id minted but not yet
+    submitted when the counter was lost is invisible to the scan. After a
+    counter loss an id CAN therefore be re-minted inside one queue, landing a
+    genuinely NEW gate on a closed row that this helper then holds closed --
+    invisible in C5b, which filters to state=='open', i.e. the fail-CLOSED
+    direction. The residual needs a counter loss to reach and is far narrower
+    than the unbounded harm below, and _run_write_decision's divergence
+    WARNING is its backstop: the hold is ANNOUNCED for a human or agent to
+    adjudicate rather than applied silently, which is exactly the case that
+    reads it.
+
+    WHY THIS IS NOT THE FAIL-CLOSED DIRECTION the reaper docstrings in this
+    module warn about. "An over-held decision is a human-triageable row,
+    while a falsely closed one is invisible" governs the REAPER's join across
+    an id namespace it CANNOT verify -- an automatic close on uncertain
+    evidence. Here identity is knowable (above, down to the one named
+    counter-loss residual) and the closure came from an
+    operator's explicit C5b act (cockpit/app.py -> update_decision_state(...,
+    DROPPED)) or from the reaper resolving against an escalation in this SAME
+    queue. The alternative is not a benign over-surfacing but an UNBOUNDED
+    one: a watcher re-files on EVERY restart while an item stays parked, and
+    reap_answered_decisions skips a non-open record ("already resolved -- no
+    re-close"), so without this the operator's dismissal is undone forever
+    and C5b's drop action is inert for exactly the class of row it exists
+    for. The escape hatch for a genuinely NEW ask at a closed id is to FILE
+    IT UNDER A NEW ID -- the remedy that exists on a shipped surface, and the
+    one _run_write_decision's divergence WARNING points a watcher at.
+    Re-opening the row IN PLACE is deliberately not offered as the headline
+    remedy, because today it needs a direct registry write: this module's
+    update_decision_state has no operator-facing caller that re-opens (the
+    cockpit's C5b decision pane writes DROPPED only) and the argparse below
+    exposes write-decision / reap-decisions but no update-decision-state
+    verb. Say "file a new id" until one of those exists.
+
+    ADDITIVE-SAFE: ``state`` is copied as an opaque ``str``, never coerced
+    through DecisionState -- mirrors DecisionRecord's own no-coercion note,
+    so a disposition a future writer adds round-trips instead of being reset
+    to 'open' by a module that has not been taught about it.
+
+    KNOWN RESIDUAL: a LEGACY unstamped (``escalations_dir=''``) non-open
+    record re-filed by its own watcher does NOT reach this helper, because
+    the caller's queue-equality test cannot resolve ``'' == stamp``. Guessing
+    whose namespace an unstamped record belongs to is precisely what
+    _merge_queue_and_escalation_id refuses to do, and task 3640's back-fill
+    is draining that population; it is left as the full overwrite rather than
+    papered over here.
+
+    PURE and side-effect-free -- including of LOGGING, which stays in the CLI
+    verb at the policy boundary (mirroring how enrichment's queue warnings
+    live in _merge_queue_and_escalation_id, not in the writer). Returns a NEW
+    record via dataclasses.replace and mutates neither argument.
+    """
+    return dataclasses.replace(
+        incoming,
+        filed_at=existing.filed_at,
+        state=existing.state,
+        manual_boost=existing.manual_boost,
+    )
+
+
 @contextlib.contextmanager
 def decision_id_lock(decision_id: str, root: Path | str | None = None) -> Iterator[None]:
     """Per-decision-id exclusive advisory lock using a stable sidecar file.
@@ -1465,13 +1579,30 @@ spelling, for the cases case/separator folding alone cannot merge (task
 3807). Applied as the LAST step of normalize_project_token, so both key and
 value must themselves already be canonical under the fold.
 
-ADMISSION RULE for a new entry -- the canonical value must be the
-``memory.project_id`` declared by a real project root's
-``dark-factory-orchestrator.yaml``. That keeps the table mechanical and
-auditable instead of a per-case judgement call, and it is the reason this
-table is deliberately NOT a config read: this module is stdlib-only with no
+ADMISSION RULE for a new entry -- TWO clauses, BOTH necessary (clause 2
+added by task 3813, which was filed to keep this rule honest):
+
+  1. The canonical value must be the ``memory.project_id`` declared by a
+     real project root's ``dark-factory-orchestrator.yaml``.
+  2. The alias must heal an ACTUAL SPLIT: after case/separator folding,
+     that project's rows must still sit in >=2 buckets. A bucket whose
+     NAME merely disagrees with the declared ``project_id``, with every
+     row already in ONE bucket, is COSMETIC and admits nothing.
+
+Together they keep the table mechanical and auditable instead of a
+per-case judgement call, and clause 1 is the reason this table is
+deliberately NOT a config read: this module is stdlib-only with no
 intra-orchestrator imports (see module docstring), so the mapping is a
 hand-maintained constant kept in sync with those configs.
+
+Clause 2 states the principle the table already embodies rather than
+adding a new one. ``df -> dark_factory`` qualifies because it healed a
+MEASURED 22/17/2 three-way split in which each partition was invisible to
+a reap scoped to either of the others -- a correctness bug. An alias that
+heals no split can only ever move rows out from under whatever reaps them
+today, which is a strictly larger risk than the naming mismatch it tidies.
+The solar-challenge entry fails clause 2 and is recorded as declined in
+PROJECT_TOKEN_ALIASES_DECLINED below.
 
 EVIDENCE for the sole seeded entry: three independent declarations name
 ``dark_factory`` as this project's identity -- ``dark-factory-orchestrator
@@ -1488,20 +1619,101 @@ entry here. It does NOT reconcile a project whose filed tokens fold to
 something OTHER than its declared ``memory.project_id``; only an alias can
 bridge that.
 
-KNOWN RESIDUAL GAP (measured 2026-08-07, 407 records):
+RESIDUAL NAMING MISMATCH -- DECIDED (task 3813): DECLINED. See
+PROJECT_TOKEN_ALIASES_DECLINED below for the evidence.
 ``/home/leo/src/solar-challenge`` declares ``my_solar_challenge``, but its
 5 OPEN decisions are filed under ``solar-challenge`` (3) and
-``solar_challenge`` (2). Folding merges those two into ONE bucket --
-strictly better than before, when a reap scoped to either missed the other
--- but the bucket is named ``solar_challenge``, so a reaper passing the
+``solar_challenge`` (2) (re-measured 2026-09-07, 748 records; unchanged
+from 2026-08-07). Folding merges those two into ONE bucket -- strictly
+better than before, when a reap scoped to either missed the other -- but
+the bucket is named ``solar_challenge``, so a reaper passing the
 config-declared ``my_solar_challenge`` matches ZERO of them. Adding
-``'solar_challenge': 'my_solar_challenge'`` would close it and the
-admission rule above already licenses it; that call is deliberately NOT
-made here because it is a cross-project behaviour change owned by its own
-filed decision task (3813). Until it lands, reap that project with a token
-that folds to ``solar_challenge`` -- and note the collapse guard is
-unaffected either way, since ``solar_challenge_platform`` is a distinct
-project root with a distinct folded token."""
+``'solar_challenge': 'my_solar_challenge'`` would rename that bucket, and
+the amended admission rule above does NOT license it: clause 2 fails,
+because folding already left every row in ONE bucket, so there is no split
+left to heal. Reap that project with a token that folds to
+``solar_challenge`` -- permanently, not "until 3813 lands" -- and note the
+collapse guard is unaffected either way, since ``solar_challenge_platform``
+is a distinct project root with a distinct folded token."""
+
+
+PROJECT_TOKEN_ALIASES_DECLINED: dict[str, tuple[str, str]] = {
+    'solar_challenge': (
+        'my_solar_challenge',
+        'No split left to heal (fold already merged 3+2 into one bucket), and '
+        'the identity question is an OPEN human gate in that project (esc-98-1, '
+        '"Do NOT auto-act").',
+    ),
+}
+"""Aliases CONSIDERED and DELIBERATELY DECLINED (task 3813), keyed
+already-folded-alias -> (already-folded declined canonical, one-line reason).
+
+WHAT THIS IS. The deliberate mirror image of PROJECT_TOKEN_ALIASES above:
+same folded-to-folded key/value invariant (pinned by a named test), so
+PROMOTING a declined entry is a one-line move between the two dicts and
+DECLINING a live one is the same move in reverse. It is read by
+``declined_project_token_hint`` and by two guard tests; it is deliberately
+NOT consulted by ``normalize_project_token``, so it costs nothing on the
+fold's hot path and every existing test of that fold is untouched. The
+in-repo precedent for encoding a deliberate exclusion next to the table it
+governs is ``fused-memory/scripts/consolidate_namespace_families.py``
+::``GRAPH_FAMILY_ALIASES``; recording it as data rather than a comment is
+what makes it checkable.
+
+THE DECISION. ``solar_challenge -> my_solar_challenge`` is DECLINED. Not
+deferred, not an oversight, not "pending a decision task" -- 3813 WAS that
+decision task, and this is its answer.
+
+THE EVIDENCE (re-measured 2026-09-07 over 748 fleet decision records:
+``solar-challenge`` 3, ``solar_challenge`` 2, ``my_solar_challenge`` ZERO,
+all 5 ``state=open`` -- identical to the 2026-08-07 measurement a month
+earlier):
+
+  - NO SPLIT REMAINS, so there is nothing for an alias to heal. Task 3807's
+    case/separator fold already merged the two filed spellings into ONE
+    bucket. Adding the alias would not MERGE anything; it would only RENAME
+    a populated bucket (5 rows) onto an empty one (0 rows), moving those
+    rows out from under whatever reaps them today. That is why the amended
+    admission rule's clause 2 exists and why this entry fails it.
+
+  - THE IDENTITY QUESTION IS AN OPEN HUMAN GATE IN THAT PROJECT, and the
+    alias would settle it from dark-factory's side. Decision record
+    ``esc-98-1`` (``state=open``, filed under ``solar_challenge``, queue
+    ``<dark-factory>/data/reconciliation/escalations``) reads: "one-way
+    policy decision -- (a) MIGRATE ~1400 orphaned 'my_solar_challenge'
+    items (876 graphiti + 524 mem0) into canonical 'solar_challenge' ...
+    or (b) ARCHIVE the 'my_solar_challenge' namespace in place. Do NOT
+    auto-act. Forward project_id-misconfig fix tracked via a separate
+    sibling task (finding 116ceed2)." That gate calls ``solar_challenge``
+    the CANONICAL token, ``my_solar_challenge`` the ORPHANED namespace, and
+    the config declaration itself a MISCONFIG whose forward fix is already
+    tracked elsewhere. Aliasing onto ``my_solar_challenge`` here would
+    resolve that gate silently, in the direction it calls "orphaned", with
+    no human sign-off.
+
+  - IN-REPO PRECEDENT for keep-separate on this exact family:
+    ``consolidate_namespace_families.py::GRAPH_FAMILY_ALIASES`` excludes the
+    solar family on the stated ground that keep-separate is the default
+    absent an explicit human decision.
+
+  - THE COLLAPSE GUARD IS UNAFFECTED either way:
+    ``solar_challenge_platform`` is a distinct project root with a distinct
+    declared ``project_id`` and folds to itself. Nothing here touches it.
+
+THE OPERATOR CONSEQUENCE. Reap and file that project with a token that
+folds to ``solar_challenge`` -- PERMANENTLY, not "until 3813 lands". The
+mismatch with its declared ``memory.project_id`` is now a decided,
+standing state, so ``write-decision`` and ``reap-decisions`` WARN when
+handed ``my_solar_challenge`` (see ``declined_project_token_hint``): the
+trap announces itself at the moment someone types the config-declared
+token, instead of returning a silent zero-row no-op that reads as "nothing
+to reap".
+
+WHAT WOULD REOPEN IT. Either ``esc-98-1`` resolving in favour of
+``my_solar_challenge`` (which would make it the canonical bucket and this
+decline wrong), or solar-challenge's config being changed to declare
+``solar_challenge`` (which would make the decline moot -- delete the entry
+and its hint together)."""
 
 
 def normalize_project_token(value: object) -> str:
@@ -1541,18 +1753,31 @@ def normalize_project_token(value: object) -> str:
     let one project's reaper close the other's decisions -- strictly worse
     than the bug being fixed. A named collapse-guard test pins that.
 
-    SCOPE: this canonicalizes ``DecisionRecord.project`` ONLY.
-    ``SessionRecord.project`` is the other half of the same fleet-global
-    project axis and is deliberately NOT normalized here -- the cockpit
-    unions the two (``known_projects`` over records + decisions, and one
-    ``project_weights`` lookup keyed on ``item.project`` for both row kinds),
-    so until the session side folds too, the picker can list one project
-    under two names and an operator-set weight keyed on the session spelling
-    will not apply to decision rows. That is a KNOWN, filed gap (task 3812),
-    not an oversight: the session population is ~39k records written on the
-    spawn path, and folding it is a strictly larger change than task 3807's
-    decision-registry fix. Do not read "canonical" here as "canonical
-    fleet-wide".
+    SCOPE: at the WRITE path, this canonicalizes ``DecisionRecord.project``
+    ONLY. ``SessionRecord.project`` is deliberately still written raw --
+    ``identity.project`` feeds ``build_session_slug`` (the record's on-disk
+    directory identity) and the stored value is parsed from
+    ``record.title``, the literal terminal title, so folding it at the spawn
+    path would churn the slug namespace and desynchronize a documented
+    mirror.
+
+    The cockpit folds BOTH record kinds at its READ boundary instead (task
+    3812), so its picker and its scorer key can no longer disagree, and the
+    fix is retroactive over every already-written record with no migration
+    run. ``cockpit/src/cockpit/registry_reader.py`` IS that boundary and its
+    module docstring is where the reasoning lives; its entry points are
+    ``::_read_record_soft`` for sessions and ``::scan_decisions`` for
+    decisions, joined by the ``priorities.yaml`` ``project_weights`` KEYS at
+    load (``cockpit/src/cockpit/priority.py::_canonical_project_weights``)
+    and the picker candidates
+    (``cockpit/src/cockpit/panes/weight_editor.py::known_projects``).
+
+    Do not read "canonical" here as "canonical fleet-wide": the on-disk
+    session records themselves are still unnormalized (they are TTL-reaped
+    by ``reap_stale_records`` rather than migrated, which is why they need
+    no ``migrate_session_project_tokens`` twin), so any OTHER consumer
+    comparing a raw ``SessionRecord.project`` must run it through this
+    function itself.
 
     Stdlib-only and fail-soft: never raises, and coerces a non-str *value*
     via ``str()`` rather than rejecting it -- ``42`` becomes ``'42'``, which
@@ -1573,6 +1798,96 @@ def normalize_project_token(value: object) -> str:
         return ''
     folded = _PROJECT_TOKEN_UNDERSCORE_RE.sub('_', raw.casefold().replace('-', '_')).strip('_')
     return PROJECT_TOKEN_ALIASES.get(folded, folded)
+
+
+def declined_project_token_hint(value: object, action: str = '') -> str | None:
+    """One-line operator warning when *value* names a DECLINED alias target
+    (task 3813). Returns None -- the overwhelmingly common case -- otherwise.
+
+    WHY THIS EXISTS. Declining the solar-challenge alias makes that project's
+    naming mismatch PERMANENT: an operator who trusts its config-declared
+    ``memory.project_id`` gets a silent zero-row no-op forever, which reads
+    exactly like "nothing to reap". Under this project's
+    loud-over-silent-degradation norm, a decision that manufactures a
+    standing silent trap is only defensible if the trap ANNOUNCES ITSELF. So
+    the recorded decline gets a live caller instead of staying documentation.
+
+    WHY IT WARNS RATHER THAN REWRITES. Rewriting the passed token to the
+    bucket that actually holds the rows would BE the cross-project behaviour
+    change task 3813 declined, smuggled in through the CLI boundary instead
+    of the alias table. Callers file under, and scope to, EXACTLY the token
+    they were given; only a log line is added. Non-blocking by construction,
+    so a watcher's filing path can never break on it -- matching the
+    fail-soft contract every helper this module hands a watch loop honours.
+
+    WHY IT KEYS ON THE DECLINED VALUE, NOT THE KEY. The trap is typing the
+    config-declared id (``my_solar_challenge``), so that is where the warning
+    must land. ``solar_challenge`` -- the token both SKILL.md files recommend
+    -- must stay SILENT, or a watcher accrues a warning every Main Loop
+    cycle and the signal degrades into noise. Because the check is gated on
+    a one-entry table it has zero false positives; it is deliberately
+    narrower than a generic "your --project matched zero records" warning,
+    which cannot distinguish a token nothing uses from a healthy project
+    with nothing open.
+
+    WHY IT IS VERB-AWARE. The two callers hit this table for OPPOSITE
+    reasons, and one message cannot be true for both. ``reap-decisions`` is
+    MATCHING, so its consequence is a zero-row no-op. ``write-decision`` is
+    CREATING, so it matches nothing by definition and a "matches no
+    decisions" line would be false the moment it is acted on -- one line
+    later the verb files a row under exactly that token. Its real
+    consequence is also the WORSE of the two and would otherwise go
+    unstated: the row lands in a bucket no documented reap scopes to (the
+    skills tell watchers to reap ``solar_challenge``), so it can never
+    auto-close, whereas a missed reap is merely repeatable. *action* selects
+    that consequence clause: ``'reap'`` and ``'file'`` are the two known
+    verbs.
+
+    An OMITTED or unrecognised *action* is not an error and is not guessed
+    at: it yields the verb-neutral core alone, which states only what the
+    decline is and where the rows live. That is fail-soft in the direction
+    that matters here -- a future caller that forgets the argument gets a
+    message that is less specific but still TRUE, never one that confidently
+    describes the wrong verb.
+
+    Folds *value* through ``normalize_project_token`` first, so case and
+    separator variants of the config-declared token (``My-Solar-Challenge``)
+    all hit, and a non-str or ``None`` *value* coerces fail-soft to a
+    matchless token or ``''`` rather than raising. Returning None costs one
+    scan of a one-entry dict. Stdlib-only, no intra-orchestrator imports
+    (see module docstring).
+    """
+    folded = normalize_project_token(value)
+    if not folded:
+        return None
+    for alias, (declined_canonical, _reason) in PROJECT_TOKEN_ALIASES_DECLINED.items():
+        if folded != declined_canonical:
+            continue
+        # Verb-neutral, and therefore true on EVERY caller's path: it states
+        # only what was declined and where the rows live, never what this
+        # caller is about to do with them.
+        core = (
+            f'--project {folded!r}: the alias {alias!r} -> {declined_canonical!r} '
+            f'was considered and DECLINED (task 3813), so that project\'s '
+            f'decisions live under {alias!r}, not {declined_canonical!r}.'
+        )
+        # Built only on a hit (rare by construction), so the cost of holding
+        # both strings here is never paid on the common None path.
+        consequence = {
+            'reap': (
+                f' This reap therefore matches ZERO of them, and its silent '
+                f'no-op reads as "nothing to reap"; re-run scoped to a token '
+                f'that folds to {alias!r}.'
+            ),
+            'file': (
+                f' This record is being FILED under {declined_canonical!r}, '
+                f'which no documented reap scopes to, so it can never '
+                f'auto-close; re-file it under a token that folds to '
+                f'{alias!r}.'
+            ),
+        }.get(action, '')
+        return f'{core}{consequence} See PROJECT_TOKEN_ALIASES_DECLINED for the evidence.'
+    return None
 
 
 def read_escalation_status(escalations_dir: Path | str, escalation_id: str) -> str | None:
@@ -1886,12 +2201,25 @@ def _pid_alive(pid: int) -> bool:
 
     Copied (not imported) from harness.py:295-317 to keep this module
     stdlib-only and self-contained (invocable as a standalone script from
-    bash with no orchestrator package import).
+    bash with no orchestrator package import). That copy's contract is
+    preserved verbatim EXCEPT in the OverflowError branch, where this one
+    deliberately diverges (task 4755): harness.py::_pid_alive and the
+    fused_memory orchestrator_detector copy it mirrors still raise there, and
+    widening them is filed as follow-up work rather than done here, because
+    neither sits on the fleet-redeploy lease's read path.
 
     - Returns False for pid <= 0 (invalid).
     - Uses os.kill(pid, 0): success -> alive; ProcessLookupError -> dead;
-      PermissionError -> alive (visible but unsignalable); other OSError ->
+      PermissionError -> alive (visible but unsignalable); other OSError, or
+      an OverflowError from a pid too large for the platform's C pid_t ->
       treated as dead.
+
+    The OverflowError case is ordinary untrusted input, not a hypothetical:
+    service_restart.lease_is_live imports this predicate to evaluate a pid
+    parsed out of JSON another process wrote, so a value no pid_t can hold
+    arrives the same way a negative one does. "Cannot name a live process" is
+    exactly the judgment the OSError branch already makes for every other
+    value the syscall refuses.
     """
     if pid <= 0:
         return False
@@ -1902,7 +2230,7 @@ def _pid_alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True
-    except OSError:
+    except (OSError, OverflowError):
         return False
 
 
@@ -3823,30 +4151,53 @@ def _run_write_decision(
     construction (it is the same dir it passes to reap-decisions), so there
     is no legitimate write-path caller.
 
-    UPSERT, NOT A BLIND OVERWRITE (task 3559). Against an OPEN record at the
-    same id, three cases are told apart:
+    UPSERT, NOT A BLIND OVERWRITE (task 3559). Against an existing record at
+    the same id, three cases are told apart:
 
     - DIFFERENT project -- an id COLLISION, not one gate seen twice, since
       DecisionRecords are fleet-global while ``esc-<taskid>-<n>`` task
       numbering restarts per project. REFUSED (loud, fail-soft, nothing
       written): merging would hide this ask inside the other project's row
-      and overwriting would delete that row.
+      and overwriting would delete that row. Scoped to an OPEN incumbent --
+      a closed row in another project is a question already dealt with, so a
+      filing there starts a new ask.
     - DIFFERENT queue stamp -- the second watcher observing the same human
       gate through another queue (the observed esc-5914-1 MODE-2 shape), so
       the filing is folded in via merge_decision_enrichment rather than
-      clobbering or downgrading what the first watcher wrote.
+      clobbering or downgrading what the first watcher wrote. Also scoped to
+      an OPEN incumbent, and for the same reason: ACROSS queues the
+      ``esc-<taskid>-<n>`` namespaces genuinely collide, so a filing against
+      a closed row may be an unrelated NEW ask.
     - MATCHING queue stamp -- the SAME watcher re-filing across a restart,
       which both SKILL.md files promise is idempotent, so its whole view
-      lands (including fields going down or empty). Only ``filed_at`` and
-      ``manual_boost`` are held back, as CUSTODY: a restart is not news
-      about queue age and says nothing about the operator's C5 boost, which
-      belongs to set_manual_boost. Same rule merge_decision_enrichment
-      applies cross-queue -- custody does not depend on which queue re-filed.
+      lands (including fields going down or empty). ``filed_at``,
+      ``manual_boost`` AND ``state`` are held back, as CUSTODY: a restart is
+      not news about queue age, says nothing about the operator's C5 boost
+      (set_manual_boost's field), and is not a disposition
+      (update_decision_state's). Same custody set merge_decision_enrichment
+      keeps -- custody does not depend on which queue re-filed.
+
+      THIS ARM IS NOT SCOPED TO AN OPEN RECORD (task 3872), unlike the two
+      above. Within ONE queue an ``esc-<taskid>-<n>`` id is unique (task
+      3528's premise), so a same-project same-queue re-file is definitively
+      the SAME gate the human already answered or dropped -- identity is
+      certain here in a way it is not on the cross-queue axis. The harm it
+      removes is concrete and unbounded: both watcher SKILLs tell an agent to
+      re-file its stable id on EVERY restart while an item stays parked, and
+      reap_answered_decisions skips a non-open decision, so without this an
+      operator's C5b dismissal is undone on the next restart and again
+      forever -- the drop action is inert for exactly the class of row it
+      exists for. Holding the state back is announced with a WARNING (below),
+      since this is the one place the verb declines to do what the filer
+      asked.
 
     Everything else keeps today's full overwrite: no existing record (the
-    normal first-filing case), an unreadable/corrupt one, or a NON-open one
-    (a question the human already dealt with -- a new filing there starts a
-    new ask, boost and age included).
+    normal first-filing case), an unreadable/corrupt one, or a non-open one
+    reached on either QUEUE-axis exception above -- a different project, or a
+    different queue stamp (including the legacy unstamped population task
+    3640 is draining, whose '' stamp matches no real queue). In each of those
+    the incumbent cannot be shown to be the same gate, so a new filing starts
+    a new ask, boost and age included.
 
     On success, prints the filed record's id (mirrors `launching` printing
     the record dir and `lease-claim` printing `decision=`) so the caller can
@@ -3907,6 +4258,19 @@ def _run_write_decision(
             'write-decision: normalized --project %r -> %r', project, canonical_project
         )
 
+    # Advisory only (task 3813). Placed AFTER canonicalization so the hint
+    # reflects the token that will actually be STORED, and BEFORE the record
+    # is built so it fires even if a later step fails. It must not alter
+    # canonical_project, gate the filing, or change the return code.
+    # action='file' because this path CREATES rather than matches: the reap
+    # wording ("matches no decisions") would be false one line below, where
+    # a row is filed under exactly this token. The filing consequence is the
+    # worse of the two -- that row lands in a bucket no documented reap
+    # scopes to and can never auto-close -- so it is the one worth naming.
+    declined_hint = declined_project_token_hint(canonical_project, action='file')
+    if declined_hint is not None:
+        logger.warning('write-decision: %s', declined_hint)
+
     incoming = DecisionRecord(
         id=decision_id,
         project=canonical_project,
@@ -3947,7 +4311,7 @@ def _run_write_decision(
                 # Absent (the common first-filing case), unreadable, or
                 # corrupt: all fall through to writing fresh.
                 existing = None
-            if existing is not None and existing.state == DecisionState.OPEN:
+            if existing is not None:
                 if normalize_project_token(existing.project) != canonical_project:
                     # SAME id, DIFFERENT project: an id COLLISION, not a
                     # MODE-2 collapse. Both SKILL.md files tell a watcher to
@@ -3979,54 +4343,108 @@ def _run_write_decision(
                     # Refusing is the non-destructive, deterministic choice --
                     # the same first-writer-wins policy _merge_queue_and_
                     # escalation_id applies to a conflicting queue stamp.
-                    # Scoped to an OPEN record for the same reason the rest of
-                    # this branch is: a non-open row is a question already
-                    # dealt with, and a new filing there starts a new ask.
-                    logger.error(
-                        'write-decision refusing to file %s for project %s: an OPEN '
-                        'decision already exists at that id for a DIFFERENT project '
-                        '(%s). DecisionRecords are fleet-global while esc-<taskid>-<n> '
-                        'ids restart per project, so this is an id COLLISION, not a '
-                        'MODE-2 cross-queue collapse of one human gate -- merging '
-                        'would hide this ask inside the other project\'s cockpit row '
-                        'and overwriting would delete that row, so neither is safe. '
-                        'The existing row is left intact and THIS ask did not reach '
-                        'the cockpit; it is still carried by the in-session note / '
-                        'afk-digest line this filing accompanies. Re-file it under an '
-                        'id that is unique fleet-wide.',
-                        decision_id,
-                        project,
-                        existing.project,
-                    )
-                    return
-                if normalize_escalations_dir(existing.escalations_dir) != stamp:
+                    #
+                    # STILL scoped to an OPEN incumbent after task 3872, on
+                    # the QUEUE axis's own reasoning: two projects always run
+                    # different queue dirs, so a cross-project collision is by
+                    # construction a CROSS-queue filing, where the
+                    # esc-<taskid>-<n> namespaces genuinely collide and a
+                    # closed row cannot be shown to be the same gate. A filing
+                    # there is a new ask, so `record` stays `incoming` and it
+                    # keeps today's full overwrite.
+                    if existing.state == DecisionState.OPEN:
+                        logger.error(
+                            'write-decision refusing to file %s for project %s: an OPEN '
+                            'decision already exists at that id for a DIFFERENT project '
+                            '(%s). DecisionRecords are fleet-global while '
+                            'esc-<taskid>-<n> ids restart per project, so this is an id '
+                            'COLLISION, not a MODE-2 cross-queue collapse of one human '
+                            'gate -- merging would hide this ask inside the other '
+                            'project\'s cockpit row and overwriting would delete that '
+                            'row, so neither is safe. The existing row is left intact '
+                            'and THIS ask did not reach the cockpit; it is still '
+                            'carried by the in-session note / afk-digest line this '
+                            'filing accompanies. Re-file it under an id that is unique '
+                            'fleet-wide.',
+                            decision_id,
+                            project,
+                            existing.project,
+                        )
+                        return
+                elif normalize_escalations_dir(existing.escalations_dir) == stamp:
+                    # A MATCHING stamp is the SAME watcher re-filing across a
+                    # restart, which both SKILL.md files promise is a plain
+                    # idempotent overwrite -- text, severity and task_id are
+                    # its own to revise, including downwards -- with the
+                    # CUSTODY fields (filed_at, manual_boost, state) held
+                    # back. merge_same_queue_refile carries the reasoning.
+                    #
+                    # NOT scoped to an OPEN record (task 3872), unlike the two
+                    # arms around it. This is the ONE axis on which identity
+                    # is knowable: within a single queue an esc-<taskid>-<n>
+                    # id is unique (task 3528's premise), so a same-project
+                    # same-queue re-file is the same gate the human already
+                    # answered or dropped -- modulo the counter-loss re-mint
+                    # hole merge_same_queue_refile names, which the WARNING
+                    # just below is the backstop for. Re-opening it would
+                    # make an operator's C5b dismissal impossible to ever make
+                    # stick -- a watcher re-files on EVERY restart while an
+                    # item stays parked, and reap_answered_decisions skips a
+                    # non-open record, so nothing would ever close it again.
+                    record = merge_same_queue_refile(existing, incoming)
+                    if existing.state != DecisionState.OPEN:
+                        # THE ONE PLACE THIS VERB DECLINES WHAT THE FILER
+                        # ASKED FOR: the filing carries state=open (the
+                        # default above) and the row stays closed. Loud, per
+                        # this repo's loud-over-silent-degradation norm, and
+                        # because the watcher SKILLs' own rule is to
+                        # ADJUDICATE such a divergence rather than assume the
+                        # re-file landed -- which needs it to be visible.
+                        #
+                        # Guarded on non-open so the COMMON path stays quiet:
+                        # a same-queue re-file against an open record is every
+                        # watcher restart for every still-parked item, nothing
+                        # is declined there, and a warning on each one is how
+                        # this one gets tuned out.
+                        #
+                        # stdout is deliberately untouched (the id is still
+                        # printed below): both SKILLs document "no id on
+                        # stdout means your filing did not land" as the
+                        # did-it-work signal, and this filing DID land.
+                        logger.warning(
+                            'write-decision kept decision %s in state %r rather than '
+                            're-opening it: this re-file came from the SAME queue (%s) '
+                            'as the record it matched, so it is the same gate a human '
+                            'already answered or dropped, not a new ask. Your text, '
+                            'severity and ids DID land, but the row stays CLOSED and '
+                            'will NOT reappear in the cockpit decision queue, which '
+                            'shows only state=open rows. Re-opening it would make an '
+                            'operator\'s cockpit disposition impossible to ever make '
+                            'stick, since a watcher re-files its stable id on every '
+                            'restart while an item stays parked. ADJUDICATE this rather '
+                            'than re-filing blindly: if the gate is genuinely a NEW ask, '
+                            'file it under a NEW id -- that is the remedy with a shipped '
+                            'surface, since re-opening this row in place currently needs '
+                            'a direct registry write (the cockpit decision pane offers a '
+                            'drop action but no re-open, and there is no '
+                            'update-decision-state CLI verb).',
+                            decision_id,
+                            str(existing.state),
+                            stamp,
+                        )
+                elif existing.state == DecisionState.OPEN:
                     # A DIFFERENT queue filing against a live record: this is
                     # the MODE-2 cross-queue collapse, so enrich rather than
                     # overwrite.
                     record = merge_decision_enrichment(existing, incoming)
-                else:
-                    # A MATCHING stamp is the SAME watcher re-filing across a
-                    # restart, which both SKILL.md files promise is a plain
-                    # idempotent overwrite -- text, severity and task_id are
-                    # its own to revise, including downwards.
-                    #
-                    # But filed_at and manual_boost are CUSTODY fields, and
-                    # custody does not depend on which queue the re-file came
-                    # from: merge_decision_enrichment already keeps both on
-                    # the cross-queue path, and the same reasoning binds here.
-                    # A watcher restart is not new information about queue AGE
-                    # (filed_at drives the cockpit's ordering), and it is not
-                    # information about the OPERATOR's C5 boost at all -- that
-                    # is set_manual_boost's field, written by a different
-                    # subsystem. Without this, an operator who boosts a row to
-                    # the top of the queue silently loses it on the next
-                    # watcher restart, which is precisely the "second writer
-                    # downgrades an open record" shape this task removes.
-                    record = dataclasses.replace(
-                        incoming,
-                        filed_at=existing.filed_at,
-                        manual_boost=existing.manual_boost,
-                    )
+                # else: a DIFFERENT queue filing against a NON-open record --
+                # including the legacy unstamped ('' stamp) population task
+                # 3640 is draining, which matches no real queue. Across queues
+                # the id namespaces collide, so this may be an unrelated NEW
+                # ask; holding it closed would make a live gate invisible,
+                # which is the fail-CLOSED direction _run_reap_decisions'
+                # docstring rules out. `record` stays `incoming`: today's full
+                # overwrite, unchanged.
 
             if write_decision(record):
                 print(record.id)
@@ -4060,6 +4478,11 @@ def _run_reap_decisions(project: str, escalations_dir: str) -> None:
        widens ACROSS projects (``solar_challenge`` vs
        ``solar_challenge_platform`` are different project roots and are
        guarded from merging), so the fail-OPEN framing below is intact.
+       A ``--project`` naming a DECLINED alias target now WARNS (task 3813,
+       see PROJECT_TOKEN_ALIASES_DECLINED), so an operator passing a
+       config-declared token that matches zero rows learns it immediately
+       instead of reading a silent no-op as "nothing to reap". Advisory
+       only: it does not change the axis, the scoping, or what gets closed.
     2. QUEUE (task 3528). An escalation id (``esc-<taskid>-<n>``) is unique
        only WITHIN one queue, and a project can run several: dark_factory
        runs ``data/escalations`` (orchestrator) and
@@ -4113,6 +4536,17 @@ def _run_reap_decisions(project: str, escalations_dir: str) -> None:
     """
     reaper_dir = normalize_escalations_dir(escalations_dir)
     reaper_project = normalize_project_token(project)
+
+    # Advisory only (task 3813). Deliberately OUTSIDE _status, so it fires
+    # ONCE per invocation rather than once per record scanned -- a watcher
+    # runs this every Main Loop cycle and a per-record line would flood its
+    # log. It must not touch reaper_project, neither scoping axis, nor what
+    # gets closed: both guards below stay fail-OPEN exactly as documented.
+    # action='reap': this path really is MATCHING, so the zero-row-no-op
+    # consequence is the true one here (contrast _run_write_decision).
+    declined_hint = declined_project_token_hint(reaper_project, action='reap')
+    if declined_hint is not None:
+        logger.warning('reap-decisions: %s', declined_hint)
 
     def _status(decision: DecisionRecord) -> str | None:
         # Axis 1: normalize the decision's OWN stored token at compare time

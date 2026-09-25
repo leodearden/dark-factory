@@ -943,6 +943,26 @@ def gpu_memory_utilization_for(budget_gib: float, total_gib: float) -> float:
     return round(budget_gib / total_gib, 3)
 
 
+def _check_reading_coherent(used_mib: int, total_mib: int) -> None:
+    """Refuse a card reading that could not describe any real card.
+
+    Shared by :func:`evaluate_budget` and :func:`unstarted_budget` so the two
+    entry points cannot drift.  These are conditions on the READING ALONE, with
+    no subtraction in sight, which is why they still hold on a path where
+    nothing was ever started.  :class:`GpuReading` validates none of its three
+    fields and ``parse_nvidia_smi_csv`` is only ONE of the ways one gets built,
+    so this is the enforcement a hand-built or replayed reading meets.
+    """
+    if total_mib <= 0:
+        raise VramProbeError(f'total VRAM must be positive, got {total_mib} MiB')
+    if used_mib < 0:
+        raise VramProbeError(f'used VRAM cannot be negative, got {used_mib} MiB')
+    if used_mib > total_mib:
+        raise VramProbeError(
+            f'used {used_mib} MiB exceeds total {total_mib} MiB — incoherent reading'
+        )
+
+
 def evaluate_budget(
     used_mib: int,
     total_mib: int,
@@ -970,14 +990,7 @@ def evaluate_budget(
     ``lms_serve._memory_share_for``.  Charging it twice would fail an arm that
     fits its own allocation exactly, which is a knife edge and not a budget.
     """
-    if total_mib <= 0:
-        raise VramProbeError(f'total VRAM must be positive, got {total_mib} MiB')
-    if used_mib < 0:
-        raise VramProbeError(f'used VRAM cannot be negative, got {used_mib} MiB')
-    if used_mib > total_mib:
-        raise VramProbeError(
-            f'used {used_mib} MiB exceeds total {total_mib} MiB — incoherent reading'
-        )
+    _check_reading_coherent(used_mib, total_mib)
     if baseline_mib <= 0:
         raise VramProbeError(
             f'baseline VRAM must be positive, got {baseline_mib} MiB. A zero '
@@ -1030,6 +1043,59 @@ def evaluate_budget(
         arm_footprint_gib=round(footprint_gib_raw, 2),
         budget_gib=round(budget_gib_raw, 2),
         headroom_gib=round(headroom_raw, 2),
+    )
+
+
+def unstarted_budget(reading: GpuReading) -> BudgetVerdict:
+    """The budget answer for a run in which NO arm was ever started.
+
+    A CONSTRUCTOR, not an evaluation.  :func:`evaluate_budget` judges the
+    subtraction ``used - baseline`` and validates that subtraction's
+    preconditions -- it rejects ``baseline_mib <= 0`` (a zero baseline there
+    means the pre-start probe never ran, and subtracting it would credit the
+    desktop's memory to the arm) and ``baseline > used``.  Here there is no
+    subtraction to validate: nothing was loaded, so the footprint is 0 by
+    construction and the card as it stands IS the pre-start card.  Routing this
+    case through :func:`evaluate_budget` would impose those preconditions on a
+    reading nobody is subtracting from, turning a card that happens to read 0
+    used into a spurious probe error, and would emit its prose -- "the arm took
+    0.00 GiB ..., within the ... budget free before it started" -- which asserts
+    a measurement of an arm that was never started, in a field an operator reads
+    verbatim.
+
+    ONLY the two SUBTRACTION preconditions are absent.  The reading's own
+    coherence is still enforced, through the same
+    :func:`_check_reading_coherent` that :func:`evaluate_budget` calls: "nothing
+    was started" says nothing about whether the card reading makes sense, and a PASS
+    verdict carrying nonsense figures is worse here than anywhere else, because
+    it is the only verdict a placeholder-only report ever carries.
+
+    ONE PRECONDITION ON THE CALLER, which this function cannot check: nothing
+    under measurement was ever started.  For ``lms_healthcheck.run_healthcheck``
+    that means every arm in the run is ``is_placeholder`` -- an arm
+    ``lms_ctl.preflight`` refuses before the card is touched, so it can never
+    have acquired a baseline or allocated anything.  Called for a run that DID
+    start something, this would report that arm's footprint as 0.
+    """
+    _check_reading_coherent(reading.used_mib, reading.total_mib)
+    return BudgetVerdict(
+        verdict='PASS',
+        reason=(
+            f'no arm was started, so the card holds only the {reading.used_gib:.2f} '
+            f'GiB it already held and there is no footprint to judge against the '
+            f'{reading.free_gib:.2f} GiB free'
+        ),
+        used_mib=reading.used_mib,
+        total_mib=reading.total_mib,
+        baseline_mib=reading.used_mib,
+        arm_footprint_mib=0,
+        budget_mib=reading.free_mib,
+        used_gib=reading.used_gib,
+        total_gib=reading.total_gib,
+        baseline_gib=reading.used_gib,
+        arm_footprint_gib=0.0,
+        budget_gib=reading.free_gib,
+        headroom_gib=reading.free_gib,
     )
 
 

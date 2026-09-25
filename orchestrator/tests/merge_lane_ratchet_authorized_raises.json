@@ -1,0 +1,192 @@
+{
+  "_README": "This is the APPEND-ONLY provenance of every raise ever authorized against the merge-lane ratchet baseline (orchestrator/tests/merge_lane_ratchet_baseline.json). It is NOT a permission list: nothing in this file grants a future raise, and no entry here will ever let --write-baseline absorb one. Authorization is an act, not a standing entry -- rerun --authorize-raise for each raise, and it appends one more record. Each entry's \"measures\" block is DERIVED from the measured raises the write gate computed, never hand-written, so it is mechanically incapable of disagreeing with the baseline diff it accompanies. There is no timestamp: git already carries the date, and a clock would churn this file on every rewrite. Written by scripts/merge_lane_metrics.py --write-baseline orchestrator/tests/merge_lane_ratchet_baseline.json --authorize-raise <task-id> --reason \"<why>\".",
+  "schema_version": 1,
+  "raises": [
+    {
+      "task_id": "5795",
+      "reason": "Net-additive defect fix, not a failed refactor. Adds _disjoint_skip_blockers plus a bounded queue-verified-main-tip registry so footprint-disjointness can no longer skip re-verification of drift no verify has seen green (the 2026-09-22 reify incident: the queue advanced main onto an unattended nightly commit and reported 'merged to main successfully'). The cognitive rise on _reverify_rebased_tree 1->4 IS the premise check the old code omitted; the prose rise records why disjointness needs P1 compositionality and P2 drift-is-green, so the next reader does not remove the check as redundant. Also raises run_main_tip_sweep's swallowed-exception log DEBUG->ERROR, draining a silent-fallthrough allowlist entry in the same commit.",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_gates.py",
+          "baseline": 287,
+          "current": 296
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_gates.py::_reverify_rebased_tree",
+          "baseline": 1,
+          "current": 4
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_gates.py",
+          "baseline": 3181,
+          "current": 3339
+        },
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_merge_queue.py",
+          "baseline": 292,
+          "current": 293
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_gates.py",
+          "baseline": 1412,
+          "current": 1515
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4713,
+          "current": 4722
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 55842,
+          "current": 56000
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6512,
+          "current": 6513
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31297,
+          "current": 31400
+        }
+      ]
+    },
+    {
+      "task_id": "3790",
+      "reason": "Flake ledger \u03b6 (PRD \u00a75.9): thread the de-flake task client through the three merge-verify recorder sites so a suppressed red opens an OWNED flake_debt row at write time; net-additive safety work restoring an invariant that was unenforced (6 suppressions, 0 debt rows since 2026-09-21). Reviewer-answering prose was trimmed first (stale-pin docstring paragraph and a 17-line comment removed; recorder bound once via functools.partial); the residual is the wiring and its tests' reads of the private post-merge-verify seam. Hand-carried 2026-09-23 on Leo's ruling (2A) to land \u03b6 ahead of task 5036; re-recorded once against the post-5795 baseline after a queue conflict.",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 2132,
+          "current": 2134
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_queue.py::SpeculativeMergeWorker::__init__",
+          "baseline": 8,
+          "current": 10
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 21572,
+          "current": 21614
+        },
+        {
+          "measure": "patch_targets",
+          "key": "orchestrator/tests/test_merge_queue_flake_recorder.py",
+          "baseline": 0,
+          "current": 1
+        },
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_merge_queue_flake_recorder.py",
+          "baseline": 11,
+          "current": 26
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 12288,
+          "current": 12327
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4722,
+          "current": 4724
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 56000,
+          "current": 56042
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6513,
+          "current": 6528
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31400,
+          "current": 31439
+        }
+      ]
+    },
+    {
+      "task_id": "5082",
+      "reason": "Task 5082 facet 1 adds five required regression tests of verify._is_bare_xdist_worker_crash's new crash-attribution clause (crash-attributed FAILED line accepted; plus unrelated FAILED, plus INTERNALERROR, already-failed-then-crashed, and no-crash-notice all rejected). Net-additive guard coverage against the same private helper the file already tests 14 times; no refactor regressed.",
+      "measures": [
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_verify_env_transient.py",
+          "baseline": 31,
+          "current": 36
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6528,
+          "current": 6533
+        }
+      ]
+    },
+    {
+      "task_id": "5811",
+      "reason": "Net-additive safety net: conftest gains _drain_leaked_tasks, a bounded first cancel of every leftover task before pytest-asyncio's loop close delivers the second, which is the fix for the deep-family xdist worker deaths (a task cancelled mid-subprocess-spawn survives one cancel). The 1907 reaper now depends on it so it tears down last.",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/tests/conftest.py",
+          "baseline": 42,
+          "current": 47
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/tests/conftest.py",
+          "baseline": 1187,
+          "current": 1201
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/tests/conftest.py",
+          "baseline": 770,
+          "current": 773
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4724,
+          "current": 4729
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 56042,
+          "current": 56056
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31439,
+          "current": 31442
+        }
+      ]
+    }
+  ]
+}
