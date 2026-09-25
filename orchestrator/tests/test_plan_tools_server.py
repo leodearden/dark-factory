@@ -426,6 +426,26 @@ class TestUpdatePlanMetadata:
         plan = artifacts.read_plan()
         assert plan['files'] == ['mod_a/foo.py', 'mod_a/bar.py']
 
+    def test_redeclaring_a_dropped_path_clears_its_drop_record(self, artifacts):
+        """``files`` and ``dropped_files`` stay disjoint: re-declaration wins."""
+        _create_plan(
+            artifacts, 'test-1', 'Test task', 'Analysis',
+            ['mod_a/foo.py', 'mod_a/bar.py', 'mod_a/baz.py'],
+        )
+        _drop_plan_file(artifacts, path='mod_a/bar.py', reason='Needed no edit')
+        _drop_plan_file(artifacts, path='mod_a/baz.py', reason='Also needed no edit')
+
+        result = _update_plan_metadata(
+            artifacts, files=['mod_a/foo.py', 'mod_a/bar.py'],
+        )
+
+        assert result['status'] == 'ok'
+        plan = artifacts.read_plan()
+        assert plan['files'] == ['mod_a/foo.py', 'mod_a/bar.py']
+        assert plan['dropped_files'] == [
+            {'path': 'mod_a/baz.py', 'reason': 'Also needed no edit'}
+        ]
+
 
 class TestDropPlanFile:
     """The honest third exit from the narrowing pass (task 4807).

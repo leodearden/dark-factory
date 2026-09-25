@@ -1382,6 +1382,7 @@ def _update_plan_metadata(
 
     if files is not None:
         plan['files'] = _coerce_files(files)
+        _forget_redeclared_drops(plan)
     if analysis is not None:
         plan['analysis'] = analysis
     artifacts.write_plan(plan)
@@ -1392,6 +1393,19 @@ def _update_plan_metadata(
         },
         markup_facts,
     )
+
+
+def _forget_redeclared_drops(plan: dict) -> None:
+    """Keep ``files`` and ``dropped_files`` disjoint: a re-declared path is back
+    in scope, so its drop record no longer describes the plan."""
+    drops = plan.get('dropped_files')
+    if not isinstance(drops, list):
+        return
+    declared = set(plan['files'])
+    plan['dropped_files'] = [
+        entry for entry in drops
+        if not (isinstance(entry, dict) and entry.get('path') in declared)
+    ]
 
 
 def _remove_plan_step(
