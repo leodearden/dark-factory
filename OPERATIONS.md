@@ -4040,11 +4040,20 @@ scripts/check_memory_metadata_census_reporting.py 72
 Exit 0 means the service's last run succeeded inside the window *and* the
 newest history row is inside it too. Non-zero means escalate, with one named
 verdict on stderr: `NOT INSTALLED` (LoadState is not `loaded`; run the
-installer), `NEVER RAN`, `STALE LAST RUN` / `FAILED LAST RUN` /
-`UNREADABLE LAST RUN` (read the journal), `STALE HISTORY ROW` or an
-unreadable history artifact, and `UNREADABLE UNIT STATE` (`systemctl` itself
-failed). It reads `$REPO/plans/memory-metadata-coverage-history.json`, with
-the wrapper's own `REPO` default.
+installer), `NEVER RAN` or `STALE LAST RUN` (both carry the `list-timers`
+check for whether the timer is armed), `FAILED LAST RUN` or
+`UNREADABLE LAST RUN` (read the journal; a run that failed is reported as
+failed even when it is also stale), `STALE HISTORY ROW` or an unreadable
+history artifact, and `UNREADABLE UNIT STATE` (`systemctl` itself failed).
+The probe reads only the service's state, so a timer that is not armed
+surfaces as `NEVER RAN` or `STALE LAST RUN` rather than as a verdict of its
+own.
+
+It reads `$REPO/plans/memory-metadata-coverage-history.json` with the
+wrapper's own `REPO` default, so **run it with `REPO` unset**. The service
+sets no `REPO`, so every nightly run writes the main checkout's file; pointed
+at a task worktree, the probe reads that worktree's older committed copy and
+reports a false `STALE HISTORY ROW`.
 
 **Why it reads the history row, not just the unit state.** The wrapper
 always exits 0, so systemd reports `Result=success` for every night that

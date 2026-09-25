@@ -3,6 +3,7 @@
 readings? Exit 0 = yes; non-zero = escalate.
 
 Usage: check_memory_metadata_census_reporting.py <hours>
+(with REPO unset, so it reads the main checkout the nightly run writes)
 
 It reads both the census service's systemd state and the newest row of the
 history artifact, because the census wrapper always exits 0 and a
