@@ -126,10 +126,11 @@ from fused_memory.server.near_duplicate_guard import (
     find_near_duplicate_memory,
     resolve_near_dup_guard_enabled,
     resolve_near_dup_threshold,
+    resolve_topic_cluster_autoseed_enabled,
     resolve_topic_guard_clusters,
 )
 from fused_memory.server.tool_errors import mcp_tool_errors
-from fused_memory.server.topic_cluster_store import TopicClusterStore
+from fused_memory.server.topic_cluster_store import TopicClusterStore, seed_topic_cluster
 from fused_memory.server.write_triage import (
     CANONICAL_ID_KEY,
     FAIL_OPEN_ESCALATION_ID_KEY,
@@ -5660,6 +5661,11 @@ def create_mcp_server(
             would invite a retry of a COMPLETED merge — re-writing a
             canonical whose supersedes are already gone, the exact ratchet
             this op ends.
+
+            ``topic_cluster_seed`` is present only when a topic-cluster store
+            is wired: the outcome (``seeded``/``skipped``/``failed``/
+            ``disabled``) of teaching the write-time topic guard this topic,
+            outside the status rule for the tombstone counts' reason.
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         # (2) AUTHORIZE before any other work, mirroring `update_memory`'s
@@ -6019,6 +6025,9 @@ def create_mcp_server(
         # Pre-delete snapshots, keyed by id. Populated BEFORE each delete and
         # consumed only for the ids the re-read confirms gone.
         victims_by_id: dict[str, dict[str, Any]] = {}
+        # The superseded texts, for the topic-guard seed at (7c). Kept apart
+        # from `victims_by_id`, which feeds tombstone rows.
+        superseded_texts: list[str] = []
         for supersede_id in supersedes_ids:
             rejection = citation_blocked.get(supersede_id)
             if rejection:
@@ -6080,6 +6089,9 @@ def create_mcp_server(
             # The two recon sweeps are unaffected — they source victims from
             # the scroll, which lifts it.
             victim_payload = (victim_record or {}).get('metadata')
+            victim_content = (victim_record or {}).get('content')
+            if isinstance(victim_content, str) and victim_content:
+                superseded_texts.append(victim_content)
             victims_by_id[supersede_id] = {
                 'id': supersede_id,
                 'metadata': victim_payload,
@@ -6540,6 +6552,34 @@ def create_mcp_server(
                 canonical_supersedes = list(confirmed_gone)
                 supersedes_correction = {'outcome': 'corrected', **correction}
 
+        # (7c) TEACH THE TOPIC GUARD. Last, once the closure is known, so the
+        # derived hint names a canonical that landed and a failure cannot
+        # strand the fold between its write and its deletes: the tombstone
+        # writer's posture. The seed never raises.
+        topic_cluster_seed: dict[str, Any] | None = None
+        if topic_cluster_store is not None:
+            member_rows = topic_members if isinstance(topic_members, list) else []
+            member_texts = [
+                row.get('content')
+                for row in member_rows
+                if isinstance(row, dict) and row.get('id') != canonical_id
+            ]
+            topic_cluster_seed = seed_topic_cluster(
+                topic_cluster_store,
+                enabled=resolve_topic_cluster_autoseed_enabled(memory_service),
+                texts=[
+                    text
+                    for text in (canonical_content, *superseded_texts, *member_texts)
+                    if isinstance(text, str) and text
+                ],
+                topic=topic,
+                canonical_id=canonical_id,
+                project_id=project_id,
+                category=category,
+                run_id=run_id,
+                source=_CONSOLIDATE_SOURCE,
+            )
+
         # (8) Anything that did not happen is NAMED, and the status rule that
         # decides `consolidated` vs `partial` lives in ONE pure place rather
         # than being re-expressed at each return.
@@ -6568,6 +6608,7 @@ def create_mcp_server(
             # An id whose delete failed was never owed a tombstone, so
             # counting it would report a phantom shortfall on a correct run.
             tombstones_expected=len(confirmed_gone),
+            topic_cluster_seed=topic_cluster_seed,
         )
 
     @mcp.tool()
