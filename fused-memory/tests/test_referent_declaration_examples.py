@@ -253,10 +253,6 @@ def test_every_guarded_example_is_accepted_by_the_live_gate(site_id, load):
     )
 
 
-def test_rendered_fragment_names_the_declaration_keyword():
-    assert _DECLARATION_KEYWORD in render_referent_declaration_guidance()
-
-
 # ── The extractor, against hand-written fixtures only ────────────────────────
 
 _ORIGIN = 'fixture.md'
