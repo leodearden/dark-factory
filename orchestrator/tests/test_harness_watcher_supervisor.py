@@ -15,10 +15,12 @@ Steps covered by this file:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import threading
 import time
 from collections import deque
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -915,6 +917,23 @@ def _make_loop_harness(tmp_path: Path) -> Harness:
     return h
 
 
+@contextlib.contextmanager
+def _patch_monotonic_for_this_thread(fake: Callable[[], float]) -> Iterator[None]:
+    """Serve *fake* as ``time.monotonic`` to the entering thread only (task 5676).
+
+    ``orchestrator.harness.time`` is the stdlib module, so the patch is
+    process-global; every other thread keeps reading the real clock.
+    """
+    real_monotonic = time.monotonic
+    owner = threading.get_ident()
+
+    def monotonic() -> float:
+        return fake() if threading.get_ident() == owner else real_monotonic()
+
+    with patch('orchestrator.harness.time.monotonic', new=monotonic):
+        yield
+
+
 def _build_monotonic_timestamps(
     durations: list[float],
     *,
@@ -956,7 +975,8 @@ async def _run_supervisor_with_rotation_durations(
     """Drive _watcher_supervisor_loop with controlled per-rotation durations.
 
     Each entry in *rotation_durations_secs* becomes one paired (start, end)
-    timestamp consumed by the patched ``time.monotonic``.
+    timestamp served by a thread-scoped ``time.monotonic`` patch, so only the
+    calling thread consumes the script.
 
     When *expect_cancelled* is ``True`` (the default), a final start timestamp
     is appended and ``fake_rotation`` raises ``CancelledError`` on the (n+1)th
@@ -999,14 +1019,14 @@ async def _run_supervisor_with_rotation_durations(
     if expect_cancelled:
         with (
             patch('orchestrator.harness.asyncio.sleep', recording_sleep),
-            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            _patch_monotonic_for_this_thread(fake_monotonic),
             pytest.raises(asyncio.CancelledError),
         ):
             await h._watcher_supervisor_loop()
     else:
         with (
             patch('orchestrator.harness.asyncio.sleep', recording_sleep),
-            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            _patch_monotonic_for_this_thread(fake_monotonic),
         ):
             await h._watcher_supervisor_loop()
 
@@ -1403,7 +1423,7 @@ class TestWatcherCrashloopTrip:
         # patch monotonic to return a stable time (all exits within the window)
         stable_time = time.monotonic()
         with patch('orchestrator.harness.asyncio.sleep', fake_sleep), \
-             patch('orchestrator.harness.time.monotonic', return_value=stable_time):
+             _patch_monotonic_for_this_thread(lambda: stable_time):
             # Loop should exit after max_restarts unclean exits
             await h._watcher_supervisor_loop()
 
@@ -1504,7 +1524,7 @@ class TestWatcherCrashloopTrip:
 
         with (
             patch('orchestrator.harness.asyncio.sleep', AsyncMock()),
-            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            _patch_monotonic_for_this_thread(fake_monotonic),
             pytest.raises(asyncio.CancelledError),
         ):
             # Loop should cancel (not trip) because old exits are evicted
@@ -1558,7 +1578,7 @@ class TestWatcherCrashloopTrip:
         stable_time = time.monotonic()
         with (
             patch('orchestrator.harness.asyncio.sleep', AsyncMock()),
-            patch('orchestrator.harness.time.monotonic', return_value=stable_time),
+            _patch_monotonic_for_this_thread(lambda: stable_time),
         ):
             # Supervisor must return even though pause_scheduler raises.
             # In RED state: CancelledError fires at max_restarts*2+1 rotations, and
@@ -1623,7 +1643,7 @@ class TestWatcherMisconfiguredGuard:
 
         with (
             patch('orchestrator.harness.asyncio.sleep', AsyncMock()),
-            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            _patch_monotonic_for_this_thread(fake_monotonic),
             pytest.raises(asyncio.CancelledError),
         ):
             await h._watcher_supervisor_loop()
@@ -1669,7 +1689,7 @@ class TestWatcherMisconfiguredGuard:
 
         with (
             patch('orchestrator.harness.asyncio.sleep', AsyncMock()),
-            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            _patch_monotonic_for_this_thread(fake_monotonic),
             pytest.raises(asyncio.CancelledError),
         ):
             await h._watcher_supervisor_loop()
@@ -1730,7 +1750,7 @@ class TestWatcherMisconfiguredGuard:
 
         with (
             patch('orchestrator.harness.asyncio.sleep', AsyncMock()),
-            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            _patch_monotonic_for_this_thread(fake_monotonic),
         ):
             # Loop should exit after max_misconfig fast-clean exits (no CancelledError)
             await h._watcher_supervisor_loop()
@@ -1818,7 +1838,7 @@ class TestWatcherMisconfiguredGuard:
 
         with (
             patch('orchestrator.harness.asyncio.sleep', AsyncMock()),
-            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            _patch_monotonic_for_this_thread(fake_monotonic),
             pytest.raises(asyncio.CancelledError),
         ):
             # Loop should cancel (not trip) because old entries are evicted
@@ -1898,7 +1918,7 @@ class TestWatcherMisconfiguredGuard:
 
         with (
             patch('orchestrator.harness.asyncio.sleep', AsyncMock()),
-            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            _patch_monotonic_for_this_thread(fake_monotonic),
         ):
             # Supervisor must return even though pause_scheduler raises.
             await h._watcher_supervisor_loop()
@@ -2245,7 +2265,7 @@ class TestWatcherMisconfiguredGuard:
 
         with (
             patch('orchestrator.harness.asyncio.sleep', fake_sleep),
-            patch('orchestrator.harness.time.monotonic', side_effect=lambda: next(monotonic_iter)),
+            _patch_monotonic_for_this_thread(lambda: next(monotonic_iter)),
             pytest.raises(asyncio.CancelledError),
         ):
             await h._watcher_supervisor_loop()
@@ -2599,7 +2619,7 @@ class TestMaybeWriteDigestSurfacesMissingState:
         # asyncio.sleep: instant no-op so the degenerate-clean backoff floor
         # doesn't actually sleep.
         with (
-            patch('orchestrator.harness.time.monotonic', return_value=0.0),
+            _patch_monotonic_for_this_thread(lambda: 0.0),
             patch('orchestrator.harness.asyncio.sleep', new=AsyncMock()),
             pytest.raises(AttributeError, match='_escalation_event_count'),
         ):
@@ -2644,7 +2664,7 @@ class TestMaybeWriteDigestSurfacesMissingState:
         # propagates the error regardless of its origin.
         digest_mock = AsyncMock(side_effect=AttributeError('scheduler'))
         with (
-            patch('orchestrator.harness.time.monotonic', return_value=0.0),
+            _patch_monotonic_for_this_thread(lambda: 0.0),
             patch('orchestrator.harness.asyncio.sleep', new=AsyncMock()),
             patch.object(h, '_maybe_write_digest', digest_mock),
             pytest.raises(AttributeError, match='scheduler'),
@@ -3369,7 +3389,7 @@ class TestWatcherSupervisorLoopEmptyQueueSkip:
 
         with (
             patch('orchestrator.harness.asyncio.sleep', recording_sleep),
-            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            _patch_monotonic_for_this_thread(fake_monotonic),
             pytest.raises(asyncio.CancelledError),
         ):
             await h._watcher_supervisor_loop()
@@ -3488,7 +3508,7 @@ class TestDigestRunsRegardlessOfEmptyQueuePrecheck:
 
         with (
             patch('orchestrator.harness.asyncio.sleep', recording_sleep),
-            patch('orchestrator.harness.time.monotonic', side_effect=fake_monotonic),
+            _patch_monotonic_for_this_thread(fake_monotonic),
             pytest.raises(asyncio.CancelledError),
         ):
             await h._watcher_supervisor_loop()
