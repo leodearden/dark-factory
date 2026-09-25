@@ -19,7 +19,8 @@ may be closed by anyone. Neither is a candidate class and neither is shadowed.
 ## The one standing rule already in force
 
 `skills/escalation-watcher/SKILL.md` — "Standing rule: accept verified
-info-level design deviations (Leo, 2026-09-17)", task 5361 — lets the
+info-level design deviations (Leo, 2026-09-17)", landed by docs commit
+`d6f9534f9f` with no task — lets the
 interactive watcher itself `close_only` an info-level `design_concern` that
 ratifies an already-made, evidence-checked deviation, under six stated
 conditions.
@@ -214,9 +215,9 @@ measurement exists to judge. None of them may be ruled today.
 
 **How `design_concern_semantic_collision` is scoped against the live rule
 above.** It is the *semantic-collision* class, and a semantic collision is a
-choice about what happens **next**. The 5361 standing rule covers only
+choice about what happens **next**. The 2026-09-17 standing rule covers only
 after-the-fact ratification of a deviation an agent has **already made**. The
-two do not overlap. A record already closable under 5361 must therefore **not**
+two do not overlap. A record already closable under that rule must therefore **not**
 be shadow-stamped: the session is the adjudicator there, so a stamp would be
 measuring the session against itself. See "The integrity rule" below.
 
@@ -236,7 +237,7 @@ interactive connection is never narrowed by that module — its own docstring sa
 so, and that is the esc-2087-2 human-channel guarantee.
 
 So adopting a class for the **interactive** session needs no `authority.py`
-change. Task 5361 is the existence proof: a live rule closing `design_concern`
+change. The 2026-09-17 rule is the existence proof: a live rule closing `design_concern`
 from the interactive session, shipped with no `authority.py` edit at all.
 Extending any class to the **auto-watcher** arm is the case that would need one.
 
