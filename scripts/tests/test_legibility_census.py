@@ -4249,6 +4249,53 @@ def test_main_without_force_no_fire_noops_with_exit_zero(tmp_path, monkeypatch, 
     assert "max-interval: not yet due" in out
 
 
+def test_main_exits_nonzero_and_names_the_quarantine_when_the_census_did_not_land(
+    tmp_path, monkeypatch, capsys,
+):
+    _write_legibility_yaml(tmp_path)
+    quarantine_dir = tmp_path / "q" / "census-2026-07-14-x"
+    fake_run_census = _make_fake_main_run_census(outcome=mod.CensusOutcome(
+        status="unlanded",
+        rollback=unlanded.Rollback(
+            quarantine_dir=quarantine_dir, paths=("docs/legibility/census-state.json",),
+        ),
+        filed_ticket_ids=["tkt_9"],
+    ))
+    monkeypatch.setattr(mod, "run_census", fake_run_census)
+
+    exit_code = mod.main(["--project-root", str(tmp_path), "--force"])
+
+    assert exit_code == 1
+    assert str(quarantine_dir) in capsys.readouterr().err
+
+
+def test_main_wires_a_roll_back_bound_to_the_censused_project(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    _write_legibility_yaml(repo)
+    census_state_path = repo / "docs" / "legibility" / "census-state.json"
+    census_state_path.write_text('{"last_census_at": "2026-06-01"}\n', encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "initial")
+    fake_run_census = _make_fake_main_run_census()
+    monkeypatch.setattr(mod, "run_census", fake_run_census)
+
+    mod.main(["--project-root", str(repo), "--force", "--date", "2026-07-14"])
+
+    call = fake_run_census.calls[0]
+    census_state_path.write_text('{"last_census_at": "2026-07-14"}\n', encoding="utf-8")
+    rb = call["roll_back"](paths=[call["census_state_path"]])
+    assert rb.restored
+    assert census_state_path.read_bytes() == _git(
+        repo, "show", "HEAD:docs/legibility/census-state.json",
+    )
+    assert rb.quarantine_dir.parent == unlanded.quarantine_root("dark_factory")
+    assert rb.quarantine_dir.name.startswith("census-2026-07-14-")
+
+
 # ---------------------------------------------------------------------------
 # step-13: main() must configure logging -- census has the SAME omission as
 # nightly. Nothing under scripts/legibility/ called logging.basicConfig, so
