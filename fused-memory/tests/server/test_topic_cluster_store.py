@@ -14,6 +14,8 @@ Covers:
   derivation (TestDeriveTopicCluster)
 - ``seed_topic_cluster``, the one non-raising seed and its outcome vocabulary
   (TestSeedTopicCluster)
+- ``server.main._build_topic_cluster_store`` hands the server an OPEN store
+  beside the other server-owned SQLite files (TestServerFactoryWiring)
 """
 
 from __future__ import annotations
@@ -489,3 +491,30 @@ class TestSeedTopicCluster:
         assert second_canonical in cluster.hint
         assert _CANONICAL not in cluster.hint
         assert _row_count(store.db_path) == 1
+
+
+class TestServerFactoryWiring:
+    """main.py builds the store once, opened, and a corrupt file fails startup loudly."""
+
+    def test_the_factory_returns_an_open_store_in_the_data_dir(self, tmp_path: Path) -> None:
+        from fused_memory.server.main import _build_topic_cluster_store  # noqa: PLC0415
+
+        store = _build_topic_cluster_store(tmp_path)
+        try:
+            assert isinstance(store, TopicClusterStore)
+            assert store.db_path == tmp_path / 'topic_clusters.db'
+            assert store.list_clusters('p') == []
+            _upsert(store, _cluster(), project_id='p')
+            assert store.list_clusters('p') == [_cluster()]
+        finally:
+            store.close()
+
+    def test_a_corrupt_row_fails_the_factory(self, tmp_path: Path) -> None:
+        from fused_memory.server.main import _build_topic_cluster_store  # noqa: PLC0415
+
+        db_path = tmp_path / 'topic_clusters.db'
+        _create_schema(db_path)
+        _insert_raw_row(db_path, project_id=_PROJECT, topic_id='broken-row', cluster_json='{not json')
+
+        with pytest.raises(TopicClusterStoreError):
+            _build_topic_cluster_store(tmp_path)
