@@ -233,11 +233,17 @@ def _make_config(
 
     ``chain_cap`` defaults to 0 — α's shipped kill switch — so a test that wants
     the deep path must opt in explicitly, exactly as an operator would.
+
+    The main-health probe is switched off through its own operator flag: a red
+    verdict here would otherwise spawn a DETACHED project-wide verify of the
+    tmp repo that outlives the test (task 5811; conftest's leaked-task drain
+    is the net under every scene that does not).
     """
     return OrchestratorConfig(
         project_root=repo,
         git=git_config or _make_spec_git_config(),
         merge_deep=MergeDeepConfig(chain_cap=chain_cap),
+        escalate_preexisting_main_break=False,
     )
 
 
@@ -1888,18 +1894,6 @@ class TestStaleCasAbortLeavesTheRestAlone:
                 f'task {tid} emitted more than its own enqueue event'
             )
 
-    @pytest.mark.skip(
-        reason=(
-            'QUARANTINED 2026-09-23 (Leo: "deflake properly. Quarantine until deflaked."). '
-            'Task 5811 owns the de-flake AND removing this marker. Measured: this node was '
-            'suppressed by the merge gate twice (tasks 4814, 4624) at the 41.7th and 33.3rd '
-            'percentile of runqueue_ratio against its own 14d baseline, i.e. BELOW this '
-            'host median -- while the three other suppressed tests died at the 80th-89th. '
-            'So this is not the CPU-starvation class task 5770 will reassess, and task 5582 '
-            'did not cover it: 5582 fixed marker inversion. While skipped, PRD decision #9 '
-            '("the walk ABORTS, it never FAILS anyone") is UNGUARDED on this path.'
-        )
-    )
     async def test_two_consecutive_tip_fails_render_nothing_for_any_link(
         self, git_repo: Path, tmp_path: Path, monkeypatch,
     ) -> None:

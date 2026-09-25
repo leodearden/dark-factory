@@ -112,7 +112,7 @@
     "orchestrator/src/orchestrator/warm_lane_pool.py": {"cognitive": 55, "function_local_imports": 0, "lines": 747, "prose_lines": 428, "reexport_names": 0},
     "orchestrator/tests/_merge_queue_harness.py": {"cognitive": 5, "function_local_imports": 0, "lines": 106, "prose_lines": 45, "reexport_names": 0},
     "orchestrator/tests/_serial_merge_worker.py": {"cognitive": 33, "function_local_imports": 0, "lines": 393, "prose_lines": 134, "reexport_names": 0},
-    "orchestrator/tests/conftest.py": {"cognitive": 42, "function_local_imports": 7, "lines": 1187, "prose_lines": 770, "reexport_names": 5}
+    "orchestrator/tests/conftest.py": {"cognitive": 47, "function_local_imports": 6, "lines": 1201, "prose_lines": 773, "reexport_names": 5}
   },
   "functions": {
     "orchestrator/src/orchestrator/git_ops.py::BranchResetError::__init__": 2,
@@ -866,6 +866,7 @@
     "orchestrator/tests/_serial_merge_worker.py::MergeWorker::stop": 8,
     "orchestrator/tests/conftest.py::_clear_probe_cache": 0,
     "orchestrator/tests/conftest.py::_drain_async_mock_coroutines": 0,
+    "orchestrator/tests/conftest.py::_drain_leaked_tasks": 5,
     "orchestrator/tests/conftest.py::_hermetic_psi_reader": 1,
     "orchestrator/tests/conftest.py::_isolate_orch_config": 0,
     "orchestrator/tests/conftest.py::_isolate_warm_lane_script_dir": 0,
