@@ -204,6 +204,25 @@ class TestRenderDecisionDetail:
         assert 'watcher-lease-abc123' in rendered
         assert 'unresolved' in rendered
 
+    def test_a_record_slug_naming_a_scanned_session_renders_it_resolved(self):
+        """The link the Enter-to-focus path uses; session_id is only provenance."""
+        from cockpit.panes.detail_pane import render_decision_detail
+
+        session = _make_record(session_slug='session-dark-factory-sess-watcher')
+        decision = _make_decision(
+            session_id='watcher-df-1348600', record_slug='session-dark-factory-sess-watcher'
+        )
+
+        rendered = render_decision_detail(
+            decision, [session], datetime(2026, 7, 7, tzinfo=UTC)
+        )
+
+        session_line = next(
+            line for line in rendered.splitlines() if line.startswith('session:')
+        )
+        assert session_line == 'session: session-dark-factory-sess-watcher'
+        assert 'unresolved' not in rendered
+
     def test_no_session_id_renders_a_placeholder_not_the_word_none(self):
         from cockpit.panes.detail_pane import render_decision_detail
 
