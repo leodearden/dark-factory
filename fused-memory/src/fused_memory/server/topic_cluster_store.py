@@ -25,25 +25,35 @@ Every sanctioned writer runs inside the server process, so a row written by
 another process is not seen until the server restarts.
 
 :func:`derive_topic_cluster` turns a topic's member texts into the cluster
-this store persists. It is pure and trigger-agnostic, so a second trigger
-reuses it unchanged.
+this store persists, and :func:`seed_topic_cluster` is the one non-raising
+derive-and-persist call every trigger makes. Both are trigger-agnostic, so a
+second trigger reuses them unchanged.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
 import time
 from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
 
 from fused_memory.config.schema import ProceduralTopicCluster
 
-__all__ = ['TopicClusterStore', 'TopicClusterStoreError', 'derive_topic_cluster']
+__all__ = [
+    'TopicClusterStore',
+    'TopicClusterStoreError',
+    'derive_topic_cluster',
+    'seed_topic_cluster',
+]
+
+logger = logging.getLogger(__name__)
 
 _SCHEMA = """\
 CREATE TABLE IF NOT EXISTS topic_clusters (
@@ -363,3 +373,89 @@ def _select_unnested(ranked: list[str]) -> list[str]:
         if len(selected) == _MAX_DERIVED_PHRASES:
             break
     return selected
+
+
+def seed_topic_cluster(
+    store: TopicClusterStore,
+    *,
+    enabled: bool,
+    texts: Sequence[str],
+    topic: str,
+    canonical_id: str,
+    project_id: str,
+    category: str | None,
+    run_id: str | None,
+    source: str,
+) -> dict[str, Any]:
+    """Derive *topic*'s cluster from *texts* and persist it; report the outcome, never raise.
+
+    Returns ``{'outcome': 'disabled'}``, ``{'outcome': 'skipped', 'reason'}``,
+    ``{'outcome': 'seeded', 'topic_id', 'phrases'}`` or
+    ``{'outcome': 'failed', 'topic_id', 'error', 'error_type'}``. This is the
+    only home of that vocabulary; every trigger calls this rather than
+    re-deriving it.
+
+    It cannot raise because it runs after an irreversible fold has completed:
+    teaching the guard is a side effect, and a side effect must not veto a
+    completed fold. A failure is logged at WARNING and disclosed in the return
+    value instead.
+    """
+    if not enabled:
+        return {'outcome': 'disabled'}
+    try:
+        cluster = derive_topic_cluster(
+            texts, topic_id=topic, hint=_consolidated_topic_hint(canonical_id)
+        )
+        if cluster is None:
+            return {
+                'outcome': 'skipped',
+                'reason': (
+                    f'fewer than {_MIN_DERIVED_PHRASES} distinctive phrases are shared '
+                    f'by at least {_MIN_SUPPORTING_TEXTS} of the {len(texts)} merged texts'
+                ),
+            }
+        store.upsert(
+            cluster,
+            source=source,
+            project_id=project_id,
+            canonical_id=canonical_id,
+            category=category,
+            run_id=run_id,
+        )
+    except Exception as exc:
+        logger.warning(
+            'topic-cluster seed failed for topic %r in project %r',
+            topic,
+            project_id,
+            exc_info=True,
+        )
+        return {
+            'outcome': 'failed',
+            'topic_id': topic,
+            'error': str(exc),
+            'error_type': type(exc).__name__,
+        }
+    return {'outcome': 'seeded', 'topic_id': cluster.topic_id, 'phrases': list(cluster.phrases)}
+
+
+def _consolidated_topic_hint(canonical_id: str) -> str:
+    """The derived cluster's hint, in the three-outcome shape of the seeded clusters.
+
+    A per-cluster hint SHADOWS the guard's default hint, which is the only
+    other place naming ``allow_near_duplicate``, so this hint must carry the
+    override itself. Content amends are authz-gated to ``recon-stage-`` /
+    ``curator-`` agent_ids, so ``update_memory`` is offered only to them.
+    """
+    return (
+        f'Known-recurring topic, already consolidated into canonical memory '
+        f'{canonical_id}. Do NOT add another entry. '
+        f'(1) Your content is genuinely DISTINCT from that entry -- re-send this '
+        f"write with metadata={{'allow_near_duplicate': True}}, which is open to "
+        f'every agent. '
+        f'(2) It duplicates or extends that entry -- SKIP the write. Only '
+        f'recon-stage- / curator- agent_ids may fold it in, with '
+        f"update_memory(memory_id='{canonical_id}', store='mem0', project_id=..., "
+        f'content=<merged text>, reason=...). '
+        f'(3) It CONTRADICTS that entry, or you are unsure -- escalate with '
+        f'escalate_blocker (or escalate_info if you are merely unsure).'
+    )
