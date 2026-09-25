@@ -62,9 +62,10 @@ PREVIOUSLY_EAGER_SUBMODULES = (
 #: disk, so an unrestricted `importlib.import_module(f'shared.{name}')` fallback
 #: — or a careless addition to `_LAZY_SUBMODULES` — would resolve them and
 #: silently widen the public surface. Sampled across the third-party-backed
-#: (`task_metadata`), pure-leaf (`psi`, `task_statuses`) and test-support
+#: (`task_metadata`), pure-leaf (`asyncio_tasks`, `psi`, `task_statuses`) and test-support
 #: (`testing`) kinds.
 NEVER_EXPORTED_SUBMODULES = (
+    'asyncio_tasks',
     'psi',
     'task_metadata',
     'task_statuses',
