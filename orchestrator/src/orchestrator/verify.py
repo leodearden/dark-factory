@@ -749,6 +749,25 @@ def _crashed_session_stop_percent(output: str) -> int | None:
     return stop_percent if stop_percent < 100 and pytest_ended_its_own_loop else None
 
 
+def _worker_death_truncation_evidence(output: str) -> str | None:
+    """Return the quotable fact proving xdist abandoned the rest of the suite.
+
+    That is the bailout literal when xdist printed it, else where the run
+    stopped (``_crashed_session_stop_percent``, the ``-q``-robust witness).
+    Returns ``None`` when truncation is unproven. The literal is checked
+    first, so every output it fires on keeps its evidence byte-for-byte.
+    """
+    if not output:
+        return None
+    bailout = _XDIST_SESSION_ABORTED_RE.search(output)
+    if bailout is not None:
+        return bailout.group(0)
+    stop_percent = _crashed_session_stop_percent(output)
+    if stop_percent is None:
+        return None
+    return f'run stopped at {stop_percent}% of collected tests'
+
+
 def _is_worker_death_truncated_session(output: str) -> bool:
     """Return True when *output* shows xdist ABANDONING the rest of the suite.
 
@@ -761,17 +780,12 @@ def _is_worker_death_truncated_session(output: str) -> bool:
     ``--max-worker-restart > 0`` takes xdist's sibling branch, replaces the
     worker, and completes normally.
 
-    Two witnesses, either suffices: the bailout literal
-    (``_XDIST_SESSION_ABORTED_RE``), when xdist printed it at verbosity >= 0,
-    and the progress-line witness (``_crashed_session_stop_percent``), which
-    also holds under ``-q``.
+    See ``_worker_death_truncation_evidence`` for the two witnesses: the
+    bailout literal, and a progress-line witness that also holds under ``-q``.
 
     Returns ``False`` for falsy *output*.
     """
-    return bool(output) and (
-        _XDIST_SESSION_ABORTED_RE.search(output) is not None
-        or _crashed_session_stop_percent(output) is not None
-    )
+    return _worker_death_truncation_evidence(output) is not None
 
 
 def _crash_attributed_nodeids(output: str) -> set[str]:
@@ -1086,7 +1100,7 @@ def _extract_failing_test_ids_from_junit(path: Path) -> list[str] | None:
     return sorted(ids)
 
 
-def _worker_death_cause_hint(output: str) -> str:
+def _worker_death_cause_hint(output: str, truncation_evidence: str) -> str:
     """Rung 0 of ``_extract_cause_hint``: the hint for a truncated session.
 
     Reports BOTH facts, never just one: the abort marker, then the first
@@ -1095,15 +1109,14 @@ def _worker_death_cause_hint(output: str) -> str:
     truncation would recreate task 4066's incident (8 real failures silently
     hidden), while naming only the survivor would let the ladder quote a
     partial tally as though it were complete. When nothing survives, the
-    bailout line itself is quoted, so the hint always says WHY there is no
-    verdict.
+    *truncation_evidence* is quoted (the bailout line, or under ``-q`` where
+    the run stopped), so the hint always says WHY there is no verdict.
     """
     survivor = _first_surviving_failure_line(output)
-    if survivor is not None:
-        detail = f'first surviving failure: {survivor}'
-    else:
-        bailout = _XDIST_SESSION_ABORTED_RE.search(output)
-        detail = bailout.group(0) if bailout else ''
+    detail = (
+        f'first surviving failure: {survivor}' if survivor is not None
+        else truncation_evidence
+    )
     return f'{WORKER_DEATH_SUMMARY_MARKER}; {detail}'.strip()[:200]
 
 
@@ -1149,8 +1162,9 @@ def _extract_cause_hint(output: str) -> str:
     if not output or not output.strip():
         return ''
 
-    if _is_worker_death_truncated_session(output):
-        return _worker_death_cause_hint(output)
+    truncation_evidence = _worker_death_truncation_evidence(output)
+    if truncation_evidence is not None:
+        return _worker_death_cause_hint(output, truncation_evidence)
 
     _HINT_PATTERNS = [
         _PYTEST_FAILED_LINE_RE,
