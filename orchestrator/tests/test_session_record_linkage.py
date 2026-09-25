@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest  # pyright: ignore[reportMissingImports]
@@ -412,3 +414,89 @@ class TestSessionStartStampsPointer:
         record = sh.run_session_start({'session_id': 'sess-hl', 'cwd': _CWD}, {}, root=tmp_path)
 
         assert sr.read_record(record.session_slug, root=tmp_path) == record
+
+
+class TestRefreshEventsStampPointer:
+    _OWNER = 3_215_601
+    _HOOK_INPUT = {'session_id': 'sess-hl', 'cwd': _CWD, 'message': 'Proceed?'}
+
+    def _bound_hand_launched_record(self, root: Path) -> str:
+        slug = sh.hook_session_slug(self._HOOK_INPUT, {}, root=root)
+        sr.write_record(
+            sr.SessionRecord(
+                session_slug=slug,
+                status=sr.Status.RUNNING,
+                claude_session_id='sess-hl',
+                claude_owner_pid=self._OWNER,
+            ),
+            root=root,
+        )
+        return slug
+
+    @pytest.mark.parametrize('handler', [sh.run_notification, sh.run_stop])
+    def test_a_session_already_running_at_rollout_is_linked_by_its_next_event(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        handler: Callable[..., str],
+    ) -> None:
+        monkeypatch.setattr(sh, '_owning_claude_pid', lambda: self._OWNER)
+        linked_root = tmp_path / 'linked'
+        slug = self._bound_hand_launched_record(linked_root)
+        unwritable_root = tmp_path / 'unwritable'
+        self._bound_hand_launched_record(unwritable_root)
+        sr.session_pointers_dir(unwritable_root).write_text('x', encoding='utf-8')
+
+        retitle = handler(self._HOOK_INPUT, {}, root=linked_root)
+
+        assert sr.resolve_session_slug_for_pid(self._OWNER, root=linked_root) == slug
+        assert retitle == handler(self._HOOK_INPUT, {}, root=unwritable_root)
+
+    def test_a_withheld_launch_window_event_stamps_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(sh, '_owning_claude_pid', lambda: self._OWNER)
+        slug = 'session-cockpit-4237001'
+        sr.write_record(
+            sr.SessionRecord(
+                session_slug=slug,
+                status=sr.Status.LAUNCHING,
+                launcher_pid=4237001,
+                start_ts=datetime.now(UTC).isoformat(),
+            ),
+            root=tmp_path,
+        )
+
+        sh.run_notification(
+            self._HOOK_INPUT, {'CLAUDE_SPAWN_SESSION_ID': slug}, root=tmp_path
+        )
+
+        assert sr.read_record(slug, root=tmp_path).status == sr.Status.LAUNCHING
+        assert not sr.session_pointer_path_for_pid(self._OWNER, root=tmp_path).exists()
+
+    def test_a_nested_claude_points_at_its_forked_record_never_its_spawners(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        spawner_pid, nested_pid = 4_237_100, 4_237_200
+        spawner_slug = 'session-cockpit-4237100'
+        sr.write_record(
+            sr.SessionRecord(
+                session_slug=spawner_slug,
+                status=sr.Status.RUNNING,
+                claude_session_id='uuid-spawner',
+                claude_owner_pid=spawner_pid,
+            ),
+            root=tmp_path,
+        )
+        sr.write_session_pointer(spawner_pid, spawner_slug, root=tmp_path)
+        monkeypatch.setattr(sh, '_owning_claude_pid', lambda: nested_pid)
+
+        forked = sh.run_session_start(
+            {'session_id': 'uuid-nested', 'cwd': _CWD},
+            {'CLAUDE_SPAWN_SESSION_ID': spawner_slug},
+            root=tmp_path,
+        )
+
+        assert forked.session_slug != spawner_slug
+        assert sr.resolve_session_slug_for_pid(nested_pid, root=tmp_path) == forked.session_slug
+        assert sr.resolve_session_slug_for_pid(spawner_pid, root=tmp_path) == spawner_slug
