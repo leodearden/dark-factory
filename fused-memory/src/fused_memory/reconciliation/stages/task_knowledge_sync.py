@@ -18,7 +18,10 @@ if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.services.memory_service import MemoryService
 
-from fused_memory.backends.task_backend_errors import DuplicateCandidateKeyError
+from fused_memory.backends.task_backend_errors import (
+    DuplicateCandidateKeyError,
+    LeakedEnvelopeMarkupError,
+)
 from fused_memory.mcp_tools.scheduler_state import read_scheduler_state
 from fused_memory.middleware.task_interceptor import TERMINAL_STATUSES
 from fused_memory.models.reconciliation import (
@@ -5814,6 +5817,18 @@ async def _queue_briefing_refresh_tasks(
                 },
             )
             skipped.append(task_id)
+        except LeakedEnvelopeMarkupError as exc:
+            logger.warning(
+                'briefing_refresh_add_task_refused_leaked_markup',
+                extra={
+                    'project_root': project_root,
+                    'task_id': task_id,
+                    'column': exc.column,
+                    'fragment': exc.fragment,
+                    'recovered': exc.recovered,
+                },
+            )
+            failed.append(task_id)
         except Exception:
             logger.warning(
                 'briefing_refresh_add_task_failed',

@@ -78,8 +78,16 @@ def _stored_rows(project_root: str) -> list[dict]:
         conn.close()
 
 
-def _leak_records(caplog) -> list[logging.LogRecord]:
-    return [record for record in caplog.records if hasattr(record, 'recovered')]
+_LEAK_FACTS = ('column', 'fragment', 'recovered')
+
+
+def _leak_reports(caplog) -> list[tuple[str, dict]]:
+    """Each log record carrying the leak's structured facts, as (message, facts)."""
+    return [
+        (record.getMessage(), {key: record.__dict__[key] for key in _LEAK_FACTS})
+        for record in caplog.records
+        if all(key in record.__dict__ for key in _LEAK_FACTS)
+    ]
 
 
 @pytest.mark.asyncio
@@ -107,11 +115,13 @@ async def test_combine_refuses_a_leaked_rewrite_and_reports_it_as_a_markup_leak(
 
     assert result is None
     assert _stored_rows(project_root) == before
-    [record] = _leak_records(caplog)
-    assert 'markup' in record.getMessage()
-    assert (record.column, record.fragment, record.recovered) == (
-        'description', REWRITE_LEAKED_FRAGMENT, {'dependencies': '4358'},
-    )
+    [(message, facts)] = _leak_reports(caplog)
+    assert 'markup' in message
+    assert facts == {
+        'column': 'description',
+        'fragment': REWRITE_LEAKED_FRAGMENT,
+        'recovered': {'dependencies': '4358'},
+    }
 
 
 @pytest.mark.asyncio
@@ -132,8 +142,10 @@ async def test_briefing_refresh_refuses_a_leaked_gap_and_reports_it_as_a_markup_
 
     assert summary == {'created': [], 'skipped': [], 'failed': ['17']}
     assert _stored_rows(project_root) == []
-    [record] = _leak_records(caplog)
-    assert 'markup' in record.getMessage()
-    assert (record.column, record.fragment, record.recovered) == (
-        'description', TASK_4358_FRAGMENT, {'priority': 'low'},
-    )
+    [(message, facts)] = _leak_reports(caplog)
+    assert 'markup' in message
+    assert facts == {
+        'column': 'description',
+        'fragment': TASK_4358_FRAGMENT,
+        'recovered': {'priority': 'low'},
+    }
