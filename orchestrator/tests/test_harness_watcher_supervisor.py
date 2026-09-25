@@ -1066,14 +1066,14 @@ class TestScriptedSupervisorClockIgnoresOtherThreads:
 
         def read_clock_until_stopped() -> None:
             while not stop.is_set():
-                in_window = window_open.is_set()
+                if not window_open.wait(timeout=0.05):
+                    continue
                 try:
                     time.monotonic()
                 except BaseException as exc:
                     reader_errors.append(exc)
                     return
-                if in_window:
-                    read_in_window.set()
+                read_in_window.set()
 
         async def digest_hook_forcing_a_foreign_read() -> None:
             read_in_window.clear()
