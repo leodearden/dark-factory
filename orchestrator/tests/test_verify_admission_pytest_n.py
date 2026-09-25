@@ -24,7 +24,7 @@ import shlex
 from unittest.mock import patch
 
 import pytest
-from _orch_helpers import _TEST_CMD, _leg_for_cmd, _module_config
+from _orch_helpers import ADMISSION_TEST_CMD, admission_leg_for_cmd, admission_module_config
 from pydantic import ValidationError
 
 from orchestrator.config import (
@@ -244,7 +244,7 @@ class TestPytestNWiring:
     """Wiring into ``_run_or_skip_timed``: the test-leg-only, role-gated
     (task/background, not merge) `-n` rewrite, injected before the
     nice-prefix wrap. Mirrors test_verify_admission_wiring.py's spy/
-    _leg_for_cmd/_module_config pattern.
+    admission_leg_for_cmd/admission_module_config pattern.
     """
 
     @pytest.mark.real_verify_admission
@@ -270,12 +270,12 @@ class TestPytestNWiring:
             await run_verification(
                 worktree=worktree,
                 config=config,
-                module_config=_module_config(),
+                module_config=admission_module_config(),
                 role=role,
                 attempt_id=None,
             )
 
-        test_cmd = next(c for c in captured_cmds if _leg_for_cmd(c) == 'test')
+        test_cmd = next(c for c in captured_cmds if admission_leg_for_cmd(c) == 'test')
         assert '-n 16' in test_cmd, f'expected -n 16 injected for role={role!r}; got {test_cmd!r}'
 
     @pytest.mark.real_verify_admission
@@ -300,12 +300,12 @@ class TestPytestNWiring:
             await run_verification(
                 worktree=worktree,
                 config=config,
-                module_config=_module_config(),
+                module_config=admission_module_config(),
                 role='merge',
                 attempt_id=None,
             )
 
-        test_cmd = next(c for c in captured_cmds if _leg_for_cmd(c) == 'test')
+        test_cmd = next(c for c in captured_cmds if admission_leg_for_cmd(c) == 'test')
         assert '-n 16' not in test_cmd, (
             f"merge's test leg must never be -n-capped (bypasses admission "
             f'slot-counting, latency-critical); got {test_cmd!r}'
@@ -333,12 +333,12 @@ class TestPytestNWiring:
             await run_verification(
                 worktree=worktree,
                 config=config,
-                module_config=_module_config(),
+                module_config=admission_module_config(),
                 role='task',
                 attempt_id=None,
             )
 
-        assert captured_cmds[0] == 'nice -n 15 ionice -c2 -n7 /bin/bash -c ' + shlex.quote(_TEST_CMD), (
+        assert captured_cmds[0] == 'nice -n 15 ionice -c2 -n7 /bin/bash -c ' + shlex.quote(ADMISSION_TEST_CMD), (
             "verify_admission_pytest_n='auto' must inject no -n rewrite — the "
             'test leg must be byte-identical to pre-T6 (nice-wrap only)'
         )
@@ -366,12 +366,12 @@ class TestPytestNWiring:
             await run_verification(
                 worktree=worktree,
                 config=config,
-                module_config=_module_config(),
+                module_config=admission_module_config(),
                 role='task',
                 attempt_id=None,
             )
 
-        assert captured_cmds[0] == _TEST_CMD, (
+        assert captured_cmds[0] == ADMISSION_TEST_CMD, (
             'disabled admission must never inject -n (or nice/bash-c wrap) the test leg'
         )
 
@@ -418,12 +418,12 @@ class TestPytestNWiring:
             await run_verification(
                 worktree=worktree,
                 config=config,
-                module_config=_module_config(test_command=test_command),
+                module_config=admission_module_config(test_command=test_command),
                 role='task',
                 attempt_id=None,
             )
 
-        test_cmd = next(c for c in captured_cmds if _leg_for_cmd(c) == 'test')
+        test_cmd = next(c for c in captured_cmds if admission_leg_for_cmd(c) == 'test')
         # role='task' also gets the nice-prefix bash-c wrap (T2); the inner
         # payload is what apply_pytest_numprocesses/render produced.
         expected = 'nice -n 15 ionice -c2 -n7 /bin/bash -c ' + shlex.quote(expected_inner)
@@ -458,12 +458,12 @@ class TestPytestNWiring:
             await run_verification(
                 worktree=worktree,
                 config=config,
-                module_config=_module_config(test_command=chained_cmd),
+                module_config=admission_module_config(test_command=chained_cmd),
                 role='task',
                 attempt_id=None,
             )
 
-        test_cmd = next(c for c in captured_cmds if _leg_for_cmd(c) == 'test')
+        test_cmd = next(c for c in captured_cmds if admission_leg_for_cmd(c) == 'test')
         assert test_cmd.count('-n 16') == 2, (
             f'expected -n 16 injected into both chained pytest invocations; got {test_cmd!r}'
         )
@@ -508,7 +508,7 @@ class TestPytestNWiring:
             await run_verification(
                 worktree=worktree,
                 config=config,
-                module_config=_module_config(),
+                module_config=admission_module_config(),
                 role='task',
                 attempt_id=None,
             )

@@ -64,7 +64,7 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
-from _orch_helpers import _TEST_CMD, _leg_for_cmd, _module_config
+from _orch_helpers import ADMISSION_TEST_CMD, admission_leg_for_cmd, admission_module_config
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.verify import run_full_verification, run_verification
@@ -118,7 +118,7 @@ class _RunCmdSpy:
         log_path: Path | None = None,
         **kwargs: Any,
     ) -> tuple[int, str, bool]:
-        leg = _leg_for_cmd(cmd)
+        leg = admission_leg_for_cmd(cmd)
         occurrence = self._leg_seen.get(leg, 0)
         self._leg_seen[leg] = occurrence + 1
         self.calls.append({'cmd': cmd, 'cwd': cwd, 'timeout': timeout, 'leg': leg})
@@ -308,7 +308,7 @@ class TestGlobalCap:
                 run_verification(
                     worktree=worktree,
                     config=config,
-                    module_config=_module_config(),
+                    module_config=admission_module_config(),
                     role='task',
                     attempt_id=None,
                 )
@@ -368,7 +368,7 @@ class TestMergeNeverBlocks:
                 run_verification(
                     worktree=holder_worktree,
                     config=config,
-                    module_config=_module_config(),
+                    module_config=admission_module_config(),
                     role='task',
                     attempt_id=None,
                 )
@@ -385,7 +385,7 @@ class TestMergeNeverBlocks:
                 merge_result = await run_verification(
                     worktree=merge_worktree,
                     config=config,
-                    module_config=_module_config(),
+                    module_config=admission_module_config(),
                     role='merge',
                     attempt_id=None,
                 )
@@ -404,7 +404,7 @@ class TestMergeNeverBlocks:
                 expected_cmd = (
                     shlex.join(['nice', '-n', '5'])
                     + ' /bin/bash -c '
-                    + shlex.quote(_TEST_CMD)
+                    + shlex.quote(ADMISSION_TEST_CMD)
                 )
                 assert merge_call['cmd'] == expected_cmd, (
                     f'expected the merge test leg wrapped with the nice -n 5 '
@@ -460,8 +460,8 @@ class TestSweepYieldsAndInterleaves:
         # resolved — so passing the same `project_root` object to both
         # satisfies the reuse guard.
         config._module_configs = {
-            'a': _module_config(prefix='a'),
-            'b': _module_config(prefix='b'),
+            'a': admission_module_config(prefix='a'),
+            'b': admission_module_config(prefix='b'),
         }
 
         acq = _DeterministicAcquire()
@@ -493,7 +493,7 @@ class TestSweepYieldsAndInterleaves:
                     run_verification(
                         worktree=task_worktree,
                         config=config,
-                        module_config=_module_config(),
+                        module_config=admission_module_config(),
                         role='task',
                         attempt_id=None,
                     )
@@ -556,7 +556,7 @@ class TestSweepYieldsAndInterleaves:
         expected_background_cmd = (
             shlex.join(['nice', '-n', '19', 'ionice', '-c3'])
             + ' /bin/bash -c '
-            + shlex.quote(_TEST_CMD)
+            + shlex.quote(ADMISSION_TEST_CMD)
         )
         assert all(c['cmd'] == expected_background_cmd for c in background_test_calls), (
             f'expected both sweep subproject test legs wrapped with the '
@@ -600,7 +600,7 @@ class TestUntimedWaitNoRequeue:
             baseline_result = await run_verification(
                 worktree=baseline_worktree,
                 config=config,
-                module_config=_module_config(),
+                module_config=admission_module_config(),
                 role='task',
                 attempt_id=None,
             )
@@ -624,7 +624,7 @@ class TestUntimedWaitNoRequeue:
                 run_verification(
                     worktree=holder_worktree,
                     config=config,
-                    module_config=_module_config(),
+                    module_config=admission_module_config(),
                     role='task',
                     attempt_id=None,
                 )
@@ -642,7 +642,7 @@ class TestUntimedWaitNoRequeue:
                     run_verification(
                         worktree=waiter_worktree,
                         config=config,
-                        module_config=_module_config(),
+                        module_config=admission_module_config(),
                         role='task',
                         attempt_id=None,
                     )
@@ -729,7 +729,7 @@ class TestSelfHeal:
                     run_verification(
                         worktree=worktree,
                         config=config,
-                        module_config=_module_config(),
+                        module_config=admission_module_config(),
                         role='task',
                         attempt_id=None,
                     )
@@ -804,7 +804,7 @@ class TestFailOpen:
             result = await run_verification(
                 worktree=worktree,
                 config=config,
-                module_config=_module_config(),
+                module_config=admission_module_config(),
                 role='task',
                 attempt_id=None,
             )
@@ -820,7 +820,7 @@ class TestFailOpen:
         )
         test_calls = [c for c in spy.calls if c['leg'] == 'test']
         assert len(test_calls) == 1
-        assert test_calls[0]['cmd'] == _TEST_CMD, (
+        assert test_calls[0]['cmd'] == ADMISSION_TEST_CMD, (
             f'expected the byte-identical, unwrapped (ungated) test-leg cmd; '
             f'got {test_calls[0]["cmd"]!r}'
         )
@@ -853,7 +853,7 @@ class TestFailOpen:
             result = await run_verification(
                 worktree=worktree,
                 config=config,
-                module_config=_module_config(),
+                module_config=admission_module_config(),
                 role='task',
                 attempt_id=None,
             )
@@ -868,7 +868,7 @@ class TestFailOpen:
         expected_cmd = (
             shlex.join(['nice', '-n', '15', 'ionice', '-c2', '-n7'])
             + ' /bin/bash -c '
-            + shlex.quote(_TEST_CMD)
+            + shlex.quote(ADMISSION_TEST_CMD)
         )
         assert test_calls[0]['cmd'] == expected_cmd, (
             f'expected the task nice-tier wrap to still apply even though '

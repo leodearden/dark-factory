@@ -28,14 +28,10 @@ The role test derives its expectation from the LOADED config and asserts the
 NO-OP contract (no ``-n`` injected at all) whenever that value is the
 ``''``/``'auto'`` sentinel, so both regimes stay covered and stay green.
 
-Harness provenance: ``_leg_for_cmd``/``_module_config`` are cross-imported from
-``_orch_helpers`` (task 4586) so the leg-labelling contract has exactly ONE
-definition — the ``'pytest'``-and-``'tests/'`` two-substring form, which the
-joined ``'pytest tests/'`` form silently breaks the moment a ``-n`` is
-spliced between them (the very rewrite under test here). ``_load_committed_
-config`` stays module-local instead: the ``test_warm_lane_bash_bucket_
-placement`` copy takes no constructor overrides, and this module needs one
-(``verify_admission_slots_dir`` redirected at ``tmp_path``).
+``_load_committed_config`` is module-local rather than shared with
+``test_warm_lane_bash_bucket_placement``: that copy takes no constructor
+overrides, and this module needs one (``verify_admission_slots_dir``
+redirected at ``tmp_path``).
 """
 
 from __future__ import annotations
@@ -46,7 +42,7 @@ from typing import Any, Literal
 from unittest.mock import patch
 
 import pytest
-from _orch_helpers import _leg_for_cmd, _module_config
+from _orch_helpers import admission_leg_for_cmd, admission_module_config
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.verify import run_verification
@@ -167,15 +163,15 @@ async def _captured_test_leg(
         await run_verification(
             worktree=worktree,
             config=config,
-            module_config=_module_config(),
+            module_config=admission_module_config(),
             role=role,
             attempt_id=None,
         )
 
-    test_cmd = next((c for c in captured_cmds if _leg_for_cmd(c) == 'test'), None)
+    test_cmd = next((c for c in captured_cmds if admission_leg_for_cmd(c) == 'test'), None)
     assert test_cmd is not None, (
         f'no test leg captured for role={role!r}; captured={captured_cmds!r}. '
-        f'Either the test leg was skipped, or _leg_for_cmd no longer labels it '
+        f'Either the test leg was skipped, or admission_leg_for_cmd no longer labels it '
         f'(it matches "pytest" and "tests/" as SEPARATE substrings precisely '
         f'because the -n cap splices tokens between them).'
     )

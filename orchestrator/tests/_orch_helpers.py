@@ -45,50 +45,34 @@ _log = logging.getLogger(__name__)
 _WaitT = TypeVar('_WaitT')
 
 
-# task 4586: single definition of the verify-admission test-leg-labelling
-# contract, hoisted here after it had drifted into two incompatible copies
-# across test_verify_admission_wiring.py, test_verify_admission_integration_
-# gate.py and test_verify_admission_pytest_n.py (a fourth, in
-# test_verify_pytest_n_operator_cap.py, already cross-imported rather than
-# duplicating). module_config commands are chosen to be uniquely
-# identifiable by substring, so a spy `_run_cmd` can label which leg is
-# running without needing `label` (a `_run_or_skip_timed`-local closure
-# variable, never passed down to `_run_cmd`).
-_TEST_CMD = 'pytest tests/'
-_LINT_CMD = 'ruff'
-_TYPE_CMD = 'pyright'
+ADMISSION_TEST_CMD = 'pytest tests/'
+ADMISSION_LINT_CMD = 'ruff'
+ADMISSION_TYPE_CMD = 'pyright'
 
 
-def _leg_for_cmd(cmd: str) -> str:
-    """Label which leg *cmd* belongs to by substring, not exact match — an
-    active admission gate nice-wraps the test leg (``<nice argv> /bin/bash -c
-    <shlex.quote(cmd)>``), so its captured cmd still CONTAINS ``_TEST_CMD``
-    but is no longer equal to it. lint/type are never wrapped either way.
+def admission_leg_for_cmd(cmd: str) -> str:
+    """Label which verify leg (test/lint/type) *cmd* belongs to.
 
-    Checks ``'pytest'``/``'tests/'`` as two SEPARATE substrings rather than the
-    joined ``_TEST_CMD``: a ``verify_admission_pytest_n`` cap splices new flags
-    BETWEEN them (``pytest tests/`` -> ``pytest -n 8 tests/``), breaking
-    containment of the joined string and silently mislabelling every test leg.
-    task 4456 hand-fixed this in three separate copies after the joined form
-    stopped labelling ANY test leg once ``verify_admission_pytest_n`` was
-    deployed; task 4586 hoisted the surviving (two-substring) form here so
-    there is exactly one definition left to regress.
+    Matches by substring because an active admission gate nice-wraps the test
+    leg, so its cmd contains ``ADMISSION_TEST_CMD`` without equalling it.
+    ``'pytest'`` and ``'tests/'`` are checked separately because a ``-n`` cap
+    splices flags between them.
     """
     if 'pytest' in cmd and 'tests/' in cmd:
         return 'test'
-    if _LINT_CMD in cmd:
+    if ADMISSION_LINT_CMD in cmd:
         return 'lint'
-    if _TYPE_CMD in cmd:
+    if ADMISSION_TYPE_CMD in cmd:
         return 'type'
     return cmd
 
 
-def _module_config(**overrides: Any) -> ModuleConfig:
+def admission_module_config(**overrides: Any) -> ModuleConfig:
     kwargs: dict[str, Any] = dict(
         prefix='pkg',
-        test_command=_TEST_CMD,
-        lint_command=_LINT_CMD,
-        type_check_command=_TYPE_CMD,
+        test_command=ADMISSION_TEST_CMD,
+        lint_command=ADMISSION_LINT_CMD,
+        type_check_command=ADMISSION_TYPE_CMD,
         # Sequential so the three legs run strictly test -> lint -> type,
         # making ordering/labelling assertions deterministic (no gather
         # interleaving between legs themselves).
