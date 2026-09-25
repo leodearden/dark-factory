@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest  # pyright: ignore[reportMissingImports]
+
 from orchestrator import session_registry as sr
 
 # A pid virtually guaranteed dead on any host (the suite-wide idiom; see
@@ -69,3 +71,100 @@ class TestSessionPointerPaths:
 
         assert sr.write_session_pointer(1234, 'role-proj-uuid', root=tmp_path) is False
         assert sr.session_pointers_dir(tmp_path).read_text(encoding='utf-8') == 'not a directory'
+
+
+def _write_pointer_raw(pid: int, content: str | bytes, root: Path) -> Path:
+    path = sr.session_pointer_path_for_pid(pid, root=root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(content, bytes):
+        path.write_bytes(content)
+    else:
+        path.write_text(content, encoding='utf-8')
+    return path
+
+
+class TestResolveSessionSlugForPid:
+    _PID = 1234
+    _SLUG = 'role-proj-uuid'
+
+    def test_no_pointer_file(self, tmp_path: Path) -> None:
+        assert sr.resolve_session_slug_for_pid(self._PID, root=tmp_path) is None
+
+    @pytest.mark.parametrize('content', ['', '   \n'])
+    def test_blank_pointer(self, tmp_path: Path, content: str) -> None:
+        _write_pointer_raw(self._PID, content, tmp_path)
+
+        assert sr.resolve_session_slug_for_pid(self._PID, root=tmp_path) is None
+
+    @pytest.mark.parametrize(
+        ('content', 'traversal_target'),
+        [
+            ('../../etc', Path('etc')),
+            ('a/b', Path('fleet/sessions/a/b')),
+            ('..', Path('fleet')),
+        ],
+    )
+    def test_pointer_that_is_not_a_record_key_never_reads_past_sessions_dir(
+        self, tmp_path: Path, content: str, traversal_target: Path
+    ) -> None:
+        root = tmp_path / 'fleet'
+        sr.sessions_dir(root).mkdir(parents=True)
+        sentinel = tmp_path / traversal_target / 'record.json'
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.write_text(
+            _record('sentinel', owner_pid=self._PID).to_json(), encoding='utf-8'
+        )
+        _write_pointer_raw(self._PID, content, root)
+
+        assert sr.resolve_session_slug_for_pid(self._PID, root=root) is None
+
+    def test_dangling_pointer(self, tmp_path: Path) -> None:
+        sr.write_session_pointer(self._PID, self._SLUG, root=tmp_path)
+
+        assert sr.resolve_session_slug_for_pid(self._PID, root=tmp_path) is None
+
+    def test_record_that_is_not_json(self, tmp_path: Path) -> None:
+        path = sr.record_path_for_slug(self._SLUG, root=tmp_path)
+        path.parent.mkdir(parents=True)
+        path.write_text('{not json', encoding='utf-8')
+        sr.write_session_pointer(self._PID, self._SLUG, root=tmp_path)
+
+        assert sr.resolve_session_slug_for_pid(self._PID, root=tmp_path) is None
+
+    def test_record_owned_by_a_different_pid(self, tmp_path: Path) -> None:
+        sr.write_record(_record(self._SLUG, owner_pid=self._PID + 1), root=tmp_path)
+        sr.write_session_pointer(self._PID, self._SLUG, root=tmp_path)
+
+        assert sr.resolve_session_slug_for_pid(self._PID, root=tmp_path) is None
+
+    def test_record_with_no_owner_pid_no_longer_vouches_for_the_pid(
+        self, tmp_path: Path
+    ) -> None:
+        sr.write_record(_record(self._SLUG, owner_pid=None), root=tmp_path)
+        sr.write_session_pointer(self._PID, self._SLUG, root=tmp_path)
+
+        assert sr.resolve_session_slug_for_pid(self._PID, root=tmp_path) is None
+
+    def test_record_owned_by_the_pid_resolves_to_its_slug(self, tmp_path: Path) -> None:
+        sr.write_record(_record(self._SLUG, owner_pid=self._PID), root=tmp_path)
+        sr.write_session_pointer(self._PID, self._SLUG, root=tmp_path)
+
+        assert sr.resolve_session_slug_for_pid(self._PID, root=tmp_path) == self._SLUG
+
+    def test_directory_in_the_pointer_files_place(self, tmp_path: Path) -> None:
+        sr.session_pointer_path_for_pid(self._PID, root=tmp_path).mkdir(parents=True)
+
+        assert sr.resolve_session_slug_for_pid(self._PID, root=tmp_path) is None
+
+    def test_pointer_that_is_not_utf8(self, tmp_path: Path) -> None:
+        sr.write_record(_record(self._SLUG, owner_pid=self._PID), root=tmp_path)
+        _write_pointer_raw(self._PID, b'\xff\xfe' + self._SLUG.encode(), tmp_path)
+
+        assert sr.resolve_session_slug_for_pid(self._PID, root=tmp_path) is None
+
+    @pytest.mark.parametrize('pid', [0, -1])
+    def test_non_positive_pid_never_touches_the_filesystem(
+        self, tmp_path: Path, pid: int
+    ) -> None:
+        assert sr.resolve_session_slug_for_pid(pid, root=tmp_path) is None
+        assert not sr.session_pointers_dir(tmp_path).exists()
