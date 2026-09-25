@@ -552,3 +552,70 @@ class TestLeaseHolderRecordSlug:
         assert contended.acquired is False
         assert contended.holder is not None
         assert contended.holder.record_slug == 'role-proj-uuid'
+
+
+class TestHolderRecordState:
+    _SLUG = 'role-proj-uuid'
+
+    def test_no_holder_is_unlinked(self, tmp_path: Path) -> None:
+        assert sr.holder_record_state(None, root=tmp_path) is sr.HolderRecordState.UNLINKED
+
+    def test_a_holder_without_a_record_slug_is_unlinked(self, tmp_path: Path) -> None:
+        state = sr.holder_record_state(_holder(record_slug=''), root=tmp_path)
+
+        assert state is sr.HolderRecordState.UNLINKED
+
+    def test_a_record_slug_that_is_not_a_record_key_is_unreadable(self, tmp_path: Path) -> None:
+        state = sr.holder_record_state(_holder(record_slug='../x'), root=tmp_path)
+
+        assert state is sr.HolderRecordState.UNREADABLE
+
+    def test_a_reaped_record_is_absent(self, tmp_path: Path) -> None:
+        state = sr.holder_record_state(_holder(record_slug=self._SLUG), root=tmp_path)
+
+        assert state is sr.HolderRecordState.ABSENT
+
+    @pytest.mark.parametrize('status', sorted(set(sr.Status) - sr.TERMINAL_STATUSES))
+    def test_a_non_terminal_record_is_active(self, tmp_path: Path, status: sr.Status) -> None:
+        sr.write_record(_record(self._SLUG, owner_pid=1, status=status), root=tmp_path)
+
+        state = sr.holder_record_state(_holder(record_slug=self._SLUG), root=tmp_path)
+
+        assert state is sr.HolderRecordState.ACTIVE
+
+    @pytest.mark.parametrize('status', sorted(sr.TERMINAL_STATUSES))
+    def test_a_terminal_record_is_exited(self, tmp_path: Path, status: sr.Status) -> None:
+        sr.write_record(_record(self._SLUG, owner_pid=1, status=status), root=tmp_path)
+
+        state = sr.holder_record_state(_holder(record_slug=self._SLUG), root=tmp_path)
+
+        assert state is sr.HolderRecordState.EXITED
+
+    def test_a_corrupt_record_is_unreadable(self, tmp_path: Path) -> None:
+        path = sr.record_path_for_slug(self._SLUG, root=tmp_path)
+        path.parent.mkdir(parents=True)
+        path.write_text('{not json', encoding='utf-8')
+
+        state = sr.holder_record_state(_holder(record_slug=self._SLUG), root=tmp_path)
+
+        assert state is sr.HolderRecordState.UNREADABLE
+
+    def test_the_printed_values(self) -> None:
+        assert [state.value for state in sr.HolderRecordState] == [
+            'unlinked',
+            'absent',
+            'unreadable',
+            'active',
+            'exited',
+        ]
+
+    def test_no_evidence_and_evidence_of_absence_never_share_a_value(
+        self, tmp_path: Path
+    ) -> None:
+        legacy = sr.LeaseHolder.from_dict({'session_slug': 'watcher-df-1', 'pid': 1, 'start_ts': ''})
+        reaped = _holder(record_slug=self._SLUG)
+
+        assert sr.HolderRecordState.UNLINKED != sr.HolderRecordState.ABSENT
+        assert sr.holder_record_state(legacy, root=tmp_path) != sr.holder_record_state(
+            reaped, root=tmp_path
+        )
