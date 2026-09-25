@@ -2503,6 +2503,14 @@ class TestExtractCauseHint:
         assert WORKER_DEATH_SUMMARY_MARKER in hint, f'Unexpected hint: {hint!r}'
         assert XDIST_IN_FLIGHT_NODEID in hint, f'Unexpected hint: {hint!r}'
 
+    def test_bailout_literal_is_still_the_quoted_evidence(self):
+        """REGRESSION GUARD: with no surviving failure and no percentage
+        progress line, the bailout literal is the evidence the hint quotes."""
+        hint = _extract_cause_hint(XDIST_SESSION_ABORTED_OUTPUT)
+        assert hint == (
+            f'{WORKER_DEATH_SUMMARY_MARKER}; worker gw3 crashed and worker restarting disabled'
+        ), f'Unexpected hint: {hint!r}'
+
 
 # ---------------------------------------------------------------------------
 # task 5082 step-7: `_summarize_checks` must not assert a COMPLETE verdict for
@@ -2846,6 +2854,16 @@ class TestWorkerDeathTruncationWithoutTheBailoutLine:
         assert WORKER_DEATH_SUMMARY_MARKER in hint, f'Unexpected hint: {hint!r}'
         assert XDIST_IN_FLIGHT_NODEID not in hint, f'Unexpected hint: {hint!r}'
         assert '9851 passed' not in hint, f'Unexpected hint: {hint!r}'
+
+    @_Q_TRUNCATED_OUTPUTS
+    def test_cause_hint_names_where_the_run_stopped(self, output):
+        """With no surviving failure, the hint quotes the evidence the detector
+        keyed on. Under -q that is the stop percentage, which tells the reader
+        how much of the suite never ran."""
+        hint = _extract_cause_hint(output)
+        assert hint == f'{WORKER_DEATH_SUMMARY_MARKER}; run stopped at 46% of collected tests', (
+            f'Unexpected hint: {hint!r}'
+        )
 
     def test_a_recovered_run_that_reached_100_percent_keeps_its_verdict(self):
         """THE LOAD-BEARING DISCRIMINATION: a recovering run carries the
