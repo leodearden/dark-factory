@@ -729,6 +729,26 @@ def _bind_claude_session_id(
     return True
 
 
+def _stamp_session_pointer(
+    record: session_registry.SessionRecord,
+    probes: _EventProbes,
+    root: Path | str | None,
+) -> None:
+    """Point this event's claude pid at *record*, iff the record names it as owner.
+
+    The pointer asserts exactly what the written record already proves --
+    ``claude_owner_pid`` is this event's owning claude pid -- so one rule
+    covers every lane (adopt, fork, a withheld launch window, an unproven
+    adopt, a blank session_id) without branching on them. The pid comes from
+    the event's probe memo, the same observation the binding was made from.
+    Fail-soft: ``write_session_pointer`` never raises.
+    """
+    pid = probes.owning_claude_pid()
+    if pid is None or record.claude_owner_pid != pid:
+        return
+    session_registry.write_session_pointer(pid, record.session_slug, root=root)
+
+
 # ---------------------------------------------------------------------------
 # Pure OSC-retitle + display-title helpers (PRD §4.6)
 # ---------------------------------------------------------------------------
@@ -1417,6 +1437,7 @@ def run_session_start(
             probes=probes,
         )
     session_registry.write_record(record, root=root)
+    _stamp_session_pointer(record, probes, root)
     return record
 
 
