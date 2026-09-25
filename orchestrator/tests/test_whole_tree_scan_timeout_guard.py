@@ -166,7 +166,10 @@ class TestTimeoutConstants:
         """
         ini_options = _pytest_ini_options()
 
-        dump_after = float(ini_options['faulthandler_timeout'])
+        dump_after = ini_options['faulthandler_timeout']
+        assert isinstance(dump_after, int | float), (
+            f'faulthandler_timeout must be a TOML number, got {dump_after!r}'
+        )
         assert 0 < dump_after < VERIFY_CLI_PER_TEST_TIMEOUT, (
             f'faulthandler_timeout ({dump_after}) must be positive and below '
             f'VERIFY_CLI_PER_TEST_TIMEOUT ({VERIFY_CLI_PER_TEST_TIMEOUT}), or a '
