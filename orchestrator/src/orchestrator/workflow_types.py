@@ -458,19 +458,20 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
         # GitOps._seed_warm_lane bounds the wait at all), so a hung thin
         # `rm -rf`, a stalled GC reclaim, or a caller that seeds with the
         # default lane_lock=SeedLaneLock.TAKE while already holding the lock
-        # produces rc=124 on EVERY attempt and does NOT self-clear. On the steal path the retry
-        # driver moves to a DIFFERENT lane (LANE_LOCK_TIMEOUT is in
-        # git_ops._STEAL_RETRYABLE), but a FREE-lane acquire re-picks the same
-        # lowest-index lane, so this uncounted row lets such a task requeue
-        # indefinitely with no cap escalation. That is accepted rather than
-        # overlooked: counting the common (self-clearing) case would charge
-        # every task caught behind an ordinary GC overlap for contention it did
-        # not cause, and the wedged case is not silent — each attempt logs an
-        # `acquire_warm_lane:` WARNING naming rc=124 and the lane, and every
-        # requeue carries the greppable reason_prefix below. If chronic rc=124
-        # on a single lane is ever observed in the journal, the fix is to
-        # unwedge the holder (or flip this row to counts_against_requeue_cap=
-        # True, as WarmLaneStealFailed does), NOT to widen the bounded wait.
+        # produces rc=124 on EVERY attempt and does NOT self-clear. On the
+        # steal path the retry driver moves to a DIFFERENT lane
+        # (LANE_LOCK_TIMEOUT is in git_ops._STEAL_RETRYABLE), but a FREE-lane
+        # acquire re-picks the same lowest-index lane, so this uncounted row
+        # lets such a task requeue indefinitely with no cap escalation. That
+        # is accepted rather than overlooked: counting the common
+        # (self-clearing) case would charge every task caught behind an
+        # ordinary GC overlap for contention it did not cause, and the wedged
+        # case is not silent — each attempt logs an `acquire_warm_lane:`
+        # WARNING naming rc=124 and the lane, and every requeue carries the
+        # greppable reason_prefix below. If chronic rc=124 on a single lane is
+        # ever observed in the journal, the fix is to unwedge the holder (or
+        # flip this row to counts_against_requeue_cap=True, as
+        # WarmLaneStealFailed does), NOT to widen the bounded wait.
         #
         # WarmLaneStealFailed is NOT self-clearing. Chronic pool pressure keeps
         # the valve stealing, and a pool that is handing out hostile lanes goes
