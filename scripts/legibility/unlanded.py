@@ -6,10 +6,12 @@ checkout and then commit. When that commit does not land — refused by the
 target repo's pre-commit hook, or failed for a plain git reason — the written
 paths stay dirty (or, after the scoped ``git add`` fallback, staged). Left
 there they block the target's redeploy, trip the orchestrator's dirty-tree
-escalation and are re-submitted the next night. reify's
-``docs/legibility/landing-contract.md`` R4 states the remedy: restore the
-written paths to HEAD, quarantine the refused content outside the tracked
-tree, and do not advance census-state.
+escalation and are re-submitted the next night. The remedy, stated here as
+this repo's copy of ruling R4 in the reify repo's landing contract
+(``reify:docs/legibility/landing-contract.md``, a file that is NOT in
+dark-factory): never commit with ``--no-verify``; restore the written paths
+to HEAD, quarantine the refused content outside the tracked tree, and do not
+advance census-state.
 
 :func:`roll_back` does that in the one order that cannot lose mined signal:
 quarantine first, and restore only once the copy is safe. Quarantine layout:
@@ -29,6 +31,10 @@ from pathlib import Path
 from legibility import trickle_state
 
 QUARANTINE_DIRNAME = 'quarantine'
+
+GIT_TIMEOUT_SECONDS = 60.0
+"""Bound on each git call :func:`roll_back` makes: a hung git becomes a
+rollback-INCOMPLETE result, so the caller's escalation is still sent."""
 
 
 def quarantine_root(project_id: str) -> Path:
@@ -151,9 +157,13 @@ def _restore_to_head(root: Path, rels: tuple[str, ...]) -> str | None:
 
 
 def _git(root: Path, *args: str) -> bytes:
-    completed = subprocess.run(
-        ['git', '--literal-pathspecs', '-C', str(root), *args], capture_output=True,
-    )
+    try:
+        completed = subprocess.run(
+            ['git', '--literal-pathspecs', '-C', str(root), *args],
+            capture_output=True, timeout=GIT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise _GitFailed(f'git {args[0]} timed out after {exc.timeout}s') from exc
     if completed.returncode != 0:
         stderr = completed.stderr.decode('utf-8', 'replace').strip()
         raise _GitFailed(f'git {args[0]} failed (rc={completed.returncode}): {stderr}')

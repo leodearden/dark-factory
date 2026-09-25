@@ -2171,8 +2171,8 @@ def test_run_census_happy_path_full_seam_wiring(tmp_path):
 # ---------------------------------------------------------------------------
 # task 5780: a census whose commit does not land (e.g. refused by the target
 # repo's pre-commit hook) rolls every written path back to HEAD, quarantines
-# the refused content, and never advances census-state (reify
-# docs/legibility/landing-contract.md R4).
+# the refused content, and never advances census-state (the remedy
+# scripts/legibility/unlanded.py's module docstring states).
 # ---------------------------------------------------------------------------
 
 _REFUSAL = "git commit failed: cited-test-path gate: tests/moved_test.rs does not exist"

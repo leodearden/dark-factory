@@ -1566,10 +1566,8 @@ def run_nightly(
                 commit_result = commit_fn(cfg.project_root, [_CODEBOOK_RELPATH], message)
                 if not commit_result.ok:
                     # Fail loud (decision 8), and never leave the refused dump
-                    # in the checkout (reify docs/legibility/landing-contract.md
-                    # R4): left there it blocked the target's redeploy, tripped
-                    # the orchestrator's dirty-tree escalation and was
-                    # re-submitted the next night.
+                    # in the checkout -- why, and the remedy applied, are in
+                    # scripts/legibility/unlanded.py's module docstring.
                     rollback = unlanded.roll_back(
                         cfg.project_root, [_CODEBOOK_RELPATH],
                         project_id=cfg.project_id,

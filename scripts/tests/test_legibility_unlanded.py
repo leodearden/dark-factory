@@ -8,7 +8,9 @@ root, and therefore the quarantine, at a per-test tmp dir.
 """
 from __future__ import annotations
 
+import os
 import subprocess
+import time
 from pathlib import Path
 
 from legibility import trickle_state, unlanded
@@ -148,6 +150,27 @@ def test_roll_back_keeps_the_quarantine_when_the_restore_fails(tmp_path):
     assert (not_a_repo / 'written.yaml').read_bytes() == _REFUSED
     assert str(rb.quarantine_dir) in rb.describe()
     assert rb.failure in rb.describe()
+
+
+def test_roll_back_returns_incomplete_when_git_hangs(tmp_path, monkeypatch):
+    repo = _repo(tmp_path)
+    (repo / _CODEBOOK).write_bytes(_REFUSED)
+    hanging_bin = tmp_path / 'hanging-bin'
+    hanging_bin.mkdir()
+    hanging_git = hanging_bin / 'git'
+    hanging_git.write_text('#!/bin/sh\nexec sleep 30\n')
+    hanging_git.chmod(0o755)
+    monkeypatch.setenv('PATH', f'{hanging_bin}:{os.environ["PATH"]}')
+    monkeypatch.setattr(unlanded, 'GIT_TIMEOUT_SECONDS', 0.5)
+
+    started = time.monotonic()
+    rb = unlanded.roll_back(repo, [_CODEBOOK], project_id='proj', label='trickle-2026-07-13')
+
+    assert time.monotonic() - started < 10
+    assert rb.restored is False
+    assert 'timed out' in rb.failure
+    assert rb.quarantine_dir is not None
+    assert (rb.quarantine_dir / _CODEBOOK).read_bytes() == _REFUSED
 
 
 def test_roll_back_refuses_a_path_outside_the_repo(tmp_path):
