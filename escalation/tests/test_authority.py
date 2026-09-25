@@ -133,6 +133,48 @@ class TestCrossLayerIdentityLockstep:
             )
 
 
+class TestPromoteSentinelBoundRoles:
+    """``PROMOTE_SENTINEL_BOUND_ROLES``: member roles whose clusters must be minted under a sentinel id.
+
+    The set ranges over the ``agent_role`` of the MEMBERS being promoted, not
+    over the promoting caller's identity, so it must never be confused with
+    ``PROMOTE_ALLOWED`` (task 4541 RC#3).
+    """
+
+    def test_is_non_empty_frozenset(self) -> None:
+        from escalation.authority import PROMOTE_SENTINEL_BOUND_ROLES
+
+        assert isinstance(PROMOTE_SENTINEL_BOUND_ROLES, frozenset)
+        assert len(PROMOTE_SENTINEL_BOUND_ROLES) > 0
+
+    def test_recovery_veto_streak_role_is_bound_in_lockstep(self) -> None:
+        """The duplicated role string stays pinned to the REAL orchestrator constant.
+
+        ``escalation`` must not module-level import ``orchestrator`` (see
+        authority.py's module docstring), so the streak alarm's role string is
+        DUPLICATED in ``PROMOTE_SENTINEL_BOUND_ROLES`` rather than imported.
+        This function-local import is the only thing that keeps the two sides
+        pinned: a rename on either side would otherwise silently re-open the
+        esc-5469-11 real-id wrapper while every test stayed green.
+        """
+        from escalation.authority import PROMOTE_SENTINEL_BOUND_ROLES
+        from orchestrator.recovery_emission import RECOVERY_VETO_STREAK_ROLE
+
+        assert RECOVERY_VETO_STREAK_ROLE in PROMOTE_SENTINEL_BOUND_ROLES, (
+            f'The role the streak alarm actually files under '
+            f'({RECOVERY_VETO_STREAK_ROLE!r}) must be sentinel-bound'
+        )
+
+    def test_disjoint_from_caller_identities(self) -> None:
+        from escalation.authority import PROMOTE_SENTINEL_BOUND_ROLES
+
+        assert 'orchestrator-escalation-watcher-auto' not in PROMOTE_SENTINEL_BOUND_ROLES
+        assert PROMOTE_SENTINEL_BOUND_ROLES.isdisjoint(PROMOTE_ALLOWED)
+
+    def test_auto_close_role_denylist_is_unchanged(self) -> None:
+        assert L2_AUTO_CLOSE_DENY_ROLES == frozenset({'orchestrator-deterministic'})
+
+
 class TestL2AutoCloseClass:
     """``l2_auto_close_class`` — the narrow above-ceiling ``close_only`` carve-out.
 
