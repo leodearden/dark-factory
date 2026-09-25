@@ -17,6 +17,7 @@ from __future__ import annotations
 import inspect
 import json
 import sqlite3
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -51,6 +52,13 @@ PROSE_MENTION_OF_THE_LEAK = (
     "Stage 1 found that task 2865's description had a leaked fragment appended: `"
     + closer_for('description') + '\\n' + CANONICAL_OPENER_PREFIX + '"priority">low`. '
     'Stage 2 verified it via get_task and stripped it via update_task.'
+)
+
+# The 4358 specimen followed by residue the tail parser cannot place, so no
+# boundary between the caller's text and the swallowed arguments is provable.
+UNPLACEABLE_RESIDUE_DESCRIPTION = (
+    TASK_4358_DESCRIPTION + closer_for('parameter')
+    + '\nand then prose the tail parser cannot place'
 )
 
 ORDINARY_TEXT = 'Add a regression test for the orphaned-commit path.'
@@ -305,3 +313,48 @@ async def test_update_task_lets_the_remediation_of_a_corrupt_description_land(
 
     [row] = _stored_rows(project_root)
     assert (row['description'], row['priority']) == (TASK_4358_PROSE, 'low')
+
+
+@pytest.mark.asyncio
+async def test_add_task_refusal_names_the_priority_main_would_default_to_medium(
+    backend, project_root,
+):
+    with pytest.raises(LeakedEnvelopeMarkupError) as excinfo:
+        await backend.add_task(
+            project_root, title='clean title', description=TASK_4358_DESCRIPTION,
+        )
+
+    assert isinstance(excinfo.value.recovered, Mapping)
+    assert excinfo.value.recovered == {'priority': 'low'}
+    assert excinfo.value.clean_value == TASK_4358_PROSE
+
+
+@pytest.mark.asyncio
+async def test_update_task_refusal_names_the_swallowed_priority(backend, project_root):
+    task_id = await _seed_clean_task(backend, project_root)
+
+    with pytest.raises(LeakedEnvelopeMarkupError) as excinfo:
+        await backend.update_task(
+            task_id, project_root, description=TASK_4358_DESCRIPTION,
+        )
+
+    assert excinfo.value.recovered == {'priority': 'low'}
+    assert excinfo.value.clean_value == TASK_4358_PROSE
+
+
+@pytest.mark.asyncio
+async def test_refusal_without_a_provable_boundary_recovers_nothing_rather_than_guessing(
+    backend, project_root,
+):
+    assert detect_leak(UNPLACEABLE_RESIDUE_DESCRIPTION) is not None
+
+    with pytest.raises(LeakedEnvelopeMarkupError) as excinfo:
+        await backend.add_task(
+            project_root, title='clean title',
+            description=UNPLACEABLE_RESIDUE_DESCRIPTION,
+        )
+
+    assert excinfo.value.column == 'description'
+    assert excinfo.value.recovered == {}
+    assert excinfo.value.clean_value is None
+    assert _stored_rows(project_root) == []
