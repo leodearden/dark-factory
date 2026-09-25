@@ -2691,22 +2691,6 @@ def test_wait_pids_exited_reports_each_survivor_with_its_last_observed_state():
 # ---------------------------------------------------------------------------
 
 
-def _pid_gone(pid: int) -> bool:
-    """Best-effort liveness probe: True when *pid* no longer refers to a live process.
-
-    ``os.kill(pid, 0)`` sends no signal, only checks existence/permission.
-    ``PermissionError`` means the pid exists but isn't ours -- that is NOT
-    "gone", so it returns False rather than masking a real survivor.
-    """
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    except PermissionError:
-        return False
-    return False
-
-
 def test_kill_holder_tree_reaps_a_session_escaped_grandchild():
     """kill_holder_tree reaps BOTH the leader and a start_new_session grandchild.
 
@@ -2721,10 +2705,12 @@ def test_kill_holder_tree_reaps_a_session_escaped_grandchild():
     cannot collide with an unrelated ``sleep`` on a shared dev box -- in
     particular with this very module's own ``sleeper_spec`` 300s sleeper.
 
-    Asserts BOTH the leader is reaped and every captured grandchild pid is
-    actually gone (not just "signalled") -- and is self-cleaning (a finally
-    that SIGKILLs any surviving captured pid) so a failing/RED run of this
-    test never itself leaks the orphan it exists to pin.
+    Asserts BOTH the leader is reaped and every captured grandchild has
+    actually EXITED, not merely been signalled.  A zombie awaiting its
+    subreaper's reap counts as exited -- see :func:`wait_pids_exited`.  It is
+    self-cleaning (a finally that SIGKILLs any surviving captured pid) so a
+    failing/RED run of this test never itself leaks the orphan it exists to
+    pin.
     """
     sleep_secs = f'271.{os.getpid() % 1000:03d}'
     leader = subprocess.Popen([
@@ -2754,15 +2740,14 @@ def test_kill_holder_tree_reaps_a_session_escaped_grandchild():
             'after the call returned'
         )
 
-        gone_deadline = time.monotonic() + 5.0
-        survivors = set(grandchildren)
-        while survivors and time.monotonic() < gone_deadline:
-            survivors = {pid for pid in survivors if not _pid_gone(pid)}
-            if survivors:
-                time.sleep(0.05)
+        survivors = wait_pids_exited(grandchildren, timeout=5.0)
+        state_by_pid = {pid: (st.state, st.ppid) for pid, st in sorted(survivors.items())}
         assert not survivors, (
-            f'kill_holder_tree left session-escaped descendant(s) alive: '
-            f'{sorted(survivors)} -- the exact orphan task 4092 exists to fix'
+            f'kill_holder_tree left session-escaped descendant(s) of leader '
+            f'pid={leader.pid} running, as {{pid: (state, ppid)}}: {state_by_pid} '
+            f'-- the exact orphan task 4092 exists to fix.  State S/T with '
+            f'ppid != {leader.pid} means the descendant walk missed it; R/D '
+            f'means it was signalled but has not yet run to exit'
         )
     finally:
         if leader.poll() is None:
