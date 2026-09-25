@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import gc
+import logging
 import weakref
 from collections.abc import Iterator
 
@@ -133,3 +134,84 @@ class TestTrackTask:
 
         assert result is None
         await _drain(task)
+
+
+class _HookFailed(Exception):
+    pass
+
+
+class TestTrackTaskOnDone:
+    async def test_hook_runs_exactly_once_with_the_finished_task(self):
+        seen: list[asyncio.Task] = []
+        task = asyncio.create_task(asyncio.sleep(0))
+
+        track_task(task, set(), on_done=seen.append)
+        await _drain(task)
+
+        assert seen == [task]
+
+    async def test_hook_sees_the_task_already_released_from_every_registry(self):
+        first: set[asyncio.Task] = set()
+        second: set[asyncio.Task] = set()
+        still_registered: list[bool] = []
+
+        def hook(finished: asyncio.Task) -> None:
+            still_registered.append(finished in first or finished in second)
+
+        task = asyncio.create_task(asyncio.sleep(0))
+        track_task(task, first, second, on_done=hook)
+        await _drain(task)
+
+        assert still_registered == [False]
+
+    async def test_hook_runs_for_a_cancelled_task(self):
+        seen: list[bool] = []
+        task = asyncio.create_task(asyncio.Event().wait())
+        track_task(task, set(), on_done=lambda finished: seen.append(finished.cancelled()))
+
+        task.cancel()
+        await _drain(task)
+
+        assert seen == [True]
+
+    async def test_hook_can_still_read_the_exception_of_a_raising_task(self):
+        seen: list[BaseException | None] = []
+        task = asyncio.create_task(_raise_boom())
+        track_task(task, set(), on_done=lambda finished: seen.append(finished.exception()))
+
+        await _drain(task)
+
+        assert len(seen) == 1
+        assert isinstance(seen[0], _Boom)
+
+    async def test_raising_hook_is_logged_and_does_not_strand_the_task(self, caplog):
+        registry: set[asyncio.Task] = set()
+
+        def raising_hook(_finished: asyncio.Task) -> None:
+            raise _HookFailed('hook blew up')
+
+        with caplog.at_level(logging.WARNING, logger='shared.asyncio_tasks'), _recorded_loop_errors() as errors:
+            task = asyncio.create_task(asyncio.sleep(0))
+            track_task(task, registry, on_done=raising_hook)
+            await _drain(task)
+
+        assert registry == set()
+        assert errors == []
+        warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert warnings[0].exc_info is not None
+        assert isinstance(warnings[0].exc_info[1], _HookFailed)
+        assert raising_hook.__qualname__ in warnings[0].getMessage()
+
+    async def test_explicit_none_hook_keeps_the_default_release_and_consumption(self):
+        registry: set[asyncio.Task] = set()
+        with _recorded_loop_errors() as errors:
+            task = asyncio.create_task(_raise_boom())
+            track_task(task, registry, on_done=None)
+            await _drain(task)
+            task_ref = weakref.ref(task)
+            del task
+            _collect_and_confirm_gone(task_ref)
+
+        assert errors == []
+        assert registry == set()
