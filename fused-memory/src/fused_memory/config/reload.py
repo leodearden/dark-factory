@@ -53,6 +53,14 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # knobs above; _iter_leaves treats the whole list[ProceduralTopicCluster]
     # as a single atomic leaf, so the clusters list reloads atomically (task 2845).
     'reconciliation.procedural_knowledge_topic_guard_clusters',
+    # Read live by resolve_topic_cluster_autoseed_enabled
+    # (server/near_duplicate_guard.py) at BOTH of its consumers -- per
+    # add_memory merge and per consolidate_memories seed -- off the shared
+    # memory_service.config.reconciliation object, never at store construction
+    # (main.py builds the store unconditionally). So False drops derived
+    # clusters from the very next guard read and True restores them, both
+    # without a restart (task 3135).
+    'reconciliation.procedural_knowledge_topic_cluster_autoseed_enabled',
     # Read live per MemoryService.search by resolve_topic_anchor_enabled
     # (services/topic_anchor.py) off the shared memory_service.config.reconciliation
     # object — never captured at construction — so an in-place reload flips the

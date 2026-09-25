@@ -1984,6 +1984,30 @@ class ReconciliationConfig(BaseModel):
         ),
     )
 
+    # Kill switch for MACHINE-DERIVED topic clusters (task 3135, PRD
+    # memory-write-path-convergence §9 leaf ζ). Read live, off the shared config
+    # object, by server/near_duplicate_guard.py::resolve_topic_cluster_autoseed_enabled
+    # at BOTH consumers -- the consolidate_memories seed and the add_memory merge --
+    # and never at store construction, so both directions of a flip take effect
+    # without a restart. Derived clusters are PROJECT-SCOPED at the read, unlike the
+    # config list above, whose cross-project over-match is a measured residual no
+    # narrowing of ProceduralTopicCluster can express.
+    procedural_knowledge_topic_cluster_autoseed_enabled: bool = Field(
+        default=True,
+        description=(
+            'Governs MACHINE-DERIVED topic clusters (server/topic_cluster_store.py). '
+            'True: consolidate_memories derives and persists one cluster per '
+            'consolidated topic, and the add_memory topic check merges the writing '
+            "project's derived clusters after the config seeds above (config wins a "
+            'topic_id collision). False: nothing is seeded and stored rows are ignored '
+            'at read time without being deleted -- the kill switch when a derived '
+            'cluster misfires. procedural_knowledge_near_dup_guard_enabled remains the '
+            'broader kill switch for the whole guard. Green-tier hot-reloadable via the '
+            'reload_config MCP tool (read live by resolve_topic_cluster_autoseed_enabled '
+            'in server/near_duplicate_guard.py).'
+        ),
+    )
+
     # Topic-anchored canonical recall (task 3111): the READ-side counterpart to the
     # write-side duplicate guards above. Consolidating a near-duplicate cluster into
     # one canonical makes that canonical the LEAST retrievable member of its own
