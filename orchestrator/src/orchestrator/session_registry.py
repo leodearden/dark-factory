@@ -3873,13 +3873,15 @@ class LeaseStatus:
         i.e. exactly claim_lease/reap_stale_leases' own staleness predicate
         (a dead holder pid AND a heartbeat strictly past LEASE_HEARTBEAT_TTL).
         A live holder is never reclaimable, however quiet it has been.
+    holder_record_slug: the body's ``record_slug``, or None when it is blank
+        or the lease is not 'held'.
+    holder_record_state: the holder's registry record (see
+        HolderRecordState) -- the record axis, independent of liveness.
 
-    There is deliberately NO holder_session field. It briefly reported the
-    holder's own session-registry state, but a lease slug is not a record key
-    (see LeaseHolder.session_slug), so it printed a constant
-    ``holder_session=absent`` that an operator could read as a positive
-    orphan finding. Withdrawn under task 3994 rather than left as a
-    plausible-looking constant.
+    Task 3994 withdrew an earlier ``holder_session`` field that printed a
+    constant ``holder_session=absent`` (a lease slug is not a record key).
+    ``holder_record_state`` reads the body's ``record_slug`` instead, and
+    spells the no-evidence case UNLINKED.
     """
 
     name: str
@@ -3890,6 +3892,8 @@ class LeaseStatus:
     heartbeat_ts: str | None
     heartbeat_age_secs: float
     reclaimable: bool
+    holder_record_slug: str | None
+    holder_record_state: HolderRecordState
 
 
 def lease_status(
@@ -3931,6 +3935,8 @@ def lease_status(
             heartbeat_ts=None,
             heartbeat_age_secs=0.0,
             reclaimable=False,
+            holder_record_slug=None,
+            holder_record_state=HolderRecordState.UNLINKED,
         )
     holder, holder_alive, age_secs = _read_lease_holder_state(path, now=now)
     return LeaseStatus(
@@ -3945,6 +3951,8 @@ def lease_status(
         # BOTH a dead pid AND an aged heartbeat. Restating it any other way
         # would re-create the two-clocks-disagreeing failure this fixes.
         reclaimable=(not holder_alive) and age_secs > LEASE_HEARTBEAT_TTL.total_seconds(),
+        holder_record_slug=(holder.record_slug or None) if holder is not None else None,
+        holder_record_state=holder_record_state(holder, root=root),
     )
 
 
@@ -4412,6 +4420,8 @@ def _run_lease_show(name: str) -> None:
     printed only when the body actually parsed, so an unreadable body reads
     as unreadable rather than as a holder named ``<unknown>``. Booleans are
     rendered lowercase (``true``/``false``) so a shell test is trivial.
+    ``holder_record=`` and ``holder_record_slug=`` are ADDITIVE and LAST,
+    the convention ``_run_lease_claim`` states.
 
     Read-only and fail-soft, like lease_status itself: it never mutates the
     lease and never raises.
@@ -4429,6 +4439,9 @@ def _run_lease_show(name: str) -> None:
     print(f'heartbeat_ts={status.heartbeat_ts}')
     print(f'heartbeat_age_secs={int(status.heartbeat_age_secs)}')
     print(f'reclaimable={str(status.reclaimable).lower()}')
+    print(f'holder_record={status.holder_record_state.value}')
+    if status.holder_record_slug is not None:
+        print(f'holder_record_slug={status.holder_record_slug}')
 
 
 def _run_lease_reap() -> list[ReapedLease]:
