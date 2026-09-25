@@ -11364,7 +11364,8 @@ class Harness:
                 # dimension (span) can be cleared on a LATER, quiet observation
                 # than the threshold crossing itself, and a hold that alarms
                 # only when it also happens to be re-stated would be silently
-                # dependent on the event cadence.
+                # dependent on the event cadence.  The alarm is also
+                # pin-class-aware — see recovery_emission's module docstring.
                 if (
                     site in STREAK_CHARGING_SITES
                     and cfg.streak_escalation_enabled
@@ -11384,6 +11385,10 @@ class Harness:
                             as_ageable_records(records), now=datetime.now(UTC),
                         ),
                         filed_at=self._recovery_streak_memo(),
+                        pin_records=records,
+                        suppress_human_parked=getattr(
+                            cfg, 'streak_escalation_suppress_human_parked', True,
+                        ),
                     )
                 if not should_emit_event(
                     observation, threshold=cfg.veto_streak_threshold,
