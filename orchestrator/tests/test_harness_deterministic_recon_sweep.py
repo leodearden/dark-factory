@@ -1338,7 +1338,9 @@ class TestGenericStrandedBlockedReaperSkipsDeterministic:
 # an assumption.  These tests must therefore NOT assert that only one fires.
 # ---------------------------------------------------------------------------
 
-def _pinning_esc(esc_id: str = 'esc-pin-1', *, task_id: str = 'tid-pinned') -> Escalation:
+def _pinning_esc(
+    esc_id: str = 'esc-pin-1', *, task_id: str = 'tid-pinned', level: int = 1,
+) -> Escalation:
     """A REAL pending record — the shape ``get_by_task`` actually returns."""
     return Escalation(
         id=esc_id,
@@ -1347,7 +1349,7 @@ def _pinning_esc(esc_id: str = 'esc-pin-1', *, task_id: str = 'tid-pinned') -> E
         severity='blocking',
         category='infra_issue',
         summary=f'{esc_id} summary',
-        level=1,
+        level=level,
         timestamp='2026-07-01T00:00:00+00:00',
     )
 
@@ -1848,9 +1850,11 @@ def _streak_recon_harness(tmp_path: Path) -> tuple[Harness, _FakeClock]:
     return h, clock
 
 
-def _hold(h: Harness, tid: str = 'tid-pinned', esc_id: str = 'esc-pin-1') -> Escalation:
+def _hold(
+    h: Harness, tid: str = 'tid-pinned', esc_id: str = 'esc-pin-1', *, level: int = 1,
+) -> Escalation:
     """Put a REAL pending record on *tid*, so the sweep's dedup skips it."""
-    esc = _pinning_esc(esc_id, task_id=tid)
+    esc = _pinning_esc(esc_id, task_id=tid, level=level)
     h._escalation_queue.submit(esc)  # type: ignore[union-attr]
     return esc
 
@@ -1895,6 +1899,23 @@ class TestDeterministicReconStreakRelease:
         alarms = _sentinel_alarms(h)
         assert len(alarms) == 1, f'expected one sentinel alarm, got {alarms}'
         assert alarms[0].level == 1
+
+    @pytest.mark.asyncio
+    async def test_a_hold_pinned_only_by_an_l2_files_no_alarm(self, tmp_path: Path) -> None:
+        """Task 4541 RC#1 at the deploy site, over live ``Escalation`` rows.
+
+        ``test_a_sustained_hold_files_one_alarm`` is the counter-signal: the
+        same hold at the level-1 default still alarms.
+        """
+        h, clock = _streak_recon_harness(tmp_path)
+        h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
+        # Source C reads task statuses for every pending L2; keep it inert.
+        h.scheduler.get_statuses = AsyncMock(return_value=({}, None))
+        _hold(h, level=2)
+
+        await _recon_passes(h, clock, 6)
+
+        assert _sentinel_alarms(h) == []
 
     @pytest.mark.asyncio
     async def test_the_next_pass_after_the_hold_clears_resolves_the_alarm(

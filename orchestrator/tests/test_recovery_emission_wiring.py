@@ -74,11 +74,18 @@ def _iso(*, secs_ago: float) -> str:
 def _ref(
     esc_id: str,
     *,
-    level: int = 2,
+    level: int = 1,
     severity: str = 'blocking',
     category: str = 'needs_human',
     age_secs: float = 300.0,
 ) -> EscalationRef:
+    """A pinning record, by default one the auto-watcher has NOT yet promoted.
+
+    ``classify_pins`` link 3 buckets levels 1 and 2 identically, so the default
+    changes no bucket, payload or signature here; it is level 1 because a
+    hold pinned only by L2s files no streak alarm (task 4541), and the alarm
+    tests below must keep exercising the path that does.
+    """
     return EscalationRef(
         id=esc_id,
         level=level,
@@ -963,6 +970,88 @@ class TestVetoStreakAlarmRecovery:
 
 
 @pytest.mark.asyncio
+class TestHumanParkedHoldsDoNotAlarm:
+    """Task 4541 RC#1, end to end through the reconcile sweep's adapter.
+
+    A hold whose every pin is already an L2 is in front of a human, so the
+    alarm — whose trigger was "a human-facing escalation is still open" —
+    must not file, and must not be regenerated when an operator closes it.
+    """
+
+    async def test_a_hold_pinned_only_by_an_l2_files_no_alarm(self, clocked):
+        harness, clock = clocked
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1', level=2)])})
+
+        await _sweeps(harness, clock, 8)
+
+        assert _alarms(harness) == []
+
+    async def test_suppression_is_not_blindness(self, clocked):
+        """The veto rows still name the pin; only the queue write is skipped."""
+        harness, clock = clocked
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1', level=2)])})
+
+        await _sweeps(harness, clock, 8)
+
+        rows = _recovery_rows(harness)
+        assert [r['data']['streak'] for r in rows] == [1, 3]
+        assert all(r['event_type'] == EventType.recovery_vetoed.value for r in rows)
+        assert all('esc-1' in json.dumps(r['data']) for r in rows)
+
+    async def test_an_unpromoted_pin_still_alarms_at_the_threshold(self, clocked):
+        """COUNTER-SIGNAL: an L1 pin is not yet in front of a human."""
+        harness, clock = clocked
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1', level=1)])})
+
+        await _sweeps(harness, clock, 2)
+        assert _alarms(harness) == []
+        clock.advance(_SWEEP_INTERVAL)
+        await _sweeps(harness, clock, 1)
+
+        assert len(_alarms(harness)) == 1
+
+    async def test_closing_the_alarm_after_promotion_does_not_regenerate_it(
+        self, clocked,
+    ):
+        """FOREVER-LOOP REGRESSION: the ``esc-recovery-veto-streak-backlog-*`` cycle."""
+        harness, clock = clocked
+        stub = _bind_reports(
+            harness, {'T1': _pinned_hold(escalations=[_ref('esc-1', level=1)])},
+        )
+        await _sweeps(harness, clock, 3)
+        (alarm,) = _alarms(harness)
+        harness._escalation_queue.resolve(
+            alarm.id, 'the pin is with a human now', resolved_by='interactive',
+        )
+        stub.reports['T1'] = _pinned_hold(escalations=[_ref('esc-1', level=2)])
+
+        await _sweeps(harness, clock, 8)
+
+        assert _alarms(harness) == []
+
+    async def test_the_knob_restores_the_old_filing(self, clocked):
+        harness, clock = clocked
+        harness.config.recovery_emission = RecoveryEmissionConfig(
+            streak_escalation_suppress_human_parked=False,
+        )
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1', level=2)])})
+
+        await _sweeps(harness, clock, 3)
+
+        assert len(_alarms(harness)) == 1
+
+    async def test_a_mixed_pin_set_alarms(self, clocked):
+        harness, clock = clocked
+        _bind_reports(harness, {
+            'T1': _pinned_hold(escalations=[_ref('a', level=2), _ref('b', level=1)]),
+        })
+
+        await _sweeps(harness, clock, 3)
+
+        assert len(_alarms(harness)) == 1
+
+
+@pytest.mark.asyncio
 class TestPerTickSitesNeverCharge:
     """Only the SWEEP-frequency sites charge the counter.
 
@@ -976,7 +1065,7 @@ class TestPerTickSitesNeverCharge:
         harness._escalation_queue.submit(Escalation(
             id='esc-T1-1', task_id='T1', agent_role='implementer',
             severity='blocking', category='design_concern',
-            summary='an open handoff on task T1', level=2,
+            summary='an open handoff on task T1', level=1,
         ))
         harness.scheduler.get_task = AsyncMock(
             return_value={'id': 'T1', 'metadata': {}},
