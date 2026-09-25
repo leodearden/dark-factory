@@ -31,6 +31,7 @@ from legibility import (
     digest,
     nightly,
     trickle_state,
+    unlanded,
 )
 from legibility import (
     config as config_mod,
@@ -2533,6 +2534,8 @@ def test_run_nightly_fail_loud_on_commit_failure(tmp_path):
     before_log = subprocess.run(
         ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
     ).stdout.splitlines()
+    codebook_path = repo / 'docs' / 'legibility' / 'confusion-codebook.yaml'
+    head_bytes = codebook_path.read_bytes()
 
     fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC)
     escalation_calls = []
@@ -2562,16 +2565,100 @@ def test_run_nightly_fail_loud_on_commit_failure(tmp_path):
     assert 'commit' in arguments['summary'].lower()
 
     # No NEW commit exists -- the escalation + non-zero exit is the loud
-    # signal (the dump already landed in the working tree, uncommitted).
+    # signal, and the unlanded dump is rolled back out of the checkout.
     after_log = subprocess.run(
         ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
     ).stdout.splitlines()
     assert after_log == before_log
 
+    _assert_refused_dump_rolled_back(repo, head_bytes, result)
+    assert 'cannot lock ref (simulated)' in arguments['detail']
+    assert str(result.rollback.quarantine_dir) in arguments['detail']
+
+
+def _assert_refused_dump_rolled_back(repo: Path, head_bytes: bytes, result) -> None:
+    """The checkout is back at HEAD and the refused dump -- with the night's
+    one 'known-cause' sighting -- survives only in the quarantine."""
     status = subprocess.run(
         ['git', 'status', '--porcelain'], cwd=repo, check=True, capture_output=True, text=True,
     ).stdout
-    assert 'confusion-codebook.yaml' in status
+    assert status == ''
+    assert (repo / 'docs' / 'legibility' / 'confusion-codebook.yaml').read_bytes() == head_bytes
+
+    rollback = result.rollback
+    assert rollback is not None and rollback.restored
+    assert rollback.quarantine_dir.parent == unlanded.quarantine_root('testproj')
+    assert rollback.quarantine_dir.name.startswith('trickle-2026-07-13-')
+    quarantined = codebook.load(
+        rollback.quarantine_dir / 'docs' / 'legibility' / 'confusion-codebook.yaml',
+    )
+    entry = next(e for e in quarantined['entries'] if e['id'] == 'known-cause')
+    assert [s['session'] for s in entry['sightings']] == ['session-1']
+
+
+def test_run_nightly_commit_refused_by_pre_commit_hook_restores_the_checkout(tmp_path):
+    """A real refusal through the DEFAULT committer, in the shape of reify's
+    cited-test-path gate (core.hooksPath pointing outside the tracked tree)."""
+    work_cwd = str(tmp_path / 'work')
+    repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+    hook = tmp_path / 'hooks' / 'pre-commit'
+    hook.parent.mkdir()
+    hook.write_text(
+        '#!/bin/sh\n'
+        'echo "cited-test-path gate: tests/moved_test.rs does not exist"\n'
+        'exit 1\n'
+    )
+    hook.chmod(0o755)
+    subprocess.run(
+        ['git', 'config', 'core.hooksPath', str(hook.parent)], cwd=repo, check=True,
+    )
+
+    projects_root = tmp_path / 'projects'
+    session_path = projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl'
+    target_date = date(2026, 7, 13)
+    _write_transcript(
+        session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
+    )
+    before_log = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+    codebook_path = repo / 'docs' / 'legibility' / 'confusion-codebook.yaml'
+    head_bytes = codebook_path.read_bytes()
+    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC)
+    escalation_calls = []
+
+    def _run():
+        return nightly.run_nightly(
+            config_path=config_path,
+            projects_root=projects_root,
+            target_date=target_date,
+            now=fixed_now,
+            invoke=_fake_invoke_known_cause,
+            status_fetcher=None,
+            poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        )
+
+    result = _run()
+
+    assert result.exit_code == 1
+    after_log = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+    assert after_log == before_log
+    _assert_refused_dump_rolled_back(repo, head_bytes, result)
+    assert len(escalation_calls) == 1
+    detail = escalation_calls[0][1]['params']['arguments']['detail']
+    assert 'cited-test-path gate' in detail
+    assert str(result.rollback.quarantine_dir) in detail
+
+    # The next night starts from HEAD, not from the refused dump.
+    hook.unlink()
+    result_2 = _run()
+
+    assert result_2.commit_made is True
+    committed = codebook.load(codebook_path)
+    entry = next(e for e in committed['entries'] if e['id'] == 'known-cause')
+    assert len(entry['sightings']) == 1
 
 
 # ---------------------------------------------------------------------------
