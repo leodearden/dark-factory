@@ -168,7 +168,7 @@ def test_roll_back_returns_incomplete_when_git_hangs(tmp_path, monkeypatch):
 
     assert time.monotonic() - started < 10
     assert rb.restored is False
-    assert 'timed out' in rb.failure
+    assert rb.failure is not None and 'timed out' in rb.failure
     assert rb.quarantine_dir is not None
     assert (rb.quarantine_dir / _CODEBOOK).read_bytes() == _REFUSED
 
