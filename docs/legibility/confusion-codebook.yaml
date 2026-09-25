@@ -2095,6 +2095,18 @@ entries:
     origin_phase: architect
     manifested_phase: ops
     note: Multiple get_pending_escalations retries (L1 x5, L2 x3) and 3 Bash watcher-rearm.sh retries, with 2 retries hitting designed-outcome ceiling (exit 124). Pattern consistent with loop mechanics fighting harness event model.
+  - date: '2026-09-21'
+    project: dark_factory
+    session: b3d32dd4-ed6e-4bba-973b-e4337fabd941
+    origin_phase: recon
+    manifested_phase: recon
+    note: recon-escalation-watcher rotation needed 13 manual 'Re-arm watcher for cycle N' background dispatches across the session (no persistent self-sustaining loop from the harness), and its own improvised liveness check initially misdiagnosed the legitimate persistent component ~/.claude/recon-watch/loop.sh as an 'independent duplicate' process tree before self-correcting at turn 370 — matches the entry's 'improvised liveness checks' and bg-task-reaping themes.
+  - date: '2026-09-21'
+    project: dark_factory
+    session: 88b152e9-82a1-40f2-8c3a-f63ed502d45a
+    origin_phase: recon
+    manifested_phase: recon
+    note: 13 sequential 'Re-arm watcher for cycle N' background commands across the session, plus a self-correction (turn 484) where the agent initially misjudged a live process tree's state, show the recon-escalation-watcher's liveness/lease semantics being worked out by trial rather than from a documented contract — matches the pattern of improvised liveness checks and harness-fighting re-arm mechanics.
 - id: subagent-runner-protocol-defects
   title: 'Sub-agent runner protocol defects: StructuredOutput shape/turn-contract traps, usage-limit resume storms, and falsy-[] predictions never persisted'
   severity: medium
@@ -3253,6 +3265,12 @@ entries:
     origin_phase: unknown
     manifested_phase: implement
     note: Implementer session for task 5560 ran `wc -l .../.task-meta/5560/iterations.jsonl` expecting it to exist; the preceding `ls` shows only agent_session.json, metadata.json, plan.json, plan.lock, reviews, verdicts — no iterations.jsonl — and the combined command exits 1.
+  - date: '2026-09-24'
+    project: dark_factory
+    session: 14efb8d4-eb96-4396-a560-5120d935549d
+    origin_phase: implement
+    manifested_phase: implement
+    note: 'turn 37: agent tries `wc -l .task-meta/5587/iterations.jsonl` and pipes tail through a parser, but the file doesn''t exist (exit 1, ''No such file or directory'') — same boilerplate-assumes-iterations.jsonl-exists pattern.'
 - id: entry-cand-20260718-1
   title: Reconciliation stage cost telemetry (tokens_used) always zero despite nonzero llm_calls
   severity: medium
@@ -4401,6 +4419,12 @@ entries:
     origin_phase: unknown
     manifested_phase: ops
     note: 'Digest ''User Corrections'' bucket captures injected task briefing (turn 7: ''Read the brief at...'') as if it were user-supplied correction; same pattern as recursive prompt ingestion.'
+  - date: '2026-09-20'
+    project: dark_factory
+    session: 8c5661d7-c638-419a-9d2c-f9d518117480
+    origin_phase: implement
+    manifested_phase: ops
+    note: 'Task-5685 session reproduces the defect directly from raw records rather than inference: Mem0/episode record b203a05c#22 (1971 chars, single assistant text block) and 6a527d51#10 (2122 chars, six weeks earlier) both parse whole via json.loads() to a dict keyed exactly {''matches'',''candidates''} — the trickle coder''s own answer schema — carrying meta phrases ''that''s wrong''/''i was wrong''. Confirms this is a stable recurring carrier shape, not a one-off.'
 - id: entry-cand-20260722-11
   title: Read tool's undocumented 256KB cap blocks whole-file architect exploration of large modules
   severity: medium
@@ -4825,6 +4849,36 @@ entries:
     origin_phase: unknown
     manifested_phase: recon
     note: 372-byte digest for a recon-class session with n_user_turns=0 and all signal_counts=0; the only content present is the standard injected system-reminder boilerplate (environment block, model-ID block, deferred-tools list, agent-types list, MCP server instructions, skills list) — no actual session substance survives extraction, matching the known 'digest collapses to system-reminder boilerplate' pattern.
+  - date: '2026-09-22'
+    project: dark_factory
+    session: bef28bca-b6b1-49ee-9785-aaf325911365
+    origin_phase: unknown
+    manifested_phase: recon
+    note: Digest for this recon session (score 0.0, n_user_turns 0, all signal_counts 0) contains only system-reminder boilerplate (environment, model id, deferred-tools list, agent-types list, MCP server instructions, skills list, date) with no actual session content — the extraction collapsed to boilerplate, discarding whatever substance (if any) the underlying recon session had.
+  - date: '2026-09-20'
+    project: dark_factory
+    session: b3a7bb06-c960-42f7-aa3f-4585bd72cf72
+    origin_phase: recon
+    manifested_phase: recon
+    note: 372-byte digest for a recon-class session scores 0.0 with n_user_turns=0 and every signal_count at zero; the only content present is the standard injected system-reminder boilerplate (environment block, model-identity notice, deferred-tools list, agent-type list, MCP server instructions, skills list) — no actual session substance survived extraction, matching the known pattern of digest generation collapsing a session down to boilerplate.
+  - date: '2026-09-25'
+    project: dark_factory
+    session: dbd3fd5f-e862-4004-9a20-83a6f7f41a81
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Recon-class session digest is entirely system-reminder boilerplate (env info, model id, deferred-tool list, agent-type list, MCP server instructions, skills catalog) with n_user_turns=0, score=0.0, and every signal_count at zero — the digest pipeline captured a session with no real substance, matching the known 'digest collapses to system-reminder boilerplate' pattern.
+  - date: '2026-09-22'
+    project: dark_factory
+    session: 6c29250b-a8b6-4282-a1da-bf131969ae6b
+    origin_phase: ops
+    manifested_phase: recon
+    note: recon-class session (score 0.0, n_user_turns=0, all signal_counts zero, size_bytes=372) whose captured 'session content' is nothing but the standard injected system-reminder boilerplate (environment block, model card, deferred-tools list, agent-types list, MCP server instructions, skills list) — no actual recon transcript substance survived extraction, matching the known digest-collapses-to-boilerplate pattern.
+  - date: '2026-09-20'
+    project: dark_factory
+    session: 76c55158-49cf-417f-b739-3316bbf9698d
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Digest is 378 bytes, score 0.0, n_user_turns 0, all signal_counts 0 — the captured 'content' is entirely system-reminder boilerplate (environment block, model-ID block, deferred-tools list, agent-types list, MCP server instructions, skills list) with zero actual session substance, matching this entry's exact failure mode.
 - id: entry-cand-20260720-7
   title: Recon stage self-reported counters diverge from computed pipeline stats, with mismatched field names between the two
   severity: medium
@@ -6379,6 +6433,12 @@ entries:
     origin_phase: verify
     manifested_phase: verify
     note: Digest 'User Corrections' section contains the trickle-coder's own injected verification prompt and codebook-reference context, mislabeled as a user correction rather than filtered as system metadata.
+  - date: '2026-09-20'
+    project: dark_factory
+    session: 8c5661d7-c638-419a-9d2c-f9d518117480
+    origin_phase: implement
+    manifested_phase: ops
+    note: Same session's forensic evidence (two independently-dated records with the trickle-coder's own {'matches','candidates'} schema captured as session content) is concrete confirmation of this entry's 'risking self-pollution of the codebook corpus' framing — the self-ingested payload literally reads as if it were a 'that's wrong'/'i was wrong' user correction.
 - id: entry-cand-20260714-3
   title: Recon dedup 'fully resolved' claims come from an under-scoped search radius, so live near-duplicates recur across cycles
   severity: medium
@@ -7283,6 +7343,12 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: ModuleNotFoundError in task worktree (.worktrees/4836) during orchestrated-task execution; n_user_turns=0 indicates agent dispatch with no interactive intervention
+  - date: '2026-09-20'
+    project: dark_factory
+    session: c5ee771b-9d65-45dc-9141-460cc279bb3d
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Interactive session in .worktrees/5601 hit a ModuleNotFoundError (turn 30) followed by a 'does not exist' not-found (turn 38); matches the ModuleNotFoundError/command-not-found-in-task-worktree pattern. Digest too thin (448 bytes, no user turns, no phase-identifying detail) to support a specific phase beyond unknown.
 - id: entry-cand-20260720-10
   title: Architect overrides explicit in-task dependency-coordination branching instructions instead of following them
   severity: medium
@@ -8782,6 +8848,18 @@ entries:
     origin_phase: ops
     manifested_phase: ops
     note: 'Digest ''Not Found'' signals rendered as bare templates (turns 141, 197: ''does not exist'' only) without specifying which file/entity or providing diagnostic context'
+  - date: '2026-09-21'
+    project: dark_factory
+    session: ff346118-64dd-426a-95b0-06987dbf7159
+    origin_phase: unknown
+    manifested_phase: ops
+    note: 'Digest''s sole signal is a bare ''Not Found'' template: ''(turn 35) not found in'' with the matched substring truncated/dropped after ''in'', consistent with the known bare-template rendering defect.'
+  - date: '2026-09-22'
+    project: dark_factory
+    session: f744ef41-21ed-4424-9989-9fcfe58020c7
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Digest's sole signal is a bare not_found template '(turn 114) does not exist' with the actual matched substring/context dropped, leaving nothing evaluable — same bare-template rendering defect as the matched entry.
 - id: entry-cand-20260722-34
   title: Census-verifier agent doesn't know the transcript storage path convention, so it blind-searches the filesystem and repeatedly hits approval gates
   severity: medium
@@ -9884,6 +9962,12 @@ entries:
     origin_phase: review
     manifested_phase: review
     note: Digest 'User Corrections' bucket captures review findings ('blocking issues were found') as if they were corrective user feedback, not review-discovered defects
+  - date: '2026-09-22'
+    project: dark_factory
+    session: fbd19b60-b314-4ad4-a153-042f2b7ed661
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 6 of the digest's 10 'User Corrections' items (turns 178, 190, 284, 306, 622, 643) are background sub-agent task-notification result dumps (e.g. 'Jev / TypeSafe AI fact sheet', 'Prior-art sweep memory and plans', 'History trace of triage task family', 'Seam ownership sweep for the PRD') -- non-corrective pasted report content mislabeled as user corrections, matching this entry's pattern exactly.
 - id: entry-cand-20260728-1
   title: Digest pipeline mislabels an ordinary task's injected '# Context' project-briefing block as a 'User Correction'
   severity: medium
@@ -15592,6 +15676,24 @@ entries:
     origin_phase: verify
     manifested_phase: verify
     note: Orchestrated task in worktree .worktrees/4116 fires repeated 'no such file or directory' errors (turns 28, 38) attempting to access .task/reviews/ and .task/iterations.jsonl. The errors do not contribute to diagnosing the primary test failure (test_stale_streak_stamp_does_not_cap_a_fresh_defer).
+  - date: '2026-09-24'
+    project: dark_factory
+    session: 389488b1-0c59-4ab5-b08b-dd70ef3e7cf4
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: orchestrated-task session in .worktrees/5792 with two not_found signals ('does not exist' turn 24, 'no such file or directory' turn 32) and zero other signal_counts (tool_error, self_correct, df_guard, interrupt, designed_outcome all 0) — matches the pattern of a worktree task firing not-found errors with no other diagnostic context to localize the failure.
+  - date: '2026-09-20'
+    project: dark_factory
+    session: 892d5860-4464-4ff5-928b-e2001885abb8
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated task in a task worktree (.worktrees/4486) hits a single unattributed 'no such file or directory' (turn 44) with zero other signal — matches the established pattern of orchestrated worktree tasks firing not-found errors with no accompanying diagnostic context. Digest too sparse (466 bytes, 0 user turns) to support a phase determination.
+  - date: '2026-09-22'
+    project: dark_factory
+    session: ca2c46c3-0b28-4e12-bdf8-36e8988b59b7
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'Orchestrated-task session in worktree .worktrees/5683: 5 ''not found''/''no such file or directory''/''does not exist'' signals across turns 27, 51 (x2), 120, 127, with every other signal_count at zero and no user turns — matches the known pattern of repeated not-found errors with no other diagnostic signal in an orchestrated worktree task. Digest too thin (598 bytes, no turn content) to identify the missing path or attribute a phase.'
 - id: entry-cand-20260809-16
   title: Agent falls back to a whole-filesystem `find /` to locate an installed package's source, timing out the Bash call
   severity: medium
@@ -16498,6 +16600,19 @@ entries:
     origin_phase: unknown
     manifested_phase: implement
     evidence_quote: 'FileNotFoundError: [Errno 2] No such file or directory: ''test_bake_off_storage_shape.py'''
+- id: entry-cand-20260921-25
+  title: recon-watch loop.sh's deliberate no-heartbeat lease design is rediscovered by failure, not documented to the watcher
+  severity: medium
+  status: open
+  origin_phase: recon
+  manifested_phase: recon
+  sightings:
+  - date: '2026-09-21'
+    project: dark_factory
+    session: 88b152e9-82a1-40f2-8c3a-f63ed502d45a
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: I was wrong a moment ago when I called that second process tree an independent duplicate. It's `~/.claude/recon-watch/loop.sh`, a deliberate component... Its header says it *deliberately* doesn't heartbeat the lease — "the lease must go stale if the owning Claude session dies, or a dead holder would block the next watcher."
 candidates:
 - id: cand-20260715-1
   title: Recon remediation cycles timeout on fused-memory I/O
@@ -30527,3 +30642,43 @@ candidates:
     origin_phase: implement
     manifested_phase: review
     evidence_quote: The same diff applied exactly this fix to five methods in test_merge_queue_concurrent_verify.py (commit 1cb11c70e2), but only because that module's in-file guard scans `Path(__file__)`. This module is not scanned, so the invariant broke silently here. It is the same single-file blind spot the new corpus guard was written to close.
+- id: cand-20260921-23
+  title: Watcher liveness pgrep matches unrelated processes system-wide, leaking other sessions' command lines into context
+  cause: Ad-hoc liveness/duplicate-process checks in watcher loops use unscoped pgrep patterns with no session/lease-id filter, so the match set includes every matching process on the host rather than just the watcher's own lineage, dumping unrelated sessions' command-line contents into the watcher's context window.
+  area: recon-escalation-watcher / escalation-watcher liveness checking
+  first_seen: '2026-09-21'
+  disposition: rejected
+  sightings:
+  - date: '2026-09-21'
+    project: dark_factory
+    session: b3d32dd4-ed6e-4bba-973b-e4337fabd941
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: a `pgrep` I ran was too broad and dumped unrelated sessions' command lines into context — my mistake, and I've scoped process checks tightly since.
+- id: cand-20260921-24
+  title: Unscoped pgrep during watcher liveness check leaks unrelated sessions' command lines into context
+  cause: The escalation-watcher session ran a broad pgrep to check for other watcher/loop processes, which matched and printed unrelated sessions' full command lines into the agent's own context — a scoping omission the agent caught and self-corrected, but which briefly exposed cross-session process data it had no need to see.
+  area: watcher-process-diagnostics
+  first_seen: '2026-09-21'
+  disposition: rejected
+  sightings:
+  - date: '2026-09-21'
+    project: dark_factory
+    session: 88b152e9-82a1-40f2-8c3a-f63ed502d45a
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: a `pgrep` I ran was too broad and dumped unrelated sessions' command lines into context — my mistake, and I've scoped process checks tightly since.
+- id: cand-20260921-25
+  title: recon-watch loop.sh's deliberate no-heartbeat lease design is rediscovered by failure, not documented to the watcher
+  cause: The watcher agent initially misdiagnosed the persistent `~/.claude/recon-watch/loop.sh` process tree as an independent duplicate and treated its stale lease as a fault, before reading the script header and realizing the design intentionally omits lease heartbeating so staleness can signal a dead owning session. The watcher-facing prompt/skill never states this contract, forcing the agent to reverse-engineer architecture intent from source under time pressure.
+  area: recon-watch-lease-design
+  first_seen: '2026-09-21'
+  disposition: promoted
+  sightings:
+  - date: '2026-09-21'
+    project: dark_factory
+    session: 88b152e9-82a1-40f2-8c3a-f63ed502d45a
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: I was wrong a moment ago when I called that second process tree an independent duplicate. It's `~/.claude/recon-watch/loop.sh`, a deliberate component... Its header says it *deliberately* doesn't heartbeat the lease — "the lease must go stale if the owning Claude session dies, or a dead holder would block the next watcher."
+  promoted_to: entry-cand-20260921-25
