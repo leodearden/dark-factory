@@ -78,6 +78,22 @@ A LEAVE caused by a LIVE claimant emits nothing at all: on a healthy fleet that
 is the overwhelming majority of every sweep, and emitting for it would bury the
 strand signal under normal traffic.
 
+PIN-CLASS AWARENESS
+-------------------
+The alarm's trigger was itself "a human-facing escalation is still open", so
+on a queue where L2s legitimately stay parked for days it re-fired forever,
+and an operator closing it only restarted the cycle.  So an
+``escalation_pinned`` hold whose every pin is already an L2 (the predicate is
+``escalation.pins.pinned_only_by_human_parked``) files no alarm; any other
+reason, and any hold with an unpromoted pin, still does.  Only the queue WRITE
+is suppressed — the streak still counts and the events and sweep summary still
+flow — and ``recovery_emission.streak_escalation_suppress_human_parked`` turns
+it off live.  Retuning ``veto_streak_threshold`` / ``veto_streak_min_span_secs``
+or ``streak_escalation_enabled`` instead was rejected: each also silences
+genuinely stuck tasks.  An alarm filed BEFORE its pin was promoted stays open
+until the release edge stands it down; no earlier stand-down is attempted,
+because it would fight the ``filed_at`` memo.
+
 WRAPPERS AND ECHOES
 -------------------
 The auto-watcher promotes these alarms to human-facing L2s.  Such a WRAPPER
@@ -862,6 +878,8 @@ def emit_recovery_veto_streak_escalation(
     escalation_ids: Any,
     ages_secs: Any = None,
     filed_at: dict[str, int] | None = None,
+    pin_records: Any = None,
+    suppress_human_parked: bool = True,
 ) -> bool:
     """File ONE blocking L1 when a veto streak clears BOTH halves of the bar.
 
@@ -901,6 +919,15 @@ def emit_recovery_veto_streak_escalation(
             check``).  Keyed on task_id — matching the SENTINEL's own
             granularity — so the memo can never disagree with what
             ``has_open_l1`` would answer.
+        pin_records: The records the caller already read for this hold (never
+            a second read), or ``None``.  With *suppress_human_parked*, an
+            ``escalation_pinned`` hold they show to be
+            ``escalation.pins.pinned_only_by_human_parked`` files nothing — see
+            PIN-CLASS AWARENESS in this module's docstring.  ``None`` (omitted,
+            or an unreadable store) never counts as human-parked.
+        suppress_human_parked:
+            ``config.recovery_emission.streak_escalation_suppress_human_parked``;
+            ``False`` restores the pre-4541 filing.
 
     Returns:
         ``True`` only when a NEW escalation was filed.
@@ -917,6 +944,20 @@ def emit_recovery_veto_streak_escalation(
     # Second half of the predicate, checked BEFORE any filesystem access so the
     # common case stays free.
     if span_seconds < min_span_seconds:
+        return False
+
+    # Before the memo and `has_open_l1`, so a suppressed hold costs no I/O.
+    if (
+        suppress_human_parked
+        and reason == LeaveReason.escalation_pinned
+        and _pinned_only_by_human_parked(task_id, pin_records)
+    ):
+        if streak == threshold:
+            logger.info(
+                'Recovery veto streak for task %s at %s not escalated: every '
+                'pin is already an L2 in front of a human (%s)',
+                task_id, site, ','.join(_flatten_ids(escalation_ids)) or '(none)',
+            )
         return False
 
     sentinel = f'{RECOVERY_VETO_STREAK_SENTINEL_PREFIX}{task_id}'
@@ -991,7 +1032,9 @@ def emit_recovery_veto_streak_escalation(
                 'long-running, this alarm is the noisy one: retune or silence '
                 'it live via the green-tier config section recovery_emission.'
                 '{veto_streak_threshold,veto_streak_min_span_secs,'
-                'streak_escalation_enabled} — no fleet restart needed.'
+                'streak_escalation_enabled,'
+                'streak_escalation_suppress_human_parked} — no fleet restart '
+                'needed.'
             ),
         )
     except Exception as exc:  # noqa: BLE001 — fail-open backstop
@@ -1020,6 +1063,27 @@ def emit_recovery_veto_streak_escalation(
         reason, ','.join(_flatten_ids(escalation_ids)) or '(none)',
     )
     return True
+
+
+def _pinned_only_by_human_parked(task_id: str, pin_records: Any) -> bool:
+    """``escalation.pins.pinned_only_by_human_parked``, failing toward the alarm."""
+    if pin_records is None:
+        return False
+    # Its own guard rather than the filer's fail-open excepts, which answer
+    # "no filing": a classifier fault must mean "not human-parked" and let the
+    # alarm fire, never silence it.
+    try:
+        from escalation.pins import pinned_only_by_human_parked  # noqa: PLC0415 — optional dep
+
+        # live_claimant=False is exact here for the reason pin_buckets gives:
+        # a charging site never reaches the filer with a live claimant.
+        return pinned_only_by_human_parked(task_id, pin_records, live_claimant=False)
+    except Exception as exc:  # noqa: BLE001 — fail toward the alarm
+        logger.warning(
+            'recovery veto streak pin class for task %s could not be read; '
+            'alarming as if not human-parked: %s', task_id, exc,
+        )
+        return False
 
 
 def resolve_recovery_veto_streak_escalation(
