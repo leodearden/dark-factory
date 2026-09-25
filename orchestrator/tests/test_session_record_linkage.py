@@ -8,11 +8,17 @@ from pathlib import Path
 
 import pytest  # pyright: ignore[reportMissingImports]
 
+from orchestrator import session_hooks as sh
 from orchestrator import session_registry as sr
 
 # A pid virtually guaranteed dead on any host (the suite-wide idiom; see
 # test_session_registry.py's own _DEAD_PID -- deliberately not imported).
 _DEAD_PID = 2**31 - 1
+
+
+@pytest.fixture(autouse=True)
+def _isolate_fleet_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
 
 
 def _record(
@@ -345,3 +351,64 @@ class TestPointerSweepDrivers:
         expected_dir = sr.record_path_for_slug(slug, root=tmp_path).parent
         assert capsys.readouterr().out == f'{expected_dir}\n'
         assert not sr.session_pointer_path_for_pid(_DEAD_PID, root=tmp_path).exists()
+
+
+_CWD = '/home/leo/src/dark-factory'
+
+
+def _pointer_files(root: Path) -> list[Path]:
+    pointers = sr.session_pointers_dir(root)
+    return sorted(pointers.iterdir()) if pointers.is_dir() else []
+
+
+class TestSessionStartStampsPointer:
+    _OWNER = 3_215_501
+
+    def test_a_hand_launched_session_is_findable_from_its_claude_pid(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(sh, '_owning_claude_pid', lambda: self._OWNER)
+
+        record = sh.run_session_start({'session_id': 'sess-hl', 'cwd': _CWD}, {}, root=tmp_path)
+
+        assert sr.resolve_session_slug_for_pid(self._OWNER, root=tmp_path) == record.session_slug
+
+    def test_the_pointer_is_keyed_on_the_claude_pid_not_the_launcher_pid(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(sh, '_owning_claude_pid', lambda: self._OWNER)
+
+        record = sh.run_session_start({'session_id': 'sess-hl', 'cwd': _CWD}, {}, root=tmp_path)
+
+        assert record.launcher_pid != self._OWNER
+        assert sr.resolve_session_slug_for_pid(record.launcher_pid, root=tmp_path) is None
+
+    def test_an_unresolvable_claude_pid_writes_the_record_but_no_pointer(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(sh, '_owning_claude_pid', lambda: None)
+
+        record = sh.run_session_start({'session_id': 'sess-hl', 'cwd': _CWD}, {}, root=tmp_path)
+
+        assert sr.read_record(record.session_slug, root=tmp_path) == record
+        assert _pointer_files(tmp_path) == []
+
+    def test_a_session_that_never_binds_gets_no_pointer(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(sh, '_owning_claude_pid', lambda: self._OWNER)
+
+        record = sh.run_session_start({'session_id': '', 'cwd': _CWD}, {}, root=tmp_path)
+
+        assert record.claude_session_id is None
+        assert _pointer_files(tmp_path) == []
+
+    def test_an_unwritable_pointer_dir_never_breaks_the_hook(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(sh, '_owning_claude_pid', lambda: self._OWNER)
+        sr.session_pointers_dir(tmp_path).write_text('not a directory', encoding='utf-8')
+
+        record = sh.run_session_start({'session_id': 'sess-hl', 'cwd': _CWD}, {}, root=tmp_path)
+
+        assert sr.read_record(record.session_slug, root=tmp_path) == record
