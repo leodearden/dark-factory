@@ -3282,6 +3282,7 @@ class SqliteTaskBackend:
 
             # details: explicit param wins over prompt. Both honor ``append``.
             existing_details = row['details'] or ''
+            new_details: str | None = None
             if details is not None:
                 new_details = (
                     f'{existing_details}\n\n{details}'
@@ -3296,6 +3297,13 @@ class SqliteTaskBackend:
                 )
                 set_columns.append('details = ?')
                 set_values.append(new_details)
+
+            # Only the columns this write supplies, judged on the values it
+            # would persist: a pre-gate corrupt column elsewhere in the row
+            # must not block the write that remediates it.
+            refuse_leaked_task_text(
+                {'title': title, 'description': description, 'details': new_details},
+            )
 
             new_metadata: str | None = None
             if metadata is not None:
