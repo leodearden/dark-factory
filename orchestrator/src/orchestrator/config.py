@@ -2679,6 +2679,21 @@ class RecoveryEmissionConfig(BaseModel):
             'auto-resolves when its veto stops.'
         ),
     )
+    streak_escalation_suppress_human_parked: bool = Field(
+        default=True,
+        description=(
+            'Skip the veto-streak L1 when the hold is escalation_pinned and '
+            'every record pinning the task is already an L2 in front of a '
+            'human. Without this the alarm re-fires forever on a queue where '
+            'L2s legitimately stay parked for days, since its trigger is '
+            'exactly "a human-facing escalation is still open" (re-filed twice '
+            'inside one hour on 2026-08-19; 27 of 94 pending records on '
+            '2026-08-31). Set to false to restore the pre-4541 behaviour. It '
+            'suppresses only the queue WRITE: recovery_vetoed rows and the '
+            'per-sweep summary line keep flowing, and a hold that includes '
+            'any unpromoted pin still alarms.'
+        ),
+    )
     landing_git_error_rate_per_hour: int = Field(
         default=10,
         ge=1,
