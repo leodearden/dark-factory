@@ -1643,6 +1643,10 @@ def _run_status_refresh_and_retitle(
     alternative of forking every pre-SessionStart event onto a new slug,
     which would misroute the OWNER's session whenever its SessionStart is
     merely slow -- trading a rare stale status for a routine wrong one.
+
+    The refresh path stamps the pid pointer too (``_stamp_session_pointer``),
+    so a session already running when the pointer shipped -- a long-lived
+    watcher -- is linked by its next Notification/Stop, not its next restart.
     """
     probes = _EventProbes(env)
     # RAW env, deliberately, on the fork path too (task 4663): this identity
@@ -1706,6 +1710,7 @@ def _run_status_refresh_and_retitle(
     # itself, and that bump is owed on EVERY event, a withheld one included
     # -- it is the whole point of withholding rather than skipping.
     session_registry.write_record(record, root=root)
+    _stamp_session_pointer(record, probes, root)
     title = hook_display_title(identity, env, record)
     return osc_retitle_sequence(status, title)
 
