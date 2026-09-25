@@ -4161,13 +4161,14 @@ class TestLeaseSlugIsNotASessionRecordKey:
       project token is the registry's project id (``dark_factory``), not the
       lease's short name (``df``).
 
-    Only ONE test lives here, on purpose: the disjointness RATIONALE belongs to
-    (and is recorded in) ``LeaseHolder.session_slug``'s docstring, and a test
-    that merely compares a literal this file wrote against
-    ``build_session_slug``'s output cannot fail as a result of any production
-    change. The single assertion below has real coupling — it would break if
-    ``read_record`` ever started resolving a lease slug, which is exactly the
-    reintroduction worth catching.
+    No test here compares a literal this file wrote against
+    ``build_session_slug``'s output, on purpose: the disjointness RATIONALE
+    belongs to (and is recorded in) ``LeaseHolder.session_slug``'s docstring,
+    and such a test cannot fail as a result of any production change. The
+    first test has real coupling — it would break if ``read_record`` ever
+    started resolving a lease slug, which is exactly the reintroduction worth
+    catching. The second pins the pid pointer (task 4237) as the join that
+    does reach the record, side by side with the lookup that cannot.
     """
 
     # A hand-launched session's uniqueness token: hook_session_slug passes the
@@ -4209,6 +4210,22 @@ class TestLeaseSlugIsNotASessionRecordKey:
         # is why holder_session_state was a constant 'absent' in production.
         with pytest.raises(FileNotFoundError):
             sr.read_record(self._lease_slug(), root=tmp_path)
+
+    def test_the_pid_pointer_reaches_the_record_the_lease_slug_cannot(
+        self, tmp_path: Path
+    ) -> None:
+        pid = 1894895
+        record_slug = self._record_slug()
+        sr.write_record(
+            _make_record(session_slug=record_slug, claude_owner_pid=pid), root=tmp_path
+        )
+        sr.write_session_pointer(pid, record_slug, root=tmp_path)
+
+        with pytest.raises(FileNotFoundError):
+            sr.read_record(self._lease_slug(pid=pid), root=tmp_path)
+        linked = sr.resolve_session_slug_for_pid(pid, root=tmp_path)
+        assert linked is not None
+        assert sr.read_record(linked, root=tmp_path).session_slug == record_slug
 
 
 # --- resolve_session_pid (task 3994 defect 2) ------------------------------

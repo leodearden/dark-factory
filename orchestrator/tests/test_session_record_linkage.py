@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from collections.abc import Callable
@@ -500,3 +501,54 @@ class TestRefreshEventsStampPointer:
         assert forked.session_slug != spawner_slug
         assert sr.resolve_session_slug_for_pid(nested_pid, root=tmp_path) == forked.session_slug
         assert sr.resolve_session_slug_for_pid(spawner_pid, root=tmp_path) == spawner_slug
+
+
+_T0 = datetime(2026, 9, 25, 12, 0, 0, tzinfo=UTC)
+
+
+def _holder(*, pid: int = 0, record_slug: str = '', slug: str = 'watcher-df-1') -> sr.LeaseHolder:
+    return sr.LeaseHolder(
+        session_slug=slug,
+        pid=pid or os.getpid(),
+        start_ts=_T0.isoformat(),
+        record_slug=record_slug,
+    )
+
+
+class TestLeaseHolderRecordSlug:
+    def test_record_slug_round_trips(self) -> None:
+        holder = _holder(record_slug='role-proj-uuid')
+
+        assert sr.LeaseHolder.from_dict(holder.to_dict()) == holder
+        assert sr.LeaseHolder.from_json(holder.to_json()) == holder
+        assert holder.to_dict()['record_slug'] == 'role-proj-uuid'
+
+    def test_a_legacy_body_parses_as_unlinked(self) -> None:
+        legacy = {
+            'session_slug': 'watcher-df-357458',
+            'pid': 357458,
+            'start_ts': '2026-08-15T00:00:00+00:00',
+        }
+
+        assert sr.LeaseHolder.from_dict(legacy).record_slug == ''
+
+    def test_an_explicit_null_parses_as_unlinked(self) -> None:
+        body = {'session_slug': 'watcher-df-1', 'pid': 1, 'start_ts': '', 'record_slug': None}
+
+        assert sr.LeaseHolder.from_dict(body).record_slug == ''
+
+    def test_the_field_defaults_to_unlinked(self) -> None:
+        holder = sr.LeaseHolder(session_slug='watcher-df-1', pid=1, start_ts='')
+
+        assert holder.record_slug == ''
+
+    def test_claim_lease_writes_it_and_a_contender_reads_it_back(self, tmp_path: Path) -> None:
+        sr.claim_lease('watcher-df', holder=_holder(record_slug='role-proj-uuid'), root=tmp_path)
+        body = json.loads(sr.lease_path_for_name('watcher-df', root=tmp_path).read_text())
+
+        contended = sr.claim_lease('watcher-df', holder=_holder(slug='watcher-df-2'), root=tmp_path)
+
+        assert body['record_slug'] == 'role-proj-uuid'
+        assert contended.acquired is False
+        assert contended.holder is not None
+        assert contended.holder.record_slug == 'role-proj-uuid'
