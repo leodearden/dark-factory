@@ -10,7 +10,7 @@ import logging
 import weakref
 from collections.abc import Iterator
 
-from shared.asyncio_tasks import track_task
+from shared.asyncio_tasks import abandon_task, track_task
 
 
 class _Boom(Exception):
@@ -215,3 +215,58 @@ class TestTrackTaskOnDone:
 
         assert errors == []
         assert registry == set()
+
+
+class TestAbandonTask:
+    async def test_cancels_the_task(self):
+        task = asyncio.create_task(asyncio.Event().wait())
+        await asyncio.sleep(0)
+
+        abandon_task(task, set())
+        await _drain(task)
+
+        assert task.cancelled()
+
+    async def test_task_is_in_every_registry_before_the_loop_runs_again(self):
+        first: set[asyncio.Task] = set()
+        second: set[asyncio.Task] = set()
+        task = asyncio.create_task(asyncio.Event().wait())
+
+        abandon_task(task, first, second)
+
+        assert task in first
+        assert task in second
+        await _drain(task)
+
+    async def test_task_is_released_from_every_registry_once_cancelled(self):
+        first: set[asyncio.Task] = set()
+        second: set[asyncio.Task] = set()
+        task = asyncio.create_task(asyncio.Event().wait())
+
+        abandon_task(task, first, second)
+        await _drain(task)
+
+        assert task not in first
+        assert task not in second
+
+    async def test_forwards_the_hook_which_sees_the_cancelled_task(self):
+        seen: list[tuple[asyncio.Task, bool]] = []
+        task = asyncio.create_task(asyncio.Event().wait())
+
+        abandon_task(task, set(), on_done=lambda finished: seen.append((finished, finished.cancelled())))
+        await _drain(task)
+
+        assert seen == [(task, True)]
+
+    async def test_already_done_task_is_not_stranded(self):
+        registry: set[asyncio.Task] = set()
+        task = asyncio.create_task(asyncio.sleep(0))
+        await _drain(task)
+
+        with _recorded_loop_errors() as errors:
+            abandon_task(task, registry)
+            assert task in registry
+            await asyncio.sleep(0)
+
+        assert task not in registry
+        assert errors == []
