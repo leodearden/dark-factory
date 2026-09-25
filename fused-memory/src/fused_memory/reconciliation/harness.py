@@ -9,7 +9,7 @@ import logging
 import os
 import time
 import traceback
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -694,6 +694,36 @@ def _stage2_ledger_write_missing(report: object) -> bool:
     and this predicate must never raise when handed one of those.
     """
     return _cycle_summary_ledger_write_missing(report, 'stage2')
+
+
+def _run_failure_record(
+    exc: BaseException,
+    *,
+    failed_stage: str | None,
+    error_message: str | None = None,
+) -> dict[str, object]:
+    """The one ``_error`` shape both S1→S2→S3 drivers record for a run ended
+    by an exception, so the failure can be classified from the row alone.
+
+    The sqlite fields are set by the sqlite3 module on errors it raises and
+    are None for any other exception; see
+    plans/recon-sqlite-database-locked-rca-2026-09-16.md for what they mean.
+    """
+    return {
+        'error_type': type(exc).__name__,
+        'error_message': str(exc) if error_message is None else error_message,
+        'failed_stage': failed_stage,
+        'traceback': ''.join(traceback.format_exception(exc)),
+        'sqlite_errorname': getattr(exc, 'sqlite_errorname', None),
+        'sqlite_errorcode': getattr(exc, 'sqlite_errorcode', None),
+    }
+
+
+def _run_failure_log_fields(run_id: str, record: Mapping[str, object]) -> str:
+    return (
+        f"run_id={run_id} sqlite_errorname={record['sqlite_errorname']} "
+        f"sqlite_errorcode={record['sqlite_errorcode']}"
+    )
 
 
 class ReconciliationHarness:
@@ -6211,16 +6241,15 @@ class ReconciliationHarness:
                 f'{current_stage_name} ({e.retries} retries in {e.elapsed_secs:.1f}s)'
             )
         except Exception as e:
+            failure = _run_failure_record(e, failed_stage=current_stage_name)
+            logger.error(
+                'Remediation pass failed: %s (%s)', e, _run_failure_log_fields(run_id, failure),
+            )
             run.status = RunStatus.failed
-            run.stage_reports['_error'] = {
-                'error_type': type(e).__name__,
-                'error_message': str(e),
-                'failed_stage': current_stage_name,
-            }
+            run.stage_reports['_error'] = failure
             await self.journal.complete_run(run_id, 'failed')
             # Do NOT re-raise — parent run already completed
             # Do NOT restore events — there are none
-            logger.error(f'Remediation pass failed: {e}')
             self._escalate(
                 'recon_integrity_issue',
                 run_id,
