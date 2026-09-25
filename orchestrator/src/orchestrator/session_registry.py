@@ -620,6 +620,57 @@ def record_path_for_slug(slug: str, root: Path | str | None = None) -> Path:
     return sessions_dir(root) / slug / 'record.json'
 
 
+SESSION_POINTERS_DIRNAME = 'sessions-by-pid'
+
+
+def session_pointers_dir(root: Path | str | None = None) -> Path:
+    """The pid-pointer dir, ``<fleet_root>/sessions-by-pid/``.
+
+    A SIBLING of ``sessions_dir``, never a child of it: every sweep over
+    ``sessions_dir`` treats each of its children as a record dir, so a
+    pointer dir inside it would be read as a corrupt record.
+    """
+    return fleet_root(root) / SESSION_POINTERS_DIRNAME
+
+
+def session_pointer_path_for_pid(pid: int, root: Path | str | None = None) -> Path:
+    return session_pointers_dir(root) / str(pid)
+
+
+def _is_record_key(slug: str) -> bool:
+    """True iff *slug* can name a record dir directly inside ``sessions_dir``.
+
+    The one well-formedness check for every pointer and ``record_slug`` read
+    or write: non-empty, already sanitized, and not an all-dots traversal
+    segment.
+    """
+    return bool(slug) and sanitize_slug(slug) == slug and not _ALL_DOTS_RE.match(slug)
+
+
+def write_session_pointer(pid: int, slug: str, root: Path | str | None = None) -> bool:
+    """Record *slug* as the record key of claude process *pid*'s current record.
+
+    The file ``sessions-by-pid/<pid>`` holds exactly that slug, last writer
+    wins. *pid* is the OWNING ``claude`` process's pid (the value
+    ``$CLAUDE_PID`` carries), never the record's ``launcher_pid``.
+
+    Returns False without writing for a non-positive *pid* or a *slug* that
+    is not a record key, and False (after a WARNING) when the write itself
+    fails. Never raises: its callers are session hooks.
+    """
+    if pid <= 0 or not _is_record_key(slug):
+        return False
+    path = session_pointer_path_for_pid(pid, root=root)
+    try:
+        _atomic_write_text(path, slug)
+    except OSError as exc:
+        logger.warning(
+            'session pointer write failed: pid=%s slug=%s path=%s: %s', pid, slug, path, exc
+        )
+        return False
+    return True
+
+
 def encode_cwd(cwd: str) -> str:
     """Encode *cwd* to Claude Code's own ``~/.claude/projects/<enc>`` dir name.
 
