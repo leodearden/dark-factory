@@ -720,3 +720,86 @@ class TestHolderRecordIsAnAdditiveAxis:
         assert claim.decision is sr.LeaseDecision.STAND_DOWN
         assert claim.holder_alive is False
         assert claim.holder_record_state is sr.HolderRecordState.EXITED
+
+
+def _show(capsys: pytest.CaptureFixture[str]) -> list[str]:
+    capsys.readouterr()
+    assert sr.main(['lease-show', '--name', _LEASE]) == 0
+    return capsys.readouterr().out.splitlines()
+
+
+class TestLeaseShowHolderRecord:
+    _SLUG = 'role-proj-uuid'
+
+    def test_lease_status_carries_the_holders_record_link(self, tmp_path: Path) -> None:
+        sr.write_record(_record(self._SLUG, owner_pid=os.getpid()), root=tmp_path)
+        _seed_lease(tmp_path, _holder(record_slug=self._SLUG))
+
+        status = sr.lease_status(_LEASE, root=tmp_path, now=_T0)
+
+        assert status.holder_record_slug == self._SLUG
+        assert status.holder_record_state is sr.HolderRecordState.ACTIVE
+
+    def test_an_absent_lease_status_is_unlinked(self, tmp_path: Path) -> None:
+        status = sr.lease_status(_LEASE, root=tmp_path, now=_T0)
+
+        assert status.holder_record_slug is None
+        assert status.holder_record_state is sr.HolderRecordState.UNLINKED
+
+    def test_an_unreadable_lease_status_is_unlinked(self, tmp_path: Path) -> None:
+        _seed_lease(tmp_path, '{not json')
+
+        status = sr.lease_status(_LEASE, root=tmp_path, now=_T0)
+
+        assert status.holder_record_slug is None
+        assert status.holder_record_state is sr.HolderRecordState.UNLINKED
+
+    def test_an_absent_lease_still_prints_only_name_and_state(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert _show(capsys) == [f'name={_LEASE}', 'state=absent']
+
+    def test_a_linked_lease_appends_both_keys_after_the_existing_ones(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        sr.write_record(
+            _record(self._SLUG, owner_pid=1, status=sr.Status.EXITED), root=tmp_path
+        )
+        _seed_lease(tmp_path, _holder(record_slug=self._SLUG))
+
+        lines = _show(capsys)
+
+        assert [line.split('=', 1)[0] for line in lines] == [
+            'name',
+            'state',
+            'holder_slug',
+            'holder_pid',
+            'holder_pid_alive',
+            'heartbeat_ts',
+            'heartbeat_age_secs',
+            'reclaimable',
+            'holder_record',
+            'holder_record_slug',
+        ]
+        assert lines[-2:] == ['holder_record=exited', f'holder_record_slug={self._SLUG}']
+
+    def test_an_unlinked_lease_prints_holder_record_but_no_slug(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _seed_lease(tmp_path, _holder())
+
+        lines = _show(capsys)
+
+        assert lines[-1] == 'holder_record=unlinked'
+        assert not any(line.startswith('holder_record_slug=') for line in lines)
+
+    def test_an_unreadable_lease_prints_holder_record_unlinked_and_no_slug(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _seed_lease(tmp_path, '{not json')
+
+        lines = _show(capsys)
+
+        assert 'state=unreadable' in lines
+        assert lines[-1] == 'holder_record=unlinked'
+        assert not any(line.startswith('holder_record_slug=') for line in lines)
