@@ -86,19 +86,37 @@ def project_root(tmp_path) -> str:
     return str(tmp_path / 'proj')
 
 
+def _db_path(project_root: str) -> Path:
+    return Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+
+
 def _stored_rows(project_root: str) -> list[dict]:
-    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
-    conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+    conn = sqlite3.connect(f'file:{_db_path(project_root)}?mode=ro', uri=True)
     conn.row_factory = sqlite3.Row
     try:
-        return [
-            dict(row) for row in conn.execute(
-                'SELECT id, title, description, details, test_strategy, '
-                'priority, metadata FROM tasks ORDER BY id'
-            )
-        ]
+        return [dict(row) for row in conn.execute('SELECT * FROM tasks ORDER BY id')]
     finally:
         conn.close()
+
+
+def _corrupt_description_as_a_pre_gate_writer_did(project_root: str, task_id: str) -> None:
+    conn = sqlite3.connect(_db_path(project_root))
+    try:
+        with conn:
+            conn.execute(
+                'UPDATE tasks SET description = ? WHERE id = ?',
+                (TASK_4358_DESCRIPTION, int(task_id)),
+            )
+    finally:
+        conn.close()
+
+
+async def _seed_clean_task(backend, project_root: str) -> str:
+    result = await backend.add_task(
+        project_root, title='clean title', description='clean description',
+        details='clean details', priority='low',
+    )
+    return result['id']
 
 
 def _add_task_text(column: str, value: str) -> dict[str, str]:
@@ -178,3 +196,112 @@ async def test_add_task_stores_metadata_quoting_the_fragment(backend, project_ro
     assert json.loads(row['metadata'])['stage2_description_corruption_fix'] == (
         json.loads(REMEDIATION_METADATA)['stage2_description_corruption_fix']
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('column', SINK_WRITABLE_COLUMNS)
+async def test_update_task_refuses_leaked_text_and_rolls_back_the_whole_write(
+    backend, project_root, column,
+):
+    task_id = await _seed_clean_task(backend, project_root)
+    before = _stored_rows(project_root)
+
+    with pytest.raises(LeakedEnvelopeMarkupError) as excinfo:
+        await backend.update_task(
+            task_id, project_root, priority='high',
+            metadata=json.dumps({'note': 'written alongside the leak'}),
+            **{column: TASK_4358_DESCRIPTION},
+        )
+
+    assert excinfo.value.column == column
+    assert excinfo.value.fragment == TASK_4358_FRAGMENT
+    assert _stored_rows(project_root) == before
+
+
+@pytest.mark.asyncio
+async def test_update_task_refuses_a_leaked_prompt_fed_into_details(backend, project_root):
+    task_id = await _seed_clean_task(backend, project_root)
+    before = _stored_rows(project_root)
+
+    with pytest.raises(LeakedEnvelopeMarkupError) as excinfo:
+        await backend.update_task(task_id, project_root, prompt=TASK_4358_DESCRIPTION)
+
+    assert excinfo.value.column == 'details'
+    assert _stored_rows(project_root) == before
+
+
+@pytest.mark.asyncio
+async def test_update_task_refuses_appending_a_leaked_tail_to_clean_details(
+    backend, project_root,
+):
+    task_id = await _seed_clean_task(backend, project_root)
+    before = _stored_rows(project_root)
+
+    with pytest.raises(LeakedEnvelopeMarkupError) as excinfo:
+        await backend.update_task(
+            task_id, project_root, details=TASK_4358_DESCRIPTION, append=True,
+        )
+
+    assert excinfo.value.column == 'details'
+    assert excinfo.value.fragment == TASK_4358_FRAGMENT
+    assert _stored_rows(project_root) == before
+
+
+@pytest.mark.asyncio
+async def test_update_task_judges_an_append_on_the_value_that_would_be_stored(
+    backend, project_root,
+):
+    """Neither half leaks alone; the concatenation the append would persist does."""
+    stray_closer_at_end = 'details quoting a stray ' + closer_for('details')
+    swallowed_opener = CANONICAL_OPENER_PREFIX + '"priority">low'
+    assert detect_leak(stray_closer_at_end) is None
+    assert detect_leak(swallowed_opener) is None
+
+    task_id = await _seed_clean_task(backend, project_root)
+    await backend.update_task(task_id, project_root, details=stray_closer_at_end)
+    before = _stored_rows(project_root)
+
+    with pytest.raises(LeakedEnvelopeMarkupError) as excinfo:
+        await backend.update_task(
+            task_id, project_root, details=swallowed_opener, append=True,
+        )
+
+    assert excinfo.value.column == 'details'
+    assert excinfo.value.fragment == (
+        closer_for('details') + '\n\n' + swallowed_opener
+    )
+    assert _stored_rows(project_root) == before
+
+
+@pytest.mark.asyncio
+async def test_update_task_leaves_a_pre_gate_corrupt_row_writable(backend, project_root):
+    task_id = await _seed_clean_task(backend, project_root)
+    _corrupt_description_as_a_pre_gate_writer_did(project_root, task_id)
+
+    await backend.update_task(
+        task_id, project_root, metadata=REMEDIATION_METADATA, metadata_mode='merge',
+    )
+    await backend.update_task(task_id, project_root, priority='low')
+    await backend.update_task(task_id, project_root, title='retitled')
+    await backend.set_task_status(task_id, 'in-progress', project_root)
+
+    [row] = _stored_rows(project_root)
+    assert row['description'] == TASK_4358_DESCRIPTION
+    assert row['title'] == 'retitled'
+    assert row['status'] == 'in-progress'
+    assert 'stage2_description_corruption_fix' in json.loads(row['metadata'])
+
+
+@pytest.mark.asyncio
+async def test_update_task_lets_the_remediation_of_a_corrupt_description_land(
+    backend, project_root,
+):
+    task_id = await _seed_clean_task(backend, project_root)
+    _corrupt_description_as_a_pre_gate_writer_did(project_root, task_id)
+
+    await backend.update_task(
+        task_id, project_root, description=TASK_4358_PROSE, priority='low',
+    )
+
+    [row] = _stored_rows(project_root)
+    assert (row['description'], row['priority']) == (TASK_4358_PROSE, 'low')
