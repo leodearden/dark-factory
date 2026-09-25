@@ -1021,7 +1021,7 @@ class SeedLaneLock(Enum):
       script is still told it is held, otherwise a self-locking script refuses
       against the caller's own lock.
     * ``LEFT_TO_SCRIPT`` — nobody holds it.  No outer flock and no assertion;
-      a self-locking script takes it itself.
+      a self-locking script takes it itself.  No production caller uses it.
     """
     TAKE = 'take'
     HELD_BY_CALLER = 'held_by_caller'
