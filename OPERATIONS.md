@@ -396,7 +396,8 @@ python3 orchestrator/src/orchestrator/session_registry.py lease-show --name watc
 ```
 
 It prints `key=value` lines — `state`, `holder_slug`, `holder_pid`,
-`holder_pid_alive`, `heartbeat_ts`, `heartbeat_age_secs`, `reclaimable` —
+`holder_pid_alive`, `heartbeat_ts`, `heartbeat_age_secs`, `reclaimable`,
+`holder_record`, and `holder_record_slug` when the body carries one —
 computed by the same reader `lease-claim` decides with, and never touches the
 lease. A lease is stale only when the holder pid is dead **and** the heartbeat
 is past `LEASE_HEARTBEAT_TTL` (2h); a live holder is never reclaimable however
@@ -407,7 +408,12 @@ only** — `orphaned` means the pid recorded in the lease body is not running,
 nothing more; `none` means the claim was acquired and there is no contending
 holder at all. Treat `orphaned` as one diagnostic, never as grounds to
 force-release on its own: a quiet-but-live holder that reads as dead is the
-duplicate-spawn incident.
+duplicate-spawn incident. `holder_record=<unlinked|absent|unreadable|active|exited>`
+(printed by both `lease-claim` and `lease-show`) is the second, independent
+axis: the state of the holder's session-registry record, found through the
+`record_slug` the lease body carries. `exited`/`absent` corroborate an
+`orphaned` pid, and `unlinked` (a lease claimed before that field existed) is no
+evidence either way.
 
 A holder whose lease body says `holder_pid=0` claimed it on the **degraded**
 pid path (`$CLAUDE_PID` unset — the CLI records 0, a never-alive sentinel, and

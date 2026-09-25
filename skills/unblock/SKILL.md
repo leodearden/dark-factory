@@ -71,7 +71,7 @@ leave the lease unreapable forever.
 `PROJECT_ROOT`.) Parse the printed lines (`decision=<acquired|proceed>`, message,
 `holder_liveness=<none|held|orphaned>`, then `slug=<the slug this claim used>` — your own derived
 identity, a diagnostic to compare against `lease-show`'s `holder_slug`, never a value to carry into
-the release):
+the release — then `holder_record=<unlinked|absent|unreadable|active|exited>`):
 
 - **`decision=proceed` with a holder reported in the message**: surface that line verbatim to the
   user — this is exactly the near-duplicate second-`/unblock`-on-the-same-task case (reify 06-28) —
@@ -91,6 +91,12 @@ the release):
   way, and you never force-release someone else's lease to "clean up".
 - **`decision=acquired`**: no prior holder; continue normally. It prints `holder_liveness=none` —
   there is no contending holder to report, the lease is yours.
+
+The lease body also carries `record_slug`: the claimant's session-registry record key, which the CLI
+resolves from the claiming pid. `lease-claim` and `lease-show` print `holder_record=` from it: the
+state of the holder's record (yours, on an acquired claim), a second axis independent of
+`holder_liveness=`. `unlinked` means nothing was looked up (a lease claimed before the field existed,
+or an unresolvable record), not that the holder is alive. Like `orphaned`, it changes nothing here.
 
 To inspect a lease, use `lease-show --name "unblock-<project>#<TASK_ID>"` — never `cat`, which shows
 the holder's immutable `start_ts` but cannot show freshness (the heartbeat is the file's mtime).
