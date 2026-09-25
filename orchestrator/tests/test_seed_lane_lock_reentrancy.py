@@ -32,7 +32,7 @@ from pathlib import Path
 import pytest
 
 from orchestrator.config import GitConfig
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import GitOps, WorktreeKind, _run
 
 # Mirrors the real script's lock stage: refuse (75) when ${LANE_DIR}.lock is
 # already held, UNLESS the caller asserts it holds the lock itself.
@@ -158,6 +158,39 @@ exec 9>"${lane_dir}.lock"
 if ! flock -n 9; then
     echo "LANE_LOCK_CONTENDED: ${lane_dir}.lock held by a live consumer" >&2
     exit 75
+fi
+mkdir -p "$lane_dir/target"
+echo seeded > "$lane_dir/target/seeded.bin"
+exit 0
+"""
+
+# Models TODAY's reify script (post-5354 + post-5568): it takes
+# ${LANE_DIR}.lock itself unless told the caller already holds it, and refuses
+# with 77 under --distinct-lock-refusal-rc.  Stricter than the real script, it
+# VERIFIES an --assume-lane-lock-held assertion (exit 3 if the lock is in fact
+# free), so a caller asserting a lock it does not hold fails loudly instead of
+# silently dropping inv.2 exclusivity.
+_CURRENT_LOCKING_SEED_SCRIPT = """#!/usr/bin/env bash
+# Supported flags include --assume-lane-lock-held and --distinct-lock-refusal-rc.
+set -u
+lane_dir="$2"
+refusal_rc=75
+assume_held=""
+for a in "$@"; do
+    case "$a" in
+        --distinct-lock-refusal-rc) refusal_rc=77 ;;
+        --assume-lane-lock-held) assume_held=1 ;;
+    esac
+done
+if [ -z "$assume_held" ]; then
+    exec 9>"${lane_dir}.lock"
+    if ! flock -n 9; then
+        echo "LANE_LOCK_CONTENDED: ${lane_dir}.lock held by a live consumer" >&2
+        exit "$refusal_rc"
+    fi
+elif flock -n "${lane_dir}.lock" true; then
+    echo "asserted lane lock ${lane_dir}.lock is not actually held" >&2
+    exit 3
 fi
 mkdir -p "$lane_dir/target"
 echo seeded > "$lane_dir/target/seeded.bin"
@@ -645,4 +678,51 @@ class TestLaneLockRefusalEndToEnd:
 
         assert result is WarmLaneUnavailable.DISK_PRESSURE, (
             f'a pre-5568 lane must be unchanged by task 4211, got {result!r}'
+        )
+
+
+@pytest.mark.asyncio
+class TestEphemeralWorktreeSeedsUnderItsOwnLaneLock:
+    """The ephemeral_worktree CM holds <probe>.lock for its whole lifetime, so
+    it must ASSERT that lock to seed rather than let a self-locking seed script
+    refuse against it (task 4913).
+    """
+
+    async def _probe_was_seeded(self, repo: Path, script_body: str) -> bool:
+        await _commit_seed_script(repo, script_body)
+        git_ops = GitOps(_config(), repo)
+        _, head, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
+        async with git_ops.ephemeral_worktree(
+            WorktreeKind.MAIN_PROBE, head.strip(), warm_seed=True,
+        ) as probe:
+            return (probe / 'target' / 'seeded.bin').exists()
+
+    async def test_warm_seed_populates_target_against_a_self_locking_seed_script(
+        self, seed_repo: Path,
+    ):
+        seeded = await self._probe_was_seeded(
+            seed_repo, _CURRENT_LOCKING_SEED_SCRIPT,
+        )
+
+        assert seeded, (
+            'the MAIN_PROBE worktree was not warm-seeded: the CM never asserted '
+            'its own held lane lock (--assume-lane-lock-held), so the seed '
+            'script refused with rc 77 against the CM\'s own flock and the '
+            'probe ran COLD'
+        )
+
+    async def test_warm_seed_still_seeds_a_pre_5354_lane_script(
+        self, seed_repo: Path,
+    ):
+        """The assume flag stays capability-probed on the CM path.
+
+        _LEGACY_SEED_SCRIPT exits 2 on ANY flag, so a flag sent blind would
+        turn this seed into a fault and the probe would run cold.
+        """
+        seeded = await self._probe_was_seeded(seed_repo, _LEGACY_SEED_SCRIPT)
+
+        assert seeded, (
+            'a pre-5354 seed script must still seed the probe; a missing '
+            'seeded.bin means a flag it does not support was passed blind '
+            '(exit 2) and the probe ran COLD'
         )
