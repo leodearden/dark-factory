@@ -20,6 +20,8 @@ from __future__ import annotations
 import types
 from unittest.mock import AsyncMock
 
+import pytest
+
 from fused_memory.config.schema import ProceduralTopicCluster
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
@@ -30,8 +32,10 @@ from fused_memory.server.near_duplicate_guard import (
     build_topic_cluster_block,
     find_matching_topic_cluster,
     find_near_duplicate_memory,
+    merge_topic_clusters,
     resolve_near_dup_guard_enabled,
     resolve_near_dup_threshold,
+    resolve_topic_cluster_autoseed_enabled,
     resolve_topic_guard_clusters,
 )
 from fused_memory.services.memory_service import RRF_K
@@ -536,3 +540,104 @@ class TestBuildTopicClusterBlock:
         cluster = _cluster(topic_id='topic-a')
         block = build_topic_cluster_block(None, 'content', cluster, ['alpha'])
         assert block['agent_id'] is None
+
+
+class TestMergeTopicClusters:
+    """Config seeds first, runtime-derived clusters after; config wins a topic_id collision (task 3135)."""
+
+    def test_config_seeds_come_first_then_runtime_in_order(self):
+        config = [_cluster(topic_id='cfg-a'), _cluster(topic_id='cfg-b')]
+        runtime = [_cluster(topic_id='rt-a'), _cluster(topic_id='rt-b')]
+
+        merged = merge_topic_clusters(config, runtime)
+
+        assert [c.topic_id for c in merged] == ['cfg-a', 'cfg-b', 'rt-a', 'rt-b']
+
+    def test_the_config_cluster_wins_the_first_match_rule(self):
+        config_cluster = _cluster(topic_id='cfg-a', phrases=['alpha', 'beta'])
+        runtime_cluster = _cluster(topic_id='rt-a', phrases=['alpha', 'beta', 'gamma'])
+        content = 'alpha and beta and gamma'
+        control = find_matching_topic_cluster(content, [runtime_cluster, config_cluster])
+        assert control is not None and control[0] is runtime_cluster
+
+        match = find_matching_topic_cluster(
+            content, merge_topic_clusters([config_cluster], [runtime_cluster])
+        )
+
+        assert match is not None
+        assert match[0] is config_cluster
+
+    def test_a_runtime_cluster_colliding_with_a_config_seed_is_dropped(self):
+        curated = ProceduralTopicCluster(
+            topic_id='shared-topic',
+            phrases=['alpha', 'beta'],
+            sufficient_phrases=['alpha'],
+            hint='route to human gate 2841',
+        )
+        derived = ProceduralTopicCluster(
+            topic_id='shared-topic', phrases=['gamma', 'delta'], hint='derived hint'
+        )
+
+        merged = merge_topic_clusters([curated], [derived])
+
+        assert merged == [curated]
+        assert merged[0].hint == 'route to human gate 2841'
+        assert merged[0].sufficient_phrases == ['alpha']
+
+    def test_duplicate_runtime_topic_ids_keep_only_the_first(self):
+        first = _cluster(topic_id='rt-a', phrases=['alpha', 'beta'])
+        second = _cluster(topic_id='rt-a', phrases=['gamma', 'delta'])
+
+        merged = merge_topic_clusters([], [first, second])
+
+        assert merged == [first]
+
+    def test_an_empty_runtime_list_returns_the_config_list(self):
+        config = [_cluster(topic_id='cfg-a'), _cluster(topic_id='cfg-b')]
+        assert merge_topic_clusters(config, []) == config
+
+    def test_neither_input_is_mutated(self):
+        config = [_cluster(topic_id='cfg-a'), _cluster(topic_id='shared')]
+        runtime = [_cluster(topic_id='shared'), _cluster(topic_id='rt-a')]
+        config_before = list(config)
+        runtime_before = list(runtime)
+
+        merged = merge_topic_clusters(config, runtime)
+
+        assert config == config_before
+        assert runtime == runtime_before
+        assert merged is not config
+        assert merged is not runtime
+
+
+class TestResolveTopicClusterAutoseedEnabled:
+    """Defensive config resolver: only a real bool is honoured, else the schema default True."""
+
+    @pytest.mark.parametrize('value', [True, False])
+    def test_returns_a_real_bool(self, value):
+        memory_service = _memory_service_with_reconciliation(
+            procedural_knowledge_topic_cluster_autoseed_enabled=value
+        )
+        assert resolve_topic_cluster_autoseed_enabled(memory_service) is value
+
+    @pytest.mark.parametrize('value', [0, 1])
+    def test_an_int_is_not_a_bool(self, value):
+        memory_service = _memory_service_with_reconciliation(
+            procedural_knowledge_topic_cluster_autoseed_enabled=value
+        )
+        assert resolve_topic_cluster_autoseed_enabled(memory_service) is True
+
+    def test_falls_back_to_true_when_leaf_missing(self):
+        memory_service = _memory_service_with_reconciliation()
+        assert resolve_topic_cluster_autoseed_enabled(memory_service) is True
+
+    def test_falls_back_to_true_when_value_is_a_mock(self):
+        memory_service = AsyncMock()
+        assert resolve_topic_cluster_autoseed_enabled(memory_service) is True
+
+    def test_falls_back_to_true_when_reconciliation_is_none(self):
+        memory_service = types.SimpleNamespace(config=types.SimpleNamespace(reconciliation=None))
+        assert resolve_topic_cluster_autoseed_enabled(memory_service) is True
+
+    def test_falls_back_to_true_when_config_missing(self):
+        assert resolve_topic_cluster_autoseed_enabled(types.SimpleNamespace()) is True
