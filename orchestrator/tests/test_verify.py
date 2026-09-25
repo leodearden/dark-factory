@@ -3,7 +3,7 @@
 import asyncio
 import contextlib
 import logging
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -15,6 +15,10 @@ from _xdist_crash_fixtures import (
     XDIST_FAILED_THEN_CRASHED_OUTPUT,
     XDIST_IN_FLIGHT_NODEID,
     XDIST_MAX_WORKERS_REACHED_OUTPUT,
+    XDIST_Q_KILLED_AFTER_RECOVERED_CRASH_OUTPUT,
+    XDIST_Q_RECOVERED_OUTPUT,
+    XDIST_Q_TRUNCATED_AT_LINE_EDGE_OUTPUT,
+    XDIST_Q_TRUNCATED_OUTPUT,
     XDIST_SESSION_ABORTED_OUTPUT,
     XDIST_WORKER_CRASH_OUTPUT,
     XDIST_WORKER_REPLACED_OUTPUT,
@@ -2631,31 +2635,39 @@ class TestWorkerDeathLegSummary:
         assert WORKER_DEATH_SUMMARY_MARKER in fragments[1], f'Unexpected summary: {summary!r}'
 
 
-def _worker_death_child(*, module: str = 'orchestrator') -> VerifyResult:
-    """A child result whose TEST leg was truncated by an xdist worker death.
+def _test_leg_result(test_output: str) -> VerifyResult:
+    """A result whose failing TEST leg printed *test_output*, beside clean
+    lint and type legs.
 
     Its summary is produced by `_summarize_checks` itself rather than
-    hand-written, so this test cannot drift from the producer: an edit to
+    hand-written, so these tests cannot drift from the producer: an edit to
     `_worker_death_leg_note`'s wording is exercised here automatically.
     """
     from orchestrator.verify import _summarize_checks
 
     _, category, cause_hint, summary, failing_legs = _summarize_checks(
-        1, XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT, False, 'uv run pytest',
+        1, test_output, False, 'uv run pytest',
         0, '', False, 'ruff check',
         0, '', False, 'pyright',
         test_duration=209.67,
     )
     return VerifyResult(
         passed=False,
-        test_output=XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT,
+        test_output=test_output,
         lint_output='',
         type_output='',
         summary=summary,
         category=category,
-        cause_hint=f'{module}: {cause_hint}',
+        cause_hint=cause_hint,
         failing_leg_categories=failing_legs,
     )
+
+
+def _worker_death_child(*, module: str = 'orchestrator') -> VerifyResult:
+    """A *module*'s child result whose TEST leg was truncated by an xdist
+    worker death."""
+    result = _test_leg_result(XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT)
+    return replace(result, cause_hint=f'{module}: {result.cause_hint}')
 
 
 class TestAggregateResultsKeepsWorkerDeathNote:
@@ -2784,6 +2796,97 @@ class TestFailureReportNamesTheAbortedSession:
         report = ordinary.failure_report()
         assert self.HEADING not in report, f'Unexpected report: {report!r}'
         assert report.startswith('## Failure Cause'), f'Unexpected report: {report!r}'
+
+
+_Q_TRUNCATED_OUTPUTS = pytest.mark.parametrize(
+    'output',
+    [XDIST_Q_TRUNCATED_OUTPUT, XDIST_Q_TRUNCATED_AT_LINE_EDGE_OUTPUT],
+    ids=['final-line-after-status-chars', 'final-fill-on-a-fresh-line'],
+)
+
+
+class TestWorkerDeathTruncationWithoutTheBailoutLine:
+    """task 5337: the four worker-death consumers must fire under ``-q`` too.
+
+    Every ``-q`` module-scoped verify leg lacks the bailout literal (xdist
+    gates it on ``verbose >= 0``), so these specimens exercise the
+    progress-line witness alone: a crash signature, a final progress line
+    below ``[100%]``, and pytest's own failure tally after it.
+    """
+
+    HEADING = '## Session Aborted After Worker Death'
+
+    @_Q_TRUNCATED_OUTPUTS
+    def test_leg_summary_says_the_session_was_aborted(self, output):
+        """The crash-attributed FAILED line is the only failure, so nothing
+        survives to be reported as 'tests failed'."""
+        summary = _test_leg_result(output).summary
+        assert WORKER_DEATH_SUMMARY_MARKER in summary, f'Unexpected summary: {summary!r}'
+        assert 'tests failed' not in summary, f'Unexpected summary: {summary!r}'
+
+    @_Q_TRUNCATED_OUTPUTS
+    def test_failure_report_leads_with_the_aborted_section(self, output):
+        report = _test_leg_result(output).failure_report()
+        assert self.HEADING in report, f'Unexpected report: {report!r}'
+
+    @_Q_TRUNCATED_OUTPUTS
+    def test_note_survives_aggregation(self, output):
+        passing = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='',
+            summary='All checks passed', category='passed',
+        )
+        agg = _aggregate_results([passing, _test_leg_result(output)])
+        assert WORKER_DEATH_SUMMARY_MARKER in agg.summary, (
+            f'Unexpected summary: {agg.summary!r}'
+        )
+
+    @_Q_TRUNCATED_OUTPUTS
+    def test_cause_hint_blames_no_test_and_quotes_no_partial_tally(self, output):
+        hint = _extract_cause_hint(output)
+        assert WORKER_DEATH_SUMMARY_MARKER in hint, f'Unexpected hint: {hint!r}'
+        assert XDIST_IN_FLIGHT_NODEID not in hint, f'Unexpected hint: {hint!r}'
+        assert '9851 passed' not in hint, f'Unexpected hint: {hint!r}'
+
+    def test_a_recovered_run_that_reached_100_percent_keeps_its_verdict(self):
+        """THE LOAD-BEARING DISCRIMINATION: a recovering run carries the
+        identical crash notice, so keying on the crash signature alone would
+        relabel it. Only where the final progress line stops tells them apart.
+        """
+        output = XDIST_Q_RECOVERED_OUTPUT
+        result = _test_leg_result(output)
+        assert result.summary == 'Failures: tests failed', (
+            f'Unexpected summary: {result.summary!r}'
+        )
+        report = result.failure_report()
+        assert self.HEADING not in report, f'Unexpected report: {report!r}'
+        hint = _extract_cause_hint(output)
+        assert hint == f'FAILED {XDIST_IN_FLIGHT_NODEID}', f'Unexpected hint: {hint!r}'
+
+    def test_a_run_killed_after_a_recovered_crash_is_not_labelled(self):
+        """The process, not xdist, ended the loop: no FAILURES section and no
+        tally. The killed-leg note and the timeout rung own that case."""
+        output = XDIST_Q_KILLED_AFTER_RECOVERED_CRASH_OUTPUT
+        hint = _extract_cause_hint(output)
+        assert WORKER_DEATH_SUMMARY_MARKER not in hint, f'Unexpected hint: {hint!r}'
+        result = _test_leg_result(output)
+        report = result.failure_report()
+        assert self.HEADING not in report, f'Unexpected report: {report!r}'
+        assert result.summary == 'Failures: tests failed', (
+            f'Unexpected summary: {result.summary!r}'
+        )
+
+    def test_a_run_stopped_short_without_a_worker_crash_is_not_labelled(self):
+        """An -x/--maxfail stop: progress below 100% alone is never enough."""
+        failed_line = 'FAILED orchestrator/tests/test_x.py::test_real - AssertionError'
+        output = (
+            '....F'.ljust(73) + '[ 10%]\n'
+            + failed_line + '\n'
+            + '1 failed, 4 passed in 0.10s\n'
+        )
+        summary = _test_leg_result(output).summary
+        assert summary == 'Failures: tests failed', f'Unexpected summary: {summary!r}'
+        hint = _extract_cause_hint(output)
+        assert hint == failed_line, f'Unexpected hint: {hint!r}'
 
 
 class TestVerifyResultCauseHint:
