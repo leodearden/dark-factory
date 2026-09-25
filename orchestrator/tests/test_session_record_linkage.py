@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest  # pyright: ignore[reportMissingImports]
@@ -168,3 +169,55 @@ class TestResolveSessionSlugForPid:
     ) -> None:
         assert sr.resolve_session_slug_for_pid(pid, root=tmp_path) is None
         assert not sr.session_pointers_dir(tmp_path).exists()
+
+
+class TestResolveOwnRecordSlug:
+    _PID = 1234
+    _SLUG = 'role-proj-uuid'
+
+    def _link(self, root: Path) -> None:
+        sr.write_record(_record(self._SLUG, owner_pid=self._PID), root=root)
+        sr.write_session_pointer(self._PID, self._SLUG, root=root)
+
+    def test_resolves_the_claude_pid_from_env(self, tmp_path: Path) -> None:
+        self._link(tmp_path)
+
+        assert sr.resolve_own_record_slug({'CLAUDE_PID': '1234'}, root=tmp_path) == self._SLUG
+
+    def test_env_none_reads_os_environ(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._link(tmp_path)
+        monkeypatch.setenv('CLAUDE_PID', '1234')
+
+        assert sr.resolve_own_record_slug(root=tmp_path) == self._SLUG
+
+    @pytest.mark.parametrize(
+        'env',
+        [{}, {'CLAUDE_PID': ''}, {'CLAUDE_PID': '   '}, {'CLAUDE_PID': '0'},
+         {'CLAUDE_PID': '-1'}, {'CLAUDE_PID': 'not-a-pid'}],
+    )
+    def test_an_unusable_claude_pid_is_none_and_quiet(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, env: dict[str, str]
+    ) -> None:
+        self._link(tmp_path)
+        caplog.set_level(logging.DEBUG)
+
+        assert sr.resolve_own_record_slug(env, root=tmp_path) is None
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    def test_a_valid_pid_with_no_pointer_is_none_and_quiet(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.DEBUG)
+
+        assert sr.resolve_own_record_slug({'CLAUDE_PID': '1234'}, root=tmp_path) is None
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    def test_resolve_session_pid_keeps_its_lease_degradation_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.DEBUG)
+
+        assert sr.resolve_session_pid({'CLAUDE_PID': ''}) == 0
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
