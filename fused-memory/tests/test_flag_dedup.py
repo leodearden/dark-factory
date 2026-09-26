@@ -13862,6 +13862,92 @@ class TestFilterEntityStandingDecisionsExpiry:
 
 
 # ---------------------------------------------------------------------------
+# EntityStandingSuppressionResult.suppression_evaluated / empty_batch (task 2943)
+# ---------------------------------------------------------------------------
+# Cross-cycle streak accounting resets a decision's streak on a cycle where it
+# suppressed nothing.  That is only sound when the cycle actually consulted the
+# active-decision index, so the result says whether it did.
+
+
+class TestEntityStandingSuppressionEvaluated:
+    """Which Hook A outcomes are genuine observations (task 2943 step-5)."""
+
+    _PID = 'p'
+    _FLAG = {
+        'entity_uuid': _ESD_U1,
+        'grounds': GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+        'flag_type': 'oversized_entity',
+    }
+
+    def test_defaults_to_evaluated(self):
+        result = flag_dedup.EntityStandingSuppressionResult(
+            kept_flags=[], suppressed_by_decision={}, grounds_by_decision={}
+        )
+        assert result.suppression_evaluated is True
+
+    @pytest.mark.asyncio
+    async def test_suppressing_path_is_evaluated(self, ledger_memory_service):
+        await _seed_standing_decision(ledger_memory_service.recon_ledger, self._PID, _ESD_U1)
+        result = await flag_dedup.filter_entity_standing_decisions(
+            ledger_memory_service, self._PID, [self._FLAG]
+        )
+        assert result.suppressed_by_decision == {_ESD_U1: 1}
+        assert result.suppression_evaluated is True
+
+    @pytest.mark.asyncio
+    async def test_empty_flags_is_evaluated(self, ledger_memory_service):
+        """A cycle with nothing to suppress is one in which no decision drained anything."""
+        result = await flag_dedup.filter_entity_standing_decisions(
+            ledger_memory_service, self._PID, []
+        )
+        assert result.suppression_evaluated is True
+
+    @pytest.mark.asyncio
+    async def test_no_active_decisions_is_evaluated(self, ledger_memory_service):
+        result = await flag_dedup.filter_entity_standing_decisions(
+            ledger_memory_service, self._PID, [self._FLAG]
+        )
+        assert result.kept_flags == [self._FLAG]
+        assert result.suppression_evaluated is True
+
+    @pytest.mark.asyncio
+    async def test_no_ledger_is_not_evaluated(self, ledger_memory_service):
+        ledger_memory_service.recon_ledger = None
+        result = await flag_dedup.filter_entity_standing_decisions(
+            ledger_memory_service, self._PID, [self._FLAG]
+        )
+        assert result.kept_flags == [self._FLAG]
+        assert result.suppression_evaluated is False
+
+    @pytest.mark.asyncio
+    async def test_ledger_read_failure_is_not_evaluated(self, ledger_memory_service):
+        await _seed_standing_decision(ledger_memory_service.recon_ledger, self._PID, _ESD_U1)
+        ledger_memory_service.recon_ledger.list_entity_standing_decisions = AsyncMock(
+            side_effect=RuntimeError('boom')
+        )
+        result = await flag_dedup.filter_entity_standing_decisions(
+            ledger_memory_service, self._PID, [self._FLAG]
+        )
+        assert result.kept_flags == [self._FLAG]
+        assert result.suppression_evaluated is False
+
+    @pytest.mark.asyncio
+    async def test_empty_batch_matches_the_filters_empty_flags_result(
+        self, ledger_memory_service
+    ):
+        """The consolidator's zero-flag cycle and the filter's empty-flags
+        return must be the same observation, so they must not drift."""
+        empty = flag_dedup.EntityStandingSuppressionResult.empty_batch()
+        assert empty.kept_flags == []
+        assert empty.suppressed_by_decision == {}
+        assert empty.grounds_by_decision == {}
+        assert empty.suppression_evaluated is True
+        assert empty == await flag_dedup.filter_entity_standing_decisions(
+            ledger_memory_service, self._PID, []
+        )
+
+
+# ---------------------------------------------------------------------------
 # maybe_escalate_suppression_storm (Hook A storm escape / γ, task 2896) — step-7
 # ---------------------------------------------------------------------------
 # (SUPPRESSION_STORM_THRESHOLD_PER_CYCLE imported at module top.)
