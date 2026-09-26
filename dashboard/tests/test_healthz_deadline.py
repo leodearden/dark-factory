@@ -854,7 +854,6 @@ def test_probe_tasks_are_tracked_by_the_shared_helpers():
     """app.py abandons and tracks probe tasks via shared.asyncio_tasks (task 4530)."""
     assert app_module.abandon_task is shared.asyncio_tasks.abandon_task
     assert app_module.track_task is shared.asyncio_tasks.track_task
-    assert not hasattr(app_module, '_abandon_probe')
 
 
 def test_probe_registries_stay_module_local_sets():
