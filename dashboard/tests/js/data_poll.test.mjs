@@ -2646,24 +2646,25 @@ test('pacing: a chip change still forces a paced WINDOWED endpoint, only the win
   assert.equal(server.count(COSTS_PATH), 3);
 });
 
-test('pacing: requestOnDemand is never paced - a user action is not a poll loop', async () => {
+test('pacing: requestOnDemand is never paced - a user action is not a poll loop, even handed a poll cadence in its deps', async () => {
   const server = makeVirtualServer({ [TASKS_PATH]: 4000 });
   const { api } = loadDataJs({ fetchStub: server.deps.fetchImpl });
   const state = api.createPollState();
+  const deps = { ...server.deps, pollIntervalMs: EXPECTED_POLL_INTERVAL_MS };
 
-  const first = api.requestOnDemand('terminal', TERMINAL_PROJECT, { state, deps: server.deps });
+  const first = api.requestOnDemand('terminal', TERMINAL_PROJECT, { state, deps });
   await drain();
   await server.advanceTo(4000);
   assert.equal(await first, api.REFRESH_OUTCOMES.applied);
 
-  const second = api.requestOnDemand('terminal', TERMINAL_PROJECT, { state, deps: server.deps });
+  const second = api.requestOnDemand('terminal', TERMINAL_PROJECT, { state, deps });
   await drain();
   await server.advanceTo(8000);
   assert.equal(await second, api.REFRESH_OUTCOMES.applied, 'a user re-request of a slow listing must be fetched, not skipped');
   assert.equal(server.count(TASKS_PATH), 2);
 });
 
-test('pacing: a service time inflated by a wall-clock jump can never hold an endpoint off beyond BACKOFF_MAX_MS', async () => {
+test('pacing: a service time inflated by a wall-clock jump can never hold an endpoint beyond BACKOFF_MAX_MS after its request started', async () => {
   // A laptop suspended mid-request: the answer lands ten hours "later" by
   // Date.now(), still a success, so no staleness banner would ever explain
   // an unbounded hold.
@@ -2677,8 +2678,11 @@ test('pacing: a service time inflated by a wall-clock jump can never hold an end
   await server.advanceTo(jumpedServiceMs);
   assert.equal(win.DF_DATA.__stale[CURATOR_PATH].failures, 0, 'nothing would warn the operator of this hold');
 
-  await server.advanceTo(jumpedServiceMs + EXPECTED_BACKOFF_MAX_MS);
+  // The cap runs from the request's start, so a late answer lands already past
+  // it: the very next tick asks again. A cap anchored at arrival would still
+  // be holding here.
+  await server.advanceTo(jumpedServiceMs + EXPECTED_POLL_INTERVAL_MS);
   api.pollTick(opts);
   await drain();
-  assert.equal(server.count(CURATOR_PATH), 2, 'held off beyond the failure-backoff ceiling');
+  assert.equal(server.count(CURATOR_PATH), 2, `held off past ${EXPECTED_BACKOFF_MAX_MS}ms after its request started`);
 });

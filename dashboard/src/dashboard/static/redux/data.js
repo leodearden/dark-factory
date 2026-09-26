@@ -437,9 +437,11 @@ const MAX_POLL_DUTY_CYCLE = 0.5;
 
 // Unlike recordFailure, a forced attempt still paces: pacing is a pure
 // function of the latest measurement, so clicks cannot inflate it.
-// A success's own deadline (DEFAULT_TIMEOUT_MS) already bounds pacing at
-// BACKOFF_MAX_MS; the cap binds only on a wall-clock jump such as
-// suspend/resume, which would otherwise freeze the endpoint with failures at 0.
+// Pacing never holds an endpoint past BACKOFF_MAX_MS after its request started.
+// The fetch deadline does not bound serviceMs: it races only fetchImpl, so a
+// slow body read, an injected deps.timeoutMs or a wall-clock jump
+// (suspend/resume) can each exceed it, and uncapped would freeze the endpoint
+// with failures at 0 and no staleness banner.
 function recordSuccess(st, deps, startedAt, receivedAt) {
   const serviceMs = receivedAt - startedAt;
   const paced = deps.pollIntervalMs !== undefined
@@ -737,9 +739,10 @@ async function refreshDFData(win, opts) {
 // single user-triggered request has nothing to spread against, and delaying it
 // would only be latency the user sees.
 //
-// NO PACING. startOnDemand deliberately leaves deps.pollIntervalMs unset: a
-// duty-cycle cap is a property of a repeating loop, and pacing a user action
-// would turn a re-request of a slow listing into skippedBackoff.
+// NO PACING. startOnDemand clears deps.pollIntervalMs after the overrides, so a
+// poll deps object spread in cannot switch pacing on: a duty-cycle cap is a
+// property of a repeating loop, and pacing a user action would turn a
+// re-request of a slow listing into skippedBackoff.
 //
 // RETURNS the refreshOne outcome of the request serving this call. A user
 // action is the one caller that cannot just wait for the next tick: without
@@ -770,7 +773,7 @@ async function requestOnDemand(name, param, opts) {
 
 function startOnDemand(name, param, state, depsOverrides, ledger) {
   const row = ON_DEMAND_KEYS[name];
-  const deps = { ...DEFAULT_POLL_DEPS, ...depsOverrides, jitterMaxMs: 0 };
+  const deps = { ...DEFAULT_POLL_DEPS, ...depsOverrides, jitterMaxMs: 0, pollIntervalMs: undefined };
   const request = refreshOne(
     row.url(param),
     { [row.key(param)]: row.spec },
