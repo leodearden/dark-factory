@@ -25,8 +25,12 @@ import collections
 import sys
 import types
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    import socket
 
 _SRC = Path(__file__).parent.parent / 'src'
 if str(_SRC) not in sys.path:
@@ -184,18 +188,24 @@ def pytest_configure(config):
 _READY_TIMEOUT_S = 10.0
 
 
-def _free_escalation_port() -> int:
-    """Return an ephemeral TCP port free on 127.0.0.1 at the time of the call.
+def _bind_escalation_listener() -> socket.socket:
+    """Return a TCP socket bound to an OS-assigned port on 127.0.0.1, for the
+    server to listen and serve on.
 
-    Binds to port 0 (OS-assigned free port) and immediately closes the socket.
-    There is an inherent (small) TOCTOU window before the real server binds the
-    same port; acceptable for a single-threaded test run.
+    The port is HELD from allocation onward: the socket stays open and does
+    not set SO_REUSEADDR, so no other socket can bind that port, not even one
+    that sets SO_REUSEADDR itself. Handing this very socket to the server is
+    what leaves no gap between choosing a port and serving on it (task 5934).
+
+    It does NOT listen(): connects are refused until the server's own
+    ``create_server()`` calls listen(), so a server that never starts gives
+    ECONNREFUSED instead of accepting into a backlog nobody answers.
     """
     import socket
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(('127.0.0.1', 0))
-        return s.getsockname()[1]
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(('127.0.0.1', 0))
+    return listener
 
 
 def _drain_pending_tasks(loop) -> None:
@@ -204,7 +214,7 @@ def _drain_pending_tasks(loop) -> None:
     Mirrors ``asyncio.run()``'s own internal shutdown sequence
     (``_cancel_all_tasks``).  Without this, a task still suspended
     mid-``await`` when the loop is stopped -- the server's own root task
-    (``run_http_async``), or an internal one it spawns (e.g. sse_starlette's
+    (``uvicorn.Server.serve``), or an internal one it spawns (e.g. sse_starlette's
     ``_shutdown_watcher``) -- is only unwound later at uncontrolled
     garbage-collection time, outside of any running task context, which
     crashes anyio's shielded lifespan cleanup with an unraisable
@@ -271,9 +281,11 @@ def _serve_escalation_mcp_impl():
 
     Call as ``serve_escalation_mcp(queue_dir)`` -> ``(base_url, port, queue)``.
     Builds ``EscalationQueue(queue_dir)`` + ``create_server(queue,
-    startup_sweep=False, dedupe_config=...)`` and serves it via
-    ``FastMCP.run_http_async`` on an OS-assigned free localhost port inside a
-    daemon thread running its own event loop.  Readiness is polled by a real
+    startup_sweep=False, dedupe_config=...)`` and serves its ``http_app()``
+    through ``uvicorn.Server`` -- production's shape -- on a localhost listener
+    the fixture binds and holds from allocation onward
+    (``_bind_escalation_listener``), inside a daemon thread running its own
+    event loop; teardown closes that listener.  Readiness is polled by a real
     MCP handshake (``_mcp_handshake_ready``, bounded ~10s total) -- not a bare
     TCP connect, and no fixed sleep.  Every server started through the factory
     is torn down when the test finishes.
@@ -313,6 +325,8 @@ def _serve_escalation_mcp_impl():
     import threading
     import time
 
+    import uvicorn
+
     from escalation.dedupe import DedupeConfig
     from escalation.queue import EscalationQueue
     from escalation.server import create_server
@@ -326,7 +340,8 @@ def _serve_escalation_mcp_impl():
         mcp = create_server(
             queue, startup_sweep=startup_sweep, dedupe_config=dedupe_config,
         )
-        port = _free_escalation_port()
+        listener = _bind_escalation_listener()
+        port = listener.getsockname()[1]
         loop = asyncio.new_event_loop()
         serve_error: BaseException | None = None
         state = {'stopping': False}
@@ -335,12 +350,14 @@ def _serve_escalation_mcp_impl():
             nonlocal serve_error
             asyncio.set_event_loop(loop)
             try:
-                loop.run_until_complete(
-                    mcp.run_http_async(
-                        host='127.0.0.1', port=port,
-                        show_banner=False, log_level='error',
-                    )
-                )
+                # The Config kwargs are the ones FastMCP.run_http_async applies
+                # itself, so serving through uvicorn directly changes only
+                # WHERE the server listens: on the socket this fixture holds.
+                server = uvicorn.Server(uvicorn.Config(
+                    mcp.http_app(), log_level='error', lifespan='on',
+                    ws='websockets-sansio', timeout_graceful_shutdown=2,
+                ))
+                loop.run_until_complete(server.serve(sockets=[listener]))
             except BaseException as exc:  # noqa: BLE001 - surfaced on timeout below
                 # Two distinct cases, told apart by the `stopping` flag:
                 #
@@ -350,14 +367,14 @@ def _serve_escalation_mcp_impl():
                 # * Anything raised before teardown began is a genuine startup
                 #   failure and must be surfaced below.
                 #
-                # BaseException, not RuntimeError: _free_escalation_port()
-                # binds-then-closes, so a TOCTOU port steal (or any other bind
-                # failure) reaches here as an OSError -- or, since uvicorn
-                # calls sys.exit(1) on a failed bind, as SystemExit, which is
-                # not even an Exception subclass. Narrowing to RuntimeError
-                # leaves serve_error None for both, so the readiness timeout
-                # below reports only the generic "did not complete an MCP
-                # handshake" and silently drops the one fact a reader needs.
+                # BaseException, not RuntimeError: a startup failure need not
+                # be a RuntimeError. asyncio rejects a listener it cannot serve
+                # on with ValueError, and uvicorn's own startup error paths end
+                # in sys.exit(1), i.e. SystemExit, which is not even an
+                # Exception subclass. Narrowing to RuntimeError leaves
+                # serve_error None for those, so the readiness timeout below
+                # reports only the generic "did not complete an MCP handshake"
+                # and silently drops the one fact a reader needs.
                 if not state['stopping']:
                     serve_error = exc
             finally:
@@ -368,7 +385,7 @@ def _serve_escalation_mcp_impl():
             target=_serve_forever, name=f'escalation-mcp-http-{port}', daemon=True,
         )
         thread.start()
-        started.append((loop, thread, state, port))
+        started.append((loop, thread, state, port, listener))
 
         # Gate readiness on a real MCP handshake (initialize+ping), not a bare
         # TCP connect: a successful connect only proves the OS accept queue is
@@ -408,7 +425,7 @@ def _serve_escalation_mcp_impl():
         yield _start
     finally:
         hung = []
-        for loop, thread, state, port in started:
+        for loop, thread, state, port, listener in started:
             state['stopping'] = True
             # A thread that died during startup already ran `loop.close()` in
             # its own `finally`, and stopping a CLOSED loop raises
@@ -420,6 +437,9 @@ def _serve_escalation_mcp_impl():
             thread.join(timeout=5.0)
             if thread.is_alive():
                 hung.append(f'escalation-mcp-http-{port}')
+            # Released only once its server is gone -- hung, stopped, or dead
+            # at startup alike. close() is idempotent.
+            listener.close()
         # Collected, not asserted in-loop: an in-loop assert would abort
         # teardown of every server started AFTER the first hung one, leaking
         # precisely the daemon threads this assert exists to prevent.
@@ -483,7 +503,7 @@ def escalation_conftest():
 
     The fixtures above auto-resolve by name, but some of this module's
     contents are not fixtures at all (``_mcp_handshake_ready``,
-    ``_free_escalation_port``) and some tests need the UNDECORATED generator
+    ``_bind_escalation_listener``) and some tests need the UNDECORATED generator
     behind ``serve_escalation_mcp`` via ``__wrapped__``, so that one server's
     startup and teardown can be observed in isolation. Handing the module over
     through a fixture is how those tests reach it; see
@@ -504,10 +524,9 @@ def escalation_conftest():
     and not a second import of the same file -- is that ``sys.modules[__name__]``
     is the LIVE module object pytest itself loaded, so ``monkeypatch.setattr``
     against it really does patch what ``_serve_escalation_mcp_impl``'s body
-    reads. That is pinned behaviourally rather than by introspection: the
-    startup-failure and readiness-bound tests in
+    reads. That is pinned behaviourally rather than by introspection: tests in
     ``test_serve_escalation_mcp_fixture.py`` monkeypatch
-    ``_free_escalation_port`` / ``_READY_TIMEOUT_S`` here and observe the
+    ``_bind_escalation_listener`` / ``_READY_TIMEOUT_S`` here and observe the
     fixture pick both up, which no second import could satisfy.
 
     Function-scoped deliberately -- it holds no state and is cheap, so it
