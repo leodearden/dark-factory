@@ -765,7 +765,7 @@ test('derivedDatum: a site with no receipt still reads as never-fetched', () => 
 // client-built envelope). The census is served per project; the topbar, the
 // rail and every multi-project tile need the sum. A partial sum is an
 // under-count passed off as a total, so a hole in any part is a hole in the
-// total — the rule orch_summary.js::orchSummaryTotal held before it.
+// total.
 // ---------------------------------------------------------------------------
 
 function throwingCombine() {
@@ -779,8 +779,8 @@ const joinInOrder = values => values.map(String).join('|');
 
 // Two fresh parts measured at different instants and received on different
 // polls, listed NEWEST FIRST so the oldest part is not simply the first one.
-// The older part declares the LOOSER bound, so "minimum bound" and "the oldest
-// part's bound" are different answers.
+// The older part declares the LOOSER bound, so "minimum bound" (30) and the
+// bound the total actually takes (60) are different answers.
 const FRESH_NEWER = withReceipt(
   { ...FRESH_WIRE, value: 4, as_of: SERVED_AT, freshness_bound_seconds: 30 },
   { servedAt: shiftIso(SERVED_AT, 2_000), receivedAt: RECEIVED_AT + 2_000 },
@@ -832,7 +832,7 @@ test('combinedDatum: ANY unknown part makes the total unknown — no partial sum
   assert.equal(total.reason, 'reify: scheduler offline; hive: snapshot failed');
 });
 
-test('combinedDatum: all fresh — the combined value, the OLDEST instant, the tightest bound', () => {
+test('combinedDatum: all fresh — the combined value, the OLDEST part\'s instant and receipt', () => {
   const total = combinedDatum(
     [
       ['reify', FRESH_NEWER],
@@ -847,10 +847,65 @@ test('combinedDatum: all fresh — the combined value, the OLDEST instant, the t
   assert.equal(total.reason, null);
   assert.equal(total.value, '4|3', 'combine receives the values in part order');
   assert.equal(total.as_of, AS_OF, 'a total is only as recent as its oldest part');
-  assert.equal(total.freshness_bound_seconds, 30, 'the tightest bound over the parts');
+  assert.equal(
+    total.freshness_bound_seconds,
+    60,
+    'the newer part\'s 30s bound, restated on the older part\'s clock, is three hours looser than 60s',
+  );
   assert.equal(total._served_at, FRESH_OLDER._served_at);
   assert.equal(total._received_at, FRESH_OLDER._received_at);
   assert.equal(displayedAgeMs(total, NOW), displayedAgeMs(FRESH_OLDER, NOW));
+});
+
+test('combinedDatum: parts from different payloads — the total looks as old as its oldest-LOOKING part', () => {
+  // The earliest as_of is not the greatest displayed age once the parts'
+  // receipts differ: `early` was measured first but arrived on this poll,
+  // `lagging` was measured later but on a payload received a minute ago.
+  const early = withReceipt(
+    { ...FRESH_WIRE, value: 1, as_of: shiftIso(SERVED_AT, -1_000) },
+    { servedAt: SERVED_AT, receivedAt: RECEIVED_AT },
+  );
+  const lagging = withReceipt(
+    { ...FRESH_WIRE, value: 2, as_of: SERVED_AT },
+    { servedAt: shiftIso(SERVED_AT, 1_000), receivedAt: RECEIVED_AT - 60_000 },
+  );
+  assert.ok(displayedAgeMs(lagging, NOW) > displayedAgeMs(early, NOW), 'fixture: lagging looks older');
+
+  const total = combinedDatum([['early', early], ['lagging', lagging]], sum, 'unused');
+
+  assert.equal(total.as_of, lagging.as_of);
+  assert.equal(total._served_at, lagging._served_at);
+  assert.equal(total._received_at, lagging._received_at);
+  assert.equal(displayedAgeMs(total, NOW), displayedAgeMs(lagging, NOW));
+  assert.equal(datumView(total, { now: NOW }).age, datumView(lagging, { now: NOW }).age);
+});
+
+test('combinedDatum: the total badges exactly when its FIRST part would — never before', () => {
+  // One receipt. `loose` is older and patient (20s old, 30s bound); `tight` is
+  // younger and impatient (5s old, 10s bound). A bare minimum bound (10s) on
+  // the oldest part's age (20s) would badge the total while neither part
+  // badges; the total instead waits for `tight` to cross its own bound.
+  const loose = withReceipt(
+    { ...FRESH_WIRE, value: 1, as_of: shiftIso(SERVED_AT, -15_000), freshness_bound_seconds: 30 },
+    RECEIPT,
+  );
+  const tight = withReceipt({ ...FRESH_WIRE, value: 2, as_of: SERVED_AT, freshness_bound_seconds: 10 }, RECEIPT);
+  const total = combinedDatum([['loose', loose], ['tight', tight]], sum, 'unused');
+
+  const badged = (datum, now) => datumView(datum, { now }).age !== null;
+  for (const now of [NOW, NOW + 4_000, NOW + 5_000, NOW + 6_000, NOW + 20_000]) {
+    const anyPart = badged(loose, now) || badged(tight, now);
+    assert.equal(badged(total, now), anyPart, `at +${now - NOW}ms a part badges: ${anyPart}`);
+  }
+  assert.equal(badged(total, NOW), false, 'no part is past its bound at NOW');
+  assert.equal(badged(total, NOW + 6_000), true, 'tight is past its 10s bound at +6s');
+});
+
+test('combinedDatum: a part with no receipt throws — its age cannot be compared', () => {
+  assert.throws(
+    () => combinedDatum([['dark-factory', FRESH_OLDER], ['reify', { ...FRESH_WIRE }]], sum, 'unused'),
+    err => err instanceof TypeError && err.message.includes('combinedDatum') && err.message.includes('withReceipt'),
+  );
 });
 
 test('combinedDatum: one stale part makes the total stale, naming only the non-fresh parts', () => {

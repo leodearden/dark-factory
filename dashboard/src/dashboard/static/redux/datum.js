@@ -361,14 +361,19 @@ function derivedDatum(value, endpointKey, absentReason, receipts) {
 // `emptyReason` — required — says why an empty scope has no total.
 //
 // A HOLE ANYWHERE IS A HOLE IN THE TOTAL. A partial sum is an under-count passed
-// off as a total — the rule orch_summary.js::orchSummaryTotal held before this
-// replaced it — so `combine` never runs over a scope with a gap in it, and the
+// off as a total, so `combine` never runs over a scope with a gap in it, and the
 // reason names every missing part so the operator reads which one and why.
 //
-// OTHERWISE THE WORST PART DECIDES: lower_bound > stale > fresh, lower_bound
-// first so both the '≥' and the age badge survive. The total is only as recent
-// as its OLDEST part, so it takes that part's as_of and receipt, and it is only
-// as patient as its TIGHTEST bound.
+// OTHERWISE THE WORST PART DECIDES THE STATE: lower_bound > stale > fresh,
+// lower_bound first so both the '≥' and the age badge survive.
+//
+// THE TOTAL LOOKS AS OLD AS ITS OLDEST-LOOKING PART, AND BADGES EXACTLY WHEN ITS
+// FIRST PART WOULD. Parts may arrive on different payloads, each with its own
+// served_at and received_at, so "oldest" is the greatest displayedAgeMs, not the
+// earliest as_of; the total takes that part's as_of and receipt. Its bound is
+// every part's bound restated on the oldest part's clock — the part's own bound
+// plus the oldest part's lead over it — and the tightest wins: a bare minimum
+// would badge the total while every part is still inside its own bound.
 const COMBINED_STATE_PRECEDENCE = ['lower_bound', 'stale', 'fresh'];
 
 function combinedDatum(partsByLabel, combine, emptyReason) {
@@ -378,22 +383,44 @@ function combinedDatum(partsByLabel, combine, emptyReason) {
   const holes = parts.filter(([, part]) => part.state === 'unknown');
   if (holes.length > 0) return unknownDatum(labelledReasons(holes));
 
-  const oldest = parts
-    .map(([, part]) => part)
-    .reduce((a, b) => (Date.parse(b.as_of) < Date.parse(a.as_of) ? b : a));
+  const measured = parts.map(([, part]) => part);
+  const ages = displayedAgesOf(measured);
+  const oldestAge = Math.max(...ages);
+  const oldest = measured[ages.indexOf(oldestAge)];
   const unfresh = parts.filter(([, part]) => part.state !== 'fresh');
-  const state = COMBINED_STATE_PRECEDENCE.find(s => parts.some(([, part]) => part.state === s));
+  const state = COMBINED_STATE_PRECEDENCE.find(s => measured.some(part => part.state === s));
 
   return withReceipt(
     {
-      value: combine(parts.map(([, part]) => part.value)),
+      value: combine(measured.map(part => part.value)),
       as_of: oldest.as_of,
       state,
       reason: unfresh.length > 0 ? labelledReasons(unfresh) : null,
-      freshness_bound_seconds: Math.min(...parts.map(([, part]) => part.freshness_bound_seconds)),
+      freshness_bound_seconds: Math.min(
+        ...measured.map((part, i) => part.freshness_bound_seconds + (oldestAge - ages[i]) / 1000),
+      ),
     },
     { servedAt: oldest._served_at, receivedAt: oldest._received_at },
   );
+}
+
+// Every part's displayed age at ONE instant. Displayed ages all grow at the
+// same rate, so their order and their differences — all combinedDatum reads —
+// hold at every later render. A part with no receipt has no displayed age to
+// compare, and a total over it could not say how old it looks: a caller's
+// error, thrown like assertDatum's.
+function displayedAgesOf(parts) {
+  const now = Date.now();
+  return parts.map(part => {
+    const age = displayedAgeMs(part, now);
+    if (age === null) {
+      throw new TypeError(
+        'combinedDatum was given a part with no displayed age — stamp every served part ' +
+          'with its receipt (withReceipt) before combining.',
+      );
+    }
+    return age;
+  });
 }
 
 function labelledReasons(parts) {
