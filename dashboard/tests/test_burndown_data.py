@@ -1929,6 +1929,35 @@ class TestDownsample:
                 assert row is not None
                 assert row[0] == 1  # compacted to one per hour
 
+    async def test_keeps_one_row_per_old_hour_not_one_per_project(self, tmp_path):
+        """Two old hours keep one row EACH.
+
+        The bucket key was once ``strftime('%%Y-%%m-%%dT%%H', ts)`` in a bound
+        (not %-formatted) SQL string, so SQLite read ``%%`` as a literal percent
+        and every row older than 7 days shared ONE bucket per project — the
+        whole 7-90 day history collapsed to a single survivor.
+        """
+        db_path = tmp_path / 'burndown.db'
+        _create_burndown_db(db_path)
+
+        old_hour = (datetime.now(UTC) - timedelta(days=10)).replace(minute=0, second=0, microsecond=0)
+        sync_conn = sqlite3.connect(str(db_path))
+        for hour in (old_hour, old_hour - timedelta(hours=1)):
+            for minute in (10, 50):
+                _insert_snapshot(sync_conn, 'proj', (hour + timedelta(minutes=minute)).isoformat())
+        sync_conn.commit()
+        sync_conn.close()
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            await downsample(conn)
+            async with conn.execute('SELECT ts FROM snapshots ORDER BY ts') as cur:
+                survivors = [row[0] for row in await cur.fetchall()]
+
+        assert [ts[:16] for ts in survivors] == [
+            (old_hour - timedelta(hours=1) + timedelta(minutes=50)).isoformat()[:16],
+            (old_hour + timedelta(minutes=50)).isoformat()[:16],
+        ], f'expected the last row of each old hour, got {survivors}'
+
     @pytest.mark.asyncio
     async def test_expires_very_old(self, tmp_path):
         """Data older than 90 days is deleted."""
@@ -2018,11 +2047,12 @@ class TestGetBurndownSeries:
         assert len(result['done']) == 3
         assert len(result['pending']) == 3
         # Exact inventory, so a key can neither vanish nor appear unnoticed.
-        # The last three are task 3543's split + cap; see
-        # tests/test_burndown_parity_alarm.py for their semantics.
+        # The split + cap are task 3543's (see tests/test_burndown_parity_alarm.py
+        # for their semantics); the last four are task 5591's.
         assert set(result.keys()) == {
             'labels', 'done', 'cancelled', 'blocked', 'deferred', 'in_progress', 'pending',
             'in_progress_live', 'in_progress_stranded', 'concurrency_cap',
+            'review', 'merge_deferred', 'infra_hold', 'in_progress_rows',
         }
 
     @pytest.mark.asyncio
@@ -2071,6 +2101,220 @@ class TestGetBurndownSeries:
 
         # done values should be in timestamp order (oldest first)
         assert result['done'] == [3, 2, 1]
+
+
+# ---------------------------------------------------------------------------
+# Read side: measured rows only, and the task 5591 columns (step-7)
+# ---------------------------------------------------------------------------
+
+_READ_NOW = datetime(2026, 9, 20, 12, 0, 0, tzinfo=UTC)
+_NEW_SERIES_KEYS = ('review', 'merge_deferred', 'infra_hold', 'in_progress_rows')
+
+
+def _hours_before_read(hours: int) -> str:
+    return (_READ_NOW - timedelta(hours=hours)).isoformat()
+
+
+def _insert_gap(conn: sqlite3.Connection, project_id: str, ts: str, reason: str = 'rows: offline') -> None:
+    """A gap row exactly as the collector writes one: no count column named."""
+    conn.execute(
+        'INSERT INTO snapshots (project_id, ts, state, reason) VALUES (?, ?, ?, ?)',
+        (project_id, ts, 'gap', reason),
+    )
+
+
+def _insert_value(conn: sqlite3.Connection, project_id: str, ts: str, **counts) -> None:
+    """A post-5591 value row; *counts* override the zero defaults."""
+    fields = {'review': 0, 'merge_deferred': 0, 'infra_hold': 0, **counts}
+    fields.setdefault('in_progress_rows', fields.get('in_progress', 0))
+    _insert_snapshot(conn, project_id, ts, state='value', **fields)
+
+
+def _migrated_pre_delta1_db(path: Path) -> None:
+    """A pre-δ1 store (its one row inside the read window), migrated in place."""
+    _pre_delta1_burndown_db(path, project_id='proj', ts=_hours_before_read(3))
+    conn = sqlite3.connect(str(path))
+    for column, ddl in (('review', 'INTEGER'), ('merge_deferred', 'INTEGER'),
+                        ('infra_hold', 'INTEGER'), ('in_progress_rows', 'INTEGER'),
+                        ('state', 'TEXT'), ('reason', 'TEXT')):
+        conn.execute(f'ALTER TABLE snapshots ADD COLUMN {column} {ddl}')
+    conn.commit()
+    conn.close()
+
+
+async def _series_of(path: Path, project_id: str = 'proj', **kwargs) -> dict:
+    async with aiosqlite.connect(str(path)) as db:
+        return await get_burndown_series(db, project_id, now=kwargs.pop('now', _READ_NOW), **kwargs)
+
+
+class TestReadSideSeesMeasuredRowsOnly:
+    """A gap row's physically-defaulted zeros must never reach a reader."""
+
+    async def test_series_skips_a_gap_row(self, tmp_path):
+        db = tmp_path / 'burndown.db'
+        _create_burndown_db(db)
+        conn = sqlite3.connect(str(db))
+        _insert_value(conn, 'proj', _hours_before_read(2), done=20, pending=5)
+        _insert_gap(conn, 'proj', _hours_before_read(1))
+        conn.commit()
+        conn.close()
+
+        series = await _series_of(db)
+
+        assert series['labels'] == [_hours_before_read(2)]
+        assert series['done'] == [20]
+
+    async def test_series_keeps_a_legacy_null_state_row(self, tmp_path):
+        """Before task 5591 only a successful read wrote a row: NULL state is measured."""
+        db = tmp_path / 'burndown.db'
+        _create_burndown_db(db)
+        conn = sqlite3.connect(str(db))
+        _insert_snapshot(conn, 'proj', _hours_before_read(2), done=7)
+        _insert_gap(conn, 'proj', _hours_before_read(1))
+        conn.commit()
+        conn.close()
+
+        series = await _series_of(db)
+
+        assert series['labels'] == [_hours_before_read(2)]
+        assert series['done'] == [7]
+
+    async def test_projects_omit_a_gap_only_project(self, tmp_path):
+        db = tmp_path / 'burndown.db'
+        _create_burndown_db(db)
+        conn = sqlite3.connect(str(db))
+        _insert_gap(conn, 'gap-only', _hours_before_read(1))
+        _insert_value(conn, 'measured', _hours_before_read(2), done=1)
+        _insert_gap(conn, 'measured', _hours_before_read(1))
+        _insert_snapshot(conn, 'legacy', _hours_before_read(2), done=1)
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect(str(db)) as c:
+            assert await get_burndown_projects(c) == ['legacy', 'measured']
+            assert await aggregate_burndown_projects([c]) == ['legacy', 'measured']
+
+    async def test_series_carries_the_new_columns_null_before_the_migration(self, tmp_path):
+        db = tmp_path / 'migrated.db'
+        _migrated_pre_delta1_db(db)
+        conn = sqlite3.connect(str(db))
+        _insert_value(conn, 'proj', _hours_before_read(1), in_progress=3, review=2,
+                      merge_deferred=1, infra_hold=4, in_progress_rows=2,
+                      in_progress_live=1, in_progress_stranded=1)
+        conn.commit()
+        conn.close()
+
+        series = await _series_of(db)
+
+        assert series['labels'] == [_hours_before_read(3), _hours_before_read(1)]
+        assert series['review'] == [None, 2]
+        assert series['merge_deferred'] == [None, 1]
+        assert series['infra_hold'] == [None, 4]
+        assert series['in_progress_rows'] == [None, 2]
+
+    async def test_empty_series_default_carries_the_new_keys(self):
+        series = await get_burndown_series(None, 'proj')
+        for key in _NEW_SERIES_KEYS:
+            assert series[key] == [], key
+
+    @pytest.mark.parametrize('make_store', [
+        pytest.param(_pre_delta1_burndown_db, id='pre_delta1_unmigrated'),
+        pytest.param(_legacy_burndown_db, id='pre_3543_legacy'),
+    ])
+    async def test_an_unmigrated_peer_store_still_reads(self, tmp_path, make_store):
+        """Other projects' burndown.db files are opened read-only and never
+        migrated: no ``state`` column, so every row is measured by construction."""
+        db = tmp_path / 'peer.db'
+        make_store(db)
+        project_id = 'pre-delta1' if make_store is _pre_delta1_burndown_db else 'legacy'
+        read_now = datetime(2026, 1, 2, tzinfo=UTC)
+
+        series = await _series_of(db, project_id, now=read_now)
+
+        assert series['labels'] == ['2026-01-01T00:00:00+00:00'], (
+            'the rows must come back through the probe-gated path, not the '
+            'except-and-return-empty guard'
+        )
+        assert series['done'] == [20]
+        for key in _NEW_SERIES_KEYS:
+            assert series[key] == [None], key
+        async with aiosqlite.connect(str(db)) as c:
+            assert await get_burndown_projects(c) == [project_id]
+
+    async def test_aggregate_merges_the_new_keys(self, tmp_path):
+        db1, db2 = tmp_path / 'one.db', tmp_path / 'two.db'
+        for path, hours, review in ((db1, 2, 1), (db2, 1, 5)):
+            _create_burndown_db(path)
+            conn = sqlite3.connect(str(path))
+            _insert_value(conn, 'proj', _hours_before_read(hours), review=review,
+                          merge_deferred=review + 1, infra_hold=review + 2,
+                          in_progress=review, in_progress_rows=review)
+            conn.commit()
+            conn.close()
+
+        async with aiosqlite.connect(str(db1)) as c1, aiosqlite.connect(str(db2)) as c2:
+            merged = await aggregate_burndown_series([c1, c2], 'proj', now=_READ_NOW)
+        empty = await aggregate_burndown_series([], 'proj')
+
+        assert merged['review'] == [1, 5]
+        assert merged['merge_deferred'] == [2, 6]
+        assert merged['infra_hold'] == [3, 7]
+        assert merged['in_progress_rows'] == [1, 5]
+        for key in _NEW_SERIES_KEYS:
+            assert empty[key] == [], key
+
+    async def test_downsample_keeps_the_measured_row_of_an_hour(self, tmp_path):
+        db = tmp_path / 'burndown.db'
+        _create_burndown_db(db)
+        now = datetime.now(UTC)
+        old_hour = (now - timedelta(days=10)).replace(minute=0, second=0, microsecond=0)
+        gap_only_hour = old_hour - timedelta(hours=5)
+        conn = sqlite3.connect(str(db))
+        _insert_value(conn, 'proj', (old_hour + timedelta(minutes=10)).isoformat(), done=9)
+        _insert_gap(conn, 'proj', (old_hour + timedelta(minutes=50)).isoformat())
+        _insert_gap(conn, 'proj', (gap_only_hour + timedelta(minutes=10)).isoformat())
+        _insert_gap(conn, 'proj', (gap_only_hour + timedelta(minutes=50)).isoformat())
+        recent = [(now - timedelta(minutes=m)).isoformat() for m in (5, 15)]
+        _insert_value(conn, 'proj', recent[0], done=10)
+        _insert_gap(conn, 'proj', recent[1])
+        conn.commit()
+        conn.close()
+
+        async with aiosqlite.connect(str(db)) as c:
+            await downsample(c)
+            async with c.execute('SELECT ts, state, done FROM snapshots ORDER BY ts') as cur:
+                rows = [tuple(r) for r in await cur.fetchall()]
+
+        old = [r for r in rows if r[0] < (now - timedelta(days=7)).isoformat()]
+        assert [(r[0][:13], r[1]) for r in old] == [
+            (gap_only_hour.isoformat()[:13], 'gap'),
+            (old_hour.isoformat()[:13], 'value'),
+        ], f'measured rows win an old hour; a gap-only hour keeps one gap: {old}'
+        assert [r for r in old if r[1] == 'value'][0][2] == 9
+        assert sorted(r[0] for r in rows if r not in old) == sorted(recent), 'recent rows untouched'
+
+    async def test_the_current_shaper_sees_no_gap_rows(self, tmp_path):
+        """Wire compatibility with ``redux_api.shape_burndown`` (task 5592 owns it):
+        a gap row contributes nothing — not zeros — to either block."""
+        from dashboard.data.redux_api import shape_burndown
+
+        with_gap, without_gap = tmp_path / 'with_gap.db', tmp_path / 'without_gap.db'
+        for path in (with_gap, without_gap):
+            _migrated_pre_delta1_db(path)
+            conn = sqlite3.connect(str(path))
+            _insert_value(conn, 'proj', _hours_before_read(2), done=25, pending=4,
+                          in_progress=2, in_progress_live=1, in_progress_stranded=1,
+                          in_progress_rows=2, review=1, concurrency_cap=24)
+            if path is with_gap:
+                _insert_gap(conn, 'proj', _hours_before_read(1))
+            conn.commit()
+            conn.close()
+
+        shaped = shape_burndown({'/p/proj': await _series_of(with_gap)})
+        expected = shape_burndown({'/p/proj': await _series_of(without_gap)})
+
+        assert shaped['BURNDOWN_BY_PROJECT'] == expected['BURNDOWN_BY_PROJECT']
+        assert shaped['BURNDOWN'] == expected['BURNDOWN']
 
 
 # ---------------------------------------------------------------------------
