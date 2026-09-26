@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import threading
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import asynccontextmanager, contextmanager, suppress
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
@@ -889,31 +890,6 @@ class TestAsyncSqliteBaseCheckpoint:
 # AtomicConnection — per-connection atomic access (task 5560)
 # ---------------------------------------------------------------------------
 
-# Filler rows the collision scan must step through before its first match.
-# Sized from the measured production regression this primitive exists to fix:
-# ~24k `completed` rows sitting ahead of the one `running` row the reaper query
-# is looking for, which is what makes the *execute* hop slow enough for another
-# coroutine's write to be queued into the gap before the fetch hop.
-_SCAN_FILLER_ROWS = 24_000
-
-# A scan whose FIRST row is only reachable after stepping every filler row, so
-# the legacy shape's execute hop holds the WAL snapshot open for milliseconds.
-_SLOW_SCAN = 'SELECT id, v FROM items WHERE flag = ? AND n < ?'
-_SLOW_SCAN_PARAMS = ('live', 10)
-
-
-async def _seed_scan_table(conn: aiosqlite.Connection) -> None:
-    """Create ``items`` with the filler prefix, one 'live' row and one foreign-writer row."""
-    await conn.execute('CREATE TABLE items (id TEXT PRIMARY KEY, flag TEXT, n INTEGER, v TEXT)')
-    await conn.executemany(
-        'INSERT INTO items (id, flag, n, v) VALUES (?, ?, ?, ?)',
-        [(f'filler-{i}', 'dead', 0, '0') for i in range(_SCAN_FILLER_ROWS)],
-    )
-    await conn.execute("INSERT INTO items VALUES ('live', 'live', 1, '0')")
-    await conn.execute("INSERT INTO items VALUES ('foreign', 'dead', 0, '0')")
-    await conn.commit()
-
-
 # A hang guard only: never elapses on a passing run.  It turns a harness bug
 # into a legible failure instead of a wedged worker thread.
 _GATE_HANG_GUARD_SECS = 30.0
@@ -977,7 +953,7 @@ async def _collide_with_a_pinned_read(
     foreign: aiosqlite.Connection,
     gate: _ScanGate,
     *,
-    read: Callable[[], Awaitable[list[aiosqlite.Row]]],
+    read: Callable[[], Coroutine[Any, Any, list[aiosqlite.Row]]],
     write: Callable[[], Awaitable[None]],
 ) -> tuple[list[aiosqlite.Row], str | None]:
     """Issue ``write`` into ``read``'s pinned-snapshot window after a foreign commit.
@@ -1073,13 +1049,13 @@ class TestAtomicConnectionReads:
 class TestAtomicConnectionSnapshotPin:
     """A write queued into a multi-hop read's snapshot window fails at once; one hop does not.
 
-    Measured on this base before the fix: the legacy ``async with
-    conn.execute(...) as cur: await cur.fetchall()`` shape loses 39 of 40
-    iterations to ``SQLITE_BUSY_SNAPSHOT``.  SQLite pins the read snapshot from
-    the execute hop until the statement completes; a write queued into that gap
-    fails immediately once a DIFFERENT connection to the same file has
+    SQLite pins the read snapshot from the execute hop until the statement
+    completes; a write queued into that gap fails immediately with
+    ``SQLITE_BUSY_SNAPSHOT`` once a DIFFERENT connection to the same file has
     committed, and ``busy_timeout`` cannot help because the busy handler is
-    never invoked while a transaction is already open.
+    never invoked while a transaction is already open.  Both arms CONSTRUCT
+    that collision by parking the read inside ``scan_gate`` rather than racing
+    threads for it, so each arm is a single deterministic run.
     """
 
     async def test_read_all_leaves_no_window_for_a_colliding_write(self, tmp_path, open_conn):
