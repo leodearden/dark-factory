@@ -58,6 +58,7 @@ def _params_of(body: str, name: str) -> str:
 _COMPONENT_DECISIONS = (
     ('charts.jsx', 'StatTile', 'datumView'),
     ('shell.jsx', 'Pip', 'datumView'),
+    ('shell.jsx', 'DatumReading', 'datumView'),
     ('tabs.jsx', 'LocksCell', 'locksCellState'),
 )
 
@@ -149,20 +150,47 @@ def test_pip_is_a_shared_component_rendering_through_datum_view(shell_jsx_body: 
     )
 
 
-def test_pip_is_exported_on_df_shell(shell_jsx_body: str) -> None:
-    """Pip must be reachable by the tabs that render it.
+def test_datum_reading_is_a_shared_component_rendering_through_datum_view(
+    shell_jsx_body: str,
+) -> None:
+    """shell.jsx::DatumReading is the reading for surfaces that are neither a
+    tile nor a pip — the topbar pill, the rail badge, the OrchTab filter buttons,
+    Progress header and legend, the Overview pipeline.
 
-    tabs.jsx and tab_escalations.jsx destructure window.DF_SHELL at top level
-    with no fallback, so a component defined but not exported is a component
-    those files cannot name — and the migration would have to hand-copy the
-    markup back, which is the drift this component removes.
+    It is the same decision as Pip without Pip's dot: one datum, one format, the
+    text, the reason as a title and the age as a dim suffix. A bare `{value}` in
+    its body would be a second answer to the hole question.
+    """
+    stripped = strip_js_comments(shell_jsx_body)
+    body = extract_function_body(stripped, 'DatumReading')
+
+    assert 'datumView' in body, 'shell.jsx::DatumReading does not call datumView.'
+    assert not re.search(r'\{\s*value\s*\}', body), (
+        'shell.jsx::DatumReading renders a bare {value}; its text must come from '
+        "datumView's `text`."
+    )
+    params = _params_of(stripped, 'DatumReading')
+    for required in ('datum', 'format'):
+        assert re.search(rf'\b{required}\b', params), (
+            f'shell.jsx::DatumReading does not accept `{required}` — got: {params.strip()}'
+        )
+
+
+@pytest.mark.parametrize('component', ['Pip', 'DatumReading'])
+def test_shared_reading_is_exported_on_df_shell(shell_jsx_body: str, component: str) -> None:
+    """Each shared reading must be reachable by the files that render it.
+
+    tabs.jsx, tab_overview.jsx, app.jsx and tab_escalations.jsx destructure
+    window.DF_SHELL at top level with no fallback, so a component defined but
+    not exported is a component those files cannot name — and the migration
+    would have to hand-copy the markup back, which is the drift it removes.
     """
     stripped = strip_js_comments(shell_jsx_body)
     match = re.search(r'window\.DF_SHELL\s*=\s*\{([^}]*)\}', stripped)
     assert match, 'shell.jsx no longer assigns window.DF_SHELL = { ... }'
-    assert re.search(r'\bPip\b', match.group(1)), (
-        'shell.jsx does not export Pip on window.DF_SHELL. Exported members: '
-        f'{match.group(1).strip()}'
+    assert re.search(rf'\b{component}\b', match.group(1)), (
+        f'shell.jsx does not export {component} on window.DF_SHELL. Exported '
+        f'members: {match.group(1).strip()}'
     )
 
 
