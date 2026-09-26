@@ -2294,6 +2294,99 @@ class TestRunVerificationAttributesFailingIdsToModule:
         assert result.failing_test_ids_by_module == {'pkg': []}
 
 
+@pytest.mark.asyncio
+class TestScopedVerificationAggregatesModuleAttribution:
+    """Task 5627: a multi-module merge verify keeps each red id's module.
+
+    ``run_verification`` is faked per module exactly as the real one now
+    answers: ``failing_test_ids_by_module={prefix: failing_test_ids}``.
+    """
+
+    _PREFIXES = ('A', 'B', 'C')
+
+    def _module_configs(self, prefixes=_PREFIXES) -> list[ModuleConfig]:
+        return [
+            ModuleConfig(
+                prefix=p, test_command=f'pytest {p}/tests',
+                lint_command=None, type_check_command=None,
+            )
+            for p in prefixes
+        ]
+
+    def _per_module_fake(
+        self,
+        ids_by_prefix: dict[str, list[str] | None],
+        *,
+        unattributed: frozenset[str] = frozenset(),
+    ):
+        async def fake(worktree, config, module_config=None, **kwargs):
+            assert module_config is not None
+            ids = ids_by_prefix[module_config.prefix]
+            attributed = ids is not None and module_config.prefix not in unattributed
+            return VerifyResult(
+                passed=not ids, test_output='', lint_output='', type_output='',
+                summary='All checks passed' if not ids else 'Failures: tests failed',
+                failing_test_ids=ids,
+                failing_test_ids_by_module={module_config.prefix: ids} if attributed else None,
+            )
+
+        return fake
+
+    async def _run(
+        self, tmp_path: Path, fake, prefixes=_PREFIXES,
+    ) -> VerifyResult:
+        config = OrchestratorConfig(project_root=tmp_path, merge_verify_breadth='full')
+        with patch.object(verify, 'run_verification', side_effect=fake):
+            return await run_scoped_verification(
+                tmp_path, config, self._module_configs(prefixes),
+                task_files=None, role='merge',
+            )
+
+    async def test_each_red_id_stays_with_its_module(self, tmp_path: Path):
+        result = await self._run(
+            tmp_path, self._per_module_fake({'A': ['a1'], 'B': [], 'C': ['c1', 'c2']}),
+        )
+
+        assert result.failing_test_ids == ['a1', 'c1', 'c2']
+        assert result.failing_test_ids_by_module == {
+            'A': ['a1'], 'B': [], 'C': ['c1', 'c2'],
+        }
+
+    async def test_an_unattributed_collecting_child_poisons_the_map(self, tmp_path: Path):
+        result = await self._run(
+            tmp_path,
+            self._per_module_fake(
+                {'A': ['a1'], 'B': ['x'], 'C': []}, unattributed=frozenset({'B'}),
+            ),
+        )
+
+        assert result.failing_test_ids == ['a1', 'x']
+        assert result.failing_test_ids_by_module is None
+
+    async def test_a_child_that_collected_nothing_does_not_poison(self, tmp_path: Path):
+        result = await self._run(
+            tmp_path, self._per_module_fake({'A': ['a1'], 'B': None}), prefixes=('A', 'B'),
+        )
+
+        assert result.failing_test_ids == ['a1']
+        assert result.failing_test_ids_by_module == {'A': ['a1']}
+
+    async def test_nothing_collected_anywhere_leaves_both_none(self, tmp_path: Path):
+        result = await self._run(
+            tmp_path, self._per_module_fake({'A': None, 'B': None, 'C': None}),
+        )
+
+        assert result.failing_test_ids is None
+        assert result.failing_test_ids_by_module is None
+
+    async def test_single_module_run_keeps_its_map(self, tmp_path: Path):
+        result = await self._run(
+            tmp_path, self._per_module_fake({'A': ['a1']}), prefixes=('A',),
+        )
+
+        assert result.failing_test_ids_by_module == {'A': ['a1']}
+
+
 class TestExtractCauseHint:
     """Tests for the ``_extract_cause_hint(output: str) -> str`` helper.
 
