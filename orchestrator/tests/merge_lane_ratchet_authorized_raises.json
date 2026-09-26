@@ -379,6 +379,60 @@
           "current": 31492
         }
       ]
+    },
+    {
+      "task_id": "5140",
+      "reason": "Net-additive bug fix: git_ops.py's worktree-add sites gain bounded retry-on-transient through ONE shared driver (GitOps._worktree_add_with_retry, which also replaces ephemeral_worktree's former private loop), an ENOSPC fast-fail predicate, and diagnosable final errors (rc + both streams + attempt count). create_worktree now mints its branch once and retries only the add. Grounded in recurring merge/dispatch blocks in data/verify-logs (3420, 3692, 3869, 4215, 4545, 4777).",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 1401,
+          "current": 1407
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/git_ops.py::GitOps::create_worktree",
+          "baseline": 87,
+          "current": 88
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 15357,
+          "current": 15501
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 8970,
+          "current": 9072
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4725,
+          "current": 4731
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 56113,
+          "current": 56257
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6604,
+          "current": 6632
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31488,
+          "current": 31590
+        }
+      ]
     }
   ]
 }

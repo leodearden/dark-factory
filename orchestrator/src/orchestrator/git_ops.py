@@ -3125,9 +3125,7 @@ class GitOps:
                 A directory already there before the first attempt is never
                 removed; only what a failed attempt left behind is.
             ref: With *detach*, the commit-ish to pin the worktree at;
-                without it, an EXISTING branch to check out. A new branch
-                cannot be minted here: a failed ``add -b`` has already
-                created it, so a retry would fail on its own leftover.
+                without it, an EXISTING branch to check out.
             label: Diagnostic prefix naming the calling site in the WARNING
                 emitted for each absorbed retry, so an operator can grep
                 which one flaked.
@@ -4889,7 +4887,6 @@ class GitOps:
         # Branch first, then a retried add of it: `git worktree add -b` creates
         # its branch BEFORE the step that races concurrent `.git/worktrees/`
         # churn, so retrying `-b` itself would fail on its own leftover branch.
-        # The `Failed to create worktree: ` prefix is what operators grep for.
         rc, out, err = await _run(
             ['git', 'branch', full_branch, start_ref], cwd=self.project_root,
         )
