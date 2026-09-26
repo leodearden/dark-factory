@@ -45,6 +45,7 @@ const EXPECTED_FUNCTION_NAMES = [
   'datumView',
   'plainDatum',
   'derivedDatum',
+  'combinedDatum',
 ];
 const EXPECTED_EXPORT_NAMES = [
   ...EXPECTED_FUNCTION_NAMES,
@@ -78,6 +79,7 @@ const { isDatum, unknownDatum, assertDatum, DATUM_STATES } = datum;
 const { withReceipt, displayedAgeMs } = datum;
 const { datumView, EM_DASH, LOWER_BOUND_PREFIX } = datum;
 const { plainDatum, derivedDatum, PLAIN_DATUM_BOUND_SECONDS } = datum;
+const { combinedDatum } = datum;
 
 // The five-key wire envelope datum.py::Datum.to_wire() emits, verbatim: `as_of`
 // is an ISO-8601 instant normalised to UTC, `reason` is null only when the
@@ -756,4 +758,179 @@ test('derivedDatum: a site with no receipt still reads as never-fetched', () => 
   // to derive FROM, so 'no completed run' would be a claim about data this
   // browser has never seen.
   assert.equal(derivedDatum(null, TASKS_PATH, 'no completed run', {}).reason, 'not yet fetched');
+});
+
+// ---------------------------------------------------------------------------
+// combinedDatum — a TOTAL over several served Datums (the fourth sanctioned
+// client-built envelope). The census is served per project; the topbar, the
+// rail and every multi-project tile need the sum. A partial sum is an
+// under-count passed off as a total, so a hole in any part is a hole in the
+// total — the rule orch_summary.js::orchSummaryTotal held before it.
+// ---------------------------------------------------------------------------
+
+function throwingCombine() {
+  throw new Error('combine must never be invoked when there is nothing to total');
+}
+
+const sum = values => values.reduce((a, b) => a + b, 0);
+
+// Order-sensitive on purpose, so "values in part order" is observable.
+const joinInOrder = values => values.map(String).join('|');
+
+// Two fresh parts measured at different instants and received on different
+// polls, listed NEWEST FIRST so the oldest part is not simply the first one.
+// The older part declares the LOOSER bound, so "minimum bound" and "the oldest
+// part's bound" are different answers.
+const FRESH_NEWER = withReceipt(
+  { ...FRESH_WIRE, value: 4, as_of: SERVED_AT, freshness_bound_seconds: 30 },
+  { servedAt: shiftIso(SERVED_AT, 2_000), receivedAt: RECEIVED_AT + 2_000 },
+);
+const FRESH_OLDER = withReceipt(
+  { ...FRESH_WIRE, value: 3, as_of: AS_OF, freshness_bound_seconds: 60 },
+  RECEIPT,
+);
+const STALE_PART = withReceipt(STALE_WIRE, RECEIPT);
+const LOWER_BOUND_PART = withReceipt(
+  { ...FRESH_WIRE, value: 5, as_of: SERVED_AT, state: 'lower_bound', reason: 'window truncated at 500 rows' },
+  RECEIPT,
+);
+
+function unknownPart(reason) {
+  return withReceipt(unknownDatum(reason), RECEIPT);
+}
+
+test('combinedDatum: no parts is a hole carrying the caller\'s reason, and combine is not run', () => {
+  const total = combinedDatum([], throwingCombine, 'no project census in scope');
+
+  assert.equal(isDatum(total), true);
+  assert.equal(total.state, 'unknown');
+  assert.equal(total.value, null);
+  assert.equal(total.as_of, null);
+  assert.equal(total.reason, 'no project census in scope');
+});
+
+test('combinedDatum: ANY unknown part makes the total unknown — no partial sums', () => {
+  // The unknown parts are named, each with its own reason, so the operator
+  // hovering the em-dash reads WHICH project is missing and why. The measured
+  // parts beside them (fresh, lower_bound) are not listed: they are not why the
+  // total is absent.
+  const total = combinedDatum(
+    [
+      ['dark-factory', FRESH_OLDER],
+      ['reify', unknownPart('scheduler offline')],
+      ['lane', LOWER_BOUND_PART],
+      ['hive', unknownPart('snapshot failed')],
+    ],
+    throwingCombine,
+    'unused',
+  );
+
+  assert.equal(isDatum(total), true);
+  assert.equal(total.state, 'unknown');
+  assert.equal(total.value, null);
+  assert.equal(total.as_of, null);
+  assert.equal(total.reason, 'reify: scheduler offline; hive: snapshot failed');
+});
+
+test('combinedDatum: all fresh — the combined value, the OLDEST instant, the tightest bound', () => {
+  const total = combinedDatum(
+    [
+      ['reify', FRESH_NEWER],
+      ['dark-factory', FRESH_OLDER],
+    ],
+    joinInOrder,
+    'unused',
+  );
+
+  assert.equal(isDatum(total), true);
+  assert.equal(total.state, 'fresh');
+  assert.equal(total.reason, null);
+  assert.equal(total.value, '4|3', 'combine receives the values in part order');
+  assert.equal(total.as_of, AS_OF, 'a total is only as recent as its oldest part');
+  assert.equal(total.freshness_bound_seconds, 30, 'the tightest bound over the parts');
+  assert.equal(total._served_at, FRESH_OLDER._served_at);
+  assert.equal(total._received_at, FRESH_OLDER._received_at);
+  assert.equal(displayedAgeMs(total, NOW), displayedAgeMs(FRESH_OLDER, NOW));
+});
+
+test('combinedDatum: one stale part makes the total stale, naming only the non-fresh parts', () => {
+  const total = combinedDatum(
+    [
+      ['dark-factory', FRESH_NEWER],
+      ['reify', STALE_PART],
+    ],
+    sum,
+    'unused',
+  );
+
+  assert.equal(total.state, 'stale');
+  assert.equal(total.value, 11);
+  assert.equal(total.reason, 'reify: ReadTimeout');
+
+  const view = datumView(total, { now: NOW, format: String });
+  assert.equal(view.text, '11');
+  assert.equal(view.title, 'reify: ReadTimeout');
+  assert.equal(view.age, datumView(STALE_PART, { now: NOW, format: String }).age);
+  assert.equal(view.age, '3h');
+});
+
+test('combinedDatum: lower_bound outranks stale, so the prefix AND the age badge both survive', () => {
+  const total = combinedDatum(
+    [
+      ['lane', LOWER_BOUND_PART],
+      ['reify', STALE_PART],
+    ],
+    sum,
+    'unused',
+  );
+
+  assert.equal(total.state, 'lower_bound');
+  assert.equal(total.value, 12);
+  assert.equal(total.reason, 'lane: window truncated at 500 rows; reify: ReadTimeout');
+
+  const view = datumView(total, { now: NOW, format: String });
+  assert.equal(view.text, `${LOWER_BOUND_PREFIX}12`);
+  assert.ok(view.age, 'the oldest part is three hours old, and the total says so');
+});
+
+test('combinedDatum: precedence is unknown > lower_bound > stale > fresh', () => {
+  const cases = [
+    [[STALE_PART, FRESH_NEWER], 'stale'],
+    [[FRESH_NEWER, LOWER_BOUND_PART, STALE_PART], 'lower_bound'],
+    [[LOWER_BOUND_PART, unknownPart('gone'), STALE_PART], 'unknown'],
+  ];
+  for (const [parts, expected] of cases) {
+    const labelled = parts.map((part, i) => ['p' + i, part]);
+    assert.equal(combinedDatum(labelled, sum, 'unused').state, expected);
+  }
+});
+
+test('combinedDatum: never mutates its inputs, and returns a new object on every call', () => {
+  const parts = [
+    ['reify', FRESH_NEWER],
+    ['dark-factory', { ...STALE_PART }],
+  ];
+  const before = structuredClone(parts);
+
+  const first = combinedDatum(parts, sum, 'unused');
+  const second = combinedDatum(parts, sum, 'unused');
+
+  assert.deepEqual(parts, before, 'combinedDatum mutated its parts');
+  assert.notEqual(first, second);
+  assert.deepEqual(first, second);
+  for (const [, part] of parts) assert.notEqual(first, part);
+
+  const emptyA = combinedDatum([], throwingCombine, 'none');
+  const emptyB = combinedDatum([], throwingCombine, 'none');
+  assert.notEqual(emptyA, emptyB, 'the empty total must not be a shared singleton');
+});
+
+test('combinedDatum: a non-Datum part throws a TypeError naming combinedDatum', () => {
+  for (const [label, candidate] of NON_DATUMS) {
+    assert.throws(
+      () => combinedDatum([['dark-factory', FRESH_OLDER], ['reify', candidate]], sum, 'unused'),
+      err => err instanceof TypeError && err.message.includes('combinedDatum'),
+      `${label} as a part should throw`,
+    );
+  }
 });
