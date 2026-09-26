@@ -6,6 +6,7 @@ response shape, and a local model is a fake with ``predict``.
 from __future__ import annotations
 
 import functools
+import itertools
 import json
 import math
 import sys
@@ -27,6 +28,11 @@ def _arms() -> types.ModuleType:
     return load_script_module(
         SCRIPTS / 'eval_write_triage_reranker_arms.py', 'eval_write_triage_reranker_arms',
     )
+
+
+@functools.cache
+def _core() -> types.ModuleType:
+    return load_script_module(SCRIPTS / 'eval_write_triage_reranker.py', 'eval_write_triage_reranker')
 
 
 def _context():
@@ -431,3 +437,74 @@ class TestApplyVramCap:
 
     def test_on_the_cpu_nothing_is_capped(self) -> None:
         _arms().apply_vram_cap(_fake_torch(available=False), 8.0)
+
+
+D1_NAMES = (
+    'qwen3-reranker-0.6b', 'mxbai-rerank-base-v2', 'bge-reranker-v2-m3',
+    'gpt-4o-mini-pairwise', 'jina-reranker', 'voyage-rerank', 'cohere-rerank', 'jev-choice',
+)
+CREDENTIAL_VARIABLES = (
+    'OPENAI_API_KEY', 'JINA_API_KEY', 'VOYAGE_API_KEY', 'COHERE_API_KEY', 'CO_API_KEY',
+    'TYPESAFE_API_KEY',
+)
+
+
+@pytest.fixture
+def bare_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No credential set and neither torch nor sentence-transformers importable."""
+    hosted = {variable for api in _arms().HOSTED_APIS for variable in api.env_vars}
+    for variable in {*CREDENTIAL_VARIABLES, *hosted}:
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setitem(sys.modules, 'torch', None)
+    monkeypatch.setitem(sys.modules, 'sentence_transformers', None)
+
+
+class TestD1Registry:
+    def test_the_eight_arms_in_report_order(self) -> None:
+        assert tuple(spec.name for spec in _arms().D1_ARMS) == D1_NAMES
+
+    def test_every_arm_class_is_represented(self) -> None:
+        arms = _arms()
+        assert {spec.arm_class for spec in arms.D1_ARMS} == set(arms.ArmClass)
+
+    def test_the_local_arms_name_their_model_repos(self) -> None:
+        assert [spec.model for spec in _arms().D1_ARMS[:3]] == [
+            'Qwen/Qwen3-Reranker-0.6B', 'mixedbread-ai/mxbai-rerank-base-v2',
+            'BAAI/bge-reranker-v2-m3',
+        ]
+
+    @pytest.mark.usefixtures('bare_host')
+    @pytest.mark.parametrize('name', D1_NAMES)
+    def test_on_a_bare_host_every_arm_is_unavailable_never_a_crash(self, name: str) -> None:
+        arms = _arms()
+        [spec] = [spec for spec in arms.D1_ARMS if spec.name == name]
+        with pytest.raises(arms.ArmUnavailable), spec.open(_context()):
+            pass
+
+    @pytest.mark.usefixtures('bare_host')
+    def test_a_bare_host_run_writes_skipped_rows_and_a_null_best(self, tmp_path: Path) -> None:
+        arms, core = _arms(), _core()
+        cases = [
+            core.RerankCase(
+                memory_id=f'd{i}', label='duplicate', entry=f'entry {i}', canonical_id='c1',
+                canonical_present=True, candidate_ids=('c1', 'x'),
+                candidate_texts=('canonical', 'other'), candidate_cosines=(0.9, 0.5),
+                candidate_parents={}, degraded=False, self_retrieved=False,
+            )
+            for i in range(2)
+        ]
+        path = tmp_path / 'bare.json'
+        report = core.run_reranker_eval(
+            cases=cases, arms=arms.D1_ARMS, aliases=None, context=_context(),
+            provenance={}, report_path=path, clock=itertools.count(0.0, 0.5).__next__,
+            max_spend_usd=1.0, p95_ceiling_seconds=3.0,
+        )
+        assert {row['status'] for row in report['arms']} == {'skipped'}
+        assert {row['skip_reason'] for row in report['arms']} <= {
+            'no_credential', 'dependency_unavailable',
+        }
+        assert report['best'] == {
+            'arm': None, 'rank1_rate': None, 'p95_seconds': None,
+            'qualified': False, 'p95_ceiling_seconds': 3.0,
+        }
+        assert '"best":' in path.read_text()
