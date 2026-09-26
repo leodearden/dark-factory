@@ -190,9 +190,10 @@ test("the Orchestrators tab's progress bar widths stay finite", () => {
 
 // ── Wiring: no consumer may dereference o.summary directly ────────────────
 
-// app.jsx left in task 5589 (gamma2): its topbar and rail read the census
-// through task_snapshot.js (test_app_chrome_census.py pins that wiring).
-const CONSUMERS = ['tabs.jsx', 'tab_overview.jsx'];
+// app.jsx and tabs.jsx left in task 5589 (gamma2): the topbar, the rail and
+// OrchTab read the census through task_snapshot.js (test_app_chrome_census.py
+// and test_tab_orchestrators.py pin that wiring).
+const CONSUMERS = ['tab_overview.jsx'];
 
 test('no consumer still reads o.summary directly', () => {
   for (const name of CONSUMERS) {
@@ -374,7 +375,7 @@ function readsAny(expression, names) {
   return names.filter(name => new RegExp(`\\b${name}\\b`).test(expression));
 }
 
-for (const name of ['tabs.jsx', 'tab_overview.jsx']) {
+for (const name of CONSUMERS) {
   test(`(d) ${name}: no datum= expression carries the crash guard's zero`, () => {
     const source = fs.readFileSync(path.join(REDUX_DIR, name), 'utf8');
     const tainted = guardZeroNames(source);
