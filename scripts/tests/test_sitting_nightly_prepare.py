@@ -375,6 +375,20 @@ def test_a_missing_binary_is_a_configuration_error_and_leases_nothing(tmp_path, 
     assert 'no-such-claude' in capsys.readouterr().err
 
 
+def test_the_entry_point_runs_standalone_without_the_test_sys_path(tmp_path):
+    """The wrapper runs the file directly, so its bootstrap alone must resolve ``legibility.account_pool``'s imports."""
+    script = REPO_ROOT / 'scripts' / 'sitting' / 'nightly_prepare.py'
+    env = {k: v for k, v in os.environ.items() if k != 'PYTHONPATH'}
+
+    proc = subprocess.run(
+        [sys.executable, str(script), '--claude-bin', str(tmp_path / 'no-such-claude')],
+        capture_output=True, text=True, env=env, cwd=tmp_path, timeout=120,
+    )
+
+    assert proc.returncode == mod.EXIT_CONFIG, proc.stderr
+    assert 'no-such-claude' in proc.stderr
+
+
 def test_main_never_raises(tmp_path, capsys):
     fake = _fake_claude(tmp_path)
 
