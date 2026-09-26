@@ -319,9 +319,10 @@ def test_the_summary_counts_each_escalation_once_and_unlinked_runs_apart():
         Disposition.CLOSED_BY_OTHER: 0,
     }
     assert [d for d, _ in summary.counts] == list(Disposition)
-    # decided = 7 classified - 1 missing - 1 pending = 5
-    assert summary.resolved_in_place_share == pytest.approx(2 / 5)
-    assert summary.promoted_share == pytest.approx(1 / 5)
+    # decided = 6 distinct ids - 1 missing - 1 pending = 4
+    assert summary.decided == 4
+    assert summary.resolved_in_place_share == pytest.approx(2 / 4)
+    assert summary.promoted_share == pytest.approx(1 / 4)
 
 
 def test_shares_are_none_when_nothing_was_decided():

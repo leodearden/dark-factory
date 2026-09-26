@@ -11,9 +11,11 @@ itself (scripts/review_model_admission.py does).
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator, Mapping
+from collections import Counter
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -155,4 +157,193 @@ def load_escalation_corpus(escalations_dir: str | Path) -> EscalationCorpus:
         records=MappingProxyType(records),
         skipped=skipped,
         oldest_archive_date=_oldest_archive_date(root),
+    )
+
+
+# The ladder's levels and the literals the disposition reads. The resolver
+# spellings are restated from escalation/src/escalation/classify.py::
+# classify_resolver_tier and orchestrator/src/orchestrator/steward.py, neither
+# importable from scripts/.
+STEWARD_LEVEL = 0
+PROMOTED_LEVEL = 1
+HUMAN_LEVEL = 2
+STEWARD_ROLE = 'steward'
+PENDING_STATUS = 'pending'
+STEWARD_RESOLVER_PREFIX = 'claude-task-'
+STEWARD_RESOLVER_SUFFIX = '-steward'
+# Written by BOTH steward.py::_auto_escalate_to_human (a promotion) and
+# steward.py::_patch_resolution_metadata (an in-place close), hence ambiguous.
+UNATTRIBUTED_STEWARD_RESOLVER = 'steward'
+AUTO_DISMISSED_RESOLVER = 'auto-dismissed'
+L2_WATCHER_ROLE = 'escalation-watcher-auto'
+CLOSE_ONLY_ACTION = 'close_only'
+
+# steward.py::_auto_escalate_to_human files the L1 and dismisses the L0 in one
+# call, so a promotion's L1 lands just before the L0's resolved_at.
+PROMOTION_ADJACENCY = timedelta(seconds=5)
+
+
+class StewardDisposition(Enum):
+    """How one steward-worked escalation left the steward, judged as of a moment."""
+
+    RECORD_MISSING = 'record missing'
+    PENDING = 'pending'
+    PROMOTED_TO_L1 = 'promoted to L1'
+    RESOLVED_IN_PLACE = 'resolved in place'
+    AUTO_DISMISSED = 'auto-dismissed'
+    CLOSED_BY_OTHER = 'closed by other'
+
+
+_UNDECIDED = frozenset({StewardDisposition.RECORD_MISSING, StewardDisposition.PENDING})
+
+
+def _steward_l1s_by_task(corpus: EscalationCorpus) -> dict[str | None, list[datetime]]:
+    """When each task's steward-filed level-1 records were stamped."""
+    grouped: dict[str | None, list[datetime]] = {}
+    for record in corpus.records.values():
+        if record.level == PROMOTED_LEVEL and record.agent_role == STEWARD_ROLE:
+            grouped.setdefault(record.task_id, []).append(record.timestamp)
+    return grouped
+
+
+def _is_steward_resolver(resolved_by: str) -> bool:
+    return resolved_by == UNATTRIBUTED_STEWARD_RESOLVER or (
+        resolved_by.startswith(STEWARD_RESOLVER_PREFIX)
+        and resolved_by.endswith(STEWARD_RESOLVER_SUFFIX)
+    )
+
+
+def _classify(
+    escalation_id: str,
+    corpus: EscalationCorpus,
+    steward_l1s: Mapping[str | None, list[datetime]],
+    as_of: datetime,
+) -> StewardDisposition:
+    record = corpus.get(escalation_id)
+    if record is None:
+        return StewardDisposition.RECORD_MISSING
+    if (record.status == PENDING_STATUS or record.resolved_at is None
+            or record.resolved_at >= as_of):
+        return StewardDisposition.PENDING
+    # Promotion BEFORE attribution: a promoted L0 and an unattributed in-place
+    # close both read resolved_by='steward'; only the adjacent L1 tells them apart.
+    if any(timedelta(0) <= record.resolved_at - filed <= PROMOTION_ADJACENCY
+           for filed in steward_l1s.get(record.task_id, ())):
+        return StewardDisposition.PROMOTED_TO_L1
+    resolver = record.resolved_by or ''
+    if _is_steward_resolver(resolver):
+        return StewardDisposition.RESOLVED_IN_PLACE
+    if resolver == AUTO_DISMISSED_RESOLVER:
+        return StewardDisposition.AUTO_DISMISSED
+    return StewardDisposition.CLOSED_BY_OTHER
+
+
+def classify_steward_disposition(
+    escalation_id: str, corpus: EscalationCorpus, *, as_of: datetime
+) -> StewardDisposition:
+    """How *escalation_id* left the steward, judged as of *as_of*.
+
+    Unresolved at *as_of* (or resolved at or after it) is PENDING, so a
+    later re-run over the same window reproduces the same answer.
+    """
+    return _classify(escalation_id, corpus, _steward_l1s_by_task(corpus), as_of)
+
+
+@dataclass(frozen=True)
+class StewardDispositionSummary:
+    """Dispositions of a set of steward-worked escalations, each counted once.
+
+    ``counts`` holds every disposition in Enum order, zeros included. The
+    shares are derived from it, over the DECIDED escalations (neither missing
+    nor pending), and are None when none was decided.
+    """
+
+    counts: tuple[tuple[StewardDisposition, int], ...]
+    unlinked_runs: int
+
+    def count(self, disposition: StewardDisposition) -> int:
+        return dict(self.counts)[disposition]
+
+    @property
+    def decided(self) -> int:
+        return sum(n for disposition, n in self.counts if disposition not in _UNDECIDED)
+
+    @property
+    def resolved_in_place_share(self) -> float | None:
+        return self._share(StewardDisposition.RESOLVED_IN_PLACE)
+
+    @property
+    def promoted_share(self) -> float | None:
+        return self._share(StewardDisposition.PROMOTED_TO_L1)
+
+    def _share(self, disposition: StewardDisposition) -> float | None:
+        return None if self.decided == 0 else self.count(disposition) / self.decided
+
+
+def summarize_steward_dispositions(
+    escalation_ids: Iterable[str | None], corpus: EscalationCorpus, *, as_of: datetime
+) -> StewardDispositionSummary:
+    """Classify each distinct escalation once; a None id is a run that named none."""
+    ids = list(escalation_ids)
+    steward_l1s = _steward_l1s_by_task(corpus)
+    tally = Counter(
+        _classify(esc_id, corpus, steward_l1s, as_of)
+        for esc_id in dict.fromkeys(i for i in ids if i is not None)
+    )
+    return StewardDispositionSummary(
+        counts=tuple((disposition, tally[disposition]) for disposition in StewardDisposition),
+        unlinked_runs=sum(1 for esc_id in ids if esc_id is None),
+    )
+
+
+@dataclass(frozen=True)
+class L2TierMetrics:
+    """Level-2 (human-tier) records filed in ``[since, until)`` and how they closed.
+
+    ``resolved`` counts those resolved before *until*; the rates and the
+    close_only share are derived, so they cannot disagree with the counts.
+    """
+
+    since: datetime
+    until: datetime
+    filed: int
+    watcher_filed: int
+    resolved: int
+    close_only: int
+
+    @property
+    def days(self) -> float:
+        return (self.until - self.since) / timedelta(days=1)
+
+    @property
+    def filed_per_day(self) -> float:
+        return self.filed / self.days
+
+    @property
+    def watcher_filed_per_day(self) -> float:
+        return self.watcher_filed / self.days
+
+    @property
+    def close_only_share(self) -> float | None:
+        return None if self.resolved == 0 else self.close_only / self.resolved
+
+
+def l2_tier_metrics(
+    corpus: EscalationCorpus, *, since: datetime, until: datetime
+) -> L2TierMetrics:
+    """Measure the human tier over the half-open window ``[since, until)``."""
+    if until <= since:
+        raise ValueError(f'empty window: until {until} is not after since {since}')
+    filed = [
+        r for r in corpus.records.values()
+        if r.level == HUMAN_LEVEL and since <= r.timestamp < until
+    ]
+    resolved = [r for r in filed if r.resolved_at is not None and r.resolved_at < until]
+    return L2TierMetrics(
+        since=since,
+        until=until,
+        filed=len(filed),
+        watcher_filed=sum(1 for r in filed if r.agent_role == L2_WATCHER_ROLE),
+        resolved=len(resolved),
+        close_only=sum(1 for r in resolved if r.resolution_action == CLOSE_ONLY_ACTION),
     )
