@@ -18,17 +18,15 @@ fixtures from ``test_task_write_agent_id.py`` and live further down this file.
 
 from __future__ import annotations
 
-import asyncio
 import inspect
 import json
 import subprocess
-import time
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import as_async_run_git
+from _fm_helpers import LoopFreedomProbe, as_async_run_git
 from shared.task_metadata import _BLESSED_METADATA_KEYS, parse_metadata
 
 import fused_memory.services.live_workflow_detector as detector_module
@@ -2320,40 +2318,25 @@ class TestInterceptorSetTaskStatusReconCheckOffload:
         probes await `shared.git_async.run_git` instead of shelling out with a
         blocking `subprocess.run` — so the offload is intrinsic and the hop is
         gone. What actually matters is unchanged and is what this asserts
-        directly: a slow gate must not stall every other write to the project.
-
-        Driven with a ticker coroutine that advances every 10 ms while a
-        detector that awaits a real 200 ms sleep is in flight. A blocking
-        implementation pins the ticker at ~0.
+        directly: while the gate is suspended inside the detector, the event
+        loop stays free to serve every other write to the project — asserted
+        with a loop-turn oracle rather than a wall-clock tick floor (task 5920).
         """
-        ticks = 0
+        probe = LoopFreedomProbe()
 
-        async def _ticker():
-            nonlocal ticks
-            while True:
-                await asyncio.sleep(0.01)
-                ticks += 1
-
-        async def _slow_detector(*args, **kwargs):
-            await asyncio.sleep(0.2)
+        async def _suspending_detector(*args, **kwargs):
+            await probe.suspend()
             return False
 
         monkeypatch.setattr(
-            recon_write_policy, 'is_workflow_live_for_task', _slow_detector,
+            recon_write_policy, 'is_workflow_live_for_task', _suspending_detector,
         )
 
-        ticker = asyncio.create_task(_ticker())
-        try:
-            await interceptor.set_task_status(
-                '1', 'in-progress', '/project', agent_id=AGENT_ID,
-            )
-        finally:
-            ticker.cancel()
+        await interceptor.set_task_status(
+            '1', 'in-progress', '/project', agent_id=AGENT_ID,
+        )
 
-        # ~20 ticks are due over the 200 ms gate; assert well clear of both
-        # sides — a blocking gate yields 0-1, and the loose bound keeps this
-        # from flaking under a loaded CI scheduler.
-        assert ticks >= 5
+        probe.assert_loop_stayed_free()
         taskmaster.set_task_status.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -2369,30 +2352,29 @@ class TestInterceptorSetTaskStatusReconCheckOffload:
         file reads per recon status write ONTO the event loop, which is the
         very defect this task exists to fix.
 
-        Both reads are monkeypatched to sleep synchronously for 150 ms; the
-        ticker must keep advancing across them.
+        Each stubbed read blocks on a LoopFreedomProbe, which reads False if
+        the read ran on the loop's thread, or ran elsewhere while the loop's
+        thread waited on it (task 5920, replacing a wall-clock tick floor). The
+        verdict is recorded, not asserted inside the read, because
+        _corroboration_verdict swallows every exception its reads raise.
         """
-        ticks = 0
+        probe = LoopFreedomProbe()
+        reads: list[str] = []
 
-        async def _ticker():
-            nonlocal ticks
-            while True:
-                await asyncio.sleep(0.01)
-                ticks += 1
-
-        def _slow_read_scheduler_state(*args, **kwargs):
-            time.sleep(0.15)
-            return None
-
-        def _slow_orchestrator_started_at(*args, **kwargs):
-            time.sleep(0.15)
-            return None
+        def _blocking_read(name):
+            def _read(*args, **kwargs):
+                reads.append(name)
+                probe.block()
+                return None
+            return _read
 
         monkeypatch.setattr(
-            recon_write_policy, 'read_scheduler_state', _slow_read_scheduler_state,
+            recon_write_policy, 'read_scheduler_state', _blocking_read('read_scheduler_state'),
         )
         monkeypatch.setattr(
-            recon_write_policy, 'orchestrator_started_at', _slow_orchestrator_started_at,
+            recon_write_policy,
+            'orchestrator_started_at',
+            _blocking_read('orchestrator_started_at'),
         )
         monkeypatch.setattr(
             recon_write_policy, 'is_workflow_live_for_task', _async_detector(False),
@@ -2405,15 +2387,12 @@ class TestInterceptorSetTaskStatusReconCheckOffload:
             'heartbeat_at': _heartbeat(_STALE_HEARTBEAT),
         })
 
-        ticker = asyncio.create_task(_ticker())
-        try:
-            await interceptor.set_task_status(
-                '599', 'pending', str(tmp_path), agent_id=AGENT_ID,
-            )
-        finally:
-            ticker.cancel()
+        await interceptor.set_task_status(
+            '599', 'pending', str(tmp_path), agent_id=AGENT_ID,
+        )
 
-        assert ticks >= 5
+        assert sorted(reads) == ['orchestrator_started_at', 'read_scheduler_state']
+        probe.assert_loop_stayed_free()
 
     @pytest.mark.asyncio
     async def test_set_task_status_always_passes_snapshot_token_none(
@@ -2569,34 +2548,26 @@ class TestBothInterceptorCallSitesAwaitCheck:
     async def test_update_task_check_does_not_block_the_event_loop(
         self, interceptor, taskmaster, monkeypatch,
     ):
-        """The update_task call site is non-blocking too — it never had a
-        to_thread hop to lose, so this is the property it GAINS."""
-        ticks = 0
-
-        async def _ticker():
-            nonlocal ticks
-            while True:
-                await asyncio.sleep(0.01)
-                ticks += 1
-
+        """The update_task call site leaves the loop free while check() is
+        suspended — the property it GAINED when it stopped calling check
+        inline (task 3778). Asserted with a loop-turn oracle rather than a
+        wall-clock tick floor (task 5920)."""
+        probe = LoopFreedomProbe()
         real_check = recon_write_policy.check
 
-        async def _slow_check(op, **kwargs):
-            await asyncio.sleep(0.2)
+        async def _suspending_check(op, **kwargs):
+            await probe.suspend()
             return await real_check(op, **kwargs)
 
-        monkeypatch.setattr(recon_write_policy, 'check', _slow_check)
+        monkeypatch.setattr(recon_write_policy, 'check', _suspending_check)
         taskmaster.get_task = AsyncMock(
             return_value={'id': '1', 'status': 'in-progress', 'title': 'T'},
         )
 
-        ticker = asyncio.create_task(_ticker())
-        try:
-            await interceptor.update_task('1', '/project', title='x', agent_id=AGENT_ID)
-        finally:
-            ticker.cancel()
+        await interceptor.update_task('1', '/project', title='x', agent_id=AGENT_ID)
 
-        assert ticks >= 5
+        probe.assert_loop_stayed_free()
+        taskmaster.update_task.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

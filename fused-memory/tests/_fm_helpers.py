@@ -18,6 +18,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import threading
 import types
 import uuid
 import warnings
@@ -1269,6 +1270,90 @@ async def retry_until_observed(
     raise AssertionError(
         f'retry_until_observed: condition not observed in {attempts} attempt(s).{detail}'
     )
+
+
+# ---------------------------------------------------------------------------
+# Shared LoopFreedomProbe loop-freedom oracle (task 5920)
+# ---------------------------------------------------------------------------
+
+#: Loop turns LoopFreedomProbe.suspend() yields before recording a held loop.
+#: One turn suffices on a free loop, because the marker is queued ahead of the
+#: stub's own resumption; the slack only absorbs a future reordering of
+#: asyncio's ready queue. It counts loop turns, never seconds.
+LOOP_FREEDOM_TURN_BUDGET = 10
+
+#: Seconds an off-loop-thread caller waits for the captured loop to run its
+#: marker. A CEILING, not a floor: a free loop answers within microseconds, so
+#: only a held loop reaches it, and it bounds how long that failure takes.
+LOOP_FREEDOM_CEILING_SECONDS = 30.0
+
+
+class LoopFreedomProbe:
+    """Did the test's event loop stay free while the code under test was paused?
+
+    Construct it inside the test coroutine (it captures the running loop and
+    its thread). A stubbed await point calls ``await probe.suspend()``; a
+    stubbed blocking call calls ``probe.block()``. Then call
+    :meth:`assert_loop_stayed_free`. Each call queues a marker on the captured
+    loop and records True iff the marker ran:
+
+    * ``suspend()`` on the captured loop yields a bounded number of loop turns,
+      so a call site that resumes the coroutine itself reads False.
+    * ``block()``, or ``suspend()`` on another thread's loop, waits for the
+      marker up to a ceiling, so a call site that holds the loop's thread while
+      that work runs elsewhere reads False. ``block()`` on the loop's own
+      thread reads False at once, because it is the holder.
+
+    Every verdict is deterministic and none hangs. It replaces a FLOOR on ticker
+    wake-ups inside a wall-clock window, which reds under host/GIL contention
+    (task 5920; the same defect
+    ``orchestrator/tests/test_verify_ruff_config_boundary.py::TestProbeDoesNotBlockTheEventLoop``
+    fixed for task 4520 / esc-4520-6).
+    """
+
+    def __init__(self, *, ceiling_seconds: float = LOOP_FREEDOM_CEILING_SECONDS) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._loop_thread = threading.get_ident()
+        self._ceiling_seconds = ceiling_seconds
+        self._observations: list[bool] = []
+
+    @property
+    def observations(self) -> tuple[bool, ...]:
+        return tuple(self._observations)
+
+    async def suspend(self) -> None:
+        if asyncio.get_running_loop() is not self._loop:
+            self.block()
+            return
+
+        marker_ran = False
+
+        def _mark() -> None:
+            nonlocal marker_ran
+            marker_ran = True
+
+        self._loop.call_soon_threadsafe(_mark)
+        for _ in range(LOOP_FREEDOM_TURN_BUDGET):
+            if marker_ran:
+                break
+            await asyncio.sleep(0)
+        self._observations.append(marker_ran)
+
+    def block(self) -> None:
+        if threading.get_ident() == self._loop_thread:
+            self._observations.append(False)
+            return
+
+        loop_answered = threading.Event()
+        self._loop.call_soon_threadsafe(loop_answered.set)
+        self._observations.append(loop_answered.wait(self._ceiling_seconds))
+
+    def assert_loop_stayed_free(self) -> None:
+        assert self._observations, 'LoopFreedomProbe: the probe was never reached by a stubbed call'
+        assert all(self._observations), (
+            'LoopFreedomProbe: the event loop was held while the code under test '
+            f'was paused (observations={self.observations})'
+        )
 
 
 # ---------------------------------------------------------------------------
