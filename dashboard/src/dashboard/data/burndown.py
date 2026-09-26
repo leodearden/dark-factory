@@ -475,22 +475,59 @@ async def collect_snapshot(
         raise
 
 
+async def _snapshot_columns(db: aiosqlite.Connection) -> frozenset[str]:
+    """The columns this DB's ``snapshots`` table actually has.
+
+    Probed, never assumed: ``_burndown_dbs`` opens OTHER projects'
+    burndown.db files read-only and nothing migrates those, so a query naming
+    a newer column would raise 'no such column' there.
+    """
+    async with db.execute('PRAGMA table_info(snapshots)') as cur:
+        return frozenset(row[1] for row in await cur.fetchall())
+
+
+@dataclass(frozen=True, slots=True)
+class _Predicate:
+    """A SQL boolean expression and the parameters it binds."""
+
+    sql: str
+    params: tuple[str, ...]
+
+
+def _measured_rows(columns: frozenset[str]) -> _Predicate:
+    """THE predicate for "this row carries a measurement".
+
+    A POSITIVE selection of ``state = 'value'`` plus a NULL state (a row from
+    before task 5591, when only a successful read wrote one), so a state this
+    code does not know is never counted as measured. A table with no ``state``
+    column is un-migrated, and every row in it is measured by construction.
+    """
+    if 'state' not in columns:
+        return _Predicate('TRUE', ())
+    return _Predicate('(state IS NULL OR state = ?)', (SnapshotState.VALUE.value,))
+
+
 async def downsample(conn: aiosqlite.Connection) -> None:
-    """Compact old snapshots: hourly after 7 days, expire after 90 days."""
+    """Compact old snapshots: hourly after 7 days, expire after 90 days.
+
+    Each old (project, hour) keeps ONE row: its latest measured row when it
+    has one, else its latest gap, so a gap never displaces a measurement.
+    """
     now = datetime.now(UTC)  # clock-exempt: single-capture writer
     cutoff_7d = (now - timedelta(days=7)).isoformat()
     cutoff_90d = (now - timedelta(days=90)).isoformat()
+    measured = _measured_rows(await _snapshot_columns(conn))
 
-    # Phase 1: For rows older than 7 days, keep only the last per (project_id, hour).
+    # Phase 1: For rows older than 7 days, keep one per (project_id, hour).
     await conn.execute(
-        """
+        f"""
         DELETE FROM snapshots
         WHERE ts < ?
           AND id NOT IN (
               SELECT id FROM (
                   SELECT id, ROW_NUMBER() OVER (
-                      PARTITION BY project_id, strftime('%%Y-%%m-%%dT%%H', ts)
-                      ORDER BY ts DESC
+                      PARTITION BY project_id, strftime('%Y-%m-%dT%H', ts)
+                      ORDER BY CASE WHEN {measured.sql} THEN 0 ELSE 1 END, ts DESC
                   ) AS rn
                   FROM snapshots
                   WHERE ts < ?
@@ -498,7 +535,7 @@ async def downsample(conn: aiosqlite.Connection) -> None:
               WHERE rn = 1
           )
         """,
-        (cutoff_7d, cutoff_7d),
+        (cutoff_7d, *measured.params, cutoff_7d),
     )
 
     # Phase 2: Delete everything older than 90 days.
@@ -510,6 +547,17 @@ async def downsample(conn: aiosqlite.Connection) -> None:
 # ---------------------------------------------------------------------------
 # Read-side queries (used by route handlers via DbPool read-only connections)
 # ---------------------------------------------------------------------------
+
+# The per-row keys of a burndown series, in order, beside ``labels``. The first
+# six are the display zones; the split partitions in_progress; concurrency_cap
+# is a per-snapshot scalar (nullable); the last four are task 5591's and read
+# None on any row written before them.
+_ZONES = ('done', 'cancelled', 'blocked', 'deferred', 'in_progress', 'pending')
+_SPLIT = ('in_progress_live', 'in_progress_stranded')
+_NULLABLE_SERIES_KEYS = (
+    'concurrency_cap', 'review', 'merge_deferred', 'infra_hold', 'in_progress_rows',
+)
+_SERIES_KEYS = (*_ZONES, *_SPLIT, *_NULLABLE_SERIES_KEYS)
 
 
 async def aggregate_burndown_projects(
@@ -555,14 +603,9 @@ async def aggregate_burndown_series(
     Returns the empty-series default ``{labels: [], done: [], ...}`` when no
     rows are found across any DB.
     """
-    _keys = (
-        'done', 'cancelled', 'blocked', 'deferred', 'in_progress', 'pending',
-        # The split partitions in_progress; concurrency_cap is a per-snapshot
-        # scalar (nullable).  Both merge last-writer-wins with the zones — a
-        # snapshot is one consistent observation, so its columns travel together.
-        'in_progress_live', 'in_progress_stranded', 'concurrency_cap',
-    )
-    empty: dict = {'labels': [], **{k: [] for k in _keys}}
+    # Every series key merges last-writer-wins with the zones — a snapshot is
+    # one consistent observation, so its columns travel together.
+    empty: dict = {'labels': [], **{k: [] for k in _SERIES_KEYS}}
 
     if not dbs:
         return empty
@@ -589,7 +632,7 @@ async def aggregate_burndown_series(
                 collisions += 1
                 if len(first_colliding) < 3:
                     first_colliding.append(label)
-            merged[label] = {k: series[k][i] for k in _keys}
+            merged[label] = {k: series[k][i] for k in _SERIES_KEYS}
     if collisions:
         logger.warning(
             'aggregate_burndown_series: %d timestamp collisions for project %r '
@@ -605,17 +648,26 @@ async def aggregate_burndown_series(
 
     sorted_labels = sorted(merged)
     result: dict = {'labels': sorted_labels}
-    for k in _keys:
+    for k in _SERIES_KEYS:
         result[k] = [merged[label][k] for label in sorted_labels]
     return result
 
 
 async def get_burndown_projects(db: aiosqlite.Connection | None) -> list[str]:
-    """Return distinct project IDs that have snapshot data."""
+    """Return distinct project IDs that have at least one MEASURED snapshot row.
+
+    A project whose only rows are gaps stays off this list: how a gap renders
+    is for the shaper to decide (task 5592), not for this read to imply.
+    """
     if db is None:
         return []
     try:
-        async with db.execute('SELECT DISTINCT project_id FROM snapshots ORDER BY project_id') as cur:
+        measured = _measured_rows(await _snapshot_columns(db))
+        async with db.execute(
+            f'SELECT DISTINCT project_id FROM snapshots WHERE {measured.sql} '
+            'ORDER BY project_id',
+            measured.params,
+        ) as cur:
             rows = await cur.fetchall()
         return [row[0] for row in rows]
     except Exception:
@@ -853,47 +905,34 @@ async def get_burndown_series(
 ) -> dict:
     """Return time-series data for a project's burndown chart.
 
-    Returns ``{labels: [...], done: [...], cancelled: [...], blocked: [...],
-    deferred: [...], in_progress: [...], pending: [...]}``.
+    Returns ``{labels: [...]}`` plus one list per :data:`_SERIES_KEYS` key,
+    over the MEASURED rows only: a gap row's count columns carry no
+    measurement and never reach a reader.
 
     *now* is the reference timestamp for the window cutoff; when ``None``
     (the default) it is resolved via :func:`dashboard.data.utils.resolve_now`.
     """
-    empty: dict = {
-        'labels': [],
-        'done': [],
-        'cancelled': [],
-        'blocked': [],
-        'deferred': [],
-        'in_progress': [],
-        'pending': [],
-        'in_progress_live': [],
-        'in_progress_stranded': [],
-        'concurrency_cap': [],
-    }
+    empty: dict = {'labels': [], **{key: [] for key in _SERIES_KEYS}}
     if db is None:
         return empty
     since = (resolve_now(now) - timedelta(days=days)).isoformat()
     try:
-        # Which of the post-3543 columns this DB actually has.  ``_burndown_dbs``
-        # opens OTHER projects' burndown.db files read-only and nothing migrates
-        # those, so a hardcoded widened SELECT would raise 'no such column'
-        # there, hit the guard below, and silently blank that project's entire
-        # chart — losing the six zones it DOES have to report three it does not.
-        async with db.execute('PRAGMA table_info(snapshots)') as cur:
-            available = {row[1] for row in await cur.fetchall()}
-        has_split = {'in_progress_live', 'in_progress_stranded'} <= available
-        has_cap = 'concurrency_cap' in available
-
-        columns = ['ts', 'done', 'cancelled', 'blocked', 'deferred', 'in_progress', 'pending']
-        if has_split:
-            columns += ['in_progress_live', 'in_progress_stranded']
-        if has_cap:
-            columns.append('concurrency_cap')
+        # Which of the later columns this DB actually has: a hardcoded widened
+        # SELECT would raise 'no such column' on an un-migrated peer DB, hit the
+        # guard below, and silently blank that project's entire chart — losing
+        # the six zones it DOES have to report columns it does not.
+        available = await _snapshot_columns(db)
+        has_split = set(_SPLIT) <= available
+        columns = [
+            'ts', *_ZONES,
+            *(_SPLIT if has_split else ()),
+            *(key for key in _NULLABLE_SERIES_KEYS if key in available),
+        ]
+        measured = _measured_rows(available)
         async with db.execute(
-            f'SELECT {", ".join(columns)} '
-            'FROM snapshots WHERE project_id = ? AND ts >= ? ORDER BY ts',
-            (project_id, since),
+            f'SELECT {", ".join(columns)} FROM snapshots '
+            f'WHERE project_id = ? AND ts >= ? AND {measured.sql} ORDER BY ts',
+            (project_id, since, *measured.params),
         ) as cur:
             rows = await cur.fetchall()
     except Exception:
@@ -902,24 +941,23 @@ async def get_burndown_series(
 
     result: dict = {key: [] for key in empty}
     for row in rows:
-        result['labels'].append(row[0])
-        result['done'].append(row[1])
-        result['cancelled'].append(row[2])
-        result['blocked'].append(row[3])
-        result['deferred'].append(row[4])
-        result['in_progress'].append(row[5])
-        result['pending'].append(row[6])
+        values = dict(zip(columns, row, strict=True))
+        result['labels'].append(values['ts'])
+        for key in _ZONES:
+            result[key].append(values[key])
         if has_split:
-            result['in_progress_live'].append(row[7])
-            result['in_progress_stranded'].append(row[8])
+            for key in _SPLIT:
+                result[key].append(values[key])
         else:
             # Un-migrated DB: the split is unknown.  All-live keeps the
             # conservation invariant (live + stranded == in_progress) true and
             # errs toward under-reporting strands, never over-reporting.
-            result['in_progress_live'].append(row[5])
+            result['in_progress_live'].append(values['in_progress'])
             result['in_progress_stranded'].append(0)
-        # A missing cap column is UNKNOWN, i.e. NULL — never 0, which would
-        # read as a cap of zero and alarm on every row.
-        result['concurrency_cap'].append(row[-1] if has_cap else None)
+        # A missing column is UNKNOWN, i.e. None — never 0.  For the cap, a 0
+        # would read as a cap of zero and alarm on every row; for the task
+        # 5591 members, as a measured zero nobody counted.
+        for key in _NULLABLE_SERIES_KEYS:
+            result[key].append(values.get(key))
 
     return result
