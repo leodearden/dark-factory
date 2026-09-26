@@ -13,9 +13,7 @@ from __future__ import annotations
 
 import fcntl
 import json
-import os
 import re
-import tempfile
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -24,6 +22,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from shared.safe_io import atomic_write_text
 from sitting.gates import UNKNOWN, Fact
 from sitting.inventory import ESC_ID_RE, ItemKey, key_str, parse_key, parse_stamp
 
@@ -232,7 +231,7 @@ def record(path: Path | str, payloads: Iterable[Mapping[str, Any]]) -> Preparati
     path.parent.mkdir(parents=True, exist_ok=True)
     with _locked(path):
         merged = _merge(load(path), incoming)
-        _atomic_write(path, _encode_store(merged))
+        atomic_write_text(path, _encode_store(merged))
     return merged
 
 
@@ -258,7 +257,7 @@ def to_json_payload(prep: Preparation) -> dict[str, Any]:
             **{name: _fact_payload(getattr(prep.gate_facts, name)) for name in GATE_FACT_NAMES},
             'pins_recovery': None if prep.gate_facts.pins_recovery is None else list(prep.gate_facts.pins_recovery),
         },
-        'standing': None if prep.standing is None else _standing_payload(prep.standing),
+        'standing': None if prep.standing is None else standing_to_json(prep.standing),
         'prepared_at': prep.prepared_at,
         'prepared_by': prep.prepared_by,
     }
@@ -281,8 +280,26 @@ def from_json_payload(obj: object) -> Preparation:
         prepared_by=data['prepared_by'],
         cites=_cites(data.get('cites')),
         gate_facts=_gate_facts(data.get('gate_facts')),
-        standing=None if data.get('standing') is None else _standing(data['standing']),
+        standing=None if data.get('standing') is None else standing_from_json(data['standing']),
     )
+
+
+def standing_to_json(standing: Standing) -> dict[str, Any]:
+    release = standing.release_predicate
+    if isinstance(release, TaskStatusIs):
+        release_payload: dict[str, Any] = {
+            'task_status_is': {'task_id': release.task_id, 'statuses': list(release.statuses)},
+        }
+    elif isinstance(release, EscalationClosed):
+        release_payload = {'escalation_closed': release.esc_id}
+    else:
+        release_payload = {'manual': release.text}
+    return {'kind': standing.kind, 'owner': standing.owner, 'release': release_payload, 'evidence': standing.evidence}
+
+
+def standing_from_json(obj: object) -> Standing:
+    data = _fields(obj, 'standing', {'kind', 'owner', 'release', 'evidence'})
+    return Standing(data['kind'], data['owner'], _release(data['release']), data['evidence'])
 
 
 def _require_text(name: str, value: object) -> None:
@@ -361,11 +378,6 @@ def _gate_facts(obj: object) -> GateFacts:
     return GateFacts(**facts, pins_recovery=None if pins is None else tuple(_list(pins, 'pins_recovery')))
 
 
-def _standing(obj: object) -> Standing:
-    data = _fields(obj, 'standing', {'kind', 'owner', 'release', 'evidence'})
-    return Standing(data['kind'], data['owner'], _release(data['release']), data['evidence'])
-
-
 def _release(obj: object) -> ReleasePredicate:
     if not isinstance(obj, dict) or len(obj) != 1:
         raise ValueError('release is an object with exactly one of task_status_is, escalation_closed, manual')
@@ -382,19 +394,6 @@ def _release(obj: object) -> ReleasePredicate:
 
 def _fact_payload(fact: Fact) -> dict[str, Any]:
     return {'held': fact.held, 'evidence': fact.evidence, 'source_kind': fact.source_kind}
-
-
-def _standing_payload(standing: Standing) -> dict[str, Any]:
-    release = standing.release_predicate
-    if isinstance(release, TaskStatusIs):
-        release_payload: dict[str, Any] = {
-            'task_status_is': {'task_id': release.task_id, 'statuses': list(release.statuses)},
-        }
-    elif isinstance(release, EscalationClosed):
-        release_payload = {'escalation_closed': release.esc_id}
-    else:
-        release_payload = {'manual': release.text}
-    return {'kind': standing.kind, 'owner': standing.owner, 'release': release_payload, 'evidence': standing.evidence}
 
 
 def _prepared_at(prep: Preparation) -> datetime:
@@ -427,16 +426,3 @@ def _locked(path: Path) -> Iterator[None]:
             yield
         finally:
             fcntl.flock(handle, fcntl.LOCK_UN)
-
-
-def _atomic_write(path: Path, text: str) -> None:
-    descriptor, temp = tempfile.mkstemp(dir=path.parent, prefix=f'.{path.name}.')
-    try:
-        with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp, path)
-    except BaseException:
-        Path(temp).unlink(missing_ok=True)
-        raise

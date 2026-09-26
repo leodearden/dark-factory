@@ -49,7 +49,8 @@ def _answer(item_ref: str, option_ref: str = '', *, note: str = '', at: str = T1
 
 def _sitting() -> mod.Ledger:
     """Items 1 (A), 3 (C) and 4 (D) open; item 2 (B) done."""
-    return _assign(_assign(mod.new_sitting(T0), [A, B, C, D]), [A, C, D], now=T1)
+    order = [A, B, C, D]
+    return _assign(_assign(mod.new_sitting(T0), order, sort_key=order.index), [A, C, D], now=T1)
 
 
 class TestNewSitting:
