@@ -4525,8 +4525,10 @@ class ReconciliationHarness:
         re-raises ``CancelledError`` without returning a partial report — so
         an absent key is proof Stage 2 produced no report, never merely a
         bookkeeping gap. (``_run_remediation_pass``'s scope-freshness
-        short-circuit returns before its ``try:`` block, so its ``finally``
-        is never reached on that path either.) A SECOND population the
+        short-circuit returns from inside its ``try:`` block, so its
+        ``finally`` does run on that path; this presence gate keeps the
+        method inert there, since a short-circuited pass runs no stage and
+        records no ``task_knowledge_sync`` key.) A SECOND population the
         presence gate alone would not exclude — a Stage 2 that started, was
         recorded, but died before reaching its own write — is excluded by
         :func:`_stage2_ledger_write_missing` treating an ABSENT
@@ -4608,9 +4610,11 @@ class ReconciliationHarness:
         ``get_cycle_summary_presence`` reads to disambiguate expected-missing
         rows. Note this does not weaken the never-fabricate guarantee on that
         driver either: ``_run_remediation_pass``'s scope-freshness
-        short-circuit RETURNS before its ``try:`` block, so its ``finally``
-        — and therefore this method — is never reached on that never-ran-any-
-        stage path.
+        short-circuit returns from inside its ``try:`` block, so its
+        ``finally`` — and therefore this method — does run on that
+        never-ran-any-stage path, but the presence gate keeps this method
+        inert there, since a short-circuited pass records no
+        ``task_knowledge_sync`` key.
 
         Must never raise: awaited unshielded in the ``finally``, immediately
         before ``update_run_stage_reports``, and AFTER
@@ -5495,220 +5499,219 @@ class ReconciliationHarness:
             },
         )
 
-        # Task 4115: resolve the tree and the instant it was read as ONE unit
-        # (ref: task 455, task 478 for the caller-supplied-tree short-circuit
-        # itself), so a caller's read instant can never be paired with a tree
-        # it does not describe. Caller-supplied tree: honour the caller's read
-        # instant when given AND timezone-aware; otherwise fall back to a
-        # fresh now() with a WARNING trace — loud rather than silent, since a
-        # caller that drops or malforms the instant regresses straight back to
-        # the pre-4115 bug this task fixes (repo loud-over-silent-degradation
-        # norm). A naive (tzinfo-less) instant is treated the same as a
-        # missing one rather than handed to corroboration_for_task as-is:
-        # has_live_claimant compares it against timezone-aware heartbeats, and
-        # the resulting TypeError is caught and swallowed several frames down
-        # (see the `except Exception as _corr_exc` below), which would
-        # otherwise leave corroborated=None and silently suppress every
-        # stranded-work escalation in the pass — the opposite of this gate's
-        # fail-safe direction. The WARNING fallback is otherwise exactly the
-        # pre-4115 behaviour, which the ~30 existing direct
-        # _run_remediation_pass callers that pass a tree without an instant
-        # depend on. Self-fetch: always stamp a fresh now() — a caller instant
-        # (if one was even supplied) describes a different tree, or no tree at
-        # all, and must never leak onto the tree just fetched here.
-        #
-        # Task 2964: `_tasks_snapshot_at` is the instant the per-task snapshot
-        # below (task_by_id, and therefore every heartbeat_at it carries) was
-        # read. It is threaded into corroboration_for_task ONLY to age-check
-        # that snapshot's own heartbeat_at against DEFAULT_HEARTBEAT_TTL, so it
-        # must be the snapshot's clock, not the clock at the moment the gate
-        # runs: the gate fires AFTER the focused S1→S2→S3 stages, i.e. after
-        # minutes of LLM work, and the TTL is 10 minutes — comparable to a
-        # whole pass. Using a fresh now() there would age a heartbeat that was
-        # fresh when read past the TTL purely because the pass was slow,
-        # reporting corroborated=False for a task that is in fact live and
-        # filing a spurious stranded-work escalation — task 4115 found this
-        # happening on exactly the caller-supplied-tree path, the one
-        # production always takes (run_full_cycle threads its pre-stage-loop
-        # fetch straight through): this stamp used to be an unconditional
-        # datetime.now(UTC) taken here regardless of which tree was in play,
-        # so a caller's own (earlier, more accurate) read instant was silently
-        # discarded. Pinning the clock to the read makes the verdict "was
-        # there a fresh per-task signal in the snapshot we hold" — evaluable,
-        # and biased toward suppression (the fail-safe direction) rather than
-        # toward escalating. task_by_id's own staleness is pre-existing and
-        # orthogonal.
-        _tasks_snapshot_at: datetime
-        if filtered_task_tree is not None:
-            remediation_tree = filtered_task_tree
-            if (
-                filtered_task_tree_fetched_at is not None
-                and filtered_task_tree_fetched_at.tzinfo is not None
-            ):
-                _tasks_snapshot_at = filtered_task_tree_fetched_at
+        current_stage_name: str | None = None
+        try:
+            # Task 4115: resolve the tree and the instant it was read as ONE unit
+            # (ref: task 455, task 478 for the caller-supplied-tree short-circuit
+            # itself), so a caller's read instant can never be paired with a tree
+            # it does not describe. Caller-supplied tree: honour the caller's read
+            # instant when given AND timezone-aware; otherwise fall back to a
+            # fresh now() with a WARNING trace — loud rather than silent, since a
+            # caller that drops or malforms the instant regresses straight back to
+            # the pre-4115 bug this task fixes (repo loud-over-silent-degradation
+            # norm). A naive (tzinfo-less) instant is treated the same as a
+            # missing one rather than handed to corroboration_for_task as-is:
+            # has_live_claimant compares it against timezone-aware heartbeats, and
+            # the resulting TypeError is caught and swallowed several frames down
+            # (see the `except Exception as _corr_exc` below), which would
+            # otherwise leave corroborated=None and silently suppress every
+            # stranded-work escalation in the pass — the opposite of this gate's
+            # fail-safe direction. The WARNING fallback is otherwise exactly the
+            # pre-4115 behaviour, which the ~30 existing direct
+            # _run_remediation_pass callers that pass a tree without an instant
+            # depend on. Self-fetch: always stamp a fresh now() — a caller instant
+            # (if one was even supplied) describes a different tree, or no tree at
+            # all, and must never leak onto the tree just fetched here.
+            #
+            # Task 2964: `_tasks_snapshot_at` is the instant the per-task snapshot
+            # below (task_by_id, and therefore every heartbeat_at it carries) was
+            # read. It is threaded into corroboration_for_task ONLY to age-check
+            # that snapshot's own heartbeat_at against DEFAULT_HEARTBEAT_TTL, so it
+            # must be the snapshot's clock, not the clock at the moment the gate
+            # runs: the gate fires AFTER the focused S1→S2→S3 stages, i.e. after
+            # minutes of LLM work, and the TTL is 10 minutes — comparable to a
+            # whole pass. Using a fresh now() there would age a heartbeat that was
+            # fresh when read past the TTL purely because the pass was slow,
+            # reporting corroborated=False for a task that is in fact live and
+            # filing a spurious stranded-work escalation — task 4115 found this
+            # happening on exactly the caller-supplied-tree path, the one
+            # production always takes (run_full_cycle threads its pre-stage-loop
+            # fetch straight through): this stamp used to be an unconditional
+            # datetime.now(UTC) taken here regardless of which tree was in play,
+            # so a caller's own (earlier, more accurate) read instant was silently
+            # discarded. Pinning the clock to the read makes the verdict "was
+            # there a fresh per-task signal in the snapshot we hold" — evaluable,
+            # and biased toward suppression (the fail-safe direction) rather than
+            # toward escalating. task_by_id's own staleness is pre-existing and
+            # orthogonal.
+            _tasks_snapshot_at: datetime
+            if filtered_task_tree is not None:
+                remediation_tree = filtered_task_tree
+                if (
+                    filtered_task_tree_fetched_at is not None
+                    and filtered_task_tree_fetched_at.tzinfo is not None
+                ):
+                    _tasks_snapshot_at = filtered_task_tree_fetched_at
+                else:
+                    logger.warning(
+                        'reconciliation.remediation_tree_read_instant_missing',
+                        extra={
+                            'project_id': project_id,
+                            'parent_run_id': parent_run_id,
+                            'reason': (
+                                'naive_datetime'
+                                if filtered_task_tree_fetched_at is not None
+                                else 'not_supplied'
+                            ),
+                        },
+                    )
+                    _tasks_snapshot_at = datetime.now(UTC)
             else:
-                logger.warning(
-                    'reconciliation.remediation_tree_read_instant_missing',
+                remediation_tree = await self._fetch_filtered_task_tree(project_root)
+                _tasks_snapshot_at = datetime.now(UTC)
+
+            # Task 2031/2067: a {str(task_id): task dict} map derived from
+            # remediation_tree in a single pass, used by the live-workflow gate below
+            # so never-dispatched cited tasks (deferred/done/cancelled) drop the
+            # project-wide orchestrator_live signal instead of being suppressed by it,
+            # and so BLOCKED cited tasks that are deterministic (never acquire a
+            # worktree/branch of their own — routed to DeterministicRunner) do too —
+            # which status alone cannot express since 'blocked' is deliberately not in
+            # ORCH_LIVE_INELIGIBLE_STATUSES (a normal blocked task may legitimately
+            # auto-unblock mid-pipeline). remediation_tree is always a valid
+            # FilteredTaskTree (degrades to empty on fetch failure), so this is safe.
+            #
+            # Task 2964 consolidated the former parallel status_by_id/task_kind_by_id
+            # scalar maps into this one: the gate now also needs `metadata` (for
+            # pure_gate) and the task's TOP-LEVEL claimant_run_id/heartbeat_at (for
+            # corroboration), which no scalar map can express. Keying the whole dict
+            # subsumes all of them from the same single pass at no extra cost, and
+            # keeps every derived value guaranteed to come from ONE task snapshot.
+            #
+            # Coverage caveat (unchanged, restated for the consolidated map): active_
+            # tasks is uncapped (deferred/blocked — the cited cases — always resolve),
+            # but done_tasks/cancelled_tasks are capped at MAX_DONE_TASKS_RETAINED=30
+            # / MAX_CANCELLED_TASKS_RETAINED=15 (task_filter.py). A cited
+            # done/cancelled task outside those caps, or one with an untracked status,
+            # is simply absent here and task_by_id.get(tid) falls back to None below —
+            # so status/task_kind/pure_gate/corroborated all degrade to the pre-2031
+            # status-blind, fail-safe-toward-live values for that one id, not a new
+            # failure mode.
+            task_by_id: dict[str, dict] = {}
+            for t in (
+                list(remediation_tree.active_tasks)
+                + list(remediation_tree.done_tasks)
+                + list(remediation_tree.cancelled_tasks)
+            ):
+                if not isinstance(t, dict) or t.get('id') is None:
+                    continue
+                task_by_id[str(t.get('id'))] = t
+
+            # Task 2417: cheap, deterministic freshness pre-check — BEFORE any
+            # stage is built or run. Filters cross-project scope-correction
+            # findings whose subject task is unchanged since the last
+            # consolidated snapshot out of `findings`, the single choke point
+            # shared by both Stage 1 (remediation_findings, wired below via
+            # _configure_consolidator) and Stage 2 (remediation_mode=True — no
+            # findings list of its own) remediation re-derivation. Best-effort:
+            # any failure here (unresolvable project, get_task/Mem0 errors, ...)
+            # falls back to the original, unfiltered `findings` — see the
+            # fused_memory.reconciliation.scope_freshness module docstring.
+            # `freshness` is pre-initialized to None so the except branch below
+            # (the pre-check raising before ever assigning it) leaves an
+            # unambiguous "pre-check did not run" sentinel for the short-circuit
+            # guard just below to key off of.
+            # `max_consecutive_skips` is wired to the SAME
+            # _INTEGRITY_FINDING_RECURRENCE_THRESHOLD used by the persistence-gated
+            # escalation loop below (amendment: reviewer finding
+            # robustness_silent_degradation) — a (task_ref, flag_key) pair can be
+            # skipped by the pre-check at most threshold-1 cycles in a row before
+            # it is forced back through a real Stage 1-3 pass. The cap ALONE is
+            # not sufficient for the loud-failure guarantee, though: the
+            # persistence-gated escalation loop only counts a run toward a
+            # finding's recurrence if that run's stage_reports carries an
+            # integrity_check entry, and a short-circuited run built none.  The
+            # short-circuit block below also stamps `freshness.skipped` into a
+            # synthetic integrity_check report before completing the run
+            # (amendment — reviewer finding behavior_change), so BOTH the cap's
+            # periodic forced re-investigation AND every intervening
+            # short-circuited skip contribute to the window — only together do
+            # they guarantee a genuinely stranded cross-project thread escalates
+            # within a bounded number of cycles instead of being silently
+            # suppressed forever.
+            freshness: ScopeFreshnessResult | None = None
+            try:
+                if self.taskmaster is None:
+                    raise RuntimeError('taskmaster is not configured')
+                freshness = await precheck_scope_correction_freshness(
+                    memory_service=self.memory,
+                    taskmaster=self.taskmaster,
+                    project_id=project_id,
+                    resolve_project_root=self._resolve_known_root,
+                    run_id=run_id,
+                    findings=findings,
+                    max_consecutive_skips=_INTEGRITY_FINDING_RECURRENCE_THRESHOLD,
+                )
+                findings = freshness.to_reinvestigate
+                skipped_task_refs = []
+                for _skipped in freshness.skipped:
+                    _sig = compute_scope_signature(_skipped, project_id)
+                    if _sig is not None:
+                        skipped_task_refs.append(_sig[0])
+                logger.info(
+                    'reconciliation.scope_freshness_precheck',
                     extra={
+                        'run_id': run_id,
                         'project_id': project_id,
-                        'parent_run_id': parent_run_id,
-                        'reason': (
-                            'naive_datetime'
-                            if filtered_task_tree_fetched_at is not None
-                            else 'not_supplied'
-                        ),
+                        'skipped_task_refs': skipped_task_refs,
+                        **freshness.stats,
                     },
                 )
-                _tasks_snapshot_at = datetime.now(UTC)
-        else:
-            remediation_tree = await self._fetch_filtered_task_tree(project_root)
-            _tasks_snapshot_at = datetime.now(UTC)
+            except Exception as exc:
+                logger.warning(
+                    'reconciliation.scope_freshness_precheck_wiring_failed',
+                    extra={'run_id': run_id, 'project_id': project_id, 'error': str(exc)},
+                )
 
-        # Task 2031/2067: a {str(task_id): task dict} map derived from
-        # remediation_tree in a single pass, used by the live-workflow gate below
-        # so never-dispatched cited tasks (deferred/done/cancelled) drop the
-        # project-wide orchestrator_live signal instead of being suppressed by it,
-        # and so BLOCKED cited tasks that are deterministic (never acquire a
-        # worktree/branch of their own — routed to DeterministicRunner) do too —
-        # which status alone cannot express since 'blocked' is deliberately not in
-        # ORCH_LIVE_INELIGIBLE_STATUSES (a normal blocked task may legitimately
-        # auto-unblock mid-pipeline). remediation_tree is always a valid
-        # FilteredTaskTree (degrades to empty on fetch failure), so this is safe.
-        #
-        # Task 2964 consolidated the former parallel status_by_id/task_kind_by_id
-        # scalar maps into this one: the gate now also needs `metadata` (for
-        # pure_gate) and the task's TOP-LEVEL claimant_run_id/heartbeat_at (for
-        # corroboration), which no scalar map can express. Keying the whole dict
-        # subsumes all of them from the same single pass at no extra cost, and
-        # keeps every derived value guaranteed to come from ONE task snapshot.
-        #
-        # Coverage caveat (unchanged, restated for the consolidated map): active_
-        # tasks is uncapped (deferred/blocked — the cited cases — always resolve),
-        # but done_tasks/cancelled_tasks are capped at MAX_DONE_TASKS_RETAINED=30
-        # / MAX_CANCELLED_TASKS_RETAINED=15 (task_filter.py). A cited
-        # done/cancelled task outside those caps, or one with an untracked status,
-        # is simply absent here and task_by_id.get(tid) falls back to None below —
-        # so status/task_kind/pure_gate/corroborated all degrade to the pre-2031
-        # status-blind, fail-safe-toward-live values for that one id, not a new
-        # failure mode.
-        task_by_id: dict[str, dict] = {}
-        for t in (
-            list(remediation_tree.active_tasks)
-            + list(remediation_tree.done_tasks)
-            + list(remediation_tree.cancelled_tasks)
-        ):
-            if not isinstance(t, dict) or t.get('id') is None:
-                continue
-            task_by_id[str(t.get('id'))] = t
+            # Short-circuit: every finding was confirmed fresh (unchanged) by the
+            # pre-check above — skip building/running any stage entirely (no LLM
+            # subprocess launches) and journal-complete the run as-is. Guarded on
+            # `freshness is not None` so a pre-check that raised (and therefore
+            # fell back to the original, unfiltered `findings` above) never
+            # short-circuits — only a POSITIVE freshness confirmation may skip
+            # remediation, never an error/uncertainty path.
+            if freshness is not None and not findings and freshness.skipped:
+                logger.info(
+                    'reconciliation.remediation_skipped_all_fresh',
+                    extra={
+                        'run_id': run_id,
+                        'project_id': project_id,
+                        'parent_run_id': parent_run_id,
+                        **freshness.stats,
+                    },
+                )
+                # Stamp the skipped findings into a synthetic integrity_check
+                # stage report BEFORE completing the run, so this short-circuited
+                # run still counts toward _finding_persistence_count's lookback
+                # window exactly as a real Stage 3 re-flag would have (task 2417
+                # amendment — reviewer finding behavior_change).  Without this,
+                # a short-circuited run occupied a slot in the persistence
+                # window while contributing 0, and the loud-failure guarantee
+                # described above depended on BOTH the consecutive-skip cap's
+                # periodic forced re-investigation AND this stamp — the cap
+                # alone forces a real pass only every threshold-th cycle, which
+                # is not by itself enough to saturate the persistence window.
+                # No stage is built or run here — this uses the plain-dict
+                # report shape the journal/tests already accept elsewhere
+                # ({'integrity_check': {'items_flagged': [...]}}).
+                run.stage_reports['integrity_check'] = {'items_flagged': list(freshness.skipped)}
+                await self.journal.update_run_stage_reports(run_id, run.stage_reports)
+                run.completed_at = datetime.now(UTC)
+                run.status = RunStatus.completed
+                await self.journal.complete_run(run_id, 'completed')
+                return
 
-        current_stage_name: str | None = None
-
-        # Task 2417: cheap, deterministic freshness pre-check — BEFORE any
-        # stage is built or run. Filters cross-project scope-correction
-        # findings whose subject task is unchanged since the last
-        # consolidated snapshot out of `findings`, the single choke point
-        # shared by both Stage 1 (remediation_findings, wired below via
-        # _configure_consolidator) and Stage 2 (remediation_mode=True — no
-        # findings list of its own) remediation re-derivation. Best-effort:
-        # any failure here (unresolvable project, get_task/Mem0 errors, ...)
-        # falls back to the original, unfiltered `findings` — see the
-        # fused_memory.reconciliation.scope_freshness module docstring.
-        # `freshness` is pre-initialized to None so the except branch below
-        # (the pre-check raising before ever assigning it) leaves an
-        # unambiguous "pre-check did not run" sentinel for the short-circuit
-        # guard just below to key off of.
-        # `max_consecutive_skips` is wired to the SAME
-        # _INTEGRITY_FINDING_RECURRENCE_THRESHOLD used by the persistence-gated
-        # escalation loop below (amendment: reviewer finding
-        # robustness_silent_degradation) — a (task_ref, flag_key) pair can be
-        # skipped by the pre-check at most threshold-1 cycles in a row before
-        # it is forced back through a real Stage 1-3 pass. The cap ALONE is
-        # not sufficient for the loud-failure guarantee, though: the
-        # persistence-gated escalation loop only counts a run toward a
-        # finding's recurrence if that run's stage_reports carries an
-        # integrity_check entry, and a short-circuited run built none.  The
-        # short-circuit block below also stamps `freshness.skipped` into a
-        # synthetic integrity_check report before completing the run
-        # (amendment — reviewer finding behavior_change), so BOTH the cap's
-        # periodic forced re-investigation AND every intervening
-        # short-circuited skip contribute to the window — only together do
-        # they guarantee a genuinely stranded cross-project thread escalates
-        # within a bounded number of cycles instead of being silently
-        # suppressed forever.
-        freshness: ScopeFreshnessResult | None = None
-        try:
-            if self.taskmaster is None:
-                raise RuntimeError('taskmaster is not configured')
-            freshness = await precheck_scope_correction_freshness(
-                memory_service=self.memory,
-                taskmaster=self.taskmaster,
-                project_id=project_id,
-                resolve_project_root=self._resolve_known_root,
-                run_id=run_id,
-                findings=findings,
-                max_consecutive_skips=_INTEGRITY_FINDING_RECURRENCE_THRESHOLD,
-            )
-            findings = freshness.to_reinvestigate
-            skipped_task_refs = []
-            for _skipped in freshness.skipped:
-                _sig = compute_scope_signature(_skipped, project_id)
-                if _sig is not None:
-                    skipped_task_refs.append(_sig[0])
-            logger.info(
-                'reconciliation.scope_freshness_precheck',
-                extra={
-                    'run_id': run_id,
-                    'project_id': project_id,
-                    'skipped_task_refs': skipped_task_refs,
-                    **freshness.stats,
-                },
-            )
-        except Exception as exc:
-            logger.warning(
-                'reconciliation.scope_freshness_precheck_wiring_failed',
-                extra={'run_id': run_id, 'project_id': project_id, 'error': str(exc)},
-            )
-
-        # Short-circuit: every finding was confirmed fresh (unchanged) by the
-        # pre-check above — skip building/running any stage entirely (no LLM
-        # subprocess launches) and journal-complete the run as-is. Guarded on
-        # `freshness is not None` so a pre-check that raised (and therefore
-        # fell back to the original, unfiltered `findings` above) never
-        # short-circuits — only a POSITIVE freshness confirmation may skip
-        # remediation, never an error/uncertainty path.
-        if freshness is not None and not findings and freshness.skipped:
-            logger.info(
-                'reconciliation.remediation_skipped_all_fresh',
-                extra={
-                    'run_id': run_id,
-                    'project_id': project_id,
-                    'parent_run_id': parent_run_id,
-                    **freshness.stats,
-                },
-            )
-            # Stamp the skipped findings into a synthetic integrity_check
-            # stage report BEFORE completing the run, so this short-circuited
-            # run still counts toward _finding_persistence_count's lookback
-            # window exactly as a real Stage 3 re-flag would have (task 2417
-            # amendment — reviewer finding behavior_change).  Without this,
-            # a short-circuited run occupied a slot in the persistence
-            # window while contributing 0, and the loud-failure guarantee
-            # described above depended on BOTH the consecutive-skip cap's
-            # periodic forced re-investigation AND this stamp — the cap
-            # alone forces a real pass only every threshold-th cycle, which
-            # is not by itself enough to saturate the persistence window.
-            # No stage is built or run here — this uses the plain-dict
-            # report shape the journal/tests already accept elsewhere
-            # ({'integrity_check': {'items_flagged': [...]}}).
-            run.stage_reports['integrity_check'] = {'items_flagged': list(freshness.skipped)}
-            await self.journal.update_run_stage_reports(run_id, run.stage_reports)
-            run.completed_at = datetime.now(UTC)
-            run.status = RunStatus.completed
-            await self.journal.complete_run(run_id, 'completed')
-            return
-
-        stages = self._make_stages(scope)
-        try:
+            stages = self._make_stages(scope)
             # Configure stages for remediation mode
             stage1 = stages[0]
             stage2 = stages[1]
