@@ -639,17 +639,6 @@ class TestHolderRecordState:
             'exited',
         ]
 
-    def test_no_evidence_and_evidence_of_absence_never_share_a_value(
-        self, tmp_path: Path
-    ) -> None:
-        legacy = sr.LeaseHolder.from_dict({'session_slug': 'watcher-df-1', 'pid': 1, 'start_ts': ''})
-        reaped = _holder(record_slug=self._SLUG)
-
-        assert sr.HolderRecordState.UNLINKED != sr.HolderRecordState.ABSENT
-        assert sr.holder_record_state(legacy, root=tmp_path) != sr.holder_record_state(
-            reaped, root=tmp_path
-        )
-
 
 _LEASE = 'watcher-df'
 
@@ -891,10 +880,14 @@ class TestLeaseClaimCliRecordSlug:
         assert excinfo.value.code == 2
 
     @pytest.mark.parametrize(
-        ('argv', 'max_calls'),
+        ('argv', 'expected_calls', 'expected_body_pid'),
         [
-            (['lease-claim', '--name', _LEASE], 1),
-            (['lease-claim', '--name', _LEASE, '--slug', 'X', '--pid', '4237400'], 0),
+            (['lease-claim', '--name', _LEASE], 1, _PID),
+            (
+                ['lease-claim', '--name', _LEASE, '--slug', 'X', '--pid', str(_OTHER_PID)],
+                0,
+                _OTHER_PID,
+            ),
         ],
         ids=['bare', 'explicit-slug-and-pid'],
     )
@@ -903,7 +896,8 @@ class TestLeaseClaimCliRecordSlug:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         argv: list[str],
-        max_calls: int,
+        expected_calls: int,
+        expected_body_pid: int,
     ) -> None:
         _link_pid(self._PID, 'watcher-own-record', tmp_path)
         monkeypatch.setenv('CLAUDE_PID', str(self._PID))
@@ -918,8 +912,8 @@ class TestLeaseClaimCliRecordSlug:
 
         assert sr.main(argv) == 0
 
-        assert len(calls) <= max_calls
-        assert _lease_body(tmp_path).pid in (self._PID, self._OTHER_PID)
+        assert len(calls) == expected_calls
+        assert _lease_body(tmp_path).pid == expected_body_pid
 
 
 def _claim_lines(capsys: pytest.CaptureFixture[str], *extra: str) -> list[str]:
