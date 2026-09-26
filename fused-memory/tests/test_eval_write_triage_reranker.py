@@ -374,3 +374,54 @@ class TestMeasureArm:
         row = _measure(_spec(_FakeScorer(answers)), self._cases(), self._CLOCK).to_json()
         assert (row['status'], row['skip_reason']) == ('skipped', 'error')
         assert row['skip_detail'].startswith('ValueError: ')
+
+
+def _arm_json(arm: str, rank1: float | None, p95: float | None, status: str = 'measured') -> dict:
+    return {'arm': arm, 'status': status, 'rank1_rate': rank1, 'p95_seconds': p95}
+
+
+def _best(rows: list, ceiling: float = 3.0) -> dict:
+    return _mod().choose_best(rows, p95_ceiling_seconds=ceiling)
+
+
+class TestChooseBest:
+    def test_the_most_accurate_arm_under_the_ceiling_wins(self) -> None:
+        rows = [
+            _arm_json('fast', 0.3, 1.0), _arm_json('accurate', 0.5, 2.0),
+            _arm_json('slow', 0.9, 4.0),
+        ]
+        assert _best(rows) == {
+            'arm': 'accurate', 'rank1_rate': 0.5, 'p95_seconds': 2.0,
+            'qualified': True, 'p95_ceiling_seconds': 3.0,
+        }
+
+    def test_a_p95_exactly_at_the_ceiling_qualifies(self) -> None:
+        rows = [_arm_json('fast', 0.3, 1.0), _arm_json('edge', 0.6, 3.0)]
+        assert (_best(rows)['arm'], _best(rows)['qualified']) == ('edge', True)
+
+    def test_a_rank1_tie_goes_to_the_lower_p95(self) -> None:
+        rows = [_arm_json('slower', 0.5, 2.0), _arm_json('quicker', 0.5, 1.0)]
+        assert _best(rows)['arm'] == 'quicker'
+
+    def test_a_full_tie_goes_to_the_earlier_row(self) -> None:
+        rows = [_arm_json('first', 0.5, 1.0), _arm_json('second', 0.5, 1.0)]
+        assert _best(rows)['arm'] == 'first'
+
+    def test_with_nothing_under_the_ceiling_the_fastest_measured_arm_is_unqualified(self) -> None:
+        rows = [_arm_json('slow', 0.9, 5.0), _arm_json('less_slow', 0.2, 4.0)]
+        assert _best(rows) == {
+            'arm': 'less_slow', 'rank1_rate': 0.2, 'p95_seconds': 4.0,
+            'qualified': False, 'p95_ceiling_seconds': 3.0,
+        }
+
+    def test_with_nothing_measured_every_value_is_null_never_zero(self) -> None:
+        rows = [_arm_json('a', None, None, 'skipped'), _arm_json('b', None, None, 'skipped')]
+        assert _best(rows, ceiling=2.5) == {
+            'arm': None, 'rank1_rate': None, 'p95_seconds': None,
+            'qualified': False, 'p95_ceiling_seconds': 2.5,
+        }
+
+    def test_a_skipped_row_is_never_selected_even_carrying_numbers(self) -> None:
+        rows = [_arm_json('stale', 0.99, 0.1, 'skipped'), _arm_json('real', 0.3, 1.0)]
+        assert _best(rows)['arm'] == 'real'
+        assert _best([_arm_json('stale', 0.99, 0.1, 'skipped')])['arm'] is None
