@@ -144,3 +144,85 @@ def test_an_empty_arm_summarizes_to_zeros_and_unknown_percentiles():
     assert summary.merge_states == ()
     assert summary.dispatch_caps == ()
     assert summary.resolved == 0
+
+
+# --- merger integrity: the drop guard and conflict re-opens ---
+
+UNTIL = APPLY + timedelta(days=1)
+DROP_REASON = 'Merge commit is missing plan target files: scripts/foo.py'
+
+
+def _finalized(runs_db, timestamp, *, task_id, state, reason=None):
+    runs_db.seed_event(
+        timestamp, 'merge_finalized', task_id=task_id,
+        data={'branch': task_id, 'state': state, 'merge_sha': None, 'reason': reason},
+    )
+
+
+def test_the_drop_guard_is_read_from_both_of_its_witnesses(runs_db):
+    runs_db.seed_event(_at(hours=1), 'merge_attempt', task_id='1058',
+                       data={'outcome': 'dropped_plan_targets'})
+    _finalized(runs_db, _at(hours=2), task_id='1071', state='blocked', reason=DROP_REASON)
+
+    events = review_model_admission.scan_drop_guard(runs_db, since=APPLY, until=UNTIL)
+
+    assert [(e.timestamp, e.task_id, e.source) for e in events] == [
+        (_at(hours=1), '1058', 'merge_attempt'),
+        (_at(hours=2), '1071', 'merge_finalized'),
+    ]
+
+
+def test_other_merge_outcomes_and_out_of_window_drops_are_not_drop_guard_events(runs_db):
+    _finalized(runs_db, _at(hours=1), task_id='1', state='blocked',
+               reason='Post-merge verification failed: pytest exited 1')
+    runs_db.seed_event(_at(hours=2), 'merge_attempt', task_id='2', data={'outcome': 'conflict'})
+    runs_db.seed_event(_at(hours=-1), 'merge_attempt', task_id='3',
+                       data={'outcome': 'dropped_plan_targets'})
+    runs_db.seed_event(UNTIL.isoformat(), 'merge_attempt', task_id='4',
+                       data={'outcome': 'dropped_plan_targets'})
+    _finalized(runs_db, UNTIL.isoformat(), task_id='5', state='blocked', reason=DROP_REASON)
+
+    assert review_model_admission.scan_drop_guard(runs_db, since=APPLY, until=UNTIL) == ()
+
+
+def _resolved_merger_run(task_id='4377', **overrides):
+    return _record(task_id=task_id, completed_at=_at(hours=2), **overrides)
+
+
+def test_a_conflict_after_a_successful_merger_run_is_a_reopen(runs_db):
+    _finalized(runs_db, _at(hours=1), task_id='4377', state='conflict')  # the one it resolved
+    _finalized(runs_db, _at(hours=5), task_id='4377', state='conflict')
+    _finalized(runs_db, _at(hours=6), task_id='4377', state='conflict')
+    _finalized(runs_db, _at(hours=5), task_id='9999', state='conflict')  # another task
+    _finalized(runs_db, _at(hours=25), task_id='4377', state='conflict')  # after until
+    _finalized(runs_db, _at(hours=7), task_id='4377', state='done')       # not a conflict
+
+    reopens = review_model_admission.conflict_reopens(
+        runs_db, [_resolved_merger_run()], until=UNTIL,
+    )
+
+    assert [(r.task_id, r.run_completed_at, r.reopened_at) for r in reopens] == [
+        ('4377', _at(hours=2), _at(hours=5)),
+        ('4377', _at(hours=2), _at(hours=6)),
+    ]
+
+
+@pytest.mark.parametrize(
+    'record',
+    [
+        _resolved_merger_run(succeeded=False),
+        _resolved_merger_run(succeeded=None),
+        _resolved_merger_run(role='steward'),
+    ],
+    ids=['failed-run', 'no-end-event', 'non-merger'],
+)
+def test_only_a_successful_merger_run_can_be_reopened(runs_db, record):
+    _finalized(runs_db, _at(hours=5), task_id='4377', state='conflict')
+
+    assert review_model_admission.conflict_reopens(runs_db, [record], until=UNTIL) == ()
+
+
+def test_no_records_means_no_reopens(runs_db):
+    _finalized(runs_db, _at(hours=5), task_id='4377', state='conflict')
+
+    assert review_model_admission.conflict_reopens(runs_db, [], until=UNTIL) == ()
