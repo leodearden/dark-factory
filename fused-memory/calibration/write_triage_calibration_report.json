@@ -199,27 +199,39 @@
     "per_k": [
       {
         "k": 1,
-        "hits": 17,
-        "total": 63,
-        "recall": 0.2698412698412698
+        "hits": 16,
+        "total": 84,
+        "recall": 0.19047619047619047
       },
       {
         "k": 3,
-        "hits": 25,
-        "total": 63,
-        "recall": 0.3968253968253968
+        "hits": 23,
+        "total": 84,
+        "recall": 0.27380952380952384
       },
       {
         "k": 5,
         "hits": 32,
-        "total": 63,
-        "recall": 0.5079365079365079
+        "total": 84,
+        "recall": 0.38095238095238093
       },
       {
         "k": 10,
-        "hits": 45,
-        "total": 63,
-        "recall": 0.7142857142857143
+        "hits": 46,
+        "total": 84,
+        "recall": 0.5476190476190477
+      },
+      {
+        "k": 20,
+        "hits": 66,
+        "total": 84,
+        "recall": 0.7857142857142857
+      },
+      {
+        "k": 50,
+        "hits": 73,
+        "total": 84,
+        "recall": 0.8690476190476191
       }
     ],
     "canonical_absent": [
@@ -307,15 +319,13 @@
         "memory_id": "e17a20d2-8011-4e3a-8f9e-21c302ae5ed8",
         "canonical_id": "417d86d0-36fe-42c8-851a-9ed0a18c64bb"
       }
-    ]
+    ],
+    "absent_in_denominator": true
   },
   "provenance": {
     "fixture_path": "tests/fixtures/write_triage_calibration.jsonl",
-    "project_id": "reify",
     "embedder_model": "text-embedding-3-small",
     "embedder_dimensions": 1536,
-    "search_stores": "mem0 (MemoryService.search, stores=[mem0])",
-    "search_categories": "all",
     "record_count": 104,
     "cluster_count": 20,
     "per_category_record_counts": {
@@ -345,6 +355,13 @@
         "unrelated": 0,
         "hard_negative": 0
       }
-    }
+    },
+    "project_id": "reify",
+    "retrieval_mode": "production",
+    "retrieval_call": "fused_memory.server.write_triage::retrieve_candidates",
+    "canonical_aliases_path": "tests/fixtures/write_triage_calibration.canonical_aliases.json",
+    "canonical_aliases_count": 3,
+    "degraded_retrievals": 0,
+    "bands_from": "calibration/write_triage_calibration_report.json"
   }
 }
