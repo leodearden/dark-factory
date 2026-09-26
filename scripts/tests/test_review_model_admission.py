@@ -521,6 +521,11 @@ def test_the_merger_arms_are_candidate_baseline_before_and_baseline_in_window(
     assert all(a.dispositions is None for a in (candidate, before, in_window))
 
 
+def _dispositions(arm):
+    assert arm.dispositions is not None
+    return arm.dispositions
+
+
 def test_the_steward_arms_split_each_window_by_tier_and_carry_dispositions(
     runs_db, scenario
 ):
@@ -537,11 +542,11 @@ def test_the_steward_arms_split_each_window_by_tier_and_carry_dispositions(
         2, 1, 1, 0,
     ]
     Disposition = escalation_ladder.StewardDisposition
-    assert candidate.dispositions.count(Disposition.PROMOTED_TO_L1) == 1
-    assert candidate.dispositions.count(Disposition.RESOLVED_IN_PLACE) == 1
-    assert window_low.dispositions.count(Disposition.AUTO_DISMISSED) == 1
-    assert before_like.dispositions.count(Disposition.RESOLVED_IN_PLACE) == 1
-    assert before_low.dispositions.decided == 0
+    assert _dispositions(candidate).count(Disposition.PROMOTED_TO_L1) == 1
+    assert _dispositions(candidate).count(Disposition.RESOLVED_IN_PLACE) == 1
+    assert _dispositions(window_low).count(Disposition.AUTO_DISMISSED) == 1
+    assert _dispositions(before_like).count(Disposition.RESOLVED_IN_PLACE) == 1
+    assert _dispositions(before_low).decided == 0
 
 
 def test_a_steward_run_no_arm_covers_is_reported_rather_than_dropped(runs_db, scenario):

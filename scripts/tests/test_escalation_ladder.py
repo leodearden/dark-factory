@@ -44,7 +44,7 @@ def test_root_and_archive_records_are_both_loaded(tmp_path):
     corpus = escalation_ladder.load_escalation_corpus(tmp_path)
 
     assert set(corpus.records) == {'esc-4377-1', 'esc-4377-2'}
-    assert corpus.get('esc-4377-2').task_id == '4377'
+    assert corpus.records['esc-4377-2'].task_id == '4377'
 
 
 def test_the_root_copy_wins_over_an_archive_copy_of_the_same_escalation(tmp_path):
@@ -54,7 +54,7 @@ def test_the_root_copy_wins_over_an_archive_copy_of_the_same_escalation(tmp_path
 
     corpus = escalation_ladder.load_escalation_corpus(tmp_path)
 
-    assert corpus.get('esc-4377-1').status == 'dismissed'
+    assert corpus.records['esc-4377-1'].status == 'dismissed'
     assert corpus.skipped == 0
 
 
@@ -95,7 +95,7 @@ def test_timestamps_are_parsed_to_aware_utc_datetimes(tmp_path):
         resolved_at='2026-09-12T08:00:00',  # naive reads as UTC
     ))
 
-    record = escalation_ladder.load_escalation_corpus(tmp_path).get('esc-4377-1')
+    record = escalation_ladder.load_escalation_corpus(tmp_path).records['esc-4377-1']
 
     assert record.timestamp == T0
     assert record.resolved_at == datetime(2026, 9, 12, 8, 0, tzinfo=UTC)
@@ -116,7 +116,7 @@ def test_an_unparseable_or_absent_resolved_at_reads_as_none(tmp_path, resolved_a
 
     corpus = escalation_ladder.load_escalation_corpus(tmp_path)
 
-    assert corpus.get('esc-4377-1').resolved_at is None
+    assert corpus.records['esc-4377-1'].resolved_at is None
     assert corpus.skipped == 0
 
 
@@ -125,7 +125,9 @@ def test_a_record_with_no_resolved_at_key_reads_as_none(tmp_path):
     del record['resolved_at']
     _write(tmp_path, record)
 
-    assert escalation_ladder.load_escalation_corpus(tmp_path).get('esc-4377-1').resolved_at is None
+    corpus = escalation_ladder.load_escalation_corpus(tmp_path)
+
+    assert corpus.records['esc-4377-1'].resolved_at is None
 
 
 def test_the_oldest_archive_date_is_the_coverage_bound(tmp_path):
