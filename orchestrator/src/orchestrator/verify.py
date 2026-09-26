@@ -3732,6 +3732,11 @@ class VerifyResult:
     # collected, zero failing" (main/branch genuinely clean under this
     # run) and must NOT be conflated with None.
     failing_test_ids: list[str] | None = None
+    # Task 5627: module prefix -> the junit-derived failing ids of the module
+    # run that produced them. Plain JSON-native, like `failing_test_ids`.
+    # None = no module attribution; the ids are then unattributable. When
+    # non-None it covers exactly `failing_test_ids`.
+    failing_test_ids_by_module: dict[str, list[str]] | None = None
     # Task 3173: one FailureCategory per FAILING leg, in test/lint/type order,
     # exactly as `_summarize_checks` classified them (its fifth return
     # element). Deliberately a plain JSON-native `list[str] | None` (mirrors
@@ -6798,6 +6803,11 @@ async def run_verification(
             junit_path, archive_root, task_id, _archive_attempt_id(attempt_id),
             module_prefix=module_prefix,
         )
+    failing_test_ids_by_module = (
+        {module_prefix: failing_test_ids}
+        if module_prefix is not None and failing_test_ids is not None
+        else None
+    )
 
     result = VerifyResult(
         passed=attempt.passed,
@@ -6812,6 +6822,7 @@ async def run_verification(
         archive_log_paths=archive_log_paths,
         duration_secs=_wall_secs,
         failing_test_ids=failing_test_ids,
+        failing_test_ids_by_module=failing_test_ids_by_module,
         failing_leg_categories=failing_leg_categories,
     )
 

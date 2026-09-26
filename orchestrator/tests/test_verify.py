@@ -2254,7 +2254,9 @@ class TestRunVerificationAttributesFailingIdsToModule:
         assert result.failing_test_ids_by_module == {'pkg': ['tests.test_sample::test_fail']}
 
     async def test_global_command_run_has_no_module_to_attribute_to(self, tmp_path: Path):
-        config = self._junit._make_config(tmp_path, breadth='full')
+        config = OrchestratorConfig(
+            project_root=tmp_path, merge_verify_breadth='full', test_command='pytest tests/',
+        )
         fake_run_cmd, _ = self._junit._fake_run_cmd_writing_junit()
 
         with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
