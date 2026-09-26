@@ -75,6 +75,7 @@ from _task_db_scan import (
     AUDIT_EXIT_NO_ROOT,
     AUDIT_EXIT_NOTHING_AUDITED,
     AUDIT_EXIT_OK,
+    decode_metadata,
     format_coverage_block,
     format_kv_line,
     run_audit_cli,
@@ -157,26 +158,6 @@ def _tracked_manifest_paths(manifest_root: str) -> list[str]:
     return sorted({p for p in completed.stdout.split("\0") if p})
 
 
-def _decode_metadata(raw: object) -> dict:
-    """Decode a raw ``metadata`` blob into a dict, degrading to ``{}``.
-
-    Copied from :func:`audit_combine_gate_marker_loss._decode_metadata`.
-    Degrades for NULL, an empty string, malformed JSON, or a payload that
-    decodes to anything other than a dict (a list, a bare scalar, ``null``). A
-    corrupt metadata blob is data to be skipped, never a reason to abort a
-    sweep over thousands of tasks.
-    """
-    if not raw or not isinstance(raw, (str, bytes)):
-        return {}
-    try:
-        payload = json.loads(raw)
-    except (ValueError, TypeError):
-        return {}
-    if not isinstance(payload, dict):
-        return {}
-    return payload
-
-
 def load_task_delivered_checks(
     tasks_db_path: str,
 ) -> tuple[set[int], dict[int, dict[str, dict]]]:
@@ -217,7 +198,7 @@ def load_task_delivered_checks(
             except (TypeError, ValueError):
                 continue
             row_ids.add(tid)
-            checks = _decode_metadata(metadata).get("delivered_checks")
+            checks = decode_metadata(metadata).get("delivered_checks")
             if not isinstance(checks, list):
                 continue
             entries: dict[str, dict] = {}
