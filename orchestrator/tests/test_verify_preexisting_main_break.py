@@ -823,6 +823,90 @@ class TestMainBaselineFailingIds:
             f'got {len(probe_calls)} call(s)'
         )
 
+    # Task 5627: a SHA is immutable, so its baseline is valid for as long as
+    # that SHA can be main's tip. The cache is bounded by recency, not by a
+    # wall-clock TTL.
+
+    @staticmethod
+    def _probe_recorder(calls: list[str]):
+        def _explode(*args, **kwargs):
+            calls.append('probe')
+            raise AssertionError('probe must not run on a cache hit')
+
+        return _explode
+
+    def test_seeded_baseline_outlives_an_hour(self, tmp_path: Path) -> None:
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = GitOps(config.git, config.project_root)
+        verify_module.seed_main_baseline(MAIN_SHA, frozenset())
+
+        real_monotonic = verify_module.time.monotonic
+        probe_calls: list[str] = []
+        with (
+            patch.object(
+                verify_module.time, 'monotonic', side_effect=lambda: real_monotonic() + 3600,
+            ),
+            patch.object(
+                verify_module, 'run_scoped_verification',
+                side_effect=self._probe_recorder(probe_calls),
+            ),
+            patch.object(
+                git_ops, 'ephemeral_worktree', side_effect=self._probe_recorder(probe_calls),
+            ),
+        ):
+            peeked = verify_module.cached_main_baseline_failing_ids(MAIN_SHA)
+            served = asyncio.run(
+                verify_module.main_baseline_failing_ids(config, [], git_ops, MAIN_SHA)
+            )
+
+        assert peeked == frozenset()
+        assert served == frozenset()
+        assert probe_calls == []
+
+    def test_cache_is_bounded_by_recency(self) -> None:
+        from orchestrator import verify as verify_module
+
+        for n in range(1000):
+            verify_module.seed_main_baseline(f'sha-{n:04d}', frozenset())
+
+        assert verify_module.cached_main_baseline_failing_ids('sha-0000') is None
+        assert verify_module.cached_main_baseline_failing_ids('sha-0999') == frozenset()
+        assert verify_module.cached_main_baseline_failing_ids('sha-0998') == frozenset()
+
+    def test_a_baseline_in_use_survives_a_stream_of_new_seeds(self, tmp_path: Path) -> None:
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = GitOps(config.git, config.project_root)
+        verify_module.seed_main_baseline('hot', frozenset({'h::1'}))
+        probe_calls: list[str] = []
+
+        async def _read_hot_between_seeds() -> list[frozenset[str] | None]:
+            answers = []
+            for n in range(1000):
+                verify_module.seed_main_baseline(f'fresh-{n:04d}', frozenset())
+                answers.append(
+                    await verify_module.main_baseline_failing_ids(config, [], git_ops, 'hot')
+                )
+            return answers
+
+        with (
+            patch.object(
+                verify_module, 'run_scoped_verification',
+                side_effect=self._probe_recorder(probe_calls),
+            ),
+            patch.object(
+                git_ops, 'ephemeral_worktree', side_effect=self._probe_recorder(probe_calls),
+            ),
+        ):
+            answers = asyncio.run(_read_hot_between_seeds())
+
+        assert probe_calls == []
+        assert set(answers) == {frozenset({'h::1'})}
+        assert verify_module.cached_main_baseline_failing_ids('hot') == frozenset({'h::1'})
+
 
 # ---------------------------------------------------------------------------
 # Test 10 — step-15 (task μ, verify-scope-inversion-prd.md): the baseline-diff

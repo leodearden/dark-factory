@@ -990,12 +990,8 @@ class TestPostMergeVerifySeedsBaseline:
         ))
         assert outcome is None, f'Expected the verify-passed sentinel (None); got {outcome!r}'
 
-        from orchestrator.verify import _BASELINE_FAILING_IDS_CACHE
-        assert 'abcsha' in _BASELINE_FAILING_IDS_CACHE, (
-            f'Expected the baseline cache to be seeded for merge_sha=abcsha; '
-            f'keys={list(_BASELINE_FAILING_IDS_CACHE)!r}'
-        )
-        _, seeded_ids = _BASELINE_FAILING_IDS_CACHE['abcsha']
+        from orchestrator.verify import cached_main_baseline_failing_ids
+        seeded_ids = cached_main_baseline_failing_ids('abcsha')
         assert seeded_ids == frozenset(), (
             f'Expected the seeded ids to be the empty frozenset (all pass); got {seeded_ids!r}'
         )
