@@ -100,7 +100,21 @@ def _is_harness_sentinel_role(agent_role: str) -> bool:
     return any((agent_role or '').startswith(p) for p in _HARNESS_SENTINEL_ROLE_PREFIXES)
 
 
-def _derive_l2_severity(queue: EscalationQueue, member_ids: list[str]) -> str | None:
+def _read_members(queue: EscalationQueue, member_ids: list[str]) -> dict[str, Escalation | None]:
+    """Read each DISTINCT member id once — ``None`` for an id that does not resolve.
+
+    The one member read ``promote_to_l2`` makes; :func:`_derive_l2_severity`
+    and :func:`_sentinel_bound_task_ids` both consume it.  Through
+    ``queue.get()`` rather than the queue root directly, so a member already
+    resolved and archived between the watcher's drain and its promote still
+    contributes (``get`` falls back to the archive), and repeated lookups of a
+    genuinely nonexistent id are negative-cached rather than re-scanning the
+    archive each time.
+    """
+    return {mid: queue.get(mid) for mid in dict.fromkeys(member_ids)}
+
+
+def _derive_l2_severity(members: dict[str, Escalation | None]) -> str | None:
     """Return max(member severities) for a promoted L2, or None if none is usable.
 
     This is what an OMITTED ``promote_to_l2(severity=...)`` argument resolves
@@ -109,11 +123,8 @@ def _derive_l2_severity(queue: EscalationQueue, member_ids: list[str]) -> str | 
     non-deterministically, since the outcome hinged on whether the LLM caller
     happened to type the argument at all.
 
-    Members are read through ``queue.get()`` rather than the queue root
-    directly, so a member already resolved and archived between the watcher's
-    drain and its promote still contributes its true severity (``get`` falls
-    back to the archive), and repeated lookups of a genuinely nonexistent id
-    are negative-cached rather than re-scanning the archive each time.
+    *members* is :func:`_read_members`' answer, so an archived member still
+    contributes its true severity.
 
     **The fold ranges over ``KNOWN_SEVERITIES`` ONLY.**  A member is USABLE
     only if it resolves AND its ``severity`` is in the vocabulary.  Nothing
@@ -154,8 +165,7 @@ def _derive_l2_severity(queue: EscalationQueue, member_ids: list[str]) -> str | 
     """
     resolved: list[str] = []
     unusable: list[str] = []
-    for mid in member_ids:
-        member = queue.get(mid)
+    for mid, member in members.items():
         if member is None:
             unusable.append(mid)
         elif member.severity not in KNOWN_SEVERITIES:
@@ -173,7 +183,7 @@ def _derive_l2_severity(queue: EscalationQueue, member_ids: list[str]) -> str | 
         logger.warning(
             'promote_to_l2: no member escalation yielded a usable severity for %s '
             '— cannot derive an L2 severity from members. Unusable ids: %s',
-            member_ids, ', '.join(unusable) or '(none)',
+            list(members), ', '.join(unusable) or '(none)',
         )
         return None
 
@@ -181,7 +191,7 @@ def _derive_l2_severity(queue: EscalationQueue, member_ids: list[str]) -> str | 
         logger.warning(
             'promote_to_l2: %d of %d member escalation(s) yielded no usable '
             'severity; deriving from the usable subset only. Unusable ids: %s',
-            len(unusable), len(member_ids), ', '.join(unusable),
+            len(unusable), len(members), ', '.join(unusable),
         )
 
     derived = resolved[0]
@@ -190,8 +200,8 @@ def _derive_l2_severity(queue: EscalationQueue, member_ids: list[str]) -> str | 
     return derived
 
 
-def _sentinel_bound_task_ids(queue: EscalationQueue, member_ids: list[str]) -> frozenset[str]:
-    """Return the task ids a promote of *member_ids* must be minted under, or empty if unconstrained.
+def _sentinel_bound_task_ids(members: dict[str, Escalation | None]) -> frozenset[str]:
+    """Return the task ids a promote of *members* must be minted under, or empty if unconstrained.
 
     Non-empty only when at least one member resolves AND every RESOLVED
     member was filed under a role in ``authority.PROMOTE_SENTINEL_BOUND_ROLES``;
@@ -199,12 +209,10 @@ def _sentinel_bound_task_ids(queue: EscalationQueue, member_ids: list[str]) -> f
     cluster is unconstrained: an ordinary member already pins its real task,
     so a real-id filing deepens nothing.  Unresolvable ids are ignored, the
     fail-open direction — an unreadable id proves nothing and must never
-    block a human-escalation path.  Reads through ``queue.get()`` for the same
-    archive-fallback and negative-cache reasons as :func:`_derive_l2_severity`.
+    block a human-escalation path.  *members* is :func:`_read_members`' answer.
     """
     bound_task_ids: set[str] = set()
-    for mid in dict.fromkeys(member_ids):
-        member = queue.get(mid)
+    for member in members.values():
         if member is None:
             continue
         if member.agent_role not in PROMOTE_SENTINEL_BOUND_ROLES:
@@ -3082,9 +3090,10 @@ def create_server(
         # more clarity than it buys.
         async with _promote_lock:
             # Validate FIRST, derive second — an invalid explicit severity must mint
-            # nothing and must never be reachable past the derive branch.  Derived
-            # from the RAW member_ids: the fold is order-independent by
-            # construction, and deduplicating the id list is a storage concern.
+            # nothing and must never be reachable past the derive branch.  Members
+            # are read ONCE, per distinct id, and that one read feeds both the
+            # severity fold and the sentinel-identity check; a duplicate id could
+            # never change a max() fold anyway.
             #
             # `derived is None` means the members said nothing usable (no id
             # resolved, or every resolved member carried an out-of-vocabulary
@@ -3094,18 +3103,17 @@ def create_server(
             # ONE hop for BOTH reads: they are adjacent with only pure-memory
             # severity resolution between them, so a single to_thread introduces
             # ONE yield point where two would introduce two — the same loop relief
-            # for fewer interleavings to reason about.  _derive_l2_severity's
+            # for fewer interleavings to reason about.  _read_members'
             # per-member queue.get() can itself trigger a targeted archive rglob
             # via _locate_path, so it is a scan worth hopping rather than a cheap
             # read to leave behind.
             def _read_for_promote():
-                derived = (
-                    None if severity is not None else _derive_l2_severity(queue, member_ids)
-                )
+                members = _read_members(queue, member_ids)
+                derived = None if severity is not None else _derive_l2_severity(members)
                 return (
                     derived,
                     queue.find_pending_l2_by_root_cause(root_cause),
-                    _sentinel_bound_task_ids(queue, member_ids),
+                    _sentinel_bound_task_ids(members),
                 )
 
             derived, existing_id, required_task_ids = await asyncio.to_thread(

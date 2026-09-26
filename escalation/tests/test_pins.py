@@ -450,7 +450,7 @@ class TestInfoAtL2Coupling:
         self, tmp_path: Path,
     ) -> None:
         from escalation.queue import EscalationQueue
-        from escalation.server import _derive_l2_severity
+        from escalation.server import _derive_l2_severity, _read_members
 
         queue = EscalationQueue(tmp_path / 'esc')
         queue.submit(Escalation(
@@ -464,7 +464,7 @@ class TestInfoAtL2Coupling:
 
         # Producer side: an all-info member cluster derives severity='info' —
         # this is what an omitted promote_to_l2(severity=...) resolves to.
-        derived = _derive_l2_severity(queue, ['esc-42-1', 'esc-42-2'])
+        derived = _derive_l2_severity(_read_members(queue, ['esc-42-1', 'esc-42-2']))
         assert derived == 'info'
 
         # The shape promote_to_l2's create path mints from `derived`: an

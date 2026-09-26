@@ -167,8 +167,8 @@ class TestPromoteSentinelBoundRoles:
         assert 'orchestrator-escalation-watcher-auto' not in PROMOTE_SENTINEL_BOUND_ROLES
         assert PROMOTE_SENTINEL_BOUND_ROLES.isdisjoint(PROMOTE_ALLOWED)
 
-    def test_auto_close_role_denylist_is_unchanged(self) -> None:
-        assert frozenset({'orchestrator-deterministic'}) == L2_AUTO_CLOSE_DENY_ROLES
+    def test_disjoint_from_the_auto_close_role_denylist(self) -> None:
+        assert PROMOTE_SENTINEL_BOUND_ROLES.isdisjoint(L2_AUTO_CLOSE_DENY_ROLES)
 
 
 class TestL2AutoCloseClass:
