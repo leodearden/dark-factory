@@ -7,6 +7,11 @@ fused-memory seam, and ``/tasks`` — which reaches the SAME ``fetch_tasks``
 through ``collect_tasks_with_counts`` — survived, because it alone wrapped
 the call in ``asyncio.wait_for``. That asymmetry is what this file pins.
 
+``/orchestrators`` has since been taken out of the population altogether
+(task 5587): it reads no task tree, so it has no seam to hang behind. It is
+still swept for a 200 — the route list is derived and nothing can opt out of
+it — but it is no longer one of the modules the hang must be reached in.
+
 Why the per-request timeout was never enough: ``fetch_tasks``' *timeout* is
 threaded into ``mcp_tool_call`` and thence ``client.post``, so it bounds
 connect/read/write and pool acquisition ONLY. The incident's hang was inside
@@ -37,9 +42,18 @@ _TINY_BUDGET = 0.05
 
 _TARGET_MODULES = {
     'dashboard.api.escalations',
-    'dashboard.data.orchestrator',
     'dashboard.data.merge_queue',
 }
+"""The modules whose hang this probe must actually REACH, or it proves nothing.
+
+``dashboard.data.orchestrator`` was the third, and is deliberately no longer
+here: task 5587 removed ``discover_orchestrators``' task fetch outright, so it
+holds no ``fetch_tasks`` binding to hang. That is the strongest available
+resolution of its share of the 19.8 h incident — a call that does not exist
+cannot wedge — and not a shrinking of the sweep. ``/api/v2/dashboard/orchestrators``
+is still requested below, because the route list is derived from ``app.routes``
+and cannot be opted out of; it must still answer 200 while the seam hangs.
+"""
 
 
 def _dashboard_get_paths() -> list[str]:
@@ -81,28 +95,41 @@ def hung_mcp(monkeypatch, tmp_path):
     """
     from dashboard.api.escalations import _task_cards_cache_clear
     from dashboard.app import _analytics_cache_clear
-    from dashboard.data import active_tasks, merge_queue, orchestrator, tasks
+    from dashboard.data import (
+        active_tasks,
+        merge_queue,
+        orchestrator,
+        task_snapshot,
+        tasks,
+    )
 
     reached: list[tuple[str, str]] = []
 
     def _make_stub(module_name: str):
-        async def _hang(client, config, project_root):
+        # **kwargs absorbs each binding's own narrowing arguments — the
+        # snapshot unit threads statuses/timeout/cached, the others do not —
+        # so one stub can stand in for every call shape without being laxer
+        # about the thing under test, which is that the call HANGS.
+        async def _hang(client, config, project_root, **_kwargs):
             reached.append((module_name, str(project_root)))
             await asyncio.Event().wait()  # nothing ever sets it
 
         return _hang
 
     # Patch the binding in EVERY module that imported the name by value —
-    # patching dashboard.data.tasks.fetch_tasks alone would miss all five.
+    # patching dashboard.data.tasks.fetch_tasks alone would miss all of them.
     # ``dashboard.app`` still binds it for the /healthz probe, which this
     # sweep does not reach; the escalations tab's binding travelled to
     # ``dashboard.api.escalations`` with ``_load_task_cards``.
+    # ``dashboard.data.orchestrator`` is absent because it binds the name no
+    # longer — see _TARGET_MODULES.
     for module_name in (
         'dashboard.app',
         'dashboard.api.escalations',
-        'dashboard.data.orchestrator',
         'dashboard.data.merge_queue',
-        'dashboard.data.active_tasks',
+        # The Tasks tab's binding travelled to the snapshot unit with the read
+        # itself (task 5587); active_tasks holds no fetch name at all now.
+        'dashboard.data.task_snapshot',
     ):
         monkeypatch.setattr(
             f'{module_name}.fetch_tasks', _make_stub(module_name),
@@ -112,30 +139,26 @@ def hung_mcp(monkeypatch, tmp_path):
 
     monkeypatch.setattr(_esc, '_TASK_CARDS_BUDGET', _TINY_BUDGET)
     monkeypatch.setattr(merge_queue, '_TASK_TITLES_BUDGET', _TINY_BUDGET)
-    monkeypatch.setattr(
-        orchestrator, '_ORCHESTRATORS_PER_ROOT_BUDGET', _TINY_BUDGET,
-    )
-    monkeypatch.setattr(
-        orchestrator, '_ORCHESTRATORS_TOTAL_BUDGET', _TINY_BUDGET,
-    )
     # The Tasks tab is already compliant; shrink it too so it does not
-    # dominate the sweep's wall time. _TASKS_PER_CALL_TIMEOUT is shrunk for
+    # dominate the sweep's wall time. PER_CALL_TIMEOUT is shrunk for
     # the same reason and is NOT optional: it was widened to 4.4 s for real
     # 5 000-task trees (task 4884), and against a stub that never returns the
     # sweep would otherwise pay it per call per root.
-    monkeypatch.setattr(active_tasks, '_TASKS_PER_CALL_TIMEOUT', _TINY_BUDGET)
+    monkeypatch.setattr(task_snapshot, 'PER_CALL_TIMEOUT', _TINY_BUDGET)
     monkeypatch.setattr(active_tasks, '_TASKS_PER_PROJECT_BUDGET', _TINY_BUDGET)
     monkeypatch.setattr(active_tasks, '_TASKS_TOTAL_BUDGET', _TINY_BUDGET)
 
     # A warm entry would be served without ever reaching the hang.
     tasks._fetch_tasks_cache_clear()
-    tasks._fetch_statuses_cache_clear()
+    task_snapshot._snapshot_cache_clear()
     merge_queue._task_titles_cache_clear()
     _task_cards_cache_clear()
     _analytics_cache_clear()
 
-    # Force the preconditions so the three target endpoints actually REACH
-    # their call site — otherwise the probe would pass vacuously.
+    # Force the preconditions so the target endpoints actually REACH their
+    # call site — otherwise the probe would pass vacuously. The orchestrator
+    # stub stays even though that endpoint no longer fetches: it is what makes
+    # the sweep exercise discovery's grouping path rather than its empty one.
     proj = tmp_path / 'probe_root'
     (proj / '.taskmaster').mkdir(parents=True)
     monkeypatch.setattr(
@@ -161,7 +184,7 @@ def hung_mcp(monkeypatch, tmp_path):
 
     # Leave no hang-stubbed entry behind for the next test in the session.
     tasks._fetch_tasks_cache_clear()
-    tasks._fetch_statuses_cache_clear()
+    task_snapshot._snapshot_cache_clear()
     merge_queue._task_titles_cache_clear()
     _task_cards_cache_clear()
     _analytics_cache_clear()

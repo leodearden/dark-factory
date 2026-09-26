@@ -25,11 +25,15 @@ const {
 // objects rather than a fresh literal per row — a spec is a declaration, not
 // per-row state, and freezing says so.
 //
-// EVERY POLLED KEY IS PLAIN TODAY, and that is a description rather than a
-// placeholder: PRD leaf beta is what puts Datums on the wire, and until it
-// lands, declaring a row datum-kinded would make applyKey refuse every real
-// payload and freeze that tab at its seed values. This registry is the ONE
-// place a later leaf flips a row.
+// EVERY POLLED KEY IS PLAIN, and that is a description rather than a
+// placeholder. PRD leaf beta does serve Datums, but NESTED: each
+// TASKS_SNAPSHOT entry carries a census Datum and a rows Datum, and
+// TASKS_SNAPSHOT itself is a map of project -> entry. The 'datum' kind checks
+// that the key's TOP-LEVEL value is one envelope, so declaring TASKS_SNAPSHOT
+// datum-kinded would make applyKey refuse every real payload and freeze both
+// done-count pips at their seed, which looks exactly like a wedged endpoint.
+// Consumers of those nested Datums stamp them with the /tasks receipt
+// (withReceipt). This registry is the ONE place a later leaf flips a row.
 const PLAIN = Object.freeze({ kind: 'plain' });
 const DATUM = Object.freeze({ kind: 'datum' });
 
@@ -50,7 +54,7 @@ function endpointsFor(win) {
     '/api/v2/dashboard/orchestrators':                { 'ORCHESTRATORS': PLAIN, 'PROJECTS': PLAIN, 'ORCHESTRATORS_SPARK': PLAIN },
     '/api/v2/dashboard/tasks':                        { 'ACTIVE_TASKS': PLAIN, 'TASKS_OFFLINE': PLAIN, 'TASKS_OFFLINE_PROJECTS': PLAIN,
                                                         'TASKS_DEGRADED_PROJECTS': PLAIN, 'TASKS_COUNT_UNKNOWN_PROJECTS': PLAIN, 'TASKS_PROJECT_COUNT': PLAIN,
-                                                        'DONE_COUNTS': PLAIN },
+                                                        'TASKS_SNAPSHOT': PLAIN },
     '/api/v2/dashboard/memory':                       { 'MEMORY_STATUS': PLAIN },
     '/api/v2/dashboard/memory-graphs':                { 'MEMORY_TIMESERIES': PLAIN, 'MEMORY_OPS_BREAKDOWN': PLAIN },
     '/api/v2/dashboard/recon':                        { 'RECON_STATE': PLAIN, 'AGENTS': PLAIN },
@@ -145,7 +149,11 @@ window.DF_DATA = {
   // derived) is a different one. 0 pre-fetch, which the banner reads as "no
   // count yet" rather than dividing by it.
   TASKS_PROJECT_COUNT: 0,
-  DONE_COUNTS: {},
+  // TASKS_SNAPSHOT: {project: {census, rows, in_progress_live,
+  //   in_progress_stranded, skew_seconds}}, census and rows each a Datum.
+  //   Seeded EMPTY, so a read before the first fetch finds no entry, which
+  //   task_done_count.js answers with the placeholder rather than a zero.
+  TASKS_SNAPSHOT: {},
   PERFORMANCE: {},
   MEMORY_STATUS: {
     graphiti: { connected: false, node_count: 0, edge_count: 0, episode_count: 0 },

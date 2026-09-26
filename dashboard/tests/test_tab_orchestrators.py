@@ -176,10 +176,11 @@ class TestOrchTabHealthState:
     """OrchTab must render *offline* and *degraded* as DISTINCT states.
 
     These pin WIRING only. The behavioural coverage of the split lives where
-    the facts are produced (``dashboard/tests/test_orchestrator.py``) and
-    shaped (``dashboard/tests/test_redux_api.py``), because this repo renders
-    no JSX under test — what can be asserted here is that the tab reads each
-    field and paints them differently.
+    the facts are shaped (``dashboard/tests/test_redux_api.py``), because this
+    repo renders no JSX under test — what can be asserted here is that the tab
+    reads each field and paints them differently. Nothing has PRODUCED either
+    flag since task 5587 made discovery a read-free ``ps`` scan, so these pins
+    hold two pips that cannot fire until leaf γ2 (task 5589) rewrites OrchTab.
 
     The label and colour assertions are LINE-SCOPED (``[^\n]*``) and therefore
     assume each pip stays a single-line JSX expression, which is how the rest

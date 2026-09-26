@@ -28,7 +28,11 @@ def test_shape_orchestrators_picks_first_pid_and_basename_project():
     assert orch['pids'] == [482103, 482104]
     assert orch['project'] == 'dark-factory'
     assert orch['running'] is True
-    assert orch['summary']['total'] == 0
+    assert 'summary' not in orch, (
+        'nothing measures a task count on this path any more, so the shaper '
+        'must not project one — a fabricated all-zero summary would read as a '
+        f'measured "this orchestrator has no tasks": {orch}'
+    )
     assert 'current_task' not in orch
 
 
@@ -118,9 +122,9 @@ def test_shape_orchestrators_projects_degraded():
 
     The pair matters, not either field alone: a degraded root's state is
     UNKNOWN, while an offline root is proven down.  Collapsing them here would
-    re-merge on the wire exactly what
-    ``dashboard/src/dashboard/data/orchestrator.py::discover_orchestrators``
-    keeps apart on the entry.
+    re-merge on the wire what the raw entry keeps apart.  Discovery has set
+    neither flag since task 5587; the pair is the shaper's contract for any
+    caller that supplies it.
     """
     raw = [{
         'pids': [7777],

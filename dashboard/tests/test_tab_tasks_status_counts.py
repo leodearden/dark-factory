@@ -217,37 +217,55 @@ class TestUnchangedHeaderElements:
         ), 'the "n/m shown" mono label is no longer rendered'
 
     def test_server_authoritative_done_count_preserved(self, tasks_tab_code):
-        """DONE_COUNTS is the authoritative full count; the bounded fallback
-        marks itself as a lower bound. Both must survive the rewiring — the
-        pure module returns a raw `done` tally and must not have replaced this
-        branch.
+        """The done pip shows a server-MEASURED count or an explicit unknown.
 
-        Asserted on SHAPE, not on the literal page size: this test is about
-        provenance (authoritative vs. lower bound), so changing the ACTIVE_TASKS
-        page size from 50 must not turn it red.
+        Never a bounded tally shown as though it were the real number. The
+        measured count is ``TASKS_SNAPSHOT[p].census`` now that ``DONE_COUNTS``
+        is gone, and ``doneCount`` (task_done_count.js, executed by
+        ``dashboard/tests/js/task_done_count.test.mjs``) is what turns an entry
+        into the count or datum.js's placeholder. So the header must hand the
+        entry to that guard and render its answer, with nothing else in the
+        expression.
+
+        The ``_fallbackDone`` / ``'50+'`` branch is gone rather than kept as a
+        second route to the pip. It tallied the done rows in ``ACTIVE_TASKS``,
+        and the default render fetches none, so it could only ever produce the
+        confident "0 done" this guard exists to stop.
         """
-        assert 'DF_T.DONE_COUNTS' in tasks_tab_code, (
-            'the server-authoritative DONE_COUNTS branch is gone'
+        counts_literal = re.search(
+            r'const\s+counts\s*=\s*\{(.*?)\};', tasks_tab_code, re.DOTALL,
         )
-        assert re.search(r'_fallbackDone\s*>=\s*\d+', tasks_tab_code), (
-            'the lower-bound page-size test for the done fallback is gone'
+        assert counts_literal is not None, 'TasksTab no longer builds a `counts` object'
+        complete = re.search(r'\bcomplete\s*:\s*([^,}]*)', counts_literal.group(1))
+        assert complete is not None, 'the display object has no `complete` count'
+        assert re.fullmatch(
+            r'doneCount\(\s*DF_T\.TASKS_SNAPSHOT\s*\[\s*p\.id\s*\]\s*\)',
+            complete.group(1).strip(),
+        ), (
+            'counts.complete must be exactly the guard reading this project\'s '
+            f'TASKS_SNAPSHOT entry, got: {complete.group(1).strip()!r}'
         )
-        assert re.search(r"'\d+\+'", tasks_tab_code), (
-            "the 'N+' lower-bound marker for the bounded done fallback is gone "
-            '— without it the header shows a capped tally as if it were the '
-            'authoritative count'
+        assert 'DONE_COUNTS' not in tasks_tab_code, (
+            'TasksTab still reads DONE_COUNTS, which /tasks no longer serves'
+        )
+        assert '_fallbackDone' not in tasks_tab_code, (
+            'the bounded done fallback is back: it counts done rows the default '
+            'render never fetches, so it can only render a fabricated zero'
+        )
+        assert not re.search(r"'\d+\+'", tasks_tab_code), (
+            "an 'N+' marker is back, and it only ever decorated that fallback"
         )
 
     def test_bounded_done_tally_is_not_on_the_display_object(self, tasks_tab_code):
         """`counts` must not carry the module's raw `done` alongside `complete`.
 
-        `statusCounts.done` counts only the done rows actually loaded (bounded
-        per project); `counts.complete` is the authoritative server count, or an
-        explicit lower-bound marker. Spreading the raw tally onto the display
-        object parks two near-synonymous done keys of different trust levels
-        side by side, and the next `{counts.done} done` edit silently renders
-        the capped number. It stays reachable only via `_fallbackDone`, whose
-        underscore says "not for display".
+        `statusCounts.done` counts only the done rows actually loaded, which the
+        default render no longer fetches at all; `counts.complete` is the
+        server-measured count, or datum.js's placeholder when there is none.
+        Spreading the raw tally onto the display object parks two
+        near-synonymous done keys of different trust levels side by side, and
+        the next `{counts.done} done` edit silently renders a zero nobody
+        measured.
         """
         assert not re.search(r'\.\.\.\s*statusCounts', tasks_tab_code), (
             'TasksTab spreads statusCounts into the display object — pick the '

@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
+from test_task_snapshot import CannedMCP
 
 import dashboard.data.tasks as tasks_mod
 from dashboard.data.tasks import _shape_task
@@ -1611,10 +1612,9 @@ class TestFanoutStreakIsolationAcrossProjectRoots:
                 root_a, {'statuses': {'1': 'done', '2': 'pending'}}
             )
         )
-        # fetch_statuses caches SUCCESSES only, so the failing root genuinely
-        # re-polls every cycle — which is exactly the streak this asserts on.
-        # (The healthy root rides its 5 s entry; that does not touch the
-        # per-label throttle being measured here.)
+        # fetch_statuses holds no cache of its own (task 5587), so BOTH
+        # roots genuinely re-read every cycle — which is exactly the streak
+        # this asserts on.
         with caplog.at_level(logging.DEBUG, logger='dashboard.data.mcp_fanout'), \
                 patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
             for _ in range(3):
@@ -3281,11 +3281,12 @@ class TestCachedFanoutCore:
         """
         seen: list[tasks_mod._TasksRead] = []
 
-        async def _fake(config, read, strategy, label):
+        async def _fake(config, read, strategy, label, *, cached=True):
             seen.append(read)
             assert config is dummy_config
             assert callable(strategy)
             assert label == 'fetch_tasks'
+            assert cached is True, 'the default read still rides the cache'
             return []
 
         monkeypatch.setattr(tasks_mod, '_cached_fanout', _fake)
@@ -3313,7 +3314,7 @@ class TestCachedFanoutCore:
         """
         labels: list[str] = []
 
-        async def _fake(config, read, strategy, label):
+        async def _fake(config, read, strategy, label, *, cached=True):
             labels.append(label)
             return []
 
@@ -3326,176 +3327,373 @@ class TestCachedFanoutCore:
         assert labels == ['fetch_tasks', 'fetch_task_page']
 
 
-class TestFetchStatusesCache:
-    """Per-project_root TTL cache inside fetch_statuses (task 3857 amendment).
+_ABSENT = object()
+"""Marks a pagination key the test deletes, as opposed to one it sets to ``None``."""
 
-    ``fetch_statuses`` was the one per-project MCP call in the narrowed design
-    with no cache, and ``active_tasks._shape_one_project`` issues it
-    unconditionally.  Both /api/v2/dashboard/tasks and
-    /api/v2/dashboard/scheduler reach that function on every 3 s poll, so
-    uncached it cost two full-population ``get_statuses`` reads per root per
-    poll — trading wire bytes for backend queries.  These tests pin the
-    collapse, and pin that it never comes at the cost of a stale failure or a
-    poisoned entry.
+
+class TestFetchStatusesPaging:
+    """``fetch_statuses`` walks the status map, and owns no cache (task 5587).
+
+    Two facts, tested together because they are two halves of one change.
+
+    PAGING.  ``get_statuses`` answers a ``page_size``/``offset`` request with
+    the five-key envelope ``fused_memory/server/tools.py::_pagination_meta``
+    builds: ``page_size`` echoes the REQUESTED size, ``returned`` is the count
+    SERVED, and ``has_more`` is ``offset + returned < total``.  The walk
+    advances by ``returned`` until ``has_more`` is False, and reads the
+    ABSENCE of the envelope as a complete answer.  ``get_statuses``' own
+    docstring says to advance by ``page_size``; its implementation does not
+    support that, and these tests follow the implementation.  An unpaginated
+    read of a large tree is rejected wholesale by the MCP transport, which is
+    the incident that pagination exists to close.
+
+    NO CACHE.  The 5 s TTL cache is gone.  After this task the only consumer
+    of this read is ``task_snapshot.acquire_snapshot``, which owns a 15 s unit
+    TTL of its own — a second cache layered under it is precisely the
+    duplicated-staleness the one-datum-one-path PRD (decision 20) removes, and
+    it would let the unit serve a map older than the ``as_of`` it stamps.
     """
 
-    @pytest.fixture(autouse=True)
-    def reset_fetch_statuses_cache(self):
-        import dashboard.data.tasks as tasks_mod
-        tasks_mod._fetch_statuses_cache_clear()
-        yield
-        tasks_mod._fetch_statuses_cache_clear()
+    @staticmethod
+    def _statuses_calls(canned):
+        return [call['args'] for call in canned.calls_to('get_statuses')]
 
-    async def test_within_ttl_issues_single_mcp_call(self, dummy_client, dummy_config):
-        """Two reads of one root within the TTL collapse to ONE get_statuses call.
+    async def test_a_paged_tree_returns_one_merged_map(
+        self, dummy_client, dummy_config
+    ):
+        """(a) 4500 statuses served in pages arrive as ONE complete map."""
+        from dashboard.data.tasks import fetch_statuses
 
-        This is the whole point of the amendment: the tasks and scheduler
-        endpoints poll the same root within the same 3 s window.
+        population = {tid: 'done' if tid % 2 else 'pending'
+                      for tid in range(1, 4501)}
+        canned = CannedMCP(status_map=population, status_page_size=2000)
+
+        with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+            result = await fetch_statuses(dummy_client, dummy_config, '/proj/big')
+
+        assert result == population, (
+            f'expected all {len(population)} statuses merged into one map, '
+            f'got {len(result)}'
+        )
+
+    async def test_every_page_is_bounded_and_the_walk_stops_on_has_more(
+        self, dummy_client, dummy_config
+    ):
+        """(b) Each request carries a safe page_size and an offset; no page follows the last.
+
+        The 2000 bound is the measured point at which a page still fits the
+        documented-safe MCP response envelope — past it the response is
+        rejected WHOLESALE while the caller believes it paged correctly.
         """
         import dashboard.data.tasks as tasks_mod
         from dashboard.data.tasks import fetch_statuses
 
-        mock_mcp = AsyncMock(return_value={'statuses': {'1': 'done', '2': 'pending'}})
-        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
-            first = await fetch_statuses(dummy_client, dummy_config, '/proj/A')
-            second = await fetch_statuses(dummy_client, dummy_config, '/proj/A')
+        canned = CannedMCP(status_map={tid: 'pending' for tid in range(1, 4501)},
+                           status_page_size=2000)
 
-        assert mock_mcp.call_count == 1, (
-            f'expected 1 MCP call within TTL, got {mock_mcp.call_count}'
+        with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+            await fetch_statuses(dummy_client, dummy_config, '/proj/big')
+
+        requests = self._statuses_calls(canned)
+        assert [args.get('offset') for args in requests] == [0, 2000, 4000], (
+            f'the walk must tile the population once, got {requests}'
         )
-        assert first == {1: 'done', 2: 'pending'}
-        assert first == second
-        call = mock_mcp.call_args_list[0]
-        assert call.args[2] == 'get_statuses'
-        assert call.args[3] == {'project_root': '/proj/A'}
-        assert call.kwargs.get('timeout') == tasks_mod.DEFAULT_PER_CALL_TIMEOUT
+        assert all(args['page_size'] <= tasks_mod.STATUSES_SAFE_PAGE_SIZE
+                   for args in requests), (
+            f'every page must stay inside the safe transport bound, got {requests}'
+        )
+        assert len(requests) == 3, (
+            'the last page reports has_more=False, so no fourth request may '
+            f'follow it, got {requests}'
+        )
 
-    async def test_distinct_roots_cached_separately(self, dummy_client, dummy_config):
-        """One root's map must never be served for another (no global keying)."""
-        from dashboard.data.tasks import fetch_statuses
+    async def test_a_clamping_server_is_walked_to_completion(
+        self, dummy_client, dummy_config
+    ):
+        """A server that serves fewer entries than asked, with has_more still True, is fully tiled.
 
-        async def _per_root(client, url, tool, args, **_kw):
-            if args.get('project_root') == '/proj/A':
-                return {'statuses': {'1': 'done'}}
-            return {'statuses': {'2': 'pending'}}
-
-        mock_mcp = AsyncMock(side_effect=_per_root)
-        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
-            a = await fetch_statuses(dummy_client, dummy_config, '/proj/A')
-            b = await fetch_statuses(dummy_client, dummy_config, '/proj/B')
-
-        assert mock_mcp.call_count == 2
-        assert a == {1: 'done'}
-        assert b == {2: 'pending'}
-
-    async def test_offline_marker_is_not_cached(self, dummy_client, dummy_config):
-        """A failed read is re-probed on the next poll — recovery is not deferred.
-
-        Unlike ``fetch_tasks`` there is deliberately no negative cache here: a
-        failed ``get_statuses`` costs one bounded per-call timeout, not a tree
-        walk, and its marker is what puts a root in
-        TASKS_COUNT_UNKNOWN_PROJECTS — a visible degradation that must clear
-        on the first poll after recovery.
+        This is the case the old fake made unrepresentable. It put the SERVED
+        count in ``page_size``, which is the reverse of what
+        ``_pagination_meta`` emits. So a walker keyed on ``page_size`` passed
+        here, and against the real envelope it would have skipped the
+        difference on every clamped page and handed ``build_census`` an
+        incomplete census.
         """
         from dashboard.data.tasks import fetch_statuses
 
-        mock_mcp = AsyncMock(side_effect=[
-            httpx.ConnectError('refused'),
-            {'statuses': {'5': 'done'}},
-        ])
-        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
-            offline = await fetch_statuses(dummy_client, dummy_config, '/proj/C')
-            recovered = await fetch_statuses(dummy_client, dummy_config, '/proj/C')
+        population = {tid: 'done' for tid in range(1, 11)}
+        # Server cap 4, serving 3 against a request of 2000: requested and
+        # served differ, which is the only configuration that can tell the two
+        # advance rules apart.
+        canned = CannedMCP(status_map=population, status_page_size=4,
+                           short_page_by=1)
 
-        assert mock_mcp.call_count == 2, (
-            f'an offline marker must not be cached, got {mock_mcp.call_count} calls'
-        )
-        assert offline.get('offline') is True
-        assert recovered == {5: 'done'}
+        with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+            result = await fetch_statuses(dummy_client, dummy_config, '/proj/clamped')
 
-    async def test_ttl_expiry_refetches(self, monkeypatch, dummy_client, dummy_config):
-        """Past the TTL the map is re-read — the cache bounds cost, it does not pin state."""
-        import dashboard.data.tasks as tasks_mod
-        from dashboard.data.tasks import fetch_statuses
-
-        monkeypatch.setattr(tasks_mod, '_FETCH_STATUSES_TTL_SECONDS', 0.0)
-        mock_mcp = AsyncMock(return_value={'statuses': {'1': 'pending'}})
-        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
-            await fetch_statuses(dummy_client, dummy_config, '/proj/A')
-            await fetch_statuses(dummy_client, dummy_config, '/proj/A')
-
-        assert mock_mcp.call_count == 2, (
-            f'expected a refetch once the TTL lapsed, got {mock_mcp.call_count}'
+        assert result == population, f'a skipped window under-reports, got {result}'
+        offsets = [args.get('offset') for args in self._statuses_calls(canned)]
+        assert offsets == [0, 3, 6, 9], (
+            f'each window must start where the previous one ended, got {offsets}'
         )
 
-    async def test_returned_map_is_a_copy(self, dummy_client, dummy_config):
-        """A caller mutating the returned map must not poison the cached entry.
+    async def test_each_offset_is_the_previous_offset_plus_returned(
+        self, dummy_client, dummy_config
+    ):
+        """The walk advances by what each page SERVED, read off that page.
 
-        ``_shape_one_project`` and ``collect_done_counts`` both iterate this
-        map; a future caller that filters it in place would otherwise corrupt
-        every subsequent reader for the whole TTL window.
+        Asserted as the identity rather than as a list of numbers, so it holds
+        for any page geometry. The server derives ``has_more = offset +
+        returned < total``, and that terminator only tiles the population for
+        a walk that advances by exactly ``returned``.
         """
         from dashboard.data.tasks import fetch_statuses
 
-        mock_mcp = AsyncMock(return_value={'statuses': {'1': 'done', '2': 'pending'}})
-        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+        canned = CannedMCP(status_map={tid: 'pending' for tid in range(1, 12)},
+                           status_page_size=5, short_page_by=2)
+        envelopes: list[dict] = []
+
+        async def _recorded(client, url, tool, args, **kwargs):
+            page = await canned(client, url, tool, args, **kwargs)
+            envelopes.append(page['pagination'])
+            return page
+
+        with patch('dashboard.data.tasks.mcp_tool_call', new=_recorded):
+            await fetch_statuses(dummy_client, dummy_config, '/proj/tiled')
+
+        assert len(envelopes) > 1, envelopes
+        for before, after in zip(envelopes, envelopes[1:], strict=False):
+            assert after['offset'] == before['offset'] + before['returned'], envelopes
+        assert envelopes[-1]['has_more'] is False, envelopes
+
+    @pytest.mark.parametrize('shipped, claimed', [
+        pytest.param(2, 4, id='a-page-clipped-in-flight'),
+        pytest.param(4, 2, id='a-page-that-under-reports'),
+    ])
+    async def test_a_page_whose_returned_disagrees_with_its_entries_is_refused(
+        self, dummy_client, dummy_config, shipped, claimed,
+    ):
+        """``returned`` is cross-checked against the entries that actually arrived.
+
+        The walk advances on the self-reported counter, so the counter has to
+        agree with the page. A page clipped in flight that still claims its
+        full count would skip the clipped entries and then terminate normally.
+        A page that under-reports would re-read entries already held. Neither
+        can be detected afterwards, so the read is refused: the caller gets
+        the offline marker, never a short map. ``_walk_pages`` performs the
+        same check on the ``get_tasks`` envelope.
+        """
+        from dashboard.data.tasks import fetch_statuses
+
+        canned = CannedMCP(status_map={tid: 'done' for tid in range(1, 11)},
+                           status_page_size=4)
+
+        async def _inconsistent(client, url, tool, args, **kwargs):
+            page = await canned(client, url, tool, args, **kwargs)
+            if args.get('offset') == 0:
+                page = {
+                    'statuses': dict(list(page['statuses'].items())[:shipped]),
+                    'pagination': {**page['pagination'], 'returned': claimed},
+                }
+            return page
+
+        with patch('dashboard.data.tasks.mcp_tool_call', new=_inconsistent):
+            result = await fetch_statuses(dummy_client, dummy_config, '/proj/clipped')
+
+        assert result.get('offline') is True, (
+            f'an inconsistent page must refuse the read, got a map of {len(result)}'
+        )
+
+    async def test_an_unparseable_id_is_dropped_without_refusing_the_read(
+        self, dummy_client, dummy_config
+    ):
+        """The cross-check counts what the SERVER sent, not what survived parsing.
+
+        An entry whose id is not an integer is dropped from the map. Counting
+        only the parsed entries against ``returned`` would turn that one entry
+        into an offline marker for the whole project. ``_walk_pages`` draws
+        the same line with ``_Page.delivered``.
+        """
+        from dashboard.data.tasks import fetch_statuses
+
+        canned = CannedMCP(status_map={tid: 'done' for tid in range(1, 5)},
+                           status_page_size=2000)
+
+        async def _one_bad_id(client, url, tool, args, **kwargs):
+            page = await canned(client, url, tool, args, **kwargs)
+            statuses = dict(page['statuses'])
+            statuses.pop('4')
+            statuses['not-an-id'] = 'done'
+            return {**page, 'statuses': statuses}
+
+        with patch('dashboard.data.tasks.mcp_tool_call', new=_one_bad_id):
+            result = await fetch_statuses(dummy_client, dummy_config, '/proj/odd')
+
+        assert result == {1: 'done', 2: 'done', 3: 'done'}
+
+    @pytest.mark.parametrize('returned', [
+        pytest.param(_ABSENT, id='absent'),
+        pytest.param(None, id='null'),
+        pytest.param('4', id='a-string'),
+    ])
+    async def test_a_page_without_a_usable_returned_is_refused(
+        self, dummy_client, dummy_config, returned,
+    ):
+        """No usable ``returned`` means completeness is unverifiable.
+
+        The same rule as a missing ``has_more``: the walk advances on this
+        counter, and an unverifiable read must not be reported as a complete
+        one.
+        """
+        from dashboard.data.tasks import fetch_statuses
+
+        canned = CannedMCP(status_map={tid: 'done' for tid in range(1, 11)},
+                           status_page_size=4)
+
+        async def _uncounted(client, url, tool, args, **kwargs):
+            page = await canned(client, url, tool, args, **kwargs)
+            envelope = dict(page['pagination'])
+            if returned is _ABSENT:
+                del envelope['returned']
+            else:
+                envelope['returned'] = returned
+            return {**page, 'pagination': envelope}
+
+        with patch('dashboard.data.tasks.mcp_tool_call', new=_uncounted):
+            result = await fetch_statuses(dummy_client, dummy_config, '/proj/uncounted')
+
+        assert result.get('offline') is True, (
+            f'an uncounted page must refuse the read, got a map of {len(result)}'
+        )
+
+    async def test_a_server_that_never_lowers_has_more_is_cut_off_at_its_page_budget(
+        self, dummy_client, dummy_config
+    ):
+        """The budget is ``ceil(total / first returned) + 2`` pages per url.
+
+        ``has_more`` is the walk's only terminator and the server reports it,
+        so a server that never lowers it would spin the walk on the httpx
+        client the render polls share. The budget comes from the first page's
+        SERVED count because that is the rate the walk advances at. Derived
+        from the requested 2000 instead, it would allow three pages here, and
+        it would refuse a clamping server that is merely slow to finish.
+        """
+        from dashboard.data.tasks import fetch_statuses
+
+        population = {tid: 'pending' for tid in range(1, 11)}
+        canned = CannedMCP(status_map=population, status_page_size=4)
+
+        async def _endless(client, url, tool, args, **kwargs):
+            # Honest page sizes, but every page claims more remains, and the
+            # window wraps round instead of running dry, so only the budget
+            # can stop the walk.
+            wrapped = {**args, 'offset': (args.get('offset') or 0) % len(population)}
+            page = await canned(client, url, tool, wrapped, **kwargs)
+            return {**page, 'pagination': {**page['pagination'], 'has_more': True}}
+
+        with patch('dashboard.data.tasks.mcp_tool_call', new=_endless):
+            result = await fetch_statuses(dummy_client, dummy_config, '/proj/endless')
+
+        assert result.get('offline') is True, result
+        assert 'budget' in str(result.get('error', '')).lower(), result
+        budget = -(-len(population) // 4) + 2
+        expected = budget * len(dummy_config.fused_memory_urls)
+        assert len(canned.calls_to('get_statuses')) == expected, (
+            f'the walk must stop at its {budget}-page budget per url; issued '
+            f'{len(canned.calls_to("get_statuses"))}, expected {expected}'
+        )
+
+    async def test_a_response_without_pagination_is_the_whole_answer(
+        self, dummy_client, dummy_config
+    ):
+        """(d) The absence of the envelope means COMPLETE — one call, backward compatible.
+
+        An older fused-memory ignores ``page_size`` and answers with the whole
+        map; looping blind on that would re-request the same rows forever.
+        """
+        from dashboard.data.tasks import fetch_statuses
+
+        population = {1: 'done', 2: 'pending', 3: 'in-progress'}
+        canned = CannedMCP(status_map=population)
+
+        with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+            result = await fetch_statuses(dummy_client, dummy_config, '/proj/old')
+
+        assert result == population
+        assert len(canned.calls_to('get_statuses')) == 1, (
+            'a complete response must terminate the walk immediately, got '
+            f'{self._statuses_calls(canned)}'
+        )
+
+    async def test_a_failure_mid_walk_returns_the_offline_marker(
+        self, dummy_client, dummy_config
+    ):
+        """(e) A broken page yields the marker, never a silently short map.
+
+        A partial map is indistinguishable from a complete one at the call
+        site, and ``build_census`` would tally it into a confident
+        under-report of ``total`` — the uniform lie the census exists to
+        refuse.
+        """
+        from dashboard.data.tasks import fetch_statuses
+
+        canned = CannedMCP(status_map={tid: 'done' for tid in range(1, 4501)},
+                           status_page_size=2000)
+        canned.fail_when = lambda call: call['args'].get('offset') == 2000
+
+        with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+            result = await fetch_statuses(dummy_client, dummy_config, '/proj/broken')
+
+        assert result.get('offline') is True, (
+            f'a truncated walk must not be served as a map, got {type(result)} '
+            f'of length {len(result)}'
+        )
+
+    async def test_the_returned_map_is_a_copy(self, dummy_client, dummy_config):
+        """(f) A caller may mutate what it was handed without poisoning a later read."""
+        from dashboard.data.tasks import fetch_statuses
+
+        canned = CannedMCP(status_map={1: 'done', 2: 'pending'},
+                           status_page_size=1)
+
+        with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
             first = await fetch_statuses(dummy_client, dummy_config, '/proj/A')
             assert isinstance(first, dict)
             first.clear()
             second = await fetch_statuses(dummy_client, dummy_config, '/proj/A')
 
-        assert mock_mcp.call_count == 1, 'still one call — the entry is warm'
         assert second == {1: 'done', 2: 'pending'}, (
-            f'the cached map was mutated through the returned reference: {second}'
+            f'the map was mutated through the returned reference: {second}'
         )
 
-    async def test_ttl_is_shorter_than_the_fetch_tasks_ttl(self):
-        """The status map must be the FRESHER half of any row+map pair.
-
-        ``collect_tasks_with_counts`` puts DONE_COUNTS (this map) beside
-        ACTIVE_TASKS rows (``fetch_tasks``); both are cached, so the skew is
-        real either way.  Keeping this TTL strictly shorter makes the skew
-        one-directional — the count can be newer than the rows, never staler —
-        which is the property both docstrings claim.
-        """
-        import dashboard.data.tasks as tasks_mod
-
-        assert (
-            tasks_mod._FETCH_STATUSES_TTL_SECONDS < tasks_mod._FETCH_TASKS_TTL_SECONDS
-        ), (
-            'fetch_statuses TTL must stay strictly under the fetch_tasks TTL: '
-            f'{tasks_mod._FETCH_STATUSES_TTL_SECONDS} vs '
-            f'{tasks_mod._FETCH_TASKS_TTL_SECONDS}'
-        )
-
-    async def test_clear_hook_does_not_reach_into_the_fetch_tasks_caches(
+    async def test_two_consecutive_reads_issue_two_walks(
         self, dummy_client, dummy_config
     ):
-        """The two clear hooks stay separate — each names exactly what it clears."""
+        """The cache is gone: nothing between the caller and the substrate.
+
+        The unit above owns the only TTL on this path, so a read here is
+        always a live one — which is what lets the snapshot stamp an ``as_of``
+        it can stand behind.
+        """
+        from dashboard.data.tasks import fetch_statuses
+
+        canned = CannedMCP(status_map={1: 'done'}, status_page_size=2000)
+
+        with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+            await fetch_statuses(dummy_client, dummy_config, '/proj/A')
+            await fetch_statuses(dummy_client, dummy_config, '/proj/A')
+
+        assert len(canned.calls_to('get_statuses')) == 2, (
+            'a cached read would collapse these to one, and the unit above '
+            'would then serve a map older than the as_of it stamps'
+        )
+
+    def test_the_cache_and_its_hooks_are_gone(self):
+        """Named absence, so the layer cannot be reintroduced unnoticed."""
         import dashboard.data.tasks as tasks_mod
-        from dashboard.data.tasks import fetch_statuses, fetch_tasks
 
-        tasks_mod._fetch_tasks_cache_clear()
-        mock_mcp = AsyncMock(side_effect=lambda c, u, tool, args, **kw: (
-            {'statuses': {'1': 'done'}} if tool == 'get_statuses'
-            else {'tasks': []}
-        ))
-        try:
-            with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
-                await fetch_tasks(dummy_client, dummy_config, '/proj/A')
-                await fetch_statuses(dummy_client, dummy_config, '/proj/A')
-
-                tasks_mod._fetch_statuses_cache_clear()
-                # fetch_tasks stays warm; fetch_statuses re-reads.
-                await fetch_tasks(dummy_client, dummy_config, '/proj/A')
-                await fetch_statuses(dummy_client, dummy_config, '/proj/A')
-        finally:
-            tasks_mod._fetch_tasks_cache_clear()
-
-        tools = [c.args[2] for c in mock_mcp.call_args_list]
-        assert tools.count('get_tasks') == 1, (
-            f'_fetch_statuses_cache_clear must not evict fetch_tasks, got {tools}'
-        )
-        assert tools.count('get_statuses') == 2, (
-            f'_fetch_statuses_cache_clear must evict fetch_statuses, got {tools}'
-        )
+        for gone in ('_FETCH_STATUSES_TTL_SECONDS', '_fetch_statuses_cache',
+                     '_fetch_statuses_cache_clear'):
+            assert not hasattr(tasks_mod, gone), (
+                f'{gone} layers a second TTL under the snapshot unit\'s own'
+            )

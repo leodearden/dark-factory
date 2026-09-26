@@ -8,6 +8,8 @@ const { CuratorTab } = window.DF_CURATOR;
 const { SchedulerTab } = window.DF_SCHEDULER;
 const { staleNoticesForTab } = window.DF_ENDPOINT_STALENESS;
 const { reconRunCounts, reconAttentionCount } = window.DF_RECON_STATUS;
+// Interim, deleted by task 5589 (γ2) — orch_summary.js's header says why.
+const { orchSummary } = window.DF_ORCH_SUMMARY;
 const DD = window.DF_DATA;
 
 // Tweaks helpers are attached directly to window
@@ -110,7 +112,10 @@ function App() {
   const summary = {
     orchRunning: DD.ORCHESTRATORS.filter(o => o.running).length,
     orchTotal: DD.ORCHESTRATORS.length,
-    tasksActive: DD.ORCHESTRATORS.reduce((s, o) => s + o.summary.in_progress + o.summary.blocked, 0),
+    tasksActive: DD.ORCHESTRATORS.reduce((n, o) => {
+      const s = orchSummary(o);
+      return n + s.in_progress + s.blocked;
+    }, 0),
     queue: DD.MEMORY_STATUS.queue.counts.pending,
     spend24h: DD.COSTS?.summary?.today ?? 0,
   };

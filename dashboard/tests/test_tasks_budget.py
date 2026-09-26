@@ -30,7 +30,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from dashboard.data import active_tasks, tasks
+from dashboard.data import active_tasks, task_snapshot, tasks
 
 # The tightest real caller of /api/v2/dashboard/tasks is the dashboard's own
 # poll loop, whose fetch wrapper aborts at DEFAULT_TIMEOUT_MS. Parsed out of
@@ -64,10 +64,10 @@ def test_tasks_budget_is_structurally_deliverable() -> None:
     Seven independent arithmetic facts, each of which can regress on its own:
 
     (a) the per-project MCP calls fit inside the per-project budget — with the
-        call count DERIVED from ``_PER_PROJECT_MCP_CALLS``, so adding a fourth
-        per-project call without raising the budget fails here, and with the
+        call count DERIVED from ``PER_PROJECT_MCP_CALLS``, so adding a fourth
+        bounded operation without raising the budget fails here, and with the
         per-call term taken from the Tasks-tab-LOCAL
-        ``_TASKS_PER_CALL_TIMEOUT`` rather than the shared default;
+        ``task_snapshot.PER_CALL_TIMEOUT`` rather than the shared default;
     (b) one project fits inside the whole-handler budget, so the handler can
         never return an all-degraded payload by arithmetic alone;
     (c) the whole-handler budget fits inside the browser's fetch abort, so the
@@ -92,15 +92,16 @@ def test_tasks_budget_is_structurally_deliverable() -> None:
     here would encode a target the design deliberately does not meet, so (g)
     asserts only the weaker fact that is actually true.
     """
-    per_call = active_tasks._TASKS_PER_CALL_TIMEOUT
+    per_call = task_snapshot.PER_CALL_TIMEOUT
     shared_per_call = tasks.DEFAULT_PER_CALL_TIMEOUT
-    calls = active_tasks._PER_PROJECT_MCP_CALLS
+    calls = task_snapshot.PER_PROJECT_MCP_CALLS
     per_project = active_tasks._TASKS_PER_PROJECT_BUDGET
     total = active_tasks._TASKS_TOTAL_BUDGET
     concurrency = active_tasks._TASKS_ROOT_CONCURRENCY
 
     assert len(calls) > 0, (
-        '_PER_PROJECT_MCP_CALLS must enumerate the real per-project MCP calls '
+        'PER_PROJECT_MCP_CALLS must enumerate the real per-project bounded '
+        'operations '
         '— an empty roster makes assertion (a) vacuously true'
     )
 
@@ -131,7 +132,7 @@ def test_tasks_budget_is_structurally_deliverable() -> None:
 
     # (d) standing guard: never raise the per-request budget to the ceiling.
     assert per_call < 10, (
-        f'_TASKS_PER_CALL_TIMEOUT ({per_call}s) must stay strictly below '
+        f'PER_CALL_TIMEOUT ({per_call}s) must stay strictly below '
         "mcp_tool_call's 10s default — a per-call budget that reaches the "
         'server-side default stops being a budget at all, and (a) would then '
         'force a per-project budget wider than (c) permits'
@@ -146,14 +147,13 @@ def test_tasks_budget_is_structurally_deliverable() -> None:
         'OFFLINE on a cold render and shipped 208 of 3045 active rows). It '
         'must NOT buy that by raising this shared constant: '
         'DEFAULT_PER_CALL_TIMEOUT feeds DEFAULT_WHOLE_OPERATION_BUDGET, which '
-        'orchestrator._ORCHESTRATORS_PER_ROOT_BUDGET, '
-        'merge_queue._TASK_TITLES_BUDGET and app._TASK_CARDS_BUDGET all bind '
-        'BY REFERENCE — so a bump here silently widens three route budgets '
-        'this work must not touch (task 4788 territory). Widen '
-        'active_tasks._TASKS_PER_CALL_TIMEOUT instead.'
+        'merge_queue._TASK_TITLES_BUDGET and escalations._TASK_CARDS_BUDGET '
+        'both bind BY REFERENCE — so a bump here silently widens route '
+        'budgets this work must not touch (task 4788 territory). Widen '
+        'task_snapshot.PER_CALL_TIMEOUT instead.'
     )
     assert per_call > shared_per_call, (
-        f'_TASKS_PER_CALL_TIMEOUT ({per_call}s) is not wider than the shared '
+        f'PER_CALL_TIMEOUT ({per_call}s) is not wider than the shared '
         f'default ({shared_per_call}s) — if the Tasks tab does not actually '
         'need a wider budget, delete the local constant and use the shared '
         'one rather than keeping a same-valued alias that hides the coupling'

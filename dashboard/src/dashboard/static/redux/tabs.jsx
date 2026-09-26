@@ -22,9 +22,12 @@ const { orchEmptyLabel } = window.DF_ORCH_FILTER || { orchEmptyLabel: () => 'No 
 const { strandBadgeState, agentCellState, locksCellState } = window.DF_TASK_ROW_CELLS;
 // The Datum readers. Module scope, no fallback, bound under datum.js's own
 // names — see the CANONICAL note in datum.js's header.
-const { plainDatum, derivedDatum, unknownDatum } = window.DF_DATUM;
+const { plainDatum, derivedDatum, unknownDatum, EM_DASH } = window.DF_DATUM;
 const { burndownStacks, burndownLegend, parityBannerState } = window.DF_BURNDOWN_BANDS;
 const { reconRunCounts, reconSuccessPct, reconStatusTone } = window.DF_RECON_STATUS;
+// Interim, deleted by task 5589 (γ2) — orch_summary.js's and task_done_count.js's headers say why.
+const { hasOrchSummary, orchSummary, orchSummaryTotal, ORCH_SUMMARY_ABSENT_REASON } = window.DF_ORCH_SUMMARY;
+const { doneCount } = window.DF_TASK_DONE_COUNT;
 const { useState: uS, useEffect: uE } = React;
 
 // Which endpoint each rendered number arrived on. plainDatum's provenance is
@@ -41,6 +44,7 @@ const EP = Object.freeze({
   costs:         '/api/v2/dashboard/costs',         burndown:     '/api/v2/dashboard/burndown',
   scheduler:     '/api/v2/dashboard/scheduler',
 });
+const orchTotalDatum = (orchs, key) => derivedDatum(orchSummaryTotal(orchs, key), EP.orchestrators, ORCH_SUMMARY_ABSENT_REASON);
 
 // Formatters the tiles hand to StatTile/Pip. Each is given a value that was
 // actually MEASURED — plainDatum answers the absent case itself — so none
@@ -270,15 +274,16 @@ function OrchTab({ projectFilter, search }) {
     <div className="grid cols-12" style={{ gap: 12 }}>
       <div className="col-span-12 grid cols-4">
         <ST label="Orchestrators" datum={plainDatum(matches.length, EP.orchestrators)} hint={`${matches.filter(o=>o.running).length} running`} history={(DF.ORCHESTRATORS_SPARK?.values || []).slice(-30)} sparkColor={CP.accent} />
-        <ST label="Tasks in flight" datum={plainDatum(matches.reduce((s,o)=>s+o.summary.in_progress,0), EP.orchestrators)} history={DF.BURNDOWN.in_progress} sparkColor={CP.accent} hint="30d" />
-        <ST label="Blocked" datum={plainDatum(matches.reduce((s,o)=>s+o.summary.blocked,0), EP.orchestrators)} history={DF.BURNDOWN.blocked} sparkColor={CP.bad} hint="30d" />
-        <ST label="Pending" datum={plainDatum(matches.reduce((s,o)=>s+o.summary.pending,0), EP.orchestrators)} history={DF.BURNDOWN.pending} sparkColor={CP.warn} hint="30d" />
+        <ST label="Tasks in flight" datum={orchTotalDatum(matches, 'in_progress')} history={DF.BURNDOWN.in_progress} sparkColor={CP.accent} hint="30d" />
+        <ST label="Blocked" datum={orchTotalDatum(matches, 'blocked')} history={DF.BURNDOWN.blocked} sparkColor={CP.bad} hint="30d" />
+        <ST label="Pending" datum={orchTotalDatum(matches, 'pending')} history={DF.BURNDOWN.pending} sparkColor={CP.warn} hint="30d" />
       </div>
 
       <div className="col-span-12"><GroupAllToggle allOpen={allOpen} onSetAll={setAll} /></div>
 
       {matches.map(o => {
-        const total = o.summary.total || 1;
+        const orchCounts = orchSummary(o);
+        const total = orchCounts.total || 1;
         const projTasks = tasks.filter(t => t.project === o.project);
         const filter = getFilter(o.pid);
         // partition by filter (multi-select)
@@ -291,24 +296,22 @@ function OrchTab({ projectFilter, search }) {
         const counts = {
           active:   projTasks.filter(t => t.status === 'in-progress' || t.status === 'blocked').length,
           pending:  projTasks.filter(t => t.status === 'pending').length,
-          complete: (DF.DONE_COUNTS && DF.DONE_COUNTS[o.project] != null)
-                      ? DF.DONE_COUNTS[o.project]
-                      : projTasks.filter(t => t.status === 'done').length,
+          complete: doneCount(DF.TASKS_SNAPSHOT[o.project]),
         };
 
         const summary = (
           <>
             <span className="pip"><span className={`status-dot ${o.running ? 'running' : 'completed'}`} style={{ marginRight: 0 }}></span>{o.running ? 'running' : 'completed'}</span>
             {/* Proven-down and not-measured are distinct facts and get distinct pips: collapsing
-                them sends an operator to restart a healthy service. Invariant:
-                dashboard/src/dashboard/data/active_tasks.py::collect_tasks_with_counts.
+                them sends an operator to restart a healthy service. Neither fires since task 5587:
+                discovery attempts no read, so nothing sets either flag (handed to γ2, task 5589).
                 The !o.offline guard states the precedence here rather than trusting the
                 producer, so a malformed entry with both set reads as the stronger, proven one. */}
             {o.offline && <span className="pip" title={o.error || undefined}><span className="pip-dot" style={{ background: CP.bad }}></span>offline</span>}
             {!o.offline && o.degraded && <span className="pip" title={o.error || undefined}><span className="pip-dot" style={{ background: CP.warn }}></span>state unknown</span>}
-            <Pip datum={plainDatum(o.summary.done, EP.orchestrators)} color={CP.ok} format={done => `${done}/${total}`} />
-            {o.summary.in_progress > 0 && <Pip datum={plainDatum(o.summary.in_progress, EP.orchestrators)} color={CP.accent} label="active" />}
-            {o.summary.blocked > 0 && <Pip datum={plainDatum(o.summary.blocked, EP.orchestrators)} color={CP.bad} label="blocked" />}
+            <Pip datum={orchTotalDatum([o], 'done')} color={CP.ok} format={done => `${done}/${total}`} />
+            {orchCounts.in_progress > 0 && <Pip datum={orchTotalDatum([o], 'in_progress')} color={CP.accent} label="active" />}
+            {orchCounts.blocked > 0 && <Pip datum={orchTotalDatum([o], 'blocked')} color={CP.bad} label="blocked" />}
             <span className="mono" style={{ color: 'var(--fg-3)', fontSize: 10 }}>PID {o.pid}</span>
           </>
         );
@@ -402,19 +405,19 @@ function OrchTab({ projectFilter, search }) {
                   <div>
                     <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: 'var(--fg-3)', marginBottom: 4 }}>
                       <span>Progress</span>
-                      <span className="mono" style={{ color: 'var(--fg-1)' }}>{o.summary.done}/{total}</span>
+                      <span className="mono" style={{ color: 'var(--fg-1)' }}>{hasOrchSummary(o) ? `${orchCounts.done}/${total}` : EM_DASH}</span>
                     </div>
                     <div className="stack-bar" style={{ height: 12 }}>
-                      <span style={{ width: `${o.summary.done/total*100}%`, background: CP.ok }} />
-                      <span style={{ width: `${o.summary.in_progress/total*100}%`, background: CP.accent }} />
-                      <span style={{ width: `${o.summary.blocked/total*100}%`, background: CP.bad }} />
-                      <span style={{ width: `${o.summary.pending/total*100}%`, background: CP.warn }} />
+                      <span style={{ width: `${orchCounts.done/total*100}%`, background: CP.ok }} />
+                      <span style={{ width: `${orchCounts.in_progress/total*100}%`, background: CP.accent }} />
+                      <span style={{ width: `${orchCounts.blocked/total*100}%`, background: CP.bad }} />
+                      <span style={{ width: `${orchCounts.pending/total*100}%`, background: CP.warn }} />
                     </div>
                     <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: 'var(--fg-3)', marginTop: 4 }}>
-                      <span style={{ color: CP.ok }}>{o.summary.done} done</span>
-                      <span style={{ color: CP.accent }}>{o.summary.in_progress} active</span>
-                      <span style={{ color: CP.bad }}>{o.summary.blocked} blocked</span>
-                      <span style={{ color: CP.warn }}>{o.summary.pending} pending</span>
+                      <span style={{ color: CP.ok }}>{orchCounts.done} done</span>
+                      <span style={{ color: CP.accent }}>{orchCounts.in_progress} active</span>
+                      <span style={{ color: CP.bad }}>{orchCounts.blocked} blocked</span>
+                      <span style={{ color: CP.warn }}>{orchCounts.pending} pending</span>
                     </div>
                   </div>
                   <div>

@@ -13,6 +13,8 @@ const { projectStatusCounts, activityPips } = window.DF_TASK_STATUS_COUNTS;
 const { strandBadgeState, agentCellState } = window.DF_TASK_ROW_CELLS;
 const { rtCell, rtAge, rtProbe, rtProbeSummary } = window.DF_RUNTIME_FMT;
 const { tasksBannerNotices } = window.DF_TASKS_OFFLINE_BANNER;
+// Interim, deleted by leaf γ3 — task_done_count.js's header says why.
+const { doneCount } = window.DF_TASK_DONE_COUNT;
 
 // Dot colour per activity pip. activityPips is pure and owns ORDER and
 // zero-suppression; colour is the caller's concern. Each reuses the hue
@@ -857,36 +859,26 @@ function TasksTab({ projectFilter, search }) {
             // 2026-07-30: dark-factory showed "43 active" against a cap of 24,
             // reify "50 active" against 48; neither was a real breach.
             const statusCounts = projectStatusCounts(projTasks);
-            const _fallbackDone = statusCounts.done;
             // Display keys are picked EXPLICITLY rather than spread in from
-            // statusCounts. Its `done` is the BOUNDED tally of the done rows
-            // actually loaded (≤50 per project); spreading it onto the display
-            // object would park it beside the authoritative `complete` under a
-            // near-synonymous name, and the next `{counts.done} done` edit
-            // would silently render the lower bound as if it were the real
-            // count. Keep it reachable only via `_fallbackDone`, whose
-            // underscore says "not for display".
+            // statusCounts. Its `done` tallies only the done rows loaded into
+            // ACTIVE_TASKS, and the default render fetches none; spreading it
+            // onto the display object would park it beside the measured
+            // `complete` under a near-synonymous name, and the next
+            // `{counts.done} done` edit would silently render a zero nobody
+            // measured.
             const counts = {
               total: statusCounts.total,
               running: statusCounts.running,
               blocked: statusCounts.blocked,
               mergeDeferred: statusCounts.mergeDeferred,
               pending: statusCounts.pending,
-              // DONE_COUNTS carries the authoritative full count from the server.
-              // The fallback counts only the bounded done rows loaded into ACTIVE_TASKS
-              // (≤50 per project). If we hit that cap without a server count, show
-              // "50+" so the user knows the displayed number is a lower bound.
-              // A MISSING DONE_COUNTS entry means the count was never
-              // measured — it does NOT mean zero. Falling through to
-              // _fallbackDone here rendered a confident "0 done", because the
-              // server skips the terminal window for exactly these projects
-              // so no done row was ever sent. Show unknown instead; the
-              // banner's 'count-unknown' notice names which projects.
-              complete: (DF_T.DONE_COUNTS && DF_T.DONE_COUNTS[p.id] != null)
-                ? DF_T.DONE_COUNTS[p.id]
-                : ((DF_T.TASKS_COUNT_UNKNOWN_PROJECTS || []).indexOf(p.id) !== -1
-                    ? '—'
-                    : (_fallbackDone >= 50 ? '50+' : _fallbackDone)),
+              // The census's done count, or the placeholder when the census
+              // was not measured. A missing count does NOT mean zero: falling
+              // back to a tally of this tab's rows once rendered a confident
+              // "0 done", because no done row is ever sent. The banner's
+              // 'count-unknown' notice names the projects whose rows are
+              // current but whose census is not.
+              complete: doneCount(DF_T.TASKS_SNAPSHOT[p.id]),
             };
             // The ONE focus-narrowing site. Both the header count below and
             // the group body read this single result, so they cannot be fed

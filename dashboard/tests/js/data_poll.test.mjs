@@ -62,7 +62,7 @@ const EXPECTED_FUNCTION_NAMES = [
 const EXPECTED_DF_DATA_KEYS = [
   'PROJECTS', 'AGENTS', 'ORCHESTRATORS', 'ORCHESTRATORS_SPARK',
   'ACTIVE_TASKS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
-  'TASKS_DEGRADED_PROJECTS', 'TASKS_PROJECT_COUNT', 'DONE_COUNTS',
+  'TASKS_DEGRADED_PROJECTS', 'TASKS_PROJECT_COUNT', 'TASKS_SNAPSHOT',
   'PERFORMANCE', 'MEMORY_STATUS', 'MEMORY_TIMESERIES', 'MEMORY_OPS_BREAKDOWN',
   'RECON_STATE', 'MERGE_QUEUE', 'COSTS', 'BURNDOWN', 'BURNDOWN_BY_PROJECT',
   'CURATOR_STATE', 'ESCALATIONS', 'ESCALATION_ANALYTICS', 'SCHEDULER',
@@ -105,13 +105,19 @@ const DATUM_SPEC = { kind: 'datum' };
 // the thing under test.
 const EXPECTED_ENDPOINT_KEYS = [
   'ACTIVE_TASKS', 'AGENTS', 'BURNDOWN', 'BURNDOWN_BY_PROJECT', 'COSTS',
-  'CURATOR_STATE', 'DONE_COUNTS', 'ESCALATIONS', 'ESCALATION_ANALYTICS',
+  'CURATOR_STATE', 'ESCALATIONS', 'ESCALATION_ANALYTICS',
   'MEMORY_EVALS', 'MEMORY_OPS_BREAKDOWN', 'MEMORY_STATUS', 'MEMORY_TIMESERIES',
   'MERGE_QUEUE', 'ORCHESTRATORS', 'ORCHESTRATORS_SPARK', 'PERFORMANCE',
   'PROJECTS', 'RECON_STATE', 'SCHEDULER', 'TASKS_COUNT_UNKNOWN_PROJECTS',
   'TASKS_DEGRADED_PROJECTS', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
-  'TASKS_PROJECT_COUNT',
+  'TASKS_PROJECT_COUNT', 'TASKS_SNAPSHOT',
 ];
+
+// The subject key of the generic datum-kind tests below. SYNTHETIC on purpose:
+// those tests are about what applyKey and datumFor do with a key DECLARED
+// datum-kinded, and no polled key is one, so borrowing a real key would pin a
+// payload that key does not carry (DONE_COUNTS was borrowed, and then retired).
+const SYNTHETIC_DATUM_KEY = 'SYNTHETIC_DATUM_KEY';
 
 // A five-key wire envelope, as data/datum.py::Datum.to_wire() emits one.
 const SERVED_DATUM = Object.freeze({
@@ -1535,8 +1541,9 @@ test('staleness: the reduced deadline is reached through the PRODUCTION deps mer
 //
 // endpointsFor's rows become endpoint -> {KEY: SPEC}, where a spec declares
 // whether the wire delivers that key as a bare value or as a Datum envelope.
-// Today every polled key is 'plain', which is the HONEST description of the
-// wire: PRD leaf beta has not landed, so no payload carries a Datum yet. The
+// Every polled key is 'plain', which is the HONEST description of the wire:
+// the Datums PRD leaf beta serves arrive NESTED inside each TASKS_SNAPSHOT
+// entry, and the 'datum' kind validates only a TOP-LEVEL envelope. The
 // registry is the single place a later leaf flips a row.
 // ---------------------------------------------------------------------------
 
@@ -1566,16 +1573,23 @@ test('registry: the reshape drops no key — the union is exactly today\'s set',
   assert.deepEqual([...seen].sort(), EXPECTED_ENDPOINT_KEYS.slice().sort());
 });
 
-test('registry: every polled key is plain today, because no payload serves a Datum', () => {
-  // Not an aspiration — a description. Beta is what puts Datums on the wire;
-  // until it lands, declaring a polled row 'datum' would make applyKey refuse
-  // every real payload and freeze that tab at its seed values.
+test('registry: every polled key is plain, because beta nests its Datums inside TASKS_SNAPSHOT', () => {
+  // Not an aspiration — a description. Beta does serve Datums, but each one
+  // sits inside a TASKS_SNAPSHOT entry (census, rows), and TASKS_SNAPSHOT
+  // itself is a map of project -> entry, never a five-key envelope. Declaring
+  // any polled row 'datum' would make applyKey refuse every real payload and
+  // freeze that tab at its seed values, which looks exactly like a wedged
+  // endpoint.
   const { api } = loadDataJs();
-  for (const [url, keySpecs] of Object.entries(api.endpointsFor('24h'))) {
+  const rows = api.endpointsFor('24h');
+  for (const [url, keySpecs] of Object.entries(rows)) {
     for (const [key, spec] of Object.entries(keySpecs)) {
       assert.equal(spec.kind, 'plain', `${url}/${key} is declared datum-kinded`);
     }
   }
+  // Named explicitly as well: this is the row a reader of "beta serves Datums"
+  // is most likely to flip, and flipping it freezes both done-count pips.
+  assert.equal(rows['/api/v2/dashboard/tasks'].TASKS_SNAPSHOT.kind, 'plain');
 });
 
 test('applyKey: a plain-kinded key still applies verbatim, in place for the stable arrays', () => {
@@ -1595,15 +1609,15 @@ test('applyKey: a datum-kinded payload is stored as a COPY carrying its receipt'
   const { api, window: win } = loadDataJs();
   const pristine = { ...SERVED_DATUM };
 
-  api.applyKey('DONE_COUNTS', SERVED_DATUM, DATUM_SPEC, { servedAt: 'S', receivedAt: 1234 });
+  api.applyKey(SYNTHETIC_DATUM_KEY, SERVED_DATUM, DATUM_SPEC, { servedAt: 'S', receivedAt: 1234 });
 
-  const stored = win.DF_DATA.DONE_COUNTS;
+  const stored = win.DF_DATA[SYNTHETIC_DATUM_KEY];
   assert.notEqual(stored, SERVED_DATUM, 'the wire payload must not be stored by reference');
   assert.deepEqual(SERVED_DATUM, pristine, 'the wire payload was mutated');
   assert.equal(stored._served_at, 'S');
   assert.equal(stored._received_at, 1234);
   assert.equal(stored.value.total, 9);
-  assert.equal(win.DF_DATA.__loaded.DONE_COUNTS, true);
+  assert.equal(win.DF_DATA.__loaded[SYNTHETIC_DATUM_KEY], true);
 });
 
 // Runs *fn* with console.warn captured, and hands back what it said. Every
@@ -1628,12 +1642,12 @@ test('applyKey: a datum-kinded payload that is NOT a Datum is refused, prior val
   // an unprovenanced number that renders as though freshly measured.
   const { api, window: win } = loadDataJs();
   const receipt = { servedAt: null, receivedAt: 1 };
-  api.applyKey('DONE_COUNTS', SERVED_DATUM, DATUM_SPEC, receipt);
-  const good = win.DF_DATA.DONE_COUNTS;
+  api.applyKey(SYNTHETIC_DATUM_KEY, SERVED_DATUM, DATUM_SPEC, receipt);
+  const good = win.DF_DATA[SYNTHETIC_DATUM_KEY];
 
   for (const bad of [42, 'nine', [SERVED_DATUM], { value: 1, as_of: null, state: 'fresh', reason: null }]) {
-    warningsFrom(() => api.applyKey('DONE_COUNTS', bad, DATUM_SPEC, { servedAt: null, receivedAt: 2 }));
-    assert.equal(win.DF_DATA.DONE_COUNTS, good, `a non-Datum (${JSON.stringify(bad)}) was applied`);
+    warningsFrom(() => api.applyKey(SYNTHETIC_DATUM_KEY, bad, DATUM_SPEC, { servedAt: null, receivedAt: 2 }));
+    assert.equal(win.DF_DATA[SYNTHETIC_DATUM_KEY], good, `a non-Datum (${JSON.stringify(bad)}) was applied`);
   }
 });
 
@@ -1643,24 +1657,23 @@ test('applyKey: a refusal SAYS SO, naming the key', () => {
   // would diagnose a network outage for a server that is answering perfectly.
   // The value must still not be applied — only the diagnosis was missing.
   const { api, window: win } = loadDataJs();
-  const seed = win.DF_DATA.DONE_COUNTS;
 
   const calls = warningsFrom(() =>
-    api.applyKey('DONE_COUNTS', 42, DATUM_SPEC, { servedAt: null, receivedAt: 1 }),
+    api.applyKey(SYNTHETIC_DATUM_KEY, 42, DATUM_SPEC, { servedAt: null, receivedAt: 1 }),
   );
 
   assert.equal(calls.length, 1, 'a refused datum payload must warn exactly once');
   assert.ok(/DF_DATA/.test(String(calls[0][0])), `the warning must name the source: ${calls[0][0]}`);
   assert.ok(
-    calls[0].includes('DONE_COUNTS'),
+    calls[0].includes(SYNTHETIC_DATUM_KEY),
     `the warning must name the refused key, got ${JSON.stringify(calls[0])}`,
   );
-  assert.equal(win.DF_DATA.DONE_COUNTS, seed, 'the refused value must still not be applied');
+  assert.equal(win.DF_DATA[SYNTHETIC_DATUM_KEY], undefined, 'the refused value must still not be applied');
 });
 
 test('applyKey: a plain-kinded key is never second-guessed, and never warns', () => {
   // The warning is scoped to a DECLARED datum row receiving a non-Datum. Every
-  // polled key is plain today, so a warn on the plain path would fire on every
+  // polled key is plain, so a warn on the plain path would fire on every
   // healthy poll and train an operator to ignore it.
   const { api } = loadDataJs();
   const calls = warningsFrom(() => api.applyKey('COSTS', 42, PLAIN_SPEC, { servedAt: null, receivedAt: 1 }));
@@ -1669,8 +1682,8 @@ test('applyKey: a plain-kinded key is never second-guessed, and never warns', ()
 
 test('applyKey: a refused datum payload does not flip the __loaded marker', () => {
   const { api, window: win } = loadDataJs();
-  warningsFrom(() => api.applyKey('DONE_COUNTS', 42, DATUM_SPEC, { servedAt: null, receivedAt: 1 }));
-  assert.equal(win.DF_DATA.__loaded.DONE_COUNTS, undefined, '__loaded must mean a real value LANDED');
+  warningsFrom(() => api.applyKey(SYNTHETIC_DATUM_KEY, 42, DATUM_SPEC, { servedAt: null, receivedAt: 1 }));
+  assert.equal(win.DF_DATA.__loaded[SYNTHETIC_DATUM_KEY], undefined, '__loaded must mean a real value LANDED');
 });
 
 test('applyKey: __receipt is refused exactly like __loaded and __stale', () => {
@@ -1683,12 +1696,12 @@ test('applyKey: __receipt is refused exactly like __loaded and __stale', () => {
 test('datumFor: unknown before the first apply, the stored Datum after', () => {
   const { api, window: win } = loadDataJs();
 
-  const before = api.datumFor('DONE_COUNTS');
+  const before = api.datumFor(SYNTHETIC_DATUM_KEY);
   assert.equal(before.state, 'unknown');
   assert.equal(before.reason, 'not yet fetched');
 
-  api.applyKey('DONE_COUNTS', SERVED_DATUM, DATUM_SPEC, { servedAt: 'S', receivedAt: 7 });
-  assert.equal(api.datumFor('DONE_COUNTS'), win.DF_DATA.DONE_COUNTS);
+  api.applyKey(SYNTHETIC_DATUM_KEY, SERVED_DATUM, DATUM_SPEC, { servedAt: 'S', receivedAt: 7 });
+  assert.equal(api.datumFor(SYNTHETIC_DATUM_KEY), win.DF_DATA[SYNTHETIC_DATUM_KEY]);
 });
 
 // ---------------------------------------------------------------------------
@@ -1808,10 +1821,11 @@ const TERMINAL_KEY = `TASKS_TERMINAL:${TERMINAL_PROJECT}`;
 // is pinned against an expectation rather than against itself.
 const TERMINAL_STATE_KEY = `${TASKS_PATH}#terminal:${TERMINAL_PROJECT}`;
 
-// A Datum as the terminal endpoint will serve one: a lower_bound, because a
-// terminal listing is truncated by construction.
+// A Datum as the terminal endpoint serves one: a lower_bound, because a
+// terminal listing is truncated by construction, whose value is the row LIST
+// itself — the PRD's `Datum[list]`, and what api/tasks.py puts on the wire.
 const SERVED_TERMINAL_DATUM = Object.freeze({
-  value: { rows: [{ id: '5588' }] },
+  value: [{ id: '5588' }],
   as_of: '2026-09-20T09:00:00+00:00',
   state: 'lower_bound',
   reason: 'terminal window truncated at 200 rows',
@@ -1857,7 +1871,7 @@ test('on-demand: one request, one fetch, and a validated Datum under the built k
   const stored = win.DF_DATA[TERMINAL_KEY];
   assert.ok(stored, `nothing was applied to DF_DATA['${TERMINAL_KEY}']`);
   assert.equal(stored.state, 'lower_bound');
-  assert.deepEqual(stored.value, { rows: [{ id: '5588' }] });
+  assert.deepEqual(stored.value, [{ id: '5588' }]);
   assert.equal(stored._served_at, '2026-09-20T09:00:01+00:00', 'the receipt must come from the body');
   assert.equal(stored._received_at, 4242, 'the receipt must come from the injected clock');
   assert.notEqual(stored, SERVED_TERMINAL_DATUM, 'the wire payload must not be stored by reference');
@@ -1866,12 +1880,13 @@ test('on-demand: one request, one fetch, and a validated Datum under the built k
 test('on-demand: a non-Datum body is refused, so no unprovenanced value reaches a terminal key', async () => {
   // Same guarantee applyKey gives every datum-kinded polled row; asserted here
   // because this is the FIRST row declared datum-kinded, so it is the first
-  // path on which the refusal is reachable at all.
+  // path on which the refusal is reachable at all. The payload is the served
+  // value stripped of its envelope — the likeliest shape of the regression.
   const { api, window: win } = loadDataJs();
   const deps = {
     fetchImpl: () => Promise.resolve({
       ok: true,
-      json: async () => ({ served_at: null, [TERMINAL_KEY]: { rows: [] } }),
+      json: async () => ({ served_at: null, [TERMINAL_KEY]: SERVED_TERMINAL_DATUM.value }),
     }),
     now: () => 1,
   };
