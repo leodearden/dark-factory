@@ -5955,6 +5955,97 @@ async def test_remediation_pass_short_circuit_write_failure_terminalises_row(
     assert 'integrity_check' in row.stage_reports
 
 
+_DROP_CATEGORY = 'recon_failure'
+_DROP_RUN_ID = 'run-5545drop'
+_DROP_SUMMARY = 'Stage memory_consolidator failed: database is locked'
+
+
+def _escalation_drop_warnings(caplog) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.WARNING
+        and r.getMessage().startswith('reconciliation.escalation_dropped')
+    ]
+
+
+def _assert_one_drop_warning_naming_the_escalation(caplog) -> None:
+    drops = _escalation_drop_warnings(caplog)
+    assert len(drops) == 1, f'expected exactly one escalation_dropped WARNING, got {drops!r}'
+    for field in (_DROP_CATEGORY, _DROP_RUN_ID, _DROP_SUMMARY):
+        assert field in drops[0]
+
+
+@pytest.mark.asyncio
+async def test_escalate_without_queue_logs_dropped_warning(
+    journal, event_buffer, mock_memory_service, caplog,
+):
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    assert harness._escalation_queue is None
+
+    with caplog.at_level(logging.WARNING):
+        harness._escalate(_DROP_CATEGORY, _DROP_RUN_ID, _DROP_SUMMARY)
+
+    _assert_one_drop_warning_naming_the_escalation(caplog)
+
+
+@pytest.mark.asyncio
+async def test_escalate_without_escalation_package_logs_dropped_warning(
+    journal, event_buffer, mock_memory_service, caplog, tmp_path,
+):
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    esc_queue = EscalationQueue(tmp_path / 'esc')
+    harness._escalation_queue = esc_queue
+
+    with (
+        patch('fused_memory.reconciliation.harness.HAS_ESCALATION', False),
+        caplog.at_level(logging.WARNING),
+    ):
+        harness._escalate(_DROP_CATEGORY, _DROP_RUN_ID, _DROP_SUMMARY)
+
+    _assert_one_drop_warning_naming_the_escalation(caplog)
+    assert esc_queue.get_pending() == []
+
+
+@pytest.mark.asyncio
+async def test_escalate_submit_failure_logs_dropped_warning(
+    journal, event_buffer, mock_memory_service, caplog, tmp_path,
+):
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness._escalation_queue = EscalationQueue(tmp_path / 'esc')
+
+    with (
+        patch(
+            'fused_memory.reconciliation.harness.submit_or_dedupe',
+            side_effect=OSError('disk full'),
+        ),
+        caplog.at_level(logging.WARNING),
+    ):
+        harness._escalate(_DROP_CATEGORY, _DROP_RUN_ID, _DROP_SUMMARY)
+
+    _assert_one_drop_warning_naming_the_escalation(caplog)
+
+
+@pytest.mark.asyncio
+async def test_escalate_successful_submit_logs_no_drop_warning(
+    journal, event_buffer, mock_memory_service, caplog, tmp_path,
+):
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    esc_queue = EscalationQueue(tmp_path / 'esc')
+    harness._escalation_queue = esc_queue
+
+    with caplog.at_level(logging.WARNING):
+        harness._escalate(_DROP_CATEGORY, _DROP_RUN_ID, _DROP_SUMMARY)
+
+    assert _escalation_drop_warnings(caplog) == []
+    assert len(esc_queue.get_pending()) == 1
+
+
 @pytest.mark.asyncio
 async def test_shielded_stage_report_persistence_still_propagates_cancellation(
     journal, event_buffer, mock_memory_service,
