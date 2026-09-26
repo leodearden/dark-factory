@@ -22,7 +22,9 @@ from fused_memory.reconciliation.standing_decision_constants import (
     CATEGORY_STANDING_DECISION_STORM,
     GROUNDS_STRUCTURAL_SIZE_CONFLATION,
     RECORD_KIND_ENTITY_STANDING_DECISION,
+    STREAK_PAYLOAD_KEY,
     SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
+    SUPPRESSION_STREAK_THRESHOLD_CYCLES,
 )
 
 
@@ -14116,3 +14118,157 @@ class TestMaybeEscalateSuppressionStorm:
         pending = self._pending(queue)
         assert len(pending) == 1, f'expected one storm escalation, got {len(pending)}'
         assert pending[0].dedupe_count == 1, 'the recurrence must be counted on the parent'
+
+
+# ---------------------------------------------------------------------------
+# update_suppression_streaks — cross-cycle streak state (task 2943)
+# ---------------------------------------------------------------------------
+# Successive calls stand in for successive full Stage-1 cycles.  Driven against
+# the real ledger because the whole feature is a value surviving from one cycle
+# to the next, which a mock cannot witness.
+
+_STREAK_PID = 'p'
+_STREAK_NOW = '2026-06-01T00:00:00+00:00'
+
+
+def _suppressing(*entity_uuids: str) -> flag_dedup.EntityStandingSuppressionResult:
+    """A fully evaluated cycle in which each named decision suppressed one flag."""
+    return flag_dedup.EntityStandingSuppressionResult(
+        kept_flags=[],
+        suppressed_by_decision={u: 1 for u in entity_uuids},
+        grounds_by_decision={u: GROUNDS_STRUCTURAL_SIZE_CONFLATION for u in entity_uuids},
+    )
+
+
+async def _stored_streaks(ledger: ReconLedgerStore) -> dict[str, int]:
+    rows = await ledger.list_suppression_streaks(_STREAK_PID)
+    return {row.entity_uuid: json.loads(row.payload_json)[STREAK_PAYLOAD_KEY] for row in rows}
+
+
+async def _run_cycle(
+    memory_service: Any,
+    run_id: str,
+    result: flag_dedup.EntityStandingSuppressionResult,
+    *,
+    now: str = _STREAK_NOW,
+) -> list:
+    return await flag_dedup.update_suppression_streaks(
+        memory_service, _STREAK_PID, run_id, result, now=now
+    )
+
+
+class TestUpdateSuppressionStreaks:
+    """Increment, reset and replay rules of the streak state (task 2943 step-7)."""
+
+    @pytest.mark.asyncio
+    async def test_first_suppressing_cycle_persists_streak_one(self, ledger_memory_service):
+        updates = await _run_cycle(ledger_memory_service, 'run-1', _suppressing(_ESD_U1))
+
+        assert updates == [
+            flag_dedup.SuppressionStreakUpdate(
+                entity_uuid=_ESD_U1,
+                grounds=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+                streak=1,
+                escalate=False,
+            )
+        ]
+        rows = await ledger_memory_service.recon_ledger.list_suppression_streaks(_STREAK_PID)
+        assert len(rows) == 1
+        payload = json.loads(rows[0].payload_json)
+        assert payload[STREAK_PAYLOAD_KEY] == 1
+        assert payload['last_run_id'] == 'run-1'
+        assert rows[0].expires_at == '2026-08-30T00:00:00+00:00', (
+            'expires_at is the write time plus STANDING_DECISION_TTL_DAYS'
+        )
+
+    @pytest.mark.asyncio
+    async def test_escalates_from_the_kth_consecutive_cycle_and_keeps_counting(
+        self, ledger_memory_service
+    ):
+        """Inclusive >= K, and escalating does not reset the counter."""
+        assert SUPPRESSION_STREAK_THRESHOLD_CYCLES == 3
+        seen = []
+        for n in range(1, 5):
+            (update,) = await _run_cycle(
+                ledger_memory_service, f'run-{n}', _suppressing(_ESD_U1)
+            )
+            seen.append((update.streak, update.escalate))
+
+        assert seen == [(1, False), (2, False), (3, True), (4, True)]
+        assert await _stored_streaks(ledger_memory_service.recon_ledger) == {_ESD_U1: 4}
+
+    @pytest.mark.asyncio
+    async def test_quiet_cycle_resets_and_the_next_streak_restarts_at_one(
+        self, ledger_memory_service
+    ):
+        ledger = ledger_memory_service.recon_ledger
+        await _run_cycle(ledger_memory_service, 'run-1', _suppressing(_ESD_U1))
+        await _run_cycle(ledger_memory_service, 'run-2', _suppressing(_ESD_U1))
+
+        updates = await _run_cycle(ledger_memory_service, 'run-3', _suppressing(_ESD_U2))
+
+        assert await _stored_streaks(ledger) == {_ESD_U1: 0, _ESD_U2: 1}
+        assert {u.entity_uuid: (u.streak, u.escalate) for u in updates} == {
+            _ESD_U1: (0, False),
+            _ESD_U2: (1, False),
+        }
+
+        (restart,) = [
+            u
+            for u in await _run_cycle(ledger_memory_service, 'run-4', _suppressing(_ESD_U1))
+            if u.entity_uuid == _ESD_U1
+        ]
+        assert restart.streak == 1
+
+    @pytest.mark.asyncio
+    async def test_already_zero_row_is_not_rewritten_on_a_quiet_cycle(
+        self, ledger_memory_service
+    ):
+        """No needless TTL refresh for a decision that has gone quiet."""
+        ledger = ledger_memory_service.recon_ledger
+        await _run_cycle(ledger_memory_service, 'run-1', _suppressing(_ESD_U1))
+        await _run_cycle(
+            ledger_memory_service,
+            'run-2',
+            flag_dedup.EntityStandingSuppressionResult.empty_batch(),
+            now='2026-06-02T00:00:00+00:00',
+        )
+        (reset_row,) = await ledger.list_suppression_streaks(_STREAK_PID)
+
+        updates = await _run_cycle(
+            ledger_memory_service,
+            'run-3',
+            flag_dedup.EntityStandingSuppressionResult.empty_batch(),
+            now='2026-06-03T00:00:00+00:00',
+        )
+
+        assert updates == []
+        (row,) = await ledger.list_suppression_streaks(_STREAK_PID)
+        assert row == reset_row
+
+    @pytest.mark.asyncio
+    async def test_replayed_run_id_does_not_increment(self, ledger_memory_service):
+        for n in range(1, 4):
+            await _run_cycle(ledger_memory_service, f'run-{n}', _suppressing(_ESD_U1))
+
+        (replayed,) = await _run_cycle(ledger_memory_service, 'run-3', _suppressing(_ESD_U1))
+
+        assert (replayed.streak, replayed.escalate) == (3, True)
+        assert await _stored_streaks(ledger_memory_service.recon_ledger) == {_ESD_U1: 3}
+
+    @pytest.mark.asyncio
+    async def test_two_entities_accumulate_independent_streaks(self, ledger_memory_service):
+        await _run_cycle(ledger_memory_service, 'run-1', _suppressing(_ESD_U1))
+        await _run_cycle(ledger_memory_service, 'run-2', _suppressing(_ESD_U1, _ESD_U2))
+        updates = await _run_cycle(
+            ledger_memory_service, 'run-3', _suppressing(_ESD_U1, _ESD_U2)
+        )
+
+        assert {u.entity_uuid: (u.streak, u.escalate) for u in updates} == {
+            _ESD_U1: (3, True),
+            _ESD_U2: (2, False),
+        }
+        assert await _stored_streaks(ledger_memory_service.recon_ledger) == {
+            _ESD_U1: 3,
+            _ESD_U2: 2,
+        }
