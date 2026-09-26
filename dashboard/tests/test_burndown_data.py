@@ -563,7 +563,7 @@ class TestEnsureSnapshotColumns:
             cur = await conn.execute(
                 'SELECT * FROM snapshots WHERE project_id = ?', (_PRE_DELTA1_ROW['project_id'],),
             )
-            rows = await cur.fetchall()
+            rows = list(await cur.fetchall())
 
         assert len(rows) == 1
         row = rows[0]
@@ -2155,49 +2155,31 @@ class TestCollectSnapshotOrchestratorDiscoveryFailure:
     async def test_oserror_from_post_helper_resolve_emits_specific_warning(
         self, burndown_env, caplog, dummy_client,
     ):
-        """OSError from project_root.resolve() (line 134) after the helper returns
-        must emit a warning specifically mentioning 'resolve', not the generic
-        'processing failed' message, and must not prevent other entries from being
-        snapshotted.
+        """An OSError while resolving one orchestrator's project root must emit
+        the resolution-specific warning, not the generic 'processing failed'
+        one, and must not prevent other entries from being snapshotted.
 
-        This tests the untested gap: the .resolve() call AFTER _resolve_project_root
-        or _read_project_root_from_config returns successfully.
+        The OSError is raised by the resolution helper itself for the bad
+        entry, so it is discovery's own ``except OSError`` branch that must
+        report it. (An earlier form patched ``Path.resolve`` and passed only
+        because a LATER read-failure warning happened to name a root called
+        ``orch_resolve_bad``.)
         """
         db_path, base_config, conn = burndown_env
 
-        good_orch_root = Path('/fake/project/orch_resolve_good')
-        bad_orch_root = Path('/fake/project/orch_resolve_bad')
-
-        # Config must be created BEFORE patching Path.resolve so __post_init__ succeeds
+        good_orch_root = Path('/fake/project/orch_good')
         config = DashboardConfig(
             project_root=base_config.project_root,
             known_project_roots=[],
         )
-
-        main_tasks = [{'status': 'pending'}]
-        good_orch_tasks = [{'status': 'done'}]
-        _tasks_map = {
-            config.project_root: main_tasks,
-            good_orch_root: good_orch_tasks,
-        }
-
-        # Capture bad_prefix BEFORE patching (established pattern from
-        # test_skips_known_root_on_resolve_error)
-        bad_prefix = str(bad_orch_root.resolve())
-
-        original_resolve = Path.resolve
-
-        def selective_bad_resolve(self, *args, **kwargs):
-            if str(self).startswith(bad_prefix):
-                raise OSError('simulated post-helper resolve failure')
-            return original_resolve(self, *args, **kwargs)
+        store = _CannedStore({
+            config.project_root: [{'status': 'pending'}],
+            good_orch_root: [{'status': 'done'}],
+        })
 
         def fake_resolve_project_root(prd_path, fallback):
-            # Return Path directly without calling .resolve() internally.
-            # This simulates the helper succeeding so that line 134's
-            # project_root.resolve() is the source of the OSError.
             if 'bad' in str(prd_path):
-                return bad_orch_root
+                raise OSError('simulated project-root resolution failure')
             return good_orch_root
 
         orchestrator_entries = [
@@ -2207,12 +2189,11 @@ class TestCollectSnapshotOrchestratorDiscoveryFailure:
 
         with (
             caplog.at_level(logging.WARNING, logger='dashboard.data.burndown'),
-            patch.object(Path, 'resolve', selective_bad_resolve),
-            _serve(_CannedStore(_tasks_map)),
+            _serve(store),
             patch('dashboard.data.burndown.find_running_orchestrators', return_value=orchestrator_entries),
             patch('dashboard.data.burndown._resolve_project_root', side_effect=fake_resolve_project_root),
         ):
-            # Must NOT raise despite the injected OSError from project_root.resolve()
+            # Must NOT raise despite the injected OSError.
             await collect_snapshot(conn, config, client=dummy_client)
 
         async with conn.execute('SELECT project_id FROM snapshots') as cur:
@@ -2223,18 +2204,20 @@ class TestCollectSnapshotOrchestratorDiscoveryFailure:
         assert len(rows) == 2, f'Expected 2 rows, got {len(rows)}: {project_ids}'
         assert str(base_config.project_root) in project_ids
         assert str(good_orch_root.resolve()) in project_ids
-        assert bad_prefix not in project_ids
 
-        # Warning contract: message must specifically mention path resolution
-        # (NOT the generic 'processing failed' message), with exc_info set.
-        # Check for 'resolv' to match both 'resolve' and 'resolving'.
-        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert warning_records, 'Expected at least one WARNING for post-helper resolve failure'
-        combined = ' '.join(r.getMessage() for r in warning_records)
-        assert 'resolv' in combined.lower(), (
-            f'Expected "resolv" (resolve/resolving) in warning message, got: {combined!r}'
+        # Warning contract: the resolution-specific message (NOT the generic
+        # 'processing failed' one), with exc_info set.
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'dashboard.data.burndown'
+        ]
+        resolving = [r for r in warning_records if 'resolv' in r.getMessage().lower()]
+        assert resolving, (
+            'Expected a WARNING about resolving the project root, got: '
+            f'{[r.getMessage() for r in warning_records]!r}'
         )
-        assert any(r.exc_info for r in warning_records)
+        assert all(r.exc_info for r in resolving)
+        assert not [r for r in warning_records if 'processing failed' in r.getMessage()]
 
 
 # ---------------------------------------------------------------------------

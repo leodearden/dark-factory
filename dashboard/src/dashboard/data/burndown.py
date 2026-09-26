@@ -1,112 +1,50 @@
 """Burndown snapshot collection, downsampling, and chart queries.
 
-Periodically snapshots task status counts per project into a SQLite table.
-The background collector (in app.py lifespan) writes via a dedicated writable
-connection; route handlers read via DbPool (read-only).
+Periodically writes one row per project into a SQLite ``snapshots`` table.
+The background collector (``loops._burndown_loop``) writes via a dedicated
+writable connection; route handlers read via DbPool (read-only).
 
-Each snapshot row carries three things beyond the six display zones
-(task 3543 / PRD ι, spec S8/E12):
+THE SOURCE is the task snapshot unit,
+``dashboard/src/dashboard/data/task_snapshot.py::acquire_snapshot`` — the same
+cached unit ``/api/v2/dashboard/tasks`` serves — never a whole-tree read. The
+unit's census gives the nine ``TaskStatus`` member columns; its rows give the
+``in_progress_live`` / ``in_progress_stranded`` split and ``in_progress_rows``
+(task 5591). ``concurrency_cap`` is ``max_concurrent_tasks`` as it stood AT
+SNAPSHOT TIME, ``NULL`` when unknown (task 3543).
 
-* ``in_progress_live`` / ``in_progress_stranded`` — a partition of the
-  ``in_progress`` zone, so a window full of strands is legible as such
-  instead of reading as healthy throughput.
-* ``concurrency_cap`` — ``max_concurrent_tasks`` as it stood AT SNAPSHOT
-  TIME, ``NULL`` when unknown.
-
-The collector's single source is ``fetch_tasks`` (MCP ``get_tasks``): the
-compact ``fetch_statuses`` map carries no claimant columns, so the split
-cannot be derived from it at all.
+A row is written only from a unit whose two halves are both FRESH at the
+collector's instant; see :func:`collect_snapshot`.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import enum
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from types import MappingProxyType
 from typing import Any
 
 import aiosqlite
 import httpx
+from shared.task_statuses import TaskStatus
 
 from dashboard.config import DashboardConfig
+from dashboard.data.census import TaskCensus, TaskView
+from dashboard.data.datum import DatumState
 from dashboard.data.orchestrator import (
     _read_project_root_from_config,
     _resolve_project_root,
     find_running_orchestrators,
     read_max_concurrent_tasks,
 )
-from dashboard.data.tasks import fetch_tasks, task_is_stranded
+from dashboard.data.task_snapshot import TaskSnapshot, acquire_snapshot, as_served
 from dashboard.data.utils import resolve_now
 
 logger = logging.getLogger(__name__)
-
-# Tasks per get_tasks response for the snapshot read.  See the SOURCE comment
-# in collect_snapshot for WHY the read is paginated at all; this comment is
-# only about the NUMBER.
-#
-# DERIVED FROM MEASURED FULL-ROW DENSITY, not by analogy with any other cap.
-# Measured read-only against this repo's own backend (.taskmaster/tasks/
-# tasks.db, 4,941 tasks, each row serialised as get_tasks delivers it):
-#
-#     mean 5,234 chars/task   median 3,999   p95 13,917   p99 25,197
-#     max 95,838
-#
-# The transport wall sits between the ~62,000-char documented-safe envelope
-# and the ~80-85 KB observed rejection point (fused-memory server/tools.py and
-# fused-memory/tests/test_get_statuses_pagination.py record both numbers from
-# the reify incident).  62,000 / 5,234 => ~11.8 rows, so 10 is the
-# conservative side of a TYPICAL page: 10 x 5,234 ~= 52 KB.
-#
-# THIS BOUNDS THE TYPICAL PAGE, NOT EVERY PAGE.  The tail is not bounded by
-# any page size: a single p99 row is 25 KB and the largest real row is 95,838
-# chars, already over the envelope on its own.  So a page of 10 dense rows can
-# still be rejected, and NO choice of _SNAPSHOT_PAGE_SIZE makes the read
-# unconditionally safe.  It is a large reduction in the probability of a
-# rejected cycle, not a proof against one.  When a page IS rejected the read
-# fails loud and all-or-nothing (fetch_tasks discards partial rows and returns
-# the offline marker) rather than writing an undercount as fact.
-#
-# COST -- MEASURED, and NOT affordable enough to pay unconditionally.  The
-# fused-memory server materialises the whole task list and slices it in memory
-# per request (tools.py get_tasks), so an N-task project costs ceil(N/10)
-# SEQUENTIAL round trips and O(N^2/10) server-side row builds per cycle --
-# ~496 requests for this repo's 4,956 tasks.  Timed read-only against this
-# repo's own backend: ~0.33-0.35 s per paginated request, so ~209 s of
-# continuous work for ONE root.  An earlier revision of this comment called
-# that "affordable because the collector runs once per 600 s"; that was wrong
-# by the measurement.  collect_snapshot fans out over EVERY discovered root
-# concurrently against a single server where the requests serialise
-# server-side, so at 3+ roots an unconditionally-paginated cycle approaches or
-# exceeds _SAMPLE_INTERVAL_SECONDS (600 s) -- ~35% of the interval per root,
-# on the same httpx client the 2 s render polls share (a live
-# httpx.PoolTimeout risk for request-path handlers), plus ~500 _log_read audit
-# writes per root per cycle.
-#
-# That measurement is why the paginated read is now GATED behind a size probe
-# rather than issued unconditionally -- see _fetch_snapshot_tasks.  Small roots
-# cost one request again; only a tree that genuinely exceeds the envelope pays
-# the ceil(N/10) walk.
-#
-# The residual per-root cost is the strongest argument that get_tasks
-# pagination is the wrong long-term lever: the loop reads exactly four keys per
-# task and a field-limited or statuses-filtered read would cost a fraction of
-# this.  No such read exists at any layer today (see collect_snapshot's SOURCE
-# comment); task 4390 is the open follow-up that would add get_tasks field
-# projection at the source, at which point this constant and the pagination it
-# drives should be revisited rather than tuned.
-#
-# THIS BLOCK IS THE SINGLE SOURCE for the density measurement and the cost
-# model above: _fetch_snapshot_tasks, collect_snapshot's inline block, the
-# fetch_tasks docstring and the test class all point HERE rather than restating
-# the numbers, so a re-measurement is a one-place edit.
-#
-# Pinned by TestSnapshotPageSizeIsSizedFromMeasuredDensity::
-# test_a_typical_page_fits_the_documented_safe_envelope in
-# dashboard/tests/test_burndown_data.py so a future bump cannot silently
-# re-cross the wall.
-_SNAPSHOT_PAGE_SIZE = 10
 
 # Whole-operation bound for ONE root's snapshot read, enforced by
 # collect_snapshot's Phase-2 gather.
@@ -208,30 +146,29 @@ _ADDED_SNAPSHOT_COLUMNS: tuple[tuple[str, str], ...] = (
     ('reason', 'TEXT'),
 )
 
-# Maps raw task statuses to the 6 display zones.
-_STATUS_MAP: dict[str, str] = {
-    'pending': 'pending',
-    'in-progress': 'in_progress',
-    'review': 'in_progress',
-    'blocked': 'blocked',
-    'deferred': 'deferred',
-    'cancelled': 'cancelled',
-    'done': 'done',
-}
 
-_ZONE_KEYS = ('pending', 'in_progress', 'blocked', 'deferred', 'cancelled', 'done')
 
-# The in_progress zone's live/stranded split (task 3543 / PRD ι, spec S8).
-# First-class snapshot columns, but NOT display zones: they partition
-# ``in_progress`` rather than sitting alongside it, so summing _ZONE_KEYS still
-# yields the task total.
-_SPLIT_KEYS = ('in_progress_live', 'in_progress_stranded')
+class SnapshotState(enum.StrEnum):
+    """What one ``snapshots`` row records: a measurement, or its absence.
 
-_INSERT_SNAPSHOT_SQL = (
-    'INSERT INTO snapshots (project_id, ts, pending, in_progress, blocked, deferred, cancelled, done, '
-    'in_progress_live, in_progress_stranded, concurrency_cap) '
-    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    NULL on a row written before task 5591 means ``VALUE``: until then only a
+    successful read wrote a row at all.
+    """
+
+    VALUE = 'value'
+    GAP = 'gap'
+
+
+MEMBER_COLUMNS: Mapping[TaskStatus, str] = MappingProxyType(
+    {member: member.value.replace('-', '_') for member in TaskStatus}
 )
+"""The ``snapshots`` column holding each ``TaskStatus`` member's census count.
+
+ONE naming rule over the closed enum, in ``TaskStatus`` order, so the columns
+follow the vocabulary rather than restating it. A tenth member maps to a
+column that does not exist, and its INSERT fails loudly instead of the count
+being absorbed into another member.
+"""
 
 
 async def ensure_snapshot_columns(conn: aiosqlite.Connection) -> None:
@@ -246,8 +183,8 @@ async def ensure_snapshot_columns(conn: aiosqlite.Connection) -> None:
 
     Mandatory, not cosmetic: :data:`BURNDOWN_SCHEMA` is applied with
     ``CREATE TABLE IF NOT EXISTS``, which is a no-op against every already
-    deployed burndown.db.  Without this, the widened
-    :data:`_INSERT_SNAPSHOT_SQL` would fail on the first collection cycle after
+    deployed burndown.db.  Without this, the collector's INSERT, which names
+    every current column, would fail on the first collection cycle after
     deploy.  Call it at store open, before the collector runs.
 
     Mirrors fused-memory's ``_migrate_v1_to_v2`` probe-then-add idiom.  The
@@ -263,122 +200,85 @@ async def ensure_snapshot_columns(conn: aiosqlite.Connection) -> None:
         logger.info('burndown: added snapshots.%s (%s)', column, ddl)
 
 
-def _count_statuses(statuses: dict[int, str | None]) -> dict[str, int]:
-    """Count statuses (id → status) by mapped display zone.
+@dataclass(frozen=True, slots=True)
+class _Measurement:
+    """What a wholly fresh snapshot unit measured, narrowed to present values."""
 
-    Superseded by :func:`_count_zones` for the collector, which needs the
-    claimant columns that the ``{id: status}`` map does not carry.  Retained
-    for callers that only have statuses to hand.
+    census: TaskCensus
+    in_progress_live: int
+    in_progress_stranded: int
+
+
+def _measurement(served: TaskSnapshot) -> _Measurement | None:
+    """*served*'s measurement, or ``None`` unless BOTH halves are ``FRESH``.
+
+    A ``STALE`` half is a last-good value from an EARLIER instant, so writing
+    it at this cycle's ``ts`` would record an old census as current. A fresh
+    census beside unmeasured rows is not a measurement either: the legacy
+    split columns are NOT NULL and cannot say "unknown".
     """
-    counts: dict[str, int] = {k: 0 for k in _ZONE_KEYS}
-    for raw in statuses.values():
-        zone = _STATUS_MAP.get(raw or 'pending', 'pending')
-        counts[zone] += 1
-    return counts
+    if served.census.state is not DatumState.FRESH or served.rows.state is not DatumState.FRESH:
+        return None
+    census = served.census.value
+    live, stranded = served.in_progress_live, served.in_progress_stranded
+    if census is None or live is None or stranded is None:
+        return None
+    return _Measurement(census, live, stranded)
 
 
-def _count_zones(tasks: Sequence[Mapping[str, Any]], now: datetime) -> dict[str, int]:
-    """Count shaped task rows by display zone, splitting ``in_progress``.
+@dataclass(frozen=True, slots=True)
+class _SnapshotRow:
+    """One ``snapshots`` row as the collector writes it.
 
-    Returns the six :data:`_ZONE_KEYS` counts plus :data:`_SPLIT_KEYS`
-    (``in_progress_live`` / ``in_progress_stranded``), which partition the
-    ``in_progress`` zone rather than adding to it.
-
-    Takes shaped task rows (as ``dashboard.data.tasks._shape_task`` emits) and
-    NOT the ``{id: status}`` map, because the split needs the claimant columns
-    that only ``get_tasks`` carries.
-
-    *now* is the reference instant for the strand verdict, supplied by the
-    caller (the collector captures one instant per cycle) — this function never
-    reads the clock.
-
-    **The split is a subtraction, deliberately.** ``in_progress_stranded`` is
-    counted directly via :func:`dashboard.data.tasks.task_is_stranded`, and
-    ``in_progress_live`` is then ``zone_total - stranded``.  Never derive
-    ``live`` independently (e.g. via ``has_live_claimant``, which carries
-    neither the status gate nor the ``metadata.infra_hold`` carve-out): only
-    the subtraction makes the conservation invariant
-    ``live + stranded == in_progress`` true by construction, and that invariant
-    is what makes the stacked chart and the parity alarm auditable.
-
-    A consequence worth naming: ``_STATUS_MAP`` folds BOTH 'in-progress' and
-    'review' into the ``in_progress`` zone, but ``is_stranded`` hard-gates on
-    ``status == 'in-progress'`` and can never fire for a 'review' row.  A
-    claimant-less review row therefore lands in ``live``.  That under-reports
-    strands and never over-reports them, which is the correct direction to err
-    for a surface that raises alarms.
+    *measured* maps column to value, in insert order.
     """
-    counts: dict[str, int] = {k: 0 for k in (*_ZONE_KEYS, *_SPLIT_KEYS)}
-    for task in tasks:
-        zone = _STATUS_MAP.get(task.get('status') or 'pending', 'pending')
-        counts[zone] += 1
-        if task_is_stranded(task, now=now):
-            counts['in_progress_stranded'] += 1
-    counts['in_progress_live'] = counts['in_progress'] - counts['in_progress_stranded']
-    return counts
+
+    project_id: str
+    ts: str
+    state: SnapshotState
+    reason: str | None
+    measured: Mapping[str, int | None]
 
 
-async def _fetch_snapshot_tasks(
-    client: httpx.AsyncClient,
-    config: DashboardConfig,
-    root: str,
-) -> list[dict] | dict:
-    """Read one project's full task tree for a snapshot, unpaginated FIRST.
-
-    SIZE PROBE, not an optimisation of the paginated path.  The paginated read
-    costs ``ceil(N/P)`` SEQUENTIAL round trips — MEASURED at ~209 s for ONE
-    root of this repo's size — and ``collect_snapshot`` fans out over every
-    discovered root concurrently against a SINGLE server where the requests
-    serialise, on the same httpx client the 2 s render polls use.  Paying that
-    unconditionally is a live ``httpx.PoolTimeout`` risk for request-path
-    handlers, not a ten-minute rounding error.  The measurement, its
-    derivation, and the cost model behind it live in ONE place:
-    ``_SNAPSHOT_PAGE_SIZE``.
-
-    So pagination is now the EXCEPTION: issue one ordinary unpaginated read
-    (exactly what this collector did before pagination existed) and fall back
-    to the paginated path only when it comes back as the offline marker.  A
-    project whose tree fits the transport envelope — every small root, which
-    is most of the fan-out — costs ONE request per cycle again.
-
-    This does NOT make the big-root case cheap: a tree that genuinely exceeds
-    the envelope pays one rejected probe and then the full walk, so for a
-    project the size of this repo that path is still the steady state.  The
-    probe bounds the FAN-OUT amplification (R roots x ceil(N/P) -> 1 root x
-    ceil(N/P) + 1 + (R-1) x 1), not the per-root cost.  Only a field-limited
-    read fixes that; task 4390 is the open follow-up.
-
-    The probe cannot mask a real outage: a genuinely offline server fails the
-    probe AND the fallback's first request, so the offline marker is still what
-    reaches ``collect_snapshot``'s triage.  A successful probe is cached by
-    ``fetch_tasks`` exactly as any other successful read.
-
-    Returns whatever ``fetch_tasks`` returns — a ``list[dict]`` on success or
-    the ``{'offline': True, 'error': str}`` marker — so the caller's existing
-    triage is unchanged.
-    """
-    probe = await fetch_tasks(client, config, root)
-    if isinstance(probe, list):
-        return probe
-    logger.debug(
-        'Unchunked snapshot read rejected for %s (%s); retrying the walk at chunk_size=%d',
-        root,
-        probe.get('error') if isinstance(probe, dict) else probe,
-        _SNAPSHOT_PAGE_SIZE,
+def _value_row(
+    project_id: str, ts: str, measurement: _Measurement, cap: int | None,
+) -> _SnapshotRow:
+    """The row recording *measurement*: nine members from the census, split from the rows."""
+    counts = measurement.census.counts
+    live, stranded = measurement.in_progress_live, measurement.in_progress_stranded
+    return _SnapshotRow(
+        project_id=project_id,
+        ts=ts,
+        state=SnapshotState.VALUE,
+        reason=None,
+        measured=MappingProxyType({
+            **{column: counts[member] for member, column in MEMBER_COLUMNS.items()},
+            'in_progress_live': live,
+            'in_progress_stranded': stranded,
+            # The unit's own partition of the rows, whole. Not a recount of
+            # statuses here, so live + stranded == in_progress_rows by
+            # construction.
+            'in_progress_rows': live + stranded,
+            # NULL, never 0, when the cap is unknown: a stored 0 would read as
+            # a cap of zero and alarm on every row.
+            'concurrency_cap': cap,
+        }),
     )
-    # `chunk_size` alone selects the walk: `fetch_tasks` returns the COMPLETE
-    # set either way, chunked or not, so there is no flag to forget and no way
-    # to accidentally snapshot the first _SNAPSHOT_PAGE_SIZE tasks as the whole
-    # tree.  (`fetch_task_page` is the function that returns one page.)
-    #
-    # This read and the probe above deliberately key SEPARATELY, and that is
-    # NOT an accident to tidy away: `chunk_size` is part of the cache key even
-    # though it is pure transport.  Why removing it silently costs exactly the
-    # oversize trees this path exists for is stated once, at
-    # `dashboard/src/dashboard/data/tasks.py::_CompleteRead`.
-    return await fetch_tasks(
-        client, config, root,
-        chunk_size=_SNAPSHOT_PAGE_SIZE,
+
+
+async def _insert_row(conn: aiosqlite.Connection, row: _SnapshotRow) -> None:
+    """INSERT *row* by explicit column names, binding ``project_id`` first."""
+    columns: dict[str, object] = {
+        'project_id': row.project_id,
+        'ts': row.ts,
+        **row.measured,
+        'state': row.state.value,
+        'reason': row.reason,
+    }
+    await conn.execute(
+        f'INSERT INTO snapshots ({", ".join(columns)}) '
+        f'VALUES ({", ".join("?" for _ in columns)})',
+        tuple(columns.values()),
     )
 
 
@@ -387,7 +287,15 @@ async def collect_snapshot(
     config: DashboardConfig,
     client: httpx.AsyncClient,
 ) -> None:
-    """Discover projects and insert one snapshot row per project.
+    """Discover projects and insert one snapshot row per measured project.
+
+    Each root is read through the task snapshot unit
+    (``task_snapshot.acquire_snapshot``), and the unit is judged as served at
+    this cycle's instant. A root whose census and rows are BOTH fresh gets a
+    value row: the census gives the nine member columns, the rows give the
+    live/stranded split. A root whose unit is not wholly fresh is logged at
+    DEBUG and skipped; a root whose acquisition raises (or overruns
+    ``_SNAPSHOT_PER_ROOT_BUDGET``) is logged at WARNING and skipped.
 
     Partial-failure semantics:
 
@@ -418,10 +326,10 @@ async def collect_snapshot(
     """
     try:
         now_dt = datetime.now(UTC)  # clock-exempt: single-capture writer
-        # One instant for the whole cycle: the ``ts`` written to every row and
-        # the reference the strand verdicts are judged against must be the SAME
-        # capture, or a row could claim a strand count that its own timestamp
-        # contradicts.
+        # One instant for the whole cycle: the ``ts`` written to every row, the
+        # instant a unit is measured at, and the one it is served at must be
+        # the SAME capture, or a row could claim a measurement its own
+        # timestamp contradicts.
         now = now_dt.isoformat()
         # config.project_root is already resolved by DashboardConfig.__post_init__
         resolved_root = str(config.project_root)
@@ -480,63 +388,19 @@ async def collect_snapshot(
             seen_roots.add(root_str)
             roots_to_snapshot.append(root_str)
 
-        # Phase 2 — Parallel read:
-        # Each fetch_tasks call hits fused-memory MCP independently;
-        # return_exceptions=True isolates per-project network failures so a
-        # single offline server can't sink the whole cycle.
+        # Phase 2 — Parallel read, one snapshot unit per root.
+        # return_exceptions=True isolates a root whose acquisition raises, so a
+        # single bad root can't sink the whole cycle (task 519).
         #
-        # SOURCE: fetch_tasks (MCP get_tasks), NOT the ~95%-smaller
-        # fetch_statuses (get_statuses).  get_statuses returns a bare
-        # {id: status} map with no claimant columns, so the live/stranded
-        # split is physically underivable from it.  The collector runs once
-        # per _SAMPLE_INTERVAL_SECONDS (600s), so the larger payload is a
-        # ten-minute cost, not a per-render one — and it collapses the
-        # collector onto ONE source instead of two that can disagree.
-        #
-        # PAGINATED-ON-DEMAND because `snapshots` is an APPEND-ONLY historical
-        # record.  A single whole-tree response that exceeds the MCP transport
-        # limit is rejected wholesale; fetch_tasks then reports offline and the
-        # triage below skips the project, so that cycle's row is never written
-        # and no later cycle backfills it — a permanent, unexplained hole in
-        # the chart.  _fetch_snapshot_tasks probes unpaginated first and falls
-        # back to the paginated walk only on rejection; why the walk is the
-        # exception rather than the steady state is on that helper, and why no
-        # page size is unconditionally safe is on _SNAPSHOT_PAGE_SIZE.
-        #
-        # Pagination is the only lever available, not the ideal one, and this
-        # is the loop that shows why: it reads exactly four keys per task —
-        # status, claimant_run_id, heartbeat_at, and metadata['infra_hold'] —
-        # so a field-limited read would be strictly better.  None exists at any
-        # layer: MCP get_tasks accepts only project_root/tag/page_size/offset/
-        # statuses (fused-memory server/tools.py) and the backend query is
-        # `SELECT *` (sqlite_task_backend.py:1534).  Pagination therefore
-        # bounds delivery, not work.
-        #
-        # A fetch_statuses fallback on oversize was considered and REJECTED:
-        # in_progress_live/in_progress_stranded are INTEGER NOT NULL DEFAULT 0
-        # (BURNDOWN_SCHEMA), so a statuses-only row cannot express "split
-        # unknown" — it would have to write stranded=0, manufacturing a
-        # confident zero out of a degraded read.  Trading a visible hole for an
-        # invisible lie in a permanent record is the wrong direction.
-        #
-        # Request-path callers are unaffected: page_size is opt-in and
-        # active_tasks still calls fetch_tasks with no page_size at all.
-        #
-        # WHOLE-OPERATION BOUND, per root (task 4884 / #4424).  Before this,
-        # collect_snapshot was the last unbounded fetch_tasks caller in the
-        # tree: a single hung MCP fan-out parked the collector task forever and
-        # every project's burndown row stopped, silently.  Each element is now
-        # wrapped in asyncio.wait_for at _SNAPSHOT_PER_ROOT_BUDGET (see that
-        # constant for why the value is not the route convention's 7.0).
-        # Expiry is a SKIPPED ROOT, not an aborted cycle: return_exceptions=True
-        # turns the TimeoutError into that root's own result, which the Phase-3
-        # triage below already handles in its isinstance(result, BaseException)
-        # branch — logged with exc_info, then continue.  Nothing in the triage
-        # changed, and task 519's partial-success semantics are untouched.
+        # WHOLE-OPERATION BOUND per root (task 4884 / #4424): an unbounded
+        # sampler await once parked every project's history silently, so each
+        # acquisition is wrapped at _SNAPSHOT_PER_ROOT_BUDGET even though the
+        # unit bounds its own reads. Expiry becomes that root's own
+        # TimeoutError result, handled below like any other raise.
         all_results = await asyncio.gather(
             *(
                 asyncio.wait_for(
-                    _fetch_snapshot_tasks(client, config, root),
+                    acquire_snapshot(client, config, root, now=now_dt),
                     timeout=_SNAPSHOT_PER_ROOT_BUDGET,
                 )
                 for root in roots_to_snapshot
@@ -550,53 +414,35 @@ async def collect_snapshot(
         # cannot roll back rows that were already committed for earlier projects.
         for root_str, result in zip(roots_to_snapshot, all_results, strict=True):
             if isinstance(result, BaseException):
-                logger.warning('Failed to fetch tasks for %s', root_str, exc_info=result)
+                logger.warning('Snapshot acquisition failed for %s', root_str, exc_info=result)
                 continue
-            # The offline marker is a dict, a healthy result is a list — check
-            # the marker FIRST so a known outage is reported as an outage
-            # rather than as a malformed result.
-            if isinstance(result, dict) and result.get('offline'):
-                logger.debug('fetch_tasks offline for %s: %s', root_str, result.get('error'))
+            served = as_served(result, now_dt)
+            measurement = _measurement(served)
+            if measurement is None:
+                logger.debug(
+                    'Snapshot unit for %s is not wholly fresh (census %s, rows %s); skipped',
+                    root_str, served.census.state, served.rows.state,
+                )
                 continue
-            if not isinstance(result, list):
-                logger.warning('Unexpected fetch_tasks result for %s: %r', root_str, type(result))
-                continue
-            tasks = [t for t in result if isinstance(t, Mapping)]
             try:
-                counts = _count_zones(tasks, now_dt)
-                # One cap read per ROOT (not per task): it touches the
-                # filesystem, and the value is a per-project scalar.  Stored on
-                # the row because max_concurrent_tasks varies across restarts
-                # and across projects — see BURNDOWN_SCHEMA's concurrency_cap
-                # comment.
+                # One cap read per ROOT: it touches the filesystem, and the
+                # value is a per-project scalar stored on the row because
+                # max_concurrent_tasks varies across restarts and across
+                # projects — see BURNDOWN_SCHEMA's concurrency_cap comment.
                 cap = read_max_concurrent_tasks(root_str)
-                if cap is not None and counts['in_progress'] > cap:
+                # The `running` sub-view is the one number an operator compares
+                # against max_concurrent_tasks (PRD decision 3).
+                running = measurement.census.sub_views[TaskView.RUNNING]
+                if cap is not None and running > cap:
                     logger.warning(
                         'Concurrency cap breached for %s: %d in-progress vs cap %d '
                         '(%d stranded)',
                         root_str,
-                        counts['in_progress'],
+                        running,
                         cap,
-                        counts['in_progress_stranded'],
+                        measurement.in_progress_stranded,
                     )
-                await conn.execute(
-                    _INSERT_SNAPSHOT_SQL,
-                    (
-                        root_str,
-                        now,
-                        counts['pending'],
-                        counts['in_progress'],
-                        counts['blocked'],
-                        counts['deferred'],
-                        counts['cancelled'],
-                        counts['done'],
-                        counts['in_progress_live'],
-                        counts['in_progress_stranded'],
-                        # NULL, never 0, when the cap is unknown: a stored 0
-                        # would read as a cap of zero and alarm on every row.
-                        cap,
-                    ),
-                )
+                await _insert_row(conn, _value_row(root_str, now, measurement, cap))
                 await conn.commit()
             except Exception:
                 logger.warning('Failed to insert snapshot for %s', root_str, exc_info=True)
