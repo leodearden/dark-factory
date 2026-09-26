@@ -750,9 +750,13 @@ async def _sweeps(harness, clock, count: int, *, interval: float = _SWEEP_INTERV
         await harness._reconcile_stranded_in_progress(mid_run=False)
 
 
+def _queue(harness) -> EscalationQueue:
+    return harness._escalation_queue
+
+
 def _alarms(harness, tid: str = 'T1') -> list:
     """Pending veto-streak alarms filed against *tid*'s SENTINEL id."""
-    return harness._escalation_queue.get_by_task(
+    return _queue(harness).get_by_task(
         f'{RECOVERY_VETO_STREAK_SENTINEL_PREFIX}{tid}', status='pending',
     )
 
@@ -1020,7 +1024,7 @@ class TestHumanParkedHoldsDoNotAlarm:
         )
         await _sweeps(harness, clock, 3)
         (alarm,) = _alarms(harness)
-        harness._escalation_queue.resolve(
+        _queue(harness).resolve(
             alarm.id, 'the pin is with a human now', resolved_by='interactive',
         )
         stub.reports['T1'] = _pinned_hold(escalations=[_ref('esc-1', level=2)])
