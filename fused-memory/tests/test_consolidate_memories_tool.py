@@ -2166,8 +2166,8 @@ class TestPartialIsNotARetrySignal:
 # stays the generic CONTENT, which is what makes each member-text SOURCE
 # below provable on its own.
 _XDIST_1 = (
-    'Run the fused-memory suite under pytest-xdist with --dist loadgroup so the '
-    'serial SQLite tests share one worker.'
+    'Run the fused-memory suite under pytest-xdist with --dist loadgroup and '
+    '--max-worker-restart 0 so the serial SQLite tests share one worker.'
 )
 _XDIST_2 = (
     'Gotcha: pytest-xdist hides worker crashes unless --max-worker-restart 0 is set; '

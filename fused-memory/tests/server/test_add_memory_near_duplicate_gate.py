@@ -1333,7 +1333,7 @@ _SEED_TEXTS = (
     'Stage by path, not with git add -f, because .task/plan.json lives under the '
     'gitignored .task/ directory.',
 )
-_SEED_PROBE = 'Reminder: git add -f .task/ is wrong because .task/plan.json is gitignored.'
+_SEED_PROBE = 'Reminder: git add -f .task/ is wrong because the .task/ directory is gitignored.'
 _UNRELATED_WRITE = 'Restart the dashboard after editing its config file.'
 
 

@@ -301,6 +301,38 @@ _UNRELATED_NOTE = (
     'and fail fast when a crashed build is visible to the tests.'
 )
 
+# Everyday API vocabulary of a memory-system project ('add_memory',
+# 'project_id') recurs in every member of such a topic, yet says nothing about
+# which topic a write belongs to.
+_EVERYDAY_IDENTIFIER_TEXTS = [
+    'add_memory with project_id set fails when the Qdrant payload exceeds 64KB; '
+    'split the content before calling add_memory.',
+    'Qdrant rejects a payload over 64KB, so add_memory for a long note (any project_id) '
+    'errors out; chunk it first.',
+    'The 64KB Qdrant payload limit bites add_memory: keep content under it regardless '
+    'of project_id.',
+]
+
+_PAYLOAD_LIMIT_TEXTS = [
+    'add_memory fails once the Qdrant payload exceeds the 64KB payload limit and the client '
+    'raises PayloadTooLarge error; split the note and reuse the same project_id for each '
+    'add_memory.',
+    'Gotcha: a long add_memory hits the 64KB payload limit in Qdrant, which surfaces as a '
+    'PayloadTooLarge error whatever the project_id; chunk the note first.',
+    'Keep each add_memory under the 64KB payload limit (project_id does not matter) or '
+    'Qdrant answers with a PayloadTooLarge error and nothing is stored.',
+]
+
+_UNRELATED_IDENTIFIER_WRITE = (
+    'Use update_memory instead of add_memory when amending; project_id must match the '
+    'original record.'
+)
+
+_PAYLOAD_LIMIT_PARAPHRASE = (
+    'Chunk long notes: anything over the 64KB payload limit comes back as a '
+    'PayloadTooLarge error.'
+)
+
 _TOPIC = 'pytest-xdist-serial-override'
 _HINT = 'Consolidated topic; update canonical 8bb3eb15 instead.'
 
@@ -311,6 +343,10 @@ def _derive(texts: list[str]) -> ProceduralTopicCluster | None:
 
 def _phrases_in(text: str, phrases: list[str]) -> list[str]:
     return [phrase for phrase in phrases if phrase.lower() in text.lower()]
+
+
+def _bare_tokens(phrases: list[str]) -> list[str]:
+    return [phrase for phrase in phrases if len(phrase.split()) < 2]
 
 
 class TestDeriveTopicCluster:
@@ -355,6 +391,30 @@ class TestDeriveTopicCluster:
         assert cluster is not None
         assert find_matching_topic_cluster(_UNRELATED_NOTE, [cluster]) is None
 
+    def test_everyday_identifiers_do_not_block_an_unrelated_write(self) -> None:
+        cluster = _derive(_EVERYDAY_IDENTIFIER_TEXTS)
+        assert cluster is None or (
+            find_matching_topic_cluster(_UNRELATED_IDENTIFIER_WRITE, [cluster]) is None
+        ), cluster.phrases
+
+    def test_topic_phrases_survive_beside_everyday_identifiers(self) -> None:
+        cluster = _derive(_PAYLOAD_LIMIT_TEXTS)
+
+        assert cluster is not None
+        assert _bare_tokens(cluster.phrases) == [], cluster.phrases
+        assert find_matching_topic_cluster(_UNRELATED_IDENTIFIER_WRITE, [cluster]) is None, (
+            cluster.phrases
+        )
+        assert find_matching_topic_cluster(_PAYLOAD_LIMIT_PARAPHRASE, [cluster]) is not None, (
+            cluster.phrases
+        )
+
+    def test_no_phrase_is_a_bare_token(self) -> None:
+        cluster = _derive(_XDIST_TEXTS)
+
+        assert cluster is not None
+        assert _bare_tokens(cluster.phrases) == [], cluster.phrases
+
     @pytest.mark.parametrize(
         'texts',
         [
@@ -385,6 +445,13 @@ class TestDeriveTopicCluster:
                     'Rotate the API key when the vault lease expires.',
                 ],
                 id='case_and_whitespace_variant',
+            ),
+            pytest.param(
+                [
+                    'Retry the add_memory once and log it for project_id audits.',
+                    'If the add_memory times out, record it for project_id review.',
+                ],
+                id='function_word_padded_identifiers',
             ),
         ],
     )
