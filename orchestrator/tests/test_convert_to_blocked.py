@@ -1583,10 +1583,9 @@ class TestResolveAlreadyLandedBranch:
     ) -> None:
         """Signal 4 in ISOLATION, with every earlier signal fully satisfied.
 
-        The sibling test above is now caught one step earlier, by the
-        revert-subject attribution guard — which is correct, but it means that
-        test no longer proves signal 4 does anything.  Here the removal is an
-        ORDINARY commit (``impl(924): ...``), so the merge marker is still the
+        Here the removal is an ORDINARY commit (``impl(924): ...``), so this
+        test isolates signal 4 independently of how the sibling test's revert
+        shape is attributed: the merge marker is still the
         attributing commit, its subject is not revert-shaped, and
         ``M^1..M`` still names the declared file.  The ONLY thing left that
         can decline is "does the landing's effect survive at current HEAD".
