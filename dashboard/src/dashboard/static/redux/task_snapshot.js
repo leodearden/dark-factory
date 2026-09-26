@@ -216,14 +216,21 @@ function censusHistory(data, projects, tile) {
 // placeholder, titled with its reason: an offline project reads why, not a
 // confident "No in-flight tasks". Nothing selected answers no placeholder —
 // that sentence is orch_filter.js's.
+//
+// A listed view whose Datum is not fresh lists its rows AND gets a `notes`
+// line saying why: the terminal window is always lower_bound (the newest N
+// only), and an aged snapshot is still a value, so neither passes for the
+// whole, current population.
 function viewRows(rowsDatum, terminalDatum, filter) {
   const sourced = CENSUS_VIEWS
     .filter(view => filter[view.key])
     .map(view => [view, view.key === 'terminal' ? terminalDatum : rowsDatum]);
   const holes = sourced.filter(([, datum]) => assertSnapshotDatum(datum, 'viewRows').value === null);
+  const partial = sourced.filter(([, datum]) => datum.value !== null && datum.state !== 'fresh');
   return {
     rows: sourced.flatMap(([view, datum]) => rowsInView(view.key, datum.value || [])),
     placeholder: holes.length === 0 ? null : viewRowsPlaceholder(holes),
+    notes: partial.map(viewReason),
   };
 }
 
@@ -234,8 +241,24 @@ function rowsInView(key, rows) {
 function viewRowsPlaceholder(holes) {
   return {
     text: SNAPSHOT_PLACEHOLDER + ' ' + holes.map(([view]) => view.label).join(', ') + ' rows',
-    title: holes.map(([view, datum]) => view.label + ': ' + datum.reason).join('; '),
+    title: holes.map(viewReason).join('; '),
   };
+}
+
+function viewReason([view, datum]) {
+  return view.label + ': ' + datum.reason;
+}
+
+// ── The terminal window, for a surface that lists it without requesting it ──
+// Terminal rows come only from the on-demand ?terminal=<project> window.
+// OrchTab lists that window when another surface's request has landed one, but
+// never requests it itself. data.js::datumFor would call an absent window
+// 'not yet fetched', which promises a fetch that is not coming, so the hole
+// states what is actually true instead.
+const TERMINAL_NOT_REQUESTED = 'the terminal window is fetched on request only, and this view does not request it';
+
+function unrequestedTerminalRows(served) {
+  return isSnapshotDatum(served) ? served : unknownSnapshotDatum(TERMINAL_NOT_REQUESTED);
 }
 
 // Module-unique export const, never a bare `API` — the CANONICAL note in
@@ -255,6 +278,7 @@ const TASK_SNAPSHOT_API = {
   censusHistory,
   projectRows,
   viewRows,
+  unrequestedTerminalRows,
 };
 
 if (typeof module !== 'undefined' && module.exports) {

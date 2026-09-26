@@ -375,13 +375,36 @@ class TestOrchTabReadsTheCensus:
     def test_the_rows_come_from_the_snapshot_by_view(self, orch_tab_code):
         assert re.search(
             r'viewRows\(\s*projectRows\(\s*DF\s*,\s*o\.project\s*\)\s*,\s*'
-            r'datumFor\(\s*ON_DEMAND_KEYS\.terminal\.key\(\s*o\.project\s*\)\s*\)',
+            r'unrequestedTerminalRows\(\s*DF\[\s*ON_DEMAND_KEYS\.terminal\.key\(\s*o\.project\s*\)\s*\]\s*\)',
             orch_tab_code,
-        ), 'OrchTab rows do not come from viewRows(projectRows(DF, o.project), datumFor(ON_DEMAND_KEYS.terminal.key(o.project)), ...)'
+        ), (
+            'OrchTab rows do not come from viewRows(projectRows(DF, o.project), '
+            'unrequestedTerminalRows(DF[ON_DEMAND_KEYS.terminal.key(o.project)]), ...). '
+            'OrchTab never requests the terminal window, so an absent one must say so '
+            'rather than datumFor\'s "not yet fetched".'
+        )
         assert 'requestOnDemand' not in orch_tab_code, (
-            'requesting the terminal window is leaf γ3\'s; γ2 only reads the datum.'
+            'OrchTab reads the terminal window when one has landed; it does not request it.'
+        )
+        assert 'datumFor(' not in orch_tab_code, (
+            'datumFor answers an absent window with "not yet fetched", a fetch OrchTab never makes.'
         )
 
     def test_the_placeholder_row_renders_the_reasoned_hole(self, orch_tab_code):
         assert re.search(r'title=\{\s*placeholder\.title\s*\}', orch_tab_code)
         assert re.search(r'\{\s*placeholder\.text\s*\}', orch_tab_code)
+
+    def test_a_partial_listing_renders_its_disclosure(self, orch_tab_code):
+        """viewRows' notes say why listed rows are not the whole, current set.
+
+        The terminal window is always lower_bound (the newest N only) and an aged
+        snapshot is still listed; task_snapshot.test.mjs executes which sources
+        are disclosed. This pins that OrchTab renders what viewRows returns.
+        """
+        destructure = re.search(r'const\s*\{([^}]*)\}\s*=\s*viewRows\(', orch_tab_code)
+        assert destructure and re.search(r'\bnotes\b', destructure.group(1)), (
+            'OrchTab does not take `notes` from viewRows(...)'
+        )
+        assert re.search(r'\bnotes\.map\(\s*(\w+)\s*=>[^;]*<td\b[^>]*>\s*\{\s*\1\s*\}', orch_tab_code), (
+            'OrchTab does not render each viewRows note in a table cell'
+        )

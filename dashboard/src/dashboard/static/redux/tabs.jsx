@@ -26,9 +26,9 @@ const { plainDatum, derivedDatum, unknownDatum } = window.DF_DATUM;
 const { burndownStacks, burndownLegend, parityBannerState } = window.DF_BURNDOWN_BANDS;
 const { reconRunCounts, reconSuccessPct, reconStatusTone } = window.DF_RECON_STATUS;
 // Every OrchTab count is a named reading over the served census — task_snapshot.js.
-const { projectCensus, censusOver, projectRows, viewRows, censusSegments, censusHistory, terminalOfTotal, CENSUS_VIEWS, CENSUS_TILES } = window.DF_TASK_SNAPSHOT;
-// The on-demand terminal window's Datum, under data.js's one copy of its key.
-const { datumFor, ON_DEMAND_KEYS } = window.DF_DATA_LOADER;
+const { projectCensus, censusOver, projectRows, viewRows, unrequestedTerminalRows, censusSegments, censusHistory, terminalOfTotal, CENSUS_VIEWS, CENSUS_TILES } = window.DF_TASK_SNAPSHOT;
+// data.js's one copy of the on-demand terminal window's key.
+const { ON_DEMAND_KEYS } = window.DF_DATA_LOADER;
 const { useState: uS, useEffect: uE } = React;
 
 // Which endpoint each rendered number arrived on. plainDatum's provenance is
@@ -285,7 +285,7 @@ function OrchTab({ projectFilter, search }) {
       {matches.map(o => {
         const census = projectCensus(DF, o.project);
         const filter = getFilter(o.pid);
-        const { rows, placeholder } = viewRows(projectRows(DF, o.project), datumFor(ON_DEMAND_KEYS.terminal.key(o.project)), filter);
+        const { rows, placeholder, notes } = viewRows(projectRows(DF, o.project), unrequestedTerminalRows(DF[ON_DEMAND_KEYS.terminal.key(o.project)]), filter);
         const filtered = rows.filter(matchesSearch);
 
         const summary = (
@@ -384,6 +384,7 @@ function OrchTab({ projectFilter, search }) {
                           </tr>
                         );
                       })}
+                      {notes.map(note => <tr key={note}><td colSpan={12} className="empty" style={{ padding: 8 }}>{note}</td></tr>)}
                     </tbody>
                   </table>
                 </div>

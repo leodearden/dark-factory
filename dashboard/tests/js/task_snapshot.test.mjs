@@ -38,7 +38,7 @@ const { api: snapshot, window: loadedWindow } = loadTaskSnapshot();
 const { projectCensus, censusOver, TASKS_ENDPOINT } = snapshot;
 const { CENSUS_VIEWS, CENSUS_TILES, censusSegments, censusHistory } = snapshot;
 const { inFlightCount, runningOfInFlight, terminalOfTotal, censusTotal, viewShareText } = snapshot;
-const { projectRows, viewRows } = snapshot;
+const { projectRows, viewRows, unrequestedTerminalRows } = snapshot;
 const { isDatum, datumView, displayedAgeMs, EM_DASH } = loadedWindow.DF_DATUM;
 const { VIEWS, SUB_VIEWS } = loadedWindow.DF_TASK_VOCAB;
 
@@ -54,6 +54,7 @@ const EXPECTED_FUNCTION_NAMES = [
   'censusHistory',
   'projectRows',
   'viewRows',
+  'unrequestedTerminalRows',
 ];
 const EXPECTED_EXPORT_NAMES = [...EXPECTED_FUNCTION_NAMES, 'TASKS_ENDPOINT', 'CENSUS_VIEWS', 'CENSUS_TILES'];
 
@@ -577,6 +578,11 @@ const rowsDatum = rows => datumIn('fresh', rows);
 const unknownTerminal = reason => datumIn('unknown', null, { reason });
 const ids = rows => rows.map(r => r.id);
 
+// The window data/task_snapshot.py::acquire_terminal_window serves: always
+// lower_bound, its reason naming the window.
+const WINDOW_REASON = 'the newest 400 of 4106 terminal rows; older ones were never read';
+const terminalWindow = rows => datumIn('lower_bound', rows, { reason: WINDOW_REASON });
+
 test('viewRows: in-flight and backlog select the snapshot rows by generated membership', () => {
   const rows = rowsDatum(SNAPSHOT_ROWS);
   const terminal = rowsDatum(TERMINAL_ROWS);
@@ -605,12 +611,11 @@ test('viewRows: several views concatenate in view order, whatever the filter\'s 
   });
   assert.deepEqual(ids(result.rows), [1, 2, 3, 4, 5, 6, 7, 8, 9]);
   assert.equal(result.placeholder, null);
+  assert.deepEqual(result.notes, [], 'fresh sources need no disclosure');
 });
 
 test('viewRows: a selected view whose Datum is unknown lists nothing and says why', () => {
-  // The terminal window is fetched on request only (leaf gamma3 wires that
-  // request); before it arrives, data.js::datumFor answers 'not yet fetched'.
-  const result = viewRows(rowsDatum(SNAPSHOT_ROWS), unknownTerminal('not yet fetched'), {
+  const result = viewRows(rowsDatum(SNAPSHOT_ROWS), unknownTerminal('terminal window read failed'), {
     in_flight: true,
     terminal: true,
   });
@@ -619,7 +624,8 @@ test('viewRows: a selected view whose Datum is unknown lists nothing and says wh
   assert.ok(result.placeholder.text.startsWith(EM_DASH), result.placeholder.text);
   assert.match(result.placeholder.text, /terminal/);
   assert.doesNotMatch(result.placeholder.text, /in-flight/);
-  assert.match(result.placeholder.title, /not yet fetched/);
+  assert.equal(result.placeholder.title, 'terminal: terminal window read failed');
+  assert.deepEqual(result.notes, [], 'a hole is the placeholder\'s to name, not a note');
 });
 
 test('viewRows: an unknown rows Datum names every selected view it feeds', () => {
@@ -633,15 +639,51 @@ test('viewRows: an unknown rows Datum names every selected view it feeds', () =>
   assert.match(result.placeholder.title, /task data unavailable/);
 });
 
-test('viewRows: stale rows still list — an aged value is still a value', () => {
+test('viewRows: stale rows still list — an aged value is still a value, and says why it is aged', () => {
   const stale = datumIn('stale', SNAPSHOT_ROWS);
   const result = viewRows(stale, rowsDatum([]), { in_flight: true });
   assert.deepEqual(ids(result.rows), [1, 2, 3, 4, 5]);
   assert.equal(result.placeholder, null);
+  assert.deepEqual(result.notes, ['in-flight: ReadTimeout']);
+});
+
+test('viewRows: the lower_bound terminal window lists its rows AND discloses that they are partial', () => {
+  const result = viewRows(rowsDatum(SNAPSHOT_ROWS), terminalWindow(TERMINAL_ROWS), { terminal: true });
+
+  assert.deepEqual(ids(result.rows), [8, 9]);
+  assert.equal(result.placeholder, null);
+  assert.deepEqual(result.notes, [`terminal: ${WINDOW_REASON}`]);
+});
+
+test('viewRows: only a view that is LISTED is disclosed', () => {
+  const result = viewRows(datumIn('stale', SNAPSHOT_ROWS), terminalWindow(TERMINAL_ROWS), { terminal: true });
+  assert.deepEqual(result.notes, [`terminal: ${WINDOW_REASON}`]);
 });
 
 test('viewRows: nothing selected lists nothing and leaves the sentence to orch_filter', () => {
   const result = viewRows(rowsDatum(SNAPSHOT_ROWS), unknownTerminal('not yet fetched'), {});
   assert.deepEqual(result.rows, []);
   assert.equal(result.placeholder, null);
+  assert.deepEqual(result.notes, []);
+});
+
+// OrchTab lists terminal rows without requesting the window: that request is
+// another surface's. So an absent window must not read 'not yet fetched', which
+// is data.js::datumFor's answer and promises a fetch that nothing here makes.
+test('unrequestedTerminalRows: an absent window says it is fetched on request — never "not yet fetched"', () => {
+  const absent = unrequestedTerminalRows(undefined);
+
+  assert.equal(isDatum(absent), true);
+  assert.equal(absent.state, 'unknown');
+  assert.match(absent.reason, /on request/);
+  assert.doesNotMatch(absent.reason, /not yet fetched/);
+
+  const result = viewRows(rowsDatum(SNAPSHOT_ROWS), absent, { terminal: true });
+  assert.deepEqual(result.rows, []);
+  assert.equal(result.placeholder.title, `terminal: ${absent.reason}`);
+});
+
+test('unrequestedTerminalRows: a window another surface requested is read exactly as served', () => {
+  const served = terminalWindow(TERMINAL_ROWS);
+  assert.equal(unrequestedTerminalRows(served), served);
 });
