@@ -17,12 +17,14 @@ and renders. The verdict belongs to the reader and to the milestone task.
 from __future__ import annotations
 
 import math
+import sqlite3
 from collections import Counter
 from collections.abc import Hashable, Iterable, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import TypeVar
 
-from audit_model_admission import InvocationRecord
+from audit_model_admission import MERGER_ROLE, InvocationRecord, load_events
 
 # The CLI's result subtypes for a run killed at its dispatch caps. The _usd
 # spelling is orchestrator/src/orchestrator/routing.py::PROBE_BUDGET_EXHAUSTED_SUBTYPE.
@@ -30,6 +32,16 @@ TURN_CAP_SUBTYPE = 'error_max_turns'
 BUDGET_CAP_SUBTYPE = 'error_max_budget_usd'
 
 MERGE_DONE_STATE = 'done'
+MERGE_CONFLICT_STATE = 'conflict'
+
+# The drop guard's two witnesses. The prefix is
+# orchestrator/src/orchestrator/merge_gates.py::DROPPED_PLAN_TARGETS_REASON_PREFIX;
+# the outcome is the OutcomeKind.dropped_plan_targets that merge_queue.py passes
+# to _emit_merge_attempt when the gate fires.
+DROPPED_PLAN_TARGETS_REASON_PREFIX = 'Merge commit is missing plan target files'
+DROPPED_PLAN_TARGETS_OUTCOME = 'dropped_plan_targets'
+MERGE_ATTEMPT_EVENT = 'merge_attempt'
+MERGE_FINALIZED_EVENT = 'merge_finalized'
 UNKNOWN_KEY = '-'
 
 _Number = TypeVar('_Number', int, float)
@@ -114,4 +126,65 @@ def summarize_outcomes(records: Sequence[InvocationRecord]) -> OutcomeSummary:
         merge_states=_tally(r.merge_outcome.state if r.merge_outcome else None
                             for r in records),
         dispatch_caps=_tally(r.dispatch_max_turns for r in records),
+    )
+
+
+@dataclass(frozen=True)
+class DropGuardEvent:
+    """One firing of the gate that refuses a merge commit missing plan target files."""
+
+    timestamp: str
+    task_id: str | None
+    source: str
+
+
+def scan_drop_guard(
+    conn: sqlite3.Connection, *, since: datetime, until: datetime
+) -> tuple[DropGuardEvent, ...]:
+    """Every drop-guard firing in ``[since, until)``, read from both witnesses.
+
+    The merge_attempt row is the gate's own emission; the merge_finalized
+    reason is what the workflow routes on (workflow.py short-circuits on the
+    prefix). Reading both makes a firing that reached only one of them visible.
+    """
+    attempts = [
+        DropGuardEvent(row.timestamp, row.task_id, MERGE_ATTEMPT_EVENT)
+        for row in load_events(conn, MERGE_ATTEMPT_EVENT, since, until)
+        if row.payload.get('outcome') == DROPPED_PLAN_TARGETS_OUTCOME
+    ]
+    finalized = [
+        DropGuardEvent(row.timestamp, row.task_id, MERGE_FINALIZED_EVENT)
+        for row in load_events(conn, MERGE_FINALIZED_EVENT, since, until)
+        if str(row.payload.get('reason') or '').startswith(DROPPED_PLAN_TARGETS_REASON_PREFIX)
+    ]
+    return tuple(sorted([*attempts, *finalized], key=lambda event: event.timestamp))
+
+
+@dataclass(frozen=True)
+class ConflictReopen:
+    """A merge conflict on a task AFTER a merger run on it had succeeded."""
+
+    task_id: str | None
+    run_completed_at: str
+    reopened_at: str
+
+
+def conflict_reopens(
+    conn: sqlite3.Connection, records: Sequence[InvocationRecord], *, until: datetime
+) -> tuple[ConflictReopen, ...]:
+    """Every conflict finalized on a successful merger run's task after it
+    completed and before *until*. One event load, from the earliest such run."""
+    resolved = [r for r in records if r.role == MERGER_ROLE and r.succeeded is True]
+    if not resolved:
+        return ()
+    earliest = datetime.fromisoformat(min(r.completed_at for r in resolved))
+    conflicts: dict[str | None, list[str]] = {}
+    for row in load_events(conn, MERGE_FINALIZED_EVENT, earliest, until):
+        if row.payload.get('state') == MERGE_CONFLICT_STATE:
+            conflicts.setdefault(row.task_id, []).append(row.timestamp)
+    return tuple(
+        ConflictReopen(task_id=r.task_id, run_completed_at=r.completed_at, reopened_at=at)
+        for r in resolved
+        for at in conflicts.get(r.task_id, ())
+        if at > r.completed_at
     )
