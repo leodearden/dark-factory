@@ -10,14 +10,23 @@
 // here can run inside a .jsx body. pins_recovery.js's header holds the
 // CANONICAL statement of why.
 //
-// Dual-loaded: a browser classic `<script>` assigns `window.DF_TASK_SNAPSHOT`,
-// node resolves the same file as CommonJS. index.html loads it after datum.js
-// and task_vocab.js and before every JSX consumer.
+// LOAD CONTRACT. It destructures window.DF_DATUM and window.DF_TASK_VOCAB at
+// module scope with no fallback, so index.html loads it after datum.js and
+// task_vocab.js and before every JSX consumer (test_index_html.py pins the
+// order). A browser classic `<script>` assigns `window.DF_TASK_SNAPSHOT`; node
+// requires the same file as CommonJS once its test has put those two globals
+// on a window shim.
 //
 // THE CLIENT NEVER ALTERS A SERVED CENSUS. A surface's number is a `format`
 // over the WHOLE census Datum, so its value, as_of, state and reason reach the
 // screen as served. The only envelopes built here are datum.js's own: a
 // receipt stamp, an unknown placeholder, and a combined total.
+//
+// TWO DELIBERATE REFUSALS, both from the PRD's rule that consumers "never
+// re-count, re-bucket or re-fetch" (plans/dashboard-one-datum-one-path-prd.md,
+// "Sketch of approach" items 1 and 5): a hole in any project is a hole in a
+// multi-project total (censusOver), and a tile scoped to two or more projects
+// draws no spark (censusHistory) rather than summing per-project series here.
 
 // Module scope, no fallback, RENAMED — see the CANONICAL note in datum.js's
 // header.
@@ -46,19 +55,20 @@ function snapshotEntries(data) {
   return data.TASKS_SNAPSHOT || {};
 }
 
-// One half (`census` or `rows`) of one project's entry: the served Datum
-// stamped with the /tasks receipt, or a hole saying which part is missing.
-// No receipt outranks everything else, as in datum.js::plainDatum: before the
-// first payload, nothing that is absent is yet evidence of anything.
-function snapshotDatum(data, project, half) {
+// The Datum under one wire key of one project's entry — `census` or `rows`,
+// as TaskSnapshot.to_wire() names them — stamped with the /tasks receipt, or a
+// hole saying which part is missing. No receipt outranks everything else, as
+// in datum.js::plainDatum: before the first payload, nothing that is absent is
+// yet evidence of anything.
+function snapshotDatum(data, project, wireKey) {
   const receipt = snapshotReceipt(data);
   if (!receipt) return unknownSnapshotDatum(SNAPSHOT_NOT_YET_FETCHED);
   const entry = snapshotEntries(data)[project];
   if (!entry) return unknownSnapshotDatum('the /tasks payload has no entry for ' + project);
-  if (!isSnapshotDatum(entry[half])) {
-    return unknownSnapshotDatum('the /tasks entry for ' + project + ' has no ' + half + ' Datum');
+  if (!isSnapshotDatum(entry[wireKey])) {
+    return unknownSnapshotDatum('the /tasks entry for ' + project + ' has no ' + wireKey + ' Datum');
   }
-  return stampSnapshotReceipt(entry[half], receipt);
+  return stampSnapshotReceipt(entry[wireKey], receipt);
 }
 
 function projectCensus(data, project) {
