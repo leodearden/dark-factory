@@ -27,7 +27,10 @@ discovery/assertion split:
 
 * ASSERTIONS -- ``subtree_and_leader_gone``, ``wait_subtree_gone`` -- and the
   descendant set ``wait_subtree_live`` RETURNS still come only from the
-  production walkers ``collect_descendants``/``read_ppid_map``.
+  production walkers ``collect_descendants``/``read_ppid_map``.  A kill
+  verdict on CAPTURED pids goes through ``wait_pids_exited`` (a zombie-aware
+  ``/proc/<pid>/stat`` read, task 5903), but the pids themselves are still
+  discovered only by those walkers.
 * the ARRANGE-phase discovery GATE adds a cheap Linux
   ``/proc/<pid>/task/*/children`` pre-filter (:func:`_read_direct_children`)
   that decides nothing except whether to spend a full rescan on a given poll
@@ -59,6 +62,7 @@ import math
 import os
 import re
 import select
+import shlex
 import signal
 import socket
 import subprocess
@@ -147,15 +151,33 @@ def write_verify_config(
 # ---------------------------------------------------------------------------
 
 
-def sleeper_spec(sleep_secs: float = 300.0, *, marker: str = 'target/warm.marker') -> MergeVerifySpec:
+def sleeper_spec(
+    sleep_secs: float = 300.0,
+    *,
+    marker: str = 'target/warm.marker',
+    build_pgid_file: Path | None = None,
+) -> MergeVerifySpec:
     """MergeVerifySpec whose scoped test command touches *marker* then blocks.
 
     Reproduces the real cargo/rustc start_new_session escape (verify.py
     ``_run_cmd``) with trivial /bin/bash -- see module docstring.
+
+    With *build_pgid_file*, the build shell atomically writes its own pid
+    there (which is also its pgid, since ``_run_cmd`` starts a new session)
+    and then execs into the sleeper: the published pid IS the process that
+    blocks, and nothing forks after it is published.
     """
+    blocker = f'sleep {sleep_secs}'
+    if build_pgid_file is not None:
+        tmp = build_pgid_file.parent / (build_pgid_file.name + '.tmp')
+        blocker = (
+            f'echo $$ > {shlex.quote(str(tmp))} && '
+            f'mv {shlex.quote(str(tmp))} {shlex.quote(str(build_pgid_file))} && '
+            f'exec {blocker}'
+        )
     return MergeVerifySpec(
         verify_commands=(
-            VerifyCommand('mod', test_command=f'mkdir -p target && touch {marker} && sleep {sleep_secs}'),
+            VerifyCommand('mod', test_command=f'mkdir -p target && touch {marker} && {blocker}'),
         ),
         unscoped_typecheck=UnscopedTypecheckSpec(
             commands=(VerifyCommand('mod', type_check_command='true'),),
@@ -415,7 +437,10 @@ class HeartbeatWriter:
 
 
 def wait_for_pgid_file(path: Path, *, timeout: float | None = None, interval: float = 0.05) -> int:
-    """Poll for a pgid file (written by verify-merge --request-id) and return its int value.
+    """Poll for a pgid file and return its int value.
+
+    Written by ``verify-merge --request-id`` or by a :func:`sleeper_spec`
+    build with *build_pgid_file*.
 
     *timeout* defaults to :func:`row_discovery_ceiling_secs`, resolved when
     the wait actually STARTS rather than at import, so a row beginning
@@ -534,8 +559,7 @@ def wait_subtree_live(
     It's optional so no existing call site is forced to change semantics.
     *proc_label* names *proc* in the failure message (default ``"leader"``);
     pass e.g. ``proc_label="dispatcher"`` when *proc* is a stand-in process
-    rather than the leader itself (e.g. the SSH dispatcher in the Row 1
-    orchestrator-killed test), so a reader doesn't apply the rc taxonomy
+    rather than the leader itself, so a reader doesn't apply the rc taxonomy
     below to the wrong process.  When *proc* is given, a timeout failure
     names its exit status (``<proc_label> rc=<n|None>``).  For the LEADER
     specifically, that rc distinguishes a watchdog self-kill (rc == 1, no
@@ -1050,7 +1074,7 @@ ROW_WATCHDOG_ENV: dict[str, str] = {
     'ORCH_WATCHDOG_KILL_GRACE_SECS': str(ROW_WATCHDOG_KILL_GRACE_SECS),
 }
 
-#: Ceiling for the rows' child.wait()/wait_subtree_gone() polls: the full
+#: Ceiling for the rows' child.wait()/wait_subtree_gone()/wait_pids_exited() polls: the full
 #: window plus load headroom.  A WEDGE-DETECTOR, not a speed assertion (the
 #: rows assert THAT the tree was killed, never how fast), so on the success
 #: path a wider ceiling costs zero wall-clock and is paid only when the test
@@ -1067,7 +1091,8 @@ ROW_TREE_KILL_CEILING_SECS: float = ROW_WATCHDOG_WINDOW_SECS + 15.0  # 30.0
 ROW_MARKER_CEILING_SECS: float = 20.0
 
 #: Base ceiling for the two DISCOVERY waits every row runs BEFORE the
-#: watchdog is even armed -- wait_for_pgid_file and wait_subtree_live.  Rows
+#: watchdog is even armed -- wait_for_pgid_file, then wait_subtree_live (Row
+#: 1: a second wait_for_pgid_file, on the build's own pgid file).  Rows
 #: 1/2/3 pass the resolved ceiling explicitly at their call sites below
 #: (instead of relying on the bare default) so this value and those defaults
 #: cannot silently drift apart.
