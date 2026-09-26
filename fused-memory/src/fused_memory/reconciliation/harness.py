@@ -5782,7 +5782,7 @@ class ReconciliationHarness:
             # that remediation cannot fix it on its own.  Below the threshold we
             # suppress the escalation and emit a structured log so the finding
             # stays observable without polluting the queue.
-            # The except handlers further below (AllAccountsCappedException and
+            # The except handlers further below (CancelledError, AllAccountsCappedException and
             # bare Exception) are untouched — they fire on stage *exceptions*, not
             # on Stage-3 findings, and are the genuine "needs human" signals.
             #
@@ -6223,6 +6223,26 @@ class ReconciliationHarness:
                 extra={'run_id': run_id, 'parent_run_id': parent_run_id},
             )
 
+        except asyncio.CancelledError as e:
+            # Always 'failed', never 'interrupted': _resume_interrupted_runs re-drives
+            # only run_full_cycle, and get_interrupted_runs does not filter by run_type.
+            run.status = RunStatus.failed
+            run.stage_reports['_error'] = _run_failure_record(
+                e, failed_stage=current_stage_name,
+                error_message='Remediation pass cancelled (shutdown, timeout or external cancellation)',
+            )
+            try:
+                await asyncio.shield(self.journal.complete_run(run_id, 'failed'))
+            except BaseException as cleanup_err:
+                logger.error(
+                    'complete_run(failed) failed after remediation cancellation for run %s: %r',
+                    run_id, cleanup_err,
+                )
+            logger.error(
+                'Remediation pass %s (parent %s) cancelled for %s (stage: %s)',
+                run_id, parent_run_id, project_id, current_stage_name,
+            )
+            raise
         except AllAccountsCappedException as e:
             run.status = RunStatus.failed
             run.stage_reports['_error'] = {
