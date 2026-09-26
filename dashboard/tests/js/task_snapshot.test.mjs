@@ -37,7 +37,7 @@ function loadTaskSnapshot() {
 const { api: snapshot, window: loadedWindow } = loadTaskSnapshot();
 const { projectCensus, censusOver, TASKS_ENDPOINT } = snapshot;
 const { CENSUS_VIEWS, CENSUS_TILES, censusSegments, censusHistory } = snapshot;
-const { inFlightCount, runningOfInFlight, terminalOfTotal, censusTotal } = snapshot;
+const { inFlightCount, runningOfInFlight, terminalOfTotal, censusTotal, viewShareText } = snapshot;
 const { projectRows, viewRows } = snapshot;
 const { isDatum, datumView, displayedAgeMs, EM_DASH } = loadedWindow.DF_DATUM;
 const { VIEWS, SUB_VIEWS } = loadedWindow.DF_TASK_VOCAB;
@@ -49,6 +49,7 @@ const EXPECTED_FUNCTION_NAMES = [
   'runningOfInFlight',
   'terminalOfTotal',
   'censusTotal',
+  'viewShareText',
   'censusSegments',
   'censusHistory',
   'projectRows',
@@ -345,6 +346,7 @@ const runningTile = byKey(CENSUS_TILES, 'running');
 const VIEW_READING_TEXT = { in_flight: '25 running of 43 in-flight', backlog: '1310 backlog', terminal: '4106 terminal' };
 const VIEW_COUNT_TEXT = { in_flight: '43', backlog: '1310', terminal: '4106' };
 const TILE_READING_TEXT = { running: '25 / 43', blocked: '10', pending: '1300' };
+const VIEW_SHARE_TEXT = { in_flight: '1%', backlog: '24%', terminal: '75%' };
 
 const SURFACES = [
   ['OrchTab Progress header', perProject, () => terminalOfTotal, '4106/5459'],
@@ -353,6 +355,8 @@ const SURFACES = [
   ...CENSUS_TILES.map(t => [`OrchTab tile (${t.key})`, fleet, () => t.reading, TILE_READING_TEXT[t.key]]),
   ['Overview running tile', fleet, () => runningTile.reading, '25 / 43'],
   ['Overview pipeline total', fleet, () => censusTotal, '5459 total'],
+  ...CENSUS_VIEWS.map(v => [`Overview pipeline row count (${v.key})`, fleet, () => v.count, VIEW_COUNT_TEXT[v.key]]),
+  ...CENSUS_VIEWS.map(v => [`Overview pipeline row share (${v.key})`, fleet, () => viewShareText(v.key), VIEW_SHARE_TEXT[v.key]]),
   ['Overview Orchestrators table Terminal cell', perProject, () => terminalOfTotal, '4106/5459'],
   ['topbar pill', fleet, () => runningOfInFlight, '25 running of 43 in-flight'],
   ['rail badge', fleet, () => inFlightCount, '43'],
@@ -463,6 +467,27 @@ test('censusSegments: a measured empty census has zero-width segments, never NaN
 
 test('censusSegments: an unknown census draws no bar at all', () => {
   assert.deepEqual(censusSegments(perProject(oneProjectData(datumIn('unknown')))), []);
+});
+
+test('viewShareText: each pipeline row reads the share of the bar segment beside it', () => {
+  const census = perProject(oneProjectData(datumIn('fresh', DF_CENSUS_VALUE)));
+  for (const segment of censusSegments(census)) {
+    const view = datumView(census, { now: NOW, format: viewShareText(segment.key) });
+    assert.equal(view.text, `${segment.share.toFixed(0)}%`, segment.key);
+  }
+});
+
+test('viewShareText: a measured empty census reads 0%, never NaN%', () => {
+  const empty = {
+    counts: Object.fromEntries(Object.keys(DF_CENSUS_VALUE.counts).map(k => [k, 0])),
+    total: 0,
+    views: { in_flight: 0, backlog: 0, terminal: 0 },
+    sub_views: { running: 0 },
+  };
+  const census = perProject(oneProjectData(datumIn('fresh', empty)));
+  for (const { key } of CENSUS_VIEWS) {
+    assert.equal(datumView(census, { now: NOW, format: viewShareText(key) }).text, '0%', key);
+  }
 });
 
 // ── censusHistory: the tile spark, over the tile's own scope ────────────────
