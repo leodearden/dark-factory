@@ -239,7 +239,7 @@ class _FakeScorer:
         return self._facts
 
 
-def _spec(scorer: _FakeScorer | None = None, *, name: str = 'fake', unavailable=None, log=None):
+def _spec(scorer: _FakeScorer | _ConstantScorer | None = None, *, name: str = 'fake', unavailable=None, log=None):
     arms = _arms()
 
     @contextlib.contextmanager
