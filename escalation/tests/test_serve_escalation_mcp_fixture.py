@@ -111,13 +111,13 @@ def _listener_without_mcp_route() -> Iterator[int]:
     probe succeeds instantly — but nothing is mounted at ``/mcp/`` yet, so an
     MCP ``initialize`` cannot complete.
 
-    A ``listen()``-only socket that never ``accept()``s is deliberately NOT
-    used here even though it is the smaller fake: measured, the MCP client's
-    request then blocks on the never-served connection until its own transport
-    timeout (>180s observed, i.e. no result at all) instead of failing fast,
-    which would blow this suite's 60s pytest-timeout. Answering 404 is also
-    the more faithful fake — a not-yet-mounted route is what a real FastMCP
-    app serves mid-startup.
+    A ``listen()``-only socket that never ``accept()``s would be the smaller
+    fake, but it is a different case: there the MCP client's request blocks on
+    the never-served connection (>180s measured, until the client's own
+    transport timeout) and fails only by the attempt's ``timeout_s`` bound,
+    which is the subject of its own test below. Answering 404 is the faithful
+    fake for THIS window — a not-yet-mounted route is what a real FastMCP app
+    serves mid-startup.
     """
     server = ThreadingHTTPServer(('127.0.0.1', 0), _NotMcpHandler)
     thread = threading.Thread(
@@ -162,7 +162,9 @@ def test_handshake_readiness_rejects_a_live_port_without_the_mcp_route(
             pass  # the weaker probe succeeds here, i.e. would report "ready"
 
         ready = asyncio.run(
-            escalation_conftest._mcp_handshake_ready(f'http://127.0.0.1:{port}')
+            escalation_conftest._mcp_handshake_ready(
+                f'http://127.0.0.1:{port}', timeout_s=5.0,
+            )
         )
 
         assert ready is False, (
@@ -170,6 +172,44 @@ def test_handshake_readiness_rejects_a_live_port_without_the_mcp_route(
             'gating readiness on a bare TCP connect is what lets the first '
             'call race a 404 against the not-yet-mounted /mcp/ route'
         )
+
+
+@pytest.mark.timeout(60)
+def test_a_handshake_attempt_against_a_listener_that_never_answers_is_bounded(
+    escalation_conftest: Any,
+) -> None:
+    """One readiness attempt must end within its ``timeout_s``, even against
+    an endpoint that accepts the connection and never answers.
+
+    That endpoint is the incident's foreign listener (task 5934): once the
+    fixture's own server had died on a lost bind, readiness kept probing the
+    port, found someone else's listener there, and a single unbounded attempt
+    ran on until pytest-timeout fired 300s later -- the MCP client's own read
+    timeout is minutes. A ``listen()``-only socket reproduces it exactly: the
+    kernel completes the handshake into the backlog, and nothing ever reads.
+
+    The last recorded error must be the ``TimeoutError`` of the bound itself,
+    so the attempt is known to have ended BY the bound and not by some other
+    failure that happened to be quick.
+    """
+    hung = escalation_conftest._bind_escalation_listener()
+    try:
+        hung.listen()
+        errors: list[BaseException] = []
+
+        ready = asyncio.run(
+            escalation_conftest._mcp_handshake_ready(
+                f'http://127.0.0.1:{hung.getsockname()[1]}', errors, timeout_s=0.5,
+            )
+        )
+
+        assert ready is False
+        assert errors, 'a failed attempt must record why it failed'
+        assert isinstance(errors[-1], TimeoutError), (
+            f'expected the attempt to end by its timeout_s bound; got {errors[-1]!r}'
+        )
+    finally:
+        hung.close()
 
 
 # ---------------------------------------------------------------------------
