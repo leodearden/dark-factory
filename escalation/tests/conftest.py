@@ -176,16 +176,64 @@ def pytest_configure(config):
 # * Readiness is an MCP handshake, not a TCP connect (`_mcp_handshake_ready`),
 #   and any startup failure is captured as BaseException — reasoning inherited
 #   from the hardened `test_status_authority_gate.py` variant when task 3736
-#   deduped these copies by UNION rather than by intersection.
+#   deduped these copies by UNION rather than by intersection. Each attempt is
+#   bounded by the remaining readiness deadline, and the wait ends as soon as
+#   the serving thread exits, so a dead server's port is never probed on
+#   (task 5934).
 #
 # Both are pinned by tests in `test_serve_escalation_mcp_fixture.py`.
 
 # How long `_start` waits for a server to complete its first MCP handshake.
-# A module-level constant rather than a literal inside `_start` so a test that
-# deliberately drives the timeout path (the not-a-RuntimeError startup-failure
-# regression test) can `monkeypatch.setattr` it down instead of paying the full
-# production bound on every run -- `_start` reads it as a global at call time.
+# A module-level constant rather than a literal inside `_start` so the one test
+# whose wait can end only at the deadline (a healthy server the client cannot
+# reach) can `monkeypatch.setattr` it down instead of paying the full production
+# bound on every run -- `_start` reads it as a global at call time. The
+# startup-failure test needs no such patch: a dead serving thread ends the wait.
 _READY_TIMEOUT_S = 10.0
+
+
+class EscalationServerNotReady(RuntimeError):
+    """The escalation HTTP test server never completed an MCP handshake.
+
+    The fields are the contract; the message is for humans. ``server_exited``
+    records why the readiness wait ENDED: True when the serving thread had
+    exited, False when the deadline passed with the thread still alive.
+    ``serve_error`` is the startup failure that thread raised, if any, and
+    ``last_handshake_error`` the final client-side handshake failure, if any
+    attempt ran -- so whichever side of the wire failed is named.
+
+    A RuntimeError, so every ``pytest.raises(RuntimeError)`` consumer still
+    catches it.
+    """
+
+    def __init__(
+        self,
+        *,
+        port: int,
+        server_exited: bool,
+        serve_error: BaseException | None,
+        last_handshake_error: BaseException | None,
+    ) -> None:
+        self.port = port
+        self.server_exited = server_exited
+        self.serve_error = serve_error
+        self.last_handshake_error = last_handshake_error
+        ending = (
+            'its serving thread exited' if server_exited
+            else 'the readiness deadline passed'
+        )
+        serve_detail = (
+            f' (server thread raised: {serve_error!r})'
+            if serve_error is not None else ''
+        )
+        handshake_detail = (
+            f' (last handshake error: {last_handshake_error!r})'
+            if last_handshake_error is not None else ''
+        )
+        super().__init__(
+            f'escalation HTTP test server on 127.0.0.1:{port} did not complete '
+            f'an MCP handshake: {ending}{serve_detail}{handshake_detail}'
+        )
 
 
 def _bind_escalation_listener() -> socket.socket:
@@ -253,7 +301,7 @@ async def _mcp_handshake_ready(
     exists to prevent, just from the other end. So when *error_box* is passed,
     the most recent exception is recorded into it (last write wins: the final
     poll's failure is the one that describes why the deadline was reached) for
-    the caller to name in its timeout message.
+    the caller to carry in its ``EscalationServerNotReady``.
 
     Each attempt is bounded by the required *timeout_s*: an endpoint that
     accepts but never answers would otherwise hold the attempt far past the
@@ -294,9 +342,11 @@ def _serve_escalation_mcp_impl():
     the fixture binds and holds from allocation onward
     (``_bind_escalation_listener``), inside a daemon thread running its own
     event loop; teardown closes that listener.  Readiness is polled by a real
-    MCP handshake (``_mcp_handshake_ready``, bounded ~10s total) -- not a bare
-    TCP connect, and no fixed sleep.  Every server started through the factory
-    is torn down when the test finishes.
+    MCP handshake (``_mcp_handshake_ready``) -- not a bare TCP connect, and no
+    fixed sleep -- until it succeeds, the serving thread exits, or ~10s pass;
+    each attempt is bounded by the time remaining.  Failure raises
+    ``EscalationServerNotReady``.  Every server started through the factory is
+    torn down when the test finishes.
 
     ``startup_sweep=False`` so pre-seeded queue files are not relocated by the
     startup sweep (the existing test convention in this suite).
@@ -400,36 +450,33 @@ def _serve_escalation_mcp_impl():
         # up, not that the FastMCP ASGI app has finished mounting /mcp/. Every
         # poll implicitly re-probes the TCP layer too (a refused/reset connect
         # just fails the handshake and retries), so no separate TCP wait is
-        # needed. Bounded ~10s instead of a fixed sleep.
+        # needed. Bounded ~10s instead of a fixed sleep, and ended early by the
+        # serving thread's death: past that point nothing of ours is listening
+        # on the port. Thread death is checked BEFORE the deadline so a thread
+        # that died during the final poll interval is still reported as exited.
         base_url = f'http://127.0.0.1:{port}'
         deadline = time.monotonic() + _READY_TIMEOUT_S
         handshake_errors: list[BaseException] = []
-        ready = False
-        while (remaining := deadline - time.monotonic()) > 0:
+        server_exited = False
+        while True:
+            if not thread.is_alive():
+                server_exited = True
+                thread.join()
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             if asyncio.run(_mcp_handshake_ready(
                 base_url, handshake_errors, timeout_s=remaining,
             )):
-                ready = True
-                break
+                return base_url, port, queue
             time.sleep(0.05)
-        if not ready:
-            # BOTH sides of the wire get named. `serve_error` covers a server
-            # thread that died; `handshake_errors` covers the case where the
-            # thread is perfectly healthy and it is the CLIENT half that cannot
-            # complete -- without it that case reports only "did not complete an
-            # MCP handshake", i.e. restates the timeout and explains nothing.
-            detail = f' (server thread raised: {serve_error!r})' if serve_error else ''
-            handshake_detail = (
-                f' (last handshake error: {handshake_errors[-1]!r})'
-                if handshake_errors else ''
-            )
-            raise RuntimeError(
-                f'escalation HTTP test server did not complete an MCP handshake '
-                f'on 127.0.0.1:{port} within {_READY_TIMEOUT_S:g}s'
-                f'{detail}{handshake_detail}'
-            )
-
-        return f'http://127.0.0.1:{port}', port, queue
+        raise EscalationServerNotReady(
+            port=port,
+            server_exited=server_exited,
+            serve_error=serve_error,
+            last_handshake_error=handshake_errors[-1] if handshake_errors else None,
+        )
 
     try:
         yield _start
