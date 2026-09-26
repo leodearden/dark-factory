@@ -696,26 +696,35 @@ def _stage2_ledger_write_missing(report: object) -> bool:
     return _cycle_summary_ledger_write_missing(report, 'stage2')
 
 
+def _sqlite_classification(exc: BaseException) -> dict[str, object]:
+    """Set by the sqlite3 module on errors it raises, None for any other
+    exception; see plans/recon-sqlite-database-locked-rca-2026-09-16.md for
+    what they mean."""
+    return {
+        'sqlite_errorname': getattr(exc, 'sqlite_errorname', None),
+        'sqlite_errorcode': getattr(exc, 'sqlite_errorcode', None),
+    }
+
+
 def _run_failure_record(
     exc: BaseException,
     *,
     failed_stage: str | None,
     error_message: str | None = None,
 ) -> dict[str, object]:
-    """The one ``_error`` shape both S1→S2→S3 drivers record for a run ended
-    by an exception, so the failure can be classified from the row alone.
-
-    The sqlite fields are set by the sqlite3 module on errors it raises and
-    are None for any other exception; see
-    plans/recon-sqlite-database-locked-rca-2026-09-16.md for what they mean.
+    """The ``_error`` record both S1→S2→S3 drivers' ``except Exception``
+    handlers, and the remediation pass's cancellation handler, write for a
+    run ended by an exception, so the failure can be classified from the row
+    alone. The other ``_error`` records (run_full_cycle's cancellation, both
+    drivers' AllAccountsCapped, the stale-run reaper) are built by hand and
+    carry neither the traceback nor the sqlite keys.
     """
     return {
         'error_type': type(exc).__name__,
         'error_message': str(exc) if error_message is None else error_message,
         'failed_stage': failed_stage,
         'traceback': ''.join(traceback.format_exception(exc)),
-        'sqlite_errorname': getattr(exc, 'sqlite_errorname', None),
-        'sqlite_errorcode': getattr(exc, 'sqlite_errorcode', None),
+        **_sqlite_classification(exc),
     }
 
 
@@ -6255,8 +6264,9 @@ class ReconciliationHarness:
                 await asyncio.shield(self.journal.complete_run(run_id, 'failed'))
             except BaseException as cleanup_err:
                 logger.error(
-                    'complete_run(failed) failed after remediation cancellation for run %s: %r',
-                    run_id, cleanup_err,
+                    'complete_run(failed) failed after remediation cancellation: %r (%s)',
+                    cleanup_err,
+                    _run_failure_log_fields(run_id, _sqlite_classification(cleanup_err)),
                 )
             logger.error(
                 'Remediation pass %s (parent %s) cancelled for %s (stage: %s)',
@@ -6285,7 +6295,14 @@ class ReconciliationHarness:
             )
             run.status = RunStatus.failed
             run.stage_reports['_error'] = failure
-            await self.journal.complete_run(run_id, 'failed')
+            try:
+                await self.journal.complete_run(run_id, 'failed')
+            except Exception as write_err:
+                logger.error(
+                    'complete_run(failed) failed after remediation failure: %r (%s)',
+                    write_err,
+                    _run_failure_log_fields(run_id, _sqlite_classification(write_err)),
+                )
             # Do NOT re-raise — parent run already completed
             # Do NOT restore events — there are none
             self._escalate(

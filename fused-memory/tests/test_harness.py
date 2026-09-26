@@ -5647,6 +5647,22 @@ def _sqlite_busy_error() -> sqlite3.OperationalError:
     return err
 
 
+def _lock_complete_run(journal, *locked_statuses: str) -> list[tuple[str, str]]:
+    """Make journal.complete_run raise the SQLite lock error for every status
+    in `locked_statuses`. Returns the live list of (run_id, status) calls."""
+    calls: list[tuple[str, str]] = []
+    original_complete_run = journal.complete_run
+
+    async def complete_run(run_id, status):
+        calls.append((run_id, status))
+        if status in locked_statuses:
+            raise _sqlite_busy_error()
+        return await original_complete_run(run_id, status)
+
+    journal.complete_run = complete_run
+    return calls
+
+
 _RUN_FAILURE_CASES = [
     pytest.param(
         _sqlite_busy_error, 'SQLITE_BUSY', 5, 'OperationalError', 'database is locked',
@@ -5843,33 +5859,30 @@ async def test_remediation_pass_cancellation_terminalises_row_as_failed(
 
 @pytest.mark.asyncio
 async def test_remediation_pass_cancellation_cleanup_failure_still_propagates_cancel(
-    journal, event_buffer, mock_memory_service,
+    journal, event_buffer, mock_memory_service, caplog,
 ):
     """A journal write that fails while terminalising a cancelled pass is
-    logged, and never replaces the CancelledError the caller must see."""
+    logged with its SQLite classification, and never replaces the
+    CancelledError the caller must see."""
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     stage_entered = asyncio.Event()
     _mock_stage_run(harness.stages[0])
     harness.stages[1].run = _stalling_stage_run(stage_entered)
     _mock_stage_run(harness.stages[2])
+    complete_run_calls = _lock_complete_run(journal, 'failed')
 
-    complete_run_calls: list[tuple[str, str]] = []
-    original_complete_run = journal.complete_run
+    with caplog.at_level(logging.ERROR):
+        outer_task = asyncio.create_task(_remediation_pass_under_test(harness))
+        await _cancel_once_entered(outer_task, stage_entered)
+        with pytest.raises(asyncio.CancelledError):
+            await outer_task
 
-    async def locked_on_failed(run_id, status):
-        complete_run_calls.append((run_id, status))
-        if status == 'failed':
-            raise RuntimeError('journal locked')
-        return await original_complete_run(run_id, status)
-
-    journal.complete_run = locked_on_failed
-
-    outer_task = asyncio.create_task(_remediation_pass_under_test(harness))
-    await _cancel_once_entered(outer_task, stage_entered)
-    with pytest.raises(asyncio.CancelledError):
-        await outer_task
-
-    assert [status for _, status in complete_run_calls] == ['failed']
+    [(run_id, status)] = complete_run_calls
+    assert status == 'failed'
+    _assert_one_classified_failure_line(
+        caplog, 'complete_run(failed) failed after remediation cancellation',
+        run_id=run_id, errorname='SQLITE_BUSY', errorcode=5,
+    )
 
 
 @pytest.mark.asyncio
@@ -5909,6 +5922,26 @@ async def test_remediation_pass_cancelled_during_freshness_precheck_terminalises
     assert stages_run == []
 
 
+def _all_fresh_precheck():
+    """Patch the freshness precheck to find the pass's one finding already
+    fresh, so the pass takes the all-fresh short-circuit and runs no stage."""
+    from fused_memory.reconciliation.scope_freshness import ScopeFreshnessResult
+
+    all_fresh = ScopeFreshnessResult(
+        to_reinvestigate=[],
+        skipped=[_make_s3_findings()[0]],
+        stats={
+            'scope_freshness_candidates': 1,
+            'scope_freshness_reinvestigated': 0,
+            'scope_freshness_skipped': 1,
+        },
+    )
+    return patch(
+        'fused_memory.reconciliation.harness.precheck_scope_correction_freshness',
+        new=AsyncMock(return_value=all_fresh),
+    )
+
+
 @pytest.mark.asyncio
 async def test_remediation_pass_short_circuit_write_failure_terminalises_row(
     journal, event_buffer, mock_memory_service,
@@ -5916,32 +5949,10 @@ async def test_remediation_pass_short_circuit_write_failure_terminalises_row(
     """A lock error on the all-fresh short-circuit's own complete_run is
     handled like any other remediation failure: the row ends 'failed' with the
     SQLite classification, and the error does not escape the pass."""
-    from fused_memory.reconciliation.scope_freshness import ScopeFreshnessResult
-
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
-    finding = _make_s3_findings()[0]
-    all_fresh = ScopeFreshnessResult(
-        to_reinvestigate=[],
-        skipped=[finding],
-        stats={
-            'scope_freshness_candidates': 1,
-            'scope_freshness_reinvestigated': 0,
-            'scope_freshness_skipped': 1,
-        },
-    )
-    original_complete_run = journal.complete_run
+    _lock_complete_run(journal, 'completed')
 
-    async def locked_on_completed(run_id, status):
-        if status == 'completed':
-            raise _sqlite_busy_error()
-        return await original_complete_run(run_id, status)
-
-    journal.complete_run = locked_on_completed
-
-    with patch(
-        'fused_memory.reconciliation.harness.precheck_scope_correction_freshness',
-        new=AsyncMock(return_value=all_fresh),
-    ):
+    with _all_fresh_precheck():
         await _remediation_pass_under_test(harness)
 
     [row] = await journal.get_recent_runs('test-project', limit=1)
@@ -6044,6 +6055,35 @@ async def test_escalate_successful_submit_logs_no_drop_warning(
 
     assert _escalation_drop_warnings(caplog) == []
     assert len(esc_queue.get_pending()) == 1
+
+
+@pytest.mark.asyncio
+async def test_remediation_pass_failed_write_failure_still_reaches_escalate(
+    journal, event_buffer, mock_memory_service, caplog,
+):
+    """When the failure handler's own complete_run('failed') hits the same lock
+    as the write that failed the pass, it is logged with its SQLite
+    classification, _escalate is still reached, and the error does not escape
+    the pass. The fixture harness has no escalation queue, so reaching
+    _escalate shows up as its escalation_dropped WARNING."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    complete_run_calls = _lock_complete_run(journal, 'completed', 'failed')
+
+    with _all_fresh_precheck(), caplog.at_level(logging.WARNING):
+        await _remediation_pass_under_test(harness)
+
+    assert [status for _, status in complete_run_calls] == ['completed', 'failed']
+    run_id = complete_run_calls[0][0]
+    _assert_one_classified_failure_line(
+        caplog, 'complete_run(failed) failed after remediation failure',
+        run_id=run_id, errorname='SQLITE_BUSY', errorcode=5,
+    )
+    drops = _escalation_drop_warnings(caplog)
+    assert len(drops) == 1, f'expected exactly one escalation_dropped WARNING, got {drops!r}'
+    assert 'category=recon_integrity_issue' in drops[0]
+    assert f'run_id={run_id}' in drops[0]
+    [row] = await journal.get_recent_runs('test-project', limit=1)
+    assert row.stage_reports['_error']['sqlite_errorname'] == 'SQLITE_BUSY'
 
 
 @pytest.mark.asyncio
