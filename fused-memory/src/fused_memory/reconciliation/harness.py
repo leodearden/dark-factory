@@ -726,6 +726,13 @@ def _run_failure_log_fields(run_id: str, record: Mapping[str, object]) -> str:
     )
 
 
+def _log_dropped_escalation(category: str, run_id: str, summary: str, *, reason: str) -> None:
+    logger.warning(
+        'reconciliation.escalation_dropped (%s): category=%s run_id=%s summary=%s',
+        reason, category, run_id, summary,
+    )
+
+
 class ReconciliationHarness:
     """Orchestrates the three-stage reconciliation pipeline."""
 
@@ -2782,8 +2789,18 @@ class ReconciliationHarness:
         4821) closes that gap on the OTHER queue, carrying the REAL task id.
         The two are complementary, not alternatives: both fire for the same
         finding, and this one fires first and unconditionally.
+
+        Every path that files nothing, other than the recently-resolved fold,
+        logs ``reconciliation.escalation_dropped``.
         """
         if not HAS_ESCALATION or self._escalation_queue is None:
+            _log_dropped_escalation(
+                category, run_id, summary,
+                reason=(
+                    'escalation package not installed' if not HAS_ESCALATION
+                    else 'escalation queue not initialised'
+                ),
+            )
             return
         try:
             queue = self._escalation_queue
@@ -2834,7 +2851,7 @@ class ReconciliationHarness:
             )
             submit_or_dedupe(queue, esc, _RECON_DEDUP_CONFIG)  # type: ignore[possibly-undefined]
         except Exception as e:
-            logger.warning(f'Failed to submit escalation: {e}')
+            _log_dropped_escalation(category, run_id, summary, reason=f'submit failed: {e!r}')
 
     def _file_finding_task_escalation(
         self,
