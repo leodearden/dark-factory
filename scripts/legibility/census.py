@@ -13,12 +13,15 @@ mining (Sonnet miners) until >=dup_rate duplicates for consecutive_batches
 synthesis into a dated ``plans/confusion-census-<date>.md`` report with
 the origin x manifestation matrix -> curator-path ``submit_task``
 remediation filing -> codebook update (promote/reject candidates, retire
-fixed, never delete) -> advance ``docs/legibility/census-state.json``.
+fixed, never delete) -> advance ``docs/legibility/census-state.json`` ->
+one scoped commit of all of it (a commit that does not land is rolled
+back to HEAD and quarantined; see ``run_census``).
 ``--force`` for operator-initiated runs.
 
 Every LLM / MCP / git side effect in this module is an INJECTED seam
 (``invoke``, ``verify_fn``, ``synthesize_fn``, ``submit_fn``,
-``escalate_fn``, ``status_fetcher``, ``commit``, ``batch_source``) --
+``escalate_fn``, ``status_fetcher``, ``commit``, ``roll_back``,
+``batch_source``) --
 mirrors delta's ``coder.code_digests(invoke=)`` and zeta's
 ``census_trigger(status_fetcher=)``. The scripts/ test env (``uv run
 --project shared``) has no live models. Every seam is ALWAYS faked in this
@@ -64,7 +67,7 @@ import subprocess
 import sys
 import tempfile
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -97,7 +100,7 @@ import coder  # noqa: E402
 import digest  # noqa: E402
 import inventory  # noqa: E402
 import sampling  # noqa: E402
-from legibility import census_trigger  # noqa: E402
+from legibility import census_trigger, unlanded  # noqa: E402
 
 # The banner marker list itself lives in shared.cap_markers and is never
 # restated here -- this module only asks the question, via the predicate.
@@ -1791,8 +1794,19 @@ already spent (reviewer_comprehensive finding #3)."""
 @dataclass
 class CensusOutcome:
     """Outcome of ``run_census``. ``status`` is ``"deferred"`` (a headroom
-    gate failed -- NOTHING was persisted) or ``"done"`` (the full pipeline
-    ran to completion)."""
+    gate failed -- NOTHING was persisted), ``"done"`` (the full pipeline
+    ran to completion and its commit landed) or ``"unlanded"`` (the
+    pipeline ran and filed its tickets, but its commit did not land, so
+    every written path -- census-state included -- was handed to
+    ``roll_back`` to be quarantined and restored to HEAD; ``rollback``
+    says whether that restore completed).
+
+    On an ``"unlanded"`` outcome ``rollback`` is the one authority on where
+    each written output now is, and no other field points at a live file:
+    ``report_path`` is ``None``, and ``dry_run`` is kept only for the facts
+    that still hold (nothing was filed; ``payload_count`` payloads were
+    built) -- its ``path`` names where the payloads file was WRITTEN, not
+    where it is now."""
 
     status: str
     reason: str | None = None
@@ -1800,6 +1814,10 @@ class CensusOutcome:
     filed_ticket_ids: list[str] = field(default_factory=list)
     stop_reason: str | None = None
     dry_run: DryRunFiling | None = None
+
+    rollback: unlanded.Rollback | None = None
+    """Where the refused outputs were quarantined and whether the checkout
+    is back at HEAD. Set iff ``status == "unlanded"``."""
 
     deferred_stage: str | None = None
     """Which headroom gate deferred this run: ``"preflight"`` (before any
@@ -1839,7 +1857,8 @@ class CensusOutcome:
 
     dropped_verdicts: tuple[DroppedVerdict, ...] = ()
     """Every verdict this run PAID FOR that resolved to no pending candidate
-    and was dropped, one record each (``status == "done"`` runs only).
+    and was dropped, one record each (``"done"`` and ``"unlanded"`` runs
+    only).
 
     THE authority on what was dropped: ``unresolved_verdicts`` below is its
     length, the run-summary WARNING is rendered from it, and the report's
@@ -1849,7 +1868,7 @@ class CensusOutcome:
 
     unresolved_verdicts: int = 0
     """How many verify verdicts this run PAID FOR resolved to no pending
-    candidate and were dropped (``status == "done"`` runs only) --
+    candidate and were dropped (``"done"`` and ``"unlanded"`` runs only) --
     ``len(dropped_verdicts)``, kept as its own field because it is what
     ``main``'s summary line and every count-only caller actually want.
 
@@ -1943,6 +1962,60 @@ def _defer(
     )
 
 
+def _unlanded(
+    commit_error: Exception,
+    landed: CensusOutcome,
+    *,
+    commit_paths: list[str],
+    roll_back,
+    escalate_fn,
+    project_id: str,
+) -> CensusOutcome:
+    """Put back a census whose commit did not land: roll back, log loudly,
+    escalate, return the outcome.
+
+    ONE owner of the ``"unlanded"`` shape, as ``_defer`` is of the deferral
+    shape. *landed* is the outcome the run would have returned had its
+    commit landed; the unlanded outcome is that one with every output --
+    report and dry-run payloads file alike -- rolled back (see
+    ``CensusOutcome`` for what its fields then name). The escalation is
+    best-effort for the same reason as
+    ``_defer``'s: the ERROR line is the real signal either way.
+    """
+    rollback = roll_back(paths=commit_paths)
+    if rollback.restored:
+        summary = (
+            f"legibility census commit did not land ({project_id}): outputs "
+            "rolled back, census-state NOT advanced"
+        )
+        state_line = (
+            "last_census_at was NOT advanced, so the census trigger will "
+            "fire again."
+        )
+    else:
+        summary = (
+            f"legibility census commit did not land ({project_id}): rollback "
+            "INCOMPLETE, outputs still dirty in the checkout"
+        )
+        state_line = (
+            "census-state.json may still carry the advanced last_census_at "
+            "in the working tree."
+        )
+    detail = (
+        f"{commit_error}\n\n"
+        f"{rollback.describe()}\n\n"
+        "Remediation tickets filed before the commit: "
+        f"{', '.join(landed.filed_ticket_ids) or 'none'}.\n"
+        f"{state_line}"
+    )
+    logger.error("%s -- %s", summary, detail)
+    try:
+        escalate_fn(category="infra_issue", severity="info", summary=summary, detail=detail)
+    except Exception as exc:  # noqa: BLE001 - best-effort; the error line above is the real signal
+        logger.warning("census: unlanded-commit escalation failed (best-effort): %s", exc)
+    return replace(landed, status="unlanded", report_path=None, rollback=rollback)
+
+
 def run_census(
     *,
     batch_source,
@@ -1953,6 +2026,7 @@ def run_census(
     escalate_fn,
     status_fetcher,
     commit,
+    roll_back,
     codebook_dict: dict,
     config,
     project_root: str,
@@ -2014,7 +2088,12 @@ def run_census(
     rather than aborting the run or inflating the filed count) ->
     ``render_report`` -> write the report to *report_path* ->
     ``codebook.dump`` -> ``advance_census_state`` (done-count from
-    *status_fetcher*) -> best-effort *commit* of report + codebook + state.
+    *status_fetcher*) -> *commit* of report + codebook + state. A *commit*
+    that raises (e.g. refused by the target repo's pre-commit hook) hands
+    every one of those paths to *roll_back*, which quarantines them and
+    restores them to HEAD -- census-state included, so ``last_census_at``
+    is not advanced by a census that did not land -- and the run returns
+    status ``"unlanded"`` (see ``_unlanded``).
 
     The report write, ``codebook.dump``, and ``advance_census_state`` run
     in that fixed order, with nothing else in between the latter two, to
@@ -2089,9 +2168,10 @@ def run_census(
     file rather than the output of a half-executed census. The write sits
     at the same point in the sequence the filing loop occupies (after
     ``build_task_payloads``, before ``codebook.dump``), preserving the
-    ordering invariant above, and the file is appended to the best-effort
-    *commit* paths -- a dry run's deliverable IS the payload file, so it
-    is versioned alongside the report and codebook it came from.
+    ordering invariant above, and the file is appended to the *commit*
+    paths -- a dry run's deliverable IS the payload file, so it is
+    versioned alongside the report and codebook it came from (and rolled
+    back with them if the commit does not land).
 
     A dry run is consequently NOT resumable by re-running: the mining, the
     codebook merge, the promotions, ``codebook.dump`` and
@@ -2419,8 +2499,7 @@ def run_census(
     # from filed_ticket_ids rather than aborting the run or silently
     # inflating the filed count (reviewer_comprehensive finding #1: an
     # unfilable result must never render as a "- None" report bullet, nor
-    # count as genuinely filed). Mirrors the best-effort handling used for
-    # commit() below.
+    # count as genuinely filed).
     # Positioned BEFORE codebook.dump()/advance_census_state() below
     # (reviewer_comprehensive finding #4): a bug in payload construction can
     # then only abort the run before anything is persisted, never strand an
@@ -2574,15 +2653,7 @@ def run_census(
         census_state_path, now_iso=date, report_path=str(report_path), done_count=done_count,
     )
 
-    commit_paths = [str(report_path), str(codebook_path), str(census_state_path)]
-    if dry_run_filing is not None:
-        commit_paths.append(dry_run_filing.path)
-    try:
-        commit(paths=commit_paths, message=f"legibility census {date}")
-    except Exception as exc:  # noqa: BLE001 - best-effort, never fails the census
-        logger.warning("census: best-effort commit failed: %s", exc)
-
-    return CensusOutcome(
+    landed = CensusOutcome(
         status="done",
         report_path=str(report_path),
         filed_ticket_ids=filed_ticket_ids,
@@ -2591,6 +2662,20 @@ def run_census(
         dropped_verdicts=tuple(dropped_verdicts),
         unresolved_verdicts=len(dropped_verdicts),
     )
+    commit_paths = [str(report_path), str(codebook_path), str(census_state_path)]
+    if dry_run_filing is not None:
+        commit_paths.append(dry_run_filing.path)
+    try:
+        commit(paths=commit_paths, message=f"legibility census {date}")
+    except Exception as exc:  # noqa: BLE001 - any unlanded commit is rolled back, never a crash
+        return _unlanded(
+            exc, landed,
+            commit_paths=commit_paths,
+            roll_back=roll_back,
+            escalate_fn=escalate_fn,
+            project_id=project_id,
+        )
+    return landed
 
 
 # ---------------------------------------------------------------------------
@@ -3115,15 +3200,15 @@ def _build_default_escalate_fn(cfg):
 
 
 def _build_default_commit(project_root):
-    """Build the real best-effort git-commit seam: ``git commit --only
+    """Build the real git-commit seam: ``git commit --only
     <paths> -m message`` in *project_root* (CLAUDE.md's scoped-commit
     convention -- never a bare ``git commit``, never ``git stash``). A path
     git has never tracked before (this run's first-ever census-state.json
     / dated report) makes ``--only`` fail with "did not match any file";
     that one case is retried once after a scoped ``git add -- <paths>``
     (mirrors ``nightly._git_commit_docs_only``'s identical fallback).
-    Raises on any other failure -- ``run_census`` already wraps this call
-    in a best-effort try/except."""
+    Raises on any other failure, a refusing pre-commit hook included --
+    ``run_census`` then rolls every written path back to HEAD."""
     def _commit(*, paths, message) -> None:
         str_paths = [str(p) for p in paths]
 
@@ -3275,8 +3360,9 @@ def main(argv: list[str] | None = None) -> int:
     Otherwise builds the real default seams (headless-CLI ``invoke`` for
     mining/verify/synthesis, MCP posters for ``submit_fn``/``escalate_fn``,
     ``census_trigger.default_status_fetcher`` for the done-count baseline,
-    a stratified-random ``batch_source`` over the mining window, and a
-    scoped git-commit helper) and runs the full pipeline via
+    a stratified-random ``batch_source`` over the mining window, a
+    scoped git-commit helper, and the ``unlanded.roll_back`` that puts
+    back a commit that did not land) and runs the full pipeline via
     ``run_census``.
 
     Three OPERATOR COST-CONTROL flags bound what a single run may spend,
@@ -3304,7 +3390,8 @@ def main(argv: list[str] | None = None) -> int:
     ``render_report``.
 
     Returns non-zero only on a genuine fail-loud error (a config-load
-    failure, or an uncaught exception from ``run_census``) -- a deferred
+    failure, an uncaught exception from ``run_census``, or an
+    ``"unlanded"`` census whose commit did not land) -- a deferred
     (headroom-preflight) outcome still exits 0, mirroring
     ``census_trigger``'s own CLI contract of reserving a non-zero exit for
     an operator-facing failure, not an expected defer/no-fire outcome.
@@ -3488,6 +3575,10 @@ def main(argv: list[str] | None = None) -> int:
             escalate_fn=escalate_fn,
             status_fetcher=status_fetcher,
             commit=_build_default_commit(project_root),
+            roll_back=functools.partial(
+                unlanded.roll_back, project_root,
+                project_id=cfg.project_id, label=f"census-{date_str}",
+            ),
             codebook_dict=codebook_dict,
             config=cfg,
             project_root=str(project_root),
@@ -3527,6 +3618,20 @@ def main(argv: list[str] | None = None) -> int:
             f"unverified_clusters={outcome.unverified_clusters} -- {outcome.reason}"
         )
         return 0
+
+    if outcome.status == "unlanded":
+        # run_census already logged ERROR and escalated; this line is for
+        # whoever watches the run, and the exit code for nightly's launcher.
+        rollback = (
+            outcome.rollback.describe() if outcome.rollback is not None
+            else "no rollback was recorded"
+        )
+        print(
+            f"census: commit did not land -- {rollback} "
+            f"filed_tickets={len(outcome.filed_ticket_ids)}",
+            file=sys.stderr,
+        )
+        return 1
 
     if outcome.dry_run is not None:
         # A bare filed_tickets=0 here would read as "a normal run that had

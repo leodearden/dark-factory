@@ -67,6 +67,7 @@ import textwrap
 import threading
 import time
 import warnings
+from collections.abc import Callable
 from pathlib import Path
 from typing import NamedTuple
 from unittest.mock import AsyncMock, MagicMock
@@ -703,6 +704,64 @@ def wait_subtree_gone(pgid: int, *, timeout: float, interval: float = 0.1) -> bo
             return True
         time.sleep(interval)
     return subtree_and_leader_gone(pgid)
+
+
+class ProcState(NamedTuple):
+    """A pid's ``/proc/<pid>/stat`` state letter and parent pid."""
+
+    state: str
+    ppid: int
+
+    @property
+    def exited(self) -> bool:
+        """A zombie has terminated and is only awaiting its (possibly reparented) parent's reap."""
+        return self.state in ('Z', 'X')
+
+
+def read_proc_state(pid: int) -> ProcState | None:
+    """*pid*'s :class:`ProcState`, or None when it has no ``/proc`` entry.
+
+    Parsed after the LAST ``') '`` exactly as
+    :func:`orchestrator.verify_cancel.read_ppid_map` does, since ``comm`` may
+    hold spaces or parens.  A malformed stat raises rather than reading as gone.
+    """
+    try:
+        raw = Path(f'/proc/{pid}/stat').read_text()
+    except OSError:
+        return None
+    fields = raw.rsplit(') ', 1)[1].split()
+    return ProcState(state=fields[0], ppid=int(fields[1]))
+
+
+def wait_pids_exited(
+    pids: set[int],
+    *,
+    timeout: float,
+    interval: float = 0.05,
+    _read_state: Callable[[int], ProcState | None] = read_proc_state,
+    _clock: Callable[[], float] = time.monotonic,
+) -> dict[int, ProcState]:
+    """Poll until every pid in *pids* has exited; return the still-RUNNING ones.
+
+    Each survivor maps to its last observed :class:`ProcState`; an empty dict
+    means every pid exited.  A zombie counts as exited: reaping a reparented
+    orphan is its subreaper's job (``systemd --user`` on this fleet), not the
+    code under test's -- the same criterion as
+    ``orchestrator/tests/test_verify_cancel.py::_is_running`` (task 3955).
+
+    The verdict is always the probe of the returning iteration, so a caller
+    descheduled across the deadline never asserts on a stale observation;
+    ``timeout=0`` is exactly one probe.
+    """
+    deadline = _clock() + timeout
+    while True:
+        running = {
+            pid: state for pid in pids
+            if (state := _read_state(pid)) is not None and not state.exited
+        }
+        if not running or _clock() >= deadline:
+            return running
+        time.sleep(interval)
 
 
 def kill_holder_tree(
@@ -2519,6 +2578,96 @@ def test_read_direct_children_sees_a_real_fork_including_off_main_thread():
             off_main.wait()
 
 
+def test_read_proc_state_reports_an_unreaped_zombie_as_exited():
+    """A terminated-but-unreaped child reads as EXITED, although signal 0 still answers.
+
+    ``os.waitid(..., WNOWAIT)`` blocks until the child has exited without
+    reaping it, so the zombie is produced by a condition wait, never a sleep.
+    """
+    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])
+    try:
+        child.kill()
+        os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)
+        try:
+            os.kill(child.pid, 0)
+        except ProcessLookupError:
+            pytest.fail(
+                'harness bug: an unreaped zombie must still answer signal 0, or '
+                'this test is not reproducing the state a signal-0 probe counts '
+                'as alive'
+            )
+
+        state = read_proc_state(child.pid)
+        assert state == ProcState(state='Z', ppid=os.getpid())
+        assert state is not None and state.exited is True
+        assert wait_pids_exited({child.pid}, timeout=0) == {}
+
+        child.wait()
+        assert read_proc_state(child.pid) is None
+    finally:
+        if child.returncode is None:
+            child.kill()
+            child.wait()
+
+
+def test_read_proc_state_reports_a_live_child_as_running():
+    """A live child reads as RUNNING, parented to this process, and survives the wait."""
+    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])
+    try:
+        state = read_proc_state(child.pid)
+        assert state is not None
+        assert state.ppid == os.getpid()
+        assert state.exited is False
+
+        survivors = wait_pids_exited({child.pid}, timeout=0)
+        assert set(survivors) == {child.pid}
+        assert survivors[child.pid].exited is False
+    finally:
+        child.kill()
+        child.wait()
+
+
+def test_wait_pids_exited_decides_on_a_probe_taken_after_its_last_sleep():
+    """A deadline crossed DURING the sleep still gets one fresh probe before the verdict.
+
+    The scripted clock jumps past the deadline while the loop sleeps.  A loop
+    that re-checks the deadline before re-probing returns the stale ``R``
+    observation; the verdict must come from the second probe, which sees ``Z``.
+    """
+    reads: list[int] = []
+
+    def read_state(pid: int) -> ProcState:
+        reads.append(pid)
+        return ProcState('R', 1) if len(reads) == 1 else ProcState('Z', 1)
+
+    ticks = iter([0.0, 0.5])
+
+    survivors = wait_pids_exited(
+        {7}, timeout=1.0, interval=0,
+        _read_state=read_state, _clock=lambda: next(ticks, 99.0),
+    )
+
+    assert survivors == {}
+    assert reads == [7, 7]
+
+
+def test_wait_pids_exited_reports_each_survivor_with_its_last_observed_state():
+    """timeout=0 is exactly one probe; a pid with no /proc entry is not a survivor."""
+    reads: list[int] = []
+
+    def sleeping(pid: int) -> ProcState:
+        reads.append(pid)
+        return ProcState('S', 4242)
+
+    assert wait_pids_exited({7}, timeout=0, _read_state=sleeping) == {7: ProcState('S', 4242)}
+    assert reads == [7]
+
+    states = {7: ProcState('S', 4242), 8: None}
+    assert wait_pids_exited({7, 8}, timeout=0, _read_state=states.__getitem__) == {
+        7: ProcState('S', 4242)
+    }
+
+
 # ---------------------------------------------------------------------------
 # Task 4092 -- deterministic-ish unit coverage for kill_holder_tree, the
 # shared teardown helper that reaps a spawn_verify_merge holder AND every
@@ -2541,22 +2690,6 @@ def test_read_direct_children_sees_a_real_fork_including_off_main_thread():
 # ---------------------------------------------------------------------------
 
 
-def _pid_gone(pid: int) -> bool:
-    """Best-effort liveness probe: True when *pid* no longer refers to a live process.
-
-    ``os.kill(pid, 0)`` sends no signal, only checks existence/permission.
-    ``PermissionError`` means the pid exists but isn't ours -- that is NOT
-    "gone", so it returns False rather than masking a real survivor.
-    """
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    except PermissionError:
-        return False
-    return False
-
-
 def test_kill_holder_tree_reaps_a_session_escaped_grandchild():
     """kill_holder_tree reaps BOTH the leader and a start_new_session grandchild.
 
@@ -2571,10 +2704,12 @@ def test_kill_holder_tree_reaps_a_session_escaped_grandchild():
     cannot collide with an unrelated ``sleep`` on a shared dev box -- in
     particular with this very module's own ``sleeper_spec`` 300s sleeper.
 
-    Asserts BOTH the leader is reaped and every captured grandchild pid is
-    actually gone (not just "signalled") -- and is self-cleaning (a finally
-    that SIGKILLs any surviving captured pid) so a failing/RED run of this
-    test never itself leaks the orphan it exists to pin.
+    Asserts BOTH the leader is reaped and every captured grandchild has
+    actually EXITED, not merely been signalled.  A zombie awaiting its
+    subreaper's reap counts as exited -- see :func:`wait_pids_exited`.  It is
+    self-cleaning (a finally that SIGKILLs any surviving captured pid) so a
+    failing/RED run of this test never itself leaks the orphan it exists to
+    pin.
     """
     sleep_secs = f'271.{os.getpid() % 1000:03d}'
     leader = subprocess.Popen([
@@ -2604,15 +2739,14 @@ def test_kill_holder_tree_reaps_a_session_escaped_grandchild():
             'after the call returned'
         )
 
-        gone_deadline = time.monotonic() + 5.0
-        survivors = set(grandchildren)
-        while survivors and time.monotonic() < gone_deadline:
-            survivors = {pid for pid in survivors if not _pid_gone(pid)}
-            if survivors:
-                time.sleep(0.05)
+        survivors = wait_pids_exited(grandchildren, timeout=5.0)
+        state_by_pid = {pid: (st.state, st.ppid) for pid, st in sorted(survivors.items())}
         assert not survivors, (
-            f'kill_holder_tree left session-escaped descendant(s) alive: '
-            f'{sorted(survivors)} -- the exact orphan task 4092 exists to fix'
+            f'kill_holder_tree left session-escaped descendant(s) of leader '
+            f'pid={leader.pid} running, as {{pid: (state, ppid)}}: {state_by_pid} '
+            f'-- the exact orphan task 4092 exists to fix.  State S/T means '
+            f'SIGKILL never reached it; R/D means it was signalled but has '
+            f'not yet run to exit'
         )
     finally:
         if leader.poll() is None:
@@ -2762,17 +2896,14 @@ def _wait_until_zombie(pid: int, *, timeout: float = 5.0) -> bool:
 
     Deliberately does NOT use ``Popen.wait()``/``poll()``: those reap the
     process, which is precisely the state transition the caller here needs
-    to NOT happen.  Reads the state field positionally from the tail after
-    the last ``)`` so a comm containing spaces or parens cannot skew it.
+    to NOT happen.  Reads the state via :func:`read_proc_state`.
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        try:
-            stat = Path(f'/proc/{pid}/stat').read_text()
-        except OSError:
+        state = read_proc_state(pid)
+        if state is None:
             return False  # already reaped by someone else, or gone
-        tail = stat.rpartition(')')[2].split()
-        if tail and tail[0] == 'Z':
+        if state.state == 'Z':
             return True
         time.sleep(0.02)
     return False

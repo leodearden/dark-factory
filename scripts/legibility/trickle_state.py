@@ -194,36 +194,27 @@ def classify_run(
 
 
 # ---------------------------------------------------------------------------
-# trickle_state_path — where the record lives, and why not in the repo
+# project_state_dir / trickle_state_path — where the record lives, and why
+# not in the repo
 # ---------------------------------------------------------------------------
 
 STATE_ROOT_ENV = 'DARK_FACTORY_LEGIBILITY_STATE_ROOT'
 """The ONE supported lever for relocating the legibility state root.
 
 Deliberately a dedicated name rather than a general-purpose one. See
-:func:`trickle_state_path` for why that distinction is the whole fix."""
+:func:`project_state_dir` for why that distinction is the whole fix."""
 
 
-def trickle_state_path(project_id: str) -> Path:
-    """Return the per-project run-state file path, resolved from the
-    ACCOUNT rather than from the calling process's environment.
+def project_state_dir(project_id: str) -> Path:
+    """Return this host's legibility state directory for *project_id*,
+    resolved from the ACCOUNT rather than from the calling process's
+    environment.
 
-    ``<passwd home>/.local/state/dark-factory/legibility/<project_id>/
-    trickle-state.json``, overridable only via :data:`STATE_ROOT_ENV`.
-
-    WHAT THIS FILE IS. Its identity is "this host's legibility state for
-    this USER and this project" — not "this PROCESS's state dir". Two
-    processes that must agree on ONE file cannot each resolve it from
-    their own environment. The writer is
-    ``legibility-trickle@<project>.service`` under the ``systemd --user``
-    manager (user-record HOME, no shell rc). The reader is
-    ``legibility-trickle-health@<project>.service``, or an
-    orchestrator-EXEC'd ``before_done`` predicate inheriting whatever
-    shell launched the orchestrator, or a dev shell. Nothing pinned them
-    to agree, so before task 4514 they silently read and wrote different
-    files — and a probe that cannot find the file reports ``missing`` and
-    fails PERMANENTLY, which for a milestone binding is a born-at-L2
-    ``milestone_check_failed`` for a pipeline running perfectly.
+    ``<passwd home>/.local/state/dark-factory/legibility/<project_id>/``,
+    overridable only via :data:`STATE_ROOT_ENV`. It holds the trickle
+    run-state file (:func:`trickle_state_path`) and the quarantine of
+    refused legibility writes (``scripts/legibility/unlanded.py::
+    quarantine_root``). Never raises.
 
     WHY THE PASSWD ANCHOR. The home in the passwd database is a property
     of the account that owns the pipeline, read from NSS, and is identical
@@ -240,8 +231,8 @@ def trickle_state_path(project_id: str) -> Path:
     for reasons having nothing to do with legibility — so writer and
     reader diverged with nobody having intended to redirect anything.
     ``DARK_FACTORY_LEGIBILITY_STATE_ROOT`` is never set incidentally; it
-    is set only by someone who means THIS file. The shipped systemd units
-    deliberately do not set it (pinned by
+    is set only by someone who means THIS directory. The shipped systemd
+    units deliberately do not set it (pinned by
     ``scripts/tests/test_install_trickle_health_timer.py``), so production
     always takes the anchored branch.
 
@@ -254,19 +245,6 @@ def trickle_state_path(project_id: str) -> Path:
     survives only for a genuinely absent passwd entry (an arbitrary-uid
     container), preserving the never-raise property this helper needs on
     the nightly run's unconditional path.
-
-    NOT UNDER ``docs/legibility/``, despite ``census-state.json`` living
-    there and looking like the local precedent. That file is git-TRACKED
-    and advances only when a census fires (rare, and committed then). A
-    file rewritten EVERY night cannot live on a tracked path: it would
-    either leave the machine-operated ``project_root`` checkout
-    permanently dirty — poisoning the startup dirty-tree guard and
-    warm-lane GC, the exact pollution class task 2439 fixed — or force a
-    nightly commit, which would make "the repo has a commit today" a valid
-    liveness signal and thereby CONTRADICT PRD decision 7 outright.
-    Host-local state outside every checkout is what this actually is: a
-    record of what the local timer did. It also needs no ``.gitignore``
-    entry.
 
     RE-DERIVED, NOT REUSED — AND NO LONGER THE SAME SHAPE. This used to
     mirror ``orchestrator/src/orchestrator/mcp_lifecycle.py::
@@ -295,17 +273,53 @@ def trickle_state_path(project_id: str) -> Path:
             base = Path(pwd.getpwuid(os.getuid()).pw_dir) / '.local' / 'state'
         except (KeyError, OSError):
             logger.warning(
-                'trickle_state_path: no passwd entry for uid %s; falling '
+                'project_state_dir: no passwd entry for uid %s; falling '
                 'back to the OS temp dir for project_id=%s — the recorded '
-                'streak will not survive a reboot. Set %s to a durable '
-                'path.',
+                'legibility state will not survive a reboot. Set %s to a '
+                'durable path.',
                 os.getuid(),
                 project_id,
                 STATE_ROOT_ENV,
             )
             base = Path(tempfile.gettempdir())
 
-    return base / 'dark-factory' / 'legibility' / project_id / STATE_FILENAME
+    return base / 'dark-factory' / 'legibility' / project_id
+
+
+def trickle_state_path(project_id: str) -> Path:
+    """Return the per-project run-state file path:
+    ``<project_state_dir(project_id)>/trickle-state.json``.
+
+    WHAT THIS FILE IS. Its identity is "this host's legibility state for
+    this USER and this project" — not "this PROCESS's state dir". Two
+    processes that must agree on ONE file cannot each resolve it from
+    their own environment. The writer is
+    ``legibility-trickle@<project>.service`` under the ``systemd --user``
+    manager (user-record HOME, no shell rc). The reader is
+    ``legibility-trickle-health@<project>.service``, or an
+    orchestrator-EXEC'd ``before_done`` predicate inheriting whatever
+    shell launched the orchestrator, or a dev shell. Nothing pinned them
+    to agree, so before task 4514 they silently read and wrote different
+    files — and a probe that cannot find the file reports ``missing`` and
+    fails PERMANENTLY, which for a milestone binding is a born-at-L2
+    ``milestone_check_failed`` for a pipeline running perfectly. How the
+    directory is resolved so that they DO agree is
+    :func:`project_state_dir`'s business.
+
+    NOT UNDER ``docs/legibility/``, despite ``census-state.json`` living
+    there and looking like the local precedent. That file is git-TRACKED
+    and advances only when a census fires (rare, and committed then). A
+    file rewritten EVERY night cannot live on a tracked path: it would
+    either leave the machine-operated ``project_root`` checkout
+    permanently dirty — poisoning the startup dirty-tree guard and
+    warm-lane GC, the exact pollution class task 2439 fixed — or force a
+    nightly commit, which would make "the repo has a commit today" a valid
+    liveness signal and thereby CONTRADICT PRD decision 7 outright.
+    Host-local state outside every checkout is what this actually is: a
+    record of what the local timer did. It also needs no ``.gitignore``
+    entry.
+    """
+    return project_state_dir(project_id) / STATE_FILENAME
 
 
 # ---------------------------------------------------------------------------

@@ -19,6 +19,7 @@ import contextlib
 import functools
 import json
 import logging
+import subprocess
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -28,7 +29,7 @@ import coder
 import digest as digest_mod
 import inventory
 import pytest
-from legibility import census_trigger
+from legibility import census_trigger, unlanded
 from shared.cap_markers import BLOCKING_BANNER_MARKERS, REAL_CLI_CAP_MESSAGES
 
 import config as config_mod
@@ -1869,6 +1870,7 @@ def _run_census_kwargs(tmp_path, **overrides) -> dict[str, Any]:
         escalate_fn=_make_fake_escalate_fn(),
         status_fetcher=_make_fake_status_fetcher(0),
         commit=_poison("commit"),
+        roll_back=_poison("roll_back"),
         codebook_dict=_minimal_v2_codebook(),
         config=config_mod.LegibilityConfig(
             project_id="dark_factory",
@@ -2164,6 +2166,164 @@ def test_run_census_happy_path_full_seam_wiring(tmp_path):
     assert outcome.report_path == str(kwargs["report_path"])
     assert outcome.filed_ticket_ids == ["tkt_1"]
     assert outcome.stop_reason == "exhausted"
+
+
+# ---------------------------------------------------------------------------
+# task 5780: a census whose commit does not land (e.g. refused by the target
+# repo's pre-commit hook) rolls every written path back to HEAD, quarantines
+# the refused content, and never advances census-state (the remedy
+# scripts/legibility/unlanded.py's module docstring states).
+# ---------------------------------------------------------------------------
+
+_REFUSAL = "git commit failed: cited-test-path gate: tests/moved_test.rs does not exist"
+
+
+def _make_refused_commit():
+    """Fake `commit(paths=, message=)` seam that records its kwargs and then
+    raises exactly as census.py::_build_default_commit does on a refusal."""
+    calls = []
+
+    def refused_commit(**kwargs):
+        calls.append(kwargs)
+        raise RuntimeError(_REFUSAL)
+
+    refused_commit.calls = calls
+    return refused_commit
+
+
+def _make_fake_roll_back(rollback):
+    """Fake `roll_back(paths=) -> unlanded.Rollback` seam returning *rollback*."""
+    calls = []
+
+    def fake_roll_back(**kwargs):
+        calls.append(kwargs)
+        return rollback
+
+    fake_roll_back.calls = calls
+    return fake_roll_back
+
+
+def _unlanded_kwargs(tmp_path, **overrides):
+    return _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[[
+            _hand_digest("dup-1", "nothing new here"),
+            _hand_digest("novel-verified", "a genuinely new confusion shape"),
+        ]],
+        verify_fn=_make_fake_verify_fn(verified_titles={"Silent no-op subagent contract"}),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        escalate_fn=_make_fake_escalate_fn(),
+        commit=_make_refused_commit(),
+        **overrides,
+    )
+
+
+def test_run_census_unlanded_commit_rolls_back_every_written_path_and_escalates(tmp_path):
+    rollback = unlanded.Rollback(
+        quarantine_dir=tmp_path / "q" / "census-2026-07-14-x", paths=("a",),
+    )
+    fake_roll_back = _make_fake_roll_back(rollback)
+    kwargs = _unlanded_kwargs(tmp_path, roll_back=fake_roll_back)
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "unlanded"
+    assert outcome.rollback is rollback
+    assert fake_roll_back.calls == [{"paths": kwargs["commit"].calls[0]["paths"]}]
+    assert outcome.report_path is None
+    assert outcome.filed_ticket_ids == ["tkt_1"]
+
+    assert len(kwargs["escalate_fn"].calls) == 1
+    call = kwargs["escalate_fn"].calls[0]
+    detail = call["detail"]
+    assert "cited-test-path gate" in detail
+    assert str(rollback.quarantine_dir) in detail
+    assert "tkt_1" in detail
+    assert "census-state" in call["summary"] + detail
+
+
+def test_run_census_dry_run_unlanded_rolls_back_the_payloads_file_and_keeps_its_facts(
+    tmp_path,
+):
+    """The payloads file is rolled back like the report. The dry-run record
+    survives only for what still holds -- nothing filed, how many payloads --
+    and its path names where the file was WRITTEN (the CensusOutcome
+    contract); where it is now is ``rollback``'s to say."""
+    payloads_path = tmp_path / "confusion-census-2026-07-14-payloads.json"
+    fake_roll_back = _make_fake_roll_back(
+        unlanded.Rollback(quarantine_dir=tmp_path / "q" / "census-2026-07-14-x", paths=("a",)),
+    )
+    kwargs = _unlanded_kwargs(
+        tmp_path, roll_back=fake_roll_back, dry_run_payloads_path=payloads_path,
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "unlanded"
+    assert str(payloads_path) in fake_roll_back.calls[0]["paths"]
+    assert outcome.report_path is None
+    assert outcome.filed_ticket_ids == []
+    assert outcome.dry_run is not None
+    assert outcome.dry_run.payload_count == 1
+    assert outcome.dry_run.path == str(payloads_path)
+
+
+def _git(repo, *args):
+    return subprocess.run(
+        ["git", "-C", str(repo), *args], check=True, capture_output=True,
+    ).stdout
+
+
+def test_run_census_never_advances_census_state_when_the_commit_does_not_land(tmp_path):
+    repo = tmp_path / "repo"
+    legibility_dir = repo / "docs" / "legibility"
+    legibility_dir.mkdir(parents=True)
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    codebook_path = legibility_dir / "confusion-codebook.yaml"
+    codebook.dump(_minimal_v2_codebook(), codebook_path)
+    census_state_path = legibility_dir / "census-state.json"
+    mod.advance_census_state(
+        census_state_path,
+        now_iso="2026-06-01",
+        report_path="plans/confusion-census-2026-06-01.md",
+        done_count=0,
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "initial")
+    report_path = repo / "plans" / "confusion-census-2026-07-14.md"
+    kwargs = _unlanded_kwargs(
+        repo,
+        roll_back=functools.partial(
+            unlanded.roll_back, repo, project_id="dark_factory", label="census-2026-07-14",
+        ),
+        codebook_path=codebook_path,
+        census_state_path=census_state_path,
+        report_path=report_path,
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert census_state_path.read_bytes() == _git(
+        repo, "show", "HEAD:docs/legibility/census-state.json",
+    )
+    assert codebook_path.read_bytes() == _git(
+        repo, "show", "HEAD:docs/legibility/confusion-codebook.yaml",
+    )
+    assert not report_path.exists()
+    assert _git(repo, "status", "--porcelain") == b""
+
+    assert outcome.rollback is not None and outcome.rollback.restored
+    quarantine_dir = outcome.rollback.quarantine_dir
+    assert quarantine_dir is not None
+    quarantined_state = json.loads(
+        (quarantine_dir / "docs" / "legibility" / "census-state.json").read_text(),
+    )
+    assert quarantined_state["last_census_at"] == "2026-07-14"
+    assert (quarantine_dir / "plans" / "confusion-census-2026-07-14.md").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -4096,6 +4256,53 @@ def test_main_without_force_no_fire_noops_with_exit_zero(tmp_path, monkeypatch, 
     out = capsys.readouterr().out
     assert "no-fire" in out.lower(), "an explanatory stdout line naming the no-fire decision"
     assert "max-interval: not yet due" in out
+
+
+def test_main_exits_nonzero_and_names_the_quarantine_when_the_census_did_not_land(
+    tmp_path, monkeypatch, capsys,
+):
+    _write_legibility_yaml(tmp_path)
+    quarantine_dir = tmp_path / "q" / "census-2026-07-14-x"
+    fake_run_census = _make_fake_main_run_census(outcome=mod.CensusOutcome(
+        status="unlanded",
+        rollback=unlanded.Rollback(
+            quarantine_dir=quarantine_dir, paths=("docs/legibility/census-state.json",),
+        ),
+        filed_ticket_ids=["tkt_9"],
+    ))
+    monkeypatch.setattr(mod, "run_census", fake_run_census)
+
+    exit_code = mod.main(["--project-root", str(tmp_path), "--force"])
+
+    assert exit_code == 1
+    assert str(quarantine_dir) in capsys.readouterr().err
+
+
+def test_main_wires_a_roll_back_bound_to_the_censused_project(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    _write_legibility_yaml(repo)
+    census_state_path = repo / "docs" / "legibility" / "census-state.json"
+    census_state_path.write_text('{"last_census_at": "2026-06-01"}\n', encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "initial")
+    fake_run_census = _make_fake_main_run_census()
+    monkeypatch.setattr(mod, "run_census", fake_run_census)
+
+    mod.main(["--project-root", str(repo), "--force", "--date", "2026-07-14"])
+
+    call = fake_run_census.calls[0]
+    census_state_path.write_text('{"last_census_at": "2026-07-14"}\n', encoding="utf-8")
+    rb = call["roll_back"](paths=[call["census_state_path"]])
+    assert rb.restored
+    assert census_state_path.read_bytes() == _git(
+        repo, "show", "HEAD:docs/legibility/census-state.json",
+    )
+    assert rb.quarantine_dir.parent == unlanded.quarantine_root("dark_factory")
+    assert rb.quarantine_dir.name.startswith("census-2026-07-14-")
 
 
 # ---------------------------------------------------------------------------
