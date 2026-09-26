@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import itertools
+import json
 import types
 from pathlib import Path
 
@@ -425,3 +427,135 @@ class TestChooseBest:
         rows = [_arm_json('stale', 0.99, 0.1, 'skipped'), _arm_json('real', 0.3, 1.0)]
         assert _best(rows)['arm'] == 'real'
         assert _best([_arm_json('stale', 0.99, 0.1, 'skipped')])['arm'] is None
+
+
+_COMMITTED_REPORT = Path(__file__).parent.parent / 'calibration' / 'write_triage_reranker_report.json'
+
+
+class TestRunRerankerEval:
+    @staticmethod
+    def _cases() -> list:
+        return [
+            _case(_record('d1', 'c1'), [_row('x', 0.5), _row('c1', 0.9)]),
+            _case(_record('n1', 'c2', label='distinct'), [_row('c2', 0.8), _row('y', 0.4)]),
+            _case(
+                _record('d9', 'gone'), [],
+                canonical_present=False, degraded=True, self_retrieved=True,
+            ),
+        ]
+
+    @staticmethod
+    def _specs(log: list | None = None) -> list:
+        arms = _arms()
+        answers = {'the entry d1': _slate((0.9, 0.1)), 'the entry n1': _slate((0.9, 0.1))}
+        return [
+            _spec(_FakeScorer(answers), name='good', log=log),
+            _spec(name='locked', unavailable=arms.ArmUnavailable(
+                arms.SkipReason.no_credential, 'JINA_API_KEY unset',
+            )),
+            _spec(_FakeScorer(answers, fail_on_call=2), name='flaky', log=log),
+        ]
+
+    def _run(self, report_path: Path, *, specs: list | None = None) -> dict:
+        return _mod().run_reranker_eval(
+            cases=self._cases(), arms=specs if specs is not None else self._specs(),
+            aliases=None, context=_context(),
+            provenance={'project_id': 'reify', 'record_count': 5},
+            report_path=report_path, clock=itertools.count(0.0, 0.5).__next__,
+            max_spend_usd=1.0, p95_ceiling_seconds=2.5,
+        )
+
+    def test_the_report_has_its_sections_in_order(self, tmp_path: Path) -> None:
+        report = self._run(tmp_path / 'r.json')
+        assert list(report) == ['arms', 'baseline', 'best', 'caveats', 'provenance']
+
+    def test_one_row_per_arm_in_spec_order_with_its_status(self, tmp_path: Path) -> None:
+        rows = self._run(tmp_path / 'r.json')['arms']
+        assert [(r['arm'], r['status'], r['skip_reason']) for r in rows] == [
+            ('good', 'measured', None),
+            ('locked', 'skipped', 'no_credential'),
+            ('flaky', 'skipped', 'error'),
+        ]
+
+    def test_the_cosine_baseline_is_reported_but_never_best(self, tmp_path: Path) -> None:
+        report = self._run(tmp_path / 'r.json')
+        baseline = report['baseline']
+        assert (baseline['arm'], baseline['status']) == ('cosine', 'measured')
+        assert baseline['rank1'] == {'hits': 2, 'total': 3}
+        assert report['arms'][0]['rank1'] == {'hits': 1, 'total': 3}
+        assert (baseline['p50_seconds'], baseline['p95_seconds'], baseline['latency']) == (
+            None, None, None,
+        )
+        assert (baseline['cost_per_write_usd'], baseline['device']) == (None, None)
+        assert report['best']['arm'] == 'good'
+
+    def test_best_is_the_selection_rule_over_the_arm_rows(self, tmp_path: Path) -> None:
+        report = self._run(tmp_path / 'r.json')
+        assert report['best'] == _mod().choose_best(report['arms'], p95_ceiling_seconds=2.5)
+
+    def test_provenance_carries_the_callers_keys_and_the_run_it_measured(
+        self, tmp_path: Path,
+    ) -> None:
+        provenance = self._run(tmp_path / 'r.json')['provenance']
+        assert (provenance['project_id'], provenance['record_count']) == ('reify', 5)
+        assert provenance['case_count'] == 3
+        assert (
+            provenance['canonical_absent'], provenance['degraded_retrievals'],
+            provenance['self_retrieved'],
+        ) == (1, 1, 1)
+        assert (provenance['p95_ceiling_seconds'], provenance['max_arm_spend_usd']) == (2.5, 1.0)
+        assert (
+            provenance['local_batch_size'], provenance['vram_cap_gib'],
+            provenance['pairwise_concurrency'],
+        ) == (4, 8.0, 20)
+
+    def test_caveats_are_strings(self, tmp_path: Path) -> None:
+        caveats = self._run(tmp_path / 'r.json')['caveats']
+        assert caveats
+        assert all(isinstance(caveat, str) and caveat for caveat in caveats)
+
+    def test_the_json_and_its_markdown_sibling_are_written(self, tmp_path: Path) -> None:
+        path = tmp_path / 'r.json'
+        report = self._run(path)
+        text = path.read_text()
+        assert text == json.dumps(report, indent=2) + '\n'
+        assert json.loads(text) == report
+        assert path.with_suffix('.md').read_text() == _mod().render_markdown(report)
+
+    def test_the_markdown_has_a_row_per_arm_and_the_best_line(self, tmp_path: Path) -> None:
+        markdown = _mod().render_markdown(self._run(tmp_path / 'r.json'))
+        lines = markdown.splitlines()
+        for arm in ('cosine', 'good', 'locked', 'flaky'):
+            assert len([line for line in lines if line.startswith(f'| {arm} |')]) == 1
+        [locked] = [line for line in lines if line.startswith('| locked |')]
+        assert 'skipped' in locked and 'no_credential' in locked and 'n/a' in locked
+        assert any(line.startswith('**Best:**') and 'good' in line for line in lines)
+
+    def test_a_report_path_not_ending_in_json_is_refused_before_any_arm_opens(
+        self, tmp_path: Path,
+    ) -> None:
+        log: list[str] = []
+        with pytest.raises(ValueError, match='.json'):
+            self._run(tmp_path / 'r.txt', specs=self._specs(log))
+        assert log == []
+        assert list(tmp_path.iterdir()) == []
+
+
+class TestGuardCommittedReport:
+    def test_a_limited_run_at_the_committed_path_is_refused(self) -> None:
+        with pytest.raises(ValueError):
+            _mod().guard_committed_report(_COMMITTED_REPORT, limit=3)
+
+    def test_the_relative_spelling_is_refused_too(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.chdir(_COMMITTED_REPORT.parent.parent)
+        with pytest.raises(ValueError):
+            _mod().guard_committed_report(
+                Path('calibration/write_triage_reranker_report.json'), limit=3,
+            )
+
+    def test_a_limited_run_elsewhere_is_allowed(self, tmp_path: Path) -> None:
+        path = tmp_path / 'smoke.json'
+        assert _mod().guard_committed_report(path, limit=3) == path
+
+    def test_a_full_run_at_the_committed_path_is_allowed(self) -> None:
+        assert _mod().guard_committed_report(_COMMITTED_REPORT, limit=None) == _COMMITTED_REPORT
