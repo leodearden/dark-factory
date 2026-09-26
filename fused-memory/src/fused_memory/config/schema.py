@@ -2175,15 +2175,11 @@ class CuratorConfig(BaseModel):
     # single-call comment block below on why single_call_budget_cap_usd must
     # move together with this value.
     max_budget_usd: float = Field(default=2.00)
-    # Per-call turn cap. Must be ≥ 3 to reserve room for the PROSE turn the
-    # model emits before it calls ``StructuredOutput``, plus the schema call
-    # itself. It is not that the schema deterministically burns a turn with
-    # reasoning optionally preceding it — measured (task 3241), the prose turn
-    # is stochastic and prompt-sensitive, and a cap of 1 leaves no room for it,
-    # so the CLI returns ``error_max_turns`` with NO structured payload. See the
-    # fuller measured note in task_curator.py above
-    # ``max_turns=self._config.curator.max_turns``. 8 leaves headroom for harder
-    # combine-vs-create decisions.
+    # Per-call turn cap. Must be ≥ 3, the established --json-schema floor: a
+    # cap of 1 leaves no room for the prose turn the model emits before calling
+    # ``StructuredOutput`` (see
+    # fused-memory/src/fused_memory/reconciliation/agent_loop.py::_AGENT_CLI_MAX_TURNS).
+    # 8 leaves headroom for harder combine-vs-create decisions.
     max_turns: int = Field(default=8, ge=3)
 
     # Corpus caps — see design notes in shared/docs (the four-stream pool).
@@ -2444,10 +2440,8 @@ class PathScopeAdjudicatorConfig(BaseModel):
     # flat $2.00 (task 1983) to match CuratorConfig's durable ceiling. Do NOT
     # lower below 0.25 — the adjudicator becomes a silent no-op.
     max_budget_usd: float = Field(default=2.00)
-    # Per-call turn cap. Must be ≥ 3 to reserve room for the PROSE turn the
-    # model emits before it calls ``StructuredOutput``, plus the schema call
-    # itself (not a deterministic schema-turn tax — task 3241). Matches the
-    # json-schema turn floor noted in CuratorConfig.
+    # Per-call turn cap. Must be ≥ 3: the --json-schema turn floor explained at
+    # CuratorConfig.max_turns.
     max_turns: int = Field(default=3, ge=3)
     # Zero-output-timeout circuit-breaker knobs (mirrors CuratorConfig).
     zero_output_breaker_threshold: int = Field(default=2, ge=1)

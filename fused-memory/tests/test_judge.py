@@ -1936,9 +1936,8 @@ async def test_call_judge_cli_passes_judge_verdict_schema(mock_journal):
       judge inherits future central fixes instead of pinning a stale copy of the
       CLI's built-in list.
     - ``max_turns >= 3`` — a cap of 1 leaves no room for the prose turn the
-      model emits before calling ``StructuredOutput``, so the CLI returns
-      ``error_max_turns`` with no payload (see ``_JUDGE_CLI_MAX_TURNS``); 3 is
-      the floor both migrated siblings use.
+      model emits before calling ``StructuredOutput`` (see
+      ``_JUDGE_CLI_MAX_TURNS``); 3 is the floor both migrated siblings use.
     - ``system_prompt`` is unchanged — JUDGE_SYSTEM_PROMPT's "## Output Format"
       block stays because it is the ONLY output contract the anthropic/openai
       provider branches have (they never see ``--json-schema``).
@@ -1975,9 +1974,8 @@ async def test_call_judge_cli_passes_judge_verdict_schema(mock_journal):
     assert call_kwargs['disallowed_tools'] == ['*']
     assert call_kwargs['max_turns'] >= 3, (
         'max_turns=1 leaves no room for the prose turn the model emits before '
-        'calling StructuredOutput, so the CLI returns error_max_turns with NO '
-        'payload attached and the call hard-fails (measured 0/6 at max_turns=1 '
-        'on Claude CLI 2.1.236; see _JUDGE_CLI_MAX_TURNS)'
+        'calling StructuredOutput, so the CLI returns error_max_turns; see '
+        '_JUDGE_CLI_MAX_TURNS'
     )
     assert call_kwargs['system_prompt'] == JUDGE_SYSTEM_PROMPT
 

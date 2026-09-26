@@ -1240,10 +1240,7 @@ async def test_call_claude_cli_delegates_to_invoke_with_cap_retry():
     # timeout, and session-threading are wired through correctly.
     # Fine-grained knobs (permission_mode, disallowed_tools) are
     # implementation details covered by shared/tests/test_cli_invoke.py.
-    # max_turns is NOT one of them and is deliberately excluded from that
-    # carve-out: it is a value only this caller chooses, and waving it through
-    # as someone else's implementation detail is exactly how it sat at a broken
-    # 1 unnoticed.  It is pinned by
+    # max_turns is not: only this caller chooses it, so it is pinned by
     # test_call_claude_cli_passes_a_workable_max_turns below.
     from pathlib import Path
 
@@ -1321,12 +1318,8 @@ async def test_call_claude_cli_passes_a_workable_max_turns():
     call_kwargs = mock_invoke.call_args.kwargs
     assert call_kwargs['max_turns'] >= 3, (
         'max_turns=1 leaves no room for the prose turn the model emits before '
-        'calling StructuredOutput, so the CLI returns error_max_turns carrying '
-        'NO structured payload: schema salvage never engages, result.success is '
-        'False, and _call_claude_cli raises.  Measured 0/6 on the real '
-        'recon-verify prompt/schema shape (Claude CLI 2.1.236, and 0/6 on '
-        '2.1.233 before it); re-measure with '
-        'fused-memory/scripts/probe_schema_max_turns.py.'
+        'calling StructuredOutput, so the CLI returns error_max_turns and '
+        '_call_claude_cli raises; see _AGENT_CLI_MAX_TURNS.'
     )
 
 
