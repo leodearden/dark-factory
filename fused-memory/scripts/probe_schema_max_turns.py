@@ -1,21 +1,16 @@
 #!/usr/bin/env python3
 """MANUAL diagnostic: measure the ``--max-turns`` x ``--json-schema`` interaction.
 
-Task 3241.  Five separate comments in this repo asserted, in mutually
-contradictory ways, what ``max_turns`` does to a ``--json-schema`` invocation —
-and none of them could be cheaply re-checked, so the wrong ones survived for
-months.  ``agent_loop.py`` passed ``max_turns=1`` on the belief that "schema
-tool-use -> JSON response happens within the same turn"; measured, that value
-failed 100% of the time and the failure was invisible because ``verify.py``
-degrades to ``default_verdict='inconclusive'``.
-
-The behaviour is CLI-VERSION-DEPENDENT and WILL drift again.  This script exists
-so the next person does not have to rebuild a probe from scratch to re-check a
-patch bump — which is exactly what the 3241 revalidation had to do.
+Task 3241.  This docstring is the single record of the measured numbers behind
+every ``max_turns`` floor on a ``--json-schema`` invocation in fused-memory
+(``agent_loop.py::_AGENT_CLI_MAX_TURNS``, ``judge.py::_JUDGE_CLI_MAX_TURNS``,
+and the curator / path-scope-adjudicator ``ge=3`` floors).  Those sites state
+the mechanism and point here; rates, sample sizes and CLI versions live only
+below.  The behaviour is CLI-VERSION-DEPENDENT: re-run this script rather than
+trusting a number copied anywhere else.
 
 NOT part of the pytest suite, deliberately.  It requires live Claude CLI
-credentials and spends real tokens; the suite stays hermetic and offline.  Run
-it by hand when a comment citing these numbers needs revalidating.
+credentials and spends real tokens; the suite stays hermetic and offline.
 
 Baseline to diff against
 ------------------------
@@ -25,12 +20,19 @@ Recon-verify shape (EXPLORE_AGENT_SYSTEM_PROMPT + CLAUDE_CLI_RESPONSE_SCHEMA),
     Claude CLI 2.1.236:  mt=1 -> 0/6   mt=3 -> 4/6   mt=6 -> 4/6   mt=10 -> 6/6
     Claude CLI 2.1.233:  mt=1 -> 0/6   mt=3 -> 2/6   mt=6 -> 4/5   mt=10 -> 4/5
 
-Every failure was ``subtype='error_max_turns'``, ``is_error=True``, carrying NO
-structured payload — so ``schema_salvaged`` was False in all 12 observed
-failures and salvage never engaged.  ``mt=1 -> 0/6`` is stable across both CLI
-versions; the intermediate rates are not.  The failure is STOCHASTIC, which is
-why every cell is repeated: a single run per cell is what produced an earlier,
-wrong "max_turns=1 is safe" verdict.
+The model emits a prose turn before it calls ``StructuredOutput``, and a cap of
+1 leaves no room for it.  Every failure was ``subtype='error_max_turns'`` with
+NO structured payload, so ``schema_salvaged`` was False every time and salvage
+never engaged.  ``mt=1 -> 0/6`` held on both CLI versions; the intermediate
+rates moved between them.  The failure is STOCHASTIC, which is why every cell
+is repeated: one run per cell is what produced an earlier, wrong "max_turns=1
+is safe" verdict.  Six clean runs at mt=10 cannot exclude a residual failure
+rate of a few tens of percent.
+
+``num_turns`` is not the counter ``--max-turns`` bounds: every failure reported
+``num_turns == max_turns + 1``, but successes at mt=10 reported 9, 11 and 14.
+
+The judge's shape (``--shape judge``) has no recorded baseline yet.
 
 Usage
 -----
@@ -45,18 +47,24 @@ Usage
 
 Fidelity notes (all load-bearing — a naive probe gets a wrong answer)
 --------------------------------------------------------------------
-* argv is built by CALLING ``shared.cli_invoke.build_claude_argv``, never a
-  hand-rolled flag list, so the probe measures the invocation production sends.
+* Every run goes through ``shared.cli_invoke.invoke_claude_agent`` — the call
+  production's ``invoke_with_cap_retry`` makes — with the same schema, deny
+  and MCP kwargs agent_loop and the judge pass.  argv, env handling, the
+  default ``max_budget_usd`` and the ``AgentResult`` verdict (``success``,
+  ``schema_salvaged``, ``schema_tool_denied``) are production's own.
+* Model and per-run timeout come from ``ReconciliationConfig``
+  (``agent_cli_timeout_seconds`` / ``judge_cli_timeout_seconds``), so a run
+  production would kill is counted as ``timed_out`` here, not as a success.
 * The system prompt is the REAL one, captured by driving
   ``CodebaseVerifier.verify()`` up to its ``AgentLoop`` construction.  A toy
   system prompt SUCCEEDS at ``max_turns=1`` and manufactures the opposite
   verdict — this is the single biggest way to get this measurement wrong.
-* The env is production's: ``ANTHROPIC_API_KEY`` stripped, per-invocation
-  ``CLAUDE_CODE_OAUTH_TOKEN`` injected, per-invocation ``CLAUDE_CONFIG_DIR``.
-  Omit it and the CLI returns ``is_error=True, subtype='success', num_turns=1,
-  result='Not logged in - Please run /login'``, which is NOT a turn-cap failure
-  but looks like a uniform 0/N and is easily misread as one.  Auth and credit
-  failures are detected and reported SEPARATELY from ``error_max_turns``.
+* Each run gets a pool account's OAuth token and a throwaway
+  ``CLAUDE_CONFIG_DIR``.  Without credentials the CLI returns
+  ``is_error=True, subtype='success', num_turns=1,
+  result='Not logged in - Please run /login'``, which is NOT a turn-cap
+  failure but looks like a uniform 0/N and is easily misread as one.  Auth and
+  credit failures are detected and reported SEPARATELY from ``error_max_turns``.
 * No token value is ever printed.
 """
 
@@ -64,14 +72,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -83,12 +90,18 @@ for _p in (_FM_SRC, _SHARED_SRC):
         sys.path.insert(0, str(_p))
 
 from shared.cli_invoke import (  # noqa: E402
-    _REAL_BUILTIN_TOOLS_DENYLIST,
-    build_claude_argv,
+    AgentResult,
+    invoke_claude_agent,
     no_mcp_servers_config,
 )
 
+from fused_memory.config.schema import ReconciliationConfig  # noqa: E402
+
 _DEFAULT_ACCOUNTS_FILE = _REPO_ROOT / 'config' / 'usage-accounts.yaml'
+_PRECHECK_TIMEOUT_SECS = 120.0
+# A run this close to its production timeout is flagged: it passed here, but
+# ordinary latency variance would have it killed in production.
+_NEAR_TIMEOUT_FRACTION = 0.8
 
 # Substrings that mean "this run never reached the model", NOT "the turn cap bit".
 # Conflating the two is the misread this script exists to prevent, so they are
@@ -100,6 +113,7 @@ _AUTH_FAILURE_MARKERS = (
     'oauth token has expired',
     'invalid api key',
     'authentication_error',
+    'disabled claude subscription access',
 )
 _CREDIT_FAILURE_MARKERS = (
     'hit your weekly limit',
@@ -110,6 +124,7 @@ _CREDIT_FAILURE_MARKERS = (
 
 _OUTCOME_OK = 'ok'
 _OUTCOME_MAX_TURNS = 'error_max_turns'
+_OUTCOME_TIMEOUT = 'timed_out'
 _OUTCOME_AUTH = 'auth_failure'
 _OUTCOME_CREDIT = 'credit_exhausted'
 _OUTCOME_OTHER = 'other_failure'
@@ -120,32 +135,39 @@ _OUTCOME_OTHER = 'other_failure'
 _OUTCOME_NO_TOOL_CALLS = 'no_tool_calls'
 
 
-@dataclass
+@dataclass(frozen=True)
 class Observation:
     """One CLI invocation's outcome."""
 
     max_turns: int
     shape: str
     outcome: str
-    returncode: int
+    success: bool
     subtype: str
-    is_error: bool
-    num_turns: Any
+    num_turns: int
     has_payload: bool
     schema_salvaged: bool
     schema_tool_denied: bool
     tool_calls: int | None
+    duration_s: float
+    timeout_s: float
     detail: str = ''
+
+    @property
+    def near_timeout(self) -> bool:
+        return self.duration_s >= _NEAR_TIMEOUT_FRACTION * self.timeout_s
 
     def line(self) -> str:
         bits = [
-            f'rc={self.returncode}',
+            f'success={self.success}',
             f'subtype={self.subtype or "-"!s}',
-            f'is_error={self.is_error}',
             f'num_turns={self.num_turns}',
             f'payload={"yes" if self.has_payload else "NO"}',
             f'schema_salvaged={self.schema_salvaged}',
+            f'took={self.duration_s:.0f}s/{self.timeout_s:.0f}s',
         ]
+        if self.near_timeout:
+            bits.append('NEAR-TIMEOUT')
         if self.schema_tool_denied:
             bits.append('schema_tool_denied=True')
         if self.tool_calls is not None:
@@ -156,18 +178,18 @@ class Observation:
         return out
 
 
-@dataclass
+@dataclass(frozen=True)
 class Shape:
-    """A (system prompt, output schema) pair to probe."""
+    """A (system prompt, output schema) pair to probe, with production's limits."""
 
     name: str
     system_prompt: str
     output_schema: dict
     prompt: str
+    model: str
+    timeout_seconds: float
     # Only agent_loop's schema has a tool_calls array to inspect.
     counts_tool_calls: bool = False
-    model: str = 'sonnet'
-    argv_extras: dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +201,7 @@ class _ShapeCaptured(Exception):
     """Sentinel raised to stop ``verify()`` at its ``AgentLoop`` construction."""
 
 
-def _capture_agent_shape(codebase_root: Path) -> Shape:
+def _capture_agent_shape(config: ReconciliationConfig, codebase_root: Path) -> Shape:
     """Capture the recon-verify system prompt exactly as production builds it.
 
     Drives the real ``CodebaseVerifier.verify()`` far enough to construct its
@@ -187,7 +209,6 @@ def _capture_agent_shape(codebase_root: Path) -> Shape:
     aborts before any CLI call.  Deriving it this way (rather than re-listing
     the tools here) means the probe follows verify.py if its tool set changes.
     """
-    from fused_memory.config.schema import ReconciliationConfig
     from fused_memory.reconciliation import verify as verify_mod
     from fused_memory.reconciliation.agent_loop import (
         CLAUDE_CLI_RESPONSE_SCHEMA,
@@ -202,19 +223,15 @@ def _capture_agent_shape(codebase_root: Path) -> Shape:
             captured['agent'] = self
             raise _ShapeCaptured
 
-    # No root is configured here: verify() takes ``codebase_root`` per call and
-    # does not read ``config.explore_codebase_root`` (verify.py::CodebaseVerifier
-    # __init__, PRD D3).  Setting the config field would look like it drove the
-    # captured shape while contributing nothing.
-    config = ReconciliationConfig(
-        agent_llm_provider='claude_cli',
-        agent_llm_model='sonnet',
-    )
+    # verify() takes ``codebase_root`` per call and does not read
+    # ``config.explore_codebase_root`` (verify.py::CodebaseVerifier __init__,
+    # PRD D3), so the root is passed here, not configured.
     verifier = verify_mod.CodebaseVerifier(config=config)
     original = verify_mod.AgentLoop
     verify_mod.AgentLoop = _CapturingAgentLoop  # type: ignore[misc]
+    returned = None
     try:
-        asyncio.run(
+        returned = asyncio.run(
             verifier.verify(
                 claim='AgentLoop caps a single assistant round-trip, not the conversation.',
                 context='Probe run; the verdict is irrelevant, only the invocation shape matters.',
@@ -229,12 +246,7 @@ def _capture_agent_shape(codebase_root: Path) -> Shape:
 
     agent = captured.get('agent')
     if agent is None:
-        raise RuntimeError(
-            'Failed to capture the recon-verify shape: CodebaseVerifier.verify() '
-            'returned without constructing an AgentLoop. verify.py has changed '
-            'shape; update _capture_agent_shape rather than substituting a toy '
-            'prompt, which measures the wrong thing.'
-        )
+        raise RuntimeError(_capture_failure_message(returned, codebase_root))
 
     tool_schemas = [t.to_anthropic_schema() for t in agent.tools.values()]
     system_prompt = agent._build_cli_system_prompt(tool_schemas)  # noqa: SLF001
@@ -247,11 +259,35 @@ def _capture_agent_shape(codebase_root: Path) -> Shape:
             'externally, one CLI invocation per outer step. Investigate and call '
             '`verification_complete` with your findings.'
         ),
+        model=config.agent_llm_model,
+        timeout_seconds=float(config.agent_cli_timeout_seconds),
         counts_tool_calls=True,
     )
 
 
-def _capture_judge_shape() -> Shape:
+def _capture_failure_message(returned: Any, codebase_root: Path) -> str:
+    """Say WHY verify() returned without building an AgentLoop.
+
+    A refused root is an input error the operator fixes with --codebase-root;
+    anything else means verify.py changed shape and this script needs updating.
+    """
+    from fused_memory.reconciliation.verify import CODEBASE_ROOT_UNRESOLVED
+
+    summary = getattr(returned, 'summary', None) or '(no VerificationResult returned)'
+    if getattr(returned, 'failure_token', '') == CODEBASE_ROOT_UNRESOLVED:
+        return (
+            f'verify() refused --codebase-root {codebase_root}: {summary}. '
+            'Pass the root of a git checkout.'
+        )
+    return (
+        'Failed to capture the recon-verify shape: CodebaseVerifier.verify() '
+        f'returned without constructing an AgentLoop ({summary}). verify.py has '
+        'changed shape; update _capture_agent_shape rather than substituting a '
+        'toy prompt, which measures the wrong thing.'
+    )
+
+
+def _capture_judge_shape(config: ReconciliationConfig) -> Shape:
     from fused_memory.reconciliation.judge import JUDGE_VERDICT_SCHEMA
     from fused_memory.reconciliation.prompts.judge import JUDGE_SYSTEM_PROMPT
 
@@ -263,6 +299,8 @@ def _capture_judge_shape() -> Shape:
             'Evaluate this reconciliation run: 3 memories were written, 1 task was '
             'closed, and every claim cited a file path. Produce your verdict.'
         ),
+        model=config.judge_llm_model,
+        timeout_seconds=float(config.judge_cli_timeout_seconds),
     )
 
 
@@ -302,26 +340,33 @@ def _classify_failure_text(text: str) -> str | None:
     return None
 
 
-def _auth_precheck(token: str, model: str, timeout: float) -> str | None:
-    """Return None if the token works, else the failure outcome constant."""
-    cmd = ['claude', '--print', '--output-format', 'json', '--model', model, '--max-turns', '1']
-    env = _probe_env(token)
-    config_dir = Path(tempfile.mkdtemp(prefix='probe_precheck_'))
-    env['CLAUDE_CONFIG_DIR'] = str(config_dir)
-    try:
-        proc = subprocess.run(
-            cmd, input=b'Reply with the single word: ok', capture_output=True,
-            env=env, timeout=timeout, check=False,
+def _auth_precheck(token: str, model: str) -> str | None:
+    """Return None only if a trivial call SUCCEEDS, else the failure outcome.
+
+    Any failure disqualifies the account, recognised marker or not: an account
+    that cannot answer "ok" would be counted as a 0/N turn-cap result.
+    """
+    with tempfile.TemporaryDirectory(prefix='probe_precheck_') as config_dir:
+        result = asyncio.run(
+            invoke_claude_agent(
+                prompt='Reply with the single word: ok',
+                system_prompt='Connectivity check.',
+                cwd=Path(config_dir),
+                model=model,
+                max_turns=1,
+                oauth_token=token,
+                config_dir=Path(config_dir),
+                timeout_seconds=_PRECHECK_TIMEOUT_SECS,
+            )
         )
-    except subprocess.TimeoutExpired:
-        return _OUTCOME_OTHER
-    finally:
-        shutil.rmtree(config_dir, ignore_errors=True)
-    blob = (proc.stdout or b'').decode(errors='replace') + (proc.stderr or b'').decode(errors='replace')
-    return _classify_failure_text(blob)
+    if result.success:
+        return None
+    if result.timed_out:
+        return _OUTCOME_TIMEOUT
+    return _classify_failure_text(result.output + result.stderr) or _OUTCOME_OTHER
 
 
-def _resolve_tokens(accounts_file: Path, model: str, timeout: float) -> list[tuple[str, str]]:
+def _resolve_tokens(accounts_file: Path, model: str) -> list[tuple[str, str]]:
     """Return usable ``(account_name, token)`` pairs, skipping ones that fail auth."""
     usable: list[tuple[str, str]] = []
     for name, env_name in _pool_token_env_names(accounts_file):
@@ -329,7 +374,7 @@ def _resolve_tokens(accounts_file: Path, model: str, timeout: float) -> list[tup
         if not token:
             print(f'  - {name} ({env_name}): not set in env, skipped')
             continue
-        verdict = _auth_precheck(token, model, timeout)
+        verdict = _auth_precheck(token, model)
         if verdict is not None:
             print(f'  - {name} ({env_name}): pre-check failed ({verdict}), skipped')
             continue
@@ -338,120 +383,71 @@ def _resolve_tokens(accounts_file: Path, model: str, timeout: float) -> list[tup
     return usable
 
 
-def _probe_env(token: str) -> dict[str, str]:
-    """Production's env shape (cli_invoke's ``_invoke_claude``): strip the API key
-    so the CLI falls back to OAuth, then inject the per-invocation token."""
-    env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}
-    env['CLAUDE_CODE_OAUTH_TOKEN'] = token
-    return env
-
-
 # ---------------------------------------------------------------------------
 # One invocation
 # ---------------------------------------------------------------------------
 
 
-def _run_once(shape: Shape, max_turns: int, token: str, cwd: Path, timeout: float) -> Observation:
-    cmd, temp_files = build_claude_argv(
-        model=shape.model,
-        max_budget_usd=1.0,
-        system_prompt=shape.system_prompt,
-        max_turns=max_turns,
-        permission_mode='bypassPermissions',
-        allowed_tools=None,
-        # Passed VERBATIM as production does. build_claude_argv expands the
-        # wildcard into _REAL_BUILTIN_TOOLS_DENYLIST when an output_schema is
-        # present, so that StructuredOutput survives; asserting the expansion
-        # below (rather than passing a copied list) keeps the probe honest if
-        # that central behaviour ever changes.
-        disallowed_tools=['*'],
-        mcp_config=no_mcp_servers_config(),
-        output_schema=shape.output_schema,
-        effort=None,
-        resume_session_id=None,
-        session_id=None,
-        strict_mcp_config=True,
-    )
-    if _REAL_BUILTIN_TOOLS_DENYLIST and _REAL_BUILTIN_TOOLS_DENYLIST[0] not in cmd:
-        print(
-            '! build_claude_argv did not expand the wildcard deny into the real-builtins '
-            'list; StructuredOutput may be blocked and every cell will fail for a reason '
-            'that has nothing to do with the turn cap.',
-            file=sys.stderr,
+def _run_once(shape: Shape, max_turns: int, token: str, cwd: Path) -> Observation:
+    with tempfile.TemporaryDirectory(prefix='probe_maxturns_') as config_dir:
+        started = time.monotonic()
+        result = asyncio.run(
+            invoke_claude_agent(
+                prompt=shape.prompt,
+                system_prompt=shape.system_prompt,
+                cwd=cwd,
+                model=shape.model,
+                max_turns=max_turns,
+                output_schema=shape.output_schema,
+                disallowed_tools=['*'],
+                mcp_config=no_mcp_servers_config(),
+                strict_mcp_config=True,
+                oauth_token=token,
+                config_dir=Path(config_dir),
+                timeout_seconds=shape.timeout_seconds,
+            )
         )
+        duration_s = time.monotonic() - started
 
-    config_dir = Path(tempfile.mkdtemp(prefix='probe_maxturns_'))
-    env = _probe_env(token)
-    env['CLAUDE_CONFIG_DIR'] = str(config_dir)
-    try:
-        proc = subprocess.run(
-            cmd, input=shape.prompt.encode(), capture_output=True,
-            env=env, cwd=str(cwd), timeout=timeout, check=False,
-        )
-        stdout = (proc.stdout or b'').decode(errors='replace')
-        stderr = (proc.stderr or b'').decode(errors='replace')
-        returncode = proc.returncode
-    except subprocess.TimeoutExpired:
-        return Observation(
-            max_turns=max_turns, shape=shape.name, outcome=_OUTCOME_OTHER,
-            returncode=-1, subtype='', is_error=True, num_turns=None,
-            has_payload=False, schema_salvaged=False, schema_tool_denied=False,
-            tool_calls=None, detail=f'timed out after {timeout}s',
-        )
-    finally:
-        shutil.rmtree(config_dir, ignore_errors=True)
-        for path in temp_files:
-            Path(path).unlink(missing_ok=True)
-
-    try:
-        data = json.loads(stdout) if stdout.strip() else {}
-    except json.JSONDecodeError:
-        data = {}
-
-    subtype = str(data.get('subtype', ''))
-    is_error = bool(data.get('is_error', False))
-    structured = data.get('structured_output')
+    structured = result.structured_output
     has_payload = isinstance(structured, dict)
-    # Mirrors cli_invoke's derivation exactly, so the reported value is the one
-    # production would compute — the point being that it is False on failure.
-    schema_salvaged = is_error and has_payload
-    denials = data.get('permission_denials')
-    schema_tool_denied = (
-        not has_payload
-        and isinstance(denials, list)
-        and any(isinstance(d, dict) and d.get('tool_name') == 'StructuredOutput' for d in denials)
-    )
-
     tool_calls: int | None = None
-    if shape.counts_tool_calls and has_payload:
-        calls = structured.get('tool_calls') if isinstance(structured, dict) else None
+    if shape.counts_tool_calls and isinstance(structured, dict):
+        calls = structured.get('tool_calls')
         tool_calls = len(calls) if isinstance(calls, list) else None
 
-    detail = ''
-    auth_or_credit = _classify_failure_text(str(data.get('result', '')) + stderr)
-    if auth_or_credit is not None:
-        outcome = auth_or_credit
-        detail = 'NOT a turn-cap failure — this run never reached the model.'
-    elif schema_tool_denied:
-        outcome = _OUTCOME_OTHER
-        detail = 'StructuredOutput was DENIED — a config break, not a turn-cap failure.'
-    elif subtype == 'error_max_turns':
-        outcome = _OUTCOME_MAX_TURNS
-    elif is_error or returncode != 0 or not has_payload:
-        outcome = _OUTCOME_OTHER
-        detail = (str(data.get('result', '')) or stderr or stdout)[:300].replace('\n', ' ')
-    elif tool_calls == 0:
-        outcome = _OUTCOME_NO_TOOL_CALLS
-        detail = 'Payload returned but tool_calls is EMPTY — run() reads this as the end of the turn.'
-    else:
-        outcome = _OUTCOME_OK
-
+    outcome, detail = _classify(result, has_payload, tool_calls, shape.timeout_seconds)
     return Observation(
-        max_turns=max_turns, shape=shape.name, outcome=outcome, returncode=returncode,
-        subtype=subtype, is_error=is_error, num_turns=data.get('num_turns'),
-        has_payload=has_payload, schema_salvaged=schema_salvaged,
-        schema_tool_denied=schema_tool_denied, tool_calls=tool_calls, detail=detail,
+        max_turns=max_turns, shape=shape.name, outcome=outcome, success=result.success,
+        subtype=result.subtype, num_turns=result.turns, has_payload=has_payload,
+        schema_salvaged=result.schema_salvaged, schema_tool_denied=result.schema_tool_denied,
+        tool_calls=tool_calls, duration_s=duration_s, timeout_s=shape.timeout_seconds,
+        detail=detail,
     )
+
+
+def _classify(
+    result: AgentResult, has_payload: bool, tool_calls: int | None, timeout: float,
+) -> tuple[str, str]:
+    """Map production's ``AgentResult`` verdict onto a probe outcome and detail."""
+    if not result.success:
+        auth_or_credit = _classify_failure_text(result.output + result.stderr)
+        if auth_or_credit is not None:
+            return auth_or_credit, 'NOT a turn-cap failure — this run never reached the model.'
+        if result.schema_tool_denied:
+            return _OUTCOME_OTHER, 'StructuredOutput was DENIED — a config break, not a turn-cap failure.'
+        if result.timed_out:
+            return _OUTCOME_TIMEOUT, f'Killed at the production timeout ({timeout:.0f}s).'
+        if result.subtype == 'error_max_turns':
+            return _OUTCOME_MAX_TURNS, ''
+        return _OUTCOME_OTHER, (result.output or result.stderr)[:300].replace('\n', ' ')
+    if not has_payload:
+        return _OUTCOME_OTHER, 'success reported but no structured payload came back.'
+    if tool_calls == 0:
+        return _OUTCOME_NO_TOOL_CALLS, (
+            'Payload returned but tool_calls is EMPTY — run() reads this as the end of the turn.'
+        )
+    return _OUTCOME_OK, ''
 
 
 # ---------------------------------------------------------------------------
@@ -487,7 +483,10 @@ def main() -> int:
         '--shape', choices=['agent', 'judge', 'both'], default='agent',
         help="Which prompt/schema shape to probe (default: agent, i.e. recon-verify).",
     )
-    parser.add_argument('--model', default='sonnet', help='Model to probe (default: sonnet).')
+    parser.add_argument(
+        '--model', default=None,
+        help="Model to probe (default: each shape's production model from ReconciliationConfig).",
+    )
     parser.add_argument(
         '--codebase-root', default=str(_REPO_ROOT),
         help='cwd for the invocation, and the root handed to verify().',
@@ -496,24 +495,29 @@ def main() -> int:
         '--accounts-file', default=str(_DEFAULT_ACCOUNTS_FILE),
         help='usage-accounts.yaml to read oauth_token_env names from.',
     )
-    parser.add_argument('--timeout', type=float, default=300.0, help='Per-run timeout seconds.')
+    parser.add_argument(
+        '--timeout', type=float, default=None,
+        help="Per-run timeout seconds (default: each shape's production value — "
+             'agent_cli_timeout_seconds / judge_cli_timeout_seconds). Raising it '
+             'hides runs production would kill.',
+    )
     args = parser.parse_args()
 
     if args.repeat < 1:
         parser.error('--repeat must be >= 1')
 
     codebase_root = Path(args.codebase_root).resolve()
+    config = ReconciliationConfig()
 
     print('=' * 78)
     print('probe_schema_max_turns — MANUAL diagnostic, spends real tokens (task 3241)')
     print(f'claude --version : {_cli_version()}')
-    print(f'model            : {args.model}')
     print(f'matrix           : max_turns={args.max_turns} x repeat={args.repeat}')
     print(f'cwd              : {codebase_root}')
     print('=' * 78)
 
     print('\nResolving pool credentials:')
-    tokens = _resolve_tokens(Path(args.accounts_file), args.model, args.timeout)
+    tokens = _resolve_tokens(Path(args.accounts_file), args.model or config.agent_llm_model)
     if not tokens:
         print(
             '\nNo usable account tokens. Aborting rather than reporting a uniform 0/N, '
@@ -524,12 +528,20 @@ def main() -> int:
 
     shapes: list[Shape] = []
     if args.shape in ('agent', 'both'):
-        shapes.append(_capture_agent_shape(codebase_root))
+        shapes.append(_capture_agent_shape(config, codebase_root))
     if args.shape in ('judge', 'both'):
-        shapes.append(_capture_judge_shape())
+        shapes.append(_capture_judge_shape(config))
+    shapes = [
+        replace(
+            shape,
+            model=args.model or shape.model,
+            timeout_seconds=args.timeout or shape.timeout_seconds,
+        )
+        for shape in shapes
+    ]
     for shape in shapes:
-        shape.model = args.model
-        print(f'\nShape {shape.name!r}: system prompt {len(shape.system_prompt)} chars, '
+        print(f'\nShape {shape.name!r}: model={shape.model} timeout={shape.timeout_seconds:.0f}s '
+              f'system prompt {len(shape.system_prompt)} chars, '
               f'schema keys={sorted((shape.output_schema.get("properties") or {}).keys())}')
 
     results: dict[tuple[str, int], list[Observation]] = {}
@@ -539,7 +551,7 @@ def main() -> int:
             observations: list[Observation] = []
             for i in range(args.repeat):
                 _, token = tokens[i % len(tokens)]
-                obs = _run_once(shape, max_turns, token, codebase_root, args.timeout)
+                obs = _run_once(shape, max_turns, token, codebase_root)
                 observations.append(obs)
                 print(obs.line())
             results[(shape.name, max_turns)] = observations
@@ -554,15 +566,19 @@ def main() -> int:
         ok = counts[_OUTCOME_OK]
         rate = f'{ok}/{len(reached)}' if reached else 'n/a (0 runs reached the model)'
         breakdown = ', '.join(f'{k}={v}' for k, v in sorted(counts.items()))
-        print(f'  {shape_name:<14} max_turns={max_turns:<3} -> {rate:<10} [{breakdown}]')
+        slowest = max(observations, key=lambda o: o.duration_s)
+        print(f'  {shape_name:<14} max_turns={max_turns:<3} -> {rate:<10} [{breakdown}] '
+              f'slowest={slowest.duration_s:.0f}s/{slowest.timeout_s:.0f}s'
+              f'{" NEAR-TIMEOUT" if slowest.near_timeout else ""}')
         if counts[_OUTCOME_CREDIT]:
             exhausted = True
-    salvaged = sum(1 for obs in results.values() for o in obs if o.schema_salvaged)
-    failures = sum(1 for obs in results.values() for o in obs if o.outcome != _OUTCOME_OK)
-    print(f'\n  schema_salvaged fired on {salvaged} of {failures} non-success runs.')
+    hit_cap = [o for obs in results.values() for o in obs if o.subtype == 'error_max_turns']
+    salvaged = sum(1 for o in hit_cap if o.schema_salvaged)
+    print(f'\n  error_max_turns on {len(hit_cap)} run(s); schema salvage rescued {salvaged}.')
     print(
-        '  (If that is 0, salvage is not a backstop on this path: an error_max_turns\n'
-        '   result carries no payload, so there is nothing to salvage.)'
+        '  (A salvaged run counts as a success above, as production treats it. If\n'
+        '   none were salvaged, salvage is not a backstop on this path: the\n'
+        '   error_max_turns results carried no payload to recover.)'
     )
     if exhausted:
         print('\n! Some runs hit a usage cap. Those cells are under-sampled — re-run them.')
