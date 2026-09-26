@@ -8,6 +8,7 @@ from __future__ import annotations
 import functools
 import json
 import math
+import sys
 import threading
 import time
 import types
@@ -325,3 +326,108 @@ class TestJevChoiceScorer:
             pass
         assert caught.value.reason == arms.SkipReason.no_credential
         assert 'TYPESAFE_API_KEY' in caught.value.detail
+
+
+class TestOpenCrossEncoder:
+    @pytest.mark.parametrize('missing', ['sentence_transformers', 'torch'])
+    def test_a_missing_dependency_is_an_unavailable_arm_with_the_install_hint(
+        self, missing: str, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        arms = _arms()
+        monkeypatch.setitem(sys.modules, missing, None)
+        with (
+            pytest.raises(arms.ArmUnavailable) as caught,
+            arms.open_cross_encoder('some/model', 512)(_context()),
+        ):
+            pass
+        assert caught.value.reason == arms.SkipReason.dependency_unavailable
+        assert missing in caught.value.detail
+        assert '--group reranker' in caught.value.detail
+
+
+class _FakeCrossEncoder:
+    def __init__(self, scores: list[float]) -> None:
+        self.scores = scores
+        self.calls: list[tuple[list, dict]] = []
+
+    def predict(self, pairs, **kwargs):
+        self.calls.append((list(pairs), kwargs))
+        return list(self.scores)
+
+
+def _word_count(text: str) -> int:
+    return len(text.split())
+
+
+class TestCrossEncoderScorer:
+
+    def _scorer(self, model: _FakeCrossEncoder):
+        arms = _arms()
+        return arms.CrossEncoderScorer(
+            model, _word_count, batch_size=4, max_length=5,
+            device_facts=lambda: arms.ScorerFacts(
+                device='cuda:0 (fake)', vram_peak_mib=100.0, max_length=None,
+            ),
+        )
+
+    def test_each_candidate_is_paired_with_the_entry_in_candidate_order(self) -> None:
+        model = _FakeCrossEncoder([0.2, 0.9, 0.5])
+        slate = self._scorer(model).score('a b c', ['d', 'e f g h', 'i j'])
+        [(pairs, kwargs)] = model.calls
+        assert pairs == [('a b c', 'd'), ('a b c', 'e f g h'), ('a b c', 'i j')]
+        assert kwargs['batch_size'] == 4
+        assert slate.scores == (0.2, 0.9, 0.5)
+        assert slate.cost_usd == 0.0
+
+    def test_only_pairs_longer_than_max_length_count_as_over(self) -> None:
+        slate = self._scorer(_FakeCrossEncoder([0.2, 0.9, 0.5])).score(
+            'a b c', ['d', 'e f g h', 'i j'],
+        )
+        assert slate.pairs_over_max_length == 1
+
+    def test_facts_carry_the_device_and_the_configured_max_length(self) -> None:
+        facts = self._scorer(_FakeCrossEncoder([])).facts()
+        assert (facts.device, facts.vram_peak_mib, facts.max_length) == (
+            'cuda:0 (fake)', 100.0, 5,
+        )
+
+
+def _fake_torch(*, available: bool, **cuda) -> SimpleNamespace:
+    return SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: available, **cuda))
+
+
+class TestCudaFacts:
+    def test_without_cuda_the_device_is_the_cpu(self) -> None:
+        facts = _arms().cuda_facts(_fake_torch(available=False))
+        assert (facts.device, facts.vram_peak_mib) == ('cpu', None)
+
+    def test_with_cuda_the_gpu_and_its_peak_allocation_are_named(self) -> None:
+        facts = _arms().cuda_facts(_fake_torch(
+            available=True, current_device=lambda: 0,
+            get_device_name=lambda index: 'NVIDIA GeForce RTX 3090',
+            max_memory_allocated=lambda index: 3 * 2**30,
+        ))
+        assert 'RTX 3090' in facts.device
+        assert facts.vram_peak_mib == 3072.0
+
+
+class TestApplyVramCap:
+    def _cuda(self, calls: list) -> SimpleNamespace:
+        return _fake_torch(
+            available=True, current_device=lambda: 0,
+            get_device_properties=lambda index: SimpleNamespace(total_memory=24 * 2**30),
+            set_per_process_memory_fraction=lambda fraction, device=None: calls.append(fraction),
+        )
+
+    def test_the_cap_is_a_fraction_of_the_devices_memory(self) -> None:
+        calls: list[float] = []
+        _arms().apply_vram_cap(self._cuda(calls), 8.0)
+        assert calls == [pytest.approx(1 / 3)]
+
+    def test_a_cap_above_the_device_is_the_whole_device(self) -> None:
+        calls: list[float] = []
+        _arms().apply_vram_cap(self._cuda(calls), 30.0)
+        assert calls == [1.0]
+
+    def test_on_the_cpu_nothing_is_capped(self) -> None:
+        _arms().apply_vram_cap(_fake_torch(available=False), 8.0)
