@@ -87,6 +87,10 @@ package_relative = _calibrate.package_relative
 
 RANK_KS = (1, 5)
 
+#: Same cluster, curator-ruled not the same claim. The rule's home is
+#: ``calibrate_write_triage.py::build_pair_sets``, whose own set is private.
+HARD_NEGATIVE_LABELS = frozenset({LABEL_DISTINCT, LABEL_PSEUDO_CONTRADICTION})
+
 
 @dataclass(frozen=True)
 class RerankCase:
@@ -117,9 +121,20 @@ class RateCount:
 
 
 @dataclass(frozen=True)
+class AucResult:
+    """AUC over pair scores; ``unscored`` counts cases whose canonical never reached the slate."""
+
+    value: float | None
+    n_true: int
+    n_hard_negative: int
+    unscored: int
+
+
+@dataclass(frozen=True)
 class RankingMetrics:
     rank1: RateCount
     rank5: RateCount
+    auc: AucResult
 
 
 def build_cases(
@@ -157,24 +172,68 @@ def baseline_scores(case: RerankCase) -> tuple[float | None, ...]:
     return case.candidate_cosines
 
 
-def _arm_order(scores: Sequence[float | None]) -> list[int]:
+def auc_true_vs_hard_negative(
+    positives: Sequence[float], negatives: Sequence[float],
+) -> float | None:
+    """Mann-Whitney: the probability a positive outscores a negative, a tie counting half."""
+    if not positives or not negatives:
+        return None
+    wins = sum(
+        1.0 if p > n else 0.5 if p == n else 0.0
+        for p in positives for n in negatives
+    )
+    return wins / (len(positives) * len(negatives))
+
+
+def _arm_order(case: RerankCase, scores: Sequence[float | None]) -> list[int]:
     """Candidate positions by score descending; a tie keeps retrieval order, None ranks last."""
-    return sorted(range(len(scores)), key=lambda i: (scores[i] is None, -(scores[i] or 0.0)))
-
-
-def _ranked_retrieval(case: RerankCase, scores: Sequence[float | None]) -> dict[str, Any]:
-    """*case* in the calibrator's retrieval shape, candidates reordered by *scores*."""
     if len(scores) != len(case.candidate_ids):
         raise ValueError(
             f'{case.memory_id}: {len(scores)} scores for {len(case.candidate_ids)} candidates',
         )
+    return sorted(range(len(scores)), key=lambda i: (scores[i] is None, -(scores[i] or 0.0)))
+
+
+def _ranked_retrieval(case: RerankCase, order: Sequence[int]) -> dict[str, Any]:
+    """*case* in the calibrator's retrieval shape, candidates in the arm's *order*."""
     return {
         'memory_id': case.memory_id,
         'canonical_id': case.canonical_id,
         'canonical_present': case.canonical_present,
-        'candidates': [case.candidate_ids[i] for i in _arm_order(scores)],
+        'candidates': [case.candidate_ids[i] for i in order],
         'candidate_parents': dict(case.candidate_parents),
     }
+
+
+def _pair_score(
+    scores: Sequence[float | None], order: Sequence[int], first_hit: Mapping[str, Any],
+) -> float | None:
+    """The arm's score for the first candidate, in its order, reaching the canonical-or-alias."""
+    rank = first_hit.get('rank_with_aliases', first_hit['rank'])
+    return None if rank == -1 else scores[order[rank - 1]]
+
+
+def _auc_block(cases: Sequence[RerankCase], pair_scores: Sequence[float | None]) -> AucResult:
+    positives: list[float] = []
+    negatives: list[float] = []
+    unscored = 0
+    for case, score in zip(cases, pair_scores, strict=True):
+        if case.label == LABEL_DUPLICATE:
+            bucket = positives
+        elif case.label in HARD_NEGATIVE_LABELS:
+            bucket = negatives
+        else:
+            continue
+        if score is None:
+            unscored += 1
+        else:
+            bucket.append(score)
+    return AucResult(
+        value=auc_true_vs_hard_negative(positives, negatives),
+        n_true=len(positives),
+        n_hard_negative=len(negatives),
+        unscored=unscored,
+    )
 
 
 def ranking_metrics(
@@ -187,12 +246,12 @@ def ranking_metrics(
 
     Scored by ``calibrate_write_triage.py::compute_recall_at_k``, the rule κ1's
     recall@1 used. Given aliases, every case is in the denominator and an
-    unreached absent canonical is a miss — the population of Γ2's basis.
+    unreached absent canonical is a miss — the population of Γ2's basis. The
+    AUC's pair score is found by the same rule, via ``compute_first_hit_ranks``.
     """
-    ranked = [
-        _ranked_retrieval(case, scores)
-        for case, scores in zip(cases, scores_per_case, strict=True)
-    ]
+    scored = list(zip(cases, scores_per_case, strict=True))
+    orders = [_arm_order(case, scores) for case, scores in scored]
+    ranked = [_ranked_retrieval(case, order) for (case, _), order in zip(scored, orders, strict=True)]
     recall = _calibrate.compute_recall_at_k(
         ranked, RANK_KS, aliases=aliases, count_absent_as_miss=bool(aliases),
     )
@@ -200,4 +259,9 @@ def ranking_metrics(
         RateCount(hits=row['hits'], total=row['total'], rate=row['recall'])
         for row in recall['per_k']
     )
-    return RankingMetrics(rank1=rank1, rank5=rank5)
+    first_hits = _calibrate.compute_first_hit_ranks(ranked, aliases=aliases)
+    pair_scores = [
+        _pair_score(scores, order, hit)
+        for (_, scores), order, hit in zip(scored, orders, first_hits, strict=True)
+    ]
+    return RankingMetrics(rank1=rank1, rank5=rank5, auc=_auc_block(cases, pair_scores))
