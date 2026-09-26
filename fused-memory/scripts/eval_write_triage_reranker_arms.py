@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import gc
 import importlib
 import math
 import os
@@ -26,7 +27,7 @@ import types
 import urllib.parse
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any, Protocol
 
@@ -115,14 +116,24 @@ def _require_env(*names: str) -> str:
     raise ArmUnavailable(SkipReason.no_credential, f'{" / ".join(names)} unset')
 
 
-def _require_module(name: str) -> types.ModuleType:
-    """Import *name* lazily; a missing module is an unavailable arm, not a crash."""
-    try:
-        return importlib.import_module(name)
-    except ImportError as exc:
+def _require_modules(*names: str) -> tuple[types.ModuleType, ...]:
+    """Import *names* lazily; any missing module makes the arm unavailable, not a crash.
+
+    Every name is tried, so the skip reason lists all that are missing.
+    """
+    modules: list[types.ModuleType] = []
+    missing: list[str] = []
+    for name in names:
+        try:
+            modules.append(importlib.import_module(name))
+        except ImportError as exc:
+            missing.append(f'{name} ({exc})')
+    if missing:
         raise ArmUnavailable(
-            SkipReason.dependency_unavailable, f'{name} is not importable ({exc}); {INSTALL_HINT}',
-        ) from exc
+            SkipReason.dependency_unavailable,
+            f'not importable: {"; ".join(missing)}; {INSTALL_HINT}',
+        )
+    return tuple(modules)
 
 
 SAME_CLAIM_INSTRUCTION = (
@@ -213,7 +224,7 @@ class PairwiseScorer:
 def open_pairwise(context: ArmContext) -> Iterator[PairwiseScorer]:
     """gpt-4o-mini over a sync client; the SDK's own retries absorb transient failures."""
     key = _require_env('OPENAI_API_KEY')
-    openai = _require_module('openai')
+    (openai,) = _require_modules('openai')
     client = openai.OpenAI(api_key=key, timeout=60.0)
     scorer = PairwiseScorer(client, concurrency=context.pairwise_concurrency)
     try:
@@ -237,7 +248,7 @@ _HTTP_TIMEOUT_SECONDS = 60.0
 
 @contextlib.contextmanager
 def _http_client() -> Iterator[Any]:
-    httpx = _require_module('httpx')
+    (httpx,) = _require_modules('httpx')
     client = httpx.Client(timeout=_HTTP_TIMEOUT_SECONDS)
     try:
         yield client
@@ -434,3 +445,109 @@ def open_jev(context: ArmContext) -> Iterator[JevChoiceScorer]:
     key = _require_env('TYPESAFE_API_KEY')
     with _http_client() as client:
         yield JevChoiceScorer(client, key)
+
+
+def cuda_facts(torch: Any) -> ScorerFacts:
+    """The device a local arm ran on and its peak allocation since the last reset."""
+    if not torch.cuda.is_available():
+        return ScorerFacts(device='cpu', vram_peak_mib=None, max_length=None)
+    index = torch.cuda.current_device()
+    return ScorerFacts(
+        device=f'cuda:{index} ({torch.cuda.get_device_name(index)})',
+        vram_peak_mib=torch.cuda.max_memory_allocated(index) / 2**20,
+        max_length=None,
+    )
+
+
+def apply_vram_cap(torch: Any, cap_gib: float) -> None:
+    """Cap this process's CUDA allocations, so an OOM lands here rather than in a resident service."""
+    if not torch.cuda.is_available():
+        return
+    index = torch.cuda.current_device()
+    total = torch.cuda.get_device_properties(index).total_memory
+    torch.cuda.set_per_process_memory_fraction(min(1.0, cap_gib * 2**30 / total), index)
+
+
+class CrossEncoderScorer:
+    """A sentence-transformers CrossEncoder scoring (entry, candidate) pairs in micro-batches."""
+
+    def __init__(
+        self,
+        model: Any,
+        token_count: Callable[[str], int],
+        *,
+        batch_size: int,
+        max_length: int,
+        device_facts: Callable[[], ScorerFacts],
+    ) -> None:
+        self._model = model
+        self._token_count = token_count
+        self._batch_size = batch_size
+        self._max_length = max_length
+        self._device_facts = device_facts
+
+    def score(self, entry: str, candidate_texts: Sequence[str]) -> SlateScores:
+        pairs = [(entry, candidate) for candidate in candidate_texts]
+        scores = self._model.predict(pairs, batch_size=self._batch_size, show_progress_bar=False)
+        entry_tokens = self._token_count(entry)
+        return SlateScores(
+            scores=tuple(float(score) for score in scores),
+            cost_usd=0.0,
+            pairs_over_max_length=sum(
+                entry_tokens + self._token_count(candidate) > self._max_length
+                for candidate in candidate_texts
+            ),
+        )
+
+    def facts(self) -> ScorerFacts:
+        return replace(self._device_facts(), max_length=self._max_length)
+
+
+def _token_counter(tokenizer: Any) -> Callable[[str], int]:
+    return lambda text: len(tokenizer(text, add_special_tokens=False)['input_ids'])
+
+
+def _cpu_facts() -> ScorerFacts:
+    return ScorerFacts(device='cpu', vram_peak_mib=None, max_length=None)
+
+
+def open_cross_encoder(
+    model_id: str, max_length: int,
+) -> Callable[[ArmContext], AbstractContextManager[CrossEncoderScorer]]:
+    """An ``ArmSpec.open`` loading *model_id* with its repo's own published configuration.
+
+    No template is transcribed and no instruction is tuned here: a model that
+    sentence-transformers cannot load is a recorded error, not a hand fix.
+    """
+
+    @contextlib.contextmanager
+    def open_(context: ArmContext) -> Iterator[CrossEncoderScorer]:
+        torch, sentence_transformers = _require_modules('torch', 'sentence_transformers')
+        device = context.device
+        if device == 'auto':
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        on_cuda = device.startswith('cuda')
+        if on_cuda:
+            gc.collect()
+            torch.cuda.empty_cache()
+            apply_vram_cap(torch, context.vram_cap_gib)
+            torch.cuda.reset_peak_memory_stats()
+        model = sentence_transformers.CrossEncoder(
+            model_id, device=device, max_length=max_length,
+            model_kwargs={'dtype': torch.bfloat16} if on_cuda else None,
+        )
+        try:
+            yield CrossEncoderScorer(
+                model,
+                _token_counter(model.tokenizer),
+                batch_size=context.local_batch_size,
+                max_length=max_length,
+                device_facts=(lambda: cuda_facts(torch)) if on_cuda else _cpu_facts,
+            )
+        finally:
+            del model
+            gc.collect()
+            if on_cuda:
+                torch.cuda.empty_cache()
+
+    return open_
