@@ -35,16 +35,29 @@ from shared.task_statuses import TaskStatus
 from dashboard.config import DashboardConfig
 from dashboard.data.census import TaskCensus, TaskView
 from dashboard.data.datum import DatumState
+from dashboard.data.mcp_fanout import _LOCK_ACQUIRE_TIMEOUT_SECONDS
 from dashboard.data.orchestrator import (
     _read_project_root_from_config,
     _resolve_project_root,
     find_running_orchestrators,
     read_max_concurrent_tasks,
 )
-from dashboard.data.task_snapshot import TaskSnapshot, acquire_snapshot, as_served
+from dashboard.data.task_snapshot import (
+    PER_CALL_TIMEOUT,
+    TaskSnapshot,
+    acquire_snapshot,
+    as_served,
+)
 from dashboard.data.utils import resolve_now
 
 logger = logging.getLogger(__name__)
+
+# The snapshot unit's own structural worst case for ONE acquisition: the unit
+# cache's bounded lock wait before a bypass, then one refresh whose two halves
+# run concurrently, each under wait_for(PER_CALL_TIMEOUT). The terminal-window
+# slot of task_snapshot.PER_PROJECT_MCP_CALLS is not counted, because
+# acquire_snapshot never spends it.
+_SNAPSHOT_UNIT_WORST_CASE_SECONDS = _LOCK_ACQUIRE_TIMEOUT_SECONDS + PER_CALL_TIMEOUT
 
 # Whole-operation backstop for ONE root's snapshot acquisition, enforced by
 # collect_snapshot's Phase-2 gather. Expiry is a GAP row naming this budget,
@@ -54,16 +67,13 @@ logger = logging.getLogger(__name__)
 # place: task 4884 showed an unbounded sampler await parks every project's
 # history silently, and the sampler's invariant is one row per root per tick.
 #
-# FLOOR: the unit's own structural worst case, so the backstop never pre-empts
-# a unit still inside its own bounds. Both halves run concurrently, each under
-# wait_for(task_snapshot.PER_CALL_TIMEOUT) (4.4 s), after the unit cache's
-# bounded lock wait (mcp_fanout._LOCK_ACQUIRE_TIMEOUT_SECONDS, 15 s) that
-# precedes a bypass: ~19.4 s.
-# CEILING: half of loops._SAMPLE_INTERVAL_SECONDS (600), so one collector
-# cycle is finished before the next begins.
+# FLOOR: _SNAPSHOT_UNIT_WORST_CASE_SECONDS, so the backstop never pre-empts a
+# unit still inside its own bounds and turns a bounded read into a gap row.
+# CEILING: half of loops._SAMPLE_INTERVAL_SECONDS, so one collector cycle is
+# finished before the next begins.
 #
-# 60.0 is ~3x the floor. Pinned by TestCollectSnapshotPerRootBudget in
-# dashboard/tests/test_burndown_data.py.
+# 60.0 is ~3x the floor. Both bounds pinned by TestCollectSnapshotPerRootBudget
+# in dashboard/tests/test_burndown_data.py.
 _SNAPSHOT_PER_ROOT_BUDGET = 60.0
 
 BURNDOWN_SCHEMA = """\

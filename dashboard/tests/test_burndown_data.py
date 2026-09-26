@@ -2933,21 +2933,20 @@ class TestCollectSnapshotPerRootBudget:
     """
 
     def test_budget_sits_between_the_units_own_bounds_and_one_collector_cycle(self):
-        """Floor: the unit's own roster arithmetic, so the backstop never
+        """Floor: the unit's own structural worst case, so the backstop never
         pre-empts a unit still inside its own bounds. Ceiling: half one
         collector cycle, so cycle N is done before cycle N+1 starts even when a
         root spends its whole budget."""
         import dashboard.loops as loops_module
 
         budget = burndown_module._SNAPSHOT_PER_ROOT_BUDGET
-        floor = task_snapshot.PER_CALL_TIMEOUT * len(task_snapshot.PER_PROJECT_MCP_CALLS)
+        floor = burndown_module._SNAPSHOT_UNIT_WORST_CASE_SECONDS
         ceiling = loops_module._SAMPLE_INTERVAL_SECONDS / 2
 
         assert budget >= floor, (
             f'_SNAPSHOT_PER_ROOT_BUDGET ({budget}) is below the snapshot unit\'s own '
-            f'bounds ({task_snapshot.PER_CALL_TIMEOUT} s x '
-            f'{len(task_snapshot.PER_PROJECT_MCP_CALLS)} bounded operations = {floor} s): '
-            'the backstop would turn a slow-but-bounded read into a gap row.'
+            f'worst case (_SNAPSHOT_UNIT_WORST_CASE_SECONDS = {floor} s): the '
+            'backstop would turn a slow-but-bounded read into a gap row.'
         )
         assert budget <= ceiling, (
             f'_SNAPSHOT_PER_ROOT_BUDGET ({budget}) is above HALF one collector '
