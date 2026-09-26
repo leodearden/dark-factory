@@ -16,7 +16,8 @@ Both are read through the REAL shipped text: each test slices its section out
 of scripts/setup-host.sh by code anchors and runs it against PATH stubs, so a
 test asserts on what the script DOES, never on how the fix is spelled.
 
-The companion source-level sweep at the bottom forbids the construct itself.
+The companion source-level sweep that forbids the construct itself is
+test_script_probe_pipelines.py::test_never_pipes_a_producer_into_grep_q.
 """
 
 from __future__ import annotations
@@ -25,7 +26,6 @@ import os
 
 from setup_host_sections import (
     run_section,
-    setup_host_text,
     slice_section,
     slice_shell_function,
     stub_bin_dir,
@@ -35,7 +35,6 @@ from shell_sections import (
     SILENT_FAILURE,
     clean_match,
     dispatch_stub_body,
-    grep_q_offenders,
     match_then_bulk,
     match_then_nonzero,
 )
@@ -379,85 +378,3 @@ def test_section_12_reports_not_responding_when_the_producer_says_nothing(tmp_pa
     assert result.returncode == 0, combined
     assert "FAIL FalkorDB: not responding" in combined, combined
     assert "OK FalkorDB: PONG" not in combined, combined
-
-
-# --- the file-scoped contract ----------------------------------------------
-# The DETECTOR itself lives in tests/scripts/shell_sections.py, shared with
-# test_script_probe_pipelines.py's sweep over export-data.sh / import-data.sh /
-# deploy-w5-recon-reliability.sh, so its three regexes exist once. The
-# guard-the-guard below stays HERE and now pins the copy BOTH suites use, which
-# is strictly stronger than guarding a private copy.
-
-
-def test_setup_host_never_pipes_a_producer_into_grep_q():
-    """No code line may decide anything through `producer | grep --quiet PAT`.
-
-    Generalises scripts/tests/test_lms_ctl.py::
-    test_installer_never_pipes_systemctl_into_grep to this file. The `pipefail`
-    assertion comes first because it is what makes the rule load-bearing:
-    without it there is no defect here and the sweep below would be guarding
-    nothing.
-
-    Scoped to greps that EXIT ON FIRST MATCH — every spelling of that, short
-    cluster or long flag, since they share one defect. `| grep -F ... || true`
-    inside a command substitution is a different, already-guarded shape (the
-    `|| true` is what makes it safe, and a non-quiet grep drains its input
-    rather than SIGPIPE-ing the producer), so it is deliberately not swept in.
-    Neither is a `grep -q` reading a FILE rather than a pipe: with no producer
-    upstream there is nothing for `pipefail` to conflate.
-
-    This forbids one known-defective construct and mandates no replacement
-    spelling — `[[ ]]`, `case`, or a `<<<` here-string are all still open to a
-    future author.
-    """
-    source = setup_host_text()
-
-    assert "set -euo pipefail" in source
-
-    offenders = grep_q_offenders(source)
-    assert not offenders, "producer piped into `grep -q`:\n" + "\n".join(
-        f"  line {n}: {line.strip()}" for n, line in offenders
-    )
-
-
-def test_the_grep_q_sweep_detects_a_planted_pipeline():
-    """Guard the guard: a detector that stops matching makes the sweep vacuous.
-
-    Same discipline tests/scripts/test_check_dashboard_unit_parity.py::
-    test_the_sweep_finds_every_known_parity_call_site applies to its own sweep.
-    Passes on arrival — it pins the mechanism, not the product behaviour.
-
-    Guards the SHARED detector in tests/scripts/shell_sections.py, so it covers
-    this file's sweep and test_script_probe_pipelines.py's alike. One detector
-    deserves one guard: a second copy of this case set would be the same drift
-    this extraction removed.
-    """
-    planted = (
-        "if foo | grep -q BAR; then\n"
-        "if foo | grep -qF BAR; then\n"
-        "if foo | grep -Fq BAR; then\n"
-        "if foo | grep -i -q BAR; then\n"
-        # The long forms. `grep --quiet` reintroduces this task's exact defect
-        # and reads as innocuous, so it is pinned by the same mechanism as the
-        # short flags rather than left to a docstring claim.
-        "if foo | grep --quiet BAR; then\n"
-        "if foo | grep --silent BAR; then\n"
-        # A flag carrying an argument in between must not hide the quiet one.
-        "if foo | grep -e BAR --quiet; then\n"
-    )
-    assert len(grep_q_offenders(planted)) == 7, grep_q_offenders(planted)
-
-    # A comment describing the construct is not the construct.
-    assert grep_q_offenders("  # never write `foo | grep -q BAR` here\n") == []
-    # Nor is a non-quiet grep, which drains its input instead of closing it.
-    assert grep_q_offenders("out=\"$(foo | grep -F 'tag' || true)\"\n") == []
-    # Nor is a `grep -q` over a FILE: no producer upstream, nothing to conflate.
-    assert grep_q_offenders("if grep -q '^\\[Install\\]' \"$unit\"; then\n") == []
-    # And a `-q` belonging to a LATER command on the line is not this grep's.
-    assert grep_q_offenders("if foo | grep -F BAR; then bar -q; fi\n") == []
-    # Nor is the trailing bar of an OR operator a pipe. `cmd || grep -q pat f`
-    # runs grep over a FILE only when cmd failed: no pipeline, no producer, and
-    # nothing for `pipefail` to conflate. None of the swept scripts writes this
-    # today, so without a case here the false positive stays invisible until it
-    # fails a future author's legitimate line.
-    assert grep_q_offenders('cmd || grep -q pat "$f"\n') == []

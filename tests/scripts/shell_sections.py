@@ -10,9 +10,10 @@ a verbatim second copy:
      scenario bodies `match_then_nonzero` / `match_then_bulk` / `clean_match`
      / `SILENT_FAILURE`: what every `producer | grep -q` probe suite needs to
      script a PATH stub and provoke both halves of the defect.
-  3. THE DETECTOR — `grep_q_offenders`, the source-level rule the file-scoped
-     sweeps assert, with its guard-the-guard in
-     test_setup_host_probe_pipelines.py.
+  3. THE DETECTOR — `grep_q_offenders` and its precondition `sets_pipefail`,
+     the source-level rule the quiet-grep sweep asserts, with its
+     guard-the-guard in
+     test_script_probe_pipelines.py::test_the_grep_q_sweep_detects_a_planted_pipeline.
 
 (2) and (3) are a rule about ONE specific defect and are not, strictly, about
 slicing. They live here anyway, and that is a decision: both consumers of the
@@ -317,12 +318,12 @@ SILENT_FAILURE = "    exit 1\n"
 
 
 # --- the `| grep -q` detector ----------------------------------------------
-# Shared by every file-scoped sweep that forbids the construct (currently
-# test_setup_host_probe_pipelines.py and test_script_probe_pipelines.py), so
-# the rule below exists ONCE. Its guard-the-guard —
-# test_setup_host_probe_pipelines.py::test_the_grep_q_sweep_detects_a_planted_pipeline,
-# planted spellings that must match plus the shapes that must not — stays in
-# that suite and now guards the copy BOTH consumers use.
+# What test_script_probe_pipelines.py::test_never_pipes_a_producer_into_grep_q
+# asserts over every swept script, so the rule below exists ONCE. Its
+# guard-the-guard —
+# test_script_probe_pipelines.py::test_the_grep_q_sweep_detects_a_planted_pipeline,
+# planted spellings that must match plus the shapes that must not — sits beside
+# that sweep.
 
 # A grep on the receiving end of a pipe, plus its arguments up to the end of
 # THAT command: `[^|;&)]*` stops at the next pipeline stage, at a `;` or `&&`,
@@ -338,7 +339,7 @@ SILENT_FAILURE = "    exit 1\n"
 # is latent by construction: it would first surface as a confusing sweep failure
 # against a future author's perfectly legitimate line, which is the worst moment
 # to discover a lint rule is wrong. Pinned in the must-not-match set of
-# test_setup_host_probe_pipelines.py::test_the_grep_q_sweep_detects_a_planted_pipeline.
+# test_script_probe_pipelines.py::test_the_grep_q_sweep_detects_a_planted_pipeline.
 _GREP_PIPE = re.compile(r"(?<!\|)\|(?!\|)\s*grep\s+(?P<args>[^|;&)]*)")
 
 # Every spelling of "exit on the first match and close the read end": the short
@@ -366,3 +367,15 @@ def grep_q_offenders(source: str) -> list[tuple[int, str]]:
         for n, line in enumerate(source.splitlines(), start=1)
         if not line.strip().startswith("#") and _pipes_into_quiet_grep(line)
     ]
+
+
+# A `set` whose option cluster ends in `o pipefail`: `set -euo pipefail`,
+# `set -uo pipefail` and `set -o pipefail` alike. Anchored at the line start
+# (after indentation), so a comment that merely quotes `set -o pipefail` does
+# not count.
+_SETS_PIPEFAIL = re.compile(r"^[ \t]*set[ \t]+-[A-Za-z]*o[ \t]+pipefail\b", re.MULTILINE)
+
+
+def sets_pipefail(source: str) -> bool:
+    """True when *source* turns on `pipefail` — the condition that makes a quiet grep a defect."""
+    return _SETS_PIPEFAIL.search(source) is not None
