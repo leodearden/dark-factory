@@ -1015,37 +1015,28 @@ class TestAtomicConnectionSnapshotPin:
         assert errors == []
 
     async def test_legacy_multi_hop_read_still_loses_the_race(self, tmp_path, open_conn):
-        """CONTROL: the shape being replaced still raises SQLITE_BUSY_SNAPSHOT here.
+        """CONTROL: the replaced shape raises SQLITE_BUSY_SNAPSHOT in the same collision.
 
-        This arm is what proves the harness above still exercises the pin after
-        the fix rather than passing vacuously — measured 39/40 iterations
-        failing on this base, so a false green is ~0.
+        The positive arm survives this exact constructed collision, so the
+        replaced shape losing it is what proves that arm discriminates rather
+        than passing vacuously.
         """
-        db_path = tmp_path / 'scan.db'
-        owner = await open_conn(db_path)
-        foreign = await open_conn(db_path)
-        await _seed_scan_table(owner)
+        owner, foreign, gate = await _open_collision_pair(open_conn, tmp_path / 'scan.db')
 
-        async def legacy_read():
-            async with owner.execute(_SLOW_SCAN, _SLOW_SCAN_PARAMS) as cur:
-                return await cur.fetchall()
+        async def legacy_read() -> list[aiosqlite.Row]:
+            async with owner.execute(_GATED_SCAN) as cur:
+                return list(await cur.fetchall())
 
-        names: list[str | None] = []
-        for i in range(40):
-            reader = asyncio.create_task(legacy_read())
-            await asyncio.sleep(0)
-            await foreign.execute("UPDATE items SET v = ? WHERE id = 'foreign'", (str(i),))
-            await foreign.commit()
-            try:
-                await owner.execute("UPDATE items SET v = ? WHERE id = 'live'", (str(i),))
-                await owner.commit()
-            except sqlite3.OperationalError as exc:
-                names.append(getattr(exc, 'sqlite_errorname', None))
-            await reader
-            with suppress(Exception):
-                await owner.rollback()
+        async def legacy_write() -> None:
+            await owner.execute("UPDATE items SET v = 'owner' WHERE id = 'live'")
+            await owner.commit()
 
-        assert 'SQLITE_BUSY_SNAPSHOT' in names
+        rows, error = await _collide_with_a_pinned_read(
+            foreign, gate, read=legacy_read, write=legacy_write
+        )
+
+        assert error == 'SQLITE_BUSY_SNAPSHOT'
+        assert [r['id'] for r in rows] == ['live']
 
 
 @pytest.mark.asyncio
