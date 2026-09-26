@@ -48,8 +48,10 @@ from fused_memory.reconciliation.standing_decision_constants import (
     EXPIRY_REASON_TTL,
     GROUNDS_ENUM,
     RECORD_KIND_ENTITY_STANDING_DECISION,
+    RECORD_KIND_ENTITY_SUPPRESSION_STREAK,
     STATE_ACTIVE,
     STATE_EXPIRED,
+    STREAK_PAYLOAD_KEY,
 )
 
 logger = logging.getLogger(__name__)
@@ -783,6 +785,91 @@ class ReconLedgerStore:
                 'explicit grounds argument before growing GROUNDS_ENUM past one value.'
             )
         return _record_from_row(rows[0])
+
+    async def upsert_suppression_streak(
+        self,
+        *,
+        project_id: str,
+        entity_uuid: str,
+        grounds: str,
+        streak: int,
+        last_run_id: str,
+        updated_at: str,
+        expires_at: str,
+    ) -> None:
+        """Write (last-write-wins) one suppression-streak row: the number of
+        consecutive full cycles in which the standing decision on
+        ``(entity_uuid, grounds)`` suppressed at least one flag (task 2943).
+
+        The PK slots deliberately mirror
+        :meth:`upsert_entity_standing_decision` — ``task_id=''``,
+        ``flag_type=grounds``, ``run_id=entity_uuid``, plus the indexed
+        ``entity_uuid`` column — so a streak row and its decision row share an
+        identity a reader can join on, while the distinct record kind
+        (:data:`~fused_memory.reconciliation.standing_decision_constants.RECORD_KIND_ENTITY_SUPPRESSION_STREAK`)
+        keeps this write from touching the decision row's payload.
+
+        Unlike the decision row, a streak row is HARD-DELETED by :meth:`gc` once
+        ``expires_at`` passes rather than TTL-flipped: recurrence history for a
+        derived counter is not worth preserving, and the delete is what bounds
+        row growth.
+
+        Validation is loud (INV-1), as in :meth:`upsert_entity_standing_decision`:
+        an empty ``entity_uuid``, a ``streak`` that is not a non-negative int, a
+        ``grounds`` outside ``GROUNDS_ENUM``, or a ``None`` ``expires_at`` raises
+        ``ValueError`` naming the field, and nothing is written.
+        """
+        if not entity_uuid:
+            raise ValueError(
+                'upsert_suppression_streak: entity_uuid must be a non-empty '
+                f'string (got {entity_uuid!r})'
+            )
+        if isinstance(streak, bool) or not isinstance(streak, int) or streak < 0:
+            raise ValueError(
+                'upsert_suppression_streak: streak must be a non-negative int '
+                f'(got {streak!r})'
+            )
+        if grounds not in GROUNDS_ENUM:
+            raise ValueError(
+                'upsert_suppression_streak: grounds must be a member of '
+                f'GROUNDS_ENUM {sorted(GROUNDS_ENUM)} (got {grounds!r})'
+            )
+        if expires_at is None:
+            raise ValueError(
+                'upsert_suppression_streak: expires_at must not be None '
+                '(an unexpiring streak row would never be reaped by gc())'
+            )
+        payload = {
+            STREAK_PAYLOAD_KEY: streak,
+            'last_run_id': last_run_id,
+            'grounds': grounds,
+            'updated_at': updated_at,
+        }
+        await self.upsert(
+            ReconLedgerRecord(
+                project_id=project_id,
+                record_kind=RECORD_KIND_ENTITY_SUPPRESSION_STREAK,
+                task_id='',
+                flag_type=grounds,
+                run_id=entity_uuid,
+                entity_uuid=entity_uuid,
+                payload_json=json.dumps(payload),
+                state=STATE_ACTIVE,
+                created_at=updated_at,
+                expires_at=expires_at,
+            )
+        )
+
+    async def list_suppression_streaks(self, project_id: str) -> list[ReconLedgerRecord]:
+        """Return every suppression-streak row for a project."""
+        rows = await self._require_access().read_all(
+            """
+            SELECT * FROM recon_ledger
+            WHERE project_id = ? AND record_kind = ?
+            """,
+            (project_id, RECORD_KIND_ENTITY_SUPPRESSION_STREAK),
+        )
+        return [_record_from_row(row) for row in rows]
 
     async def close(self) -> None:
         """Close the underlying aiosqlite connection.
