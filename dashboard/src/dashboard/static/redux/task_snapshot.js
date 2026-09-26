@@ -26,6 +26,7 @@ const {
   unknownDatum: unknownSnapshotDatum,
   combinedDatum: combineSnapshotDatums,
   isDatum: isSnapshotDatum,
+  assertDatum: assertSnapshotDatum,
 } = window.DF_DATUM;
 const { VIEWS: TASK_VIEW_MEMBERS } = window.DF_TASK_VOCAB;
 
@@ -98,12 +99,106 @@ function sumCensusMembers(maps) {
   return summed;
 }
 
+// ── The named readings ──
+// Each is a datumView `format` over a census VALUE. datumView never invokes a
+// format on a hole, so no reading ever sees a missing value and none carries a
+// guard. Numbers are plain String(n), no locale: one number, one spelling on
+// every surface.
+function runningOfInFlight(census) {
+  return `${census.sub_views.running} running of ${census.views.in_flight} in-flight`;
+}
+
+function terminalOfTotal(census) {
+  return `${census.views.terminal}/${census.total}`;
+}
+
+function censusTotal(census) {
+  return `${census.total} total`;
+}
+
+function censusViewCount(key) {
+  return census => String(census.views[key]);
+}
+
+function censusViewReading(key, label) {
+  return census => `${census.views[key]} ${label}`;
+}
+
+function censusMemberCount(member) {
+  return census => String(census.counts[member]);
+}
+
+const inFlightCount = censusViewCount('in_flight');
+
+// The generated views (DF_TASK_VOCAB.VIEWS, from data/census.py), each with
+// its label, its palette tone, the bare count a filter button shows, and the
+// reading a pip or legend entry shows. in_flight's reading shows its running
+// sub-view WITH its superset, never alone (PRD decision 3).
+function censusView(key, label, tone, reading = censusViewReading(key, label)) {
+  return Object.freeze({ key, label, tone, count: censusViewCount(key), reading });
+}
+
+const CENSUS_VIEWS = Object.freeze([
+  censusView('in_flight', 'in-flight', 'accent', runningOfInFlight),
+  censusView('backlog', 'backlog', 'warn'),
+  censusView('terminal', 'terminal', 'ok'),
+]);
+
+// The OrchTab census tiles show MEMBERS, not views. Burndown persists members,
+// so each tile's `series` is the history of the very member its headline
+// shows; a view tile would sit beside the spark of a different quantity.
+const CENSUS_TILES = Object.freeze([
+  Object.freeze({
+    key: 'running',
+    label: 'Running / in-flight',
+    tone: 'accent',
+    series: 'in_progress',
+    reading: census => `${census.sub_views.running} / ${census.views.in_flight}`,
+  }),
+  Object.freeze({ key: 'blocked', label: 'Blocked', tone: 'bad', series: 'blocked', reading: censusMemberCount('blocked') }),
+  Object.freeze({ key: 'pending', label: 'Pending', tone: 'warn', series: 'pending', reading: censusMemberCount('pending') }),
+]);
+
+// ── The Progress and pipeline bar ──
+// One segment per view, as a share of the total. Keyed on the presence of a
+// value, datumView's own hole rule: an aged census still draws its bar, a hole
+// draws none, and a measured empty census draws zero-width segments rather
+// than dividing by zero.
+function censusSegments(census) {
+  const { value } = assertSnapshotDatum(census, 'censusSegments');
+  if (value === null) return [];
+  return CENSUS_VIEWS.map(({ key, tone }) => ({
+    key,
+    tone,
+    share: value.total > 0 ? (value.views[key] / value.total) * 100 : 0,
+  }));
+}
+
+// ── A tile's spark, over the tile's own scope ──
+// The server aggregate with no project filter, that project's series with
+// one, and NO spark over two or more: summing ragged per-project series here
+// would be a second copy of redux_api.py::shape_burndown's aggregation.
+function censusHistory(data, projects, tile) {
+  if (projects === null) return data.BURNDOWN[tile.series];
+  if (projects.length !== 1) return null;
+  const projectSeries = (data.BURNDOWN_BY_PROJECT || {})[projects[0]] || {};
+  return projectSeries[tile.series] || [];
+}
+
 // Module-unique export const, never a bare `API` — the CANONICAL note in
 // datum.js's header, enforced by classic_script_scope.test.mjs.
 const TASK_SNAPSHOT_API = {
   TASKS_ENDPOINT,
   projectCensus,
   censusOver,
+  CENSUS_VIEWS,
+  CENSUS_TILES,
+  inFlightCount,
+  runningOfInFlight,
+  terminalOfTotal,
+  censusTotal,
+  censusSegments,
+  censusHistory,
 };
 
 if (typeof module !== 'undefined' && module.exports) {
