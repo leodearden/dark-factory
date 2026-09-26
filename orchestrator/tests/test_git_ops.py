@@ -10,7 +10,7 @@ import os
 import shutil
 import subprocess
 import time
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import NamedTuple
 from unittest.mock import patch
@@ -4313,23 +4313,6 @@ class TestMergeMarkerIndex:
         assert await git_ops.find_merge_marker('task/absent') is None
         assert await git_ops._scan_merge_marker('task/absent') is None
 
-    async def test_marker_in_commit_BODY_is_found(self, git_ops: GitOps):
-        """A marker in the body, not the subject, must still be found.
-
-        ``git log --grep`` matches anywhere in the commit message, so the index
-        reads ``%B`` rather than ``%s``.  Measured on dark-factory's own main:
-        19 of 62,950 commits carry a marker only in the body, so a subject-only
-        index would silently change those verdicts.
-        """
-        repo = git_ops.project_root
-        marker = _merge_subject('task/body-only', git_ops.config.main_branch)
-        message = f'chore: record a landing\n\n{marker}\n'
-        sha = await _seed_on_main(repo, {'body.txt': 'x\n'}, message)
-
-        assert await git_ops.find_merge_marker('task/body-only') == sha
-        # Equivalence with the path it replaced.
-        assert await git_ops._scan_merge_marker('task/body-only') == sha
-
     async def test_non_canonical_subject_stays_invisible(self, git_ops: GitOps):
         """A hand-written ``Merge task/x: ...`` subject is not a marker.
 
@@ -4444,6 +4427,91 @@ class TestMergeMarkerIndex:
 
         assert match is not None
         assert match.group(1) == 'task/derived'
+
+
+async def _quote_marker_in_body(repo: Path, marker: str) -> None:
+    await _seed_on_main(
+        repo, {'notes.md': 'x\n'},
+        f'docs: explain markers\n\nQuoting {marker} verbatim.\n',
+    )
+
+
+async def _body_quote_only(repo: Path, marker: str) -> str | None:
+    """Task 4104 shape: e79f9b1094 quotes a marker in prose; nothing landed."""
+    await _quote_marker_in_body(repo, marker)
+    return None
+
+
+async def _body_quote_newer_than_true_merge(repo: Path, marker: str) -> str | None:
+    """Task 4181 shape: d0d67f0c53 quotes the marker after the real merge landed."""
+    merge = await _land_branch(repo, '5765', {'landed.txt': 'x\n'})
+    await _quote_marker_in_body(repo, marker)
+    return merge
+
+
+async def _revert_of_true_merge(repo: Path, marker: str) -> str | None:
+    """Task 5668 shape: 3e7d55ce47 'Revert "<marker>"' contains the marker."""
+    merge = await _land_branch(repo, '5765', {'landed.txt': 'x\n'})
+    rc, _, err = await _run(
+        ['git', 'revert', '--no-edit', '-m', '1', merge], cwd=repo,
+    )
+    assert rc == 0, f'revert failed: {err}'
+    return merge
+
+
+async def _suffixed_subject(repo: Path, marker: str) -> str | None:
+    """ce78ad8546 shape: '<marker>: extra words' is a longer subject."""
+    await _seed_on_main(repo, {'suffixed.txt': 'x\n'}, f'{marker}: extra words')
+    return None
+
+
+async def _single_parent_exact_subject(repo: Path, marker: str) -> str | None:
+    """task/176 shape: ba1bba2611 is a real marker with a single parent."""
+    return await _seed_on_main(repo, {'single.txt': 'x\n'}, marker)
+
+
+async def _wrapped_first_paragraph(repo: Path, marker: str) -> str | None:
+    """git's %s joins a wrapped first paragraph back into the marker."""
+    wrapped = marker.replace(' into ', '\ninto ', 1)
+    return await _seed_on_main(repo, {'wrapped.txt': 'x\n'}, wrapped)
+
+
+@pytest.mark.asyncio
+class TestMergeMarkerIsExactSubject:
+    """A marker is a commit whose git subject (``%s``) equals
+    ``_merge_subject(branch, main_branch)``; the body and the parent count are
+    never consulted (task 5765).
+    """
+
+    @pytest.mark.parametrize(
+        'build',
+        [
+            pytest.param(_body_quote_only, id='body_quote_only'),
+            pytest.param(
+                _body_quote_newer_than_true_merge,
+                id='body_quote_newer_than_true_merge',
+            ),
+            pytest.param(_revert_of_true_merge, id='revert_of_true_merge'),
+            pytest.param(_suffixed_subject, id='suffixed_subject'),
+            pytest.param(
+                _single_parent_exact_subject, id='single_parent_exact_subject',
+            ),
+            pytest.param(_wrapped_first_paragraph, id='wrapped_first_paragraph'),
+        ],
+    )
+    async def test_marker_is_the_commit_whose_subject_is_exactly_the_merge_subject(
+        self,
+        git_ops: GitOps,
+        build: Callable[[Path, str], Awaitable[str | None]],
+    ):
+        repo = git_ops.project_root
+        branch = 'task/5765'
+        marker = _merge_subject(branch, git_ops.config.main_branch)
+
+        expected = await build(repo, marker)
+
+        assert await git_ops.find_merge_marker(branch, gate_on_existing_ref=False) == expected
+        assert await git_ops._scan_merge_marker(branch) == expected
 
 
 @pytest.mark.asyncio
