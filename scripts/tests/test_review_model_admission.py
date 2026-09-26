@@ -226,3 +226,131 @@ def test_no_records_means_no_reopens(runs_db):
     _finalized(runs_db, _at(hours=5), task_id='4377', state='conflict')
 
     assert review_model_admission.conflict_reopens(runs_db, [], until=UNTIL) == ()
+
+
+# --- cost and caps: daily slices, the peak trailing 24 h, rejections, scoped hits ---
+
+
+def _spend(runs_db, cost_usd, **offset):
+    runs_db.seed_invocation(
+        model=FABLE, role='merger', task_id='4377', cost_usd=cost_usd,
+        started_at=_at(**offset), completed_at=_at(**offset),
+    )
+
+
+def test_daily_spend_is_exactly_days_half_open_slices(runs_db):
+    _spend(runs_db, 5.0, hours=1)
+    _spend(runs_db, 7.0, hours=24)   # on the slice-0/1 boundary: the LATER slice
+    _spend(runs_db, 3.0, hours=47)
+    _spend(runs_db, 99.0, hours=72)  # the end of the last slice: out
+
+    slices = review_model_admission.daily_spend(
+        runs_db, model=FABLE, since=APPLY, days=3, ceiling_usd=150.0,
+    )
+
+    assert all(isinstance(s, audit_model_admission.SpendInWindow) for s in slices)
+    assert [(s.window_start, s.window_end) for s in slices] == [
+        (_at(days=k), _at(days=k + 1)) for k in range(3)
+    ]
+    assert [s.total_usd for s in slices] == [5.0, 10.0, 0.0]
+    assert [s.invocation_count for s in slices] == [1, 2, 0]
+    assert slices[0].headroom_usd == 145.0
+
+
+def test_daily_spend_without_a_ceiling_leaves_the_ceiling_cells_unknown(runs_db):
+    _spend(runs_db, 5.0, hours=1)
+
+    (only,) = review_model_admission.daily_spend(
+        runs_db, model=FABLE, since=APPLY, days=1, ceiling_usd=None,
+    )
+
+    assert (only.ceiling_usd, only.headroom_usd, only.at_or_over_ceiling) == (None, None, None)
+
+
+def test_the_peak_trailing_24h_can_exceed_a_ceiling_no_daily_slice_reaches(runs_db):
+    """The resolver sums a TRAILING window, so it can trip on spend that two
+    adjacent daily slices split between them."""
+    _spend(runs_db, 60.0, hours=14)
+    _spend(runs_db, 50.0, hours=22)
+    _spend(runs_db, 45.0, hours=37, minutes=59)
+
+    peak = review_model_admission.peak_trailing_24h(
+        runs_db, model=FABLE, since=APPLY, until=APPLY + timedelta(days=2),
+        ceiling_usd=150.0,
+    )
+    slices = review_model_admission.daily_spend(
+        runs_db, model=FABLE, since=APPLY, days=2, ceiling_usd=150.0,
+    )
+
+    assert peak is not None
+    assert peak.total_usd == pytest.approx(155.0)
+    assert peak.at == _at(hours=37, minutes=59)
+    assert peak.ceiling_usd == 150.0
+    assert peak.at_or_over_ceiling is True
+    assert not any(s.at_or_over_ceiling for s in slices)
+
+
+def test_the_peak_window_is_closed_at_both_ends_like_the_resolver_s(runs_db):
+    """shared/src/shared/cost_store.py::CostStore.model_cost_in_window sums
+    with BETWEEN: a run exactly 24 h before t is still inside t's window."""
+    _spend(runs_db, 100.0, hours=1)
+    _spend(runs_db, 60.0, hours=25)
+
+    peak = review_model_admission.peak_trailing_24h(
+        runs_db, model=FABLE, since=APPLY, until=APPLY + timedelta(days=2),
+        ceiling_usd=None,
+    )
+
+    assert peak is not None
+    assert (peak.total_usd, peak.at) == (pytest.approx(160.0), _at(hours=25))
+    assert peak.at_or_over_ceiling is None
+
+
+def test_the_peak_is_none_when_nothing_ran(runs_db):
+    _spend(runs_db, 100.0, hours=-1)  # before since
+
+    assert review_model_admission.peak_trailing_24h(
+        runs_db, model=FABLE, since=APPLY, until=APPLY + timedelta(days=2),
+        ceiling_usd=150.0,
+    ) is None
+
+
+def _rejection(reason, resolved_model):
+    return audit_model_admission.RoutingRejection(
+        timestamp=_at(hours=1), task_id='4377', role='merger',
+        resolved_model=resolved_model, reasons=(reason,),
+    )
+
+
+def test_ceiling_trips_are_the_ceiling_rejections_with_their_fall_through():
+    rejections = (
+        _rejection('config:model-not-in-allowlist', 'opus'),
+        _rejection('config:model-ceiling-exhausted', 'opus'),
+        _rejection('policy_rule:model-capacity-exhausted', 'sonnet'),
+    )
+    scan = audit_model_admission.RoutingScan(
+        selections=(), rejections=rejections, skipped_rows=0,
+    )
+
+    assert review_model_admission.model_rejections(scan) == rejections
+    trips = review_model_admission.ceiling_trips(scan)
+    assert [(t.reasons, t.resolved_model) for t in trips] == [
+        (('config:model-ceiling-exhausted',), 'opus'),
+    ]
+
+
+def test_scoped_hits_are_counted_per_account_with_each_first_hit():
+    hits = tuple(
+        audit_model_admission.ScopedCapHit(created_at=at, account_name=account, reason='limit')
+        for at, account in (
+            (_at(days=2), 'max-e'), (_at(days=3), 'max-c'), (_at(days=4), 'max-e'),
+        )
+    )
+    scan = audit_model_admission.ScopedCapScan(
+        scoped_hits=hits, unscoped_cap_hit_count=0, restarts=(),
+    )
+
+    assert review_model_admission.scoped_hits_by_account(scan) == (
+        ('max-c', 1, _at(days=3)),
+        ('max-e', 2, _at(days=2)),
+    )
