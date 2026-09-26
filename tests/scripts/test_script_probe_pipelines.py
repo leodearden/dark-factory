@@ -41,9 +41,12 @@ import pathlib
 import pytest
 from shell_sections import (
     REPO_ROOT,
-    SIGPIPE_BULK_BYTES,
+    SILENT_FAILURE,
+    clean_match,
     dispatch_stub_body,
     grep_q_offenders,
+    match_then_bulk,
+    match_then_nonzero,
     run_with_preamble,
     slice_section,
     slice_shell_function,
@@ -111,46 +114,25 @@ def _run_probe(tmp_path, section_text, *, docker_body):
     return run_with_preamble(tmp_path, _preamble(tmp_path), section_text)
 
 
-# Scenario bodies for a scripted docker branch, indented to sit inside `case`.
-#
-# Parameterized by the reply token rather than frozen as constants: the two
-# `ps --status running` sites look for `falkordb` and the two `redis-cli ping`
-# sites look for `PONG`, and eight near-identical constants is how the four
-# sites drift apart.
-def _match_then_nonzero(reply):
-    """Producer emits the match, then exits non-zero for its own reasons — case (a)."""
-    return f"    printf '{reply}\\n'\n    exit 1\n"
-
-
-def _match_then_bulk(reply):
-    """Producer emits the match, then keeps writing until grep closes the pipe — case (b)."""
-    return f"    printf '{reply}\\n'\n    head -c {SIGPIPE_BULK_BYTES} /dev/zero | tr '\\0' x\n"
-
-
-def _clean_match(reply):
-    """Characterization: the ordinary path — the match, then exit 0."""
-    return f"    printf '{reply}\\n'\n    exit 0\n"
-
-
 def _nonmatching_output(reply):
     """Producer SUCCEEDS, saying something that does not contain the token.
 
     The second negative direction, and the one that actually happens in
     production: `docker compose ps --status running` exits 0 listing only
     qdrant because falkordb is genuinely down, or redis-cli answers an error
-    string instead of PONG. Distinct from `_SILENT_FAILURE` below in the path
-    it takes through the fixed code, not merely in its wording — the producer
+    string instead of PONG. Distinct from `SILENT_FAILURE` in the path it
+    takes through the fixed code, not merely in its wording — the producer
     exits 0, so the capture's `|| true` never fires and the `[[ ]]` decides on
     real content rather than on the empty string left behind by a failure.
     Nothing pinned that direction before, so every site's negative branch was
     reachable only via a producer that had failed.
 
-    Body-identical to `_clean_match` by construction (print, exit 0) and
+    Body-identical to `clean_match` by construction (print, exit 0) and
     deliberately kept as its own name: what distinguishes the two scenarios is
-    the argument, and a call site reading `_clean_match("qdrant")` would say
+    the argument, and a call site reading `clean_match("qdrant")` would say
     the opposite of what it means.
     """
-    return _clean_match(reply)
+    return clean_match(reply)
 
 
 # What each pair of sites sees when the thing it asks about is honestly absent.
@@ -160,11 +142,6 @@ def _nonmatching_output(reply):
 # the whole content of the scenario.
 _LISTING_WITHOUT_FALKORDB = "qdrant"
 _REPLY_WITHOUT_PONG = "ERR unknown command"
-
-
-# A producer that says NOTHING and fails. The honest verdict for every site is
-# the negative branch, reached WITHOUT aborting — see each site's guard test.
-_SILENT_FAILURE = "    exit 1\n"
 
 
 # --- export-data.sh section 3: the FalkorDB BGSAVE flush --------------------
@@ -234,7 +211,7 @@ def test_export_flushes_falkordb_when_the_listing_exits_nonzero(tmp_path):
     skips the BGSAVE on a live database and exports a stale dump.rdb — silent
     data loss, logged as a routine warning.
     """
-    result = _run_export_bgsave(tmp_path, _match_then_nonzero("falkordb"))
+    result = _run_export_bgsave(tmp_path, match_then_nonzero("falkordb"))
 
     combined = result.stdout + result.stderr
     assert "OK FalkorDB BGSAVE completed" in combined, combined
@@ -248,7 +225,7 @@ def test_export_flushes_falkordb_when_the_listing_is_sigpiped(tmp_path):
     signal 13, `pipefail` turns that into 141, and the `if` reads "not running"
     off a listing that began with the container's own name.
     """
-    result = _run_export_bgsave(tmp_path, _match_then_bulk("falkordb"))
+    result = _run_export_bgsave(tmp_path, match_then_bulk("falkordb"))
 
     combined = result.stdout + result.stderr
     assert "OK FalkorDB BGSAVE completed" in combined, combined
@@ -264,7 +241,7 @@ def test_export_skips_the_flush_when_the_listing_says_nothing(tmp_path):
     else branch. `returncode == 0` is the only assertion in this file that
     distinguishes the correct fix from that plausible-looking regression.
     """
-    result = _run_export_bgsave(tmp_path, _SILENT_FAILURE)
+    result = _run_export_bgsave(tmp_path, SILENT_FAILURE)
 
     combined = result.stdout + result.stderr
     assert result.returncode == 0, combined
@@ -293,7 +270,7 @@ def test_export_skips_the_flush_when_the_listing_omits_falkordb(tmp_path):
 
 def test_export_flushes_falkordb_on_a_clean_listing(tmp_path):
     """Characterization: the ordinary path lists falkordb and exits 0."""
-    result = _run_export_bgsave(tmp_path, _clean_match("falkordb"))
+    result = _run_export_bgsave(tmp_path, clean_match("falkordb"))
 
     combined = result.stdout + result.stderr
     assert "OK FalkorDB BGSAVE completed" in combined, combined
@@ -345,7 +322,7 @@ def test_import_stops_the_containers_when_the_listing_exits_nonzero(tmp_path):
     replace the data trees underneath them — the import's whole reason for
     stopping them first.
     """
-    result = _run_import_stop(tmp_path, _match_then_nonzero("falkordb"))
+    result = _run_import_stop(tmp_path, match_then_nonzero("falkordb"))
 
     combined = result.stdout + result.stderr
     assert _STOPPED in combined, combined
@@ -353,7 +330,7 @@ def test_import_stops_the_containers_when_the_listing_exits_nonzero(tmp_path):
 
 def test_import_stops_the_containers_when_the_listing_is_sigpiped(tmp_path):
     """Same misread via SIGPIPE: `grep -q` closes the pipe, the producer dies, 141."""
-    result = _run_import_stop(tmp_path, _match_then_bulk("falkordb"))
+    result = _run_import_stop(tmp_path, match_then_bulk("falkordb"))
 
     combined = result.stdout + result.stderr
     assert _STOPPED in combined, combined
@@ -366,7 +343,7 @@ def test_import_stops_nothing_when_the_listing_says_nothing(tmp_path):
     the bare-assignment spelling: `returncode == 0` pins that the fix must not
     turn an unavailable docker into a `set -e` abort of the whole import.
     """
-    result = _run_import_stop(tmp_path, _SILENT_FAILURE)
+    result = _run_import_stop(tmp_path, SILENT_FAILURE)
 
     combined = result.stdout + result.stderr
     assert result.returncode == 0, combined
@@ -386,7 +363,7 @@ def test_import_stops_nothing_when_the_listing_omits_falkordb(tmp_path):
 
 def test_import_stops_the_containers_on_a_clean_listing(tmp_path):
     """Characterization: the ordinary path lists falkordb and exits 0."""
-    result = _run_import_stop(tmp_path, _clean_match("falkordb"))
+    result = _run_import_stop(tmp_path, clean_match("falkordb"))
 
     combined = result.stdout + result.stderr
     assert _STOPPED in combined, combined
@@ -440,7 +417,7 @@ def test_import_wait_reports_healthy_when_the_ping_exits_nonzero(tmp_path):
     pipeline's status conflates the two and polls a live FalkorDB for thirty
     seconds before declaring it never came up.
     """
-    result = _run_import_wait(tmp_path, _match_then_nonzero("PONG"))
+    result = _run_import_wait(tmp_path, match_then_nonzero("PONG"))
 
     combined = result.stdout + result.stderr
     assert _HEALTHY in combined, combined
@@ -449,7 +426,7 @@ def test_import_wait_reports_healthy_when_the_ping_exits_nonzero(tmp_path):
 
 def test_import_wait_reports_healthy_when_the_ping_is_sigpiped(tmp_path):
     """A producer still writing when grep matches dies of SIGPIPE; PONG was still said."""
-    result = _run_import_wait(tmp_path, _match_then_bulk("PONG"))
+    result = _run_import_wait(tmp_path, match_then_bulk("PONG"))
 
     combined = result.stdout + result.stderr
     assert _HEALTHY in combined, combined
@@ -458,7 +435,7 @@ def test_import_wait_reports_healthy_when_the_ping_is_sigpiped(tmp_path):
 
 def test_import_wait_times_out_when_the_ping_says_nothing(tmp_path):
     """No reply is still not-healthy — and the loop must reach that verdict without aborting."""
-    result = _run_import_wait(tmp_path, _SILENT_FAILURE)
+    result = _run_import_wait(tmp_path, SILENT_FAILURE)
 
     combined = result.stdout + result.stderr
     assert result.returncode == 0, combined
@@ -483,7 +460,7 @@ def test_import_wait_times_out_when_the_ping_answers_something_else(tmp_path):
 
 def test_import_wait_reports_healthy_on_a_clean_ping(tmp_path):
     """Characterization: the ordinary path answers PONG and exits 0."""
-    result = _run_import_wait(tmp_path, _clean_match("PONG"))
+    result = _run_import_wait(tmp_path, clean_match("PONG"))
 
     combined = result.stdout + result.stderr
     assert _HEALTHY in combined, combined
@@ -525,7 +502,7 @@ def test_import_health_reports_pong_when_the_ping_exits_nonzero(tmp_path):
     is the operator's closing signal: a successful import reported as a
     database that never came back.
     """
-    result = _run_import_health(tmp_path, _match_then_nonzero("PONG"))
+    result = _run_import_health(tmp_path, match_then_nonzero("PONG"))
 
     combined = result.stdout + result.stderr
     assert _PONG_OK in combined, combined
@@ -534,7 +511,7 @@ def test_import_health_reports_pong_when_the_ping_exits_nonzero(tmp_path):
 
 def test_import_health_reports_pong_when_the_ping_is_sigpiped(tmp_path):
     """A producer still writing when grep matches dies of SIGPIPE; PONG was still said."""
-    result = _run_import_health(tmp_path, _match_then_bulk("PONG"))
+    result = _run_import_health(tmp_path, match_then_bulk("PONG"))
 
     combined = result.stdout + result.stderr
     assert _PONG_OK in combined, combined
@@ -543,7 +520,7 @@ def test_import_health_reports_pong_when_the_ping_is_sigpiped(tmp_path):
 
 def test_import_health_reports_not_responding_when_the_ping_says_nothing(tmp_path):
     """No reply is genuinely not responding — reached WITHOUT aborting the import."""
-    result = _run_import_health(tmp_path, _SILENT_FAILURE)
+    result = _run_import_health(tmp_path, SILENT_FAILURE)
 
     combined = result.stdout + result.stderr
     assert result.returncode == 0, combined
@@ -565,7 +542,7 @@ def test_import_health_reports_not_responding_when_the_ping_answers_something_el
 
 def test_import_health_reports_pong_on_a_clean_ping(tmp_path):
     """Characterization: the ordinary path answers PONG and exits 0."""
-    result = _run_import_health(tmp_path, _clean_match("PONG"))
+    result = _run_import_health(tmp_path, clean_match("PONG"))
 
     combined = result.stdout + result.stderr
     assert _PONG_OK in combined, combined

@@ -32,9 +32,12 @@ from setup_host_sections import (
     write_stub,
 )
 from shell_sections import (
-    SIGPIPE_BULK_BYTES,
+    SILENT_FAILURE,
+    clean_match,
     dispatch_stub_body,
     grep_q_offenders,
+    match_then_bulk,
+    match_then_nonzero,
 )
 
 # --- section 2: the FalkorDB "wait for healthy" loop -----------------------
@@ -105,13 +108,6 @@ def _compose_env(tmp_path):
     return {"COMPOSE_FILE": str(tmp_path / "docker-compose.yml")}
 
 
-# Scenario bodies for the docker exec branch. Indented to sit inside `case`.
-_REPLY_THEN_NONZERO = "    printf 'PONG\\n'\n    exit 1\n"
-_REPLY_THEN_BULK = f"    printf 'PONG\\n'\n    head -c {SIGPIPE_BULK_BYTES} /dev/zero | tr '\\0' x\n"
-_SILENT_FAILURE = "    exit 1\n"
-_CLEAN_REPLY = "    printf 'PONG\\n'\n    exit 0\n"
-
-
 def _docker_stub_body(exec_body):
     """A `docker` stub body whose `... exec ...` invocation runs *exec_body*.
 
@@ -153,7 +149,7 @@ def test_section_2_reports_healthy_when_the_producer_exits_nonzero_after_the_rep
     answered is a fact about the OUTPUT. Reading the verdict from the pipeline's
     status conflates the two and reports a live FalkorDB as never healthy.
     """
-    result = _run_section_2(tmp_path, _REPLY_THEN_NONZERO)
+    result = _run_section_2(tmp_path, match_then_nonzero("PONG"))
 
     combined = result.stdout + result.stderr
     assert "OK FalkorDB healthy" in combined, combined
@@ -169,7 +165,7 @@ def test_section_2_reports_healthy_when_the_producer_is_sigpiped_after_the_reply
     signal 13, `pipefail` turns that into 141, and the `if` reads "not healthy"
     off a reply that began with PONG.
     """
-    result = _run_section_2(tmp_path, _REPLY_THEN_BULK)
+    result = _run_section_2(tmp_path, match_then_bulk("PONG"))
 
     combined = result.stdout + result.stderr
     assert "OK FalkorDB healthy" in combined, combined
@@ -184,7 +180,7 @@ def test_section_2_still_times_out_when_the_producer_says_nothing(tmp_path):
     moment docker is unavailable, where the old pipeline merely took the else
     branch. `returncode == 0` is what pins that difference.
     """
-    result = _run_section_2(tmp_path, _SILENT_FAILURE)
+    result = _run_section_2(tmp_path, SILENT_FAILURE)
 
     combined = result.stdout + result.stderr
     assert result.returncode == 0, combined
@@ -194,7 +190,7 @@ def test_section_2_still_times_out_when_the_producer_says_nothing(tmp_path):
 
 def test_section_2_reports_healthy_on_a_clean_reply(tmp_path):
     """Characterization: the ordinary path answers PONG and exits 0."""
-    result = _run_section_2(tmp_path, _CLEAN_REPLY)
+    result = _run_section_2(tmp_path, clean_match("PONG"))
 
     combined = result.stdout + result.stderr
     assert "OK FalkorDB healthy" in combined, combined
@@ -217,15 +213,9 @@ _JCODEMUNCH_END = 'ok "jcodemunch MCP added to user config"\n  fi\nfi'
 # `set -e`, so a failing one takes the whole bootstrap down.
 _ADD_SENTINEL = "STUB-CLAUDE-MCP-ADD-RAN"
 
-_LISTING_NAMES_IT_THEN_NONZERO = (
-    "    printf 'jcodemunch: uvx jcodemunch-mcp - Connected\\n'\n    exit 1\n"
-)
-_LISTING_NAMES_IT_THEN_BULK = (
-    "    printf 'jcodemunch: uvx jcodemunch-mcp - Connected\\n'\n"
-    f"    head -c {SIGPIPE_BULK_BYTES} /dev/zero | tr '\\0' x\n"
-)
-_LISTING_WITHOUT_IT = "    printf 'some-other-server: uvx other - Connected\\n'\n    exit 0\n"
-_LISTING_UNREADABLE = "    exit 1\n"
+# A `claude mcp list` line naming jcodemunch, and one naming only another server.
+_LISTING_NAMES_IT = "jcodemunch: uvx jcodemunch-mcp - Connected"
+_LISTING_WITHOUT_IT = "some-other-server: uvx other - Connected"
 
 
 def _run_jcodemunch(tmp_path, list_body):
@@ -251,7 +241,7 @@ def test_jcodemunch_sees_an_installed_server_when_the_listing_exits_nonzero(tmp_
     whether jcodemunch appeared. Reading the verdict from the pipeline conflates
     the two and re-runs `claude mcp add` on an already-registered server.
     """
-    result = _run_jcodemunch(tmp_path, _LISTING_NAMES_IT_THEN_NONZERO)
+    result = _run_jcodemunch(tmp_path, match_then_nonzero(_LISTING_NAMES_IT))
 
     combined = result.stdout + result.stderr
     assert "OK jcodemunch MCP already in user config" in combined, combined
@@ -260,7 +250,7 @@ def test_jcodemunch_sees_an_installed_server_when_the_listing_exits_nonzero(tmp_
 
 def test_jcodemunch_sees_an_installed_server_when_the_listing_is_sigpiped(tmp_path):
     """A long listing dies of SIGPIPE the instant `grep -q` matches its first line."""
-    result = _run_jcodemunch(tmp_path, _LISTING_NAMES_IT_THEN_BULK)
+    result = _run_jcodemunch(tmp_path, match_then_bulk(_LISTING_NAMES_IT))
 
     combined = result.stdout + result.stderr
     assert "OK jcodemunch MCP already in user config" in combined, combined
@@ -269,7 +259,7 @@ def test_jcodemunch_sees_an_installed_server_when_the_listing_is_sigpiped(tmp_pa
 
 def test_jcodemunch_adds_the_server_when_the_listing_does_not_name_it(tmp_path):
     """Guard: a listing without jcodemunch still installs it."""
-    result = _run_jcodemunch(tmp_path, _LISTING_WITHOUT_IT)
+    result = _run_jcodemunch(tmp_path, clean_match(_LISTING_WITHOUT_IT))
 
     combined = result.stdout + result.stderr
     assert _ADD_SENTINEL in combined, combined
@@ -283,7 +273,7 @@ def test_jcodemunch_adds_the_server_when_the_listing_cannot_be_read(tmp_path):
     under `set -e` would kill the bootstrap on any host where `claude mcp list`
     fails rather than falling through to the add.
     """
-    result = _run_jcodemunch(tmp_path, _LISTING_UNREADABLE)
+    result = _run_jcodemunch(tmp_path, SILENT_FAILURE)
 
     combined = result.stdout + result.stderr
     assert result.returncode == 0, combined
@@ -363,7 +353,7 @@ def test_section_12_reports_pong_when_the_producer_exits_nonzero_after_the_reply
     tmp_path,
 ):
     """A health check that got PONG says PONG, whatever the producer's status was."""
-    result = _run_section_12(tmp_path, _REPLY_THEN_NONZERO)
+    result = _run_section_12(tmp_path, match_then_nonzero("PONG"))
 
     combined = result.stdout + result.stderr
     assert "OK FalkorDB: PONG" in combined, combined
@@ -374,7 +364,7 @@ def test_section_12_reports_pong_when_the_producer_is_sigpiped_after_the_reply(
     tmp_path,
 ):
     """The SIGPIPE misread, at the health check rather than the wait loop."""
-    result = _run_section_12(tmp_path, _REPLY_THEN_BULK)
+    result = _run_section_12(tmp_path, match_then_bulk("PONG"))
 
     combined = result.stdout + result.stderr
     assert "OK FalkorDB: PONG" in combined, combined
@@ -383,7 +373,7 @@ def test_section_12_reports_pong_when_the_producer_is_sigpiped_after_the_reply(
 
 def test_section_12_reports_not_responding_when_the_producer_says_nothing(tmp_path):
     """Guard: a silent producer is still not-responding, reached without aborting."""
-    result = _run_section_12(tmp_path, _SILENT_FAILURE)
+    result = _run_section_12(tmp_path, SILENT_FAILURE)
 
     combined = result.stdout + result.stderr
     assert result.returncode == 0, combined

@@ -6,9 +6,10 @@ a verbatim second copy:
 
   1. THE SLICER — `find_in_code` / `slice_section` / `slice_shell_function`,
      plus the runner `run_with_preamble` / `stub_bin_dir` / `write_stub`.
-  2. THE PROBE SCAFFOLD — `SIGPIPE_BULK_BYTES` and `dispatch_stub_body`, the
-     two things every `producer | grep -q` probe suite needs to script a
-     PATH stub and provoke the SIGPIPE half of the defect.
+  2. THE PROBE SCAFFOLD — `SIGPIPE_BULK_BYTES`, `dispatch_stub_body` and the
+     scenario bodies `match_then_nonzero` / `match_then_bulk` / `clean_match`
+     / `SILENT_FAILURE`: what every `producer | grep -q` probe suite needs to
+     script a PATH stub and provoke both halves of the defect.
   3. THE DETECTOR — `grep_q_offenders`, the source-level rule the file-scoped
      sweeps assert, with its guard-the-guard in
      test_setup_host_probe_pipelines.py.
@@ -243,10 +244,10 @@ def run_with_preamble(
 
 # --- the shared probe scaffold ----------------------------------------------
 # What a `producer | grep -q` probe suite needs beyond the slicer: a stub body
-# that reports the producer's own status, and a payload size big enough to make
-# the SIGPIPE half of the defect deterministic. Both were verbatim per-suite
-# copies before (test_setup_host_probe_pipelines.py and
-# test_script_probe_pipelines.py), which is the drift this module exists to stop.
+# that reports the producer's own status, a payload size big enough to make the
+# SIGPIPE half of the defect deterministic, and the four scenario bodies
+# (`match_then_nonzero`, `match_then_bulk`, `clean_match`, `SILENT_FAILURE`)
+# every probe site is run against. Each lives here once, for every probe suite.
 
 # Trailing bytes a producer writes AFTER the matching line, to provoke the
 # SIGPIPE half of the misread.
@@ -289,6 +290,30 @@ def dispatch_stub_body(branches: tuple[tuple[str, str], ...]) -> str:
     """
     arms = "".join(f"  {glob})\n{text}    ;;\n" for glob, text in branches)
     return 'case "$*" in\n' + arms + "  *)\n    exit 0\n    ;;\nesac\n"
+
+
+# Scenario bodies for a `dispatch_stub_body` branch, indented to sit inside
+# `case`. Parameterized by the reply token rather than frozen as constants: the
+# listing sites look for a container name and the ping sites for `PONG`, and one
+# constant per (scenario, token) pair is how the sites drift apart.
+def match_then_nonzero(reply: str) -> str:
+    """Producer emits the match, then exits non-zero for its own reasons — case (a)."""
+    return f"    printf '{reply}\\n'\n    exit 1\n"
+
+
+def match_then_bulk(reply: str) -> str:
+    """Producer emits the match, then keeps writing until grep closes the pipe — case (b)."""
+    return f"    printf '{reply}\\n'\n    head -c {SIGPIPE_BULK_BYTES} /dev/zero | tr '\\0' x\n"
+
+
+def clean_match(reply: str) -> str:
+    """Characterization: the ordinary path — the match, then exit 0."""
+    return f"    printf '{reply}\\n'\n    exit 0\n"
+
+
+# A producer that says NOTHING and fails. The honest verdict for every site is
+# the negative branch, reached WITHOUT aborting — see each site's guard test.
+SILENT_FAILURE = "    exit 1\n"
 
 
 # --- the `| grep -q` detector ----------------------------------------------
