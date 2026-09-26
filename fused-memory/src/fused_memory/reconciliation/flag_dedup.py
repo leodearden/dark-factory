@@ -1292,6 +1292,31 @@ def _decoded_streak_payload(row: ReconLedgerRecord) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _next_suppression_streaks(
+    stored: dict[tuple[str, str], dict[str, Any]],
+    result: EntityStandingSuppressionResult,
+    run_id: str,
+) -> dict[tuple[str, str], int]:
+    """The ``(entity_uuid, grounds) -> streak`` rows this cycle must write.
+
+    A suppressing decision extends its stored streak by one, or holds it when
+    the stored ``last_run_id`` is this *run_id* (a replayed cycle).  A stored
+    non-zero streak whose decision suppressed nothing resets to 0; a stored 0
+    needs no write.  Pure, sync, no I/O.
+    """
+    next_streaks: dict[tuple[str, str], int] = {}
+    for entity_uuid in result.suppressed_by_decision:
+        key = (entity_uuid, result.grounds_by_decision.get(entity_uuid, ''))
+        prior = stored.get(key, {})
+        prior_streak = _nonnegative_int_from_payload(prior, STREAK_PAYLOAD_KEY)
+        replayed = bool(run_id) and prior.get('last_run_id') == run_id
+        next_streaks[key] = prior_streak if replayed else prior_streak + 1
+    for key, payload in stored.items():
+        if key not in next_streaks and _nonnegative_int_from_payload(payload, STREAK_PAYLOAD_KEY):
+            next_streaks[key] = 0
+    return next_streaks
+
+
 async def update_suppression_streaks(
     memory_service: Any,
     project_id: str,
@@ -1314,6 +1339,17 @@ async def update_suppression_streaks(
     *run_id* is re-written without incrementing, so a re-entered stage cannot
     reach *threshold* before the drain has persisted for that many real cycles.
 
+    Best-effort throughout, and an unread ledger is never read as a quiet
+    cycle.  A *result* with ``suppression_evaluated`` False returns ``[]``
+    before any I/O: Hook A fell open, so its empty ``suppressed_by_decision``
+    is not evidence that any decision went quiet.  No ``recon_ledger`` returns
+    ``[]`` (logged DEBUG).  A failed streak read returns ``[]`` and writes
+    NOTHING (logged WARNING), because without the prior counts every write
+    would clobber an established streak.  A failed write costs that one
+    entity its update (logged WARNING, excluded from the return), not the
+    cycle.  Stored payloads are never trusted for shape: anything but a
+    non-negative int reads as streak 0.
+
     Every write refreshes ``expires_at`` to *now* plus
     ``STANDING_DECISION_TTL_DAYS``, spelled as ``isoformat()`` like the
     standing-decision writer so ``gc()``'s TEXT comparison stays valid.
@@ -1322,37 +1358,63 @@ async def update_suppression_streaks(
     Returns one :class:`SuppressionStreakUpdate` per row written, sorted by
     ``(entity_uuid, grounds)``.
     """
-    ledger = memory_service.recon_ledger
-    rows = await ledger.list_suppression_streaks(project_id)
+    if not result.suppression_evaluated:
+        return []
+
+    ledger = getattr(memory_service, 'recon_ledger', None)
+    if ledger is None:
+        logger.debug(
+            'update_suppression_streaks: no recon_ledger on memory_service for '
+            'project %s; suppression streaks not advanced this cycle',
+            project_id,
+        )
+        return []
+
+    try:
+        rows = await ledger.list_suppression_streaks(project_id)
+    except Exception as e:
+        logger.warning(
+            'update_suppression_streaks: recon_ledger.list_suppression_streaks '
+            'failed for project %s: %s (best-effort — writing no streak this '
+            'cycle so established streaks survive intact)',
+            project_id,
+            e,
+            exc_info=True,
+        )
+        return []
     stored = {
         ((row.entity_uuid or row.run_id).lower(), row.flag_type): _decoded_streak_payload(row)
         for row in rows
     }
 
-    next_streaks: dict[tuple[str, str], int] = {}
-    for entity_uuid in result.suppressed_by_decision:
-        key = (entity_uuid, result.grounds_by_decision.get(entity_uuid, ''))
-        prior = stored.get(key, {})
-        prior_streak = _nonnegative_int_from_payload(prior, STREAK_PAYLOAD_KEY)
-        replayed = bool(run_id) and prior.get('last_run_id') == run_id
-        next_streaks[key] = prior_streak if replayed else prior_streak + 1
-    for key, payload in stored.items():
-        if key not in next_streaks and _nonnegative_int_from_payload(payload, STREAK_PAYLOAD_KEY):
-            next_streaks[key] = 0
-
     now_dt = datetime.now(UTC) if now is None else datetime.fromisoformat(now)
     expires_at = (now_dt + timedelta(days=STANDING_DECISION_TTL_DAYS)).isoformat()
     updates: list[SuppressionStreakUpdate] = []
-    for (entity_uuid, grounds), streak in sorted(next_streaks.items()):
-        await ledger.upsert_suppression_streak(
-            project_id=project_id,
-            entity_uuid=entity_uuid,
-            grounds=grounds,
-            streak=streak,
-            last_run_id=run_id,
-            updated_at=now_dt.isoformat(),
-            expires_at=expires_at,
-        )
+    for (entity_uuid, grounds), streak in sorted(
+        _next_suppression_streaks(stored, result, run_id).items()
+    ):
+        try:
+            await ledger.upsert_suppression_streak(
+                project_id=project_id,
+                entity_uuid=entity_uuid,
+                grounds=grounds,
+                streak=streak,
+                last_run_id=run_id,
+                updated_at=now_dt.isoformat(),
+                expires_at=expires_at,
+            )
+        except Exception as e:
+            logger.warning(
+                'update_suppression_streaks: failed to write streak=%d for '
+                'entity_uuid=%s grounds=%s in project %s: %s',
+                streak,
+                entity_uuid,
+                grounds,
+                project_id,
+                e,
+                exc_info=True,
+            )
+            continue
         updates.append(
             SuppressionStreakUpdate(
                 entity_uuid=entity_uuid,
