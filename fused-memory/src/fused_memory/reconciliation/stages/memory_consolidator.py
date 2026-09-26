@@ -28,6 +28,7 @@ from fused_memory.reconciliation.degenerate_task_node_sweep import (
     sweep_degenerate_task_nodes,
 )
 from fused_memory.reconciliation.flag_dedup import (
+    EntityStandingSuppressionResult,
     acknowledge_resolved_flags,
     compute_content_fingerprint_signature,
     compute_flag_signature,
@@ -41,6 +42,8 @@ from fused_memory.reconciliation.flag_dedup import (
     filter_style_only_authorship_flags,
     filter_terminal_metadata_flags,
     maybe_escalate_suppression_storm,
+    maybe_escalate_suppression_streak,
+    update_suppression_streaks,
 )
 from fused_memory.reconciliation.gate_owned_finding_phrasing import (
     extract_human_gated_task_ids,
@@ -363,7 +366,11 @@ class MemoryConsolidator(BaseStage):
         # is simply ABSENT from a remediation report, which is the .get(..., 0)
         # fallback the always-present convention exists to spare consumers — and
         # Stage 1's whole stats blob is serialized verbatim into Stage 2's prompt.
+        # The longest cross-cycle suppression streak (task 2943) follows the same
+        # convention: overwritten by _account_suppression_streaks on every full
+        # cycle, 0 on a remediation pass.
         report.stats['entity_standing_decision_suppressed'] = 0
+        report.stats['entity_standing_decision_max_suppression_streak'] = 0
 
         # ── Preservation-specimen corroboration guard (task 4223) ──────────────
         # Decline stranded/reset recommendations for tasks whose odd state is
@@ -641,6 +648,9 @@ class MemoryConsolidator(BaseStage):
         # below when there is anything to acknowledge; stays 0 when items_flagged is
         # empty/falsy.
         report.stats['stage1_flag_markers_acknowledged'] = 0
+        # Hook A reassigns this inside the block below; a cycle that flagged
+        # nothing keeps the empty batch, which is the same observation.
+        _esd_result = EntityStandingSuppressionResult.empty_batch()
         if report.items_flagged:
             # Snapshot before the filter chain (task-2029): used below to compute
             # which flags the chain dropped for a MOOT reason — terminal task,
@@ -819,8 +829,9 @@ class MemoryConsolidator(BaseStage):
             # Per-cycle "storm escape": one active decision suppressing more than the
             # threshold in a single cycle is a signal it may be over-broad or the
             # entity's situation changed — file one L1 recon escalation for that
-            # entity (best-effort; deduped per entity_uuid + category). Skipped when
-            # no escalation queue is wired (nothing would consume the escalation).
+            # entity (best-effort; recurrences fold onto it by content fingerprint).
+            # Skipped when no escalation queue is wired (nothing would consume the
+            # escalation).  Its cross-cycle streak arm runs after this block.
             if self._escalation_queue is not None:
                 await maybe_escalate_suppression_storm(
                     escalation_queue=self._escalation_queue,
@@ -996,6 +1007,8 @@ class MemoryConsolidator(BaseStage):
                         )
                     )
                     report.stats['gate_owned_suggested_actions_normalized'] = _normalized
+
+        await self._account_suppression_streaks(run_id, _esd_result, report)
 
         # ── Census inconsistency detection ────────────────────────────────────
         # Compare task IDs referenced in this cycle's events against the census
@@ -1326,6 +1339,48 @@ class MemoryConsolidator(BaseStage):
         report.stats['stage1_cycle_summary_ledger_written'] = 1 if ledger_written else 0
 
         return report
+
+    async def _account_suppression_streaks(
+        self,
+        run_id: str,
+        esd_result: EntityStandingSuppressionResult,
+        report: StageReport,
+    ) -> None:
+        """Advance every standing decision's suppression streak and file those at K.
+
+        The storm escape's cross-cycle arm (task 2943).  The per-cycle escape
+        catches one decision suppressing a flood in ONE cycle; this one catches
+        a persistent low-grade drain — at least one flag in each of K
+        consecutive full cycles, every one under N — which can hide a genuinely
+        new finding as surely as a single-cycle flood.
+
+        It runs on EVERY full cycle, zero-flag ones included, which is why
+        run() calls it after the ``if report.items_flagged:`` block rather than
+        beside Hook A inside it.  A cycle that flagged nothing is one in which
+        no decision drained anything, so it must reset every streak; skipping it
+        would let a decision suppressing on alternate cycles reach K with gaps
+        in between.  On such a cycle *esd_result* is the pre-bound empty batch.
+
+        The state update sits outside the escalation-queue gate so the streak is
+        already real when a queue is wired; only the filing needs the queue.
+        Both callees are best-effort and never raise.
+        """
+        updates = await update_suppression_streaks(
+            memory_service=self.memory,
+            project_id=self.project_id,
+            run_id=run_id,
+            result=esd_result,
+        )
+        report.stats['entity_standing_decision_max_suppression_streak'] = max(
+            (update.streak for update in updates), default=0
+        )
+        if self._escalation_queue is not None:
+            await maybe_escalate_suppression_streak(
+                escalation_queue=self._escalation_queue,
+                project_id=self.project_id,
+                run_id=run_id,
+                updates=updates,
+            )
 
     def get_system_prompt(self) -> str:
         return STAGE1_SYSTEM_PROMPT
