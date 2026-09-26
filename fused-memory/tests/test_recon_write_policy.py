@@ -21,7 +21,6 @@ from __future__ import annotations
 import inspect
 import json
 import subprocess
-import threading
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
@@ -2353,27 +2352,29 @@ class TestInterceptorSetTaskStatusReconCheckOffload:
         file reads per recon status write ONTO the event loop, which is the
         very defect this task exists to fix.
 
-        A blocking read can keep the loop free only by running elsewhere, so
-        the property is asserted directly: each read records the thread it ran
-        on, and neither may be the loop's thread (task 5920, replacing a
-        wall-clock tick floor).
+        Each stubbed read blocks on a LoopFreedomProbe, which reads False if
+        the read ran on the loop's thread, or ran elsewhere while the loop's
+        thread waited on it (task 5920, replacing a wall-clock tick floor). The
+        verdict is recorded, not asserted inside the read, because
+        _corroboration_verdict swallows every exception its reads raise.
         """
-        loop_thread = threading.get_ident()
-        read_threads: dict[str, int] = {}
+        probe = LoopFreedomProbe()
+        reads: list[str] = []
 
-        def _recording_read(name):
+        def _blocking_read(name):
             def _read(*args, **kwargs):
-                read_threads[name] = threading.get_ident()
+                reads.append(name)
+                probe.block()
                 return None
             return _read
 
         monkeypatch.setattr(
-            recon_write_policy, 'read_scheduler_state', _recording_read('read_scheduler_state'),
+            recon_write_policy, 'read_scheduler_state', _blocking_read('read_scheduler_state'),
         )
         monkeypatch.setattr(
             recon_write_policy,
             'orchestrator_started_at',
-            _recording_read('orchestrator_started_at'),
+            _blocking_read('orchestrator_started_at'),
         )
         monkeypatch.setattr(
             recon_write_policy, 'is_workflow_live_for_task', _async_detector(False),
@@ -2390,9 +2391,8 @@ class TestInterceptorSetTaskStatusReconCheckOffload:
             '599', 'pending', str(tmp_path), agent_id=AGENT_ID,
         )
 
-        assert set(read_threads) == {'read_scheduler_state', 'orchestrator_started_at'}
-        on_loop = sorted(name for name, ident in read_threads.items() if ident == loop_thread)
-        assert not on_loop, f'blocking reads ran on the event loop thread: {on_loop}'
+        assert sorted(reads) == ['orchestrator_started_at', 'read_scheduler_state']
+        probe.assert_loop_stayed_free()
 
     @pytest.mark.asyncio
     async def test_set_task_status_always_passes_snapshot_token_none(

@@ -1555,13 +1555,25 @@ class TestRetryUntilObserved:
 # ---------------------------------------------------------------------------
 # Tests for the shared LoopFreedomProbe oracle (task 5920)
 # ---------------------------------------------------------------------------
-# Pins the probe's discriminating power: a free loop reads True, and each of
-# the two loop-holding call-site shapes reads False without hanging. Every
-# verdict is driven by loop TURNS, never wall clock, so this suite cannot
-# itself become the next flake.
+
+#: Only a held loop ever reaches the ceiling, so shortening it cannot turn a
+#: False verdict True; it only keeps the held-loop cases fast.
+_HELD_LOOP_CEILING_SECONDS = 0.01
+
+
+def _drive_without_yielding_to_loop(coro) -> None:
+    with pytest.raises(StopIteration):
+        while True:
+            coro.send(None)
+
+
+def _run_on_a_worker_while_the_loop_thread_waits(fn, *args) -> None:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(fn, *args).result()
+
 
 class TestLoopFreedomProbe:
-    """Unit tests for LoopFreedomProbe.suspend() / .observations / .assert_loop_stayed_free()."""
+    """Unit tests for LoopFreedomProbe.suspend() / .block() / .observations / .assert_loop_stayed_free()."""
 
     @pytest.mark.asyncio
     async def test_a_free_loop_reads_true(self):
@@ -1576,19 +1588,47 @@ class TestLoopFreedomProbe:
     async def test_a_call_site_that_resumes_the_coroutine_itself_reads_false(self):
         probe = LoopFreedomProbe()
 
-        coro = probe.suspend()
-        with pytest.raises(StopIteration):
-            while True:
-                coro.send(None)
+        _drive_without_yielding_to_loop(probe.suspend())
 
         assert probe.observations == (False,)
 
     @pytest.mark.asyncio
     async def test_a_call_site_waiting_on_another_threads_loop_reads_false(self):
+        probe = LoopFreedomProbe(ceiling_seconds=_HELD_LOOP_CEILING_SECONDS)
+
+        _run_on_a_worker_while_the_loop_thread_waits(asyncio.run, probe.suspend())
+
+        assert probe.observations == (False,)
+
+    @pytest.mark.asyncio
+    async def test_a_call_site_awaiting_another_threads_loop_reads_true(self):
         probe = LoopFreedomProbe()
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            pool.submit(asyncio.run, probe.suspend()).result()
+        await asyncio.to_thread(asyncio.run, probe.suspend())
+
+        assert probe.observations == (True,)
+
+    @pytest.mark.asyncio
+    async def test_a_blocking_call_offloaded_from_the_loop_reads_true(self):
+        probe = LoopFreedomProbe()
+
+        await asyncio.to_thread(probe.block)
+
+        assert probe.observations == (True,)
+
+    @pytest.mark.asyncio
+    async def test_a_blocking_call_on_the_loop_thread_reads_false(self):
+        probe = LoopFreedomProbe()
+
+        probe.block()
+
+        assert probe.observations == (False,)
+
+    @pytest.mark.asyncio
+    async def test_a_blocking_call_the_loop_thread_waits_on_reads_false(self):
+        probe = LoopFreedomProbe(ceiling_seconds=_HELD_LOOP_CEILING_SECONDS)
+
+        _run_on_a_worker_while_the_loop_thread_waits(probe.block)
 
         assert probe.observations == (False,)
 
@@ -1602,10 +1642,7 @@ class TestLoopFreedomProbe:
     @pytest.mark.asyncio
     async def test_assert_loop_stayed_free_rejects_a_held_loop(self):
         probe = LoopFreedomProbe()
-        coro = probe.suspend()
-        with pytest.raises(StopIteration):
-            while True:
-                coro.send(None)
+        _drive_without_yielding_to_loop(probe.suspend())
 
         with pytest.raises(AssertionError, match='held'):
             probe.assert_loop_stayed_free()

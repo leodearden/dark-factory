@@ -18,6 +18,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import threading
 import types
 import uuid
 import warnings
@@ -1281,26 +1282,39 @@ async def retry_until_observed(
 #: asyncio's ready queue. It counts loop turns, never seconds.
 LOOP_FREEDOM_TURN_BUDGET = 10
 
+#: Seconds an off-loop-thread caller waits for the captured loop to run its
+#: marker. A CEILING, not a floor: a free loop answers within microseconds, so
+#: only a held loop reaches it, and it bounds how long that failure takes.
+LOOP_FREEDOM_CEILING_SECONDS = 30.0
+
 
 class LoopFreedomProbe:
-    """Did the test's event loop stay free while the code under test was suspended?
+    """Did the test's event loop stay free while the code under test was paused?
 
-    Construct it inside the test coroutine (it captures the running loop),
-    have the stubbed await point ``await probe.suspend()``, then call
-    :meth:`assert_loop_stayed_free`. Each ``suspend()`` queues a marker on the
-    captured loop and yields a bounded number of loop turns; it records True
-    iff the marker ran. A call site that resumes the coroutine itself, or
-    blocks synchronously on another thread's loop, never lets the marker run,
-    so it reads False — deterministically, and without hanging.
+    Construct it inside the test coroutine (it captures the running loop and
+    its thread). A stubbed await point calls ``await probe.suspend()``; a
+    stubbed blocking call calls ``probe.block()``. Then call
+    :meth:`assert_loop_stayed_free`. Each call queues a marker on the captured
+    loop and records True iff the marker ran:
 
-    It replaces a FLOOR on ticker wake-ups inside a wall-clock window, which
-    reds under host/GIL contention (task 5920; the same defect
+    * ``suspend()`` on the captured loop yields a bounded number of loop turns,
+      so a call site that resumes the coroutine itself reads False.
+    * ``block()``, or ``suspend()`` on another thread's loop, waits for the
+      marker up to a ceiling, so a call site that holds the loop's thread while
+      that work runs elsewhere reads False. ``block()`` on the loop's own
+      thread reads False at once, because it is the holder.
+
+    Every verdict is deterministic and none hangs. It replaces a FLOOR on ticker
+    wake-ups inside a wall-clock window, which reds under host/GIL contention
+    (task 5920; the same defect
     ``orchestrator/tests/test_verify_ruff_config_boundary.py::TestProbeDoesNotBlockTheEventLoop``
     fixed for task 4520 / esc-4520-6).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, ceiling_seconds: float = LOOP_FREEDOM_CEILING_SECONDS) -> None:
         self._loop = asyncio.get_running_loop()
+        self._loop_thread = threading.get_ident()
+        self._ceiling_seconds = ceiling_seconds
         self._observations: list[bool] = []
 
     @property
@@ -1308,6 +1322,10 @@ class LoopFreedomProbe:
         return tuple(self._observations)
 
     async def suspend(self) -> None:
+        if asyncio.get_running_loop() is not self._loop:
+            self.block()
+            return
+
         marker_ran = False
 
         def _mark() -> None:
@@ -1321,11 +1339,20 @@ class LoopFreedomProbe:
             await asyncio.sleep(0)
         self._observations.append(marker_ran)
 
+    def block(self) -> None:
+        if threading.get_ident() == self._loop_thread:
+            self._observations.append(False)
+            return
+
+        loop_answered = threading.Event()
+        self._loop.call_soon_threadsafe(loop_answered.set)
+        self._observations.append(loop_answered.wait(self._ceiling_seconds))
+
     def assert_loop_stayed_free(self) -> None:
-        assert self._observations, 'LoopFreedomProbe: the stubbed await point was never reached'
+        assert self._observations, 'LoopFreedomProbe: the probe was never reached by a stubbed call'
         assert all(self._observations), (
             'LoopFreedomProbe: the event loop was held while the code under test '
-            f'was suspended (observations={self.observations})'
+            f'was paused (observations={self.observations})'
         )
 
 
