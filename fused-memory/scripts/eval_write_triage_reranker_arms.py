@@ -551,3 +551,29 @@ def open_cross_encoder(
                 torch.cuda.empty_cache()
 
     return open_
+
+
+def _local_arm(name: str, model_id: str, max_length: int) -> ArmSpec:
+    return ArmSpec(
+        name=name, arm_class=ArmClass.local_cross_encoder, model=model_id,
+        open=open_cross_encoder(model_id, max_length),
+    )
+
+
+#: PRD D1's arms in report row order. The names are the stable row keys the
+#: report and Γ2's reader see. bge-reranker-v2-m3 runs at 1024 tokens, the
+#: length its model card tunes it for, so its pairs_over_max_length is large.
+D1_ARMS: tuple[ArmSpec, ...] = (
+    _local_arm('qwen3-reranker-0.6b', 'Qwen/Qwen3-Reranker-0.6B', 8192),
+    _local_arm('mxbai-rerank-base-v2', 'mixedbread-ai/mxbai-rerank-base-v2', 8192),
+    _local_arm('bge-reranker-v2-m3', 'BAAI/bge-reranker-v2-m3', 1024),
+    ArmSpec(
+        name='gpt-4o-mini-pairwise', arm_class=ArmClass.llm_pairwise, model=PAIRWISE_MODEL,
+        open=open_pairwise,
+    ),
+    *(
+        ArmSpec(name=api.name, arm_class=ArmClass.hosted_api, model=api.model, open=open_hosted(api))
+        for api in HOSTED_APIS
+    ),
+    ArmSpec(name='jev-choice', arm_class=ArmClass.jev_choice, model=JEV_MODEL, open=open_jev),
+)
