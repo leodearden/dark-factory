@@ -1083,28 +1083,27 @@ class TestAtomicConnectionSnapshotPin:
     """
 
     async def test_read_all_leaves_no_window_for_a_colliding_write(self, tmp_path, open_conn):
-        """40 iterations of read-then-write across a foreign commit raise nothing."""
-        db_path = tmp_path / 'scan.db'
-        owner = await open_conn(db_path)
-        foreign = await open_conn(db_path)
-        await _seed_scan_table(owner)
+        """One constructed collision raises nothing, and the write lands.
+
+        The read is parked mid-step with its snapshot pinned, a foreign
+        connection commits, and a write unit is issued into that window.
+        """
+        owner, foreign, gate = await _open_collision_pair(open_conn, tmp_path / 'scan.db')
         access = AtomicConnection(owner)
 
-        errors: list[str] = []
-        for i in range(40):
-            reader = asyncio.create_task(access.read_all(_SLOW_SCAN, _SLOW_SCAN_PARAMS))
-            await asyncio.sleep(0)
-            await foreign.execute("UPDATE items SET v = ? WHERE id = 'foreign'", (str(i),))
-            await foreign.commit()
-            try:
-                async with access.write() as db:
-                    await db.execute("UPDATE items SET v = ? WHERE id = 'live'", (str(i),))
-            except sqlite3.OperationalError as exc:
-                errors.append(f'{getattr(exc, "sqlite_errorname", "?")}: {exc}')
-            rows = await reader
-            assert len(rows) == 1
+        async def unit_write() -> None:
+            async with access.write() as db:
+                await db.execute("UPDATE items SET v = 'owner' WHERE id = 'live'")
 
-        assert errors == []
+        rows, error = await _collide_with_a_pinned_read(
+            foreign, gate, read=lambda: access.read_all(_GATED_SCAN), write=unit_write
+        )
+
+        assert error is None
+        assert [r['id'] for r in rows] == ['live']
+        landed = await access.read_one("SELECT v FROM items WHERE id = 'live'")
+        assert landed is not None
+        assert landed['v'] == 'owner'
 
     async def test_legacy_multi_hop_read_still_loses_the_race(self, tmp_path, open_conn):
         """CONTROL: the replaced shape raises SQLITE_BUSY_SNAPSHOT in the same collision.
