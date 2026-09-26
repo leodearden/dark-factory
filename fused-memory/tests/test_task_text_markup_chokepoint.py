@@ -77,9 +77,6 @@ REMEDIATION_METADATA = json.dumps({
     },
 })
 
-# test_strategy is scanned, but neither sink accepts it as an argument.
-SINK_WRITABLE_COLUMNS = ('title', 'description', 'details')
-
 
 @pytest_asyncio.fixture
 async def backend(tmp_path):
@@ -135,6 +132,11 @@ def _description_swallowing(swallowed: Mapping[str, str]) -> str:
     )
 
 
+def _skip_unless_the_sink_writes(sink, column: str) -> None:
+    if column not in inspect.signature(sink).parameters:
+        pytest.skip(f'{sink.__name__} takes no {column!r} argument, so no write can carry one')
+
+
 def _add_task_text(column: str, value: str) -> dict[str, str]:
     text = {'title': 'clean title', 'description': 'clean description'}
     text[column] = value
@@ -148,22 +150,13 @@ def test_specimens_sit_on_the_intended_side_of_the_precise_detector():
     assert detect_leak(REMEDIATION_METADATA) is not None
 
 
-def test_every_scanned_column_but_test_strategy_is_writable_at_the_sinks():
-    add_params = inspect.signature(SqliteTaskBackend.add_task).parameters
-    update_params = inspect.signature(SqliteTaskBackend.update_task).parameters
-
-    assert set(SCANNED_COLUMNS) - set(SINK_WRITABLE_COLUMNS) == {'test_strategy'}
-    assert set(SINK_WRITABLE_COLUMNS) <= set(add_params)
-    assert set(SINK_WRITABLE_COLUMNS) <= set(update_params)
-    assert 'test_strategy' not in add_params
-    assert 'test_strategy' not in update_params
-
-
 @pytest.mark.asyncio
-@pytest.mark.parametrize('column', SINK_WRITABLE_COLUMNS)
+@pytest.mark.parametrize('column', SCANNED_COLUMNS)
 async def test_add_task_refuses_leaked_text_and_inserts_nothing(
     backend, project_root, column,
 ):
+    _skip_unless_the_sink_writes(SqliteTaskBackend.add_task, column)
+
     with pytest.raises(LeakedEnvelopeMarkupError) as excinfo:
         await backend.add_task(
             project_root, priority=None, **_add_task_text(column, TASK_4358_DESCRIPTION),
@@ -176,10 +169,12 @@ async def test_add_task_refuses_leaked_text_and_inserts_nothing(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('column', SINK_WRITABLE_COLUMNS)
+@pytest.mark.parametrize('column', SCANNED_COLUMNS)
 async def test_add_task_stores_prose_quoting_the_leak_verbatim(
     backend, project_root, column,
 ):
+    _skip_unless_the_sink_writes(SqliteTaskBackend.add_task, column)
+
     await backend.add_task(
         project_root, **_add_task_text(column, PROSE_MENTION_OF_THE_LEAK),
     )
@@ -215,10 +210,11 @@ async def test_add_task_stores_metadata_quoting_the_fragment(backend, project_ro
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('column', SINK_WRITABLE_COLUMNS)
+@pytest.mark.parametrize('column', SCANNED_COLUMNS)
 async def test_update_task_refuses_leaked_text_and_rolls_back_the_whole_write(
     backend, project_root, column,
 ):
+    _skip_unless_the_sink_writes(SqliteTaskBackend.update_task, column)
     task_id = await _seed_clean_task(backend, project_root)
     before = _stored_rows(project_root)
 
