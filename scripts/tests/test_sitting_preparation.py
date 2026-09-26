@@ -125,9 +125,10 @@ class TestStanding:
     def test_known_kinds(self, kind):
         assert mod.Standing(kind, 'Leo', mod.Manual('Leo says when'), 'handover §1').kind == kind
 
-    def test_unknown_kind_is_refused(self):
+    @pytest.mark.parametrize('kind', ['parked', ['hold']])
+    def test_unknown_kind_is_refused(self, kind):
         with pytest.raises(ValueError):
-            mod.Standing('parked', 'Leo', mod.Manual('x'), 'evidence')
+            mod.Standing(kind, 'Leo', mod.Manual('x'), 'evidence')
 
     def test_release_predicate_is_the_closed_union(self):
         with pytest.raises(ValueError):

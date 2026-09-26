@@ -117,7 +117,7 @@ class Standing:
     evidence: str
 
     def __post_init__(self) -> None:
-        if self.kind not in STANDING_KINDS:
+        if not isinstance(self.kind, str) or self.kind not in STANDING_KINDS:
             raise ValueError(f'standing kind {self.kind!r} is not one of {sorted(STANDING_KINDS)}')
         _require_text('standing owner', self.owner)
         if not isinstance(self.release_predicate, TaskStatusIs | EscalationClosed | Manual):
@@ -265,7 +265,7 @@ def to_json_payload(prep: Preparation) -> dict[str, Any]:
 
 
 def from_json_payload(obj: object) -> Preparation:
-    """Decode the documented JSON shape strictly: an unknown or missing key is refused by name."""
+    """Decode the shape :func:`to_json_payload` emits, strictly: an unknown or missing key is refused by name."""
     data = _fields(
         obj, 'preparation',
         {'item', 'question', 'options', 'recommendation', 'on_apply', 'prepared_at', 'prepared_by'},
