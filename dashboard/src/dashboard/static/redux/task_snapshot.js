@@ -168,15 +168,20 @@ const CENSUS_TILES = Object.freeze([
 // One segment per view, as a share of the total. Keyed on the presence of a
 // value, datumView's own hole rule: an aged census still draws its bar, a hole
 // draws none, and a measured empty census draws zero-width segments rather
-// than dividing by zero.
+// than dividing by zero. A pipeline row's share is a reading of the same
+// number, so the text beside a segment always matches its width.
 function censusSegments(census) {
   const { value } = assertSnapshotDatum(census, 'censusSegments');
   if (value === null) return [];
-  return CENSUS_VIEWS.map(({ key, tone }) => ({
-    key,
-    tone,
-    share: value.total > 0 ? (value.views[key] / value.total) * 100 : 0,
-  }));
+  return CENSUS_VIEWS.map(({ key, tone }) => ({ key, tone, share: viewShare(value, key) }));
+}
+
+function viewShare(census, key) {
+  return census.total > 0 ? (census.views[key] / census.total) * 100 : 0;
+}
+
+function viewShareText(key) {
+  return census => `${viewShare(census, key).toFixed(0)}%`;
 }
 
 // ── A tile's spark, over the tile's own scope ──
@@ -235,6 +240,7 @@ const TASK_SNAPSHOT_API = {
   runningOfInFlight,
   terminalOfTotal,
   censusTotal,
+  viewShareText,
   censusSegments,
   censusHistory,
   projectRows,

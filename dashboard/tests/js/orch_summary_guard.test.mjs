@@ -190,10 +190,11 @@ test("the Orchestrators tab's progress bar widths stay finite", () => {
 
 // ── Wiring: no consumer may dereference o.summary directly ────────────────
 
-// app.jsx and tabs.jsx left in task 5589 (gamma2): the topbar, the rail and
-// OrchTab read the census through task_snapshot.js (test_app_chrome_census.py
-// and test_tab_orchestrators.py pin that wiring).
-const CONSUMERS = ['tab_overview.jsx'];
+// All three consumers left in task 5589 (gamma2): the topbar, the rail, OrchTab
+// and the Overview read the census through task_snapshot.js
+// (test_app_chrome_census.py, test_tab_orchestrators.py and
+// test_tab_overview.py pin that wiring). This file goes with orch_summary.js.
+const CONSUMERS = [];
 
 test('no consumer still reads o.summary directly', () => {
   for (const name of CONSUMERS) {
@@ -401,27 +402,3 @@ for (const name of CONSUMERS) {
     assert.match(source, /\borchSummaryTotal\(/);
   });
 }
-
-test("(e) the Overview 'Active tasks' tile puts no guard zero beside its em-dash", () => {
-  const source = fs.readFileSync(path.join(REDUX_DIR, 'tab_overview.jsx'), 'utf8');
-  const openAt = source.indexOf('<StatTile label="Active tasks"');
-  assert.notEqual(openAt, -1, "tab_overview.jsx has no 'Active tasks' StatTile");
-  const closeAt = source.indexOf('/>', openAt);
-  const tile = source.slice(openAt, closeAt + 2);
-
-  assert.deepEqual(
-    readsAny(tile, guardZeroNames(source)),
-    [],
-    "the tile's unit or hint still reads the guard's totals, so '/ 0' or '0 done' " +
-      'renders beside the em-dash',
-  );
-  for (const attribute of ['unit', 'hint']) {
-    const [expression] = attributeExpressions(tile, attribute);
-    assert.ok(expression !== undefined, `the tile has no ${attribute}={…} expression`);
-    assert.match(
-      expression,
-      /[!=]=\s*null/,
-      `${attribute}={${expression}} must be omitted when its total is unknown`,
-    );
-  }
-});
