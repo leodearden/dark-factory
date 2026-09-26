@@ -40,10 +40,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import subprocess
 from pathlib import Path
 from unittest.mock import AsyncMock, call, patch
 
 import pytest
+from _orch_helpers import assert_isolated_git_repo, git_env_with_ceiling
 from _worktree_add_fakes import make_fake_run
 
 import orchestrator.git_ops as git_ops_mod
@@ -345,6 +347,41 @@ class TestWorktreeAddWithRetry:
             'expected the partial directory left by each failed add to be '
             'cleared before the next attempt; observed target.exists() at '
             f'each attempt entry = {exists_at_entry}'
+        )
+
+    def test_a_directory_that_predates_the_first_attempt_is_never_removed(
+        self, tmp_path: Path,
+    ) -> None:
+        """The residue clearing is for what a failed attempt CREATED, not for
+        whatever sat at *path* before the call. ``create_worktree`` can reach
+        its add with the path still occupied — it deliberately leaves a
+        protected-band directory in place rather than delete it — and the
+        driver must not do the deletion that call site refused to do.
+        """
+        git_ops = GitOps(GitConfig(), tmp_path)
+        calls: list[list[str]] = []
+        target = tmp_path / 'wt' / 'occupied'
+        target.mkdir(parents=True)
+        sentinel = target / 'foreign-content'
+        sentinel.write_text('not ours\n')
+
+        async def _body():
+            return await git_ops._worktree_add_with_retry(
+                target, MERGE_SHA, label='test',
+            )
+
+        with (
+            patch(
+                'orchestrator.git_ops._run',
+                side_effect=make_fake_run([(1, '', 'lock contention')], calls),
+            ),
+            patch('orchestrator.git_ops.asyncio.sleep', new_callable=AsyncMock),
+        ):
+            rc, _out, _err, attempts = asyncio.run(_body())
+
+        assert (rc, attempts) == (1, 3)
+        assert sentinel.read_text() == 'not ours\n', (
+            f'expected the pre-existing {target} to survive every retry intact'
         )
 
     def test_absorbed_retry_emits_a_greppable_warning(
@@ -722,3 +759,151 @@ class TestCreateMergeWorktreeFinalFailure:
         assert leaked == [], (
             f'expected no _merge-* residue under {git_ops.worktree_base}; got {leaked}'
         )
+
+
+# ---------------------------------------------------------------------------
+# PART B: create_worktree's add joins the shared driver
+# ---------------------------------------------------------------------------
+
+# Verbatim from data/verify-logs/4777 (2026-09-23): create_worktree's add died
+# on a SIBLING's admin dir — a `_mainprobe-*` worktree ephemeral_worktree was
+# adding or removing at that moment — not on the worktree being added.
+TRANSIENT_4777_STDERR = (
+    "Preparing worktree (new branch 'task/task/rrcas-c')\n"
+    "fatal: Invalid path '/tmp/pytest-of-leo/pytest-21094/popen-gw3/"
+    "test_cascade_remerge_error_rou0/repo/.git/worktrees/_mainprobe-04001a95': "
+    'No such file or directory'
+)
+
+
+def _init_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    subprocess.run(['git', 'init', '-q', '-b', 'main'], cwd=repo, check=True)
+    assert_isolated_git_repo(repo)
+    env = git_env_with_ceiling(repo)
+    for cmd in (
+        ['git', 'config', 'user.email', 'test@test.com'],
+        ['git', 'config', 'user.name', 'Test'],
+        ['git', 'commit', '-q', '--allow-empty', '-m', 'Initial commit'],
+    ):
+        subprocess.run(cmd, cwd=repo, check=True, env=env)
+    return repo
+
+
+def _real_run_failing_first_adds(
+    failures: list[tuple[int, str, str]], add_calls: list[list[str]],
+):
+    """The REAL ``_run``, except that the first ``len(failures)`` ``git
+    worktree add`` calls return *failures* in order.
+
+    A failing ``-b`` add creates its branch first, exactly as git 2.43 does:
+    it runs ``git branch`` before the worktree enumeration that died in 4777.
+    So a verbatim ``-b`` retry meets its own leftover branch here just as it
+    would in production.
+    """
+    real_run = git_ops_mod._run
+
+    async def _run(cmd, **kwargs):
+        if list(cmd[:3]) != ['git', 'worktree', 'add']:
+            return await real_run(cmd, **kwargs)
+        add_calls.append(list(cmd))
+        if len(add_calls) > len(failures):
+            return await real_run(cmd, **kwargs)
+        if '-b' in cmd:
+            branch = cmd[cmd.index('-b') + 1]
+            await real_run(['git', 'branch', branch, cmd[-1]], **kwargs)
+        return failures[len(add_calls) - 1]
+
+    return _run
+
+
+class TestCreateWorktreeRetry:
+    """PART B: ``create_worktree`` retries its add through the shared driver.
+
+    Its add names a NEW branch, which is what makes it different from the two
+    detached sites: a failed ``git worktree add -b`` has already created that
+    branch, so the branch is created once and only the add of it is retried.
+    """
+
+    def test_the_4777_sibling_admin_dir_race_is_absorbed(
+        self, tmp_path: Path,
+    ) -> None:
+        repo = _init_repo(tmp_path)
+        git_ops = GitOps(GitConfig(), repo)
+        add_calls: list[list[str]] = []
+
+        with (
+            patch(
+                'orchestrator.git_ops._run',
+                side_effect=_real_run_failing_first_adds(
+                    [(128, '', TRANSIENT_4777_STDERR)], add_calls,
+                ),
+            ),
+            patch('orchestrator.git_ops.asyncio.sleep', new_callable=AsyncMock) as mock_sleep,
+        ):
+            info = asyncio.run(git_ops.create_worktree('rrcas-c'))
+
+        head_branch = subprocess.run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+            cwd=info.path, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        assert head_branch == 'task/rrcas-c', (
+            f'expected the worktree on its new task branch; got {head_branch!r}'
+        )
+        assert len(add_calls) == 2, f'expected one absorbed retry; got {add_calls}'
+        assert mock_sleep.await_args_list == [call(0.5)]
+
+    def test_enospc_fails_fast_with_a_diagnosable_error(self, tmp_path: Path) -> None:
+        repo = _init_repo(tmp_path)
+        git_ops = GitOps(GitConfig(), repo)
+        add_calls: list[list[str]] = []
+
+        with (
+            patch(
+                'orchestrator.git_ops._run',
+                side_effect=_real_run_failing_first_adds(
+                    [(128, '', ENOSPC_3692_STDERR)], add_calls,
+                ),
+            ),
+            patch('orchestrator.git_ops.asyncio.sleep', new_callable=AsyncMock) as mock_sleep,
+            pytest.raises(RuntimeError) as exc_info,
+        ):
+            asyncio.run(git_ops.create_worktree('full-disk'))
+
+        msg = str(exc_info.value)
+        assert msg.startswith('Failed to create worktree: '), msg
+        assert ENOSPC_3692_STDERR in msg, msg
+        assert 'rc=128' in msg and 'after 1 attempt(s)' in msg, msg
+        assert len(add_calls) == 1
+        assert mock_sleep.await_args_list == []
+
+    def test_an_exhausted_retry_reports_everything_and_the_task_can_redispatch(
+        self, tmp_path: Path,
+    ) -> None:
+        """The branch minted before the failed adds is left at main with no
+        commits — the shape the next dispatch already cleans up — so one
+        exhausted retry costs a requeue, never a wedged task id."""
+        repo = _init_repo(tmp_path)
+        git_ops = GitOps(GitConfig(), repo)
+        add_calls: list[list[str]] = []
+
+        with (
+            patch(
+                'orchestrator.git_ops._run',
+                side_effect=_real_run_failing_first_adds(
+                    [(128, 'STDOUT-MARKER', 'STDERR-MARKER')] * 3, add_calls,
+                ),
+            ),
+            patch('orchestrator.git_ops.asyncio.sleep', new_callable=AsyncMock),
+            pytest.raises(RuntimeError) as exc_info,
+        ):
+            asyncio.run(git_ops.create_worktree('exhausted'))
+
+        msg = str(exc_info.value)
+        assert msg.startswith('Failed to create worktree: '), msg
+        for fragment in ('STDOUT-MARKER', 'STDERR-MARKER', 'rc=128', 'after 3 attempt(s)'):
+            assert fragment in msg, f'expected {fragment!r} in {msg!r}'
+
+        info = asyncio.run(git_ops.create_worktree('exhausted'))
+        assert (info.path / '.git').exists(), f'expected a live worktree at {info.path}'

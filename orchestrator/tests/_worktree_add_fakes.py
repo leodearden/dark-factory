@@ -26,8 +26,8 @@ def make_fake_run(
 
     ``git worktree add`` results are consumed in order from *add_results* as
     ``(rc, stdout, stderr)`` triples; the last entry repeats once exhausted.
-    A successful add mkdirs the ``--detach`` target, mirroring real ``git
-    worktree add``.  With *mkdir_on_failure* a FAILED add mkdirs it too —
+    A successful add mkdirs its target (``cmd[-2]`` in either ``add [--detach]
+    <path> <ref>`` shape), mirroring real ``git worktree add``.  With *mkdir_on_failure* a FAILED add mkdirs it too —
     also what real git does, since it creates the target directory before
     the add can fail.  When *exists_at_entry* is supplied, each add records
     whether the target already existed on entry, which is how the
@@ -41,7 +41,7 @@ def make_fake_run(
     async def _fake_run(cmd, **kwargs) -> tuple[int, str, str]:
         calls.append(list(cmd))
         if 'worktree' in cmd and 'add' in cmd:
-            target = Path(cmd[cmd.index('--detach') + 1])
+            target = Path(cmd[-2])
             if exists_at_entry is not None:
                 exists_at_entry.append(target.exists())
             rc, out, err = add_results[
