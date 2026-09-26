@@ -1,7 +1,7 @@
 """Behavioural coverage for `producer | grep -q PAT` probes, plus the ONE quiet-grep sweep.
 
-The behavioural sections cover scripts/export-data.sh and
-scripts/import-data.sh. The sibling suite test_setup_host_probe_pipelines.py
+The behavioural sections cover scripts/export-data.sh, scripts/import-data.sh
+and scripts/verify-migration.sh. The sibling suite test_setup_host_probe_pipelines.py
 does the same job for scripts/setup-host.sh; the two share one slicer, one
 probe scaffold and one detector, all in tests/scripts/shell_sections.py.
 
@@ -24,7 +24,8 @@ happens, both covered below per site:
 EVERY ONE OF THESE SITES SITS INSIDE AN `if`, so the failure mode is a WRONG
 ANSWER, not an abort: export-data.sh decides a running FalkorDB is not running
 and skips the BGSAVE, import-data.sh decides live containers need no stopping
-and then reports a healthy FalkorDB as not responding. Nothing crashes and
+and then reports a healthy FalkorDB as not responding, verify-migration.sh
+fails a good migration on a FalkorDB that answered PONG. Nothing crashes and
 nothing is logged as a failure — the scripts just quietly do the wrong thing,
 which is why these need behavioural tests rather than a lint.
 
@@ -60,6 +61,7 @@ from shell_sections import (
 EXPORT_DATA_PATH = REPO_ROOT / "scripts" / "export-data.sh"
 IMPORT_DATA_PATH = REPO_ROOT / "scripts" / "import-data.sh"
 DEPLOY_W5_PATH = REPO_ROOT / "scripts" / "deploy-w5-recon-reliability.sh"
+VERIFY_MIGRATION_PATH = REPO_ROOT / "scripts" / "verify-migration.sh"
 
 
 # --- the shared scaffold ----------------------------------------------------
@@ -552,6 +554,202 @@ def test_import_health_reports_pong_on_a_clean_ping(tmp_path):
     assert _NOT_RESPONDING not in combined, combined
 
 
+# --- verify-migration.sh section 1: the FalkorDB checks ---------------------
+# This script sets `-uo pipefail` WITHOUT -e, its `fail` only prints and its
+# `check_fail` only counts, so it cannot share `_PREAMBLE`, whose `fail` exits.
+#
+# `end_after` IS REQUIRED, and was MEASURED: without it the slice stops at the
+# column-0 `fi` closing the `command -v redis-cli` capture and never reaches
+# either site. All three anchors are code, unique, and survive the fix.
+_VERIFY_FALKORDB_START = 'info "FalkorDB checks"'
+_VERIFY_FALKORDB_END = "\nfi\n"
+_VERIFY_FALKORDB_END_AFTER = 'check_fail "FalkorDB not reachable on port 6379'
+
+_VERIFY_PREAMBLE = (
+    "set -uo pipefail\n"
+    "info()  { printf '==> %s\\n' \"$*\"; }\n"
+    "ok()    { printf 'OK %s\\n' \"$*\"; }\n"
+    "warn()  { printf 'WARN %s\\n' \"$*\"; }\n"
+    "fail()  { printf 'FAIL %s\\n' \"$*\"; }\n"
+)
+
+_PING_OK = "OK FalkorDB PING"
+_NOT_REACHABLE = "FAIL FalkorDB not reachable on port 6379"
+_CONTAINER_RUNNING = "OK FalkorDB container running"
+_CONTAINER_NOT_FOUND = (
+    "WARN FalkorDB port 6379 responds but container not found via docker ps"
+)
+
+
+def _verify_preamble(tmp_path):
+    """`_VERIFY_PREAMBLE`, $COMPOSE_FILE, and the SHIPPED counters and check_* helpers.
+
+    The not-reachable message interpolates $COMPOSE_FILE, so under `set -u` an
+    unset one aborts. The helpers are sliced live, so every verdict below is
+    the script's own `check_pass` / `check_fail` / `check_warn`.
+    """
+    return (
+        _VERIFY_PREAMBLE
+        + f'COMPOSE_FILE="{tmp_path / "docker-compose.yml"}"\n'
+        + slice_section(VERIFY_MIGRATION_PATH, "CHECKS_PASSED=0", "check_warn() {")
+    )
+
+
+def _run_verify_falkordb(tmp_path, *, ping_body, ps_body):
+    """Slice verify-migration.sh's section 1 and run it against scripted redis-cli and docker.
+
+    A `redis-cli` on PATH sends `command -v redis-cli` down the direct branch;
+    its DBSIZE answer is a constant, since only the PING verdict is under test.
+    The docker glob is `"ps "*` because the argv `ps --format {{.Names}}` has
+    no leading space for the export suite's `*" ps "*` to match.
+    """
+    stub_bin = stub_bin_dir(tmp_path)
+    write_stub(
+        stub_bin,
+        "redis-cli",
+        dispatch_stub_body((("*ping*", ping_body), ("*DBSIZE*", clean_match("5")))),
+    )
+    write_stub(stub_bin, "docker", dispatch_stub_body((('"ps "*', ps_body),)))
+    return run_with_preamble(
+        tmp_path,
+        _verify_preamble(tmp_path),
+        slice_section(
+            VERIFY_MIGRATION_PATH,
+            _VERIFY_FALKORDB_START,
+            _VERIFY_FALKORDB_END,
+            end_after=_VERIFY_FALKORDB_END_AFTER,
+        ),
+    )
+
+
+def _run_verify_ping(tmp_path, ping_body):
+    """The PING site under *ping_body*, with the docker listing held clean."""
+    return _run_verify_falkordb(
+        tmp_path, ping_body=ping_body, ps_body=clean_match("falkordb")
+    )
+
+
+def _run_verify_listing(tmp_path, ps_body):
+    """The `docker ps` site under *ps_body*, with the PING held clean."""
+    return _run_verify_falkordb(
+        tmp_path, ping_body=clean_match("PONG"), ps_body=ps_body
+    )
+
+
+def test_verify_reports_ping_ok_when_the_reply_is_sigpiped(tmp_path):
+    """A captured PONG re-fed through `echo | grep -q` is misread as unreachable.
+
+    The capture holds the whole reply, but `echo` writes it into a pipe that
+    `grep -q` closes on PONG; echo dies of SIGPIPE, `pipefail` makes that 141,
+    and a good migration is verified as broken.
+    """
+    result = _run_verify_ping(tmp_path, match_then_bulk("PONG"))
+
+    combined = result.stdout + result.stderr
+    assert _PING_OK in combined, combined
+    assert _NOT_REACHABLE not in combined, combined
+
+
+def test_verify_reports_ping_ok_when_redis_cli_exits_nonzero_after_pong(tmp_path):
+    """Characterization: the capture's `|| echo "FAIL"` appends a line, and PONG still counts."""
+    result = _run_verify_ping(tmp_path, match_then_nonzero("PONG"))
+
+    combined = result.stdout + result.stderr
+    assert _PING_OK in combined, combined
+    assert _NOT_REACHABLE not in combined, combined
+
+
+def test_verify_reports_unreachable_when_the_ping_says_nothing(tmp_path):
+    """A silent redis-cli is genuinely unreachable — reported, and the section runs to the end."""
+    result = _run_verify_ping(tmp_path, SILENT_FAILURE)
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert _NOT_REACHABLE in combined, combined
+    assert _PING_OK not in combined, combined
+
+
+def test_verify_reports_unreachable_when_the_ping_answers_something_else(tmp_path):
+    """redis-cli's connection-refused message is not a PONG."""
+    result = _run_verify_ping(
+        tmp_path,
+        _nonmatching_output(
+            "Could not connect to Redis at 127.0.0.1:6379: Connection refused"
+        ),
+    )
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert _NOT_REACHABLE in combined, combined
+    assert _PING_OK not in combined, combined
+
+
+def test_verify_reports_ping_ok_on_a_clean_ping(tmp_path):
+    """Characterization: the ordinary path answers PONG and exits 0."""
+    result = _run_verify_ping(tmp_path, clean_match("PONG"))
+
+    combined = result.stdout + result.stderr
+    assert _PING_OK in combined, combined
+    assert _NOT_REACHABLE not in combined, combined
+
+
+def test_verify_sees_the_container_when_the_listing_exits_nonzero(tmp_path):
+    """A `docker ps` listing that NAMED falkordb means the container is running, whatever its status.
+
+    Misreading it warns the operator that a running FalkorDB container is
+    missing, on a host where the migration succeeded.
+    """
+    result = _run_verify_listing(tmp_path, match_then_nonzero("falkordb"))
+
+    combined = result.stdout + result.stderr
+    assert _CONTAINER_RUNNING in combined, combined
+    assert _CONTAINER_NOT_FOUND not in combined, combined
+
+
+def test_verify_sees_the_container_when_the_listing_is_sigpiped(tmp_path):
+    """Same misread via SIGPIPE: `grep -q` closes the pipe, the listing dies, 141."""
+    result = _run_verify_listing(tmp_path, match_then_bulk("falkordb"))
+
+    combined = result.stdout + result.stderr
+    assert _CONTAINER_RUNNING in combined, combined
+    assert _CONTAINER_NOT_FOUND not in combined, combined
+
+
+def test_verify_warns_when_the_listing_says_nothing(tmp_path):
+    """An unavailable docker warns, and must not abort the section.
+
+    The script has no -e today; `returncode == 0` keeps an unavailable docker
+    from ever becoming an abort should one be added.
+    """
+    result = _run_verify_listing(tmp_path, SILENT_FAILURE)
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert _CONTAINER_NOT_FOUND in combined, combined
+    assert _CONTAINER_RUNNING not in combined, combined
+
+
+def test_verify_warns_when_the_listing_omits_falkordb(tmp_path):
+    """A healthy listing naming only qdrant is a real "container not found"."""
+    result = _run_verify_listing(
+        tmp_path, _nonmatching_output(_LISTING_WITHOUT_FALKORDB)
+    )
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert _CONTAINER_NOT_FOUND in combined, combined
+    assert _CONTAINER_RUNNING not in combined, combined
+
+
+def test_verify_sees_the_container_on_a_clean_listing(tmp_path):
+    """Characterization: the ordinary path lists falkordb and exits 0."""
+    result = _run_verify_listing(tmp_path, clean_match("falkordb"))
+
+    combined = result.stdout + result.stderr
+    assert _CONTAINER_RUNNING in combined, combined
+    assert _CONTAINER_NOT_FOUND not in combined, combined
+
+
 # --- the quiet-grep sweep --------------------------------------------------
 # Every script whose `producer | grep -q` sites have been fixed, listed ONCE.
 # check_write_triage_flip_preconditions.sh and memory-metadata-coverage-census.sh
@@ -563,6 +761,7 @@ _SWEPT_SCRIPTS = (
     DEPLOY_W5_PATH,
     REPO_ROOT / "scripts" / "check_write_triage_flip_preconditions.sh",
     REPO_ROOT / "scripts" / "memory-metadata-coverage-census.sh",
+    VERIFY_MIGRATION_PATH,
 )
 
 
