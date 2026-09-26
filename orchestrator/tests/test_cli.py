@@ -2740,3 +2740,91 @@ def test_verify_merge_watchdog_fire_callback_forwards_trigger(tmp_path, monkeypa
     pgid, kwargs = kill_calls[0]
     assert pgid == FAKE_PGID
     assert kwargs['trigger'] is WatchdogTrigger.HEARTBEAT_STARVATION
+
+
+# ---------------------------------------------------------------------------
+# Task 5904 — a fired watchdog owns the exit on every path out of _run()
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('setup_raises', [True, False], ids=['setup_raises', 'returns'])
+def test_verify_merge_hands_exit_to_a_fired_watchdog_on_every_path(
+    tmp_path, monkeypatch, setup_raises,
+):
+    """A raise out of _run() hands the exit to a fired watchdog, exactly like a return.
+
+    The watchdog's own SIGTERM routinely makes _run() RAISE (it kills
+    ``git worktree add``, rc=-15). If that path exits without joining the
+    watchdog, interpreter shutdown tears the daemon watchdog thread down
+    mid-grace and its SIGKILL escalation never runs. See
+    cli.py::verify_merge.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from orchestrator.verify_cancel import WatchdogTrigger
+
+    FAKE_PGID = 55557
+    known_json = '{"passed": true, "results": []}'
+
+    fake_wt = tmp_path / '_merge-verify'
+    fake_wt.mkdir()
+    mock_git_ops = MagicMock()
+    mock_git_ops.worktree_base = tmp_path / '.worktrees'
+    if setup_raises:
+        mock_git_ops.acquire_host_verify_worktree = AsyncMock(
+            side_effect=RuntimeError('git worktree add failed rc=-15'),
+        )
+    else:
+        mock_git_ops.acquire_host_verify_worktree = AsyncMock(return_value=fake_wt)
+    mock_git_ops.cleanup_merge_worktree = AsyncMock(return_value=None)
+    monkeypatch.setattr('orchestrator.git_ops.GitOps', MagicMock(return_value=mock_git_ops))
+
+    fake_config = OrchestratorConfig(project_root=tmp_path)
+    monkeypatch.setattr(cli_module, 'load_config', lambda _: fake_config)
+    monkeypatch.setattr(cli_module, 'start_own_process_group', lambda: FAKE_PGID)
+
+    log = []
+
+    def fake_fire_watchdog_kill(pgid, **kwargs):
+        log.append('escalation_started')
+
+    monkeypatch.setattr(cli_module, 'fire_watchdog_kill', fake_fire_watchdog_kill)
+
+    class _FakeWatchdogThread:
+        def join(self, timeout=None):
+            log.append('watchdog_joined')
+
+    def fake_start_stdin_watchdog(pgid, *, fire, **kwargs):
+        fire(WatchdogTrigger.EOF)
+        return _FakeWatchdogThread()
+
+    monkeypatch.setattr(cli_module, 'start_stdin_watchdog', fake_start_stdin_watchdog)
+
+    monkeypatch.setattr('orchestrator.verify_runner.spec_from_json', lambda s: MagicMock())
+    monkeypatch.setattr(
+        'orchestrator.verify_runner.run_merge_verify_on_worktree',
+        AsyncMock(return_value=MagicMock()),
+    )
+    monkeypatch.setattr('orchestrator.verify_runner.result_to_json', lambda r: known_json)
+
+    cfg_file = tmp_path / 'config.yaml'
+    cfg_file.write_text('')
+
+    sha = 'abc1234567890abc1234567890abc1234567890ab'
+    r = CliRunner().invoke(main, [
+        'verify-merge',
+        '--sha', sha,
+        '--spec', '{}',
+        '--config', str(cfg_file),
+        '--request-id', 'test-req-5904',
+    ])
+
+    assert log == ['escalation_started', 'watchdog_joined'], (
+        f'a fired watchdog must own the exit: expected the main thread to block on '
+        f'the watchdog after the escalation began; got log={log!r}, '
+        f'exit_code={r.exit_code}, output={r.output!r}'
+    )
+    assert r.exit_code == 1, f'expected exit_code 1, got {r.exit_code}; output={r.output!r}'
+    assert known_json not in r.stdout, (
+        f'never print a VerifyResult for a build the watchdog killed; stdout={r.stdout!r}'
+    )
