@@ -1444,6 +1444,19 @@ class TestRuntimeSeededClusterBlocksAProbeWrite:
         mock_service.add_memory.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_retiring_the_derived_topic_lets_the_probe_land(self, derived_cluster_store):
+        mock_service = _derived_guard_service()
+        mock_service.config.reconciliation.procedural_knowledge_topic_cluster_autoseed_retired = {
+            _PROJECT_ID: [_SEED_TOPIC]
+        }
+        server = create_mcp_server(mock_service, topic_cluster_store=derived_cluster_store)
+
+        result = await _add(server, _SEED_PROBE)
+
+        assert result.get('error_type') != 'ProceduralKnowledgeKnownTopicClusterWriteRejected', result
+        mock_service.add_memory.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_allow_near_duplicate_exempts_a_derived_cluster_too(self, derived_cluster_store):
         mock_service = _derived_guard_service()
         server = create_mcp_server(mock_service, topic_cluster_store=derived_cluster_store)

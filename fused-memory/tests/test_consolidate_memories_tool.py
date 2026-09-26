@@ -2326,6 +2326,33 @@ class TestASeedShortfallIsDisclosedNotFatal:
         assert cluster_store.list_clusters(PROJECT_ID) == []
 
     @pytest.mark.asyncio
+    async def test_a_topic_retired_for_this_project_is_not_seeded(self, cluster_store):
+        svc = make_service(contents=_SUPERSEDE_CONTENTS)
+        svc.config.reconciliation.procedural_knowledge_topic_cluster_autoseed_retired = {
+            PROJECT_ID: [TOPIC]
+        }
+
+        with patched_tombstone_writer():
+            result = await call_consolidate(svc, topic_cluster_store=cluster_store)
+
+        assert result['status'] == 'consolidated'
+        assert result['topic_cluster_seed'] == {'outcome': 'disabled'}
+        assert cluster_store.list_clusters(PROJECT_ID) == []
+
+    @pytest.mark.asyncio
+    async def test_a_topic_retired_for_another_project_is_still_seeded(self, cluster_store):
+        svc = make_service(contents=_SUPERSEDE_CONTENTS)
+        svc.config.reconciliation.procedural_knowledge_topic_cluster_autoseed_retired = {
+            'reify': [TOPIC]
+        }
+
+        with patched_tombstone_writer():
+            result = await call_consolidate(svc, topic_cluster_store=cluster_store)
+
+        assert result['topic_cluster_seed']['outcome'] == 'seeded'
+        assert len(cluster_store.list_clusters(PROJECT_ID)) == 1
+
+    @pytest.mark.asyncio
     async def test_no_store_wired_means_no_key(self):
         svc = make_service(contents=_SUPERSEDE_CONTENTS)
 

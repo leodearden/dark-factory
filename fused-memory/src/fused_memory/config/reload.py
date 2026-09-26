@@ -61,6 +61,11 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # clusters from the very next guard read and True restores them, both
     # without a restart (task 3135).
     'reconciliation.procedural_knowledge_topic_cluster_autoseed_enabled',
+    # Read live by resolve_retired_derived_topic_ids
+    # (server/near_duplicate_guard.py) at the same two consumers as the
+    # switch above, off the same shared object, so retiring one misfiring
+    # derived cluster is a reload, not a restart (task 3135 review).
+    'reconciliation.procedural_knowledge_topic_cluster_autoseed_retired',
     # Read live per MemoryService.search by resolve_topic_anchor_enabled
     # (services/topic_anchor.py) off the shared memory_service.config.reconciliation
     # object — never captured at construction — so an in-place reload flips the

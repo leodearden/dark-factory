@@ -65,10 +65,16 @@ that derivation needs, so it now seeds the guard itself
   everything the writer needs: the canonical UUID, the `allow_near_duplicate` escape,
   and `update_memory`, offered only to the `recon-stage-`/`curator-` agent_ids that may
   amend content.
-- **Kill switch.** New green-tier leaf
+- **Kill switches.** New green-tier leaf
   `reconciliation.procedural_knowledge_topic_cluster_autoseed_enabled` (default
   `true`), read live at both the seed and the merge. `false` seeds nothing and ignores
-  the stored rows at read time without deleting them.
+  the stored rows at read time without deleting them. Its per-topic companion,
+  `reconciliation.procedural_knowledge_topic_cluster_autoseed_retired`
+  (`{project_id: [topic_id, ...]}`, default empty, also green-tier and read at both),
+  retires one misfiring derived cluster with a config edit, the way a config cluster
+  is retired. The stored row is kept, so deleting the entry restores it. A retired
+  topic's seed reports `disabled`, and a non-slug entry fails config load, because it
+  could never match.
 - **Disclosed, never fatal.** The envelope gains `topic_cluster_seed`, with outcome
   `seeded`, `skipped`, `failed` or `disabled`. The key is present only when a store is
   wired. It sits OUTSIDE the status rule, for the same reason as the tombstone counts:

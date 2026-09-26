@@ -126,6 +126,7 @@ from fused_memory.server.near_duplicate_guard import (
     find_near_duplicate_memory,
     resolve_near_dup_guard_enabled,
     resolve_near_dup_threshold,
+    resolve_retired_derived_topic_ids,
     resolve_topic_cluster_autoseed_enabled,
     resolve_topic_guard_clusters,
 )
@@ -5666,6 +5667,8 @@ def create_mcp_server(
             is wired: the outcome (``seeded``/``skipped``/``failed``/
             ``disabled``) of teaching the write-time topic guard this topic,
             outside the status rule for the tombstone counts' reason.
+            ``disabled`` covers both the global switch and a topic retired
+            for this project.
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         # (2) AUTHORIZE before any other work, mirroring `update_memory`'s
@@ -6566,7 +6569,10 @@ def create_mcp_server(
             ]
             topic_cluster_seed = seed_topic_cluster(
                 topic_cluster_store,
-                enabled=resolve_topic_cluster_autoseed_enabled(memory_service),
+                enabled=(
+                    resolve_topic_cluster_autoseed_enabled(memory_service)
+                    and topic not in resolve_retired_derived_topic_ids(memory_service, project_id)
+                ),
                 texts=[
                     text
                     for text in (canonical_content, *superseded_texts, *member_texts)

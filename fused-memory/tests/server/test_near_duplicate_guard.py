@@ -38,6 +38,7 @@ from fused_memory.server.near_duplicate_guard import (
     merge_topic_clusters,
     resolve_near_dup_guard_enabled,
     resolve_near_dup_threshold,
+    resolve_retired_derived_topic_ids,
     resolve_topic_cluster_autoseed_enabled,
     resolve_topic_guard_clusters,
 )
@@ -614,6 +615,75 @@ class TestMergeTopicClusters:
         assert merged is not runtime
 
 
+    def test_a_retired_runtime_cluster_is_dropped(self):
+        config = [_cluster(topic_id='cfg-a')]
+        runtime = [_cluster(topic_id='rt-a'), _cluster(topic_id='rt-b')]
+
+        merged = merge_topic_clusters(config, runtime, retired=frozenset({'rt-a'}))
+
+        assert [c.topic_id for c in merged] == ['cfg-a', 'rt-b']
+
+    def test_retiring_a_topic_id_never_drops_a_config_cluster(self):
+        config = [_cluster(topic_id='shared')]
+        runtime = [_cluster(topic_id='shared'), _cluster(topic_id='rt-a')]
+
+        merged = merge_topic_clusters(config, runtime, retired=frozenset({'shared'}))
+
+        assert merged == [config[0], runtime[1]]
+
+
+class TestResolveRetiredDerivedTopicIds:
+    """Defensive config resolver: only a real dict of lists retires anything."""
+
+    def test_returns_the_projects_retired_topic_ids(self):
+        memory_service = _memory_service_with_reconciliation(
+            procedural_knowledge_topic_cluster_autoseed_retired={
+                'dark_factory': ['topic-a', 'topic-b'],
+                'reify': ['topic-c'],
+            }
+        )
+        assert resolve_retired_derived_topic_ids(memory_service, 'dark_factory') == frozenset(
+            {'topic-a', 'topic-b'}
+        )
+
+    def test_another_project_has_nothing_retired(self):
+        memory_service = _memory_service_with_reconciliation(
+            procedural_knowledge_topic_cluster_autoseed_retired={'reify': ['topic-c']}
+        )
+        assert resolve_retired_derived_topic_ids(memory_service, 'dark_factory') == frozenset()
+
+    def test_non_string_entries_are_ignored(self):
+        memory_service = _memory_service_with_reconciliation(
+            procedural_knowledge_topic_cluster_autoseed_retired={'dark_factory': ['topic-a', 7, None]}
+        )
+        assert resolve_retired_derived_topic_ids(memory_service, 'dark_factory') == frozenset(
+            {'topic-a'}
+        )
+
+    @pytest.mark.parametrize(
+        'memory_service',
+        [
+            pytest.param(_memory_service_with_reconciliation(), id='leaf_missing'),
+            pytest.param(AsyncMock(), id='mock'),
+            pytest.param(
+                _memory_service_with_reconciliation(
+                    procedural_knowledge_topic_cluster_autoseed_retired=['topic-a']
+                ),
+                id='not_a_dict',
+            ),
+            pytest.param(
+                _memory_service_with_reconciliation(
+                    procedural_knowledge_topic_cluster_autoseed_retired={'dark_factory': 'topic-a'}
+                ),
+                id='value_not_a_list',
+            ),
+            pytest.param(types.SimpleNamespace(), id='config_missing'),
+        ],
+    )
+    def test_anything_malformed_retires_nothing(self, memory_service):
+        assert resolve_retired_derived_topic_ids(memory_service, 'dark_factory') == frozenset()
+
+
 class TestResolveTopicClusterAutoseedEnabled:
     """Defensive config resolver: only a real bool is honoured, else the schema default True."""
 
@@ -675,10 +745,13 @@ class _NonListStore:
         return ('not', 'a', 'list')
 
 
-def _guard_service(config: list, *, autoseed: bool = True) -> types.SimpleNamespace:
+def _guard_service(
+    config: list, *, autoseed: bool = True, retired: dict | None = None
+) -> types.SimpleNamespace:
     return _memory_service_with_reconciliation(
         procedural_knowledge_topic_guard_clusters=config,
         procedural_knowledge_topic_cluster_autoseed_enabled=autoseed,
+        procedural_knowledge_topic_cluster_autoseed_retired=retired or {},
     )
 
 
@@ -733,6 +806,34 @@ class TestResolveMergesTheRuntimeStore:
         assert resolve() == [*self.CONFIG, _DERIVED]
         svc.config.reconciliation.procedural_knowledge_topic_cluster_autoseed_enabled = False
         assert resolve() == self.CONFIG
+
+    def test_a_retired_topic_is_dropped_for_its_project_only(self, seeded_store):
+        def resolve(retired: dict) -> list:
+            return resolve_topic_guard_clusters(
+                _guard_service(self.CONFIG, retired=retired),
+                runtime_store=seeded_store,
+                project_id='dark_factory',
+            )
+
+        assert resolve({'dark_factory': [_DERIVED.topic_id]}) == self.CONFIG
+        assert resolve({'reify': [_DERIVED.topic_id]}) == [*self.CONFIG, _DERIVED]
+        assert seeded_store.list_clusters('dark_factory') == [_DERIVED]
+
+    def test_retirement_is_read_live(self, seeded_store):
+        svc = _guard_service(self.CONFIG)
+
+        def resolve() -> list:
+            return resolve_topic_guard_clusters(
+                svc, runtime_store=seeded_store, project_id='dark_factory'
+            )
+
+        assert resolve() == [*self.CONFIG, _DERIVED]
+        svc.config.reconciliation.procedural_knowledge_topic_cluster_autoseed_retired = {
+            'dark_factory': [_DERIVED.topic_id]
+        }
+        assert resolve() == self.CONFIG
+        svc.config.reconciliation.procedural_knowledge_topic_cluster_autoseed_retired = {}
+        assert resolve() == [*self.CONFIG, _DERIVED]
 
     @pytest.mark.parametrize('store', [_RaisingStore(), _NonListStore()], ids=['raises', 'non_list'])
     def test_a_misbehaving_store_degrades_to_config_only_and_warns(self, store, caplog):

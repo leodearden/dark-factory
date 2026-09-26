@@ -241,8 +241,32 @@ def resolve_topic_cluster_autoseed_enabled(memory_service: Any) -> bool:
     return _DEFAULT_TOPIC_CLUSTER_AUTOSEED_ENABLED
 
 
-def merge_topic_clusters(config_clusters: list, runtime_clusters: list) -> list:
-    """Return config seeds in order, then runtime clusters whose ``topic_id`` is new.
+def resolve_retired_derived_topic_ids(memory_service: Any, project_id: str) -> frozenset[str]:
+    """Read *project_id*'s retired derived ``topic_id``s from *memory_service*'s config.
+
+    The ONE reader of ``procedural_knowledge_topic_cluster_autoseed_retired``,
+    shared by the ``consolidate_memories`` seed and
+    :func:`resolve_topic_guard_clusters`, like
+    :func:`resolve_topic_cluster_autoseed_enabled`. Anything but a real
+    ``dict`` whose value for *project_id* is a ``list`` retires nothing, and
+    non-string entries are ignored.
+    """
+    value = _reconciliation_attr(
+        memory_service, 'procedural_knowledge_topic_cluster_autoseed_retired'
+    )
+    topic_ids = value.get(project_id) if isinstance(value, dict) else None
+    if not isinstance(topic_ids, list):
+        return frozenset()
+    return frozenset(topic_id for topic_id in topic_ids if isinstance(topic_id, str))
+
+
+def merge_topic_clusters(
+    config_clusters: list,
+    runtime_clusters: list,
+    *,
+    retired: frozenset[str] = frozenset(),
+) -> list:
+    """Return config seeds in order, then runtime clusters whose ``topic_id`` is new and not *retired*.
 
     Order is load-bearing: :func:`find_matching_topic_cluster` returns the
     FIRST qualifying cluster, so an operator's curated cluster produces the
@@ -250,6 +274,8 @@ def merge_topic_clusters(config_clusters: list, runtime_clusters: list) -> list:
     config seed wins and the runtime cluster is dropped, because curated
     ``sufficient_phrases`` and gate-task hints are what a derived cluster
     cannot reproduce. A repeated runtime ``topic_id`` keeps its first entry.
+    *retired* drops runtime clusters only; a config seed is retired by
+    removing it from the config list.
 
     Duck-typed on ``.topic_id`` so this module keeps importing
     ``config.schema`` for type checking only. Returns a new list and mutates
@@ -258,9 +284,9 @@ def merge_topic_clusters(config_clusters: list, runtime_clusters: list) -> list:
     merged = list(config_clusters)
     emitted = {cluster.topic_id for cluster in merged}
     for cluster in runtime_clusters:
-        if cluster.topic_id in emitted:
+        if cluster.topic_id in emitted or cluster.topic_id in retired:
             logger.debug(
-                'topic-cluster merge: dropped runtime cluster %r (topic_id already emitted)',
+                'topic-cluster merge: dropped runtime cluster %r (already emitted or retired)',
                 cluster.topic_id,
             )
             continue
@@ -290,7 +316,8 @@ def resolve_topic_guard_clusters(
 
     The runtime half (task 3135) is merged by :func:`merge_topic_clusters` only
     when both *runtime_store* and *project_id* are given and
-    :func:`resolve_topic_cluster_autoseed_enabled` is on, read live per call.
+    :func:`resolve_topic_cluster_autoseed_enabled` is on, less the topics
+    :func:`resolve_retired_derived_topic_ids` names, both read live per call.
     Derived rows are project-scoped because their hint names one project's
     canonical. A store that raises or returns a non-list degrades to the
     config half with a WARNING: this runs inside ``add_memory``, where an
@@ -320,7 +347,11 @@ def resolve_topic_guard_clusters(
             project_id,
         )
         return config_clusters
-    return merge_topic_clusters(config_clusters, runtime)
+    return merge_topic_clusters(
+        config_clusters,
+        runtime,
+        retired=resolve_retired_derived_topic_ids(memory_service, project_id),
+    )
 
 
 def _reconciliation_attr(memory_service: Any, attr: str) -> Any:
