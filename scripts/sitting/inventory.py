@@ -184,7 +184,7 @@ def collect_open_items(
             item = _escalation_item(queue_dir, esc, now)
             items[item.key] = item
 
-    decisions, decision_shortfalls = _read_decisions(decisions_root)
+    decisions, decision_shortfalls = read_decisions(decisions_root)
     shortfalls += decision_shortfalls
     for record in decisions:
         if record.state != DecisionState.OPEN:
@@ -316,7 +316,8 @@ def _scan_queue(queue_dir: str) -> tuple[dict[str, Path], list[Escalation], list
     return index, pending, shortfalls
 
 
-def _read_decisions(fleet: Path | str | None) -> tuple[list[DecisionRecord], list[Shortfall]]:
+def read_decisions(fleet: Path | str | None) -> tuple[list[DecisionRecord], list[Shortfall]]:
+    """Every record under *fleet*'s ``decisions/``, plus a shortfall for each file ``list_decisions`` skipped."""
     # Listed BEFORE the read: a decision filed in between is then merely unlisted,
     # never misreported as unreadable.
     on_disk = sorted(decisions_dir(fleet).glob('*.json'))

@@ -127,14 +127,14 @@ def _snapshot(root: Path) -> dict[Path, tuple[bytes, int]]:
 
 
 @pytest.fixture
-def df(tmp_path, make_tasks_db) -> Path:
+def df(tmp_path, make_tasks_db, project_root_with_tasks_db) -> Path:
     root = tmp_path / 'src' / 'dark-factory'
     make_tasks_db([
         {'id': 10, 'status': 'blocked', 'title': 'blocked behind an open escalation'},
         {'id': 11, 'status': 'blocked', 'title': 'blocked with nothing open'},
         {'id': 12, 'status': 'pending'},
         {'id': 13, 'status': 'done'},
-    ], directory=root / '.taskmaster' / 'tasks')
+    ], directory=project_root_with_tasks_db(root).parent)
     _build_runs_db(mod.runs_db_path(root))
     queue = root / 'data' / 'escalations'
     _write_escalation(queue, id='esc-10-1', level=1, category='infra_issue')
@@ -238,10 +238,13 @@ class TestStuck:
         assert measurement.source == str(df / '.taskmaster' / 'tasks' / 'tasks.db')
         rows = {row.task_id: row for row in measurement.value}
         assert set(rows) == {'10', '11'}
+        assert rows['10'].open_escalations is not None
         (open_esc,) = rows['10'].open_escalations
         assert (open_esc.escalation_id, open_esc.category, open_esc.level) == ('esc-10-1', 'infra_issue', 1)
         assert open_esc.age_days == pytest.approx(2.0)
+        assert open_esc.queue_dir == normalize_escalations_dir(df / 'data' / 'escalations')
         assert 'esc-10-1' in rows['10'].reason and 'infra_issue' in rows['10'].reason
+        assert 'data/escalations' in rows['10'].reason
         assert rows['11'].open_escalations == ()
         assert rows['11'].reason == mod.NO_OPEN_ESCALATION == 'blocked with no open escalation'
         assert rows['10'].title == 'blocked behind an open escalation'
@@ -348,10 +351,12 @@ class TestStandingPolicyRulings:
         measurement = mod.standing_policy_rulings([str(first), str(second)], WINDOW, now=NOW)
 
         per_queue = [agreement_report(q, since=WINDOW.start, until=WINDOW.end) for q in (first, second)]
+        queue_rows = [row for report in per_queue if (row := report.for_class(cls)) is not None]
         folded = measurement.value.report.for_class(cls)
         assert measurement.status == 'ok'
+        assert folded is not None
         assert (folded.agreed, folded.diverged) == (2, 1) == (
-            sum(r.for_class(cls).agreed for r in per_queue), sum(r.for_class(cls).diverged for r in per_queue))
+            sum(row.agreed for row in queue_rows), sum(row.diverged for row in queue_rows))
         assert measurement.value.report.unresolved_lifetime == 1
         assert (measurement.value.report.since, measurement.value.report.until) == (WINDOW.start, WINDOW.end)
 
@@ -444,7 +449,10 @@ class TestCrossProject:
         state = mod.measure_projects([df], index, window=WINDOW, now=NOW)['dark_factory']
 
         rows = {row.task_id: row for row in state.stuck.value}
-        assert [e.escalation_id for e in rows['11'].open_escalations] == ['esc-11-1']
+        assert rows['11'].open_escalations is not None
+        assert [(e.escalation_id, e.queue_dir) for e in rows['11'].open_escalations] == [
+            ('esc-11-1', normalize_escalations_dir(recon))]
+        assert 'data/reconciliation/escalations' in rows['11'].reason
         assert state.standing_policy.source == ', '.join(
             normalize_escalations_dir(q) for q in (df / 'data' / 'escalations', recon))
 
