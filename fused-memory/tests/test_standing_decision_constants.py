@@ -70,3 +70,41 @@ def test_expiry_reason_vocabulary_and_members():
         sdc.EXPIRY_REASON_OPERATOR,
     ):
         assert reason in sdc.EXPIRY_REASONS
+
+
+def test_suppression_streak_record_kind_is_distinct_and_not_a_marker_kind():
+    """The streak's ledger record kind is pinned and DISTINCT from the decision
+    row's kind (a collision would make the streak upsert overwrite the decision
+    row itself), and it is not a per-task marker kind, so gc()'s terminal-task
+    DELETE arm never touches it and only the expires_at arm reaps it."""
+    from fused_memory.reconciliation.recon_ledger import MARKER_KINDS
+
+    assert (
+        sdc.RECORD_KIND_ENTITY_SUPPRESSION_STREAK
+        == 'entity_standing_decision_suppression_streak'
+    )
+    assert (
+        sdc.RECORD_KIND_ENTITY_SUPPRESSION_STREAK
+        != sdc.RECORD_KIND_ENTITY_STANDING_DECISION
+    )
+    assert sdc.RECORD_KIND_ENTITY_SUPPRESSION_STREAK not in MARKER_KINDS
+
+
+def test_suppression_streak_threshold_is_three_cycles():
+    """K is an int >= 2 (a one-cycle "streak" would fire the streak escape on
+    every single suppressing cycle) and is decided at 3, matching ζ's
+    GROWTH_SWEEP_FAILURE_STREAK_THRESHOLD (PRD Open Question 4)."""
+    assert isinstance(sdc.SUPPRESSION_STREAK_THRESHOLD_CYCLES, int)
+    assert not isinstance(sdc.SUPPRESSION_STREAK_THRESHOLD_CYCLES, bool)
+    assert sdc.SUPPRESSION_STREAK_THRESHOLD_CYCLES >= 2
+    assert sdc.SUPPRESSION_STREAK_THRESHOLD_CYCLES == 3
+
+
+def test_streak_payload_key_is_distinct_from_done_suppressions_key():
+    """The streak count's payload key is a non-empty str that does not collide
+    with flag_dedup's consecutive-cycle done-suppression counter key."""
+    from fused_memory.reconciliation.flag_dedup import _DONE_SUPPRESSIONS_PAYLOAD_KEY
+
+    assert isinstance(sdc.STREAK_PAYLOAD_KEY, str)
+    assert sdc.STREAK_PAYLOAD_KEY
+    assert sdc.STREAK_PAYLOAD_KEY != _DONE_SUPPRESSIONS_PAYLOAD_KEY
