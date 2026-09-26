@@ -2938,6 +2938,11 @@ class SqliteTaskBackend:
         tag: str | None = None,
         status: str = 'pending',
     ) -> AddTaskResult:
+        arguments_as_received = dict(
+            project_root=project_root, prompt=prompt, title=title,
+            description=description, details=details, dependencies=dependencies,
+            priority=priority, metadata=metadata, tag=tag, status=status,
+        )
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
         if status not in _VALID_STATUSES:
@@ -3034,12 +3039,7 @@ class SqliteTaskBackend:
                 )
                 refuse_leaked_task_text(
                     {'title': title, 'description': description, 'details': details},
-                    arguments=dict(
-                        project_root=project_root, prompt=prompt, title=title,
-                        description=description, details=details,
-                        dependencies=dependencies, priority=priority,
-                        metadata=metadata, tag=tag, status=status,
-                    ),
+                    arguments=arguments_as_received,
                 )
 
                 # Index-independent dedup guard (fm-task-dedup self-heal
@@ -3160,6 +3160,12 @@ class SqliteTaskBackend:
         status: str | None = None,
         dependencies: list[str] | None = None,
     ) -> UpdateTaskResult:
+        arguments_as_received = dict(
+            task_id=task_id, project_root=project_root, prompt=prompt,
+            metadata=metadata, append=append, tag=tag, metadata_mode=metadata_mode,
+            title=title, description=description, details=details,
+            priority=priority, status=status, dependencies=dependencies,
+        )
         # Write-authority floors mirroring the server/tools.py + interceptor
         # ceiling (2026-05-08 forensics). set_task_status is the only
         # sanctioned writer for status AND metadata.done_provenance — it
@@ -3309,13 +3315,7 @@ class SqliteTaskBackend:
             # must not block the write that remediates it.
             refuse_leaked_task_text(
                 {'title': title, 'description': description, 'details': new_details},
-                arguments=dict(
-                    task_id=task_id, project_root=project_root, prompt=prompt,
-                    metadata=metadata, append=append, tag=tag,
-                    metadata_mode=metadata_mode, title=title,
-                    description=description, details=details, priority=priority,
-                    status=status, dependencies=dependencies,
-                ),
+                arguments=arguments_as_received,
             )
 
             new_metadata: str | None = None

@@ -127,6 +127,14 @@ async def _seed_clean_task(backend, project_root: str) -> str:
     return result['id']
 
 
+def _description_swallowing(swallowed: Mapping[str, str]) -> str:
+    """Task 4358's prose, then a fragment that swallowed *swallowed*, in order."""
+    return TASK_4358_PROSE + closer_for('description') + closer_for('parameter').join(
+        '\n' + CANONICAL_OPENER_PREFIX + f'"{name}">{value}'
+        for name, value in swallowed.items()
+    )
+
+
 def _add_task_text(column: str, value: str) -> dict[str, str]:
     text = {'title': 'clean title', 'description': 'clean description'}
     text[column] = value
@@ -339,6 +347,42 @@ async def test_update_task_refusal_names_the_swallowed_priority(backend, project
         )
 
     assert excinfo.value.recovered == {'priority': 'low'}
+    assert excinfo.value.clean_value == TASK_4358_PROSE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'swallowed',
+    [{'priority': 'low', 'metadata': '{"a": 1}'}, {'priority': 'low', 'tag': 'master'}],
+    ids=['metadata-the-pending-stamp-fills-in', 'tag-the-sink-defaults'],
+)
+async def test_add_task_refusal_recovers_arguments_the_sink_would_fill_in(
+    backend, project_root, swallowed,
+):
+    with pytest.raises(LeakedEnvelopeMarkupError) as excinfo:
+        await backend.add_task(
+            project_root, title='clean title',
+            description=_description_swallowing(swallowed),
+        )
+
+    assert excinfo.value.recovered == swallowed
+    assert excinfo.value.clean_value == TASK_4358_PROSE
+    assert _stored_rows(project_root) == []
+
+
+@pytest.mark.asyncio
+async def test_update_task_refusal_recovers_a_tag_the_sink_would_default(
+    backend, project_root,
+):
+    task_id = await _seed_clean_task(backend, project_root)
+    swallowed = {'priority': 'low', 'tag': 'master'}
+
+    with pytest.raises(LeakedEnvelopeMarkupError) as excinfo:
+        await backend.update_task(
+            task_id, project_root, description=_description_swallowing(swallowed),
+        )
+
+    assert excinfo.value.recovered == swallowed
     assert excinfo.value.clean_value == TASK_4358_PROSE
 
 
