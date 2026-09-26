@@ -3980,16 +3980,14 @@ class ReconciliationHarness:
                 )
                 return run
             except Exception as e:
+                failure = _run_failure_record(e, failed_stage=current_stage_name)
+                logger.error(
+                    'Reconciliation failed: %s (%s)', e, _run_failure_log_fields(run_id, failure),
+                )
                 run.status = RunStatus.failed
-                run.stage_reports['_error'] = {
-                    'error_type': type(e).__name__,
-                    'error_message': str(e),
-                    'failed_stage': current_stage_name,
-                    'traceback': traceback.format_exc(),
-                }
+                run.stage_reports['_error'] = failure
                 await self.journal.complete_run(run_id, 'failed')
                 await self.buffer.restore_drained(project_id)
-                logger.error(f'Reconciliation failed: {e}')
                 self._escalate(
                     'recon_failure', run_id,
                     f'Stage {current_stage_name} failed: {e}',
